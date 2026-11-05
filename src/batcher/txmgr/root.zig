@@ -32,7 +32,22 @@ pub const Config = struct {
     bump_percent: u8 = 10,
     /// `blobs`: one frame per blob, one blob per transaction (EIP-4844).
     data_availability: DataAvailability = .calldata,
+    /// Blob mode: frames (one per blob) packed into each transaction, 1..6.
+    blobs_per_tx: u8 = 1,
 };
+
+/// Pull interface for transaction payloads (the channel manager's frames). A returned
+/// slice is valid until the next call.
+pub const FrameSource = struct {
+    context: *anyopaque,
+    next_fn: *const fn (context: *anyopaque) ?[]const u8,
+
+    fn next(source: FrameSource) ?[]const u8 {
+        return source.next_fn(source.context);
+    }
+};
+
+const blobs_per_tx_max = blob_tx.blobs_per_tx_max;
 
 pub const DataAvailability = enum { calldata, blobs };
 
@@ -47,17 +62,18 @@ pub const Slot = struct {
     hash: primitives.B256 = .zero,
     /// Blob mode only: the encoded blob, its commitment and proof (computed once at
     /// submit; resubmissions only re-sign), and the current max blob fee.
-    blob: ?*kzg.Blob = null,
-    commitment: kzg.Commitment = @splat(0),
-    proof: kzg.Proof = @splat(0),
+    blobs: [blobs_per_tx_max]?*kzg.Blob = @splat(null),
+    commitments: [blobs_per_tx_max]kzg.Commitment = @splat(@splat(0)),
+    proofs: [blobs_per_tx_max]kzg.Proof = @splat(@splat(0)),
+    blob_count: u8 = 0,
     blob_fee: u128 = 0,
 };
 
 pub const Error = rpc.Error || rpc.DecodeError || txdata.SignError || kzg.Error ||
     blobs.EncodeError || error{NoFreeSlot};
 
-/// Upper bound of a blob transaction's network encoding (one blob).
-const blob_network_bytes_max = blobs.bytes_per_blob + 1024;
+/// Upper bound of one blob's share of a blob transaction's network encoding.
+const blob_network_bytes_per_blob = blobs.bytes_per_blob + 128;
 
 pub const TxManager = struct {
     config: Config,
@@ -73,20 +89,18 @@ pub const TxManager = struct {
         const slots = try allocator.alloc(Slot, config.slots_max);
         errdefer allocator.free(slots);
         var initialized: usize = 0;
-        errdefer for (slots[0..initialized]) |slot| allocator.free(slot.data);
         const use_blobs = config.data_availability == .blobs;
         if (use_blobs) assert(config.tx_data_bytes_max <= blobs.blob_data_length_max);
-        errdefer for (slots[0..initialized]) |slot| {
-            if (slot.blob) |blob| allocator.destroy(blob);
-        };
+        assert(config.blobs_per_tx >= 1 and config.blobs_per_tx <= blobs_per_tx_max);
+        const blob_count: u8 = if (use_blobs) config.blobs_per_tx else 0;
+        errdefer for (slots[0..initialized]) |slot| destroy_blobs(allocator, slot);
         for (slots) |*slot| {
-            const data = try allocator.alloc(u8, config.tx_data_bytes_max);
-            errdefer allocator.free(data);
-            const blob = if (use_blobs) try allocator.create(kzg.Blob) else null;
-            slot.* = .{ .data = data, .blob = blob };
+            slot.* = .{ .data = try allocator.alloc(u8, config.tx_data_bytes_max) };
             initialized += 1;
+            for (slot.blobs[0..blob_count]) |*blob| blob.* = try allocator.create(kzg.Blob);
         }
-        const raw_length = @max(config.tx_data_bytes_max + 512, blob_network_bytes_max);
+        const blob_bytes = @as(usize, blob_count) * blob_network_bytes_per_blob + 1024;
+        const raw_length = @max(config.tx_data_bytes_max + 512, blob_bytes);
         const raw_buffer = try allocator.alloc(u8, raw_length);
         errdefer allocator.free(raw_buffer);
         const params_buffer = try allocator.alloc(u8, 2 * raw_buffer.len + 16);
@@ -102,6 +116,13 @@ pub const TxManager = struct {
         };
     }
 
+    fn destroy_blobs(allocator: std.mem.Allocator, slot: Slot) void {
+        allocator.free(slot.data);
+        for (slot.blobs) |maybe_blob| {
+            if (maybe_blob) |blob| allocator.destroy(blob);
+        }
+    }
+
     fn create_prover(allocator: std.mem.Allocator) !*kzg.Prover {
         const prover = try allocator.create(kzg.Prover);
         errdefer allocator.destroy(prover);
@@ -110,10 +131,7 @@ pub const TxManager = struct {
     }
 
     pub fn deinit(manager: *TxManager, allocator: std.mem.Allocator) void {
-        for (manager.slots) |slot| {
-            allocator.free(slot.data);
-            if (slot.blob) |blob| allocator.destroy(blob);
-        }
+        for (manager.slots) |slot| destroy_blobs(allocator, slot);
         allocator.free(manager.slots);
         if (manager.prover) |prover| {
             prover.deinit(allocator);
@@ -134,36 +152,61 @@ pub const TxManager = struct {
         return manager.pending_count() < manager.slots.len;
     }
 
-    /// Queues `tx_data` under the next nonce and sends it.
+    /// Queues one payload under the next nonce and sends it.
     pub fn submit(
         manager: *TxManager,
         client: *rpc.Client,
         tx_data: []const u8,
         now_ms: u64,
     ) Error!void {
-        assert(tx_data.len > 0 and tx_data.len <= manager.config.tx_data_bytes_max);
+        var single: SingleFrame = .{ .frame = tx_data };
+        const sent = try manager.submit_from(client, single.source(), now_ms);
+        assert(sent and single.frame == null);
+    }
+
+    /// Pulls payloads from `frames` into one transaction (one frame for calldata, up to
+    /// `blobs_per_tx` blobs) and sends it under the next nonce. Nonce and fees are read
+    /// before any frame is pulled, so an RPC failure never drops a frame. Returns false
+    /// when `frames` was empty.
+    pub fn submit_from(
+        manager: *TxManager,
+        client: *rpc.Client,
+        frames: FrameSource,
+        now_ms: u64,
+    ) Error!bool {
         const slot = for (manager.slots) |*slot| {
             if (slot.state == .free) break slot;
         } else return error.NoFreeSlot;
         const nonce = manager.next_nonce orelse try manager.account_nonce(client, "pending");
         const fees = try manager.suggested_fees(client);
+        const blob_fee = if (manager.prover != null) try manager.suggested_blob_fee(client) else 0;
         if (manager.prover) |prover| {
-            const blob = slot.blob.?;
-            try blobs.encode(tx_data, blob);
-            slot.commitment = try prover.commitment(blob);
-            slot.proof = try prover.blob_proof(blob, &slot.commitment);
-            slot.blob_fee = try manager.suggested_blob_fee(client);
+            slot.blob_count = 0;
+            while (slot.blob_count < manager.config.blobs_per_tx) : (slot.blob_count += 1) {
+                const tx_data = frames.next() orelse break;
+                const index = slot.blob_count;
+                const blob = slot.blobs[index].?;
+                try blobs.encode(tx_data, blob);
+                slot.commitments[index] = try prover.commitment(blob);
+                slot.proofs[index] = try prover.blob_proof(blob, &slot.commitments[index]);
+            }
+            if (slot.blob_count == 0) return false;
+        } else {
+            const tx_data = frames.next() orelse return false;
+            assert(tx_data.len > 0 and tx_data.len <= manager.config.tx_data_bytes_max);
+            @memcpy(slot.data[0..tx_data.len], tx_data);
+            slot.data_length = @intCast(tx_data.len);
         }
-        @memcpy(slot.data[0..tx_data.len], tx_data);
         slot.state = .pending;
         slot.nonce = nonce;
         slot.fees = fees;
-        slot.data_length = @intCast(tx_data.len);
+        slot.blob_fee = blob_fee;
         slot.sent_at_ms = 0;
         slot.attempts = 0;
         manager.next_nonce = nonce + 1;
         try manager.send(client, slot, now_ms);
         assert(slot.state == .pending);
+        return true;
     }
 
     /// Frees slots whose nonce was mined and resubmits stale ones. Returns the number
@@ -220,21 +263,27 @@ pub const TxManager = struct {
             }, manager.config.private_key);
             return .{ txdata.encode_raw(envelope, manager.raw_buffer), envelope.hash() };
         }
-        const hashes = [_][32]u8{kzg.versioned_hash(&slot.commitment)};
-        var hash_buffer: [33]u8 = undefined;
+        const count = slot.blob_count;
+        assert(count >= 1 and count <= blobs_per_tx_max);
+        var hashes: [blobs_per_tx_max][32]u8 = undefined;
+        var blob_list: [blobs_per_tx_max]*const kzg.Blob = undefined;
+        for (0..count) |index| {
+            hashes[index] = kzg.versioned_hash(&slot.commitments[index]);
+            blob_list[index] = slot.blobs[index].?;
+        }
+        var hash_buffer: [33 * blobs_per_tx_max]u8 = undefined;
         const envelope = try blob_tx.sign(.{
             .chain_id = manager.config.chain_id,
             .nonce = slot.nonce,
             .fees = slot.fees,
             .blob_fee_wei = slot.blob_fee,
             .to = manager.config.to,
-            .versioned_hashes = &hashes,
+            .versioned_hashes = hashes[0..count],
         }, &hash_buffer, manager.config.private_key);
-        const blob_list = [_]*const kzg.Blob{slot.blob.?};
         const sidecar: blob_tx.Sidecar = .{
-            .blobs = &blob_list,
-            .commitments = @as(*const [1]kzg.Commitment, &slot.commitment),
-            .proofs = @as(*const [1]kzg.Proof, &slot.proof),
+            .blobs = blob_list[0..count],
+            .commitments = slot.commitments[0..count],
+            .proofs = slot.proofs[0..count],
         };
         return .{ blob_tx.encode_network(envelope, sidecar, manager.raw_buffer), envelope.hash() };
     }
@@ -286,6 +335,21 @@ pub const TxManager = struct {
             break :blk blob_tx.blob_base_fee(excess);
         };
         return @max(base *| 2, blob_tx.blob_base_fee_min);
+    }
+};
+
+/// A `FrameSource` over one payload.
+const SingleFrame = struct {
+    frame: ?[]const u8,
+
+    fn source(single: *SingleFrame) FrameSource {
+        return .{ .context = single, .next_fn = next };
+    }
+
+    fn next(context: *anyopaque) ?[]const u8 {
+        const single: *SingleFrame = @ptrCast(@alignCast(context));
+        defer single.frame = null;
+        return single.frame;
     }
 };
 
@@ -430,7 +494,7 @@ test "txmgr: blob mode sends a 4844 tx committing to the frame and doubles fees 
     try testing.expectEqual(@as(u128, 6), slot.blob_fee);
     const decoded_data = try testing.allocator.alloc(u8, blobs.blob_data_length_max);
     defer testing.allocator.free(decoded_data);
-    const decoded = try blobs.decode(slot.blob.?, decoded_data);
+    const decoded = try blobs.decode(slot.blobs[0].?, decoded_data);
     try testing.expectEqualStrings("\x00frame-in-a-blob", decoded);
 
     // The network form's body is a signed 4844 tx naming the blob's versioned hash.
@@ -446,7 +510,7 @@ test "txmgr: blob mode sends a 4844 tx committing to the frame and doubles fees 
     @memcpy(typed[1..][0..body.len], body);
     const envelope = try consensus.Envelope.decode(typed[0 .. body.len + 1]);
     const versioned = envelope.eip4844.tx.blob_versioned_hashes.get(0);
-    try testing.expectEqualSlices(u8, &kzg.versioned_hash(&slot.commitment), &versioned.bytes);
+    try testing.expectEqualSlices(u8, &kzg.versioned_hash(&slot.commitments[0]), &versioned.bytes);
     try testing.expect(envelope.hash().eql(slot.hash));
 
     // Stale: every fee at least doubles.
@@ -457,4 +521,55 @@ test "txmgr: blob mode sends a 4844 tx committing to the frame and doubles fees 
     try testing.expect(slot.fees.max_fee_per_gas >= 2 * fees_before.max_fee_per_gas);
     const tip_before = fees_before.max_priority_fee_per_gas;
     try testing.expect(slot.fees.max_priority_fee_per_gas >= 2 * tip_before);
+}
+
+const ListFrames = struct {
+    frames: []const []const u8,
+    next_index: usize = 0,
+
+    fn source(list: *ListFrames) FrameSource {
+        return .{ .context = list, .next_fn = next };
+    }
+
+    fn next(context: *anyopaque) ?[]const u8 {
+        const list: *ListFrames = @ptrCast(@alignCast(context));
+        if (list.next_index == list.frames.len) return null;
+        defer list.next_index += 1;
+        return list.frames[list.next_index];
+    }
+};
+
+test "txmgr: blob mode packs up to blobs_per_tx frames per transaction" {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var l1: FakeL1 = .{ .mined_nonce = 0 };
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 600 * 1024,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    var manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 2,
+        .tx_data_bytes_max = 4096,
+        .data_availability = .blobs,
+        .blobs_per_tx = 2,
+    });
+    defer manager.deinit(testing.allocator);
+    var list: ListFrames = .{ .frames = &.{ "\x00one", "\x00two", "\x00three" } };
+    try testing.expect(try manager.submit_from(&client, list.source(), 0));
+    try testing.expect(try manager.submit_from(&client, list.source(), 0));
+    try testing.expectEqual(@as(u8, 2), manager.slots[0].blob_count);
+    try testing.expectEqual(@as(u8, 1), manager.slots[1].blob_count);
+    try testing.expectEqual(@as(u64, 1), manager.slots[1].nonce);
+    const commitments = manager.slots[0].commitments;
+    try testing.expect(!std.mem.eql(u8, &commitments[0], &commitments[1]));
+    try testing.expectError(error.NoFreeSlot, manager.submit_from(&client, list.source(), 0));
+    l1.mined_nonce = 2;
+    try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 0));
+    try testing.expect(!try manager.submit_from(&client, list.source(), 0));
+    try testing.expectEqual(@as(u32, 2), l1.sends);
 }

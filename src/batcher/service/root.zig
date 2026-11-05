@@ -149,20 +149,18 @@ pub const Service = struct {
     }
 
     fn submit_frames(service: *Service, l1: *rpc.Client, now_ms: u64, report: *Report) Error!void {
-        while (service.txs.has_capacity()) {
-            const tx_data = service.channels.next_tx_data() orelse return;
-            const pending_before = service.txs.pending_count();
-            service.txs.submit(l1, tx_data, now_ms) catch |err| {
-                // A frame that never got a slot is lost; rebuild channels from the safe
-                // head so the stream stays complete. A slot that exists is resent by poll.
-                if (service.txs.pending_count() == pending_before) {
-                    service.channels.reset();
-                    report.resets += 1;
-                }
-                return err;
-            };
+        const frames: txmgr.FrameSource = .{ .context = &service.channels, .next_fn = next_frame };
+        while (service.txs.has_capacity() and service.channels.has_pending_frames()) {
+            // Nonce and fees are read before frames are pulled, so an error here leaves
+            // the frames in the channel manager; a slot that exists is resent by poll.
+            if (!try service.txs.submit_from(l1, frames, now_ms)) return;
             report.txs_submitted += 1;
         }
+    }
+
+    fn next_frame(context: *anyopaque) ?[]const u8 {
+        const channels: *channel_manager.Manager = @ptrCast(@alignCast(context));
+        return channels.next_tx_data();
     }
 };
 

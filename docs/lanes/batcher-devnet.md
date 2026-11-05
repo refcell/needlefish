@@ -30,7 +30,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/blobs/kzg`: KZG prover (blob commitment + blob proof), verified by the pairing check.
 - [x] `batcher/txdata`: EIP-4844 blob txs (sign, sidecar network form, blob fees); txmgr blob mode;
   `base batcher --data-availability blobs` (one frame per blob, one blob per tx).
-- [ ] `batcher`: multiple blobs per tx (up to 6 frames per tx).
+- [x] `batcher`: multiple blobs per tx (up to 6 frames per tx, `FrameSource` pull; nonce and
+  fees read before frames are pulled so RPC errors never drop frames).
 - [x] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
 - [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
 - [x] `batcher/source`: EIP-7702 (type 4) transactions.
@@ -102,3 +103,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   c-kzg's loader (the file is in natural order).
 - 2026-11-05: blob DA end to end; anvil (c-kzg) accepted and mined our type-3 tx with sidecar.
 - 2026-11-05: `base devnet batches` inspector; live: 20 batches decoded from an anvil L1.
+- 2026-11-05: multi-blob transactions (default 6 per tx in blob mode).

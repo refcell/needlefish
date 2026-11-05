@@ -102,6 +102,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             .to = rollup.batch_inbox_address,
             .tx_data_bytes_max = payload_max,
             .data_availability = flags.data_availability,
+            // op-batcher's blob default: up to 6 frames (blobs) per transaction.
+            .blobs_per_tx = if (flags.data_availability == .blobs) 6 else 1,
         },
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
