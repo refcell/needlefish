@@ -15,6 +15,8 @@ const RpcClient = proof.host.rpc_source.RpcSource(io.IO).Client;
 const Endpoint = proof.rpc.Endpoint(io.IO);
 const Chain = challenger.rpc_chain.RpcChain(Endpoint);
 const Submitter = challenger.tx_submitter.TxSubmitter(Endpoint);
+const ServiceClient = proof.prover_service.client.Client(io.IO);
+const ChallengerProver = proof.prover_service.challenger_prover.ChallengerProver(io.IO);
 
 const usage =
     \\usage: base challenger --l1-eth-rpc <url> --l2-eth-rpc <url>
@@ -42,6 +44,10 @@ const Process = struct {
     chain: Chain,
     submitter: Submitter,
     driver: challenger.Driver,
+    prover_http: RpcClient,
+    prover_endpoint: Endpoint,
+    prover_client: ServiceClient,
+    prover: ChallengerProver,
 
     fn step(context: *anyopaque) anyerror!void {
         const os_io: *io.IO = @ptrCast(@alignCast(context));
@@ -53,9 +59,8 @@ const Process = struct {
     }
 };
 
-/// Disputes need a prover service client (`proof/challenger` prover client); until then
-/// every request is refused and the attempt retries, while scanning, anchor updates and
-/// bond claims run.
+/// Without `--zk-rpc-url` every proof request is refused and the attempt retries, while
+/// scanning, anchor updates and bond claims run.
 const NoProver = struct {
     fn request(
         _: *anyopaque,
@@ -86,9 +91,6 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("challenger: {t}\n{s}", .{ err, usage });
         return 2;
     };
-    if (flags.zk_rpc_url.len > 0) {
-        std.debug.print("challenger: --zk-rpc-url is not wired yet; disputes stay pending\n", .{});
-    }
     const allocator = init.gpa;
     const process = try allocator.create(Process);
     defer allocator.destroy(process);
@@ -97,10 +99,18 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 1;
     };
     defer disconnect(process, allocator);
+    const prover = if (flags.zk_rpc_url.len == 0) NoProver.prover() else prover: {
+        open_prover(process, allocator, flags.zk_rpc_url) catch |err| {
+            std.debug.print("challenger: cannot open the prover service: {t}\n", .{err});
+            return 1;
+        };
+        break :prover process.prover.prover();
+    };
+    defer if (flags.zk_rpc_url.len > 0) close_prover(process, allocator);
     const sender = try secp256k1.address(flags.private_key.?);
     process.driver.init(flags.driver_config(sender), .{
         .chain = process.chain.view(),
-        .prover = NoProver.prover(),
+        .prover = prover,
         .submitter = process.submitter.submitter(),
     });
     return tick_loop(process, &flags);
@@ -142,6 +152,22 @@ fn connect(
         .private_key = key,
         .from = try secp256k1.address(key),
     });
+}
+
+fn open_prover(process: *Process, allocator: std.mem.Allocator, url: []const u8) !void {
+    const address = try consensus_cli.parse_url(url);
+    process.prover_http = try .init(allocator, &process.os_io, address, http_options, 4096);
+    errdefer process.prover_http.deinit();
+    process.prover_endpoint = .init(allocator, &process.prover_http, process.pump(), 300_000);
+    errdefer process.prover_endpoint.deinit();
+    process.prover_client = try .init(allocator, &process.prover_endpoint, .{});
+    process.prover = .{ .client = &process.prover_client };
+}
+
+fn close_prover(process: *Process, allocator: std.mem.Allocator) void {
+    process.prover_client.deinit(allocator);
+    process.prover_endpoint.deinit();
+    process.prover_http.deinit();
 }
 
 fn disconnect(process: *Process, allocator: std.mem.Allocator) void {

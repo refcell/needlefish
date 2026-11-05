@@ -91,9 +91,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   AggregateVerifier getters with per-proxy version-gated intervals, `getAnchorRoot` +
   `anchorGame` pinned to one L1 block, registry preflight/finality, DelayedWETH
   `delay`/`withdrawals`, L1 block number from a hash-checked raw header, L2 raw headers).
-- [ ] `proof/challenger` prover client: `Prover` over the prover-service JSON-RPC with the
-  `base/challenger/proof-session/v2` session ids, once `proof/prover-service` defines the
-  protocol on main.
+- [x] `proof/challenger` prover client: `prover_service/challenger_prover.zig`
+  (`base/challenger/proof-session/v2` UUIDv5 session ids per game, invalid index and kind;
+  TEE as AWS Nitro, ZK as SP1 PLONK; numeric handles over a 64-slot table) and
+  `base challenger --zk-rpc-url`; e2e with a fake TEE worker through the service.
 - [x] `proof/challenger` submission: shared `src/proof/submission/` (`Sender`: estimate,
   EIP-1559 signing with value via `batcher/txdata`, broadcast, receipt polling, failed
   receipt replay, revert data from `Endpoint.last_error`; `classify` through
@@ -237,6 +238,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - `base proposer` with the native prover sends the witness archive as `initData`
   (calldata cap raised to 4 MiB): L1 nodes cap transactions near 128 KiB, so this mode is
   for local chains; real deployments use a prover service with compact proofs.
+- Challenger ZK results pass the service's proof bytes through as the on-chain body:
+  base/base decodes an SP1 receipt into the seal (`SnarkReceiptEncoder`), which needs SP1
+  types that do not exist here.
 - Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
   batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
   estimation, no revert data), while a game creation needs the bond as value and the
@@ -281,6 +285,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: challenger prover-service client, `base challenger --zk-rpc-url`.
 - 2026-11-05: `base challenger` (flags, JSON-RPC view and submitter, driver loop).
 - 2026-11-05: `base prover-service` / `base prover-worker`; empty L1 genesis fix.
 - 2026-11-05: `base proposer --prover-rpc <url>` and `--l1-beacon`.
