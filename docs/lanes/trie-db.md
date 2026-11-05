@@ -68,6 +68,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   checksums catch it); write errors retry then panic; fsync errors panic (fsyncgate). IO
   callbacks only queue; storage callbacks run from `tick()`, which calls non-blocking
   `io.tick()`. With `SimIo` the caller advances time (`io.run_for_ns`) before `tick()`.
+- `IoStorageType(IO)`: caller opens/owns the fd (sparse files ok); bounded completions with
+  FIFO overflow; short transfers resubmitted; read errors retried then zero-filled (checksums
+  catch it); write errors retried then panic; fsync failure panics (no retry after fsync
+  error); full fsync (F_FULLFSYNC on Darwin); callbacks only from `tick`.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -85,6 +89,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   crash/torn-write/bit-rot fault injection over SimStorage; mutation-checked.
 - 2026-11-05: durable database facade over the storage engine; crash-recovery tests
   (24 seeds x 4 crashes) recover a head/root between last acked and last submitted op.
+- 2026-11-05: io-backed storage (sim + real OS file), engine end-to-end over both.
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
 - 2026-11-05: IoStorage over utilities.io; engine end to end over a short-IO double, SimIo
   (16 crash seeds), and kqueue/io_uring on a real temp file.
