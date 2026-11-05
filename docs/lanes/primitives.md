@@ -47,6 +47,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   Seven curated vectors are committed for `zig build test`.
 - [x] ethereum/tests `GenesisTests/basic_genesis_tests.json` committed: genesis JSON to full
   block RLP matches (2 cases; the legacy `wei`-alloc case is skipped like alloy).
+- [x] `genesis.feature`: base/base `BaseFeature` registry (82 features) and the full 17-entry
+  `genesis.Upgrade` (Bedrock..Zenith, base/base ordinals), `is_feature_enabled`,
+  `activation_states`, `Upgrade.from_base`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -115,6 +118,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - Fee fields are u128 like alloy (base/base), so three ethereum/tests vectors with 31-byte
   gas prices that geth accepts are rejected; `txtest` reports them as `wider_than_u128`.
 
+- `genesis.Upgrade` is common's own full upgrade enum because common may not import the
+  consensus/execution `Upgrade` enums; ordinals match base/base `BaseUpgrade`.
+
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
@@ -144,3 +150,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: `genesischeck` tool; base/base mainnet/sepolia/zeronet genesis hashes match.
 - 2026-11-05: `txtest` TransactionTests runner, 0 failures.
 - 2026-11-05: ethereum/tests GenesisTests vectors (genesis block RLP parity).
+- 2026-11-05: `genesis.feature` BaseFeature registry.
