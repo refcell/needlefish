@@ -152,3 +152,6 @@ provably robust.
   replayed honest ranges as fresh channels with shuffled and duplicated frames,
   truncated channels, garbage, and oversize frames. The undecodable-batch check is
   waived for such seeds (head checks remain). 5000 seeds green.
+- 2026-11-05: differential Engine API JSON fuzz (`fuzz_targets_engine.zig`): payloads
+  V1-V4 both directions, payload attributes, payload status and forkchoice-updated
+  between the consensus client and execution server codecs; 3/3 wire mutants caught.

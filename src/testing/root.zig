@@ -11,6 +11,7 @@ pub const fuzz_targets = @import("fuzz_targets.zig");
 pub const fuzz_targets_p2p = @import("fuzz_targets_p2p.zig");
 pub const fuzz_targets_batcher = @import("fuzz_targets_batcher.zig");
 pub const fuzz_targets_derive = @import("fuzz_targets_derive.zig");
+pub const fuzz_targets_engine = @import("fuzz_targets_engine.zig");
 
 test {
     std.testing.refAllDecls(@This());
