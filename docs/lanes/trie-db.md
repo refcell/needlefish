@@ -14,7 +14,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Durable database facade (`db/database.zig`): journal block/head entries, state moves
   only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
 - [x] Real storage backend over `utilities.io` (io_uring/kqueue): `db/storage/io_storage.zig`.
-- [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
+- [x] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
 - [x] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`.
 - [x] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
@@ -125,6 +125,40 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   insert (only a planning error can, and not for a child of the head), a plain `block` entry
   is journaled so replay stays in step. A block already stored only journals a `head` entry.
   Group commit stays an option if standalone insert+set_head pairs ever become hot.
+- Checkpoint fallback (superblock version 2): the superblock also names the previous
+  checkpoint (`checkpoint_previous`, `journal_start_previous`, `commit_metadata_previous`),
+  and the journal tail is the previous checkpoint's start, so live entries span two
+  checkpoints. A checkpoint's superblock demotes the replaced newest to the fallback and only
+  then releases entries before the old fallback's start. Open streams the newest checkpoint;
+  if it fails to verify, `Consumer.on_checkpoint_reset` drops the chunks already delivered,
+  the fallback streams, and replay starts at the fallback's start. The fallback must replay
+  at least up to the newest checkpoint's coverage (else `CheckpointCorrupt`); then the
+  superblock is rewritten naming the fallback as newest (no distinct fallback), so the next
+  checkpoint overwrites the rotten zone. Right after format, and after the first checkpoint,
+  the fallback is the empty state with the journal from entry 1. Chosen over per-block parity
+  (option b) because it is TigerBeetle's approach (the WAL covers the previous checkpoint),
+  needs no new on-disk structure beyond superblock fields, and also covers a checkpoint lost
+  to a misdirected write. Stream-then-reset instead of verify-then-stream keeps open at one
+  read of the checkpoint. A first-to-verify transient read fault (4 retries) also falls back;
+  harmless, the result is the same state. Two zones only: while a checkpoint writes into the
+  fallback zone, only the newest checkpoint is recoverable (a third zone would close that
+  window; not worth it for a double fault). The journal trigger is unchanged (`used` from the
+  tail > half the journal), which now counts two checkpoints of entries, so checkpoints run
+  about twice as often (each covers ~1/4 of the journal) and Busy/JournalFull clears after at
+  most two back-to-back checkpoints.
+
+## Known limitations (storage)
+- Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
+  `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
+  journal redundancy (TigerBeetle repairs from replicas; we have one copy).
+- One rotten checkpoint zone is survived; it is data loss (`CheckpointCorrupt`) only with a
+  second fault: rot in the fallback zone, rot in a journal entry between the two checkpoint
+  starts, or a crash during a checkpoint write combined with rot in the newest zone.
+- A transient read fault while streaming the fallback after it was chosen fails open (no third
+  option); reopening retries.
+- A cleanly closed journal can report `journal_stop = header_corrupt`: the sector after the
+  last entry may hold a body sector from an older lap, which the scan cannot tell from a torn
+  header. Recovery is still the full valid prefix; only the stop reason is pessimistic.
 
 - Storage-heavy block (profiled with phase timers, not committed): the cost was changeset
   sorting (~2 ms: block sort copying 128+ byte entries, byte-wise compare) and `State.apply`
@@ -187,5 +221,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   address hash per slot run, batched key hashing); remaining gap is 2x dirty accounts plus
   storage rehash (docs/PERF.md).
 - 2026-11-05: historical proofs store: `eth_getProof` at any block of the window from
-  versioned node preimages; differential against a State unwound to each block (6 seeds,
+  versioned node preimages; differential against a State unwound to each block (2 seeds,
   reorgs, window 10), proofs verified against each block's root.
+- 2026-11-05: checkpoint fallback: journal keeps entries back to the previous checkpoint; a
+  rotten newest checkpoint (any sector) reopens via the older zone plus the longer journal.
+  Engine fault injection now also rots the newest checkpoint (fallbacks asserted), database
+  crash test too; superblock fallback fields fuzzed.

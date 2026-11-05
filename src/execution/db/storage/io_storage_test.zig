@@ -321,6 +321,12 @@ fn HarnessType(comptime IO: type) type {
             self.recovered_size += @intCast(chunk.len);
         }
 
+        fn consume_checkpoint_reset(context: *anyopaque) void {
+            const self: *Harness = @ptrCast(@alignCast(context));
+            assert(!self.recovered_loaded);
+            self.recovered_size = 0;
+        }
+
         fn consume_entry(context: *anyopaque, entry: engine_module.Entry) void {
             const self: *Harness = @ptrCast(@alignCast(context));
             self.check_entry(entry) catch |err| {
@@ -358,6 +364,7 @@ fn HarnessType(comptime IO: type) type {
             self.engine.open(.{
                 .context = self,
                 .on_checkpoint = consume_checkpoint,
+                .on_checkpoint_reset = consume_checkpoint_reset,
                 .on_entry = consume_entry,
             }, on_phase);
             try self.wait_phase();

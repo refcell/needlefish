@@ -1,8 +1,9 @@
 //! Database tests: the entry codec (fuzzed), checkpoint-then-reopen equality, and the lane's
 //! durability guarantee under fault injection. Each seed runs a random workload of blocks with
 //! random state writes, side branches, reorgs, and checkpoints over `SimStorage`, crashes at
-//! random ticks, reopens, and checks that the recovered head and state root equal the live
-//! values after some entry between the last acknowledged one and the last submitted one.
+//! random ticks, sometimes rots the newest checkpoint, reopens, and checks that the recovered
+//! head and state root equal the live values after some entry between the last acknowledged
+//! one and the last submitted one.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -11,6 +12,7 @@ const testing = std.testing;
 const database = @import("database.zig");
 const engine_module = @import("storage/engine.zig");
 const storage = @import("storage/storage.zig");
+const checkpoint_module = @import("storage/checkpoint.zig");
 const SimStorage = @import("storage/sim_storage.zig").SimStorage;
 const state_module = @import("state.zig");
 const overlay_module = @import("overlay.zig");
@@ -94,6 +96,11 @@ const Harness = struct {
     block_id_next: u32 = 0,
     header_buffer: [64]u8 = undefined,
     transactions: [3]Hash = undefined,
+    /// The engine's fallback checkpoint is known intact: false while a checkpoint runs (it
+    /// overwrites the fallback zone) and after an open that fell back, true once a
+    /// checkpoint completes.
+    fallback_intact: bool = true,
+    checkpoints_seen: u64 = 0,
 
     fn create(sim: *SimStorage, seed: u64) !*Harness {
         const self = try testing.allocator.create(Harness);
@@ -307,13 +314,43 @@ const Harness = struct {
         }
         if (self.db.checkpoint_error) |err| return err;
         self.sim.tick();
+        self.track_fallback();
     }
 
-    /// Crash, restart, and check the recovered head against the live history.
-    fn crash_and_check(self: *Harness) !void {
+    fn track_fallback(self: *Harness) void {
+        if (self.db.checkpoints_completed != self.checkpoints_seen) {
+            self.checkpoints_seen = self.db.checkpoints_completed;
+            self.fallback_intact = true;
+        }
+        if (self.db.engine.checkpoint_phase != .idle) self.fallback_intact = false;
+    }
+
+    /// Rots one checkpoint block header of the newest checkpoint; false if there is none.
+    fn rot_newest_checkpoint(self: *Harness) bool {
+        const checkpoint = self.db.engine.superblock.working.checkpoint;
+        if (checkpoint.sequence == 0 or checkpoint.size_bytes == 0) return false;
+        const block_size = config.engine.checkpoint_block_size;
+        const blocks = checkpoint_module.block_count(checkpoint.size_bytes, block_size);
+        const block = self.prng.below(blocks);
+        const offset = config.engine.checkpoint_zone_offset(checkpoint.zone) + block * block_size;
+        // The first byte of a block header is checksummed: the block can no longer verify.
+        self.sim.durable[@intCast(offset)] ^= 0x04;
+        self.sim.memory[@intCast(offset)] ^= 0x04;
+        return true;
+    }
+
+    /// Crash, restart, and check the recovered head against the live history. With `.rot`,
+    /// also rot the newest checkpoint when its fallback is intact.
+    fn crash_and_check(self: *Harness, rot_checkpoint: enum { keep, rot }) !void {
         const acknowledged = self.db.durable_sequence;
+        self.track_fallback();
+        const fallback_ready = self.fallback_intact;
         self.sim.crash();
+        const rotten = rot_checkpoint == .rot and fallback_ready and self.rot_newest_checkpoint();
         try self.reopen();
+        const fallback = (try self.db.engine.open_result).checkpoint_fallback;
+        if (rotten) try testing.expect(fallback);
+        if (fallback) self.fallback_intact = false;
         const recovered = self.db.submitted_sequence;
         try testing.expect(recovered >= acknowledged);
         try testing.expect(recovered <= self.submitted);
@@ -335,31 +372,69 @@ fn sim_create(seed: u64, prng: *Prng) !SimStorage {
     });
 }
 
-fn run_crash_seed(seed: u64) !void {
+fn run_crash_seed(seed: u64) !u32 {
     var prng = Prng.init(seed);
     var sim = try sim_create(seed, &prng);
     defer sim.deinit(testing.allocator);
     const harness = try Harness.create(&sim, prng.int(u64));
     defer harness.destroy();
     try harness.format(0xd8_0000 + seed);
+    var fallbacks: u32 = 0;
     var cycle: u32 = 0;
     while (cycle < 4) : (cycle += 1) {
         const crash_tick = prng.range(1, 1200);
         var tick: u64 = 0;
         while (tick < crash_tick) : (tick += 1) try harness.step();
-        try harness.crash_and_check();
+        try harness.crash_and_check(if (prng.chance(1, 2)) .rot else .keep);
+        if ((try harness.db.engine.open_result).checkpoint_fallback) fallbacks += 1;
     }
     try testing.expect(harness.db.chain.block_count() > 0);
+    return fallbacks;
 }
 
 test "database: seeded crash recovery matches a point between acknowledged and submitted" {
+    var fallbacks: u32 = 0;
     var seed: u64 = 0;
     while (seed < 24) : (seed += 1) {
-        run_crash_seed(seed) catch |err| {
+        fallbacks += run_crash_seed(seed) catch |err| {
             std.debug.print("database crash recovery: failing seed={d}\n", .{seed});
             return err;
         };
     }
+    // Rotten newest checkpoints were recovered through the fallback.
+    try testing.expect(fallbacks >= 8);
+}
+
+test "database: rotten newest checkpoint reopens to the live state via the fallback" {
+    var prng = Prng.init(0xfa11);
+    var sim = try sim_create(9, &prng);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 9);
+    defer harness.destroy();
+    try harness.format(0xfa11);
+    for (0..2) |_| {
+        var steps: u32 = 0;
+        while (steps < 300) : (steps += 1) try harness.step();
+        try harness.tick_until(Harness.idle);
+        harness.db.request_checkpoint();
+        try harness.tick_until(Harness.idle);
+    }
+    var steps: u32 = 0;
+    while (steps < 100) : (steps += 1) try harness.step();
+    try harness.tick_until(Harness.idle);
+    try testing.expect(harness.db.engine.superblock.working.has_fallback());
+    try testing.expect(harness.rot_newest_checkpoint());
+    try check_equal_after_reopen(harness);
+    const result = try harness.db.engine.open_result;
+    try testing.expect(result.checkpoint_fallback);
+    try testing.expect(result.entries_replayed > 0);
+    // Work continues and a later clean reopen needs no fallback.
+    steps = 0;
+    while (steps < 100) : (steps += 1) try harness.step();
+    harness.db.request_checkpoint();
+    try harness.tick_until(Harness.idle);
+    try check_equal_after_reopen(harness);
+    try testing.expect(!(try harness.db.engine.open_result).checkpoint_fallback);
 }
 
 fn check_equal_after_reopen(harness: *Harness) !void {

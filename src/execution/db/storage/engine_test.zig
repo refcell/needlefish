@@ -1,8 +1,9 @@
 //! Engine tests, including the lane's crash-safety guarantee: a seeded fault-injection run
 //! over many seeds. Each seed drives a random workload of commits and checkpoints against a
 //! model, crashes at a random tick (losing, keeping, or tearing unsynced sectors), sometimes
-//! rots one superblock copy, reopens, and checks that the recovered state is exactly the
-//! model state after a prefix of the submitted entries that includes every acknowledged one.
+//! rots one superblock copy or one sector of the newest checkpoint, reopens, and checks that
+//! the recovered state is exactly the model state after a prefix of the submitted entries
+//! that includes every acknowledged one.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -92,6 +93,10 @@ const Harness = struct {
     recovered_sequence: u64 = 0,
     scratch: [state_size]u8 = undefined,
     failure: ?anyerror = null,
+    /// The superblock's fallback checkpoint is known intact: false from a checkpoint start
+    /// (it overwrites the fallback zone) until a checkpoint completes, and after an open that
+    /// fell back (no distinct fallback is left).
+    fallback_intact: bool = true,
 
     fn on_phase(engine: *Engine) void {
         const self: *Harness = @alignCast(@fieldParentPtr("engine", engine));
@@ -111,7 +116,9 @@ const Harness = struct {
         const self: *Harness = @alignCast(@fieldParentPtr("engine", engine));
         _ = engine.checkpoint_result catch {
             self.failure = error.CheckpointFailed;
+            return;
         };
+        self.fallback_intact = true;
     }
 
     fn produce(context: *anyopaque, buffer: []u8) u32 {
@@ -129,6 +136,12 @@ const Harness = struct {
         assert(self.recovered_size + chunk.len <= snapshot_size);
         @memcpy(self.recovered[self.recovered_size..][0..chunk.len], chunk);
         self.recovered_size += @intCast(chunk.len);
+    }
+
+    fn consume_checkpoint_reset(context: *anyopaque) void {
+        const self: *Harness = @ptrCast(@alignCast(context));
+        assert(!self.recovered_loaded);
+        self.recovered_size = 0;
     }
 
     fn consume_entry(context: *anyopaque, entry: engine_module.Entry) void {
@@ -164,8 +177,7 @@ const Harness = struct {
         try testing.expect(self.recovered_sequence <= self.model.submitted);
         self.model.state_at(self.recovered_sequence, &self.scratch);
         try testing.expectEqualSlices(u8, &self.scratch, self.recovered[8..]);
-        const start = self.engine.superblock.working.journal_start;
-        try testing.expectEqual(self.recovered_sequence + 1, start.sequence);
+        try testing.expectEqual(self.recovered_sequence + 1, self.engine.open_start.sequence);
     }
 
     fn wait_phase(self: *Harness) !void {
@@ -189,10 +201,12 @@ const Harness = struct {
         self.engine.open(.{
             .context = self,
             .on_checkpoint = consume_checkpoint,
+            .on_checkpoint_reset = consume_checkpoint_reset,
             .on_entry = consume_entry,
         }, on_phase);
         try self.wait_phase();
         const result = try self.engine.open_result;
+        if (result.checkpoint_fallback) self.fallback_intact = false;
         try self.load_checkpoint();
         if (self.failure) |err| return err;
         const last = result.sequence_last;
@@ -215,9 +229,7 @@ const Harness = struct {
         if (commit_idle and engine.checkpoint_phase == .idle and
             (self.checkpoint_requested or self.prng.chance(1, 60)))
         {
-            self.snapshot_take();
-            const producer: engine_module.Producer = .{ .context = self, .produce = produce };
-            try engine.checkpoint(producer, on_checkpoint);
+            try self.checkpoint_start();
             self.checkpoint_requested = false;
         } else if (commit_idle and self.model.submitted < entries_max and
             self.prng.chance(1, 3))
@@ -250,6 +262,30 @@ const Harness = struct {
         self.commit_sequence = sequence;
     }
 
+    fn checkpoint_start(self: *Harness) !void {
+        self.snapshot_take();
+        const producer: engine_module.Producer = .{ .context = self, .produce = produce };
+        try self.engine.checkpoint(producer, on_checkpoint);
+        self.fallback_intact = false;
+    }
+
+    /// Commits `count` random entries, each durable before the next.
+    fn commit_durable(self: *Harness, count: u32) !void {
+        for (0..count) |_| {
+            try self.commit_random();
+            try testing.expect(self.commit_sequence != 0); // The journal had room.
+            try engine_module.tick_until_idle(self.sim, &self.engine, 10_000);
+        }
+    }
+
+    /// Takes a checkpoint of everything acknowledged and waits for it.
+    fn checkpoint_durable(self: *Harness) !void {
+        try self.checkpoint_start();
+        try engine_module.tick_until_idle(self.sim, &self.engine, 100_000);
+        if (self.failure) |err| return err;
+        try testing.expect(self.fallback_intact);
+    }
+
     fn snapshot_take(self: *Harness) void {
         std.mem.writeInt(u64, self.snapshot[0..8], self.model.acknowledged, .little);
         @memcpy(self.snapshot[8..], &self.model.state);
@@ -264,6 +300,48 @@ const Harness = struct {
         self.checkpoint_requested = false;
     }
 };
+
+/// The sectors holding the payload of `checkpoint` (each block's used sectors), in order.
+fn checkpoint_sector_count(checkpoint: engine_module.Checkpoint) u32 {
+    assert(checkpoint.size_bytes > 0);
+    const block_size = config.checkpoint_block_size;
+    const capacity = checkpoint_module.payload_capacity(block_size);
+    const blocks = checkpoint_module.block_count(checkpoint.size_bytes, block_size);
+    assert(blocks >= 1);
+    const full_sectors = block_size / sector_size;
+    const last_payload = checkpoint.size_bytes - (blocks - 1) * capacity;
+    const last_sectors = storage.sector_ceil(checkpoint_module.block_header_size + last_payload) /
+        sector_size;
+    return @intCast((blocks - 1) * full_sectors + last_sectors);
+}
+
+/// The storage sector of the `index`th used sector of `checkpoint`.
+fn checkpoint_sector(checkpoint: engine_module.Checkpoint, index: u32) u32 {
+    assert(index < checkpoint_sector_count(checkpoint));
+    const block_sectors: u32 = config.checkpoint_block_size / sector_size;
+    const block = index / block_sectors;
+    const sector_in_block = index % block_sectors;
+    const offset = config.checkpoint_zone_offset(checkpoint.zone) +
+        @as(u64, block) * config.checkpoint_block_size + @as(u64, sector_in_block) * sector_size;
+    return @intCast(offset / sector_size);
+}
+
+/// Bit rot in the first byte of `sector`, which in a used checkpoint sector is always a
+/// checksummed header or payload byte (never block padding).
+fn rot_sector(sim: *SimStorage, sector: u32) void {
+    const offset = @as(usize, sector) * sector_size;
+    sim.durable[offset] ^= 0x10;
+    sim.memory[offset] ^= 0x10;
+}
+
+/// Rots one random used sector of the newest checkpoint; false if there is none.
+fn corrupt_newest_checkpoint(harness: *Harness, prng: *Prng) bool {
+    const checkpoint = harness.engine.superblock.working.checkpoint;
+    if (checkpoint.sequence == 0 or checkpoint.size_bytes == 0) return false;
+    const index: u32 = @intCast(prng.below(checkpoint_sector_count(checkpoint)));
+    rot_sector(harness.sim, checkpoint_sector(checkpoint, index));
+    return true;
+}
 
 fn sim_create(seed: u64) !SimStorage {
     return SimStorage.init(testing.allocator, .{ .size_bytes = config.size_bytes(), .seed = seed });
@@ -313,7 +391,9 @@ test "engine: format, commit, checkpoint, reopen" {
     try harness.reinit();
     result = try harness.open();
     try testing.expectEqual(acknowledged, result.sequence_last);
-    try testing.expectEqual(engine_module.StopReason.clean, result.journal_stop);
+    // The bytes after the last entry are left over from an older lap: a header (clean end)
+    // or a body sector, which the scan cannot tell from a torn header. Never a bad body.
+    try testing.expect(result.journal_stop != .body_corrupt);
     try testing.expect(!result.superblock_repaired);
     try testing.expect(result.checkpoint.sequence > 0);
     try testing.expectEqualSlices(u8, &metadata, &harness.engine.commit_metadata);
@@ -386,7 +466,124 @@ test "engine: journal body corruption stops replay and is reported" {
     try testing.expectEqual(engine_module.StopReason.body_corrupt, result.journal_stop);
 }
 
-fn run_fault_seed(seed: u64) !void {
+/// Formats and builds two durable checkpoints with entries after each, so the newest
+/// checkpoint has a real (non-empty) fallback in the other zone.
+fn setup_two_checkpoints(harness: *Harness) !void {
+    try harness.format();
+    _ = try harness.open();
+    try harness.commit_durable(6);
+    try harness.checkpoint_durable();
+    try harness.commit_durable(5);
+    try harness.checkpoint_durable();
+    try harness.commit_durable(4);
+    const working = &harness.engine.superblock.working;
+    try testing.expect(working.has_fallback());
+    try testing.expect(working.checkpoint_previous.sequence > 0);
+    try testing.expectEqual(@as(u32, 0), harness.sim.unsynced_sector_count());
+}
+
+test "engine: any rotten sector of the newest checkpoint falls back to the previous one" {
+    var sim = try sim_create(5);
+    defer sim.deinit(testing.allocator);
+    const harness = try harness_create(&sim, 5);
+    defer harness_destroy(harness);
+    try setup_two_checkpoints(harness);
+    const acknowledged = harness.model.acknowledged;
+    const newest = harness.engine.superblock.working.checkpoint;
+    const previous = harness.engine.superblock.working.checkpoint_previous;
+    const image = try testing.allocator.dupe(u8, sim.durable);
+    defer testing.allocator.free(image);
+
+    const sectors = checkpoint_sector_count(newest);
+    try testing.expect(sectors >= 3);
+    for (0..sectors) |index| {
+        @memcpy(sim.durable, image);
+        @memcpy(sim.memory, image);
+        rot_sector(&sim, checkpoint_sector(newest, @intCast(index)));
+        try harness.reinit();
+        const result = try harness.open();
+        try testing.expect(result.checkpoint_fallback);
+        try testing.expectEqual(previous.sequence, result.checkpoint.sequence);
+        try testing.expectEqual(acknowledged, result.sequence_last);
+        try testing.expectEqual(engine_module.StopReason.clean, result.journal_stop);
+        // The fallback is now the newest checkpoint, and there is no other.
+        const working = &harness.engine.superblock.working;
+        try testing.expectEqual(previous.sequence, working.checkpoint.sequence);
+        try testing.expect(!working.has_fallback());
+    }
+    // The next checkpoint overwrites the rotten zone, and reopening needs no fallback.
+    try harness.commit_durable(2);
+    try harness.checkpoint_durable();
+    const working = &harness.engine.superblock.working;
+    try testing.expectEqual(newest.zone, working.checkpoint.zone);
+    try testing.expectEqual(previous.zone, working.checkpoint_previous.zone);
+    try harness.reinit();
+    const result = try harness.open();
+    try testing.expect(!result.checkpoint_fallback);
+    try testing.expectEqual(acknowledged + 2, result.sequence_last);
+    try testing.expectEqual(@as(u64, 0), result.entries_replayed);
+}
+
+test "engine: rotten first checkpoint falls back to the empty state and the whole journal" {
+    var sim = try sim_create(6);
+    defer sim.deinit(testing.allocator);
+    const harness = try harness_create(&sim, 6);
+    defer harness_destroy(harness);
+    try harness.format();
+    _ = try harness.open();
+    try harness.commit_durable(6);
+    try harness.checkpoint_durable();
+    try harness.commit_durable(3);
+    const newest = harness.engine.superblock.working.checkpoint;
+    try testing.expect(harness.engine.superblock.working.has_fallback());
+    rot_sector(&sim, checkpoint_sector(newest, 0));
+    try harness.reinit();
+    var result = try harness.open();
+    try testing.expect(result.checkpoint_fallback);
+    try testing.expectEqual(@as(u64, 0), result.checkpoint.sequence);
+    try testing.expectEqual(@as(u64, 9), result.entries_replayed);
+    try testing.expectEqual(@as(u64, 9), result.sequence_last);
+    // Commits and checkpoints continue; a clean reopen sees all of it.
+    try harness.commit_durable(2);
+    try harness.checkpoint_durable();
+    try harness.reinit();
+    result = try harness.open();
+    try testing.expect(!result.checkpoint_fallback);
+    try testing.expectEqual(@as(u64, 11), result.sequence_last);
+}
+
+test "engine: rotten newest checkpoint and rotten fallback is CheckpointCorrupt" {
+    var sim = try sim_create(7);
+    defer sim.deinit(testing.allocator);
+    const harness = try harness_create(&sim, 7);
+    defer harness_destroy(harness);
+    try setup_two_checkpoints(harness);
+    const working = harness.engine.superblock.working;
+    rot_sector(&sim, checkpoint_sector(working.checkpoint, 1));
+    rot_sector(&sim, checkpoint_sector(working.checkpoint_previous, 0));
+    try harness.reinit();
+    try testing.expectError(error.CheckpointCorrupt, harness.open());
+}
+
+test "engine: fallback whose retained journal is rotten is CheckpointCorrupt" {
+    var sim = try sim_create(8);
+    defer sim.deinit(testing.allocator);
+    const harness = try harness_create(&sim, 8);
+    defer harness_destroy(harness);
+    try harness.format();
+    _ = try harness.open();
+    try harness.commit_durable(6);
+    try harness.checkpoint_durable();
+    try harness.commit_durable(3);
+    const newest = harness.engine.superblock.working.checkpoint;
+    rot_sector(&sim, checkpoint_sector(newest, 0));
+    // Entry 1's header: replay from the empty state stops before the checkpoint's coverage.
+    sim.corrupt_sector(@intCast(config.journal_offset() / sector_size));
+    try harness.reinit();
+    try testing.expectError(error.CheckpointCorrupt, harness.open());
+}
+
+fn run_fault_seed(seed: u64) !u32 {
     var prng = Prng.init(seed);
     var sim = try SimStorage.init(testing.allocator, .{
         .size_bytes = config.size_bytes(),
@@ -400,24 +597,37 @@ fn run_fault_seed(seed: u64) !void {
     defer harness_destroy(harness);
     try harness.format();
     _ = try harness.open();
+    var fallbacks: u32 = 0;
     var cycle: u32 = 0;
     while (cycle < 4) : (cycle += 1) {
         const crash_tick = prng.range(1, 1500);
         var tick: u64 = 0;
         while (tick < crash_tick) : (tick += 1) try harness.step();
+        // A checkpoint in flight is overwriting the fallback zone: rotting the newest zone
+        // too would be a double fault.
+        const fallback_ready = harness.fallback_intact and
+            harness.engine.checkpoint_phase == .idle;
         sim.crash();
         if (prng.chance(1, 4)) sim.corrupt_sector(@intCast(prng.below(4)));
+        const rotten = fallback_ready and prng.chance(1, 2) and
+            corrupt_newest_checkpoint(harness, &prng);
         try harness.reinit();
-        _ = try harness.open();
+        const result = try harness.open();
+        if (result.checkpoint_fallback) fallbacks += 1;
+        // Rot in the newest zone always forces the fallback.
+        if (rotten) try testing.expect(result.checkpoint_fallback);
     }
+    return fallbacks;
 }
 
 test "engine: seeded crash and corruption fault injection" {
+    var fallbacks: u32 = 0;
     var seed: u64 = 0;
     while (seed < 64) : (seed += 1) {
-        run_fault_seed(seed) catch |err| {
+        fallbacks += run_fault_seed(seed) catch |err| {
             std.debug.print("engine fault injection: failing seed={d}\n", .{seed});
             return err;
         };
     }
+    try testing.expect(fallbacks >= 16);
 }

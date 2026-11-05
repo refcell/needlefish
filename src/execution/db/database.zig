@@ -22,6 +22,8 @@
 //! frozen staging buffer streams out. `open` loads the checkpoint and replays the journal
 //! through the same code paths without journaling again, then checks the result against the
 //! last entry's metadata (head number, head hash, state root).
+//! If the newest checkpoint is rotten, the engine resets the staged bytes, streams the older
+//! fallback checkpoint instead, and replays the longer journal kept since it.
 //!
 //! Determinism: replay must make the same decisions as the live run. Operations that fail are
 //! never journaled, and block retention is decided here (by count, bytes, and transactions,
@@ -441,6 +443,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.engine.open(.{
                 .context = self,
                 .on_checkpoint = consume_checkpoint,
+                .on_checkpoint_reset = consume_checkpoint_reset,
                 .on_entry = consume_entry,
             }, on_open);
         }
@@ -455,6 +458,16 @@ pub fn DatabaseType(comptime Storage: type) type {
             }
             @memcpy(self.staging[self.staging_len..][0..chunk.len], chunk);
             self.staging_len += @intCast(chunk.len);
+        }
+
+        /// The newest checkpoint failed to verify; the engine streams the fallback next.
+        fn consume_checkpoint_reset(context: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            assert(self.phase == .opening);
+            assert(!self.load_done);
+            // Staging overflow is the only load error before the first entry.
+            self.staging_len = 0;
+            self.load_error = null;
         }
 
         fn consume_entry(context: *anyopaque, entry: engine_module.Entry) void {
@@ -711,6 +724,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.submitted_sequence += 1;
             self.journal_bytes_pending += journal_module.entry_size_bytes(length);
             const journal = &self.engine.journal;
+            // `used` counts from the fallback checkpoint's start, so it spans the entries of
+            // two checkpoints; triggering at half the journal leaves the other half for
+            // entries committed while the checkpoint runs, and in steady state each
+            // checkpoint covers about a quarter of the journal.
             const used = journal.head - journal.tail + self.journal_bytes_pending;
             if (used * 2 > journal.config.zone_size_bytes) self.checkpoint_wanted = true;
             self.pump();

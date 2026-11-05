@@ -1,9 +1,13 @@
 //! Superblock: the root of all durable state, stored in four copies at sectors 0..3.
 //!
 //! The superblock names the latest checkpoint (zone, size, checksum) and the journal position
-//! where replay starts. Updating it is the engine's only atomic commit point for checkpoints:
-//! copies are written one at a time with a sync after each, so a crash or torn write damages
-//! at most the copy in flight. Open reads all copies and picks the highest sequence with a
+//! where replay starts. It also names the previous checkpoint and its journal start: the
+//! journal keeps every entry from that older start, so if the newest checkpoint rots, open
+//! falls back to the previous checkpoint and replays the longer journal.
+//!
+//! Updating the superblock is the engine's only atomic commit point for checkpoints: copies
+//! are written one at a time with a sync after each, so a crash or torn write damages at
+//! most the copy in flight. Open reads all copies and picks the highest sequence with a
 //! valid checksum; copies sharing a sequence must agree byte for byte.
 
 const std = @import("std");
@@ -16,7 +20,7 @@ const sector_size = storage.sector_size;
 
 /// "nfsuperb" read as a little-endian u64.
 pub const magic: u64 = 0x6272_6570_7573_666e;
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 pub const copy_count: u32 = 4;
 pub const commit_metadata_size: u32 = 128;
 pub const zone_size_bytes: u64 = copy_count * sector_size;
@@ -49,8 +53,8 @@ pub const Layout = extern struct {
     reserved: u64 = 0,
 };
 
-const header_size = 16 + 16 + 8 + 4 + 4 + 8 + 8 + @sizeOf(JournalStart) +
-    @sizeOf(Checkpoint) + @sizeOf(Layout) + commit_metadata_size;
+const header_size = 16 + 16 + 8 + 4 + 4 + 8 + 8 + 2 * @sizeOf(JournalStart) +
+    2 * @sizeOf(Checkpoint) + @sizeOf(Layout) + 2 * commit_metadata_size;
 
 pub const SuperBlock = extern struct {
     /// Checksum of every byte after this field.
@@ -65,10 +69,18 @@ pub const SuperBlock = extern struct {
     reserved_b: u64,
     journal_start: JournalStart,
     checkpoint: Checkpoint,
+    /// The fallback: the checkpoint before `checkpoint` and the journal start that goes with
+    /// it. Equal to `journal_start`/`checkpoint` (byte for byte) when there is no distinct
+    /// fallback, for example right after format or after open fell back. A previous
+    /// checkpoint with `sequence == 0` is the empty state at format.
+    journal_start_previous: JournalStart,
+    checkpoint_previous: Checkpoint,
     layout: Layout,
     /// Opaque to the engine: the caller's description of the checkpointed state (for example
     /// block number, block hash, state root).
     commit_metadata: [commit_metadata_size]u8,
+    /// The caller's description of the state of `checkpoint_previous`.
+    commit_metadata_previous: [commit_metadata_size]u8,
     reserved: [sector_size - header_size]u8,
 
     pub fn compute_checksum(superblock: *const SuperBlock) u128 {
@@ -76,10 +88,16 @@ pub const SuperBlock = extern struct {
     }
 
     pub fn seal(superblock: *SuperBlock) void {
+        superblock.seal_unchecked();
+        assert(superblock.valid());
+    }
+
+    /// Seals without asserting validity (for tests that build invalid superblocks).
+    pub fn seal_unchecked(superblock: *SuperBlock) void {
         superblock.magic = magic;
         superblock.version = version;
         superblock.checksum = superblock.compute_checksum();
-        assert(superblock.valid());
+        assert(superblock.checksum == superblock.compute_checksum());
     }
 
     /// Checksum, constants, reserved bytes, and field ranges. Never trusts an unverified byte.
@@ -98,6 +116,48 @@ pub const SuperBlock = extern struct {
         if (superblock.checkpoint.sequence == 0 and superblock.checkpoint.size_bytes != 0) {
             return false;
         }
+        return superblock.previous_valid();
+    }
+
+    /// True when a distinct, older checkpoint is named as the fallback.
+    pub fn has_fallback(superblock: *const SuperBlock) bool {
+        assert(superblock.checkpoint_previous.sequence <= superblock.checkpoint.sequence);
+        return superblock.checkpoint_previous.sequence < superblock.checkpoint.sequence;
+    }
+
+    fn previous_valid(superblock: *const SuperBlock) bool {
+        const current = &superblock.checkpoint;
+        const previous = &superblock.checkpoint_previous;
+        const start = &superblock.journal_start;
+        const start_previous = &superblock.journal_start_previous;
+        if (!all_zero(&previous.reserved)) return false;
+        if (previous.zone > 1) return false;
+        if (previous.sequence == 0 and previous.size_bytes != 0) return false;
+        if (previous.sequence > current.sequence) return false;
+        if (start_previous.sequence == 0) return false;
+        if (start_previous.offset % sector_size != 0) return false;
+        if (start_previous.offset >= superblock.layout.journal_size_bytes) return false;
+        if (start_previous.sequence > start.sequence) return false;
+        if (start_previous.sequence == start.sequence) {
+            // No entries between the two starts: the same journal position.
+            if (start_previous.offset != start.offset) return false;
+            if (start_previous.previous_checksum != start.previous_checksum) return false;
+        }
+        if (previous.sequence == current.sequence) {
+            // No distinct fallback: both references name the same checkpoint.
+            if (!std.mem.eql(u8, std.mem.asBytes(previous), std.mem.asBytes(current))) {
+                return false;
+            }
+            if (start_previous.sequence != start.sequence) return false;
+            const metadata_equal = std.mem.eql(
+                u8,
+                &superblock.commit_metadata,
+                &superblock.commit_metadata_previous,
+            );
+            return metadata_equal;
+        }
+        // A real previous checkpoint lives in the other zone (the empty one has no zone).
+        if (previous.sequence > 0 and previous.zone == current.zone) return false;
         return true;
     }
 };
@@ -107,6 +167,7 @@ comptime {
     assert(@sizeOf(JournalStart) == 32);
     assert(@sizeOf(Checkpoint) == 48);
     assert(@sizeOf(Layout) == 32);
+    assert(header_size == 512);
     assert(header_size % 16 == 0);
     assert(@offsetOf(SuperBlock, "reserved") == header_size);
 }
@@ -350,6 +411,14 @@ fn sample(prng: *Prng, sequence: u64) SuperBlock {
         .sequence = 3,
         .zone = 1,
     };
+    superblock.journal_start_previous = superblock.journal_start;
+    superblock.checkpoint_previous = .{
+        .checksum = prng.int(u128),
+        .size_bytes = 5,
+        .sequence = 2,
+        .zone = 0,
+    };
+    prng.fill(&superblock.commit_metadata_previous);
     superblock.layout = .{
         .checkpoint_zone_size_bytes = 1 << 20,
         .journal_size_bytes = 1 << 20,
@@ -428,6 +497,88 @@ test "superblock: seeded mutations of valid copies are rejected or decode to the
             try testing.expectEqualSlices(u8, original, std.mem.asBytes(&decoded));
         }
     }
+}
+
+/// Draws a value from a few boundary cases or at random.
+fn pick(prng: *Prng, comptime T: type, cases: []const T) T {
+    if (prng.chance(1, 4)) return prng.int(T);
+    return cases[@intCast(prng.below(cases.len))];
+}
+
+/// Random fallback fields around the current ones, valid or not.
+fn sample_previous(prng: *Prng, superblock: *SuperBlock) void {
+    const current = superblock.checkpoint;
+    const start = superblock.journal_start;
+    const journal_size = superblock.layout.journal_size_bytes;
+    if (prng.chance(1, 4)) {
+        superblock.checkpoint_previous = current;
+        superblock.journal_start_previous = start;
+        superblock.commit_metadata_previous = superblock.commit_metadata;
+    } else {
+        superblock.checkpoint_previous = .{
+            .checksum = prng.int(u128),
+            .size_bytes = pick(prng, u64, &.{ 0, 1, current.size_bytes }),
+            .sequence = pick(prng, u64, &.{ 0, 1, current.sequence - 1, current.sequence }),
+            .zone = pick(prng, u8, &.{ 0, 1, 2 }),
+        };
+        superblock.journal_start_previous = .{
+            .previous_checksum = pick(prng, u128, &.{start.previous_checksum}),
+            .offset = pick(prng, u64, &.{ 0, sector_size, start.offset, journal_size, 1 }),
+            .sequence = pick(prng, u64, &.{ 0, 1, start.sequence, start.sequence + 1 }),
+        };
+    }
+    if (prng.chance(1, 8)) superblock.checkpoint_previous.reserved[prng.below(15)] = 1;
+    if (prng.chance(1, 8)) superblock.commit_metadata_previous[0] ^= 1;
+}
+
+/// The fallback rules, restated: a decoded superblock must satisfy every one.
+fn expect_previous_consistent(superblock: *const SuperBlock) !void {
+    const current = superblock.checkpoint;
+    const previous = superblock.checkpoint_previous;
+    const start = superblock.journal_start;
+    const start_previous = superblock.journal_start_previous;
+    try testing.expect(previous.sequence <= current.sequence);
+    try testing.expect(previous.zone <= 1);
+    try testing.expect(previous.sequence > 0 or previous.size_bytes == 0);
+    try testing.expect(start_previous.sequence >= 1);
+    try testing.expect(start_previous.sequence <= start.sequence);
+    try testing.expect(start_previous.offset < superblock.layout.journal_size_bytes);
+    try testing.expectEqual(@as(u64, 0), start_previous.offset % sector_size);
+    if (start_previous.sequence == start.sequence) {
+        try testing.expectEqual(start.offset, start_previous.offset);
+        try testing.expectEqual(start.previous_checksum, start_previous.previous_checksum);
+    }
+    if (superblock.has_fallback()) {
+        try testing.expect(previous.sequence == 0 or previous.zone != current.zone);
+    } else {
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&current), std.mem.asBytes(&previous));
+        try testing.expectEqual(start.sequence, start_previous.sequence);
+        try testing.expectEqualSlices(
+            u8,
+            &superblock.commit_metadata,
+            &superblock.commit_metadata_previous,
+        );
+    }
+}
+
+test "superblock: seeded fuzz of the fallback fields" {
+    var prng = Prng.init(5);
+    var accepted: u32 = 0;
+    var rejected: u32 = 0;
+    for (0..4096) |_| {
+        var superblock = sample(&prng, prng.range(1, 100));
+        superblock.journal_start.sequence = prng.range(1, 4);
+        superblock.journal_start.offset = sector_size * prng.range(0, 3);
+        sample_previous(&prng, &superblock);
+        superblock.seal_unchecked();
+        if (decode(std.mem.asBytes(&superblock))) |decoded| {
+            accepted += 1;
+            try expect_previous_consistent(&decoded);
+        } else rejected += 1;
+    }
+    // Both outcomes are exercised.
+    try testing.expect(accepted > 256);
+    try testing.expect(rejected > 256);
 }
 
 const SimStorage = @import("sim_storage.zig").SimStorage;

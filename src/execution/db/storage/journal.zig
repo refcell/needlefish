@@ -4,14 +4,16 @@
 //! holds its own checksum, the body checksum, a sequence number that grows by exactly one,
 //! and the previous entry's header checksum, so the entries form a hash chain rooted in the
 //! superblock's `journal_start`. An entry that does not fit before the zone end goes to the
-//! zone start. Entries at or after the tail (`journal_start`) are never overwritten: append
-//! returns `error.JournalFull` and the caller checkpoints, which moves the tail.
+//! zone start. Entries at or after the tail are never overwritten: append returns
+//! `error.JournalFull` and the caller checkpoints, which moves the tail. The tail is the
+//! previous checkpoint's journal start (the fallback), so the live entries span up to two
+//! checkpoints; replay starts at the newest checkpoint's journal start.
 //!
 //! Positions are logical byte offsets that only grow; `position % zone_size` is the physical
 //! offset and wrapping jumps to the next multiple of `zone_size`. The ring is full when an
 //! entry would end past `tail + zone_size`.
 //!
-//! Recovery scans from the tail and accepts an entry only if the header checksum, sequence,
+//! Recovery scans from the replay start and accepts an entry only if the header checksum, sequence,
 //! chain link, and body checksum all match. At the first position that fails it also tries
 //! the zone start once (the writer may have wrapped there), then stops. A stop on a zeroed
 //! header, a header from an older lap, or a header from another format is a clean end; any
@@ -141,7 +143,7 @@ pub fn JournalType(comptime Storage: type) type {
         /// One entry: header sector plus the largest padded body.
         buffer: []align(sector_size) u8,
         format_id: u128 = 0,
-        /// Logical position of the oldest live entry (`journal_start`).
+        /// Logical position of the oldest live entry (the fallback checkpoint's start).
         tail: u64 = 0,
         /// Logical position just past the newest durable entry.
         head: u64 = 0,
@@ -191,15 +193,41 @@ pub fn JournalType(comptime Storage: type) type {
 
         /// Positions the journal at `start` (from the superblock), with nothing after it.
         pub fn reset(self: *Self, format_id: u128, start: JournalStart) void {
+            self.reset_retained(format_id, start, start);
+        }
+
+        /// Positions the journal at `start` (replay begins there) while keeping every entry
+        /// from the older `retained` start live: nothing at or after `retained` is
+        /// overwritten. Both come from the superblock; `retained` names the fallback.
+        pub fn reset_retained(
+            self: *Self,
+            format_id: u128,
+            start: JournalStart,
+            retained: JournalStart,
+        ) void {
             assert(self.state == .idle);
-            assert(start.offset < self.config.zone_size_bytes);
-            assert(start.offset % sector_size == 0);
-            assert(start.sequence > 0);
+            const zone_size = self.config.zone_size_bytes;
+            assert(start.offset < zone_size and retained.offset < zone_size);
+            assert(start.offset % sector_size == 0 and retained.offset % sector_size == 0);
+            assert(retained.sequence > 0);
+            assert(retained.sequence <= start.sequence);
+            // Entries from `retained` to `start` span at most one lap, so the physical offsets
+            // and the sequences fix the logical distance: an equal offset with entries in
+            // between is a full lap.
+            var head = start.offset;
+            if (start.sequence == retained.sequence) {
+                assert(start.offset == retained.offset);
+                assert(start.previous_checksum == retained.previous_checksum);
+            } else if (start.offset <= retained.offset) {
+                head += zone_size;
+            }
             self.format_id = format_id;
-            self.tail = start.offset;
-            self.head = start.offset;
+            self.tail = retained.offset;
+            self.head = head;
             self.sequence_next = start.sequence;
             self.previous_checksum = start.previous_checksum;
+            assert(self.head >= self.tail);
+            assert(self.head - self.tail <= zone_size);
         }
 
         /// The `journal_start` for a checkpoint covering every entry appended so far.
@@ -212,8 +240,8 @@ pub fn JournalType(comptime Storage: type) type {
             };
         }
 
-        /// Frees entries before logical position `tail` (a past `head`), once a superblock
-        /// naming it as `journal_start` is durable.
+        /// Frees entries before logical position `tail` (a past `head`), once every durable
+        /// superblock copy names a start at or after it, as current or fallback.
         pub fn release(self: *Self, tail: u64) void {
             assert(tail >= self.tail);
             assert(tail <= self.head);
@@ -293,17 +321,19 @@ pub fn JournalType(comptime Storage: type) type {
             self.finish();
         }
 
-        /// Replays every valid entry from the tail through `consumer`, in order. Afterwards
+        /// Replays every valid entry from the head (the replay start set by `reset`) through
+        /// `consumer`, in order. Afterwards
         /// `head`, `sequence_next`, and `previous_checksum` follow the last valid entry and
         /// `recover_result` tells how many entries replayed and why the scan stopped.
         pub fn recover(self: *Self, consumer: Consumer, callback: Callback) void {
             assert(self.state == .idle);
             assert(self.callback == null);
-            assert(self.head == self.tail);
+            assert(self.head >= self.tail);
+            assert(self.head - self.tail <= self.config.zone_size_bytes);
             self.state = .recover_header;
             self.callback = callback;
             self.recover_consumer = consumer;
-            self.recover_position = self.tail;
+            self.recover_position = self.head;
             self.recover_wrap_reason = null;
             self.recover_wrapped = false;
             self.recover_result = .{ .replayed = 0, .stop = .clean };

@@ -8,13 +8,20 @@
 //!
 //! Protocol:
 //! - `commit(body, metadata)` appends a journal entry; the callback fires once it is durable.
-//! - `checkpoint(producer)` streams a full snapshot into the zone the superblock does not
-//!   name, syncs it, then writes a new superblock naming it, with `journal_start` at the
-//!   first entry the snapshot does not cover. Only once all four superblock copies are
-//!   durable does the journal release the entries before that point.
+//! - `checkpoint(producer)` streams a full snapshot into the zone the newest checkpoint does
+//!   not use, syncs it, then writes a new superblock naming it, with `journal_start` at the
+//!   first entry the snapshot does not cover. The superblock keeps the checkpoint it replaces
+//!   as the fallback (`checkpoint_previous`, `journal_start_previous`). Only once all four
+//!   superblock copies are durable does the journal release entries, and only those before
+//!   the fallback's start: the journal always holds every entry since the fallback.
 //! - `open(consumer)` picks the newest valid superblock (rewriting all copies if they
 //!   disagree), streams the checkpoint into the consumer, then replays the journal from
-//!   `journal_start` in order.
+//!   `journal_start` in order. If the newest checkpoint does not verify, the consumer is
+//!   told to discard what it got (`on_checkpoint_reset`), the fallback checkpoint streams
+//!   instead, and the journal replays from the fallback's start. The fallback succeeds only
+//!   if replay reaches the newest checkpoint's coverage; the superblock is then rewritten to
+//!   name the fallback as newest (no distinct fallback), so the next checkpoint overwrites
+//!   the rotten zone and never the one just loaded.
 //!
 //! Crash safety: nothing a recoverable superblock depends on is overwritten while any copy of
 //! that superblock may still be chosen. The checkpoint zone in use and the journal entries
@@ -22,6 +29,12 @@
 //! and a superblock is only written after the data it names is synced. So after a crash at
 //! any point, recovery yields the newest durable checkpoint plus a hash-chained prefix of the
 //! journal that includes every entry whose commit callback fired.
+//!
+//! Redundancy: one rotten checkpoint zone is survived through the fallback. It is lost (and
+//! open fails with `CheckpointCorrupt`) only together with a second fault: rot in the
+//! fallback zone or in a retained journal entry, or a crash while a checkpoint write is
+//! overwriting the fallback zone (between the zone write starting and the superblock being
+//! durable, the fallback zone holds the half-written new checkpoint).
 //!
 //! Concurrency: one commit and one checkpoint may run at the same time. A checkpoint cannot
 //! start while a commit is in flight, so its snapshot covers exactly the entries committed
@@ -81,13 +94,20 @@ pub const Consumer = struct {
     context: *anyopaque,
     /// Receives the checkpoint in order, one verified chunk at a time.
     on_checkpoint: *const fn (context: *anyopaque, chunk: []const u8) void,
+    /// Discards every checkpoint chunk received so far: that checkpoint failed to verify and
+    /// the fallback checkpoint streams next, from its first byte. Called at most once per
+    /// open, always before any entry.
+    on_checkpoint_reset: *const fn (context: *anyopaque) void,
     /// Receives each replayed journal entry in order, after the whole checkpoint. The
     /// entry's slices are valid only during the call.
     on_entry: *const fn (context: *anyopaque, entry: Entry) void,
 };
 
 pub const OpenResult = struct {
+    /// The checkpoint the state was loaded from.
     checkpoint: Checkpoint,
+    /// The newest checkpoint did not verify; the state came from the fallback.
+    checkpoint_fallback: bool,
     entries_replayed: u64,
     /// Sequence of the last entry the state now reflects (0 if none ever).
     sequence_last: u64,
@@ -127,6 +147,8 @@ pub fn EngineType(comptime Storage: type) type {
             repairing,
             opening_checkpoint,
             opening_journal,
+            /// After a fallback: naming the fallback checkpoint as the newest.
+            demoting,
             ready,
         };
         pub const CheckpointPhase = enum { idle, writing, superblock };
@@ -141,6 +163,13 @@ pub fn EngineType(comptime Storage: type) type {
         consumer: ?Consumer = null,
         open_result: OpenError!OpenResult = error.SuperBlockMissing,
         superblock_repaired: bool = false,
+        /// Open is loading the fallback checkpoint because the newest one failed to verify.
+        open_fallback: bool = false,
+        /// Where open's journal replay started (the loaded checkpoint's journal start).
+        open_start: JournalStart = undefined,
+        /// Logical journal position of the durable superblock's `journal_start`. Released to
+        /// once the next checkpoint's superblock makes it the fallback start.
+        journal_start_position: u64 = 0,
         /// Metadata of the newest committed entry (or of the checkpoint, if none since).
         commit_metadata: Metadata = @splat(0),
         commit_metadata_pending: Metadata = @splat(0),
@@ -214,6 +243,7 @@ pub fn EngineType(comptime Storage: type) type {
                 .offset = 0,
                 .sequence = 1,
             };
+            superblock.journal_start_previous = superblock.journal_start;
             superblock.layout = self.config.layout();
             self.superblock.working = superblock_module.zero();
             self.phase = .formatting;
@@ -230,6 +260,7 @@ pub fn EngineType(comptime Storage: type) type {
             self.phase_callback = callback;
             self.consumer = consumer;
             self.superblock_repaired = false;
+            self.open_fallback = false;
             self.superblock.open(on_superblock);
         }
 
@@ -263,7 +294,8 @@ pub fn EngineType(comptime Storage: type) type {
             if (self.checkpoint_phase != .idle or self.commit_callback != null) return error.Busy;
             assert(self.journal.idle());
             const working = &self.superblock.working;
-            // Never the zone the durable superblock names.
+            // Never the newest checkpoint's zone. The fallback's zone is overwritten: until
+            // the new superblock is durable, only the newest checkpoint is recoverable.
             const zone: u8 = if (working.checkpoint.sequence == 0)
                 0
             else
@@ -294,6 +326,7 @@ pub fn EngineType(comptime Storage: type) type {
                     self.superblock_repaired = true;
                     self.open_checkpoint();
                 },
+                .demoting => self.open_done(),
                 .ready => self.checkpoint_superblock_done(),
                 .closed, .opening_checkpoint, .opening_journal => unreachable,
             }
@@ -322,13 +355,23 @@ pub fn EngineType(comptime Storage: type) type {
             self.open_checkpoint();
         }
 
+        /// The checkpoint open loads: the newest, or the fallback after the newest failed.
+        fn open_target(self: *const Self) Checkpoint {
+            const working = &self.superblock.working;
+            if (self.open_fallback) {
+                assert(working.has_fallback());
+                return working.checkpoint_previous;
+            }
+            return working.checkpoint;
+        }
+
         fn open_checkpoint(self: *Self) void {
             const working = &self.superblock.working;
-            const checkpoint_ = working.checkpoint;
+            const checkpoint_ = self.open_target();
             if (checkpoint_.size_bytes == 0) {
                 const empty_ok = checkpoint_.sequence == 0 or
                     checkpoint_.checksum == checksum_module.checksum("");
-                if (!empty_ok) return self.open_failed(error.CheckpointCorrupt);
+                if (!empty_ok) return self.open_checkpoint_failed();
                 return self.open_journal();
             }
             const blocks = checkpoint_module.block_count(
@@ -336,13 +379,26 @@ pub fn EngineType(comptime Storage: type) type {
                 self.config.checkpoint_block_size,
             );
             if (blocks > self.checkpoint_io.blocks_max()) {
-                return self.open_failed(error.CheckpointCorrupt);
+                return self.open_checkpoint_failed();
             }
             self.phase = .opening_checkpoint;
             self.checkpoint_io.read_start(working.format_id, checkpoint_, .{
                 .context = self,
                 .consume = forward_checkpoint,
             }, on_checkpoint_io);
+        }
+
+        /// The checkpoint being loaded did not verify: fall back once, else fail.
+        fn open_checkpoint_failed(self: *Self) void {
+            assert(self.phase != .ready and self.phase != .closed);
+            const working = &self.superblock.working;
+            if (self.open_fallback or !working.has_fallback()) {
+                return self.open_failed(error.CheckpointCorrupt);
+            }
+            self.open_fallback = true;
+            self.commit_metadata = working.commit_metadata_previous;
+            self.consumer.?.on_checkpoint_reset(self.consumer.?.context);
+            self.open_checkpoint();
         }
 
         fn forward_checkpoint(context: *anyopaque, chunk: []const u8) void {
@@ -354,7 +410,7 @@ pub fn EngineType(comptime Storage: type) type {
         fn on_checkpoint_io(checkpoint_io: *CheckpointType) void {
             const self: *Self = @alignCast(@fieldParentPtr("checkpoint_io", checkpoint_io));
             if (self.phase == .opening_checkpoint) {
-                checkpoint_io.result catch return self.open_failed(error.CheckpointCorrupt);
+                checkpoint_io.result catch return self.open_checkpoint_failed();
                 return self.open_journal();
             }
             assert(self.phase == .ready);
@@ -364,6 +420,10 @@ pub fn EngineType(comptime Storage: type) type {
                 error.CheckpointCorrupt => unreachable, // Only reads report corruption.
             };
             var superblock = self.superblock.working;
+            // The replaced newest checkpoint becomes the fallback.
+            superblock.journal_start_previous = superblock.journal_start;
+            superblock.checkpoint_previous = superblock.checkpoint;
+            superblock.commit_metadata_previous = superblock.commit_metadata;
             superblock.journal_start = self.checkpoint_start;
             superblock.checkpoint = checkpoint_io.checkpoint;
             superblock.commit_metadata = self.checkpoint_metadata;
@@ -373,8 +433,11 @@ pub fn EngineType(comptime Storage: type) type {
 
         fn checkpoint_superblock_done(self: *Self) void {
             assert(self.checkpoint_phase == .superblock);
-            // Every copy now names the new checkpoint: older entries are no longer needed.
-            self.journal.release(self.checkpoint_tail);
+            // Every copy now names the new checkpoint, with the replaced one as the fallback:
+            // entries before the fallback's start are no longer needed.
+            assert(self.journal_start_position <= self.checkpoint_tail);
+            self.journal.release(self.journal_start_position);
+            self.journal_start_position = self.checkpoint_tail;
             self.checkpoint_finish(self.superblock.working.checkpoint);
         }
 
@@ -389,7 +452,18 @@ pub fn EngineType(comptime Storage: type) type {
 
         fn open_journal(self: *Self) void {
             const working = &self.superblock.working;
-            self.journal.reset(working.format_id, working.journal_start);
+            if (self.open_fallback) {
+                self.open_start = working.journal_start_previous;
+                self.journal.reset(working.format_id, self.open_start);
+            } else {
+                self.open_start = working.journal_start;
+                self.journal.reset_retained(
+                    working.format_id,
+                    working.journal_start,
+                    working.journal_start_previous,
+                );
+            }
+            self.journal_start_position = self.journal.head;
             self.phase = .opening_journal;
             self.journal.recover(.{ .context = self, .on_entry = forward_entry }, on_journal);
         }
@@ -403,7 +477,7 @@ pub fn EngineType(comptime Storage: type) type {
 
         fn on_journal(journal: *JournalType) void {
             const self: *Self = @alignCast(@fieldParentPtr("journal", journal));
-            if (self.phase == .opening_journal) return self.open_done();
+            if (self.phase == .opening_journal) return self.open_journal_done();
             assert(self.phase == .ready);
             const callback = self.commit_callback.?;
             self.commit_metadata = self.commit_metadata_pending;
@@ -411,18 +485,41 @@ pub fn EngineType(comptime Storage: type) type {
             callback(self);
         }
 
-        fn open_done(self: *Self) void {
+        fn open_journal_done(self: *Self) void {
             assert(self.phase == .opening_journal);
+            if (!self.open_fallback) return self.open_done();
+            const working = &self.superblock.working;
+            // The fallback must reach the state the rotten checkpoint covered: entries up to
+            // its start were acknowledged before that checkpoint was taken.
+            if (self.journal.sequence_next < working.journal_start.sequence) {
+                return self.open_failed(error.CheckpointCorrupt);
+            }
+            // Name the fallback as the newest checkpoint before anything else is written, so
+            // the next checkpoint goes into the rotten zone, not the one just loaded.
+            var superblock = working.*;
+            superblock.journal_start = superblock.journal_start_previous;
+            superblock.checkpoint = superblock.checkpoint_previous;
+            superblock.commit_metadata = superblock.commit_metadata_previous;
+            assert(!superblock.has_fallback());
+            assert(self.journal_start_position == self.journal.tail);
+            self.phase = .demoting;
+            self.superblock.write_superblock(superblock, on_superblock);
+        }
+
+        fn open_done(self: *Self) void {
+            assert(self.phase == .opening_journal or self.phase == .demoting);
             const recovered = self.journal.recover_result;
             self.phase = .ready;
             self.consumer = null;
             self.open_result = .{
                 .checkpoint = self.superblock.working.checkpoint,
+                .checkpoint_fallback = self.open_fallback,
                 .entries_replayed = recovered.replayed,
                 .sequence_last = self.journal.sequence_next - 1,
                 .journal_stop = recovered.stop,
                 .superblock_repaired = self.superblock_repaired,
             };
+            assert(self.open_start.sequence <= self.journal.sequence_next);
             self.finish_phase();
         }
 
