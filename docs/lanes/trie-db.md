@@ -173,6 +173,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`TrieType.clear_changes` replaces the drain walk; version kind/mask/fingerprint;
   `db/path_index.zig`; interleaved medians heavy 17.0 -> 5.7 ms p50, typical 10.0 -> 3.8 ms;
   stays on the critical path, see Decisions and PERF.md)
+- [ ] Checkpoint stalls at 200 ms blocks: measure the durable commit latency distribution
+  (p50/p99/max) over thousands of blocks on a real file (`IoStorage` over the os backend),
+  including the blocks that trigger a checkpoint; if a checkpoint's state write exceeds the
+  slot budget, spread it over commits (incremental checkpoint chunks per commit) so no
+  single commit stalls. Crash tests must still pass.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
