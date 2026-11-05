@@ -903,8 +903,17 @@ const Fixture = struct {
     }
 
     fn run(self: *Fixture) !struct { client.Outcome, bool } {
+        return self.run_with(self.store.fetcher(), self.handler.router());
+    }
+
+    /// Runs the client over `fetcher`, with hints routed to `router`.
+    fn run_with(
+        self: *Fixture,
+        fetcher: preimage.Fetcher,
+        router: preimage.Router,
+    ) !struct { client.Outcome, bool } {
         var harness: preimage.InProcess = undefined;
-        try harness.init(testing.allocator, self.store.fetcher(), self.handler.router(), .{
+        try harness.init(testing.allocator, fetcher, router, .{
             .channel_bytes = 1 << 18,
             .hint_bytes = 1 << 14,
         });
@@ -958,6 +967,31 @@ test "e2e: client derives and executes node-built L2 blocks from L1 batches" {
     defer self.destroy();
     try testing.expectEqual(@as(u32, 2), self.l1_count);
     try testing.expectEqual(@as(u32, 0), self.source.blob_requests);
+}
+
+test "e2e: a recorded witness alone replays to the same verdict" {
+    const self = try Fixture.create(.{});
+    defer self.destroy();
+    try self.put_boot(true);
+    var witness: host.Store = .init(testing.allocator, .{});
+    defer witness.deinit();
+    var recording: host.Recording = .{ .inner = self.store.fetcher(), .witness = &witness };
+    const recorded, const recorded_holds = try self.run_with(
+        recording.fetcher(),
+        self.handler.router(),
+    );
+    try testing.expect(recorded_holds);
+    try testing.expectEqual(@as(u64, 0), recording.dropped);
+    // Hints made the host fetch more than the client read.
+    try testing.expect(witness.count() < self.store.count());
+    try testing.expect(recording.reads >= witness.count());
+    const replayed, const replayed_holds = try self.run_with(
+        witness.fetcher(),
+        preimage.in_process.ignore_hints,
+    );
+    try testing.expect(replayed_holds);
+    try testing.expectEqual(recorded.output_root, replayed.output_root);
+    try testing.expectEqual(recorded.block_number, replayed.block_number);
 }
 
 test "e2e: a wrong claimed output root fails the claim" {

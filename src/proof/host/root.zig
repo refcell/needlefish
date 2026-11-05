@@ -10,6 +10,8 @@ pub const offline = @import("offline.zig");
 pub const rpc_source = @import("rpc_source.zig");
 pub const beacon_blobs = @import("beacon_blobs.zig");
 pub const native = @import("native.zig");
+pub const recording = @import("recording.zig");
+pub const Recording = recording.Recording;
 
 pub const Store = store.Store;
 pub const BootValues = store.BootValues;

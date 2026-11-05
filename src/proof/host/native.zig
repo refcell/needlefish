@@ -15,6 +15,7 @@ const crypto = @import("../../common/crypto/root.zig");
 const handler_module = @import("handler.zig");
 const offline = @import("offline.zig");
 const store_module = @import("store.zig");
+const recording_module = @import("recording.zig");
 
 pub const Error = client.client.Error || store_module.Error || error{
     InvalidHeader,
@@ -45,22 +46,30 @@ pub fn output_root_of(raw_header: []const u8) error{InvalidHeader}![32]u8 {
 }
 
 /// Runs the client over `store` (pre-filled with the boot values and the agreed output
-/// root preimage), serving hints from `source`.
+/// root preimage), serving hints from `source`. With `witness`, every preimage the client
+/// reads is also recorded there: a replay of the witness alone reaches the same verdict.
 pub fn run(
     allocator: std.mem.Allocator,
     store: *store_module.Store,
     source: handler_module.Source,
     roots_brp: ?*const [@import("../../common/crypto/kzg/root.zig").field_elements_per_blob][32]u8,
     options: client.client.Options,
+    witness: ?*store_module.Store,
 ) Error!offline.Verdict {
     assert(store.count() > 0);
+    assert(witness != store);
+    var recording: recording_module.Recording = .{
+        .inner = store.fetcher(),
+        .witness = witness orelse store,
+    };
+    const fetcher = if (witness != null) recording.fetcher() else store.fetcher();
     var handler: handler_module.Handler = .{
         .store = store,
         .source = source,
         .roots_brp = roots_brp,
     };
     var harness: preimage.InProcess = undefined;
-    harness.init(allocator, store.fetcher(), handler.router(), .{ .channel_bytes = 1 << 20 }) catch
+    harness.init(allocator, fetcher, handler.router(), .{ .channel_bytes = 1 << 20 }) catch
         return error.NativeFailed;
     defer harness.deinit(allocator);
     const io: client.Client.Io = .{
@@ -74,6 +83,7 @@ pub fn run(
     var scratch: [program.boot.rollup_config_bytes_max]u8 = undefined;
     const boot = try program.BootInfo.load(harness.oracle_reader(), &scratch);
     const holds = client.claim_holds(&boot, &outcome);
+    if (recording.dropped > 0) return error.NativeFailed;
     const claimed = boot.claimed_l2_output_root;
     return .{ .outcome = outcome, .claimed_output_root = claimed, .holds = holds };
 }

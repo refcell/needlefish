@@ -65,6 +65,14 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   submitter via the batcher's txmgr), `bin/base proposer`, DST test with L1 reorgs.
 - [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
   roots, bond claiming, `bin/base challenger` (port `challenge/src/*`), DST test.
+- [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
+  holds exactly the preimages the client read; `native.run(.., witness)`; `proof run
+  --out` writes it; e2e replays the witness alone with hints ignored.
+- [ ] `proof/e2e-fuzz`: seeded random e2e scenarios (block counts, epoch splits, batch
+  kinds, transfers, deposit-only retries) proving each against the node; a failing seed
+  is a bug report.
+- [ ] `proof/prover-service`: port `prover-service` + `worker` (proof request JSON-RPC
+  contract, job lifecycle) with the native host as the in-process prover backend.
 
 ## Decisions
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
@@ -153,6 +161,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/witness`: recorded witness replays alone (e2e + live devnet).
 - 2026-11-05: `proof/e2e-3` landed: intermediate output roots sampled at boot key 9 (e2e:
   every block, the full range, a non-dividing interval, the trace extension); boot rejects
   a schedule block below the claim; a deposit-only retry after valid transfers proven from
