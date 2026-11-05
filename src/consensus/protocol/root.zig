@@ -12,6 +12,7 @@ pub const log = @import("log.zig");
 pub const deposits = @import("deposits.zig");
 pub const l1_info = @import("l1_info.zig");
 pub const batch = @import("batch.zig");
+pub const batch_reader = @import("batch_reader.zig");
 
 pub const BlockId = block.BlockId;
 pub const BlockInfo = block.BlockInfo;
