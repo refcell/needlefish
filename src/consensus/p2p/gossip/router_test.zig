@@ -357,3 +357,70 @@ test "router: fuzz inbound RPCs" {
     const options: fuzz.Options = .{ .input_size_max = 1024, .corpus = &.{corpus} };
     try fuzz.run_bytes(FuzzContext{}, fuzz_on_rpc, options);
 }
+
+/// One hostile control RPC: `iwant` ids (the last one real), a full IDONTWANT, 64 IHAVEs of
+/// fresh ids, and a GRAFT followed by a PRUNE.
+fn control_flood_frame(random: std.Random, real: *const Id, output: []u8) ![]const u8 {
+    const State = struct {
+        var ids: [5000][20]u8 = undefined;
+        var views: [5000][]const u8 = undefined;
+    };
+    for (&State.ids, &State.views) |*id, *view| {
+        random.bytes(id);
+        view.* = id;
+    }
+    State.views[3999] = real;
+    var message: rpc.RpcDefault = undefined;
+    message.reset();
+    try message.add_iwant(State.views[0..4000]);
+    for (0..16) |index| try message.add_idontwant(State.views[4000 + index * 32 ..][0..32]);
+    for (0..8) |index| {
+        try message.add_ihave(topic_name, State.views[4512 + index * 60 ..][0..60]);
+    }
+    try message.add_graft(topic_name);
+    try message.add_prune(topic_name, &.{}, 60);
+    return message.encode(output);
+}
+
+test "router: control-message floods are bounded per peer; honest gossip still flows" {
+    var config = scored_config();
+    // No mesh: the honest peer gets every message only through IHAVE and IWANT.
+    config.d = 0;
+    config.d_low = 0;
+    config.d_score = 0;
+    config.d_out = 0;
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(3, 0xc0de, config);
+    defer cluster.deinit();
+    cluster.connect(0, 1);
+    cluster.connect(0, 2);
+    try cluster.heartbeat();
+    const victim = &cluster.routers[0];
+    const attacker = cluster.slots[0][2].?;
+    var prng = Prng.init(0xc0de);
+    const frame = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(frame);
+    const rounds = 20;
+    var payload: [48]u8 = @splat(0x11);
+    for (0..rounds) |round| {
+        payload[0] = @truncate(round);
+        _ = try victim.publish(0, &payload, cluster.now_ns);
+        const real = test_message_id(null, topic_name, &payload);
+        for (0..5) |_| {
+            const bytes = try control_flood_frame(prng.random(), &real, frame);
+            victim.on_rpc(attacker, bytes, cluster.now_ns) catch {}; // Graylisted later.
+            const target = victim.peer(attacker);
+            try std.testing.expect(target.iwant_ids_received <= config.iwant_ids_max);
+            try std.testing.expect(target.idontwant_ids_received <= config.idontwant_ids_max);
+            try std.testing.expect(target.queue_count <= 1 + round);
+        }
+        try cluster.flush();
+        try cluster.heartbeat();
+    }
+    try std.testing.expectEqual(@as(u32, rounds), cluster.received[1]);
+    try std.testing.expect(victim.stats.control_ids_ignored > 0);
+    // GRAFT during the PRUNE backoff, every round: the attacker's score sinks.
+    try std.testing.expect(victim.peer_score_value(attacker) < config.thresholds.gossip_threshold);
+    try std.testing.expectEqual(@as(u64, 0), victim.mesh_peers(0));
+}

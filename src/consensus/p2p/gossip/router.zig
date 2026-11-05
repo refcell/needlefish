@@ -53,6 +53,12 @@ pub const Config = struct {
     mesh_delivery_window_ns: u64 = 2 * ns_per_s,
     /// IHAVE messages accepted per peer per heartbeat (libp2p `max_ihave_messages`).
     ihave_messages_max: u32 = 10,
+    /// Message ids looked up per peer per heartbeat for IWANT and for IDONTWANT. Each
+    /// lookup scans the cache or the delivery log, so without a budget one 5000-id RPC
+    /// costs milliseconds of CPU. Honest peers ask only for ids we advertised (at most
+    /// 64 per heartbeat) and send a few IDONTWANTs per large message.
+    iwant_ids_max: u32 = 256,
+    idontwant_ids_max: u32 = 256,
     opportunistic_graft_ticks: u32 = 60,
     opportunistic_graft_peers: u32 = 2,
     message_size_max: u32 = 10 * (1 << 20),
@@ -104,6 +110,9 @@ const Peer = struct {
     score: f64 = 0,
     backoff_until_ns: [topics_max]u64 = @splat(0),
     ihave_received: u32 = 0,
+    /// IWANT and IDONTWANT ids looked up this heartbeat (`Config.*_ids_max`).
+    iwant_ids_received: u32 = 0,
+    idontwant_ids_received: u32 = 0,
     promises: [promises_max]Promise = undefined,
     promises_count: u32 = 0,
     send_subscriptions: bool = false,
@@ -199,6 +208,8 @@ pub const Stats = struct {
     slow_peer: u64 = 0,
     /// Messages received on a known topic we are not (or no longer) subscribed to.
     blocked_inbound: [topics_max]u64 = @splat(0),
+    /// IWANT and IDONTWANT ids skipped because the peer's heartbeat budget ran out.
+    control_ids_ignored: u64 = 0,
 };
 
 pub const Router = struct {
@@ -513,7 +524,12 @@ pub const Router = struct {
     /// `dont_want_max` ids per RPC entry, like rust-libp2p's per-heartbeat cap.
     fn on_idontwant(router: *Router, slot: Slot, ids: []const []const u8) void {
         const target = router.peer(slot);
-        for (ids[0..@min(ids.len, dont_want_max)]) |raw| {
+        const budget = router.config.idontwant_ids_max -| target.idontwant_ids_received;
+        const count = @min(ids.len, dont_want_max, budget);
+        router.stats.control_ids_ignored += @min(ids.len, dont_want_max) - count;
+        target.idontwant_ids_received += @intCast(count);
+        assert(target.idontwant_ids_received <= router.config.idontwant_ids_max);
+        for (ids[0..count]) |raw| {
             if (raw.len != seen_cache.id_length) continue;
             const id: *const Id = raw[0..seen_cache.id_length];
             if (router.find_delivery(id)) |delivery| delivery.peers |= bit(slot);
@@ -672,7 +688,12 @@ pub const Router = struct {
     fn on_iwant(router: *Router, slot: Slot, ids: []const []const u8) void {
         const target = router.peer(slot);
         if (target.score < router.config.thresholds.gossip_threshold) return;
-        for (ids) |raw| {
+        const budget = router.config.iwant_ids_max -| target.iwant_ids_received;
+        const count = @min(ids.len, budget);
+        router.stats.control_ids_ignored += ids.len - count;
+        target.iwant_ids_received += @intCast(count);
+        assert(target.iwant_ids_received <= router.config.iwant_ids_max);
+        for (ids[0..count]) |raw| {
             if (raw.len != seen_cache.id_length) continue;
             const id: *const Id = raw[0..seen_cache.id_length];
             const entry = router.cache.find(id) orelse continue;
@@ -816,7 +837,11 @@ pub const Router = struct {
             router.maintain_mesh(topic, now_ns);
             router.emit_gossip(topic);
         }
-        for (router.peers) |*target| target.ihave_received = 0;
+        for (router.peers) |*target| {
+            target.ihave_received = 0;
+            target.iwant_ids_received = 0;
+            target.idontwant_ids_received = 0;
+        }
         router.cache.shift();
         router.seen.expire(now_ns, router.config.seen_ttl_ns);
         router.check_invariants();

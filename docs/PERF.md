@@ -439,6 +439,7 @@ transfers` case) never wake the pool (`flush` returns before the split), and flu
 | p2p/gossip rpc decode 128 KiB publish | 21 | | zero-copy: cost is independent of payload size |
 | p2p/gossip seen insert | 5.7 | | open addressing, 8192 ids |
 | p2p/gossip publish+drain to 8 peers | 64 539 | 2 031 | id hash + 8 framed RPCs (copy per peer) |
+| p2p/gossip control flood rpc (4000 iwant + 1000 idontwant ids) | 53 162 | – | hostile 170 KB RPC; was 3 838 523 ns before per-peer IWANT/IDONTWANT id budgets (256/heartbeat) |
 | p2p/block gossip end to end 128 KiB | 1 087 778 | 120 | sequencer service -> noise -> verifier service, one real signed block; no yamux/socket |
 | p2p/block gossip sequencer 128 KiB | 300 315 | 436 | SSZ + sign + snappy + publish + drain (the EL's block hash is excluded) |
 

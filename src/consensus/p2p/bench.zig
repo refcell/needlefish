@@ -78,6 +78,11 @@ pub const cases = [_]Case{
         .bytes_per_op = payload_bytes,
     },
     .{
+        .name = "p2p/gossip control flood rpc (4000 iwant + 1000 idontwant ids)",
+        .iterations = 200,
+        .run = bench_control_flood,
+    },
+    .{
         .name = "p2p/block gossip end to end 128 KiB",
         .iterations = 200,
         .run = bench_end_to_end,
@@ -296,6 +301,53 @@ fn bench_router(iterations: u32) u64 {
         }
     }
     return checksum;
+}
+
+/// One hostile RPC per op against a router whose cache and delivery log are full
+/// (1024 entries each, the production sizes): 4000 random IWANT ids and 1000 random
+/// IDONTWANT ids, none of them cached. A heartbeat every 50 RPCs.
+fn bench_control_flood(iterations: u32) u64 {
+    var prng = Prng.init(4);
+    var router = router_module.Router.init(std.heap.page_allocator, .{
+        .message_id = bench_message_id,
+        .mcache = .{ .entries_max = 1024, .arena_bytes = 1 << 20 },
+    }, prng.random()) catch @panic("bench control flood: out of memory");
+    defer router.deinit(std.heap.page_allocator);
+    const topic = router.subscribe("/optimism/8453/3/blocks") catch unreachable;
+    var bytes: [34]u8 = @splat(1);
+    bytes[0] = 0x12;
+    bytes[1] = 32;
+    const attacker = router.add_peer(peer_id.from_bytes(&bytes) catch unreachable, true, null, 0).?;
+    var data: [64]u8 = @splat(0);
+    for (0..1024) |index| {
+        std.mem.writeInt(u64, data[0..8], index, .little);
+        _ = router.publish(topic, &data, 1) catch unreachable;
+    }
+    const ids = std.heap.page_allocator.alloc([20]u8, 5000) catch @panic("out of memory");
+    defer std.heap.page_allocator.free(ids);
+    var views: [5000][]const u8 = undefined;
+    for (ids, &views) |*id, *view| {
+        prng.fill(id);
+        view.* = id;
+    }
+    var message: rpc.RpcDefault = undefined;
+    message.reset();
+    message.add_iwant(views[0..4000]) catch unreachable; // 4000 <= message_ids_max.
+    for (0..1000 / 32) |index| {
+        message.add_idontwant(views[4000 + index * 32 ..][0..32]) catch unreachable;
+    }
+    const frame = std.heap.page_allocator.alloc(u8, 256 * 1024) catch @panic("out of memory");
+    defer std.heap.page_allocator.free(frame);
+    const encoded = message.encode(frame);
+    var now_ns: u64 = 2;
+    for (0..iterations) |index| {
+        if (index % 50 == 0) {
+            now_ns += 500 * std.time.ns_per_ms;
+            router.heartbeat(now_ns);
+        }
+        router.on_rpc(attacker, encoded, now_ns) catch unreachable;
+    }
+    return router.stats.slow_peer +% encoded.len;
 }
 
 test "p2p bench: cases run" {

@@ -49,6 +49,18 @@ behind a small interface and switch later.
   signature-checked blocks enter; new `accepted_evicted` stat. Tests: the flood DST
   (`transport_test`, failed before the fix) and a slow-consumer unit test
   (`handler_test`: oldest dropped, the rest in order).
+- [x] Gossip control-message flood (IHAVE/IWANT/IDONTWANT/GRAFT/PRUNE): every IWANT and
+  IDONTWANT id was a linear scan of the 1024-entry cache or delivery log, so one
+  hostile 5000-id RPC (170 KB) cost 3.8 ms of CPU (~45 MB/s from one peer pins a core).
+  Fix: per-peer, per-heartbeat id budgets (`iwant_ids_max`, `idontwant_ids_max` = 256;
+  honest peers ask only for ids we advertised, <= 64 per heartbeat), excess counted in
+  `stats.control_ids_ignored`; now 53 us per hostile RPC (decode). IHAVE was already
+  capped (10/heartbeat, 64 requested ids), GRAFT-in-backoff penalized, IWANT
+  retransmission limited to once per peer. Router DST: an attacker sends 100 hostile
+  RPCs while the victim's messages reach an honest mesh-less peer only via IHAVE/IWANT;
+  all delivered, budgets hold, attacker sinks below the gossip threshold. Negative
+  control: unlimited budgets fail it.
+- [ ] Bound connection memory when one peer opens many yamux streams.
 - [x] Scoring parity: `peers/score.zig` already mirrors base/base `score.rs` formula for
   formula (thresholds, topic and peer params, `score_decay`); covered by its tests.
 - [x] Req/resp sync at 5 blocks/s: not applicable; base/base has no p2p req/resp
@@ -478,3 +490,4 @@ behind a small interface and switch later.
 - 2026-11-05: hostile in-session discv5 fuzz (seeded + run_bytes).
 - 2026-11-05: direction change (no flashblocks, 200 ms blocks): Denim gossip DST added; nothing to remove.
 - 2026-11-05: gossip flood DST found accepted blocks evictable by junk; added a dedicated accepted-block store.
+- 2026-11-05: per-peer IWANT/IDONTWANT id budgets (control flood 3.8 ms -> 53 us per RPC).
