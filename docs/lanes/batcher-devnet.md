@@ -57,7 +57,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `--min-basefee`, `--max-pending-transactions` (base/base txmgr flags).
 - [x] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
   the channel time out on L1 (base/base `sub_safety_margin`).
-- [ ] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
+- [x] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
 - [ ] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
   (base/base `sequencers.rs`).
 - [ ] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
@@ -142,3 +142,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: batcher admin API; backlog extended with remaining base/base batcher features.
 - 2026-11-05: txmgr confirmations (no resubmission of mined-but-unconfirmed txs), min tip /
   base fee floors, `--max-pending-transactions` (default stays 8, base/base uses 1).
+- 2026-11-05: admin_setThrottleController (missing fields keep current values; switching to
+  off after a push keeps pushing the unthrottled limits).

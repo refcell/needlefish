@@ -29,6 +29,23 @@ pub const Config = struct {
     tx_size_upper_limit: u64 = 390_000,
     refresh_ms: u64 = 10_000,
 
+    /// Runtime check for configs from outside (admin API): the reason it is invalid,
+    /// matching base/base `ThrottleConfigError`, or null.
+    pub fn problem(config: Config) ?[]const u8 {
+        if (config.full_threshold_bytes <= config.start_threshold_bytes)
+            return "full_threshold_bytes must be above start_threshold_bytes";
+        if (config.max_intensity_ppm > ppm) return "max_intensity must be within [0, 1]";
+        if (config.block_size_lower_limit == 0)
+            return "block_size_lower_limit must be greater than zero";
+        if (config.tx_size_lower_limit == 0) return "tx_size_lower_limit must be greater than zero";
+        if (config.block_size_lower_limit > config.block_size_upper_limit)
+            return "block_size_lower_limit must not exceed block_size_upper_limit";
+        if (config.tx_size_lower_limit > config.tx_size_upper_limit)
+            return "tx_size_lower_limit must not exceed tx_size_upper_limit";
+        if (config.refresh_ms == 0) return "refresh_ms must be greater than zero";
+        return null;
+    }
+
     pub fn validate(config: Config) void {
         assert(config.full_threshold_bytes > config.start_threshold_bytes);
         assert(config.max_intensity_ppm <= ppm);
@@ -105,10 +122,24 @@ pub const Throttle = struct {
     pushed: ?DaLimits = null,
     pushed_at_ms: u64 = 0,
     disabled: bool = false,
+    /// The builder lacks `miner_setMaxDASize`: never push again.
+    unsupported: bool = false,
 
     pub fn init(config: Config) Throttle {
         config.validate();
         return .{ .config = config, .disabled = config.strategy == .off };
+    }
+
+    /// Replaces the config at runtime (admin API) and forces a push on the next update.
+    /// Switching to `off` after limits were pushed stays active so the builder receives
+    /// the unthrottled (upper) limits instead of keeping stale throttled ones.
+    pub fn reconfigure(throttle: *Throttle, config: Config) void {
+        config.validate();
+        const had_pushed = throttle.pushed != null;
+        throttle.config = config;
+        throttle.pushed = null;
+        throttle.disabled = throttle.unsupported or (config.strategy == .off and !had_pushed);
+        assert(!throttle.unsupported or throttle.disabled);
     }
 
     /// Recomputes the limits for `backlog_bytes` and pushes them to `builder` when they
@@ -135,6 +166,7 @@ pub const Throttle = struct {
         const result = builder.call("miner_setMaxDASize", params_json) catch |err| {
             if (err == error.RpcError and builder.last_error_code == method_not_found_code) {
                 throttle.disabled = true;
+                throttle.unsupported = true;
                 return .unsupported;
             }
             return .failed;
@@ -283,4 +315,32 @@ fn fuzz_limits(_: void, smith: *testing.Smith) anyerror!void {
     const limits = config.limits(backlog);
     try testing.expect(limits.max_tx_size >= config.tx_size_lower_limit);
     try testing.expect(limits.max_block_size <= config.block_size_upper_limit);
+}
+
+test "throttle: problem mirrors validate and reconfigure forces a push" {
+    var prng = Prng.init(0x7e);
+    for (0..500) |_| {
+        var config: Config = .{
+            .start_threshold_bytes = prng.below(100),
+            .full_threshold_bytes = prng.below(100),
+            .max_intensity_ppm = @intCast(prng.below(ppm + 2)),
+            .block_size_lower_limit = prng.below(4),
+            .block_size_upper_limit = prng.below(4),
+            .tx_size_lower_limit = prng.below(4),
+            .tx_size_upper_limit = prng.below(4),
+        };
+        if (config.problem() == null) config.validate();
+        config.refresh_ms = 0;
+        try std.testing.expect(config.problem() != null);
+    }
+    var throttle = Throttle.init(.{ .strategy = .off });
+    try std.testing.expect(throttle.disabled);
+    throttle.reconfigure(.{ .strategy = .linear });
+    try std.testing.expect(!throttle.disabled and throttle.pushed == null);
+    throttle.pushed = (Config{}).limits(0);
+    throttle.reconfigure(.{ .strategy = .off });
+    try std.testing.expect(!throttle.disabled); // Must push the upper limits once.
+    throttle.unsupported = true;
+    throttle.reconfigure(.{ .strategy = .step });
+    try std.testing.expect(throttle.disabled);
 }
