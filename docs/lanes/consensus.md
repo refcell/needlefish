@@ -26,7 +26,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `engine`: engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
-- [ ] `safedb`: L1→safe head mapping persisted.
+- [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [ ] `p2p` (stub first): real implementation is owned by the p2p lane in `src/consensus/p2p/` (see p2p.md); consume its `p2p.Service`.
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
 
@@ -64,6 +64,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   the channel's decompressed buffer.
 
 ## Log
+- 2026-11-05: safedb: safe head updates, reset semantics, lookup, record codec, fuzz.
 - 2026-11-05: derive: channel bank (Granite ready selection, size prune), assembler, provider.
 - 2026-11-05: derive: calldata/blob data source, L1 retrieval, frame queue + Holocene prune.
 - 2026-11-05: stateful attributes builder (Denim BaseTime/gas scaling), upgrade txs.
