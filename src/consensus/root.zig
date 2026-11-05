@@ -10,6 +10,7 @@ pub const safedb = @import("safedb/root.zig");
 pub const engine = @import("engine/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const sequencer = @import("sequencer/root.zig");
+pub const sources = @import("sources/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
