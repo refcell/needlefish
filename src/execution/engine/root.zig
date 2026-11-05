@@ -19,6 +19,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
 pub const types = @import("types.zig");
+pub const block = @import("block.zig");
 
 const B256 = primitives.B256;
 pub const ExecutionPayload = types.ExecutionPayload;

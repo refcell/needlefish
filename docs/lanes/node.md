@@ -4,6 +4,7 @@ Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
 Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
+- [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
 - [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
@@ -41,6 +42,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: engine payload well-formedness (block hash verification).
 - 2026-11-05: txpool stateless validation over common/consensus envelopes.
 - 2026-11-05: engine types, method/fork versioning, Engine(Backend) handlers, fuzz.
 - 2026-11-05: payload attributes, op-geth-parity payload IDs, version/fork validation.
