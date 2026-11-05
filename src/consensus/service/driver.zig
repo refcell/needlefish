@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 
 const protocol = @import("../protocol/root.zig");
 const task = @import("../engine/task.zig");
+const conf_depth = @import("conf_depth.zig");
 const derive_errors = @import("../derive/errors.zig");
 const pipeline_module = @import("../derive/pipeline.zig");
 const attributes_module = @import("../derive/attributes.zig");
@@ -62,6 +63,11 @@ pub const Options = struct {
     /// come from a source node through `insert_unsafe` and safe/finalized labels through
     /// `promote_labels`.
     follow: bool = false,
+    /// Derive only from L1 blocks this many below the L1 head (`--l1.verifier-confs`).
+    verifier_l1_confs: u64 = 0,
+    /// Pick sequencer L1 origins this many below the L1 head (`--sequencer.l1-confs`;
+    /// the binary defaults to base/base's 4).
+    sequencer_l1_confs: u64 = 0,
 };
 
 pub const Phase = enum { starting, resetting, running };
@@ -294,7 +300,7 @@ pub const Driver = struct {
     fn reset_pipeline(driver: *Driver, providers: anytype) void {
         const safe_head = driver.queue.state.sync_state.safe_head;
         const signal: pipeline_module.Signal = .{ .reset = .{ .l2_safe_head = safe_head } };
-        driver.pipeline.signal(providers.l1, providers.l2, signal) catch |err| {
+        driver.pipeline.signal(driver.derive_l1(providers), providers.l2, signal) catch |err| {
             if (err != error.NotAvailable) driver.note(err);
             if (derive_errors.kind(err) == .critical) driver.stats.critical_errors += 1;
             return; // Temporary (data in flight) or reset: retry next tick.
@@ -436,6 +442,34 @@ pub const Driver = struct {
         assert(driver.last_error != null);
     }
 
+    /// The L1 provider derivation reads, `verifier_l1_confs` below the head.
+    fn derive_l1(
+        driver: *const Driver,
+        providers: anytype,
+    ) conf_depth.ConfDepth(@TypeOf(providers.l1)) {
+        assert(driver.options.verifier_l1_confs < 1 << 32);
+        return .{
+            .l1 = providers.l1,
+            .l1_head = providers.l1_head,
+            .depth = driver.options.verifier_l1_confs,
+            .unknown = .pass,
+        };
+    }
+
+    /// The L1 provider the sequencer picks origins from, `sequencer_l1_confs` below the head.
+    fn sequencer_l1(
+        driver: *const Driver,
+        providers: anytype,
+    ) conf_depth.ConfDepth(@TypeOf(providers.l1)) {
+        assert(driver.options.sequencer);
+        return .{
+            .l1 = providers.l1,
+            .l1_head = providers.l1_head,
+            .depth = driver.options.sequencer_l1_confs,
+            .unknown = .hide,
+        };
+    }
+
     fn drop_sealing(driver: *Driver) void {
         if (driver.sealing) |*attributes| attributes.deinit(driver.allocator);
         driver.sealing = null;
@@ -514,7 +548,8 @@ pub const Driver = struct {
                     driver.building = false;
                     driver.drop_sealing();
                 }
-                driver.pipeline.signal(providers.l1, providers.l2, .flush_channel) catch {};
+                const l1 = driver.derive_l1(providers);
+                driver.pipeline.signal(l1, providers.l2, .flush_channel) catch {};
             },
         }
     }
@@ -530,7 +565,7 @@ pub const Driver = struct {
         }
         const cursor = driver.queue.state.sync_state.local_safe_head;
         for (0..driver.options.steps_per_tick_max) |_| {
-            const l1 = providers.l1;
+            const l1 = driver.derive_l1(providers);
             const result = driver.pipeline.step(l1, providers.blobs, providers.l2, cursor);
             const err = switch (result) {
                 .prepared_attributes => return,
@@ -568,7 +603,7 @@ pub const Driver = struct {
         const outcome = sequencer_build.build_on(
             &driver.selector,
             &driver.builder,
-            providers.l1,
+            driver.sequencer_l1(providers),
             providers.l2,
             head,
             driver.options.recovery_mode,
@@ -897,6 +932,24 @@ test "driver: subsecond sequencer holds the payload until 150 ms into the slot" 
     for (0..8) |_| driver.tick(scenario.providers(), slot_start + 400);
     try testing.expectEqual(@as(u64, 1), driver.stats.sealed);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+test "driver: confirmation depths gate derivation and sequencer origins separately" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{ .sequencer = true, .verifier_l1_confs = 2, .sequencer_l1_confs = 4 });
+    defer scenario.deinit();
+    const driver = &scenario.driver;
+    const providers = scenario.providers(); // L1 head: block 7.
+    try testing.expect(!driver.derive_l1(providers).hidden(5));
+    try testing.expect(driver.derive_l1(providers).hidden(6));
+    try testing.expect(!driver.sequencer_l1(providers).hidden(3));
+    try testing.expect(driver.sequencer_l1(providers).hidden(4));
+    const delayed = driver.sequencer_l1(providers);
+    try testing.expectError(error.NotFound, delayed.l1_block_info_by_number(4));
+    var no_head = providers;
+    no_head.l1_head = null;
+    try testing.expect(!driver.derive_l1(no_head).hidden(6)); // Derivation: no head, no gate.
+    try testing.expect(driver.sequencer_l1(no_head).hidden(1)); // Sequencer: nothing usable.
 }
 
 test "driver: a sealed payload inserts into a verifier as its unsafe head" {

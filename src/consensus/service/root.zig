@@ -11,6 +11,7 @@ pub const checkpoint = @import("checkpoint.zig");
 pub const metrics = @import("metrics.zig");
 pub const follow = @import("follow.zig");
 pub const conductor = @import("conductor.zig");
+pub const conf_depth = @import("conf_depth.zig");
 pub const ws_rpc = @import("ws_rpc.zig");
 pub const Node = node.Node;
 

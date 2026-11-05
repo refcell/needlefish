@@ -63,9 +63,10 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] admin_overrideLeader (no conductor: InternalError like base/base),
     admin_refreshUpgradeSignal (-32004 outside runtime-admin mode), dev_taskQueueLength
   - [ ] admin_clearPendingP2pConnections (needs a dial-abort API in `p2p.Service`)
-  - [ ] `--l1.verifier-confs` (default 0) / `--sequencer.l1-confs` (default 4): derive and
+  - [x] `--l1.verifier-confs` (default 0) / `--sequencer.l1-confs` (default 4): derive and
     pick origins at the L1 head minus confirmations
-  - [ ] `--sequencer.recover` (initial recover mode), `--rpc.disabled`
+  - [x] `--sequencer.recover` (initial recover mode)
+  - [ ] `--rpc.disabled`
   - [ ] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
@@ -230,6 +231,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: confs: `service/conf_depth.zig` hides L1 blocks within N of the head from derivation (`--l1.verifier-confs`, no head: no gate) and from sequencer origin selection (`--sequencer.l1-confs`, default 4, no head: nothing); `--sequencer.recover`.
 - 2026-11-05: 200 ms devnet trial (local, uncommitted Denim genesis): EL rejects same-second FCU attrs and lacks Base upgrades from genesis; handed to the node and batcher-devnet lanes.
 - 2026-11-05: derive: end-to-end pipeline test of native 200 ms Denim blocks (singular batches sharing a second, BaseTimeUpdateTx millis).
 - 2026-11-05: sequencer: native 200 ms cadence: driver ticks in ms; subsecond blocks build from the parent's timestamp and seal 150 ms into the slot (base/base `block_seal_target`); stop discards a waiting payload.

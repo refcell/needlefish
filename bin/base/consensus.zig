@@ -17,6 +17,7 @@ const usage =
     \\usage: base consensus --rollup-config ROLLUP.json --l1 URL --l2 URL --l2-jwt FILE
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
     \\         [--rpc.ws-enabled [--rpc.ws-port P]] [--rpc.enable-admin] [--rpc.dev-enabled]
+    \\         [--l1.verifier-confs N] [--sequencer.l1-confs N] [--sequencer.recover]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
@@ -43,6 +44,10 @@ pub const Flags = struct {
     /// WebSocket RPC on its own port (base/base serves it on the HTTP port).
     rpc_ws_enabled: bool = false,
     rpc_admin: bool = false,
+    /// base/base defaults: derive from the L1 head, pick origins 4 blocks below it.
+    verifier_l1_confs: u64 = 0,
+    sequencer_l1_confs: u64 = 4,
+    sequencer_recover: bool = false,
     rpc_dev: bool = false,
     rpc_ws_port: u16 = 7546,
     /// Prometheus endpoint (base/base defaults: disabled, 0.0.0.0:9090).
@@ -125,6 +130,10 @@ fn apply_switch(flags: *Flags, arg: []const u8) bool {
         flags.sequencer_stopped = true;
         return true;
     }
+    if (std.mem.eql(u8, arg, "--sequencer.recover")) {
+        flags.sequencer_recover = true;
+        return true;
+    }
     if (std.mem.eql(u8, arg, "--metrics.enabled")) {
         flags.metrics_enabled = true;
         return true;
@@ -152,6 +161,10 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.rpc_addr = try parse_ip4(value);
     } else if (eql(u8, arg, "--rpc.port")) {
         flags.rpc_port = try std.fmt.parseInt(u16, value, 10);
+    } else if (eql(u8, arg, "--l1.verifier-confs")) {
+        flags.verifier_l1_confs = try std.fmt.parseInt(u64, value, 10);
+    } else if (eql(u8, arg, "--sequencer.l1-confs")) {
+        flags.sequencer_l1_confs = try std.fmt.parseInt(u64, value, 10);
     } else if (eql(u8, arg, "--rpc.ws-port")) {
         flags.rpc_ws_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(u8, arg, "--metrics.addr")) {
@@ -248,7 +261,13 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .jwt_secret = secret,
         .rpc_address = io.Address.ip4(flags.rpc_addr, flags.rpc_port),
         .sequencer = flags.sequencer,
-        .driver = .{ .sequencer = flags.sequencer, .sequencer_stopped = flags.sequencer_stopped },
+        .driver = .{
+            .sequencer = flags.sequencer,
+            .sequencer_stopped = flags.sequencer_stopped,
+            .recovery_mode = flags.sequencer_recover,
+            .verifier_l1_confs = flags.verifier_l1_confs,
+            .sequencer_l1_confs = flags.sequencer_l1_confs,
+        },
         .conductor = flags.conductor_rpc,
         .version = base.build_options.version,
         .p2p = p2p_config,
@@ -389,6 +408,14 @@ test "consensus: flags" {
     const admin_args = required ++ [_][]const u8{ "--rpc.enable-admin", "--rpc.dev-enabled" };
     const with_admin = try parse_flags(&admin_args);
     try std.testing.expect(with_admin.rpc_admin and with_admin.rpc_dev);
+    try std.testing.expectEqual(@as(u64, 4), with_admin.sequencer_l1_confs);
+    const conf_args = required ++ [_][]const u8{
+        "--l1.verifier-confs", "3", "--sequencer.l1-confs", "0", "--sequencer.recover",
+    };
+    const with_confs = try parse_flags(&conf_args);
+    try std.testing.expectEqual(@as(u64, 3), with_confs.verifier_l1_confs);
+    try std.testing.expectEqual(@as(u64, 0), with_confs.sequencer_l1_confs);
+    try std.testing.expect(with_confs.sequencer_recover);
     try std.testing.expectEqual(@as(u16, 8547), conducted.conductor_rpc.?.port);
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
