@@ -9,6 +9,7 @@ const primitives = @import("../primitives/root.zig");
 const consensus = @import("../consensus/root.zig");
 pub const json = @import("json.zig");
 pub const eip8130 = @import("eip8130.zig");
+pub const request = @import("request.zig");
 
 const Writer = std.Io.Writer;
 const Object = json.Object;
@@ -389,5 +390,6 @@ pub fn write_block(
 test {
     _ = json;
     _ = eip8130;
+    _ = request;
     _ = @import("root_test.zig");
 }

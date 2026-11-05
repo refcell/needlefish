@@ -21,7 +21,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   phaseStatuses), headers and blocks, streamed to `std.Io.Writer`.
 - [x] `flashblocks`: payload/base/delta/metadata types, JSON or brotli message decode
   (5 MiB cap), JSON writer, `FlashblockId`.
-- [ ] `rpc_types`: request parsing (TransactionRequest, block tags) once `utilities/json` lands.
+- [x] `rpc_types/request`: TransactionRequest (incl. 0x79 scalar fields) and EIP-1898 block
+  ids from a parsed `std.json.Value`.
+- [ ] `rpc_types/request`: 0x79 `accountChanges`/`calls` in requests (rejected today).
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -83,3 +85,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: rpc_types JSON writers (alloy field names; checksummed addresses).
 - 2026-11-05: flashblocks types and message decoding.
 - 2026-11-05: blob sidecar KZG verification (v0).
+- 2026-11-05: rpc_types request parsing (TransactionRequest, BlockId).
