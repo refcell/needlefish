@@ -24,12 +24,14 @@ pub const Stats = struct {
     saves_skipped: u64 = 0,
 };
 
-/// `loaded` receives the file contents once; `produce` writes an image into the buffer it
-/// is given and returns the used prefix.
+/// `loaded` receives the file contents once (they stay valid until `deinit`); `produce`
+/// writes an image into the buffer it is given and returns the used prefix. Without
+/// `produce` the file is read-only: no timer, no writes. `loaded` also runs, with empty
+/// contents, when the file cannot be opened or read, so the owner can fall back.
 pub fn Hooks(comptime Owner: type) type {
     return struct {
         loaded: fn (*Owner, []const u8) void,
-        produce: fn (*Owner, []u8) []const u8,
+        produce: ?fn (*Owner, []u8) []const u8 = null,
     };
 }
 
@@ -92,8 +94,10 @@ pub fn StoreFile(comptime IO: type, comptime Owner: type, comptime hooks: Hooks(
         pub fn start(self: *Self) void {
             assert(self.phase == .closed);
             assert(!self.stopping);
-            self.fd = self.io.open_file(self.path, .create) catch {
+            const mode: io_module.OpenMode = if (hooks.produce == null) .read_only else .create;
+            self.fd = self.io.open_file(self.path, mode) catch {
                 self.stats.open_errors += 1;
+                hooks.loaded(self.owner, self.buffer[0..0]);
                 return;
             };
             self.phase = .reading;
@@ -121,11 +125,12 @@ pub fn StoreFile(comptime IO: type, comptime Owner: type, comptime hooks: Hooks(
 
         /// Writes the current image now unless an operation is in flight.
         pub fn save(self: *Self) void {
+            const produce = hooks.produce orelse return;
             if (self.phase != .idle) {
                 self.stats.saves_skipped += 1;
                 return;
             }
-            const image = hooks.produce(self.owner, self.buffer);
+            const image = produce(self.owner, self.buffer);
             assert(image.ptr == self.buffer.ptr);
             assert(image.len <= self.buffer.len);
             assert(self.file_length <= self.buffer.len);
@@ -155,6 +160,7 @@ pub fn StoreFile(comptime IO: type, comptime Owner: type, comptime hooks: Hooks(
             assert(self.phase == .reading);
             const count = result catch {
                 self.stats.load_errors += 1;
+                hooks.loaded(self.owner, self.buffer[0..0]);
                 self.become_idle();
                 return;
             };
@@ -170,7 +176,7 @@ pub fn StoreFile(comptime IO: type, comptime Owner: type, comptime hooks: Hooks(
         fn become_idle(self: *Self) void {
             assert(self.phase != .closed);
             self.phase = .idle;
-            if (self.stopping) return;
+            if (self.stopping or hooks.produce == null) return;
             if (!self.timer_armed) self.submit_timer();
         }
 

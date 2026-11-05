@@ -48,7 +48,11 @@ const Pair = struct {
         return pair.init_flags(upgrade, .{ .boot_other = true }, .{ .boot_other = true });
     }
 
-    const Flags = struct { boot_other: bool, bootstore: bool = false };
+    const Flags = struct {
+        boot_other: bool,
+        bootstore: bool = false,
+        bootnodes_file: bool = false,
+    };
 
     fn init_flags(pair: *Pair, upgrade: rollup_config.Upgrade, a: Flags, b: Flags) !void {
         const allocator = testing.allocator;
@@ -95,7 +99,7 @@ const Pair = struct {
         const listen_flag = try std.fmt.bufPrint(&pair.listen_flags[index], listen_text, .{
             index + 1,
         });
-        var arguments: [3][]const u8 = undefined;
+        var arguments: [4][]const u8 = undefined;
         var count: usize = 0;
         arguments[count] = listen_flag;
         count += 1;
@@ -105,6 +109,10 @@ const Pair = struct {
         }
         if (flags.bootstore) {
             arguments[count] = "--p2p.bootstore=bootstore.json";
+            count += 1;
+        }
+        if (flags.bootnodes_file) {
+            arguments[count] = "--p2p.bootnodes-file=bootnodes.txt";
             count += 1;
         }
         const options = try options_module.parse(arguments[0..count]);
@@ -151,6 +159,32 @@ const Pair = struct {
         network.deinit(testing.allocator);
         try pair.init_network(index, flags);
         _ = try network.start();
+    }
+
+    /// Writes `contents` to a new file on node `index`'s simulated disk.
+    fn write_file(pair: *Pair, index: usize, path: []const u8, contents: []const u8) !void {
+        const Writer = struct {
+            done: bool = false,
+            failed: bool = false,
+            fn on_write(
+                writer: *@This(),
+                _: *io_module.SimIo.Completion,
+                result: io_module.WriteError!usize,
+            ) void {
+                writer.done = true;
+                _ = result catch {
+                    writer.failed = true;
+                };
+            }
+        };
+        const io = &pair.ios[index];
+        const fd = try io.open_file(path, .create);
+        defer io.close_now(fd);
+        var writer: Writer = .{};
+        var completion: io_module.SimIo.Completion = .{};
+        io.write(*Writer, &writer, Writer.on_write, &completion, fd, contents, 0);
+        while (!writer.done) pair.world.run_for_ns(ns_per_ms);
+        if (writer.failed) return error.WriteFailed;
     }
 
     fn run(pair: *Pair, duration_ns: u64) void {
@@ -281,4 +315,44 @@ test "p2p interop: a restarted node finds its peer again from the bootstore file
     try testing.expectEqual(@as(u32, 1), restarted.peer_count());
     var prng = Prng.init(7);
     try pair.exchange(1, 1, prng.random());
+}
+
+test "p2p interop: --p2p.bootnodes-file is read through the io layer and seeded" {
+    const pair = try testing.allocator.create(Pair);
+    defer testing.allocator.destroy(pair);
+    // Node 0 starts with no bootnode at all, then learns node 1 from its file.
+    try pair.init_flags(.ecotone, .{ .boot_other = false }, .{ .boot_other = false });
+    defer pair.deinit();
+    const record = try enr.build(pair.secrets[1], .{
+        .ip4 = .{ 10, 0, 0, 2 },
+        .tcp = 9222,
+        .udp = 9223,
+        .opstack = .{ .chain_id = chain_id },
+    });
+    var text: [enr.text_length_max]u8 = undefined;
+    var contents_storage: [enr.text_length_max + 64]u8 = undefined;
+    const contents = try std.fmt.bufPrint(&contents_storage, "# devnet\n\n{s}\n", .{
+        enr.encode_text(&text, &record),
+    });
+    try pair.write_file(0, "bootnodes.txt", contents);
+    try pair.restart(0, .{ .boot_other = false, .bootnodes_file = true });
+    pair.run(5 * ns_per_s);
+    const network = &pair.networks[0];
+    try testing.expectEqual(@as(u64, 1), network.bootnodes_file.?.stats.loads);
+    try testing.expectEqual(@as(u32, 1), network.options.bootnodes_count);
+    try testing.expectEqual(@as(u32, 0), network.bootnodes_invalid);
+    try testing.expectEqual(@as(u32, 1), network.peer_count());
+}
+
+test "p2p interop: a missing bootnodes file falls back to the chain defaults" {
+    const pair = try testing.allocator.create(Pair);
+    defer testing.allocator.destroy(pair);
+    const flags: Pair.Flags = .{ .boot_other = false, .bootnodes_file = true };
+    try pair.init_flags(.ecotone, flags, .{ .boot_other = false });
+    defer pair.deinit();
+    pair.run(100 * ns_per_ms);
+    const network = &pair.networks[0];
+    try testing.expectEqual(@as(u64, 1), network.bootnodes_file.?.stats.open_errors);
+    try testing.expectEqual(@as(u32, 0), network.options.bootnodes_count);
+    try testing.expect(network.service.discovery.boot_records_count > 0);
 }

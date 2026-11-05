@@ -27,6 +27,8 @@ const Options = options_module.Options;
 const ns_per_s = std.time.ns_per_s;
 /// base/base syncs the bootstore file every 60 s (discv5 driver `store_interval`).
 pub const bootstore_sync_interval_ns = 60 * ns_per_s;
+/// `--p2p.bootnodes-file` read limit: 64 entries of the longest ENR text plus comments.
+pub const bootnodes_file_size_max = 64 * 1024;
 
 pub const Error = error{ NoUnsafeBlockSigner, InvalidNodeKey, InvalidBootnode };
 
@@ -124,6 +126,15 @@ pub fn Network(comptime IO: type) type {
         /// Bootstore file contents that were not valid bootstore JSON (treated as empty).
         bootstore_invalid: u64 = 0,
 
+        /// `--p2p.bootnodes-file`, read once at start (base/base appends it to
+        /// `--p2p.bootnodes`; the chain defaults apply only when both are empty).
+        bootnodes_file: ?BootnodesFile = null,
+        /// Bootnode texts that did not parse, from flags and the bootnodes file.
+        bootnodes_invalid: u32 = 0,
+
+        pub const BootnodesFile = store_file_module.StoreFile(IO, Self, .{
+            .loaded = on_bootnodes_loaded,
+        });
         pub const BootstoreFile = store_file_module.StoreFile(IO, Self, .{
             .loaded = on_bootstore_loaded,
             .produce = save_bootstore,
@@ -170,6 +181,14 @@ pub fn Network(comptime IO: type) type {
                 }
             }
             errdefer if (self.bootstore_file) |*file| file.deinit(allocator);
+            self.bootnodes_file = null;
+            self.bootnodes_invalid = 0;
+            if (options.bootnodes_file) |path| {
+                self.bootnodes_file = @as(BootnodesFile, undefined);
+                const size = bootnodes_file_size_max;
+                try self.bootnodes_file.?.init(allocator, io, self, path, size, ns_per_s);
+            }
+            errdefer if (self.bootnodes_file) |*file| file.deinit(allocator);
             try self.transport.init(allocator, io, self.service, .{
                 .listen = listen,
                 .identity_secret = secret,
@@ -180,14 +199,28 @@ pub fn Network(comptime IO: type) type {
         }
 
         /// Opens the listener and seeds bootnodes. Bad bootnode text is skipped and
-        /// counted in the return value.
+        /// counted in the return value. With `--p2p.bootnodes-file`, its entries are seeded
+        /// once the read completes (see `bootnodes_invalid`).
         pub fn start(self: *Self) !u32 {
             try self.transport.start();
             if (self.bootstore_file) |*file| file.start();
-            const now = self.transport.io.now_realtime_ns();
             const configured = self.options.bootnode_slice();
             const chain_id = self.service.config.rollup.l2_chain_id;
-            const texts = if (configured.len > 0) configured else boot.for_chain(chain_id);
+            var invalid: u32 = 0;
+            if (self.bootnodes_file) |*file| {
+                invalid = self.seed_bootnodes(configured);
+                file.start();
+            } else {
+                const defaults = boot.for_chain(chain_id);
+                invalid = self.seed_bootnodes(if (configured.len > 0) configured else defaults);
+            }
+            self.bootnodes_invalid += invalid;
+            self.transport.execute_commands();
+            return invalid;
+        }
+
+        fn seed_bootnodes(self: *Self, texts: []const []const u8) u32 {
+            const now = self.transport.io.now_realtime_ns();
             var invalid: u32 = 0;
             for (texts) |text| {
                 const node = boot.parse(text) catch {
@@ -204,12 +237,31 @@ pub fn Network(comptime IO: type) type {
                     },
                 }
             }
-            self.transport.execute_commands();
+            assert(invalid <= texts.len);
             return invalid;
+        }
+
+        /// Appends the file's entries to the flag bootnodes and seeds them; falls back to the
+        /// chain defaults when neither gave any (also when the file could not be read).
+        fn on_bootnodes_loaded(self: *Self, contents: []const u8) void {
+            const before = self.options.bootnodes_count;
+            options_module.add_bootnodes_file(&self.options, contents) catch {
+                self.bootnodes_invalid += 1; // More than `bootnodes_max`: the rest is ignored.
+            };
+            assert(self.options.bootnodes_count >= before);
+            const added = self.options.bootnode_slice()[before..];
+            if (self.options.bootnodes_count == 0) {
+                const chain_id = self.service.config.rollup.l2_chain_id;
+                self.bootnodes_invalid += self.seed_bootnodes(boot.for_chain(chain_id));
+            } else {
+                self.bootnodes_invalid += self.seed_bootnodes(added);
+            }
+            self.transport.execute_commands();
         }
 
         /// Stops the transport and writes a final bootstore image.
         pub fn stop(self: *Self) void {
+            if (self.bootnodes_file) |*file| file.stop();
             if (self.bootstore_file) |*file| file.stop();
             self.transport.stop();
         }
@@ -217,12 +269,14 @@ pub fn Network(comptime IO: type) type {
         /// True while the bootstore file still has an operation or its timer outstanding;
         /// run the IO loop until false before `deinit`.
         pub fn busy(self: *const Self) bool {
-            const file = if (self.bootstore_file) |*value| value else return false;
-            return file.busy();
+            const bootnodes = if (self.bootnodes_file) |*file| file.busy() else false;
+            const bootstore = if (self.bootstore_file) |*file| file.busy() else false;
+            return bootnodes or bootstore;
         }
 
         /// Frees memory after `stop` once the IO loop has drained the completions.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.bootnodes_file) |*file| file.deinit(allocator);
             if (self.bootstore_file) |*file| file.deinit(allocator);
             if (self.store) |*store| store.deinit(allocator);
             self.transport.deinit();

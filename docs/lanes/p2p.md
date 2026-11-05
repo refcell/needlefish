@@ -50,8 +50,11 @@ behind a small interface and switch later.
   node 1, and reconnects from its file alone (fails with the file off).
   Decision: no default path (base/base uses `~/.base/<chain>/bootstore.json`); the store is
   memory-only unless `--p2p.bootstore` is given, so library code never derives home paths.
-- [ ] `--p2p.bootnodes-file` read through `utilities.io` at start (today only parsed when the
-  caller hands over the contents; the binary never does).
+- [x] `--p2p.bootnodes-file` read through `utilities.io` at start (read-only `StoreFile`):
+  entries append to `--p2p.bootnodes` as in base/base `bootnode_strings`; chain defaults
+  only when both are empty, including when the file is missing or unreadable (base/base
+  fails startup there; we keep running and count `open_errors`). Interop tests: a node
+  whose only route to its peer is the file connects; a missing file seeds the defaults.
 - [ ] Identify peerstore (base/base `max_identify_peerstore_peers` = 1024): LRU of identify
   info that outlives connections, evicting disconnected peers first; admin `peers` reports it.
 - [x] Dial rate limiting (base/base gater `peer_redialing` / `dial_period`): already in
@@ -353,3 +356,4 @@ behind a small interface and switch later.
 - 2026-11-05: chaos seed sweep DST.
 - 2026-11-05: in-process p2p<->consensus interop test; backlog extended (bootstore/bootnodes-file persistence via io, identify peerstore).
 - 2026-11-05: bootstore file persistence through utilities.io (StoreFile + crash fuzz + restart DST).
+- 2026-11-05: --p2p.bootnodes-file read through the io layer.
