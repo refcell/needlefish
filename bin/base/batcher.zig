@@ -16,6 +16,7 @@ const usage =
     \\         [--throttle-strategy off|step|linear|quadratic]
     \\         [--admin-port P [--admin-addr IP]] [--stopped] [--num-confirmations N]
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
+    \\         [--sub-safety-margin L1_BLOCKS]
     \\
 ;
 
@@ -27,6 +28,9 @@ const Flags = struct {
     key_index: u32 = @backingInt(batcher.devnet.accounts.Role.batcher),
     private_key: ?[32]u8 = null,
     max_channel_duration: u64 = 2,
+    /// L1 blocks subtracted from `max_channel_duration` so channels close with room to land
+    /// before they could time out (base/base `--sub-safety-margin`).
+    sub_safety_margin: u64 = 0,
     poll_interval_ms: u64 = 1000,
     data_availability: batcher.txmgr.DataAvailability = .calldata,
     /// base/base batches with brotli (Fjord is active from genesis on the devnet).
@@ -87,6 +91,8 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--sub-safety-margin")) {
+            flags.sub_safety_margin = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, arg, "--num-confirmations")) {
             flags.confirmations = try std.fmt.parseInt(u64, value, 10);
             if (flags.confirmations == 0) return error.InvalidConfirmations;
@@ -111,6 +117,8 @@ fn parse_flags(args: []const []const u8) !Flags {
         i += 2;
     }
     if (i != args.len) return error.MissingValue;
+    // base/base rejects a margin that leaves no channel duration.
+    if (flags.sub_safety_margin >= flags.max_channel_duration) return error.SubSafetyMarginTooLarge;
     return flags;
 }
 
@@ -146,7 +154,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
                 .input_bytes_max = 4 << 20,
                 .algorithm = flags.compression,
             },
-            .max_channel_duration_l1_blocks = flags.max_channel_duration,
+            .max_channel_duration_l1_blocks = flags.max_channel_duration - flags.sub_safety_margin,
         },
         .txs = .{
             .chain_id = rollup.l1_chain_id,
@@ -335,6 +343,10 @@ test "batcher: flags" {
     try std.testing.expectError(error.InvalidGwei, parse_gwei("1.0000000001"));
     try std.testing.expectError(error.InvalidGwei, parse_gwei(".5"));
     try std.testing.expectEqual(@as(u128, 1_500_000_000), try parse_gwei("1.5"));
+    const margin = [_][]const u8{ "--max-channel-duration", "10", "--sub-safety-margin", "4" };
+    try std.testing.expectEqual(@as(u64, 4), (try parse_flags(&margin)).sub_safety_margin);
+    const no_room = [_][]const u8{ "--max-channel-duration", "4", "--sub-safety-margin", "4" };
+    try std.testing.expectError(error.SubSafetyMarginTooLarge, parse_flags(&no_room));
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };

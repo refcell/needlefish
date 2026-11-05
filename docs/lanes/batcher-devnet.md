@@ -54,7 +54,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `--stopped`, `--admin-port`, `--admin-addr`; one event loop serves admin + metrics.
 - [x] `batcher`: `--num-confirmations` (free a slot only N blocks after inclusion), `--min-tip-cap`,
   `--min-basefee`, `--max-pending-transactions` (base/base txmgr flags).
-- [ ] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
+- [x] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
   the channel time out on L1 (base/base `sub_safety_margin`).
 - [ ] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
 - [ ] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
