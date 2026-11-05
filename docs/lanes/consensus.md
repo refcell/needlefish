@@ -55,10 +55,13 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     BlobProvider + KZG, L2Provider, polling engine client); logs phase/unsafe/safe heads
   - [ ] L2Provider `l2_block_by_number` (full safe blocks via `l2_block_full`) so span
     batches overlapping the safe chain decide instead of waiting
-  - [ ] devnet smoke green (sequencer produces blocks, verifier safe head follows)
+  - [x] devnet smoke green (sequencer produces blocks, verifier safe head follows)
   - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
+- Devnet: the dev L1 JSON-RPC server allowed only 4 connections; each consensus node holds
+  two (watcher + provider) and the batcher more, so the verifier's L1 provider was reset
+  forever (RecvFailed). Raised to 16 (beacon 8) in `execution/node/service.zig`.
 - Driver: one tick-driven loop instead of base/base's actors; the engine queue owns the
   heads. Sequencer builds at the block's timestamp and seals right after the payload id
   (base/base seals on the next tick at block time); good enough until gossip lands.
@@ -160,6 +163,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: devnet smoke green; driver/L1 failure logging; L1 server connection limit.
 - 2026-11-05: service: node runs the driver over real providers (`base consensus`).
 - 2026-11-05: service: driver (startup, derivation, finalization, sequencing), fuzzed.
 - 2026-11-05: sequencer: next-block attributes (build_on, pool gating), fuzzed.

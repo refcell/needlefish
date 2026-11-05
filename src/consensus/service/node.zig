@@ -174,6 +174,8 @@ pub fn Node(comptime IO: type) type {
         logged_phase: driver_module.Phase = .starting,
         logged_safe_number: u64 = 0,
         logged_unsafe_number: u64 = 0,
+        logged_error: ?anyerror = null,
+        status_logged_ns: u64 = 0,
 
         /// Builds the node in place; `node` must not move afterwards.
         pub fn init(
@@ -336,8 +338,36 @@ pub fn Node(comptime IO: type) type {
             assert(node.driver.sync_state().is_ordered());
         }
 
+        /// Every 10 s while not running: where startup waits.
+        fn log_waiting(node: *Self) void {
+            if (node.driver.phase == .running) return;
+            const now_ns = node.io.now_realtime_ns();
+            if (now_ns < node.status_logged_ns + 10 * std.time.ns_per_s) return;
+            node.status_logged_ns = now_ns;
+            node.logger.log(.info, "consensus", "waiting", .{
+                .phase = @tagName(node.driver.phase),
+                .finder = @tagName(node.driver.finder.phase),
+                .l1_head = if (node.watcher.head(.latest)) |head| head.number else 0,
+                .l1_requests = node.l1.stats.requests,
+                .l1_failures = node.l1.stats.failures,
+                .l1_error = if (node.l1.stats.last_failure) |err| @errorName(err) else "none",
+                .l2_requests = node.l2.stats.requests,
+                .l2_failures = node.l2.stats.failures,
+                .l2_not_found = node.l2.stats.not_found,
+            });
+        }
+
         fn log_progress(node: *Self) void {
+            node.log_waiting();
             const state = node.driver.sync_state();
+            if (node.driver.last_error != node.logged_error) {
+                node.logged_error = node.driver.last_error;
+                node.logger.log(.warn, "consensus", "driver error", .{
+                    .err = @errorName(node.driver.last_error.?),
+                    .phase = @tagName(node.driver.phase),
+                    .count = node.driver.error_sequence,
+                });
+            }
             if (node.driver.phase != node.logged_phase) {
                 node.logged_phase = node.driver.phase;
                 node.logger.log(.info, "consensus", "driver phase", .{

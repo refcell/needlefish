@@ -75,7 +75,7 @@ ok "batch for L2 block $block decoded from L1 inbox $BATCH_INBOX"
 seq_hash=$(rpc "$SEQ" eth_getBlockByNumber "[\"$block_hex\",false]" | field hash)
 derived() {
   local safe; safe=$(rpc "$VER_CL" optimism_syncStatus '[]' \
-    | grep -o '"safe_l2":{[^}]*}' | grep -o '"number":[0-9]*' | cut -d: -f2)
+    | grep -o '"safe_l2":{[^}]*}' | grep -o '"number":[0-9]*' | head -n1 | cut -d: -f2)
   [ -n "$safe" ] && [ "$safe" -ge "$block" ] || return 1
   [ "$(rpc "$VER" eth_getBlockByNumber "[\"$block_hex\",false]" | field hash)" = "$seq_hash" ]
 }

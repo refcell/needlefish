@@ -108,13 +108,14 @@ pub const Limits = struct {
     },
     beacon: beacon_module.Config = .{ .slots_max = 256, .bytes_max = 32 << 20 },
     http: http.server.Options = .{
-        .connections_max = 4,
+        // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
+        .connections_max = 16,
         .recv_buffer_size = 4 << 20,
         .send_buffer_size = 1 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
     },
     beacon_http: http.server.Options = .{
-        .connections_max = 2,
+        .connections_max = 8,
         .recv_buffer_size = 16 * 1024,
         .send_buffer_size = 4 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },

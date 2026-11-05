@@ -118,6 +118,9 @@ pub const Driver = struct {
     /// A build or seal task is queued.
     building: bool = false,
     stats: Stats = .{},
+    /// The most recent failure of any kind, for logs; `error_sequence` counts them.
+    last_error: ?anyerror = null,
+    error_sequence: u64 = 0,
 
     /// `driver` must not move afterwards (the pipeline and builder keep config pointers).
     pub fn init(
@@ -185,6 +188,7 @@ pub const Driver = struct {
         const client: FinderClient(@TypeOf(providers)) = .{ .providers = providers };
         const found = driver.finder.step(client) catch |err| {
             if (err == error.NotAvailable) return;
+            driver.note(err);
             driver.stats.critical_errors += 1;
             driver.finder = .init(driver.rollup); // Retry from the labeled heads.
             return;
@@ -208,6 +212,7 @@ pub const Driver = struct {
         const safe_head = driver.queue.state.sync_state.safe_head;
         const signal: pipeline_module.Signal = .{ .reset = .{ .l2_safe_head = safe_head } };
         driver.pipeline.signal(providers.l1, providers.l2, signal) catch |err| {
+            if (err != error.NotAvailable) driver.note(err);
             if (derive_errors.kind(err) == .critical) driver.stats.critical_errors += 1;
             return; // Temporary (data in flight) or reset: retry next tick.
         };
@@ -225,6 +230,12 @@ pub const Driver = struct {
         driver.finder = .init(driver.rollup);
         driver.phase = .starting;
         assert(driver.queue.len() == 0);
+    }
+
+    fn note(driver: *Driver, err: anyerror) void {
+        driver.last_error = err;
+        driver.error_sequence += 1;
+        assert(driver.last_error != null);
     }
 
     fn drop_sealing(driver: *Driver) void {
@@ -278,6 +289,7 @@ pub const Driver = struct {
 
     fn on_failed(driver: *Driver, providers: anytype, failure: task_queue.Failure) void {
         driver.stats.engine_failures += 1;
+        driver.note(failure.err);
         switch (failure.severity) {
             .temporary, .deferred => {}, // The task stays queued and is retried.
             .critical => driver.stats.critical_errors += 1,
@@ -312,6 +324,7 @@ pub const Driver = struct {
                 .advanced_origin => continue,
                 .origin_advance_err, .step_failed => |err| err,
             };
+            if (err != error.NotAvailable and err != error.Eof) driver.note(err);
             switch (derive_errors.kind(err)) {
                 .temporary => {},
                 .reset => {
@@ -343,7 +356,8 @@ pub const Driver = struct {
             providers.l2,
             head,
             driver.options.recovery_mode,
-        ) catch {
+        ) catch |err| {
+            driver.note(err);
             driver.stats.critical_errors += 1;
             return;
         };

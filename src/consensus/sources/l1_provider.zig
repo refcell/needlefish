@@ -84,6 +84,8 @@ pub const Request = struct {
 pub const Stats = struct {
     requests: u64 = 0,
     failures: u64 = 0,
+    /// The most recent failure, for logs.
+    last_failure: ?anyerror = null,
     not_found: u64 = 0,
     dropped: u64 = 0,
 };
@@ -315,9 +317,10 @@ pub fn L1Provider(comptime IO: type) type {
                 provider.queue_count -= 1;
                 provider.in_flight = request;
                 provider.stats.requests += 1;
-                provider.send(request) catch {
+                provider.send(request) catch |err| {
                     provider.in_flight = null;
                     provider.stats.failures += 1;
+                    provider.stats.last_failure = err;
                     continue;
                 };
                 return;
@@ -361,20 +364,23 @@ pub fn L1Provider(comptime IO: type) type {
             provider.in_flight = null;
             defer provider.pump();
             defer _ = provider.scratch.reset(.{ .retain_with_limit = scratch_retain_bytes });
-            const outcome = result catch {
+            const outcome = result catch |err| {
                 provider.stats.failures += 1;
+                provider.stats.last_failure = err;
                 return;
             };
             const raw = switch (outcome) {
                 .ok => |raw| raw,
                 .rpc_error => {
                     provider.stats.failures += 1;
+                    provider.stats.last_failure = error.RpcError;
                     return;
                 },
             };
             if (std.mem.eql(u8, raw, "null")) return provider.record_missing(request);
-            provider.complete(request, raw) catch {
+            provider.complete(request, raw) catch |err| {
                 provider.stats.failures += 1;
+                provider.stats.last_failure = err;
             };
         }
 
