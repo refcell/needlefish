@@ -37,8 +37,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   eip712Domain, announce with privileged internal calls; stablecoin `currency()`, fixed 6
   decimals, root `base.b20.stablecoin` 0x35827975..6200), factory (`native_b20_factory.zig`
   at 0xB20F00..00, warmed from Beryl: createB20 for both variants, getB20Address, isB20,
-  isB20Initialized). Next: common/Asset/Stablecoin V2 (Cobalt: seize, UI multiplier,
-  metered permit, ...) and V3 (Denim); until then the V1 surface serves every fork.
+  isB20Initialized). V2 (Cobalt) and V3 (Denim) done: `Version` picks the table surface
+  (entries carry `since`), V3 logic (token address is an invalid receiver for transfer/
+  transferFrom/mint/seize; executor policy always checked, sender skipped when caller ==
+  from and the executor and sender ids match) is gated on the upgrade in `native_b20`.
+  The factory stays V1 on every fork (base `FactoryVersions`). Base's B-20 lookup has no
+  marker check; uninitialized tokens revert empty inside the precompile (as here).
   V2 (Cobalt) delta, from base logic/v2.rs: common adds SEIZE_ROLE, SEIZE_EXEMPT_POLICY,
   SEIZE_RECEIVER_POLICY, seizeWithMemo (pause feature SEIZE=3, enum max 3; ensure seizable =
   fails seize-exempt policy; seize-receiver policy on `to`; from==to InvalidReceiver; Memo
