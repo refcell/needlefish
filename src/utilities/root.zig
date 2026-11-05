@@ -7,6 +7,7 @@ pub const io = @import("io/root.zig");
 pub const time = @import("time/root.zig");
 pub const json = @import("json/root.zig");
 pub const http = @import("http/root.zig");
+pub const rpc = @import("rpc/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -7,7 +7,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `time`: monotonic + realtime via IO; simulated clock for DST.
 - [x] `json`: fast zero-alloc JSON tokenizer/writer for JSON-RPC (hex quantities, 0x data) — fuzzed.
 - [x] `http`: HTTP/1.1 server + client on the IO interface (keep-alive, pipelining, bounded buffers), fuzzed parser.
-- [ ] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
+- [x] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
 - [ ] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [ ] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
@@ -34,6 +34,11 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   handler writing into `ResponseBuilder` (body first, head prepended, no copy). Client:
   one keep-alive connection, one request in flight, retries once only when a reused
   connection dies before any response byte (never resends after a partial response).
+- JSON-RPC: `Router(Ctx, &methods)` dispatches by comptime table into a fixed writer; a
+  failed handler's partial output is rewound and replaced by an error object. Handlers use
+  `call.params` (positional cursor: quantity/data/fixed/string/boolean/raw) and
+  `call.writer`; `call.fail(code, message)` for typed errors. Batches capped at 100.
+  `rpc.Client(IO)` sends one call at a time with optional bearer auth (JWT).
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -47,3 +52,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: json: validating zero-alloc Scanner (skip, unescape), Writer, QUANTITY/DATA hex; fuzzed.
 - 2026-11-05: http: incremental HTTP/1.1 parser (pipelining, in-place chunked, smuggling checks); fuzzed.
 - 2026-11-05: http: Server(IO, Ctx, handler) and Client(IO) with keep-alive and pipelining; SimIo + kqueue + io_uring tests.
+- 2026-11-05: rpc: JSON-RPC 2.0 Router (batches, notifications, typed params, error rewind) and Client; fuzzed.
