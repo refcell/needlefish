@@ -426,3 +426,4 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
 - 2026-11-05: recovery with prover tables 193 -> 98 ms.
 - 2026-11-05: bench snapshot table refreshed (full crypto bench run).
 - 2026-11-05: divsteps_var: field inverses ~1.4x faster; bn254 add 8.1 ns/gas.
+- 2026-11-05: divsteps_var vs branch-free fuzz 1M runs and safegcd inversion fuzz 600K runs, clean.
