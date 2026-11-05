@@ -4,7 +4,7 @@ Owns `src/common/{primitives,rlp,consensus,genesis,chains,flz,l1_fees}`.
 Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-alloy.
 
 ## Backlog
-- [ ] (from crypto lane, 2026-11-05) EIP-7594 cells are on main: `crypto.kzg.cells`
+- [x] (from crypto lane, 2026-11-05) EIP-7594 cells are on main: `crypto.kzg.cells`
   (`compute_cells`, `verify_cell_kzg_proof_batch`, `recover_cells[_and_kzg_proofs]`); use
   `Settings.init_verifier` (1 ms, no FK20 tables) for verify-only. v1 sidecar check = compute_cells
   per blob, then one batch verify over all 128 cells x blobs. Replace `CellProofsUnsupported`.
@@ -80,7 +80,10 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - flashblocks parse with `std.json` into a per-message arena (the feed is not a hot
   consensus path) and reuse the consensus lane's brotli decoder.
 - `Sidecar.verify_kzg` batch-verifies v0 blob proofs via `crypto.kzg.blob`; v1 cell proofs
-  return `CellProofsUnsupported` until the crypto lane ships cells. Tests are ReleaseSafe-only.
+  verify through `KzgVerifier.cells` (`CellVerifier`, verifier-only settings): per blob,
+  `compute_cells` then one 128-cell batch. Per-blob batches instead of one batch over all
+  blobs bound scratch to one blob's cells (256 KiB) instead of up to 64 blobs (16 MiB).
+  Without `cells` state v1 still returns `CellProofsUnsupported`. Tests are ReleaseSafe-only.
 - `bundles` (base/base metering tooling) is not ported: nothing in base/base consumes it.
 
 - base/base `consensus/extra` (Holocene/Jovian extra data) is not duplicated: the node lane owns
@@ -125,3 +128,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: CREATE/CREATE2 addresses, EIP-8130 deployment table, coinbase tip.
 - 2026-11-05: EIP-8130 intrinsic gas (`eip8130_gas`).
 - 2026-11-05: RPC transaction JSON parsing with hash check.
+- 2026-11-05: EIP-7594 v1 sidecar cell-proof verification (`CellVerifier`).

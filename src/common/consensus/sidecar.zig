@@ -18,6 +18,7 @@ const rlp = @import("../rlp/root.zig");
 const tx_module = @import("tx.zig");
 const kzg = @import("../crypto/kzg/root.zig");
 const kzg_blob = kzg.blob;
+const kzg_cells = kzg.cells;
 const B256 = primitives.B256;
 const Encoder = rlp.Encoder;
 const Decoder = rlp.Decoder;
@@ -117,7 +118,7 @@ pub const ValidateError = error{
 };
 
 pub const KzgError = error{
-    /// EIP-7594 cell proofs: verification lands with the crypto lane's cell API.
+    /// EIP-7594 cell proofs, but the verifier has no `cells` state.
     CellProofsUnsupported,
     /// A blob element is not canonical, or a commitment or proof is not a valid point.
     InvalidKzgInput,
@@ -131,7 +132,23 @@ pub const KzgVerifier = struct {
     settings: *const kzg_blob.Settings,
     workspace: *kzg_blob.Workspace,
     batch: *kzg_blob.BatchStorage(blobs_per_tx_max),
+    /// EIP-7594 state; without it v1 sidecars fail with `CellProofsUnsupported`.
+    cells: ?CellVerifier = null,
 };
+
+/// EIP-7594 cell verification state (about 2.8 MiB with verifier-only settings:
+/// `kzg.cells.Settings.init_verifier`). Each blob's 128 cells are recomputed from the
+/// blob and checked against its 128 proofs in one batch.
+pub const CellVerifier = struct {
+    settings: *const kzg_cells.Settings,
+    workspace: *kzg_cells.Workspace,
+    batch: *kzg_cells.VerifyStorage(cells_per_ext_blob),
+    cells: *kzg_cells.Cells,
+};
+
+comptime {
+    assert(kzg_cells.cells_per_ext_blob == cells_per_ext_blob);
+}
 
 pub const Sidecar = struct {
     version: WrapperVersion = .eip4844,
@@ -158,7 +175,9 @@ pub const Sidecar = struct {
 
     /// Verifies every blob proof in one batched pairing check. Call after `validate`.
     pub fn verify_kzg(sidecar: Sidecar, verifier: KzgVerifier) KzgError!void {
-        if (sidecar.version != .eip4844) return error.CellProofsUnsupported;
+        if (sidecar.version == .eip7594) {
+            return sidecar.verify_cells(verifier.cells orelse return error.CellProofsUnsupported);
+        }
         const count = sidecar.blobs.count();
         assert(count <= blobs_per_tx_max);
         assert(sidecar.commitments.count() == count and sidecar.proofs.count() == count);
@@ -183,6 +202,44 @@ pub const Sidecar = struct {
             error.InvalidInputLength => unreachable, // All three slices hold `count` items.
         };
         if (!valid) return error.KzgProofMismatch;
+    }
+
+    /// EIP-7594: proof `index * 128 + k` opens cell k of blob `index`.
+    fn verify_cells(sidecar: Sidecar, verifier: CellVerifier) KzgError!void {
+        assert(sidecar.version == .eip7594);
+        const count = sidecar.blobs.count();
+        assert(count <= blobs_per_tx_max);
+        assert(sidecar.proofs.count() == count * cells_per_ext_blob);
+        var indices: [cells_per_ext_blob]u64 = undefined;
+        for (&indices, 0..) |*cell_index, k| cell_index.* = k;
+        var commitments: [cells_per_ext_blob]kzg_cells.Commitment = undefined;
+        var proofs: [cells_per_ext_blob]kzg_cells.Proof = undefined;
+        for (0..count) |index| {
+            kzg_cells.compute_cells(
+                verifier.settings,
+                verifier.workspace,
+                sidecar.blobs.get(index),
+                verifier.cells,
+            ) catch return error.InvalidKzgInput; // Only non-canonical blob elements.
+            @memset(&commitments, sidecar.commitments.get(index).*);
+            for (&proofs, 0..) |*proof, k| {
+                proof.* = sidecar.proofs.get(index * cells_per_ext_blob + k).*;
+            }
+            const valid = kzg_cells.verify_cell_kzg_proof_batch(
+                verifier.settings,
+                verifier.workspace,
+                verifier.batch.scratch(),
+                &commitments,
+                &indices,
+                verifier.cells,
+                &proofs,
+            ) catch |err| return switch (err) {
+                error.InvalidFieldElement, error.InvalidPoint => error.InvalidKzgInput,
+                // Fixed 128-cell batches with indices 0..127 and storage for 128 cells.
+                error.InvalidCellIndex, error.InvalidLength, error.ScratchTooSmall => unreachable,
+            };
+            if (!valid) return error.KzgProofMismatch;
+        }
     }
 
     fn version_length(sidecar: Sidecar) usize {
@@ -504,7 +561,8 @@ var test_blob_list: [2 * (bytes_per_blob + 4)]u8 = undefined;
 
 test "sidecar: KZG verification" {
     const v1: Sidecar = .{ .version = .eip7594 };
-    const no_verifier: KzgVerifier = undefined;
+    var no_verifier: KzgVerifier = undefined;
+    no_verifier.cells = null;
     try testing.expectError(error.CellProofsUnsupported, v1.verify_kzg(no_verifier));
     if (!heavy_tests) return error.SkipZigTest;
     const verifier = try test_verifier();
@@ -541,5 +599,64 @@ test "sidecar: KZG verification" {
     var bad_point: kzg_blob.Proof = @splat(0xff);
     bad_point[0] = 0x9f;
     sidecar.proofs = ProofList.build(&proof_buffer, &.{ proofs[0], bad_point });
+    try testing.expectError(error.InvalidKzgInput, sidecar.verify_kzg(verifier));
+}
+
+var test_cell_storage: kzg_cells.Settings.Storage = undefined;
+var test_cell_workspace: kzg_cells.Workspace = undefined;
+var test_cell_batch: kzg_cells.VerifyStorage(cells_per_ext_blob) = .{};
+var test_cells: kzg_cells.Cells = undefined;
+var test_cell_proofs: kzg_cells.Proofs = undefined;
+var test_cell_proof_list: [cells_per_ext_blob * (bytes_per_proof + 1)]u8 = undefined;
+
+test "sidecar: EIP-7594 cell proof verification" {
+    if (!heavy_tests) return error.SkipZigTest;
+    // Full settings: the test computes the proofs with FK20.
+    const cell_settings = try kzg_cells.Settings.init(&test_cell_storage);
+    var verifier = try test_verifier();
+    verifier.cells = .{
+        .settings = &cell_settings,
+        .workspace = &test_cell_workspace,
+        .batch = &test_cell_batch,
+        .cells = &test_cells,
+    };
+    var prng = Prng.init(0x7594);
+    const blob = &test_blobs[0];
+    @memset(blob, 0);
+    for (0..kzg_blob.field_elements) |element| blob[element * 32 + 31] = prng.int(u8);
+    const commitment = try kzg_blob.blob_to_kzg_commitment(
+        verifier.settings,
+        verifier.workspace,
+        blob,
+    );
+    try kzg_cells.compute_cells_and_kzg_proofs(
+        &cell_settings,
+        &test_cell_workspace,
+        blob,
+        &test_cells,
+        &test_cell_proofs,
+    );
+    var commitment_buffer: [64]u8 = undefined;
+    var sidecar: Sidecar = .{
+        .version = .eip7594,
+        .blobs = BlobList.build(&test_blob_list, test_blobs[0..1]),
+        .commitments = CommitmentList.build(&commitment_buffer, &.{commitment}),
+        .proofs = ProofList.build(&test_cell_proof_list, &test_cell_proofs),
+    };
+    try sidecar.verify_kzg(verifier);
+    // A proof for another cell does not open this one.
+    const saved = test_cell_proofs[5];
+    test_cell_proofs[5] = test_cell_proofs[6];
+    sidecar.proofs = ProofList.build(&test_cell_proof_list, &test_cell_proofs);
+    try testing.expectError(error.KzgProofMismatch, sidecar.verify_kzg(verifier));
+    test_cell_proofs[5] = @splat(0xff);
+    test_cell_proofs[5][0] = 0x9f;
+    sidecar.proofs = ProofList.build(&test_cell_proof_list, &test_cell_proofs);
+    try testing.expectError(error.InvalidKzgInput, sidecar.verify_kzg(verifier));
+    test_cell_proofs[5] = saved;
+    // A non-canonical blob element.
+    blob[0] = 0xff;
+    sidecar.blobs = BlobList.build(&test_blob_list, test_blobs[0..1]);
+    sidecar.proofs = ProofList.build(&test_cell_proof_list, &test_cell_proofs);
     try testing.expectError(error.InvalidKzgInput, sidecar.verify_kzg(verifier));
 }
