@@ -24,6 +24,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `rpc_types/request`: TransactionRequest (incl. 0x79 scalar fields) and EIP-1898 block
   ids from a parsed `std.json.Value`.
 - [x] `rpc_types/request`: 0x79 `accountChanges`/`calls` in requests (round-trip the writer).
+- [x] `signer`: `eth_signTransaction` request body, response parse, content + signer checks.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -87,3 +88,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: blob sidecar KZG verification (v0).
 - 2026-11-05: rpc_types request parsing (TransactionRequest, BlockId).
 - 2026-11-05: 0x79 accountChanges/calls request parsing.
+- 2026-11-05: remote signer codecs (`common/signer`).
