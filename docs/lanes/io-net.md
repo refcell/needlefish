@@ -98,3 +98,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: json.find_path (raw value at an object key path); l1_head: `cap_head` + `Calculator(IO)` (outputAtBlock -> finalized -> capped block hash), SimIo-tested against a fake node.
 - 2026-11-05: upgrade_signal core (version, contract ABI with comptime keccak selectors, Reader: block by tag -> eth_call x2 at blockHash); decode fails closed (canonical offset, length <= 256, zero-padded uint64).
 - 2026-11-05: upgrade_signal Observer: immediate + tag-interval single-attempt polls, keeps last schedule on failure, on_update on first/changed, per-upgrade labeled metrics.
+- 2026-11-05: http: close-delimited responses (no length, no chunking) were parsed as empty bodies; now `.incomplete` until EOF, finished by `parse_response_at_eof` from the client (keep_alive=false). optimism-rpc skipped: thin typed wrappers over `rpc.Client`, call sites live in consensus/batcher.

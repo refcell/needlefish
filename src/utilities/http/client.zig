@@ -257,7 +257,7 @@ pub fn Client(comptime IO: type) type {
             assert(completion == &client.completion);
             assert(client.state == .receiving);
             const size = result catch return client.fail_or_retry(error.RecvFailed);
-            if (size == 0) return client.fail_or_retry(error.ConnectionClosed);
+            if (size == 0) return client.on_eof();
             client.recv_size += @intCast(size);
             const buffered = client.recv_buffer[0..client.recv_size];
             const limits = client.options.limits;
@@ -277,6 +277,26 @@ pub fn Client(comptime IO: type) type {
                     // Extra bytes after a response mean the stream is out of sync.
                     const leftover = complete.consumed != client.recv_size;
                     if (!complete.message.keep_alive or leftover) client.disconnect();
+                    client.state = .idle;
+                    client.callback(client.context, client, &complete.message);
+                },
+            }
+        }
+
+        /// The server closed: completes a close-delimited response, otherwise fails.
+        fn on_eof(client: *Self) void {
+            if (client.recv_size == 0) return client.fail_or_retry(error.ConnectionClosed);
+            const buffered = client.recv_buffer[0..client.recv_size];
+            const limits = client.options.limits;
+            const parsed = parser.parse_response_at_eof(buffered, limits, client.method) catch {
+                client.disconnect();
+                return client.finish(error.InvalidResponse);
+            };
+            client.disconnect();
+            switch (parsed) {
+                .incomplete => client.finish(error.ConnectionClosed),
+                .complete => |complete| {
+                    assert(client.fd == null);
                     client.state = .idle;
                     client.callback(client.context, client, &complete.message);
                 },

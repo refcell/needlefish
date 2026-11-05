@@ -292,10 +292,31 @@ fn chunked_complete(buffer: []const u8, offset: u32) bool {
 }
 
 /// Parses one response. `request_method` decides whether a body is expected (HEAD has none).
+/// A response with a body but no declared length is delimited by connection close (RFC 9112
+/// 6.3): it stays `.incomplete` here; finish it with `parse_response_at_eof`.
 pub fn parse_response(
     buffer: []u8,
     limits: Limits,
     request_method: Method,
+) Error!Parsed(Response) {
+    return parse_response_framed(buffer, limits, request_method, false);
+}
+
+/// Like `parse_response`, after the peer closed the connection: a close-delimited body ends
+/// at the end of `buffer`. Length-framed and chunked responses must already be complete.
+pub fn parse_response_at_eof(
+    buffer: []u8,
+    limits: Limits,
+    request_method: Method,
+) Error!Parsed(Response) {
+    return parse_response_framed(buffer, limits, request_method, true);
+}
+
+fn parse_response_framed(
+    buffer: []u8,
+    limits: Limits,
+    request_method: Method,
+    at_eof: bool,
 ) Error!Parsed(Response) {
     const head = try parse_head(buffer, limits) orelse return .incomplete;
     const line = head.start_line;
@@ -307,12 +328,18 @@ pub fn parse_response(
     const reason = if (line.len > 13) line[13..] else "";
     const no_body = request_method == .HEAD or status < 200 or status == 204 or status == 304;
     const kind: BodyKind = if (no_body) .none else try body_kind(&head.headers, limits);
-    // Responses without a length are delimited by close; this client requires a length.
-    if (!no_body and kind == .none and head.headers.get("content-length") == null) {
-        if (keep_alive_of(version, &head.headers)) return error.InvalidContentLength;
+    const close_delimited = !no_body and kind == .none and
+        head.headers.get("content-length") == null;
+    var body: Body = undefined;
+    if (close_delimited) {
+        if (buffer.len - head.body_offset > limits.body_size_max) return error.BodyTooLarge;
+        if (!at_eof) return .incomplete;
+        const end: u32 = @intCast(buffer.len);
+        body = .{ .body = buffer[head.body_offset..end], .end = end };
+    } else {
+        if (kind == .chunked and !chunked_complete(buffer, head.body_offset)) return .incomplete;
+        body = try parse_body(buffer, head.body_offset, kind, limits) orelse return .incomplete;
     }
-    if (kind == .chunked and !chunked_complete(buffer, head.body_offset)) return .incomplete;
-    const body = try parse_body(buffer, head.body_offset, kind, limits) orelse return .incomplete;
     return .{ .complete = .{
         .message = .{
             .status = status,
@@ -320,7 +347,7 @@ pub fn parse_response(
             .version = version,
             .headers = head.headers,
             .body = body.body,
-            .keep_alive = keep_alive_of(version, &head.headers),
+            .keep_alive = !close_delimited and keep_alive_of(version, &head.headers),
         },
         .consumed = body.end,
     } };

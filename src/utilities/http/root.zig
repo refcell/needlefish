@@ -22,4 +22,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("server_test.zig");
     _ = @import("timeout_test.zig");
+    _ = @import("framing_test.zig");
 }
