@@ -494,7 +494,49 @@ Window as wall-clock span (state + span x bytes/block, this state):
 
 Node defaults from this: `--proofs-history.window` 300 (60 s at 200 ms) and
 `Limits.history_bytes_max` 1 GiB. The history commit (~12 ms typical, ~34 ms heavy) runs on top
-of the block apply + root (~8 ms heavy) inside the 200 ms slot.
+of the block apply + root (~8 ms heavy) inside the 200 ms slot. (Commit time and path bytes
+since cut: see "db history commit at 200 ms blocks" below.)
+
+## 2026-11-05 db history commit at 200 ms blocks (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/history`, same state and blocks as the memory
+section above. Before = parent commit, after = this change; both binaries run interleaved,
+three runs each, medians of the per-run p50 and max (64 steady-state commits per run). The
+machine was loaded (load average 70-150 from other builds), so max is mostly scheduling
+noise; one run of each saw a 73-160 ms outlier.
+
+| Block | before p50 / max | after p50 / max | p50 change |
+| --- | ---: | ---: | --- |
+| typical 1k acct + 1k slot | 9.97 / 17.3 ms | 3.75 / 13.5 ms | -62% |
+| heavy 1k acct + 4k slot | 17.03 / 23.4 ms | 5.73 / 8.65 ms | -66% |
+
+Profile (`sample` on the bench binary, heavy, before): visit walk + version writes 52%,
+tombstone diff (`bury_removed`) 32%, the second `drain` walk 17%, pruning ~0 (46 µs per
+block once the window is full). Changes, in order of gain:
+- The `drain` walk only cleared change marks but re-encoded every changed node:
+  `TrieType.clear_changes` memsets the bitsets instead (heavy 20 -> ~16 ms in a first run).
+- Version metadata in the record's padding (still 32 bytes): node kind, branch child mask
+  (both from the trie node, `Visit.kind`/`branch_mask`), and a 14-bit fingerprint of the
+  node reference (`Visit.reference`, the hash the trie already has). The diff reads masks
+  instead of RLP-decoding the old and new encodings (decode only for account leaves and
+  extensions), and an unchanged-encoding check loads the old encoding only when length and
+  fingerprint match (heavy ~16 -> 10.8 ms).
+- `db/path_index.zig` replaces `std.AutoHashMapUnmanaged(Key, u32)`: 8-byte slots (key
+  hash, path id), keys compared in the path records the lookup loads anyway, linear probing
+  with backward-shift deletion (no tombstones, no periodic rehash). One slot line plus the
+  record instead of metadata + key + value + record (heavy 10.8 -> 5.7 ms).
+
+Memory: `path_bytes` 147 -> 84 B (the key lives once, in the path record). State bytes
+78.7 -> 65.0 MiB; steady 64-block window 259.0 -> 245.3 MiB typical, 378.3 -> 364.6 MiB
+heavy; bytes per block unchanged (2.82 / 4.68 MiB). At the node default 300 blocks the
+1 GiB budget keeps ~204 heavy blocks (40.8 s). The index is filled at init and `reset`
+(1.5 slots per path: ~37 MiB for the node's ~3.1M paths, vs ~4 MiB of hash map metadata).
+
+Remaining heavy commit (~5.7 ms): the trie's full-node re-encode per visited node, copying
+15k encodings (~4.7 MiB) into the pools, and one random path record + version per node.
+Moving the commit off the block's critical path was evaluated and not done: at ~6 ms of a
+200 ms slot it does not pay for a second history state (proofs at the head would have to
+wait or fall back to live state) and the ordering it adds under DST.
 
 ## Targets
 

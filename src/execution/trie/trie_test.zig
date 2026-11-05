@@ -437,6 +437,9 @@ fn ChangeModel(comptime T: type) type {
         pub fn visit(self: *Self, visit_info: trie_module.Visit) !void {
             assert(visit_info.encoding.len <= T.node_bytes_max);
             self.visited += 1;
+            const reference = node.RlpNode.from_rlp(visit_info.encoding);
+            try testing.expectEqualSlices(u8, reference.slice(), visit_info.reference);
+            try testing.expectEqual(visit_info.kind == .branch, visit_info.branch_mask != 0);
             const key = key_of(visit_info.path);
             if (self.checking) {
                 const stored = self.map.getPtr(key) orelse return error.TestUnexpectedResult;
@@ -477,7 +480,13 @@ fn check_change_tracking(comptime T: type, seed: u64) !void {
         try trie.visit_nodes(trie.root, .count, &model);
         const counted = model.visited;
         model.visited = 0;
-        try trie.visit_nodes(trie.root, mode, &model);
+        if (round % 2 == 1) {
+            // `count` then `clear_changes` is a drain without the second walk.
+            try trie.visit_nodes(trie.root, .count, &model);
+            trie.clear_changes();
+        } else {
+            try trie.visit_nodes(trie.root, mode, &model);
+        }
         if (round > 0) try testing.expectEqual(counted, model.visited);
         // Nothing changed since the drain: a second drain visits nothing.
         model.visited = 0;

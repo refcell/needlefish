@@ -379,6 +379,11 @@ pub const StateTrie = struct {
         /// Nibbles from the trie root to the node.
         path: []const u8,
         encoding: []const u8,
+        /// The node's reference in its parent (hash, or the encoding when short).
+        reference: []const u8,
+        kind: trie_module.VisitKind,
+        /// Branch: one bit per non-empty child slot; 0 otherwise.
+        branch_mask: u16,
     };
 
     /// Starts recording rehashed nodes in both pools (see `TrieType.track_changes`).
@@ -386,6 +391,13 @@ pub const StateTrie = struct {
         try self.accounts.track_changes(allocator);
         try self.storage.track_changes(allocator);
         assert(self.accounts.changed.len > 0 and self.storage.changed.len > 0);
+    }
+
+    /// Clears the change marks of both pools (see `TrieType.clear_changes`).
+    pub fn clear_changes(self: *StateTrie) void {
+        assert(self.dirty_len == 0);
+        self.accounts.clear_changes();
+        self.storage.clear_changes();
     }
 
     /// Calls `visitor.visit(NodeVisit)` for account-trie nodes (see `TrieType.visit_nodes`)
@@ -408,6 +420,9 @@ pub const StateTrie = struct {
                     .owner = wrapper.owner,
                     .path = visit_info.path,
                     .encoding = visit_info.encoding,
+                    .reference = visit_info.reference,
+                    .kind = visit_info.kind,
+                    .branch_mask = visit_info.branch_mask,
                 });
             }
         };
@@ -420,6 +435,9 @@ pub const StateTrie = struct {
                     .owner = null,
                     .path = visit_info.path,
                     .encoding = visit_info.encoding,
+                    .reference = visit_info.reference,
+                    .kind = visit_info.kind,
+                    .branch_mask = visit_info.branch_mask,
                 });
                 if (visit_info.leaf_key.len == 0) return;
                 assert(visit_info.leaf_key.len == 64);

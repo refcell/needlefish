@@ -232,6 +232,7 @@ const Harness = struct {
     /// the oldest block), then drains the prune queue and checks that exactly the nodes of
     /// the oldest block's trie remain at or before it (deleted paths are freed).
     fn sweep(self: *Harness) !void {
+        try testing.expect(try self.store.check_metadata() > 0);
         const window = self.store.window().?;
         var number = window.head;
         while (true) : (number -= 1) {
@@ -596,7 +597,7 @@ test "history: a state above the byte budget is refused" {
     // The unit sizes docs/PERF.md and the lane decisions quote.
     try testing.expectEqual(@as(u64, 196), history.small_version_bytes);
     try testing.expectEqual(@as(u64, 682), history.large_version_bytes);
-    try testing.expectEqual(@as(u64, 147), history.path_bytes);
+    try testing.expectEqual(@as(u64, 84), history.path_bytes);
     var prng = Prng.init(0xb0d9);
     var harness: Harness = undefined;
     try harness.init(sized_config(4, block_versions_max));

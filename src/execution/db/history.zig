@@ -24,9 +24,12 @@ const assert = std.debug.assert;
 const trie = @import("../trie/root.zig");
 const changeset_module = @import("changeset.zig");
 const lazy_alloc = @import("../../utilities/lazy_alloc/root.zig");
+const PathIndex = @import("path_index.zig").PathIndex;
+const IndexSlot = @import("path_index.zig").Slot;
 const rlp = trie.rlp;
 const nibbles_module = trie.nibbles;
 const StateTrie = trie.StateTrie;
+const VisitKind = trie.trie.VisitKind;
 
 pub const Address = changeset_module.Address;
 pub const Hash = changeset_module.Hash;
@@ -123,17 +126,49 @@ const Version = struct {
     path: u32,
     /// Encoding length; 0 is a tombstone (no node at the path from this block on).
     len: u16,
+    /// Branch: one bit per non-empty child slot (from the trie); 0 otherwise.
+    mask: u16,
+    tag: Tag,
 };
 
-const Path = struct { key: Key, head: u32 };
+/// The node kind (meaningless for a tombstone) and a fingerprint of the node's reference in
+/// its parent: two versions with different fingerprints have different encodings, so
+/// `commit_block` skips the byte compare (and the load of the old encoding) for them.
+const Tag = packed struct(u16) { kind: VisitKind, fingerprint: u14 };
+
+fn fingerprint(reference: []const u8) u14 {
+    assert(reference.len > 0 and reference.len <= 33);
+    return @truncate(std.hash.Wyhash.hash(0, reference));
+}
+
+comptime {
+    // Metadata lives in what was padding: the record stays one half cache line.
+    assert(@sizeOf(Version) == 32);
+}
+
+const Path = struct { head: u32, key: Key };
+
+fn key_hash(key: *const Key) u32 {
+    return @truncate(std.hash.Wyhash.hash(0, key));
+}
+
+/// `PathIndex` key comparison against the stored path records.
+const KeyMatcher = struct {
+    paths: []const Path,
+    key: *const Key,
+
+    pub fn eql(self: KeyMatcher, id: u32) bool {
+        return std.mem.eql(u8, &self.paths[id].key, self.key);
+    }
+};
 
 /// Bytes one occupied slot holds, as `Store.bytes_used` counts them: a version record, its
-/// encoding slot, and its free-stack entry; a path record, its free-stack entry, and its
-/// `path_index` entry (key, value, one metadata byte; the index's load-factor slack is
-/// static capacity, not counted).
+/// encoding slot, and its free-stack entry; a path record (key and newest version), its
+/// free-stack entry, and its `path_index` slot (the index's load-factor slack is static
+/// capacity, not counted).
 pub const small_version_bytes: u64 = @sizeOf(Version) + small_bytes + @sizeOf(u32);
 pub const large_version_bytes: u64 = @sizeOf(Version) + large_bytes + @sizeOf(u32);
-pub const path_bytes: u64 = @sizeOf(Path) + @sizeOf(u32) + @sizeOf(Key) + @sizeOf(u32) + 1;
+pub const path_bytes: u64 = @sizeOf(Path) + @sizeOf(u32) + @sizeOf(IndexSlot);
 
 comptime {
     assert(small_version_bytes < large_version_bytes);
@@ -295,10 +330,6 @@ fn node_shape(bytes: []const u8) StepError!Shape {
     return .{ .kind = .extension, .path = decoded.path };
 }
 
-const Drain = struct {
-    pub fn visit(_: *Drain, _: StateTrie.NodeVisit) error{}!void {}
-};
-
 /// Pruning and sizing. `commit_block` only moves the window: the block that becomes the
 /// oldest hands its versions to a FIFO prune queue. `prune_step(budget)` examines up to
 /// `budget` queued versions; for each it frees the older version it shadows (in FIFO order
@@ -324,15 +355,13 @@ const Drain = struct {
 /// alone is above the budget.
 pub const Store = struct {
     config: Config,
-    path_index: std.AutoHashMapUnmanaged(Key, u32),
+    path_index: PathIndex,
     paths: []Path,
     path_free: []u32,
     path_free_len: u32,
     /// Path slots `[paths_fresh, paths_max)` were never used since the last `clear` (as
     /// `Pool.fresh`: only used slots are touched, the arrays are lazily committed).
     paths_fresh: u32,
-    /// Paths removed from `path_index` since its last rehash (tombstone cleanup).
-    paths_removed: u32,
     small: Pool(small_bytes),
     large: Pool(large_bytes),
     /// Ring of retained blocks, oldest first; one spare slot for the block being written.
@@ -350,8 +379,7 @@ pub const Store = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {
         assert(config.window_blocks > 0);
         assert(config.small_versions_max < large_bit and config.large_versions_max < large_bit);
-        var path_index: std.AutoHashMapUnmanaged(Key, u32) = .empty;
-        try path_index.ensureTotalCapacity(allocator, config.paths_max);
+        var path_index = try PathIndex.init(allocator, config.paths_max);
         errdefer path_index.deinit(allocator);
         const paths = try lazy_alloc.alloc(allocator, Path, config.paths_max);
         errdefer lazy_alloc.free(allocator, paths);
@@ -371,7 +399,6 @@ pub const Store = struct {
             .path_free = path_free,
             .path_free_len = 0,
             .paths_fresh = 0,
-            .paths_removed = 0,
             .small = small,
             .large = large,
             .blocks = blocks,
@@ -400,10 +427,9 @@ pub const Store = struct {
     }
 
     fn clear(self: *Store) void {
-        self.path_index.clearRetainingCapacity();
+        self.path_index.clear();
         self.path_free_len = 0;
         self.paths_fresh = 0;
-        self.paths_removed = 0;
         self.small.clear();
         self.large.clear();
         self.blocks_start = 0;
@@ -452,7 +478,8 @@ pub const Store = struct {
 
     /// Whether the store holds any version at the path (freed paths are gone).
     pub fn contains_path(self: *const Store, owner: ?Hash, path: []const u8) bool {
-        return self.path_index.contains(make_key(owner, path));
+        const key = make_key(owner, path);
+        return self.find_path(&key) != null;
     }
 
     /// Versions written by the head block (for sizing `B`, see `Store`).
@@ -464,23 +491,61 @@ pub const Store = struct {
     /// Node versions at or before the oldest block (tests: after the queue drains this is
     /// the node count of the oldest block's trie). O(paths).
     pub fn base_node_count(self: *const Store) u32 {
-        const oldest = self.window().?.oldest;
-        var count: u32 = 0;
-        var iterator = self.path_index.valueIterator();
-        while (iterator.next()) |path_id| {
-            var id = self.paths[path_id.*].head;
-            var steps: u64 = 0;
-            while (id != none) : (steps += 1) {
-                assert(steps <= self.versions_total());
-                const current = self.version(id);
-                if (current.block <= oldest) {
-                    if (current.len > 0) count += 1;
-                    break;
+        const Counter = struct {
+            store: *const Store,
+            oldest: u64,
+            count: u32 = 0,
+
+            pub fn visit(counter: *@This(), path_id: u32) void {
+                var id = counter.store.paths[path_id].head;
+                var steps: u64 = 0;
+                while (id != none) : (steps += 1) {
+                    assert(steps <= counter.store.versions_total());
+                    const current = counter.store.version(id);
+                    if (current.block <= counter.oldest) {
+                        if (current.len > 0) counter.count += 1;
+                        break;
+                    }
+                    id = current.prev;
                 }
+            }
+        };
+        var counter: Counter = .{ .store = self, .oldest = self.window().?.oldest };
+        self.path_index.for_each(&counter);
+        return counter.count;
+    }
+
+    /// Tests: every stored version's metadata (kind, branch mask, fingerprint) matches its
+    /// encoding, as if decoded. O(versions); returns the versions checked.
+    pub fn check_metadata(self: *const Store) error{HistoryCorrupt}!u64 {
+        var checked: u64 = 0;
+        for (self.path_index.slots) |slot| {
+            if (slot.id == none) continue;
+            var id = self.paths[slot.id].head;
+            while (id != none) : (checked += 1) {
+                assert(checked <= self.versions_total());
+                const current = self.version(id);
+                if (current.len > 0) try self.check_version_metadata(id);
                 id = current.prev;
             }
         }
-        return count;
+        return checked;
+    }
+
+    fn check_version_metadata(self: *const Store, id: u32) error{HistoryCorrupt}!void {
+        const current = self.version(id);
+        const bytes = self.encoding(id);
+        assert(bytes.len > 0);
+        const shape = node_shape(bytes) catch return error.HistoryCorrupt;
+        const kind: VisitKind = switch (shape.kind) {
+            .leaf => .leaf,
+            .extension => .extension,
+            .branch => .branch,
+        };
+        if (kind != current.tag.kind) return error.HistoryCorrupt;
+        if (shape.mask != current.mask) return error.HistoryCorrupt;
+        const reference = trie.node.RlpNode.from_rlp(bytes);
+        if (fingerprint(reference.slice()) != current.tag.fingerprint) return error.HistoryCorrupt;
     }
 
     fn versions_total(self: *const Store) u64 {
@@ -512,6 +577,11 @@ pub const Store = struct {
         return self.path_free_len + (@as(u32, @intCast(self.paths.len)) - self.paths_fresh);
     }
 
+    fn find_path(self: *const Store, key: *const Key) ?u32 {
+        const matcher: KeyMatcher = .{ .paths = self.paths, .key = key };
+        return self.path_index.find(key_hash(key), matcher);
+    }
+
     fn new_path(self: *Store, key: *const Key) u32 {
         assert(self.paths_available() > 0);
         var id: u32 = undefined;
@@ -524,18 +594,16 @@ pub const Store = struct {
             self.paths_fresh += 1;
         }
         self.paths[id] = .{ .key = key.*, .head = none };
-        self.path_index.putAssumeCapacityNoClobber(key.*, id);
+        self.path_index.insert(key_hash(key), id);
         return id;
     }
 
     fn free_path(self: *Store, id: u32) void {
         assert(self.paths[id].head == none);
         assert(self.path_free_len < self.paths_fresh);
-        const removed = self.path_index.remove(self.paths[id].key);
-        assert(removed);
+        self.path_index.remove(key_hash(&self.paths[id].key), id);
         self.path_free[self.path_free_len] = id;
         self.path_free_len += 1;
-        self.paths_removed += 1;
     }
 
     /// Drops all history and stores every node of `state_trie` as block `number`, the new
@@ -590,8 +658,7 @@ pub const Store = struct {
             _ = self.prune_step(self.prune_count);
             try self.write_block(state_trie, number, root);
         };
-        var drain: Drain = .{};
-        try state_trie.visit_nodes(.drain, &drain);
+        state_trie.clear_changes();
         if (self.blocks_len > self.config.window_blocks) self.advance_oldest();
         try self.fit_budget();
         assert(self.window().?.head == number);
@@ -679,12 +746,6 @@ pub const Store = struct {
             self.prune_version(id);
         }
         assert((self.prune_head == none) == (self.prune_count == 0));
-        // Removed keys leave hash map tombstones that lengthen probes; one O(paths) rehash
-        // per paths_max / 2 removals keeps the amortized cost per removal constant.
-        if (self.paths_removed > 0 and self.paths_removed >= self.paths.len / 2) {
-            self.path_index.rehash(std.hash_map.AutoContext(Key){});
-            self.paths_removed = 0;
-        }
         return examined;
     }
 
@@ -754,7 +815,8 @@ pub const Store = struct {
     /// The newest version of the path at or before `number`; null when there is none or it
     /// is a tombstone.
     fn lookup(self: *const Store, owner: ?Hash, path: []const u8, number: u64) ?u32 {
-        const path_id = self.path_index.get(make_key(owner, path)) orelse return null;
+        const key = make_key(owner, path);
+        const path_id = self.find_path(&key) orelse return null;
         var id = self.paths[path_id].head;
         var steps: u64 = 0;
         while (id != none) : (steps += 1) {
@@ -767,17 +829,22 @@ pub const Store = struct {
         return null;
     }
 
-    /// Whether `visit` needs a new version, and whether its path is new.
-    fn needs_version(self: *const Store, key: *const Key, visit_encoding: []const u8) struct {
-        version: bool,
-        path_id: ?u32,
-    } {
+    /// Whether a node with `visit_encoding` and `tag` needs a new version, and whether its
+    /// path is new. Only equal lengths and fingerprints load the old encoding.
+    fn needs_version(
+        self: *const Store,
+        key: *const Key,
+        visit_encoding: []const u8,
+        tag: Tag,
+    ) struct { version: bool, path_id: ?u32 } {
         assert(visit_encoding.len > 0);
-        const path_id = self.path_index.get(key.*) orelse
-            return .{ .version = true, .path_id = null };
+        const path_id = self.find_path(key) orelse return .{ .version = true, .path_id = null };
         const head = self.paths[path_id].head;
         assert(head != none);
-        const same = std.mem.eql(u8, self.encoding(head), visit_encoding);
+        const current = self.version(head);
+        const same = current.len == visit_encoding.len and
+            @as(u16, @bitCast(current.tag)) == @as(u16, @bitCast(tag)) and
+            std.mem.eql(u8, self.encoding(head), visit_encoding);
         return .{ .version = !same, .path_id = path_id };
     }
 
@@ -797,8 +864,10 @@ pub const Store = struct {
     ) error{HistoryFull}!void {
         const length = visit.encoding.len;
         assert(length > 0 and length <= large_bytes);
+        assert((visit.kind == .branch) == (visit.branch_mask != 0));
         const key = make_key(visit.owner, visit.path);
-        const needed = self.needs_version(&key, visit.encoding);
+        const tag: Tag = .{ .kind = visit.kind, .fingerprint = fingerprint(visit.reference) };
+        const needed = self.needs_version(&key, visit.encoding, tag);
         if (!needed.version) return;
         // Check every resource before taking any, so a failure leaves nothing behind.
         if (needed.path_id == null and self.paths_available() == 0) return error.HistoryFull;
@@ -814,11 +883,23 @@ pub const Store = struct {
             @memcpy(self.large.data[index][0..length], visit.encoding);
             id = index | large_bit;
         }
-        self.link_version(path_id, id, number, @intCast(length));
+        self.link_version(path_id, id, number, .{
+            .len = @intCast(length),
+            .mask = visit.branch_mask,
+            .tag = tag,
+        });
     }
 
+    const VersionMeta = struct { len: u16, mask: u16, tag: Tag };
+
+    const tombstone_meta: VersionMeta = .{
+        .len = 0,
+        .mask = 0,
+        .tag = .{ .kind = .leaf, .fingerprint = 0 },
+    };
+
     /// Makes `id` the newest version of the path and of the head block.
-    fn link_version(self: *Store, path_id: u32, id: u32, number: u64, length: u16) void {
+    fn link_version(self: *Store, path_id: u32, id: u32, number: u64, meta: VersionMeta) void {
         const path = &self.paths[path_id];
         if (path.head != none) {
             assert(self.version(path.head).block < number);
@@ -833,7 +914,9 @@ pub const Store = struct {
             .newer = none,
             .block_next = entry.versions,
             .path = path_id,
-            .len = length,
+            .len = meta.len,
+            .mask = meta.mask,
+            .tag = meta.tag,
         };
         if (entry.versions == none) entry.versions_tail = id;
         path.head = id;
@@ -848,7 +931,8 @@ pub const Store = struct {
         path: []const u8,
         number: u64,
     ) error{HistoryFull}!bool {
-        const path_id = self.path_index.get(make_key(owner, path)).?;
+        const key = make_key(owner, path);
+        const path_id = self.find_path(&key).?;
         const head = self.version(self.paths[path_id].head);
         if (head.len == 0) {
             assert(head.block == number);
@@ -857,7 +941,7 @@ pub const Store = struct {
         // An unreachable node is never visited, so it has no version in this block.
         assert(head.block < number);
         if (self.small.available() == 0) return error.HistoryFull;
-        self.link_version(path_id, self.small.take(), number, 0);
+        self.link_version(path_id, self.small.take(), number, tombstone_meta);
         return true;
     }
 
@@ -897,23 +981,37 @@ pub const Store = struct {
         number: u64,
     ) Error!void {
         const current = self.version(id);
+        const previous = self.version(current.prev);
+        assert(current.len > 0 and previous.len > 0);
         const key = &self.paths[current.path].key;
         const owner = key_owner(key);
+        // The metadata settles the common cases without decoding: a storage leaf has nothing
+        // below it, and a branch that keeps all its children drops nothing.
+        const kept_mask: u16 = if (current.tag.kind == .branch) current.mask else 0;
+        switch (previous.tag.kind) {
+            .leaf => if (owner != null) return,
+            .extension => {},
+            .branch => if (previous.mask & ~kept_mask == 0) return,
+        }
         var path_buffer: [path_nibbles_max]u8 = undefined;
         const path = key_path(key, &path_buffer);
-        const old = node_shape(self.encoding(current.prev)) catch return error.HistoryCorrupt;
-        const new = node_shape(self.encoding(id)) catch return error.HistoryCorrupt;
-        switch (old.kind) {
-            .leaf => if (owner == null) try self.bury_storage_if_gone(state_trie, path, &old),
+        switch (previous.tag.kind) {
+            .leaf => {
+                const old = node_shape(self.encoding(current.prev)) catch
+                    return error.HistoryCorrupt;
+                if (old.kind != .leaf) return error.HistoryCorrupt;
+                try self.bury_storage_if_gone(state_trie, path, &old);
+            },
             .extension => {
+                const old = node_shape(self.encoding(current.prev)) catch
+                    return error.HistoryCorrupt;
+                const new = node_shape(self.encoding(id)) catch return error.HistoryCorrupt;
+                if (old.kind != .extension) return error.HistoryCorrupt;
                 const kept = new.kind == .extension and
                     std.mem.eql(u8, new.path.slice(), old.path.slice());
                 if (!kept) self.push_bury(owner, path, old.path.slice(), true);
             },
-            .branch => {
-                const kept: u16 = if (new.kind == .branch) new.mask else 0;
-                self.push_branch_children(owner, path, old.mask & ~kept, true);
-            },
+            .branch => self.push_branch_children(owner, path, previous.mask & ~kept_mask, true),
         }
         try self.bury_frames(state_trie, number);
     }
@@ -992,11 +1090,24 @@ pub const Store = struct {
                 return error.HistoryCorrupt;
             if (frame.checked and self.reachable(owner, path, number)) continue;
             if (!try self.put_tombstone(owner, path, number)) continue;
-            const old = node_shape(self.encoding(old_id)) catch return error.HistoryCorrupt;
-            switch (old.kind) {
-                .leaf => if (owner == null) try self.bury_storage_if_gone(state_trie, path, &old),
-                .extension => self.push_bury(owner, path, old.path.slice(), frame.checked),
-                .branch => self.push_branch_children(owner, path, old.mask, frame.checked),
+            const old_version = self.version(old_id);
+            switch (old_version.tag.kind) {
+                .leaf => if (owner == null) {
+                    const old = node_shape(self.encoding(old_id)) catch
+                        return error.HistoryCorrupt;
+                    if (old.kind != .leaf) return error.HistoryCorrupt;
+                    try self.bury_storage_if_gone(state_trie, path, &old);
+                },
+                .extension => {
+                    const old = node_shape(self.encoding(old_id)) catch
+                        return error.HistoryCorrupt;
+                    if (old.kind != .extension) return error.HistoryCorrupt;
+                    self.push_bury(owner, path, old.path.slice(), frame.checked);
+                },
+                .branch => {
+                    assert(old_version.mask != 0);
+                    self.push_branch_children(owner, path, old_version.mask, frame.checked);
+                },
             }
         }
     }

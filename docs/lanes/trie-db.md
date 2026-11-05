@@ -165,11 +165,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
   `eth_getProof` with many storage keys at an older block walks the history trie once per
   key; reuse `path_targets` + `history.Store.walk_paths` for one sorted walk per trie.
-- [ ] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
+- [x] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
   117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
   (version allocation, path index probes, node re-encoding) and cut it, or move it off the
   block's critical path (commit history after the head commit is durable, bounded queue of
   one block, proofs at the newest block wait or fall back to live state).
+  (`TrieType.clear_changes` replaces the drain walk; version kind/mask/fingerprint;
+  `db/path_index.zig`; interleaved medians heavy 17.0 -> 5.7 ms p50, typical 10.0 -> 3.8 ms;
+  stays on the critical path, see Decisions and PERF.md)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -332,6 +335,24 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   second `drain` walk only on success, so the commit can be retried. Replaces the old
   `count`-then-write sizing walk (still two walks per block). The oldest block only moves
   after the write succeeds.
+- History commit cost (`db/history.zig`, `db/path_index.zig`): the change marks are cleared
+  with `StateTrie.clear_changes` (bitset memset) after a successful write instead of a second
+  `drain` walk that re-encoded every changed node; marks of unreachable nodes go too, which is
+  safe because a reused node is marked again when rehashed and a trie with the same contents
+  has the same encodings. Versions carry the node kind, branch child mask, and a 14-bit
+  fingerprint of the node's reference (from the trie's `Visit`, in the record's padding, still
+  32 bytes): the removed-node diff reads masks instead of decoding both encodings, and the
+  unchanged check compares bytes only when length and fingerprint match. `Store.check_metadata`
+  (run by every history test sweep) re-derives them from the encodings. The path index is our
+  own open-addressing table of (key hash, path id) slots with keys compared in the path records
+  (linear probing, backward-shift deletion, load <= 2/3, no rehash): `path_bytes` 147 -> 84,
+  but the slot array is filled at init and `reset` (~37 MiB for the node's ~3.1M paths, vs ~4
+  MiB of std hash map metadata). Proof bytes are unchanged (the existing seeded tests compare
+  every proof against the unwound live state). Not moved off the critical path: heavy commit
+  is ~6 ms of the 200 ms slot, below the cost of a second history head (proofs at the newest
+  block waiting or falling back) and the extra ordering under DST. Remaining cost: the trie
+  re-encodes each visited node and its encoding is copied into a pool slot; taking encodings
+  from a trie-side cache would need the trie to keep full encodings.
 - History is not journaled: it is derived data. After a restart the durable database
   rebuilds the window from the retained blocks' changesets (see "History rebuild on open").
   Journaling every node version would multiply the journal volume per block for data the
@@ -639,7 +660,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - History byte budget (`history.Config.bytes_max`; the backlog's `Config.history_bytes_max`,
   kept on the store config the database already takes, plus `Limits.history_bytes_max` in
   the node): `Store.bytes_used` counts occupied paths and versions at fixed unit sizes
-  (`small_version_bytes` 196, `large_version_bytes` 682, `path_bytes` 147: record, encoding
+  (`small_version_bytes` 196, `large_version_bytes` 682, `path_bytes` 84, was 147: record, encoding
   slot, free-stack entry, index entry). After a commit writes its block and moves the window,
   `fit_budget` drains the prune queue (garbage first), then moves the oldest block forward one
   at a time and prunes what it shadowed until the store fits: the window stays contiguous

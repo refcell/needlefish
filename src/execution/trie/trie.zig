@@ -52,7 +52,14 @@ pub const Visit = struct {
     encoding: []const u8,
     /// For a leaf, the nibbles of its whole key; empty otherwise.
     leaf_key: []const u8,
+    /// The node's reference in its parent (`RlpNode`: hash, or the encoding when short).
+    reference: []const u8,
+    kind: VisitKind,
+    /// Branch: one bit per non-empty child slot; 0 otherwise.
+    branch_mask: u16,
 };
+
+pub const VisitKind = enum(u2) { leaf, extension, branch };
 
 pub fn TrieType(comptime config: Config) type {
     comptime assert(config.key_bytes_max > 0);
@@ -1118,7 +1125,41 @@ pub fn TrieType(comptime config: Config) type {
                 }
             }
             if (mode != .count) self.set_changed(index, false);
-            try visitor.visit(.{ .path = path, .encoding = encoding, .leaf_key = key[0..key_len] });
+            try visitor.visit(.{
+                .path = path,
+                .encoding = encoding,
+                .leaf_key = key[0..key_len],
+                .reference = self.cache[index].slice(),
+                .kind = visit_kind(current),
+                .branch_mask = branch_mask(current),
+            });
+        }
+
+        fn visit_kind(current: *const Node) VisitKind {
+            return switch (current.kind) {
+                .free => unreachable, // Reachable nodes are never on the free list.
+                .leaf => .leaf,
+                .extension => .extension,
+                .branch => .branch,
+            };
+        }
+
+        fn branch_mask(current: *const Node) u16 {
+            if (current.kind != .branch) return 0;
+            var mask: u16 = 0;
+            for (current.body.branch[0..16], 0..) |child, nibble| {
+                if (child != none) mask |= @as(u16, 1) << @intCast(nibble);
+            }
+            return mask;
+        }
+
+        /// Clears every change mark: what a `drain` walk does, without the walk. A consumer
+        /// that took the changed nodes with `count` calls this once it no longer needs them.
+        /// Marks of unreachable nodes go too; a reused node is marked again when rehashed.
+        pub fn clear_changes(self: *Self) void {
+            assert(self.changed.len > 0);
+            assert(self.changed.len * 64 >= self.nodes.len);
+            @memset(self.changed, 0);
         }
 
         /// Merkle proof for `key`, in the format of `eth_getProof`: the root node, then every
