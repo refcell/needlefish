@@ -39,7 +39,7 @@ fallback but hot paths should be our own, optimized implementations.
   safegcd (BLS + secp moduli) and lazy-reduction checks to the montgomery target.
 - [x] safegcd codegen: the generic copy's i318 accumulator was the 10% gap; rounded to whole
   words, secp256k1 now uses `safegcd.zig` and modinv.zig is deleted.
-- [ ] p256: wider static generator table (window 8, 64 affine entries) for verify.
+- [x] p256 window-8 generator table: closed by analysis (removes ~4 of ~32 mixed adds, ~2%).
 - [ ] fuzz campaigns: 30-minute `zig build test --fuzz -Doptimize=ReleaseSafe` runs per crypto
   target when host load allows; commit any reproducer as a regression test.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
