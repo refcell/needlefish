@@ -15,6 +15,8 @@ pub const pipeline = @import("pipeline.zig");
 pub const fakes = @import("fakes.zig");
 pub const rpc_chain = @import("rpc_chain.zig");
 pub const tx_submitter = @import("tx_submitter.zig");
+pub const config = @import("config.zig");
+pub const dry_run = @import("dry_run.zig");
 
 pub const Intervals = intervals.Intervals;
 pub const RecoveredState = target.RecoveredState;

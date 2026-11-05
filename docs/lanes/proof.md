@@ -73,8 +73,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   init bond from `initBonds`, `eth_estimateGas`, EIP-1559 signing via `batcher/txdata`,
   receipt polling, revert classification (data selector, selector text, error name) of
   estimation errors and replayed failed receipts; dropped after N empty polls.
-- [ ] `bin/base proposer`: flags/config validation (base/base `config.rs`/`cli.rs`), dry-run
-  submitter, the pipeline driven by `utilities.io` time, health/metrics later.
+- [ ] `bin/base proposer`: done: `proposer/config.zig` (base/base `cli.rs`/`config.rs`
+  flag names, defaults, validation; fuzzed) and the dry-run submitter. Left: the binary
+  (endpoints, pipeline driven by `utilities.io` time) once the prover-service requester
+  lands; health/metrics later.
 - [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
   roots, bond claiming, `bin/base challenger` (port `challenge/src/*`), DST test.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
@@ -199,6 +201,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: proposer config (flags + validation) and dry-run submitter.
 - 2026-11-05: `proof/proposer-txmgr`: proposer tx submitter with revert classification.
 - 2026-11-05: `proof/proposer-adapters`: RPC `Chain` for the proposer, canned-RPC tests.
 - 2026-11-05: `proof/proposer` first slice: intervals, recovery walk, dispatcher/collector
