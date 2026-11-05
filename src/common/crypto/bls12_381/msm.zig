@@ -58,6 +58,9 @@ pub fn msm(comptime C: type, points: []const C.Affine, scalars: []const u256) C 
     assert(points.len == scalars.len);
     if (points.len == 0) return C.identity;
     if (points.len == 1) return single_mul(C, points[0], scalars[0]);
+    if (C == g1.G1 and points.len >= batch_affine_points_min) {
+        return msm_batch_affine(C, points, scalars);
+    }
     const bits = window_bits(C, points.len);
     const bucket_count = @as(usize, 1) << @intCast(bits - 1);
     var buckets: [1 << (window_bits_max(C) - 1)]C = undefined;
@@ -81,6 +84,115 @@ pub fn msm(comptime C: type, points: []const C.Affine, scalars: []const u256) C 
             }
         }
         result = result.add(sum_buckets(C, buckets[0..bucket_count]));
+    }
+    return result;
+}
+
+/// Below this many points the per-batch inversion does not pay off.
+const batch_affine_points_min = 256;
+/// Pending affine bucket additions that share one field inversion.
+const batch_size = 128;
+
+/// Bucket state for batch-affine accumulation: affine buckets updated in batches
+/// with one shared inversion (Montgomery's trick), plus Jacobian side buckets for
+/// additions that cannot join the current batch (slot already pending, or equal x).
+fn BatchAffine(comptime C: type) type {
+    const F = @TypeOf(@as(C.Affine, undefined).x);
+    const buckets_cap = 1 << (window_bits_max(C) - 1);
+    return struct {
+        const Self = @This();
+        affine: [buckets_cap]C.Affine = undefined,
+        side: [buckets_cap]C = undefined,
+        pending_slot: [buckets_cap]bool = undefined,
+        slots: [batch_size]u16 = undefined,
+        addends: [batch_size]C.Affine = undefined,
+        denominators: [batch_size]F = undefined,
+        prefix: [batch_size]F = undefined,
+        count: u32 = 0,
+
+        fn reset(self: *Self, bucket_count: usize) void {
+            assert(bucket_count <= buckets_cap);
+            @memset(self.affine[0..bucket_count], C.Affine.identity);
+            @memset(self.side[0..bucket_count], C.identity);
+            @memset(self.pending_slot[0..bucket_count], false);
+            self.count = 0;
+        }
+
+        fn add(self: *Self, slot: usize, point: C.Affine) void {
+            assert(!point.infinity);
+            const bucket = self.affine[slot];
+            if (bucket.infinity and !self.pending_slot[slot]) {
+                self.affine[slot] = point;
+            } else if (self.pending_slot[slot] or bucket.x.eql(point.x)) {
+                self.side[slot] = self.side[slot].add_affine(point);
+            } else {
+                self.pending_slot[slot] = true;
+                self.slots[self.count] = @intCast(slot);
+                self.addends[self.count] = point;
+                self.denominators[self.count] = point.x.sub(bucket.x);
+                self.count += 1;
+                if (self.count == batch_size) self.flush();
+            }
+        }
+
+        /// Applies every pending addition with a single inversion.
+        fn flush(self: *Self) void {
+            if (self.count == 0) return;
+            const count = self.count;
+            self.prefix[0] = self.denominators[0];
+            for (1..count) |index| {
+                self.prefix[index] = self.prefix[index - 1].mul(self.denominators[index]);
+            }
+            var inverse = self.prefix[count - 1].inverse();
+            var index: usize = count;
+            while (index > 0) {
+                index -= 1;
+                const inverse_here =
+                    if (index > 0) inverse.mul(self.prefix[index - 1]) else inverse;
+                inverse = inverse.mul(self.denominators[index]);
+                const slot = self.slots[index];
+                const bucket = self.affine[slot];
+                const point = self.addends[index];
+                const lambda = point.y.sub(bucket.y).mul(inverse_here);
+                const x3 = lambda.square().sub(bucket.x).sub(point.x);
+                const y3 = lambda.mul(bucket.x.sub(x3)).sub(bucket.y);
+                self.affine[slot] = .{ .x = x3, .y = y3, .infinity = false };
+                self.pending_slot[slot] = false;
+            }
+            self.count = 0;
+        }
+
+        fn total(self: *Self, bucket_count: usize) C {
+            assert(self.count == 0);
+            for (self.side[0..bucket_count], self.affine[0..bucket_count]) |*side, affine| {
+                side.* = side.add_affine(affine);
+            }
+            return sum_buckets(C, self.side[0..bucket_count]);
+        }
+    };
+}
+
+fn msm_batch_affine(comptime C: type, points: []const C.Affine, scalars: []const u256) C {
+    assert(points.len == scalars.len and points.len >= batch_affine_points_min);
+    const bits = window_bits(C, points.len);
+    const bucket_count = @as(usize, 1) << @intCast(bits - 1);
+    var state: BatchAffine(C) = .{};
+    var result = C.identity;
+    var window = window_count_for(bits);
+    while (window > 0) {
+        window -= 1;
+        if (!result.is_identity()) {
+            for (0..bits) |_| result = result.double();
+        }
+        state.reset(bucket_count);
+        for (points, scalars) |point, scalar| {
+            if (point.infinity) continue;
+            const digit = digit_at(scalar, window, bits);
+            if (digit > 0) state.add(@intCast(digit - 1), point);
+            if (digit < 0) state.add(@intCast(-digit - 1), point.neg());
+        }
+        state.flush();
+        result = result.add(state.total(bucket_count));
     }
     return result;
 }
@@ -137,8 +249,8 @@ fn check_msm(
     scalar_mask: u256,
 ) !void {
     var prng = Prng.init(seed);
-    var points: [300]C.Affine = undefined;
-    var scalars: [300]u256 = undefined;
+    var points: [320]C.Affine = undefined;
+    var scalars: [320]u256 = undefined;
     var expected = C.identity;
     const base = generator.to_jacobian();
     var point = base.mul(prng.int(u64) | 1);
@@ -172,4 +284,6 @@ test "msm: G2 matches the sum of scalar multiplications" {
 test "msm: many points with a wide window" {
     // Short scalars keep the reference scalar multiplications cheap in Debug.
     try check_msm(g1.G1, g1.generator, chunk_points_max + 3, 99, std.math.maxInt(u24));
+    // Tiny scalars force bucket collisions, equal-x additions and cancellations.
+    try check_msm(g1.G1, g1.generator, chunk_points_max + 40, 7, 3);
 }
