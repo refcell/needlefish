@@ -9,6 +9,7 @@ pub const executor = @import("executor/root.zig");
 pub const program = @import("program/root.zig");
 pub const driver = @import("driver/root.zig");
 pub const client = @import("client/root.zig");
+pub const host = @import("host/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

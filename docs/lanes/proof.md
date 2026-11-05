@@ -101,6 +101,8 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host: preimage `Store` (keccak, ordered list tries via the new trie
+  `NodeSink` hook on the hash builder, boot local keys).
 - 2026-11-05: `proof/program`, `proof/driver`, `proof/client` landed (sync, driver loop
   with deposit-only retry, client prologue/epilogue, e2e over L1 exhaustion).
 - 2026-11-05: program: L1 blob provider (field-element reassembly, KZG check) and L2
