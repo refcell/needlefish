@@ -29,6 +29,7 @@ fn bench_field_mul(comptime F: type) fn (u32) u64 {
     }.run;
 }
 const sha256 = @import("sha256.zig");
+const ripemd160 = @import("ripemd160.zig");
 
 pub const Case = struct {
     name: []const u8,
@@ -143,6 +144,28 @@ fn bench_sha256_4k_std(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_ripemd160_32(iterations: u32) u64 {
+    var data: [32]u8 = @splat(0x5a);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const digest = ripemd160.ripemd160(&data);
+        data[0] = digest[0];
+        accumulator +%= digest[19];
+    }
+    return accumulator;
+}
+
+fn bench_ripemd160_4k(iterations: u32) u64 {
+    var data: [4096]u8 = @splat(0x33);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const digest = ripemd160.ripemd160(&data);
+        data[0] = digest[0];
+        accumulator +%= digest[19];
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
@@ -155,6 +178,8 @@ pub const cases = [_]Case{
     .{ .name = "sha256/32B (std)", .iterations = 2_000_000, .run = bench_sha256_32_std },
     .{ .name = "sha256/4KiB", .iterations = 100_000, .run = bench_sha256_4k },
     .{ .name = "sha256/4KiB (std)", .iterations = 100_000, .run = bench_sha256_4k_std },
+    .{ .name = "ripemd160/32B", .iterations = 1_000_000, .run = bench_ripemd160_32 },
+    .{ .name = "ripemd160/4KiB", .iterations = 50_000, .run = bench_ripemd160_4k },
 };
 
 /// Runs every case whose name contains `filter` (all when null).
