@@ -46,8 +46,10 @@ allocation after startup.
   RPC, metrics exported.
 - [x] `infra/snapshotter`: datadir snapshot create/restore for the node (port
   `snapshotter/src/*`), coordinate with trie-db for a consistent DB checkpoint.
-- [ ] Devnet smoke: add load-test + websocket-proxy + withdrawer steps to
-  `just devnet smoke` (coordinate with batcher-devnet, who owns `etc/devnet`).
+- [x] Devnet smoke: load-test step added to `just devnet smoke` (websocket-proxy dropped by
+  rule 10).
+- [ ] Devnet smoke: withdrawer step once the devnet deploys a proving portal (the stand-in
+  portal in `batcher/devnet/portal.zig` only emits deposits).
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -145,3 +147,6 @@ allocation after startup.
   sequencer, conductor, proofs, upgrade-readiness, doctor) with canned-response tests,
   seeded + std.testing fuzz of every decoder, and doctor pass/warn/fail tests; smoke-tested
   against a running devnet (doctor caught a stopped L1 and a 1148-block safe lag).
+- 2026-11-05: smoke step 5 (`base load-test` 20 tx/s for 5 s from dev accounts 2-4 against the
+  sequencer); full `just devnet smoke` passes, 99/99 confirmed, p50 690 ms. load-test gains
+  `--receipt-poll-ms` (default 200, matching 200 ms L2 blocks).

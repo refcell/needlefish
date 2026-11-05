@@ -107,4 +107,14 @@ deposited() { greater "$(balance "$SEQ")" "$before_seq" && greater "$(balance "$
 until_ok "deposit credited on sequencer and verifier" deposited
 ok "deposit credited on L2"
 
+# 5. Load: a short seeded load test from dev accounts 2-4 (no devnet role uses them) must
+# confirm every transaction it submits (infra-tools lane, `base load-test`).
+load=$("$BASE" load-test --rpc-url "$SEQ" --chain-id "$L2_CHAIN_ID" --rate 20 --duration-s 5 \
+  --drain-s 30 --accounts 2,3,4 --mix transfer=70,calldata=30 2>&1) || fail "load test: $load"
+submitted=$(echo "$load" | awk '/^submitted/ {print $2}')
+confirmed=$(echo "$load" | awk '/^confirmed/ {print $2}')
+[ -n "$submitted" ] && [ "$submitted" -gt 0 ] && [ "$submitted" = "$confirmed" ] ||
+  fail "load test confirmed $confirmed of $submitted: $load"
+ok "load test: $confirmed/$submitted confirmed, $(echo "$load" | grep '^latency' | tr -s ' ')"
+
 echo "smoke: all checks passed"

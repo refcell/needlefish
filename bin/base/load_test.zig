@@ -26,6 +26,7 @@ pub const Spec = struct {
     mix: []const u8 = "transfer=100",
     calldata_bytes_max: u32 = 1024,
     confirmations: u64 = 1,
+    receipt_poll_ms: u64 = 200,
 
     pub const help = .{
         .rpc_url = "JSON-RPC endpoint (http://...)",
@@ -39,6 +40,7 @@ pub const Spec = struct {
         .mix = "Payload weights: transfer=N,calldata=N,erc20_transfer=N",
         .calldata_bytes_max = "Largest random calldata payload",
         .confirmations = "Blocks deep before a transaction counts as confirmed",
+        .receipt_poll_ms = "Receipt poll interval (L2 blocks are 200 ms)",
     };
 };
 
@@ -50,7 +52,9 @@ const Parsed = struct {
 /// Validates flags. `parsed.config.account_indices` points into `parsed.indices`.
 pub fn parse_config(spec: Spec, parsed: *Parsed) !void {
     if (spec.calldata_bytes_max > load_test.runner.calldata_bytes_max) return error.InvalidValue;
-    if (spec.rate == 0 or spec.duration_s == 0 or spec.confirmations == 0) {
+    if (spec.rate == 0 or spec.duration_s == 0 or spec.confirmations == 0 or
+        spec.receipt_poll_ms == 0)
+    {
         return error.InvalidValue;
     }
     var count: usize = 0;
@@ -74,7 +78,7 @@ pub fn parse_config(spec: Spec, parsed: *Parsed) !void {
         .manager = .{
             .num_confirmations = spec.confirmations,
             .resubmission_timeout_ms = 12_000,
-            .receipt_query_interval_ms = 1_000,
+            .receipt_query_interval_ms = spec.receipt_poll_ms,
         },
     };
 }
@@ -145,7 +149,7 @@ fn run(io: Io, runner: *load_test.Runner) !void {
                 runner.outstanding(),
             });
         }
-        try io.sleep(.fromMilliseconds(100), .awake);
+        try io.sleep(.fromMilliseconds(50), .awake);
     }
 }
 
