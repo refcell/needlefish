@@ -567,7 +567,7 @@ pub const Signed = struct {
     sender_auth: []const u8,
     payer_auth: []const u8 = &.{},
 
-    fn payload_length(signed: Signed, payer_auth: []const u8) usize {
+    pub fn payload_length(signed: Signed, payer_auth: []const u8) usize {
         return signed.tx.fields_length_with(signed.tx.sender) +
             rlp.bytes_length(signed.sender_auth) + rlp.bytes_length(payer_auth);
     }

@@ -15,6 +15,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
 - [x] `txpool/validate`: verify blob proofs with `common.consensus.sidecar.Sidecar.verify_kzg`
   (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
+- [ ] txpool/evm: admit 0x79 using `common.consensus.eip8130_gas.compute` (intrinsic gas,
+  `Input.worst_case` for admission/estimation, `max_payer_auth_cost` for block reservation).
 - [x] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
 - [x] Block executor (L1 + L2/OP): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).

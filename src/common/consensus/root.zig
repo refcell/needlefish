@@ -17,6 +17,7 @@ pub const base_time = @import("base_time.zig");
 pub const bench = @import("bench.zig");
 pub const eip8130 = @import("eip8130.zig");
 pub const eip8130_structure = @import("eip8130_structure.zig");
+pub const eip8130_gas = @import("eip8130_gas.zig");
 pub const eip8130_test = @import("eip8130_test.zig");
 
 pub const Signature = signature.Signature;

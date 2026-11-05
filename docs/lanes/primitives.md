@@ -30,6 +30,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] EIP-8130 account-state constants (flags, `unsequenced`) and the delegation indicator.
 - [x] `primitives.create_address` / `create2_address`; EIP-8130 CREATE2 deployment table
   (salts + init code hashes verified by derivation), ERC-1167 proxy helpers, `coinbase_tip`.
+- [x] `consensus/eip8130_gas.zig`: base/base `base-common-eip8130` gas schedule and intrinsic
+  gas (nonce key, bytecode, account changes, sender/payer auth, EIP-7623 payload floor).
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -81,6 +83,11 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - `create_address` hand-encodes `rlp([sender, nonce])` so primitives stays below rlp in the
   import graph.
 
+- EIP-8130 sender-billed payload cost is computed from the canonical encoding in place
+  (type byte, re-sized list header, body before `payer_auth`, `0x80`), no re-encode buffer;
+  tests check it against `encode_without_payer_auth`. Nonce-manager slots stay in
+  `execution/evm/native.zig`.
+
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
@@ -104,3 +111,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: genesis Base upgrade times and activation admin address.
 - 2026-11-05: EIP-8130 account flags, unsequenced sentinel, delegation indicator.
 - 2026-11-05: CREATE/CREATE2 addresses, EIP-8130 deployment table, coinbase tip.
+- 2026-11-05: EIP-8130 intrinsic gas (`eip8130_gas`).
