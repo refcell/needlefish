@@ -87,6 +87,17 @@ pub const Cache = struct {
         cache.sessions[index] = cache.sessions[cache.count - 1];
         cache.count -= 1;
     }
+
+    /// Drops every session with `node_id`, at any endpoint.
+    pub fn remove_node(cache: *Cache, node_id: packet.NodeId) void {
+        var index: u32 = 0;
+        while (index < cache.count) {
+            if (std.mem.eql(u8, &cache.sessions[index].node_id, &node_id)) {
+                cache.remove(&cache.sessions[index]);
+            } else index += 1;
+        }
+        assert(cache.count <= cache.sessions.len);
+    }
 };
 
 /// Next message nonce for `session`, or null when the counter is exhausted (the caller

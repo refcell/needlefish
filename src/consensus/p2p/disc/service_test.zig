@@ -182,6 +182,28 @@ test "disc service: two nodes handshake and exchange records" {
     try std.testing.expect(cluster.discovered[0][1]);
 }
 
+test "disc service: banned nodes are evicted and ignored until the ban expires" {
+    const cluster = try Cluster.init(std.testing.allocator, 3, 2, 0);
+    defer cluster.deinit();
+    cluster.boot_all_from(0);
+    cluster.run(1000 * ns_per_ms);
+    const banned_id = cluster.services[1].local_id;
+    try std.testing.expect(cluster.services[0].table.get(banned_id) != null);
+    cluster.services[0].ban_node(banned_id, std.math.maxInt(u64));
+    try std.testing.expect(cluster.services[0].table.get(banned_id) == null);
+    try std.testing.expect(cluster.services[0].is_banned(banned_id, 0));
+    cluster.run(6000 * ns_per_ms);
+    try std.testing.expect(cluster.services[0].table.get(banned_id) == null);
+    try std.testing.expect(cluster.services[0].stats.packets_banned > 0);
+    // Re-banning keeps the later expiry; a short ban lapses.
+    cluster.services[0].ban_node(banned_id, 10);
+    try std.testing.expect(cluster.services[0].is_banned(banned_id, 11));
+    const other_id: enr.NodeId = @splat(0x77);
+    cluster.services[0].ban_node(other_id, 10);
+    try std.testing.expect(cluster.services[0].is_banned(other_id, 9));
+    try std.testing.expect(!cluster.services[0].is_banned(other_id, 10));
+}
+
 fn expect_convergence(node_count: u8, duration_ms: u64, live_min: u32) !void {
     const cluster = try Cluster.init(std.testing.allocator, 0x5eed, node_count, 20_000);
     defer cluster.deinit();

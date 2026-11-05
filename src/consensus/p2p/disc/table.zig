@@ -294,6 +294,17 @@ pub const Table = struct {
         return true;
     }
 
+    /// Evicts a live entry now (bans). Returns true if it was live.
+    pub fn remove(table: *Table, node_id: NodeId) bool {
+        const bucket = table.bucket_for(node_id) orelse return false;
+        const position = table.find(bucket.live[0..bucket.live_count], node_id) orelse
+            return false;
+        table.pool[bucket.live[position]].failures = table.config.failures_max - 1;
+        const evicted = table.mark_failed(node_id);
+        assert(evicted);
+        return evicted;
+    }
+
     /// Copies up to `output.len` live entries at log distance `distance` (1..256).
     pub fn at_distance(table: *Table, distance: u16, output: []*const Entry) usize {
         assert(distance >= 1 and distance <= bucket_count);

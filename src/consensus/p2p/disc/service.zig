@@ -39,6 +39,11 @@ pub const Config = struct {
     table: table_module.Config = .{},
 };
 
+/// Banned node ids (base/base bans low-scoring gossip peers in discovery for 1 h).
+pub const bans_max = 256;
+
+const Ban = struct { node_id: enr.NodeId, until_ns: u64 };
+
 pub const Stats = struct {
     packets_received: u64 = 0,
     packets_invalid: u64 = 0,
@@ -47,6 +52,7 @@ pub const Stats = struct {
     handshakes_completed: u64 = 0,
     requests_timed_out: u64 = 0,
     records_rejected: u64 = 0,
+    packets_banned: u64 = 0,
 };
 
 pub const Datagram = struct {
@@ -127,6 +133,8 @@ pub const Service = struct {
     lookup: lookup_module.Lookup = .{},
     next_lookup_ns: u64 = 0,
     stats: Stats = .{},
+    bans: [bans_max]Ban = undefined,
+    bans_count: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -184,8 +192,39 @@ pub const Service = struct {
         return service.discovered.pop();
     }
 
+    /// Bans `node_id` until `until_ns`: evicts it and ignores its packets and records.
+    /// When the list is full the ban expiring soonest is replaced.
+    pub fn ban_node(service: *Service, node_id: enr.NodeId, until_ns: u64) void {
+        _ = service.table.remove(node_id);
+        service.sessions.remove_node(node_id);
+        var victim: u32 = service.bans_count;
+        for (service.bans[0..service.bans_count], 0..) |*ban, index| {
+            if (std.mem.eql(u8, &ban.node_id, &node_id)) {
+                ban.until_ns = @max(ban.until_ns, until_ns);
+                return;
+            }
+            if (victim == service.bans_count or ban.until_ns < service.bans[victim].until_ns) {
+                victim = @intCast(index);
+            }
+        }
+        if (service.bans_count < bans_max) {
+            victim = service.bans_count;
+            service.bans_count += 1;
+        }
+        service.bans[victim] = .{ .node_id = node_id, .until_ns = until_ns };
+        assert(service.bans_count <= bans_max);
+    }
+
+    pub fn is_banned(service: *const Service, node_id: enr.NodeId, now_ns: u64) bool {
+        for (service.bans[0..service.bans_count]) |*ban| {
+            if (std.mem.eql(u8, &ban.node_id, &node_id)) return now_ns < ban.until_ns;
+        }
+        return false;
+    }
+
     /// Seeds the table with a boot record and pings it to start a session.
     pub fn add_boot_record(service: *Service, record: *const enr.Record, now_ns: u64) void {
+        if (service.is_banned(record.node_id(), now_ns)) return;
         const endpoint = endpoint_of(record) orelse return;
         const result = service.table.insert(record, endpoint, now_ns);
         if (result == .added or result == .updated) {
@@ -438,6 +477,10 @@ pub const Service = struct {
         decoded: *const packet.Decoded,
         now_ns: u64,
     ) void {
+        if (service.is_banned(src_id, now_ns)) {
+            service.stats.packets_banned += 1;
+            return;
+        }
         var plaintext: [packet.size_max]u8 = undefined;
         if (service.sessions.get(src_id, from)) |session| {
             if (packet.open_message(decoded, session.read_key, &plaintext)) |opened| {
@@ -579,6 +622,10 @@ pub const Service = struct {
         handshake: *const packet.Handshake,
         now_ns: u64,
     ) void {
+        if (service.is_banned(handshake.src_id, now_ns)) {
+            service.stats.packets_banned += 1;
+            return;
+        }
         const challenge = service.find_challenge(handshake.src_id, from) orelse return;
         var record_storage: enr.Record = undefined;
         const record = service.handshake_record(handshake, &record_storage) orelse {
@@ -627,6 +674,7 @@ pub const Service = struct {
 
     /// Inserts a verified record; publishes it and probes a full bucket's oldest entry.
     fn learn(service: *Service, record: *const enr.Record, now_ns: u64) void {
+        if (service.is_banned(record.node_id(), now_ns)) return;
         const endpoint = endpoint_of(record) orelse return;
         switch (service.table.insert(record, endpoint, now_ns)) {
             .added => service.publish(record),
