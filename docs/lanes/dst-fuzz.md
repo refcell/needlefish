@@ -56,3 +56,5 @@ provably robust.
   L1 hash; rewind above post-restart unsafe head; clamp leaving a gap. 10k seeds green.
 - 2026-11-05: pinned regression configs (`simulator regression SEED`), byzantine negative
   test (equivocating sequencer must trip checkers), coverage-guided fuzz over cluster configs.
+- 2026-11-05: bls12-381 g1/g2 canonical-encoding fuzz; `just test-times` (per-test wall
+  time); flagged 73 s p2p test to coordinator.

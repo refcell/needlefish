@@ -62,6 +62,10 @@ fmt:
 tidy:
     etc/scripts/tidy.sh
 
+# Slowest unit tests: just test-times 20
+test-times count='20':
+    etc/scripts/test-times.sh {{ count }}
+
 # Asserts per function, lowest first (informational): just assert-density src/testing/
 assert-density prefix='src/':
     etc/scripts/assert-density.sh {{ prefix }}

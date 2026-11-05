@@ -64,3 +64,11 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | consensus/receipt_encode_empty | 9.7 | |
 | flz/compress_length_tx | 920.7 | same tx |
 | l1_fees/tx_l1_cost_fjord | 1143.4 | FastLZ length + fee math |
+
+## Test suite time
+
+`zig build test` runs on every push of every lane, so its wall time is a shared budget.
+Find the slowest tests with `just test-times`. Keep any single test under ~1 s in Debug;
+long simulations belong in `zig build sim` / swarm, not the unit suite.
+
+2026-11-05: suite ~90 s run time; 73 s in one p2p discv5 cluster test (flagged to the lane).
