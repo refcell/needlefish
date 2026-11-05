@@ -5,6 +5,9 @@
 const std = @import("std");
 
 pub const multistream = @import("multistream.zig");
+pub const protobuf = @import("protobuf.zig");
+pub const identity = @import("identity.zig");
+pub const noise = @import("noise.zig");
 
 test {
     std.testing.refAllDecls(@This());
