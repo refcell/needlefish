@@ -10,6 +10,10 @@ const assert = std.debug.assert;
 const utilities_metrics = @import("../../utilities/metrics/root.zig");
 const http = @import("../../utilities/http/root.zig");
 const service = @import("../service/root.zig");
+const rpc = @import("../rpc/root.zig");
+
+/// Balance poll period (base/base `BalanceMonitorLayer::DEFAULT_POLL_INTERVAL`).
+pub const balance_poll_ms = 12_000;
 
 const Counter = utilities_metrics.Counter;
 const Gauge = utilities_metrics.Gauge;
@@ -27,6 +31,10 @@ pub const Metrics = struct {
     txs_confirmed: Counter = .{},
     resets: Counter = .{},
     step_failures: Counter = .{},
+    /// The batcher account's L1 balance in gwei (gauges are integers; base/base exports
+    /// ether as a float).
+    balance_gwei: Gauge = .{},
+    balance_polled_ms: ?u64 = null,
     registry: Registry = .{},
 
     /// `metrics` must not move afterwards: the registry points into it.
@@ -47,7 +55,25 @@ pub const Metrics = struct {
         try r.counter("base_batcher_txs_confirmed_total", "Batch txs mined.", confirmed);
         try r.counter("base_batcher_resets_total", "Pipeline resets.", &metrics.resets);
         try r.counter("base_batcher_step_failures_total", "Failed steps.", &metrics.step_failures);
-        assert(metrics.registry.count == 10);
+        const balance = &metrics.balance_gwei;
+        try r.gauge("base_batcher_balance_gwei", "Batcher L1 balance in gwei.", balance);
+        assert(metrics.registry.count == 11);
+    }
+
+    /// Reads the account balance at most once per `balance_poll_ms`. A failed read keeps
+    /// the last value (the metric is optional) and retries at the next period.
+    pub fn poll_balance(metrics: *Metrics, l1: *rpc.Client, address: [20]u8, now_ms: u64) void {
+        if (metrics.balance_polled_ms) |polled_ms| {
+            if (now_ms -| polled_ms < balance_poll_ms) return;
+        }
+        metrics.balance_polled_ms = now_ms;
+        var params_buffer: [64]u8 = undefined;
+        const params = std.fmt.bufPrint(&params_buffer, "[\"0x{x}\",\"latest\"]", .{&address}) catch
+            unreachable; // 20 bytes of hex fit.
+        const result = l1.call("eth_getBalance", params) catch return;
+        const wei = rpc.quantity(u256, result) catch return;
+        metrics.balance_gwei.set(gwei_of(wei));
+        assert(metrics.balance_gwei.get() >= 0);
     }
 
     pub fn record(metrics: *Metrics, report: service.Report, pending_txs: u32) void {
@@ -77,7 +103,64 @@ pub const Metrics = struct {
     }
 };
 
+fn gwei_of(wei: u256) i64 {
+    const gwei = wei / 1_000_000_000;
+    return @intCast(@min(gwei, std.math.maxInt(i64)));
+}
+
 const testing = std.testing;
+
+test "metrics: balance polled once per period, in gwei, failures keep the last value" {
+    var answers = [_]rpc.CannedTransport.Answer{
+        .{ .method = "eth_getBalance", .result = "\"0xde0b6b3a7640000\"" }, // 1 ether.
+    };
+    var canned: rpc.CannedTransport = .{ .answers = &answers };
+    var l1 = try rpc.Client.init(testing.allocator, canned.transport(), .{});
+    defer l1.deinit(testing.allocator);
+    var metrics: Metrics = .{};
+    metrics.poll_balance(&l1, @splat(0x11), 1_000);
+    try testing.expectEqual(@as(i64, 1_000_000_000), metrics.balance_gwei.get());
+    answers[0].result = "\"0x0\"";
+    metrics.poll_balance(&l1, @splat(0x11), 1_000 + balance_poll_ms - 1);
+    try testing.expectEqual(@as(i64, 1_000_000_000), metrics.balance_gwei.get());
+    try testing.expectEqual(@as(u32, 1), canned.calls);
+    answers[0].result = "\"bogus\"";
+    metrics.poll_balance(&l1, @splat(0x11), 1_000 + balance_poll_ms);
+    try testing.expectEqual(@as(i64, 1_000_000_000), metrics.balance_gwei.get());
+    answers[0].result = "\"0x3b9aca00\""; // 1 gwei.
+    metrics.poll_balance(&l1, @splat(0x11), 1_000 + 2 * balance_poll_ms);
+    try testing.expectEqual(@as(i64, 1), metrics.balance_gwei.get());
+}
+
+test "metrics: seeded fuzz of the gwei conversion" {
+    var prng = Prng.init(0xba1a);
+    for (0..2000) |_| {
+        var bytes: [32]u8 = undefined;
+        prng.fill(bytes[0..prng.range(0, 32)]);
+        const wei = std.mem.readInt(u256, &bytes, .little) >> @intCast(prng.below(256));
+        try check_gwei(wei);
+    }
+    try check_gwei(std.math.maxInt(u256));
+    try check_gwei(0);
+}
+
+fn check_gwei(wei: u256) !void {
+    const gwei = gwei_of(wei);
+    try testing.expect(gwei >= 0);
+    if (wei / 1_000_000_000 <= std.math.maxInt(i64)) {
+        try testing.expectEqual(wei / 1_000_000_000, @as(u256, @intCast(gwei)));
+    } else try testing.expectEqual(@as(i64, std.math.maxInt(i64)), gwei);
+}
+
+test "metrics: fuzz the gwei conversion" {
+    try testing.fuzz({}, fuzz_gwei, .{});
+}
+
+fn fuzz_gwei(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [32]u8 = @splat(0);
+    _ = smith.slice(&bytes);
+    try check_gwei(std.mem.readInt(u256, &bytes, .little));
+}
 const Prng = @import("../../testing/prng.zig").Prng;
 
 fn render(metrics: *Metrics, raw: []const u8, buffer: []u8) !http.ResponseBuilder {

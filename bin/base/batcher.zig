@@ -285,6 +285,7 @@ fn run(
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
             metrics.record(report, service.txs.pending_count());
+            metrics.poll_balance(&l1, service.txs.config.from.bytes, now_ms);
             log_throttle(report.throttle, &throttle_logged);
             if (report.blobs_forced != blobs_forced_logged) {
                 blobs_forced_logged = report.blobs_forced;
