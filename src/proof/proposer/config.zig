@@ -40,6 +40,9 @@ pub const Config = struct {
     rollup_config: []const u8 = "",
     /// Custom L1 chains only, with the native prover: the L1 genesis JSON file.
     l1_genesis: []const u8 = "",
+    /// With the native prover: the L1 beacon API for blob batches (without it blob reads
+    /// fail).
+    l1_beacon: []const u8 = "",
     /// Stop after this many poll intervals (smoke tests); runs forever when null.
     ticks_max: ?u64 = null,
 
@@ -86,6 +89,7 @@ const Flag = enum {
     private_key,
     rollup_config,
     l1_genesis,
+    l1_beacon,
     ticks_max,
 };
 
@@ -135,6 +139,7 @@ fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
         .private_key => config.private_key = try parse_fixed(32, value),
         .rollup_config => config.rollup_config = value,
         .l1_genesis => config.l1_genesis = value,
+        .l1_beacon => config.l1_beacon = value,
         .ticks_max => config.ticks_max = std.fmt.parseUnsigned(u64, value, 10) catch
             return error.InvalidValue,
     }
@@ -193,8 +198,9 @@ test "proposer config: flags, defaults and validation" {
     const native_args = [_][]const u8{ "--dry-run", "--prover-rpc", "native" };
     try testing.expectError(error.MissingFlag, parse(&(required ++ native_args)));
     const native = try parse(&(required ++ native_args ++ [_][]const u8{
-        "--rollup-config", "rollup.json", "--ticks-max", "3",
+        "--rollup-config", "rollup.json", "--ticks-max", "3", "--l1-beacon", "http://b:1",
     }));
+    try testing.expectEqualStrings("http://b:1", native.l1_beacon);
     try testing.expect(native.native_prover());
     try testing.expectEqual(@as(?u64, 3), native.ticks_max);
     try testing.expectError(error.UnknownFlag, parse(&.{"--nope"}));
