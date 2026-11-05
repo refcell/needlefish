@@ -71,13 +71,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Witness size + build-time benchmarks (nodes, bytes, us per block) for 1k-account and
   storage-heavy blocks; record in docs/PERF.md. (`db/witness_bench.zig`, `-- db/witness`;
   plus a 200-call evm block; docs/PERF.md "db witness")
-- [ ] `SparseState.reset` / `SparseTrie.clear` is O(pool capacity): ~370 us per reset for a
+- [x] `SparseState.reset` / `SparseTrie.clear` is O(pool capacity): ~370 us per reset for a
   104k-node pool, paid by every `Builder.build` and verifier load. Clear only used nodes
-  (or track a high-water mark).
+  (or track a high-water mark). (high-water mark + free list in `trie/sparse.zig`, landed
+  with the witness memory change: `clear` is O(1))
 - [x] `Builder.build` is 4-5x a full-state block apply (30.7 vs 8.2 ms storage-heavy): proves
   every key separately, then replays on a sparse trie. Share proof walks (sorted keys, one
   descent) or build the witness from the full trie's dirty-path walk.
-  (sorted multi-key walk, see the next item)
+  (sorted multi-key walk: see "Faster `witness.Builder.build`")
 - [ ] (blocked: base/base commits no reth witness fixtures and running reth is out of scope)
   Byte-compare our `debug_executionWitness` against reth's output for public fixture blocks;
   revisit when public fixtures exist. Meanwhile: the `witness-diff` port below.
