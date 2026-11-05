@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
 
 const node = @import("node.zig");
 const proof_module = @import("proof.zig");
@@ -339,4 +340,78 @@ test "trie: seeded differential of batched against serial hashing, multi-root" {
         }
         try testing.expectEqual(serial.node_count(), batched.node_count());
     }
+}
+
+const ModelEntry = struct { key: [3]u8, key_len: u8, value: [40]u8, value_len: u8 };
+
+fn model_find(model: []const ModelEntry, key: []const u8) ?usize {
+    for (model, 0..) |*entry, index| {
+        if (std.mem.eql(u8, entry.key[0..entry.key_len], key)) return index;
+    }
+    return null;
+}
+
+/// Checks every model entry is readable and the incremental root equals a fresh rebuild.
+fn check_against_model(trie: *Trie, fresh: *Trie, model: []const ModelEntry) !void {
+    fresh.clear();
+    for (model) |*entry| {
+        const value = entry.value[0..entry.value_len];
+        try testing.expectEqualSlices(u8, value, trie.get(entry.key[0..entry.key_len]).?);
+        try fresh.put(entry.key[0..entry.key_len], value);
+    }
+    try testing.expectEqual(fresh.root_hash(), trie.root_hash());
+    try testing.expectEqual(fresh.node_count(), trie.node_count());
+}
+
+test "trie: seeded prefix keys exercise branch values (put, overwrite, delete, collapse)" {
+    var prng = Prng.init(0xb7a1c);
+    var trie = try Trie.init(testing.allocator, 1024);
+    defer trie.deinit(testing.allocator);
+    var fresh = try Trie.init(testing.allocator, 1024);
+    defer fresh.deinit(testing.allocator);
+    var model: [96]ModelEntry = undefined;
+    var round: u32 = 0;
+    while (round < 60) : (round += 1) {
+        trie.clear();
+        var model_len: usize = 0;
+        for (0..prng.range(1, 300)) |_| {
+            // Keys of 0-3 bytes over a tiny alphabet: many keys prefix others.
+            var entry: ModelEntry = undefined;
+            entry.key_len = @intCast(prng.range(0, 3));
+            for (entry.key[0..entry.key_len]) |*byte| byte.* = @intCast(prng.below(3) * 0x11);
+            const key = entry.key[0..entry.key_len];
+            const found = model_find(model[0..model_len], key);
+            if (prng.chance(1, 3)) {
+                try testing.expectEqual(found != null, trie.delete(key));
+                if (found) |index| {
+                    model[index] = model[model_len - 1];
+                    model_len -= 1;
+                }
+            } else {
+                entry.value_len = @intCast(prng.range(1, entry.value.len));
+                prng.fill(entry.value[0..entry.value_len]);
+                try trie.put(key, entry.value[0..entry.value_len]);
+                const index = found orelse model_len;
+                assert(index < model.len);
+                model[index] = entry;
+                if (found == null) model_len += 1;
+            }
+            if (prng.chance(1, 4)) _ = trie.root_hash();
+        }
+        try check_against_model(&trie, &fresh, model[0..model_len]);
+        for (model[0..model_len]) |*entry| {
+            try testing.expect(trie.delete(entry.key[0..entry.key_len]));
+        }
+        try testing.expectEqual(node.empty_root, trie.root_hash());
+        try testing.expectEqual(@as(u32, 0), trie.node_count());
+    }
+}
+
+test "trie: node layout sizes" {
+    // Hot node bytes per configuration; cached references live in a parallel 34-byte array.
+    const Account = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 112 });
+    const Storage = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 33 });
+    comptime assert(@sizeOf(Account.Node) == 152);
+    comptime assert(@sizeOf(Storage.Node) == 72);
+    comptime assert(@sizeOf(node.RlpNode) == 34);
 }

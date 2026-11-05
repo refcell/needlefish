@@ -17,11 +17,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
 - [x] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`.
-- [ ] Compact node layout (packed paths, out-of-line values).
 - [ ] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
   (vs 2 ms for 1k accounts alone). Profile storage trie rehash/creation and fix.
 - [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
+- [x] Compact node layout (packed paths, per-kind body, cached refs out of line).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -84,7 +84,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   own runner for percentiles (`run_commit`, takes `std.Io` for the clock); the OS case uses a
   scratch file under `.zig-cache/tmp/needlefish-db-bench`, deleted afterwards. Journal sized
   so rounds never trigger automatic checkpoints; checkpoints are timed separately.
-- Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
+- Compact trie node (`TrieType`): an `extern union` body per kind (leaf: packed path + inline
+  value; extension: packed path + child; branch: 17 `u32` children), so a node is
+  `4 + max(key_bytes + 1 + value_size_max, 68)` bytes; the cached `RlpNode` lives in a parallel
+  `cache` array. Paths are stored packed in hex-prefix layout without the flag, so encoding is a
+  copy plus the flag nibble and `get` compares leaf paths against the packed key bytes. A
+  branch value is a leaf with an empty path in child slot 16, so branches carry no value
+  buffer; a value branch now costs two pool nodes (only with prefix keys; fixed-length state
+  keys never have branch values). Out-of-line values in a byte arena were not done: without a
+  caller-given byte budget the arena must be sized for every node holding a maximal value
+  (no saving over inline), and freeing variable-size values needs compaction or a general
+  allocator. Account node 284 -> 186 B, storage node 204 -> 106 B (docs/PERF.md).
 - Batched rehash: `TrieType` collects dirty nodes with their depth (explicit stack), hashes
   deepest level first, sorts each level by encoding length, and feeds equal-length encodings of
   32+ bytes to `keccak256_batch` (leftovers hash singly). Scratch is one `u64` per pool node,
@@ -125,3 +135,5 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   21 ms commit until durable (kqueue + F_FULLFSYNC), 40 ms checkpoint of a 17 MB state.
 - 2026-11-05: one fsync per `execute_and_commit` (`block_and_head` entry): 1.0 syncs/block,
   fsync wait per block ~9 -> ~4 ms (durable p50 24.1 -> 15.3-17.6 ms on a noisy laptop).
+- 2026-11-05: compact trie node layout: 284 -> 186 B/node (accounts), 204 -> 106 B (storage);
+  100k bench trie 393 -> 257 live B/entry; get 173 -> 166 ns, other benches within noise.

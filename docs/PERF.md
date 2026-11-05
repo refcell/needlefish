@@ -87,6 +87,31 @@ The durability cost per block halves (about 9 -> 4 ms of fsync wait). The laptop
 than the first db run (before-run cpu p50 15.0 ms vs 13.4 ms earlier), so compare the
 durable - cpu column, not absolute numbers; p99 is dominated by CPU noise in noisy runs.
 
+## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`TrieType` nodes keep only what their kind needs: a packed path (2 nibbles per byte, stored in
+hex-prefix layout) and inline value for leaves, 17 `u32` children for branches (the 17th is the
+branch value as an empty-path leaf), and the cached `RlpNode` moved to a parallel array.
+Lookups compare leaf paths against the packed key bytes directly.
+
+| Memory (account config: 32-byte keys, 112-byte values) | before | after |
+| --- | ---: | ---: |
+| bytes per pool node (hot + cached ref) | 284 | 152 + 34 = 186 (-35%) |
+| storage config node (33-byte values) | 204 | 72 + 34 = 106 (-48%) |
+| live bytes per entry, 100k bench trie (138 493 nodes) | 393 | 257 |
+| allocated bytes per entry, bench pool (4 nodes/entry) | 1 136 | 744 |
+
+Timings: medians of 3-7 interleaved before/after runs on a loaded machine (single runs vary
+up to ±15%).
+
+| Case | before ns/op | after ns/op | Change |
+| --- | ---: | ---: | --- |
+| trie/get 100k | 173 | 166 | -4% (after runs 165-168, before 172-177) |
+| trie/block 1k puts+root on 100k | 1 378 792 | 1 360 301 | noise |
+| trie/hash_builder 10k leaves | 3 061 979 | 3 117 547 | noise (an earlier round had after lower) |
+| trie/ordered root 200x200B | 73 308 | 73 874 | noise |
+| trie/state block 1k accounts | 1 653 791 | 1 627 583 | noise |
+
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 | Case | ns/op | MB/s | Notes |

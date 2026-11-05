@@ -143,46 +143,82 @@ fn encoded_length(payload_length: u64) u64 {
     return rlp.header_length(payload_length) + payload_length;
 }
 
+/// Encoded length of the hex-prefix string of a path of `path_length` nibbles.
+fn hex_prefix_string_length(path_length: usize) u64 {
+    const hp_length = path_length / 2 + 1;
+    assert(hp_length <= nibbles.hex_prefix_bytes_max);
+    return if (hp_length == 1) 1 else rlp.header_length(hp_length) + hp_length;
+}
+
 pub fn leaf_length(path: []const u8, value: []const u8) u64 {
-    const hp_length = path.len / 2 + 1;
-    const hp_encoded: u64 = if (hp_length == 1) 1 else 1 + hp_length;
-    return encoded_length(hp_encoded + rlp.string_encoded_length(value));
+    return encoded_length(hex_prefix_string_length(path.len) + rlp.string_encoded_length(value));
 }
 
 pub fn encode_leaf(sink: anytype, path: []const u8, value: []const u8) void {
     var hp: [nibbles.hex_prefix_bytes_max]u8 = undefined;
-    const hp_length = nibbles.hex_prefix_encode(path, true, &hp);
-    const payload = rlp.string_encoded_length(hp[0..hp_length]) + rlp.string_encoded_length(value);
-    write_list_header(sink, payload);
-    write_string(sink, hp[0..hp_length]);
-    write_string(sink, value);
+    encode_leaf_compact(sink, hp[0..nibbles.hex_prefix_encode(path, true, &hp)], value);
 }
 
 pub fn leaf_ref(path: []const u8, value: []const u8) RlpNode {
-    var sink = RefSink.init(leaf_length(path, value));
-    encode_leaf(&sink, path, value);
+    var hp: [nibbles.hex_prefix_bytes_max]u8 = undefined;
+    return leaf_ref_compact(hp[0..nibbles.hex_prefix_encode(path, true, &hp)], value);
+}
+
+/// Leaf length from an already hex-prefix encoded path `hp` (flag nibble included).
+pub fn leaf_length_compact(hp: []const u8, value: []const u8) u64 {
+    assert(hp.len > 0);
+    assert(hp[0] >> 4 == 2 or hp[0] >> 4 == 3);
+    return encoded_length(rlp.string_encoded_length(hp) + rlp.string_encoded_length(value));
+}
+
+pub fn encode_leaf_compact(sink: anytype, hp: []const u8, value: []const u8) void {
+    assert(hp.len > 0);
+    write_list_header(sink, rlp.string_encoded_length(hp) + rlp.string_encoded_length(value));
+    write_string(sink, hp);
+    write_string(sink, value);
+}
+
+pub fn leaf_ref_compact(hp: []const u8, value: []const u8) RlpNode {
+    var sink = RefSink.init(leaf_length_compact(hp, value));
+    encode_leaf_compact(&sink, hp, value);
     return sink.finish();
 }
 
 pub fn extension_length(path: []const u8, child: *const RlpNode) u64 {
     assert(path.len > 0);
-    const hp_length = path.len / 2 + 1;
-    const hp_encoded: u64 = if (hp_length == 1) 1 else 1 + hp_length;
-    return encoded_length(hp_encoded + child.len);
+    return encoded_length(hex_prefix_string_length(path.len) + child.len);
 }
 
 pub fn encode_extension(sink: anytype, path: []const u8, child: *const RlpNode) void {
     assert(path.len > 0);
     var hp: [nibbles.hex_prefix_bytes_max]u8 = undefined;
-    const hp_length = nibbles.hex_prefix_encode(path, false, &hp);
-    write_list_header(sink, rlp.string_encoded_length(hp[0..hp_length]) + child.len);
-    write_string(sink, hp[0..hp_length]);
-    sink.write(child.slice());
+    encode_extension_compact(sink, hp[0..nibbles.hex_prefix_encode(path, false, &hp)], child);
 }
 
 pub fn extension_ref(path: []const u8, child: *const RlpNode) RlpNode {
-    var sink = RefSink.init(extension_length(path, child));
-    encode_extension(&sink, path, child);
+    assert(path.len > 0);
+    var hp: [nibbles.hex_prefix_bytes_max]u8 = undefined;
+    return extension_ref_compact(hp[0..nibbles.hex_prefix_encode(path, false, &hp)], child);
+}
+
+/// Extension length from an already hex-prefix encoded, non-empty path `hp`.
+pub fn extension_length_compact(hp: []const u8, child: *const RlpNode) u64 {
+    assert(hp.len > 0);
+    assert(hp[0] >> 4 == 0 or hp[0] >> 4 == 1);
+    assert(hp.len > 1 or hp[0] >> 4 == 1); // The path is not empty.
+    return encoded_length(rlp.string_encoded_length(hp) + child.len);
+}
+
+pub fn encode_extension_compact(sink: anytype, hp: []const u8, child: *const RlpNode) void {
+    assert(hp.len > 0);
+    write_list_header(sink, rlp.string_encoded_length(hp) + child.len);
+    write_string(sink, hp);
+    sink.write(child.slice());
+}
+
+pub fn extension_ref_compact(hp: []const u8, child: *const RlpNode) RlpNode {
+    var sink = RefSink.init(extension_length_compact(hp, child));
+    encode_extension_compact(&sink, hp, child);
     return sink.finish();
 }
 
