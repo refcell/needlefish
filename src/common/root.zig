@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+pub const primitives = @import("primitives/root.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
