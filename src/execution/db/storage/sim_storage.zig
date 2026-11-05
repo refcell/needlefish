@@ -437,7 +437,10 @@ test "sim storage: write, read back, sync makes durable" {
 }
 
 test "sim storage: crash loses, keeps, or tears unsynced sectors" {
-    var sim = try SimStorage.init(testing.allocator, .{ .size_bytes = 64 * sector_size, .seed = 9 });
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = 64 * sector_size,
+        .seed = 9,
+    });
     defer sim.deinit(testing.allocator);
     var ops: TestOps = .{};
     var data: [64 * sector_size]u8 = undefined;
