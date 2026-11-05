@@ -58,7 +58,7 @@ pub const Runner = struct {
     context: *anyopaque = undefined,
 };
 
-pub const Error = error{ InvalidFixture, OutOfMemory } || evm_module.Error ||
+pub const Error = error{ InvalidFixture, OutOfMemory, TrieInitFailed } || evm_module.Error ||
     trie.state_trie.Error || std.json.ParseError(std.json.Scanner);
 
 /// Run every case in one fixture file.
@@ -422,11 +422,12 @@ fn state_root(
     defer addresses.deinit(arena);
     const accounts: u32 = @intCast(addresses.count() + 16);
     const slots: u32 = @intCast(database.storage.count() + state.slots.count() + 16);
-    var state_trie = try trie.StateTrie.init(arena, .{
+    // `init` may also fail to start its rehash threads; those errors are not fixture bugs.
+    var state_trie = trie.StateTrie.init(arena, .{
         .accounts_max = accounts,
         .account_nodes_max = 4 * accounts,
         .storage_nodes_max = 4 * slots,
-    });
+    }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.TrieInitFailed;
     defer state_trie.deinit(arena);
     for (addresses.keys()) |address| {
         const account = post_account(database, state, address) orelse continue;
@@ -512,4 +513,26 @@ test "state_test: hex parsing" {
     try std.testing.expectEqual(@as(u256, 0x0a), try parse_u256("0x0a"));
     try std.testing.expectEqual(@as(u256, 0), try parse_u256("0x"));
     try std.testing.expectError(error.InvalidFixture, parse_u256("0xzz"));
+}
+
+test "state_test: an EEST EIP-7702 fixture (delegation to a precompile) passes end to end" {
+    // One case from execution-spec-tests v5.4.0 `test_set_code_to_precompile` (identity,
+    // CALL), `secretKey` removed. It covers authorization parsing and recovery, delegated
+    // precompile semantics, and the state-root path, so the runner keeps compiling.
+    const fixture = @embedFile("testdata/eip7702_set_code_to_precompile.json");
+    const evm_test = @import("evm_test.zig");
+    var database = MemoryDatabase.init(std.testing.allocator);
+    defer database.deinit();
+    var state = try state_module.State.init(
+        std.testing.allocator,
+        database.interface(),
+        evm_test.test_limits,
+    );
+    defer state.deinit(std.testing.allocator);
+    var machine = try evm_module.Evm.init(std.testing.allocator, evm_test.test_config, &state);
+    defer machine.deinit(std.testing.allocator);
+    var runner = Runner{ .state = &state, .evm = &machine };
+    const summary = try run_file(&runner, std.testing.allocator, fixture, .{});
+    try std.testing.expectEqual(@as(u32, 1), summary.passed);
+    try std.testing.expectEqual(@as(u32, 0), summary.failed);
 }

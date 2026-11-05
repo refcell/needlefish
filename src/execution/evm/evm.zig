@@ -310,17 +310,14 @@ pub const Evm = struct {
                 return failed(request.gas_limit, .revert);
             }
         }
-        // EIP-7702: a delegation to a precompile (or native contract) runs that account's
-        // empty code, as in revm, so dispatch keys off the undelegated address only.
-        const delegated = !std.mem.eql(u8, &request.code_address, &request.target);
-        if (!delegated) {
-            if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
-                return evm.run_precompile(precompile, request, checkpoint);
-            }
-            if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
-                const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
-                return evm.run_native(contract, request, checkpoint, call);
-            }
+        // EIP-7702: dispatch keys off the called address, never the delegate, so a delegation
+        // to a precompile (or native contract) runs that account's empty code, as in revm.
+        if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
+            return evm.run_precompile(precompile, request, checkpoint);
+        }
+        if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
+            const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
+            return evm.run_native(contract, request, checkpoint, call);
         }
         const code_account = try evm.state.load(request.code_address);
         const code = try evm.state.code(code_account);

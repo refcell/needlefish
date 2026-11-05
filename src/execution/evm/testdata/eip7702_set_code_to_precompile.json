@@ -1,0 +1,120 @@
+{
+ "tests/prague/eip7702_set_code_tx/test_set_code_txs.py::test_set_code_to_precompile[fork_Prague-precompile_0x0000000000000000000000000000000000000004-call_opcode_CALL-evm_code_type_LEGACY-state_test]": {
+  "env": {
+   "currentCoinbase": "0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba",
+   "currentGasLimit": "0x07270e00",
+   "currentNumber": "0x01",
+   "currentTimestamp": "0x03e8",
+   "currentRandom": "0x0000000000000000000000000000000000000000000000000000000000000000",
+   "currentDifficulty": "0x00",
+   "currentBaseFee": "0x07",
+   "currentExcessBlobGas": "0x00"
+  },
+  "pre": {
+   "0xb292e40a8eae6c8e695a913cbb23da252c3f0c73": {
+    "nonce": "0x01",
+    "balance": "0x01",
+    "code": "0x6000600060006000600173c9d09553f8a166125efe67f82101c8d06bcb2ec56000f16000553d60015500",
+    "storage": {}
+   },
+   "0xdfb4c8e32f7ce5b4cc96e48e2008a955d9de577a": {
+    "nonce": "0x00",
+    "balance": "0x3635c9adc5dea00000",
+    "code": "0x",
+    "storage": {}
+   }
+  },
+  "transaction": {
+   "nonce": "0x00",
+   "maxPriorityFeePerGas": "0x00",
+   "maxFeePerGas": "0x07",
+   "gasLimit": [
+    "0x07a120"
+   ],
+   "to": "0xb292e40a8eae6c8e695a913cbb23da252c3f0c73",
+   "value": [
+    "0x00"
+   ],
+   "data": [
+    "0x"
+   ],
+   "accessLists": [
+    []
+   ],
+   "authorizationList": [
+    {
+     "chainId": "0x00",
+     "address": "0x0000000000000000000000000000000000000004",
+     "nonce": "0x00",
+     "v": "0x00",
+     "r": "0xf51b20bf7abf47e9f0481411927ece5444cba27ff8730dc834206c03c2246c52",
+     "s": "0x43f69609c8b10ee8c868df90e8525e3516372f0d5bda18de82e7c98d0d26fc15",
+     "signer": "0xc9d09553f8a166125efe67f82101c8d06bcb2ec5",
+     "yParity": "0x00"
+    }
+   ],
+   "sender": "0xdfb4c8e32f7ce5b4cc96e48e2008a955d9de577a"
+  },
+  "post": {
+   "Prague": [
+    {
+     "hash": "0x82c883b4b9724d5176c7852260c4514d0489f10d734af58113c7e725517fd775",
+     "logs": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+     "txbytes": "0x04f8c0018080078307a12094b292e40a8eae6c8e695a913cbb23da252c3f0c738080c0f85cf85a809400000000000000000000000000000000000000048080a0f51b20bf7abf47e9f0481411927ece5444cba27ff8730dc834206c03c2246c52a043f69609c8b10ee8c868df90e8525e3516372f0d5bda18de82e7c98d0d26fc1501a058c22593cda999f8b72ff5c229399e1b96a7d5e14914b1396b35d5e1330665a59f41de9238c0bb27f9a7dedd255080317b8df2387d56ff8381134475eb837b44",
+     "indexes": {
+      "data": 0,
+      "gas": 0,
+      "value": 0
+     },
+     "state": {
+      "0xb292e40a8eae6c8e695a913cbb23da252c3f0c73": {
+       "nonce": "0x01",
+       "balance": "0x00",
+       "code": "0x6000600060006000600173c9d09553f8a166125efe67f82101c8d06bcb2ec56000f16000553d60015500",
+       "storage": {
+        "0x00": "0x01"
+       }
+      },
+      "0xdfb4c8e32f7ce5b4cc96e48e2008a955d9de577a": {
+       "nonce": "0x01",
+       "balance": "0x3635c9adc5de97c045",
+       "code": "0x",
+       "storage": {}
+      },
+      "0xc9d09553f8a166125efe67f82101c8d06bcb2ec5": {
+       "nonce": "0x01",
+       "balance": "0x01",
+       "code": "0xef01000000000000000000000000000000000000000004",
+       "storage": {}
+      }
+     }
+    }
+   ]
+  },
+  "config": {
+   "blobSchedule": {
+    "Cancun": {
+     "target": "0x03",
+     "max": "0x06",
+     "baseFeeUpdateFraction": "0x32f0ed"
+    },
+    "Prague": {
+     "target": "0x06",
+     "max": "0x09",
+     "baseFeeUpdateFraction": "0x4c6964"
+    }
+   },
+   "chainid": "0x01"
+  },
+  "_info": {
+   "hash": "0x95cc73737235ac25ea091c03d717ed357494f65e0bfadec763aca830437fdd9f",
+   "comment": "`execution-specs` generated test",
+   "filling-transition-tool": "2.18.0rc6",
+   "description": "Test setting the code of an account to a pre-compile address and executing\n    all call opcodes.",
+   "url": "https://github.com/ethereum/execution-specs/blob/tests-v5.4.0/tests/prague/eip7702_set_code_tx/test_set_code_txs.py#L2741",
+   "fixture-format": "state_test",
+   "reference-spec": "https://github.com/ethereum/EIPs/blob/master/EIPS/eip-7702.md",
+   "reference-spec-version": "99f1be49f37c034bdd5c082946f5968710dbfc87"
+  }
+ }
+}

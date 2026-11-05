@@ -13,6 +13,7 @@ pub const bytecode = @import("bytecode.zig");
 pub const env = @import("env.zig");
 pub const state = @import("state.zig");
 pub const memory_db = @import("memory_db.zig");
+pub const uint = @import("uint.zig");
 pub const interpreter = @import("interpreter.zig");
 pub const evm = @import("evm.zig");
 pub const precompiles = @import("precompiles.zig");

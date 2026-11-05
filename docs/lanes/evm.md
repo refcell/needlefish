@@ -111,7 +111,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `evm: snailtracer` in `zig build bench`, ~50 ms / 166M gas, docs/PERF.md).
 - [x] Performance: profile snailtracer (interpreter loop ~80%, memory ops ~15%, keccak ~2%;
   docs/PERF.md).
-- [ ] Performance: compare with revm on the same machine (needs a Rust toolchain build).
+- [x] Performance: compare with revm on the same machine (snailtracer: revm 31-46 ms,
+  needlefish 27 ms after the `uint.zig` division rewrite; docs/PERF.md).
 
 ## Decisions
 - EIP-8130 pre-call reads warm the accounts and slots they touch (base's gas-free journal
@@ -162,6 +163,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: u256 DIV/MOD family via Knuth D (`uint.zig`): snailtracer 50.5 -> 27.1 ms,
+  ahead of revm on the same machine. Embedded EEST 7702 fixture guards the statetest runner
+  (it stopped compiling after a trie error-set change; `zig build test` did not build it).
 - 2026-11-05: EEST v5.4.0 state tests 44039/44039 (Frontier through Osaka) and
   GeneralStateTests 37724/37724. The runner now parses `authorizationList` (authority
   recovered locally, low-s), and a 7702 delegation to a precompile or native runs empty code

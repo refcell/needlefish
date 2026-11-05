@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 const primitives = @import("primitives.zig");
 const op = @import("opcode.zig");
 const gas = @import("gas.zig");
+const uint = @import("uint.zig");
 const memory_module = @import("memory.zig");
 const bytecode = @import("bytecode.zig");
 const state_module = @import("state.zig");
@@ -147,40 +148,46 @@ pub fn mul(a: u256, b: u256) u256 {
 pub fn sub(a: u256, b: u256) u256 {
     return a -% b;
 }
+// Division goes through `uint`: LLVM's generic u256 division is ~100x slower.
 pub fn div(a: u256, b: u256) u256 {
-    return if (b == 0) 0 else a / b;
+    return uint.div(a, b);
 }
 pub fn mod(a: u256, b: u256) u256 {
-    return if (b == 0) 0 else a % b;
+    return uint.rem(a, b);
 }
 
+const sign_bit: u256 = 1 << 255;
+
+fn magnitude(x: u256) u256 {
+    return if (x & sign_bit != 0) 0 -% x else x;
+}
+
+/// Two's-complement division truncating toward zero; minInt / -1 wraps to minInt.
 pub fn sdiv(a: u256, b: u256) u256 {
     if (b == 0) return 0;
-    const sa: i256 = @bitCast(a);
-    const sb: i256 = @bitCast(b);
-    if (sa == std.math.minInt(i256) and sb == -1) return a;
-    return @bitCast(@divTrunc(sa, sb));
+    const quotient = uint.div(magnitude(a), magnitude(b));
+    const negative = (a ^ b) & sign_bit != 0;
+    return if (negative) 0 -% quotient else quotient;
 }
 
+/// The remainder takes the sign of the dividend.
 pub fn smod(a: u256, b: u256) u256 {
     if (b == 0) return 0;
-    const sa: i256 = @bitCast(a);
-    const sb: i256 = @bitCast(b);
-    if (sb == -1) return 0;
-    return @bitCast(@rem(sa, sb));
+    const remainder = uint.rem(magnitude(a), magnitude(b));
+    return if (a & sign_bit != 0) 0 -% remainder else remainder;
 }
 
 pub fn addmod(a: u256, b: u256, n: u256) u256 {
     if (n == 0) return 0;
-    const sum = @as(u257, a) + b;
-    return @intCast(sum % n);
+    const sum = @as(u288, a) + b;
+    return uint.div_rem(u288, sum, n).remainder;
 }
 
 pub fn mulmod(a: u256, b: u256, n: u256) u256 {
     if (n == 0) return 0;
     if (a == 0 or b == 0) return 0;
     const product = @as(u512, a) * b;
-    return @intCast(product % n);
+    return uint.div_rem(u512, product, n).remainder;
 }
 
 pub fn exponent(base: u256, power: u256) u256 {

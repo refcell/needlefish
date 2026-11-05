@@ -455,7 +455,17 @@ the shared machine at load average ~35, so treat it as a ceiling:
 
 | case | ns/op | notes |
 |---|---|---|
-| evm: snailtracer | 50 479 625 | ~3.3 Ggas/s; arithmetic, memory, and jump heavy |
+| evm: snailtracer | 50 479 625 | before `uint.zig`: LLVM's generic u256 division |
+| evm: snailtracer | 27 078 208 | ~6.1 Ggas/s with Knuth division over 32-bit limbs |
+
+u256 division microbench (same machine): LLVM's lowering of `u256 / u256` costs ~500 ns
+(u64-sized divisor) and ~230 ns (wide divisor), against ~3 ns for a u256 multiply. DIV, MOD,
+SDIV, SMOD, ADDMOD, and MULMOD now go through `src/execution/evm/uint.zig` (Knuth D on 32-bit
+limbs, every step a hardware 64-bit divide), differentially fuzzed against the builtins.
+
+revm comparison (revm ee9ab3f, `revme bench snailtracer -w 2 -m 6 -s 10`, back to back with
+ours at load average ~24): revm 31.3-45.8 ms per call (criterion intervals of two runs);
+needlefish 50.4-51.0 ms before `uint.zig`, 27.1 ms after (best of samples).
 
 Profile (macOS `sample`, 5 s of snailtracer, top of stack): the threaded interpreter loop
 ~80% (dispatch plus inlined arithmetic/stack ops), `memory_op` MLOAD/MSTORE ~15% (mostly the
@@ -463,9 +473,6 @@ u256 byte swap; an in-bounds fast path that skips expansion pricing measured ~1%
 noise, so it was not kept), Keccak-f ~2%, memmove/memset ~1%. No call-frame cost shows up:
 snailtracer makes almost no calls. The call-frame path is covered by `evm: call loop`
 (~117 ns per frame push/pop).
-
-Not yet compared with revm on the same machine: building revm needs a Rust toolchain build
-the shared disk cannot spare right now.
 
 ## Test suite time
 
