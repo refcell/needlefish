@@ -77,8 +77,16 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   flag names, defaults, validation; fuzzed) and the dry-run submitter. Left: the binary
   (endpoints, pipeline driven by `utilities.io` time) once the prover-service requester
   lands; health/metrics later.
-- [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
-  roots, bond claiming, `bin/base challenger` (port `challenge/src/*`), DST test.
+- [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
+  output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
+  manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
+  injected vtables; seeded simulation against an in-memory world.
+- [ ] `proof/challenger` network adapters: `ChainView`/`Prover` over `src/proof/rpc`
+  (factory, AggregateVerifier, AnchorStateRegistry, DelayedWETH reads; L2 raw headers;
+  prover RPC with the `base/challenger/proof-session/v2` session ids).
+- [ ] `proof/challenger` submission: `Submitter` over the batcher's txmgr (signing, fee
+  bumping, receipt polling, revert data mapped through `aggregate_verifier.classify_revert`).
+- [ ] `bin/base challenger`: CLI/config wiring, real IO loop calling `Driver.tick`.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
   holds exactly the preimages the client read; `native.run(.., witness)`; `proof run
   --out` writes it; e2e replays the witness alone with hints ignored.
@@ -195,6 +203,26 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   estimation, no revert data), while a game creation needs the bond as value and the
   revert selector. No fee bumping: a dropped creation fails, and the pipeline's restart
   re-proposes at a fresh nonce (base/base's `TxManager` resubmits in place).
+- Challenger (port of `crates/proof/challenge/src`): pure state machines over three
+  injected vtables (`chain.ChainView` reads, `Prover` request/poll, `Submitter`
+  send/status); `Driver.tick(now_ns)` is the only entry point. Ported: `scanner.rs`
+  (`GameCategory`, anchor index search in 1024-game backward batches, fully nullified
+  games filtered first), `validator.rs` (roots from raw L2 headers via
+  `host/native.output_of`; header-hash/account-proof checks not needed since the header
+  is hashed locally), `dispute_attempt.rs` (TEE first, ZK fallback after the TEE submit
+  retry limit, reprove on timeout/failure), `proof_manager.rs` (3 retries; slot table of
+  64 attempts and a 1024-entry FIFO ignore list instead of 10 000), `bond.rs`,
+  `anchor.rs`, `config.rs`, and `contracts/aggregate_verifier.rs` (codecs, known reverts,
+  fork-aware interval gate). base/base awaits each transaction inline; here transactions
+  are queued and polled, and a game with a pending transaction is never sent another, so
+  steps are never duplicated. Not ported: metrics, `attempt_reporter`, `service`, `cli`,
+  admin RPC, and the network adapters (backlog items above).
+- Challenger simulation (`challenger/sim_test.zig`): proposer with fraudulent siblings,
+  an attacker filing fraudulent ZK challenges against honest games, external resolvers,
+  and seeded prover/read/tx faults and latencies. The fake verifier counts disputes of
+  valid roots, so the invariants (never dispute a valid game, every invalid game disputed
+  once per bad proof, honest games win, bounded queues, bonds withdrawn exactly once)
+  are checked by the world, not by the driver under test. 4 seeds (~6 s debug).
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
@@ -247,3 +275,6 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   tests vs `execution/trie`). The differential fuzz found a `SparseTrie` crash (branch
   collapsing into a witness extension with an unloaded child); fixed in `sparse.zig`.
 - 2026-11-05: `proof/preimage` landed (key, channel/duplex, oracle, hint + fuzz).
+- 2026-11-05: `proof/challenger` core landed (AggregateVerifier codecs, scanner,
+  validator, dispute attempts with ZK fallback, bonds, anchor updater, driver, seeded
+  simulation). Network adapters, txmgr submission and `bin/base challenger` remain.
