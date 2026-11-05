@@ -15,6 +15,8 @@ const payload = @import("../payload/root.zig");
 const txpool = @import("../txpool/root.zig");
 const engine_module = @import("../engine/root.zig");
 const eth = @import("../rpc/eth.zig");
+const engine_rpc = @import("../rpc/engine.zig");
+const jwt = @import("../../utilities/jwt/root.zig");
 const http = @import("../../utilities/http/root.zig");
 const io_module = @import("../../utilities/io/root.zig");
 const log = @import("../../utilities/log/root.zig");
@@ -37,6 +39,9 @@ pub const Options = struct {
     dev_l1: bool = false,
     block_time_s: u64 = 2,
     beacon_address: ?io_module.Address = null,
+    /// Engine API (plus eth_*) behind JWT authentication; both or neither.
+    authrpc_address: ?io_module.Address = null,
+    jwt_secret: ?jwt.Secret = null,
     limits: Limits = .{},
 };
 
@@ -86,6 +91,13 @@ pub const Limits = struct {
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
     },
     rpc_scratch_bytes: u32 = 4 << 20,
+    engine: engine_rpc.Limits = .{},
+    authrpc_http: http.server.Options = .{
+        .connections_max = 4,
+        .recv_buffer_size = 4 << 20,
+        .send_buffer_size = 4 << 20,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
+    },
 };
 
 pub fn Service(comptime IO: type) type {
@@ -93,6 +105,7 @@ pub fn Service(comptime IO: type) type {
         const Self = @This();
         const HttpServer = http.Server(IO, *Self, handle_rpc);
         const BeaconServer = http.Server(IO, *Self, handle_beacon);
+        const AuthServer = http.Server(IO, *Self, handle_authrpc);
 
         allocator: std.mem.Allocator,
         io: *IO,
@@ -106,6 +119,8 @@ pub fn Service(comptime IO: type) type {
         engine: Engine,
         api: eth.Api,
         http_server: HttpServer,
+        engine_api: ?engine_rpc.EngineApi = null,
+        auth_server: ?AuthServer = null,
         beacon: ?beacon_module.Beacon = null,
         beacon_server: ?BeaconServer = null,
         miner_completion: IO.Completion = .{},
@@ -123,6 +138,7 @@ pub fn Service(comptime IO: type) type {
         ) !void {
             assert(options.block_time_s > 0);
             assert(!options.dev_l1 or options.beacon_address != null);
+            assert((options.authrpc_address == null) == (options.jwt_secret == null));
             service.* = .{
                 .allocator = allocator,
                 .io = io,
@@ -181,6 +197,8 @@ pub fn Service(comptime IO: type) type {
             errdefer allocator.free(service.api.scratch);
             try service.http_server.init(allocator, service.io, service, limits.http);
             errdefer service.http_server.deinit();
+            try service.init_authrpc();
+            errdefer service.deinit_authrpc();
             if (!service.options.dev_l1) return;
             service.beacon = try beacon_module.Beacon.init(
                 allocator,
@@ -193,9 +211,30 @@ pub fn Service(comptime IO: type) type {
             try service.beacon_server.?.init(allocator, service.io, service, limits.beacon_http);
         }
 
+        fn init_authrpc(service: *Self) !void {
+            if (service.options.authrpc_address == null) return;
+            const limits = &service.options.limits;
+            service.engine_api = try engine_rpc.EngineApi.init(
+                service.allocator,
+                &service.engine,
+                &service.api,
+                limits.engine,
+            );
+            errdefer service.engine_api.?.deinit(service.allocator);
+            service.auth_server = @as(AuthServer, undefined);
+            const server = &service.auth_server.?;
+            try server.init(service.allocator, service.io, service, limits.authrpc_http);
+        }
+
+        fn deinit_authrpc(service: *Self) void {
+            if (service.auth_server) |*server| server.deinit();
+            if (service.engine_api) |*api| api.deinit(service.allocator);
+        }
+
         pub fn deinit(service: *Self) void {
             if (service.beacon_server) |*server| server.deinit();
             if (service.beacon) |*beacon| beacon.deinit(service.allocator);
+            service.deinit_authrpc();
             service.http_server.deinit();
             service.allocator.free(service.api.scratch);
             service.deinit_state();
@@ -214,6 +253,12 @@ pub fn Service(comptime IO: type) type {
         pub fn start(service: *Self) !io_module.Address {
             const bound = try service.http_server.listen(service.options.http_address);
             service.logger.log(.info, "node", "json-rpc listening", .{ .port = bound.port });
+            if (service.auth_server) |*server| {
+                const auth_bound = try server.listen(service.options.authrpc_address.?);
+                service.logger.log(.info, "node", "engine api listening", .{
+                    .port = auth_bound.port,
+                });
+            }
             if (service.beacon_server) |*server| {
                 const beacon_bound = try server.listen(service.options.beacon_address.?);
                 service.logger.log(.info, "node", "beacon api listening", .{
@@ -246,6 +291,28 @@ pub fn Service(comptime IO: type) type {
         ) void {
             assert(service.options.dev_l1);
             service.beacon.?.handle(request, response);
+        }
+
+        pub fn authrpc_address(service: *const Self) ?io_module.Address {
+            const server = service.auth_server orelse return null;
+            return server.address;
+        }
+
+        fn handle_authrpc(
+            service: *Self,
+            request: *const http.Request,
+            response: *http.ResponseBuilder,
+        ) void {
+            if (request.method != .POST) return response.fail(405);
+            const header = request.headers.get("authorization") orelse return response.fail(401);
+            const token = jwt.bearer_token(header) orelse return response.fail(401);
+            const now_s = service.io.now_realtime_ns() / std.time.ns_per_s;
+            _ = jwt.verify(service.options.jwt_secret.?, token, now_s) catch {
+                return response.fail(401);
+            };
+            const api = &service.engine_api.?;
+            const outcome = engine_rpc.Router.handle(api, request.body, response.writer());
+            if (outcome == .empty) response.status = 204;
         }
 
         // ---- Dev L1 miner -------------------------------------------------------------

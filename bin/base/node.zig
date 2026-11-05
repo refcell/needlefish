@@ -70,6 +70,9 @@ pub fn parse_flags(args: []const []const u8) !Flags {
         i += 2;
     }
     if (flags.chain == null) return error.MissingChain;
+    if ((flags.authrpc_port == null) != (flags.jwt_secret_path == null)) {
+        return error.AuthrpcNeedsPortAndSecret;
+    }
     return flags;
 }
 
@@ -83,6 +86,11 @@ fn parse_ip4(text: []const u8) ![4]u8 {
 
 fn beacon_address(flags: Flags) io.Address {
     return io.Address.ip4(flags.http_addr, flags.beacon_port);
+}
+
+fn authrpc_address(flags: Flags) ?io.Address {
+    const port = flags.authrpc_port orelse return null;
+    return io.Address.ip4(flags.http_addr, port);
 }
 
 fn now_ns(context: ?*anyopaque) u64 {
@@ -102,6 +110,12 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const parsed = try base.common.genesis.parse(init.gpa, text);
     defer parsed.deinit();
 
+    var secret: ?base.utilities.jwt.Secret = null;
+    if (flags.jwt_secret_path) |path| {
+        var buffer: [256]u8 = undefined;
+        const secret_text = try cwd.readFile(init.io, path, &buffer);
+        secret = try base.utilities.jwt.Secret.parse_hex(secret_text);
+    }
     var os_io = if (@import("builtin").os.tag == .linux) try io.IO.init(.{}) else try io.IO.init();
     defer os_io.deinit();
     var logger: log.Logger = .{
@@ -116,6 +130,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .dev_l1 = flags.dev_l1,
         .block_time_s = flags.block_time_s,
         .beacon_address = if (flags.dev_l1) beacon_address(flags) else null,
+        .authrpc_address = authrpc_address(flags),
+        .jwt_secret = secret,
     });
     defer service.deinit();
     _ = try service.start();
@@ -138,4 +154,8 @@ test "node: flags" {
     try std.testing.expectError(error.UnknownFlag, parse_flags(&.{ "--nope", "1" }));
     try std.testing.expectError(error.MissingValue, parse_flags(&.{"--chain"}));
     try std.testing.expectError(error.InvalidAddress, parse_ip4("1.2.3.4.5"));
+    try std.testing.expectError(
+        error.AuthrpcNeedsPortAndSecret,
+        parse_flags(&.{ "--chain", "g.json", "--authrpc.port", "9551" }),
+    );
 }

@@ -20,7 +20,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] Block executor (L1; OP deposits pending evm): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
 - [x] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
 - [x] `payload`: (attributes, payload ID, validation, extra data done) payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
-- [ ] `engine`: (handlers/versioning/forkchoice rules done; JSON + JWT wiring pending io-net) Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
+- [x] `engine`: Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
 - [ ] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
 - [ ] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
 - [ ] Persistence + restart, reorg handling via forkchoice.
@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: Engine API JSON (rpc/engine_json + rpc/engine): fcU V1-3, newPayload V1-4, getPayload V1-4 (OP envelope with parentBeaconBlockRoot), exchangeCapabilities, getClientVersionV1; authrpc also serves eth_*. JWT-checked authrpc server in Service; `--authrpc.port/--authrpc.jwtsecret` in `base node`. Builder/follower JSON agreement test. Raised the rpc Router comptime branch quota (io-net lane, integration fix).
 - 2026-11-05: `base node` binary (flags per etc/devnet/devnet.sh): --dev-l1 mines and serves beacon API; smoke-tested with curl. Decisions: state in memory, --datadir created but unused; devnet-sized default limits (~485 MB RSS ReleaseSafe); past slots since genesis are mined back-to-back at startup.
 - 2026-11-05: node/service: Service(IO) owns the whole node, eth HTTP server, dev-L1 slot miner (one block per slot through the Engine API, head=safe=finalized) and beacon API; blob sidecars captured from the pool before FCU prunes them. SimIo e2e tests.
 - 2026-11-05: ChainSpec from genesis config, genesis loader into StateDb; test proves our L1/L2 genesis hashes equal the devnet rollup.json anchors. Decision: blobSchedule not parsed yet, standard Cancun/Prague params used.

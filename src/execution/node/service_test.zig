@@ -231,3 +231,99 @@ test "service: dev L1 keeps blob sidecars of mined blob transactions" {
     const head = service.chain.header(service.chain.head_hash()).?;
     try testing.expectEqual(@as(?u64, 131_072), head.blob_gas_used);
 }
+
+const Outcome = struct {
+    ok: bool = false,
+    failed: bool = false,
+    text: [256]u8 = undefined,
+    size: usize = 0,
+
+    fn on_result(
+        outcome: *Outcome,
+        client: *rpc.Client(io.SimIo),
+        result: rpc.client.Error!rpc.client.Result,
+    ) void {
+        _ = client;
+        const value = result catch {
+            outcome.failed = true;
+            return;
+        };
+        switch (value) {
+            .ok => |ok| {
+                const size = @min(ok.len, outcome.text.len);
+                @memcpy(outcome.text[0..size], ok[0..size]);
+                outcome.size = size;
+                outcome.ok = true;
+            },
+            .rpc_error => outcome.failed = true,
+        }
+    }
+};
+
+fn write_capabilities(context: void, writer: *json.Writer) json.Writer.WriteError!void {
+    _ = context;
+    try writer.begin_array();
+    try writer.end_array();
+}
+
+test "service: L2 engine API requires a valid JWT" {
+    const jwt = @import("../../utilities/jwt/root.zig");
+    var world = try io.SimWorld.init(testing.allocator, .{ .seed = 5 });
+    defer world.deinit();
+    var node_io: io.SimIo = undefined;
+    try io.SimIo.init(&node_io, testing.allocator, &world, .{
+        .host = io.Address.ip4(.{ 10, 0, 0, 1 }, 0),
+    });
+    defer node_io.deinit();
+    var client_io: io.SimIo = undefined;
+    try io.SimIo.init(&client_io, testing.allocator, &world, .{
+        .host = io.Address.ip4(.{ 10, 0, 0, 2 }, 0),
+    });
+    defer client_io.deinit();
+    var text: [64 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    try devnet.genesis.write_l2_genesis(&writer, &.{ .genesis_timestamp = genesis_time });
+    const parsed = try genesis.parse(testing.allocator, writer.buffered());
+    defer parsed.deinit();
+    var log_buffer: [4096]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const secret: jwt.Secret = .{ .bytes = @splat(0x42) };
+    var limits = test_limits;
+    limits.engine = .{ .bytes = 1 << 16, .transactions_max = 64 };
+    limits.authrpc_http = limits.http;
+    const service = try testing.allocator.create(Service);
+    defer testing.allocator.destroy(service);
+    try service.init(testing.allocator, &node_io, &logger, &parsed.value, .{
+        .http_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 9545),
+        .authrpc_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 9551),
+        .jwt_secret = secret,
+        .limits = limits,
+    });
+    defer service.deinit();
+    try testing.expectEqual(@import("../chainspec/root.zig").Mode.l2, service.spec.mode);
+    _ = try service.start();
+
+    const authrpc = service.authrpc_address().?;
+    var client = try rpc.Client(io.SimIo).init(testing.allocator, &client_io, authrpc, .{
+        .send_buffer_size = 4096,
+        .recv_buffer_size = 16 * 1024,
+        .limits = .{ .head_size_max = 1024, .body_size_max = 8 * 1024 },
+    }, 1024);
+    defer client.deinit();
+    var rejected: Outcome = .{};
+    const method = "engine_exchangeCapabilities";
+    try client.call(*Outcome, &rejected, Outcome.on_result, method, {}, write_capabilities);
+    world.run_for_ns(std.time.ns_per_s / 2);
+    try testing.expect(rejected.failed);
+
+    var token_buffer: [jwt.token_size_max]u8 = undefined;
+    const now_s = node_io.now_realtime_ns() / std.time.ns_per_s;
+    client.set_bearer(jwt.create(secret, now_s, &token_buffer));
+    var accepted: Outcome = .{};
+    try client.call(*Outcome, &accepted, Outcome.on_result, method, {}, write_capabilities);
+    world.run_for_ns(std.time.ns_per_s / 2);
+    try testing.expect(accepted.ok);
+    const capabilities = accepted.text[0..accepted.size];
+    try testing.expect(std.mem.indexOf(u8, capabilities, "newPayloadV4") != null);
+}

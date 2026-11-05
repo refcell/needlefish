@@ -237,6 +237,7 @@ pub fn Method(comptime Context: type) type {
 /// Dispatches requests to a comptime method table.
 pub fn Router(comptime Context: type, comptime methods: []const Method(Context)) type {
     comptime {
+        @setEvalBranchQuota(1000 + 64 * methods.len * methods.len);
         for (methods, 0..) |a, i| for (methods[i + 1 ..]) |b| {
             if (std.mem.eql(u8, a.name, b.name)) @compileError("duplicate method " ++ a.name);
         };
