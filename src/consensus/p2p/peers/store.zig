@@ -35,17 +35,25 @@ pub const Store = struct {
         return &store.records[(store.head + index) % store.slots()];
     }
 
-    fn contains(store: *const Store, record: *const enr.Record) bool {
+    /// Index of the stored record for the same node, if any.
+    fn find_node(store: *const Store, record: *const enr.Record) ?u32 {
+        const node_id = record.node_id();
         var index: u32 = 0;
         while (index < store.count) : (index += 1) {
-            if (std.mem.eql(u8, store.at(index).raw(), record.raw())) return true;
+            if (std.mem.eql(u8, &store.at(index).node_id(), &node_id)) return index;
         }
-        return false;
+        return null;
     }
 
-    /// Adds a record unless an identical one is stored; evicts the oldest when full.
+    /// Adds a record. A stored record for the same node is replaced when this one has a
+    /// higher sequence number and kept otherwise. Evicts the oldest record when full.
     pub fn add(store: *Store, record: *const enr.Record) void {
-        if (store.contains(record)) return;
+        if (store.find_node(record)) |index| {
+            const slot = &store.records[(store.head + index) % store.slots()];
+            if (record.sequence > slot.sequence) slot.* = record.*;
+            assert(slot.sequence >= record.sequence);
+            return;
+        }
         if (store.count == store.slots()) {
             store.head = (store.head + 1) % store.slots();
             store.count -= 1;
@@ -127,6 +135,21 @@ fn skip_space(bytes: []const u8, start: usize) usize {
 
 const boot = @import("boot.zig");
 const fuzz = @import("../../../testing/fuzz.zig");
+
+test "store: a newer record for the same node replaces the older one" {
+    var store = try Store.init(std.testing.allocator, 4);
+    defer store.deinit(std.testing.allocator);
+    var secret: [32]u8 = @splat(0);
+    secret[31] = 5;
+    const older = try enr.build(secret, .{ .sequence = 1, .ip4 = .{ 1, 1, 1, 1 }, .tcp = 1 });
+    const newer = try enr.build(secret, .{ .sequence = 2, .ip4 = .{ 2, 2, 2, 2 }, .tcp = 2 });
+    store.add(&older);
+    store.add(&newer);
+    store.add(&older);
+    try std.testing.expectEqual(@as(u32, 1), store.count);
+    try std.testing.expectEqual(@as(u64, 2), store.at(0).sequence);
+    try std.testing.expectEqual([4]u8{ 2, 2, 2, 2 }, store.at(0).ip4().?);
+}
 
 test "store: dedup, eviction, chain filter" {
     var store = try Store.init(std.testing.allocator, 4);

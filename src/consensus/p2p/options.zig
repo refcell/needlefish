@@ -43,6 +43,9 @@ pub const Options = struct {
     bootnodes: [bootnodes_max][]const u8 = undefined,
     bootnodes_count: u32 = 0,
     bootnodes_file: ?[]const u8 = null,
+    /// Bootstore JSON path (`--p2p.bootstore`); the binary reads and writes it.
+    bootstore: ?[]const u8 = null,
+    no_bootstore: bool = false,
     unsafe_block_signer: ?primitives.Address = null,
 
     pub fn bootnode_slice(options: *const Options) []const []const u8 {
@@ -76,7 +79,7 @@ pub fn parse(args: []const []const u8) Error!Options {
 }
 
 const bool_flags = [_][]const u8{
-    "no-discovery", "scoring.topics", "topic-scoring", "ban.peers",
+    "no-discovery", "scoring.topics", "topic-scoring", "ban.peers", "no-bootstore",
 };
 
 fn is_bool(name: []const u8) bool {
@@ -103,6 +106,8 @@ fn apply(options: *Options, name: []const u8, value: ?[]const u8) Error!void {
         try add_bootnodes(options, text);
     } else if (eql(name, "bootnodes-file")) {
         options.bootnodes_file = text;
+    } else if (eql(name, "bootstore")) {
+        options.bootstore = text;
     } else if (eql(name, "unsafe.block.signer")) {
         options.unsafe_block_signer = primitives.Address.from_hex(text) catch
             return error.InvalidValue;
@@ -113,6 +118,7 @@ fn apply_bool(options: *Options, name: []const u8, value: bool) void {
     if (eql(name, "no-discovery")) options.no_discovery = value;
     if (eql(name, "scoring.topics") or eql(name, "topic-scoring")) options.topic_scoring = value;
     if (eql(name, "ban.peers")) options.ban_peers = value;
+    if (eql(name, "no-bootstore")) options.no_bootstore = value;
 }
 
 /// Returns true when `name` is a numeric option (and stores it).

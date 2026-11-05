@@ -13,6 +13,7 @@ const boot = @import("peers/boot.zig");
 const enr = @import("peers/enr.zig");
 const ip = @import("peers/ip.zig");
 const node_key = @import("peers/node_key.zig");
+const store_module = @import("peers/store.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
 const block = @import("gossip/block.zig");
 const router_module = @import("gossip/router.zig");
@@ -112,6 +113,8 @@ pub fn Network(comptime IO: type) type {
         transport: Transport,
         options: Options,
         record: enr.Record,
+        /// Known peers persisted across restarts (base/base bootstore), unless disabled.
+        store: ?store_module.Store = null,
 
         /// `self` must not move afterwards. `seed` feeds per-connection noise keys and must
         /// come from OS entropy in production.
@@ -135,6 +138,11 @@ pub fn Network(comptime IO: type) type {
                 .ip4 => |bytes| io_module.Address.ip4(bytes, options.listen_tcp),
                 .ip6 => |bytes| io_module.Address.ip6(bytes, options.listen_tcp),
             };
+            self.store = null;
+            if (!options.no_bootstore) {
+                self.store = try store_module.Store.init(allocator, store_module.capacity_default);
+            }
+            errdefer if (self.store) |*store| store.deinit(allocator);
             try self.transport.init(allocator, io, self.service, .{
                 .listen = listen,
                 .identity_secret = secret,
@@ -177,6 +185,7 @@ pub fn Network(comptime IO: type) type {
 
         /// Frees memory after `stop` once the IO loop has drained the completions.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.store) |*store| store.deinit(allocator);
             self.transport.deinit();
             self.service.destroy(allocator);
         }
@@ -202,6 +211,46 @@ pub fn Network(comptime IO: type) type {
         /// The next validated unsafe block from the network, decoded into `scratch`.
         pub fn pop_block(self: *Self, scratch: []u8) ?block.Envelope {
             return self.service.pop_block(scratch);
+        }
+
+        /// Loads bootstore JSON (file contents) and seeds discovery with every record for
+        /// this chain. Returns how many records were seeded; 0 when the bootstore is off.
+        pub fn load_bootstore(self: *Self, contents: []const u8) error{InvalidFormat}!u32 {
+            const store = if (self.store) |*value| value else return 0;
+            _ = try store.load(contents);
+            const now = self.transport.io.now_realtime_ns();
+            const chain_id = self.service.config.rollup.l2_chain_id;
+            var seeded: u32 = 0;
+            var index: u32 = 0;
+            while (index < store.count) : (index += 1) {
+                const record = store.at(index);
+                if (enr.validate_chain(record, chain_id) != .valid) continue;
+                self.service.add_boot_record(record, now);
+                seeded += 1;
+            }
+            assert(seeded <= store.count);
+            return seeded;
+        }
+
+        /// Bytes `save_bootstore` needs at most.
+        pub fn bootstore_length_max(self: *const Self) usize {
+            const store = if (self.store) |*value| value else return 0;
+            return 2 + store.records.len * (enr.text_length_max + 3);
+        }
+
+        /// Merges the discovery table into the bootstore and returns its JSON for the
+        /// caller to write (base/base syncs every 60 s). Empty when the bootstore is off.
+        pub fn save_bootstore(self: *Self, output: []u8) []const u8 {
+            const store = if (self.store) |*value| value else return output[0..0];
+            assert(output.len >= self.bootstore_length_max());
+            const table = &self.service.discovery.table;
+            var entries: [32]*const @import("disc/table.zig").Entry = undefined;
+            var distance: u16 = 1;
+            while (distance <= 256) : (distance += 1) {
+                const count = table.at_distance(distance, &entries);
+                for (entries[0..count]) |entry| store.add(&entry.record);
+            }
+            return store.serialize(output);
         }
 
         pub fn peer_count(self: *const Self) u32 {
@@ -300,6 +349,17 @@ test "network: two nodes over SimIo connect through an enode bootnode" {
     world.run_for_ns(3 * ns_per_s);
     try testing.expectEqual(@as(u32, 1), networks[0].peer_count());
     try testing.expectEqual(@as(u32, 1), networks[1].peer_count());
+    // Datagrams are not wired to io yet, so seed node 1's table with node 0's record;
+    // the bootstore then carries it.
+    networks[1].service.add_boot_record(&networks[0].record, ios[1].now_realtime_ns());
+    const json = try allocator.alloc(u8, networks[1].bootstore_length_max());
+    defer allocator.free(json);
+    const saved = networks[1].save_bootstore(json);
+    var text: [enr.text_length_max]u8 = undefined;
+    const node0_text = enr.encode_text(&text, &networks[0].record);
+    try testing.expect(std.mem.indexOf(u8, saved, node0_text) != null);
+    try testing.expect(try networks[0].load_bootstore(saved) >= 1);
+    try testing.expectError(error.InvalidFormat, networks[0].load_bootstore("{"));
     for (&networks) |*network| network.stop();
     world.run_for_ns(100 * std.time.ns_per_ms);
 }
