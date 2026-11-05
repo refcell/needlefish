@@ -15,7 +15,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
 - [ ] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
-  - [ ] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
+  - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
   - [ ] channel bank / assembler / reader
   - [ ] batch stream, batch queue, batch validator
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
@@ -58,6 +58,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   `Withdrawal` and converts to its engine type with `engine()`.
 
 ## Log
+- 2026-11-05: derive: calldata/blob data source, L1 retrieval, frame queue + Holocene prune.
 - 2026-11-05: stateful attributes builder (Denim BaseTime/gas scaling), upgrade txs.
 - 2026-11-05: derive: blob codec, error kinds, provider contracts, L1 traversal.
 - 2026-11-05: span batches (codec, tx data, derive, validity), brotli decoder, batch reader.
