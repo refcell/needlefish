@@ -73,7 +73,7 @@ pub const View = struct {
     now_ns: u64,
 };
 
-fn low_word(hash: B256) ?u64 {
+pub fn low_word(hash: B256) ?u64 {
     for (hash.bytes[0..24]) |byte| {
         if (byte != 0) return null;
     }
@@ -81,13 +81,16 @@ fn low_word(hash: B256) ?u64 {
 }
 
 /// The model L1 as a derivation chain provider (`derive/providers.zig`).
-const L1View = struct {
+pub const L1View = struct {
     l1: *const nodes.L1,
     pool: *const codec.TxPool,
     reachable: bool,
+    /// Blocks this close to the head are not served by number (a confirmation depth): the
+    /// real sequencer's origins and derivation then only see blocks no L1 reorg changes.
+    confirmations: u64 = 0,
     transactions: [nodes.l1_batches_max]L1Transaction = undefined,
 
-    fn info(view: *const L1View, number: u64) BlockInfo {
+    pub fn info(view: *const L1View, number: u64) BlockInfo {
         assert(number <= view.l1.head);
         const block = &view.l1.blocks[number];
         assert(block.number == number);
@@ -114,7 +117,7 @@ const L1View = struct {
 
     pub fn l1_block_info_by_number(view: *L1View, number: u64) ProviderError!BlockInfo {
         if (!view.reachable) return error.NotAvailable;
-        if (number > view.l1.head) return error.NotFound;
+        if (number > view.l1.head -| view.confirmations) return error.NotFound;
         return view.info(number);
     }
 
@@ -167,7 +170,7 @@ const L1View = struct {
 };
 
 /// One stored L2 block. Transactions live inline; slices are built on read.
-const Block = struct {
+pub const Block = struct {
     info: L2BlockInfo,
     prev_randao: B256 = .zero,
     fee_recipient: primitives.Address = .zero,
@@ -179,7 +182,7 @@ const Block = struct {
     tx_lengths: [block_txs_max]u16 = @splat(0),
     tx_bytes: [block_txs_max][tx_bytes_max]u8 = undefined,
 
-    fn transaction(block: *const Block, index: usize) []const u8 {
+    pub fn transaction(block: *const Block, index: usize) []const u8 {
         assert(index < block.tx_count);
         return block.tx_bytes[index][0..block.tx_lengths[index]];
     }
@@ -233,6 +236,9 @@ pub const SimEngine = struct {
     written_low: u64 = std.math.maxInt(u64),
     pending: Block = undefined,
     pending_id: ?task.PayloadId = null,
+    /// The sequencer's transaction pool: when set, a build whose attributes allow the pool
+    /// (`no_tx_pool` not true) appends one model payload transaction with a random payload.
+    pool: ?Prng = null,
     builds: u64 = 0,
     pending_slices: [block_txs_max][]const u8 = undefined,
     read_slices: [block_txs_max][]const u8 = undefined,
@@ -381,7 +387,19 @@ pub const SimEngine = struct {
         if (attributes.timestamp != codec.rollup.l2_block_timestamp(number)) return false;
         const pending = &engine.pending;
         pending.* = .{ .info = .{} };
-        if (!pending.store_transactions(attributes.transactions orelse &.{})) return false;
+        const forced = attributes.transactions orelse &.{};
+        if (forced.len == 0 or forced.len > block_txs_max) return false;
+        var included: [block_txs_max][]const u8 = undefined;
+        @memcpy(included[0..forced.len], forced);
+        var included_count = forced.len;
+        var pool_tx: [codec.payload_tx_length_max]u8 = undefined;
+        if (engine.pool) |*pool| {
+            if (attributes.no_tx_pool != true and included_count < block_txs_max) {
+                included[included_count] = codec.payload_tx(pool.int(u64), &pool_tx);
+                included_count += 1;
+            }
+        }
+        if (!pending.store_transactions(included[0..included_count])) return false;
         const transactions = slices(pending, &engine.pending_slices);
         const parent_hash = engine.blocks[parent].info.block_info.hash;
         pending.info.block_info = .{
@@ -590,7 +608,7 @@ fn sequencer_block_info(sequencer: *const nodes.Sequencer, number: u64) L2BlockI
     return result;
 }
 
-const Providers = struct {
+pub const Providers = struct {
     l1: *L1View,
     blobs: *L1View,
     l2: *SimEngine,

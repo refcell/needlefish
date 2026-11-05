@@ -19,7 +19,8 @@ provably robust.
     against model state through JSON-RPC transports (`sim/real_batcher.zig`).
   - [x] Verifier derivation: the real consensus `Driver` (pipeline, engine task queue,
     startup discovery) as the first verifier's consensus client (`sim/real_verifier.zig`).
-  - [ ] Sequencer: the real driver in sequencer mode producing the L2 chain.
+  - [x] Sequencer: the real driver in sequencer mode producing the L2 chain
+    (`sim/real_sequencer.zig`, `Config.real_sequencer`).
 - [x] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
   reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
@@ -243,3 +244,22 @@ provably robust.
   mutants caught: forged gossip payload (unsafe head diverged), wrong gossip fee recipient
   (no consolidation), disk fault without driver restart (critical error), no gap sync
   (seed 16 liveness).
+- 2026-11-05: real sequencer (`sim/real_sequencer.zig`, `Config.real_sequencer`, drawn last
+  in `Config.random`; smith config; swarm reduction 20): the consensus `Driver` in sequencer
+  mode builds through the engine task queue against a `SimEngine` with a tx pool (one model
+  payload tx per pool-enabled build), picks L1 origins through a 3-block confirmation
+  depth, and gossips its sealed payloads as model `unsafe_block`s. Its engine blocks become
+  the reference chain (model sequencer production off; it still serves sync requests).
+  Checked per block: L1 info deposit then one user tx, block time spacing, origin monotone
+  (sequence numbers), final, not newer than the block, within drift; no equivocation or
+  head rewind (across crashes; disk faults lose the last label update, never blocks);
+  gossip equals the recorded block; liveness: produces on time after healing and its own
+  safe head reaches its head. Decision: the sequencer EL never loses gossiped blocks (that
+  equivocates by construction). Swarm 1..3000 green (ReleaseSafe). Mutants: no pool tx (no
+  user tx), pool tx first (critical error: engine rejects), block time 3 (spacing), origin
+  skips a block (monotone; also needs the builder's epoch parent check off), no confirmation
+  depth (not final), early origin (newer than block; needs the builder's BadTimestamp check
+  and assert off), never advance origin + pool past drift (beyond drift, 1900 s run),
+  restart recovers unsafe := safe with a non-truncating EL (equivocated), disk fault loses 5
+  blocks (head went back), sealed gossip drops the user tx (gossip differs), production
+  stalls at 40 (did not produce), sequencer skips derivation (safe head lags): 12/12 caught.

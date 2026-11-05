@@ -27,6 +27,13 @@
 //!     expire, see `codec.seq_window_blocks`), its safe head never decreases except across
 //!     restarts (including engine disk faults) and L1 reorgs, and after healing both heads
 //!     reach the batcher-confirmed head
+//!   - real sequencer (`Config.real_sequencer`, the consensus lane's driver in sequencer
+//!     mode, see `real_sequencer.zig`): it produces the reference chain instead of the
+//!     model sequencer. Every block holds the L1 info deposit then one user transaction,
+//!     is one block time after its parent, and has a monotone, final L1 origin within the
+//!     sequencer drift; it never equivocates or rewinds (across restarts too), its gossip
+//!     is its recorded chain, and after healing it produces on time and its safe head
+//!     reaches its unsafe head
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -36,6 +43,7 @@ const nodes = @import("nodes.zig");
 const codec = @import("codec.zig");
 const real_batcher = @import("real_batcher.zig");
 const real_verifier = @import("real_verifier.zig");
+const real_sequencer = @import("real_sequencer.zig");
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
@@ -97,6 +105,9 @@ pub const Config = struct {
     /// Run the consensus lane's real node driver as a verifier (see `real_verifier.zig`),
     /// as the first verifier's consensus client.
     real_verifier: bool = false,
+    /// Run the consensus lane's real driver in sequencer mode (see `real_sequencer.zig`)
+    /// as the sequencer node: it produces the chain the model sequencer would.
+    real_sequencer: bool = false,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -144,6 +155,8 @@ pub const Config = struct {
             config.admin_ops_per_minute = 0;
             config.reorg_tx_loss_ppm = 0;
         }
+        // Drawn after every other field so the existing streams stay the same.
+        config.real_sequencer = prng.chance(1, 2);
         config.validate();
         return config;
     }
@@ -228,6 +241,7 @@ pub const Cluster = struct {
     byzantine: codec.Encoder,
     real: ?*real_batcher.RealBatcher,
     real_verifier: ?*real_verifier.RealVerifier,
+    real_sequencer: ?*real_sequencer.RealSequencer,
     /// Real verifier safe head floor; reset on its restarts and on L1 reorgs.
     real_safe_floor: u64 = 0,
     real_reorgs_seen: u64 = 0,
@@ -276,11 +290,11 @@ pub const Cluster = struct {
             null;
         errdefer if (real) |r| r.destroy(allocator);
         batcher.submitting = real == null;
-        const verifier_real = if (config.real_verifier)
-            try real_verifier.RealVerifier.create(allocator, config.block_count_max(), seed)
-        else
-            null;
+        const verifier_real = try create_real(real_verifier.RealVerifier, allocator, config, seed);
         errdefer if (verifier_real) |v| v.destroy();
+        const sequencer_real =
+            try create_real(real_sequencer.RealSequencer, allocator, config, seed);
+        errdefer if (sequencer_real) |s| s.destroy();
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
         errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
@@ -303,6 +317,7 @@ pub const Cluster = struct {
                 .chain = sequencer_chain,
                 .block_time_ns = config.l2_block_time_ns,
                 .next_block_ns = config.l2_block_time_ns,
+                .producing = sequencer_real == null,
             },
             .batcher = batcher,
             .tx_pool = tx_pool,
@@ -310,9 +325,28 @@ pub const Cluster = struct {
             .byzantine = byzantine,
             .real = real,
             .real_verifier = verifier_real,
+            .real_sequencer = sequencer_real,
             .allocator = allocator,
             .verifiers = verifiers,
         };
+    }
+
+    /// The real driver node of type `T` when the config enables it, else null.
+    fn create_real(
+        comptime T: type,
+        allocator: std.mem.Allocator,
+        config: Config,
+        seed: u64,
+    ) !?*T {
+        const enabled = switch (T) {
+            real_verifier.RealVerifier => config.real_verifier,
+            real_sequencer.RealSequencer => config.real_sequencer,
+            else => comptime unreachable,
+        };
+        if (!enabled) return null;
+        const node = try T.create(allocator, config.block_count_max(), seed);
+        assert(node.restarts == 0);
+        return node;
     }
 
     pub fn deinit(cluster: *Cluster, allocator: std.mem.Allocator) void {
@@ -323,6 +357,7 @@ pub const Cluster = struct {
         cluster.byzantine.deinit(allocator);
         if (cluster.real) |real| real.destroy(allocator);
         if (cluster.real_verifier) |v| v.destroy();
+        if (cluster.real_sequencer) |s| s.destroy();
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -372,6 +407,7 @@ pub const Cluster = struct {
             cluster.restart_due();
             cluster.deliver();
             cluster.tick();
+            try cluster.tick_real_sequencer();
             try cluster.check_safety();
         }
         cluster.report.steps = steps_max;
@@ -426,6 +462,35 @@ pub const Cluster = struct {
             .l1_reachable = cluster.linked(node, nodes.node_l1),
             .now_ns = cluster.env(node).now_ns,
         };
+    }
+
+    /// The real sequencer steps, its new engine blocks join the reference chain, and its
+    /// sealed payload is gossiped to every verifier, as the model sequencer does.
+    fn tick_real_sequencer(cluster: *Cluster) Failure!void {
+        const sequencer = cluster.real_sequencer orelse return;
+        const node = nodes.node_sequencer;
+        if (!cluster.up(node)) return;
+        const e = cluster.env(node);
+        sequencer.tick(.{
+            .l1 = &cluster.l1,
+            .pool = &cluster.tx_pool,
+            .l1_reachable = cluster.linked(node, nodes.node_l1),
+            .now_ns = e.now_ns,
+        }, cluster.now_ns < cluster.config.production_end_ns);
+        if (sequencer.record(&cluster.sequencer, &cluster.l1)) |reason| {
+            return cluster.fail(reason, node);
+        }
+        const gossip = sequencer.take_gossip(&cluster.sequencer) catch
+            return cluster.fail("real sequencer gossip differs from its chain", node);
+        const block = gossip orelse return;
+        var verifier: u8 = 0;
+        while (verifier < cluster.config.verifier_count) : (verifier += 1) {
+            e.send(node, nodes.node_verifier_first + verifier, .{ .unsafe_block = .{
+                .number = block.number,
+                .payload = block.payload,
+                .hash = block.hash,
+            } });
+        }
     }
 
     fn tick(cluster: *Cluster) void {
@@ -670,7 +735,18 @@ pub const Cluster = struct {
             cluster.clock_offset_ns[node] = cluster.random_clock_offset();
             const e = cluster.env(node);
             switch (node) {
-                nodes.node_sequencer => cluster.sequencer.restart(&e),
+                nodes.node_sequencer => {
+                    cluster.sequencer.restart(&e);
+                    if (cluster.real_sequencer) |sequencer| {
+                        const disk_fault = cluster.prng_faults.chance(
+                            cluster.config.disk_fault_ppm,
+                            1_000_000,
+                        );
+                        cluster.report.disk_faults += @intFromBool(disk_fault);
+                        // Proof: the driver re-allocates what it just freed.
+                        sequencer.restart(disk_fault) catch unreachable;
+                    }
+                },
                 nodes.node_batcher => {
                     cluster.batcher.restart(&e);
                     if (cluster.real) |real| {
@@ -762,6 +838,7 @@ pub const Cluster = struct {
             if (v.unsafe_head != head) return cluster.fail("verifier unsafe head lags", v.id);
             if (v.safe_head != head) return cluster.fail("verifier safe head lags", v.id);
         }
+        try cluster.check_real_sequencer_liveness();
         if (cluster.real_verifier) |verifier| {
             if (verifier.safe_number() != head) {
                 return cluster.fail("real verifier safe head lags", nodes.node_verifier_first);
@@ -769,6 +846,26 @@ pub const Cluster = struct {
             if (verifier.unsafe_number() != head) {
                 return cluster.fail("real verifier unsafe head lags", nodes.node_verifier_first);
             }
+        }
+    }
+
+    /// After healing the real sequencer is up and linked for the rest of production, so it
+    /// must catch up with its clock (minus the largest skew), and its own derivation must
+    /// confirm its whole chain.
+    fn check_real_sequencer_liveness(cluster: *Cluster) Failure!void {
+        const sequencer = cluster.real_sequencer orelse return;
+        const node = nodes.node_sequencer;
+        const config = cluster.config;
+        const window_ns = config.production_end_ns - config.fault_end_ns;
+        if (window_ns >= 10 * ns_per_s) {
+            const end_ns = config.production_end_ns -| config.clock_skew_ns_max;
+            const expected = @min(end_ns / config.l2_block_time_ns, config.block_count_max());
+            if (cluster.sequencer.head + 2 < expected) {
+                return cluster.fail("real sequencer did not produce on time", node);
+            }
+        }
+        if (sequencer.safe_number() != cluster.sequencer.head) {
+            return cluster.fail("real sequencer safe head lags", node);
         }
     }
 
@@ -793,6 +890,21 @@ pub const Cluster = struct {
             std.debug.print("  verifier {d}: safe={d} unsafe={d} l1_cursor={d}\n", .{
                 v.id, v.safe_head, v.unsafe_head, v.follower.cursor,
             });
+        }
+        if (cluster.real_sequencer) |sequencer| {
+            const driver = &sequencer.driver;
+            std.debug.print(
+                "  real sequencer: engine_head={d} safe={d} phase={s} resets={d} " ++
+                    "critical={d} last_error={s}\n",
+                .{
+                    sequencer.engine.head(),
+                    sequencer.safe_number(),
+                    @tagName(driver.phase),
+                    driver.stats.resets,
+                    driver.stats.critical_errors,
+                    if (driver.last_error) |err| @errorName(err) else "none",
+                },
+            );
         }
         if (cluster.real_verifier) |verifier| {
             const driver = &verifier.driver;
@@ -1124,6 +1236,7 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     };
     config.mempool_evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
     config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
+    config.real_sequencer = smith.value(bool);
     // BUG(batcher): see `Config.random`.
     if (config.real_batcher and config.real_verifier) config.reorg_tx_loss_ppm = 0;
     var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
@@ -1133,4 +1246,62 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "cluster: fuzz configs (extreme fault rates)" {
     try @import("../fuzz.zig").run({}, fuzz_cluster, .{ .iterations = 12 });
+}
+
+test "cluster: real sequencer produces the chain to liveness without faults" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 31, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_batcher = real,
+            .real_verifier = real,
+            .real_sequencer = true,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const sequencer = cluster.real_sequencer.?;
+        // Block 60 has timestamp 120: the clock reaches it on the last production step.
+        try std.testing.expect(report.sequencer_head >= 59);
+        try std.testing.expectEqual(report.sequencer_head, sequencer.engine.head());
+        try std.testing.expectEqual(report.sequencer_head, sequencer.safe_number());
+        try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+        try std.testing.expect(sequencer.gossiped + 1 >= report.sequencer_head);
+        // Origins advance: the chain is not stuck on the L1 genesis.
+        const origin = cluster.sequencer.chain.origins[report.sequencer_head];
+        try std.testing.expect(origin.number >= 5);
+        if (real) {
+            const verifier = cluster.real_verifier.?;
+            try std.testing.expectEqual(report.sequencer_head, verifier.safe_number());
+            try std.testing.expect(verifier.engine.consolidated_gossip > 0);
+        }
+    }
+}
+
+test "cluster: real sequencer recovers its unsafe head across crashes" {
+    for ([_]u64{ 41, 42, 43 }) |seed| {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 6,
+            .partitions_per_minute = 1,
+            .disk_fault_ppm = 500_000,
+            .l1_reorgs_per_minute = 1,
+            .real_batcher = seed == 42,
+            .real_verifier = seed != 41,
+            .real_sequencer = true,
+            .fault_end_ns = 240 * ns_per_s,
+            .production_end_ns = 300 * ns_per_s,
+            .settle_end_ns = 700 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const sequencer = cluster.real_sequencer.?;
+        try std.testing.expect(sequencer.restarts > 0);
+        try std.testing.expect(report.sequencer_head >= 140);
+        try std.testing.expectEqual(report.sequencer_head, sequencer.safe_number());
+        try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+    }
 }
