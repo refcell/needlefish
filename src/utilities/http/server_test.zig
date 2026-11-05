@@ -10,12 +10,15 @@ const client_module = @import("client.zig");
 const Address = io.Address;
 
 const Echo = struct {
+    /// The peer the server reported for the last request.
+    peer: ?Address = null,
+
     fn handle(
         echo: *Echo,
         request: *const parser.Request,
         response: *server_module.ResponseBuilder,
     ) void {
-        _ = echo;
+        echo.peer = response.peer;
         if (request.method != .POST) return response.fail(405);
         response.writer().print("{s}:{s}", .{ request.target, request.body }) catch
             return response.fail(500);
@@ -125,6 +128,9 @@ test "http: server and client keep-alive over SimIo" {
     try std.testing.expectEqualStrings("/rpc:{\"id\":3}", collector.body(2));
     try std.testing.expectEqual(@as(u64, 3), server.requests_handled);
     try std.testing.expectEqual(@as(u32, 1), server.connections_open()); // Reused.
+    // The handler sees the client's host with its ephemeral port.
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, echo.peer.?.host_bytes());
+    try std.testing.expect(echo.peer.?.port != 0);
 
     try client.request(*@TypeOf(sink), &sink, @TypeOf(sink).on_response, .GET, "/", &.{}, "");
     harness.world.run_for_ns(std.time.ns_per_s);
@@ -262,6 +268,8 @@ test "http: server and client over the OS backend" {
     }
     try std.testing.expectEqual(@as(u32, 1), collector.count);
     try std.testing.expectEqualStrings("/x:hi", collector.body(0));
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, echo.peer.?.host_bytes());
+    try std.testing.expect(echo.peer.?.port != 0 and echo.peer.?.port != bound.port);
 }
 
 /// Stops `server`, runs `world` until it has drained, then frees it.

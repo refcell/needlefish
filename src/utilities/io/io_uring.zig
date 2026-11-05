@@ -180,6 +180,12 @@ const LinuxIoUring = struct {
         os.shutdown(fd);
     }
 
+    /// The remote address of a connected socket, or null if unavailable.
+    pub fn peer_address(io: *LinuxIoUring, fd: Fd) ?Address {
+        _ = io;
+        return os.peer_address(fd);
+    }
+
     pub fn close_now(io: *LinuxIoUring, fd: Fd) void {
         _ = io;
         os.close(fd);

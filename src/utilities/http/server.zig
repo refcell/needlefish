@@ -59,6 +59,9 @@ pub fn reason_phrase(status: u16) []const u8 {
 /// the body is never copied.
 pub const ResponseBuilder = struct {
     buffer: []u8,
+    /// The client's socket address (unspecified 0.0.0.0:0 if the backend cannot tell).
+    /// Behind a load balancer, resolve the real client with `trusted_proxy`.
+    peer: Address = Address.ip4(.{ 0, 0, 0, 0 }, 0),
     body: std.Io.Writer,
     status: u16 = 200,
     content_type: []const u8 = "application/json",
@@ -149,6 +152,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             keep_alive: bool = false,
             last_progress_ns: u64 = 0,
             timed_out: bool = false,
+            peer: Address = undefined,
         };
 
         io: *IO,
@@ -315,6 +319,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             connection.recv_size = 0;
             connection.timed_out = false;
             connection.last_progress_ns = server.io.now_monotonic_ns();
+            connection.peer = server.io.peer_address(fd) orelse Address.ip4(.{ 0, 0, 0, 0 }, 0);
             connection_recv(connection);
         }
 
@@ -384,6 +389,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                 },
                 .complete => |complete| {
                     var builder = ResponseBuilder.init(connection.send_buffer);
+                    builder.peer = connection.peer;
                     handler(server.context, &complete.message, &builder);
                     server.requests_handled += 1;
                     connection.consumed = complete.consumed;

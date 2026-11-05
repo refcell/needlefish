@@ -155,6 +155,14 @@ pub fn listen(fd: fd_t, address: Address, backlog: u31) common.SetupError!Addres
     return bound.to_address() orelse error.Unexpected;
 }
 
+/// The remote address of a connected socket, or null if unavailable (e.g. reset).
+pub fn peer_address(fd: fd_t) ?Address {
+    var peer: SockAddr = undefined;
+    var peer_len: socklen_t = @sizeOf(SockAddr);
+    if (errno(system.getpeername(fd, &peer.any, &peer_len)) != .SUCCESS) return null;
+    return peer.to_address();
+}
+
 pub fn open_file(path: []const u8, mode: common.OpenMode) common.SetupError!fd_t {
     var path_buffer: [std.posix.PATH_MAX]u8 = undefined;
     if (path.len == 0 or path.len >= path_buffer.len) return error.NameTooLong;

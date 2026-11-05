@@ -185,6 +185,8 @@ const Side = struct {
     open: bool = false,
     /// `shutdown_now` was called: recv returns 0, send fails, and the peer has seen FIN.
     shut: bool = false,
+    /// This side's socket address (client: host plus ephemeral port; server: listener).
+    address: Address = undefined,
     /// Bytes flowing to this side.
     inbound: Pipe,
 };
@@ -623,6 +625,14 @@ pub const SimIo = struct {
         target.canceled = true;
     }
 
+    /// The remote address of a connected stream, or null for other descriptors.
+    pub fn peer_address(io: *SimIo, fd: Fd) ?Address {
+        const descriptor = io.descriptors[fd];
+        if (descriptor != .stream) return null;
+        const connection = &io.world.connections[descriptor.stream.connection];
+        return connection.sides[descriptor.stream.side ^ 1].address;
+    }
+
     pub fn reset_connection(io: *SimIo, fd: Fd) void {
         const descriptor = io.descriptors[fd];
         assert(descriptor == .stream);
@@ -802,6 +812,8 @@ pub const SimIo = struct {
         connection.sides[0].node = io.index;
         connection.sides[0].fd = fd;
         connection.sides[0].open = true;
+        connection.sides[0].address = io.options.host.with_port(io.port_ephemeral());
+        connection.sides[1].address = listener.address;
         // The server side opens on accept; until then its inbound pipe buffers bytes.
         connection.sides[1].node = listener.node;
         connection.pending_accept = true;

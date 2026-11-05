@@ -206,6 +206,15 @@ test "trusted_proxy: header occurrences join in order, scanned right to left" {
     try expect_ip("2001:db8::1", custom.client_ip(test_ip("::ffff:10.0.0.1"), &real));
 }
 
+test "trusted_proxy: resolves from a parsed request" {
+    var cidrs: [test_cidrs.len]Cidr = undefined;
+    const config = test_config(&cidrs);
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.4, 10.9.9.9\r\n\r\n".*;
+    const parsed = try http_parser.parse_request(&raw, .{});
+    const request = parsed.complete.message;
+    try expect_ip("198.51.100.4", config.client_ip(test_ip("10.0.0.1"), request.headers.slice()));
+}
+
 fn resolve_arbitrary(config: *const Config, value: []const u8) !void {
     const peer = test_ip("10.0.0.1");
     const headers = [_]http_parser.Header{.{ .name = "x-forwarded-for", .value = value }};
