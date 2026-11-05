@@ -7,6 +7,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const keccak = @import("keccak.zig");
 const montgomery = @import("montgomery.zig");
+const modexp = @import("modexp.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 
 const Bn254Fp = montgomery.Field(
     4,
@@ -166,9 +168,52 @@ fn bench_ripemd160_4k(iterations: u32) u64 {
     return accumulator;
 }
 
+/// MODEXP with a `modulus_bytes` modulus (odd unless `even`) and `exponent_bytes` exponent
+/// of full width (or the 17-bit 65537 when `exponent_bytes` is 3 with the fixed RSA value).
+fn bench_modexp(
+    comptime modulus_bytes: u32,
+    comptime exponent_bytes: u32,
+    comptime even: bool,
+) fn (u32) u64 {
+    return struct {
+        fn run(iterations: u32) u64 {
+            var prng = Prng.init(modulus_bytes * 1000 + exponent_bytes);
+            var base: [modulus_bytes]u8 = undefined;
+            var exponent: [exponent_bytes]u8 = undefined;
+            var modulus: [modulus_bytes]u8 = undefined;
+            prng.fill(&base);
+            prng.fill(&modulus);
+            modulus[0] |= 0x80;
+            const low = modulus[modulus_bytes - 1];
+            modulus[modulus_bytes - 1] = if (even) low & 0xfe else low | 1;
+            if (exponent_bytes == 3) {
+                exponent = .{ 0x01, 0x00, 0x01 };
+            } else {
+                prng.fill(&exponent);
+                exponent[0] |= 0x80;
+            }
+            var accumulator: u64 = 0;
+            for (0..iterations) |_| {
+                var out: [modulus_bytes]u8 = undefined;
+                modexp.modexp(&base, &exponent, &modulus, &out);
+                base[modulus_bytes - 1] ^= out[modulus_bytes - 1];
+                base[1] = out[1];
+                accumulator +%= out[0];
+            }
+            return accumulator +% base[0];
+        }
+    }.run;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
+    .{ .name = "modexp/256b full exp", .iterations = 20_000, .run = bench_modexp(32, 32, false) },
+    .{ .name = "modexp/2048b e=65537", .iterations = 2_000, .run = bench_modexp(256, 3, false) },
+    .{ .name = "modexp/2048b full exp", .iterations = 20, .run = bench_modexp(256, 256, false) },
+    .{ .name = "modexp/4096b e=65537", .iterations = 500, .run = bench_modexp(512, 3, false) },
+    .{ .name = "modexp/4096b full exp", .iterations = 5, .run = bench_modexp(512, 512, false) },
+    .{ .name = "modexp/2048b even e=65537", .iterations = 500, .run = bench_modexp(256, 3, true) },
     .{ .name = "keccak256/32B", .iterations = 2_000_000, .run = bench_keccak_32 },
     .{ .name = "keccak256/32B (std)", .iterations = 2_000_000, .run = bench_keccak_32_std },
     .{ .name = "keccak256/32B batch", .iterations = 2_000_000, .run = bench_keccak_32_batch },
