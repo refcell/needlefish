@@ -35,6 +35,10 @@ pub const l1_genesis_hash: u64 = 0x6c31_6765_6e65_7369;
 /// Deepest L1 reorg the fault injector produces. Followers must handle any depth.
 pub const l1_reorg_depth_max = 3;
 
+comptime {
+    assert(l1_batches_max <= codec.transactions_max);
+}
+
 pub fn block_hash(parent_hash: u64, number: u64, payload: u64) u64 {
     assert(number > 0);
     const words = [3]u64{ parent_hash, number, payload };
@@ -45,6 +49,8 @@ pub fn block_hash(parent_hash: u64, number: u64, payload: u64) u64 {
 /// its blocks only by decoding the bytes with the real protocol codecs.
 pub const Batch = struct {
     tx_index: u32,
+    /// `codec.sender_batcher`, or `codec.sender_attacker` for forged inbox spam.
+    sender: u8 = codec.sender_batcher,
 };
 
 pub const L1Block = struct {
@@ -432,11 +438,11 @@ pub const Batcher = struct {
         if (batcher.submitted - batcher.confirmed >= pipeline_blocks_max) return;
         if (batcher.submitted >= sequencer.head) return;
         const count: u8 = @intCast(@min(batch_blocks_max, sequencer.head - batcher.submitted));
+        const first = batcher.submitted + 1;
         const data = batcher.encoder.encode(
-            sequencer.chain.hashes,
-            sequencer.chain.payloads,
-            batcher.submitted + 1,
-            count,
+            first,
+            sequencer.chain.hashes[first - 1 .. first + count],
+            sequencer.chain.payloads[first .. first + count],
         );
         // A full pool ends submissions; the liveness checker reports the stall.
         const tx_index = env.tx_pool.append(data) orelse return;
@@ -461,6 +467,8 @@ pub const Batcher = struct {
         }
         if (!accepted.process) return;
         for (block.batches[0..block.batch_count]) |batch| {
+            // Like op-batcher, track only our own transactions.
+            if (batch.sender != codec.sender_batcher) continue;
             const blocks = batcher.decoder.decode(env.tx_pool.get(batch.tx_index)) orelse
                 continue;
             if (batch_extension(batcher.confirmed, blocks)) |extension| {
@@ -515,6 +523,9 @@ pub const Verifier = struct {
     equivocations: u64 = 0,
     /// L1 transactions that failed to decode; the honest batcher never writes one.
     invalid_batches: u64 = 0,
+    /// Derivation accepts inbox transactions only from the system config batcher.
+    /// Negative tests disable the check to prove the checkers notice.
+    sender_check: bool = true,
 
     pub const sync_timeout_ns: u64 = 500 * std.time.ns_per_ms;
 
@@ -576,14 +587,7 @@ pub const Verifier = struct {
                     verifier.unsafe_head = @max(verifier.unsafe_head, verifier.safe_head);
                 }
                 if (!accepted.process) return;
-                for (block.batches[0..block.batch_count]) |batch| {
-                    const data = env.tx_pool.get(batch.tx_index);
-                    if (verifier.decoder.decode(data)) |blocks| {
-                        verifier.derive(blocks);
-                    } else {
-                        verifier.invalid_batches += 1;
-                    }
-                }
+                verifier.derive_l1_block(env, &block);
                 verifier.safe_at[block.number] = verifier.safe_head;
                 verifier.checkpoint_previous = verifier.checkpoint;
                 verifier.checkpoint = .{
@@ -628,6 +632,29 @@ pub const Verifier = struct {
         env.send(verifier.id, node_sequencer, .{ .sync_request = .{
             .number_first = verifier.unsafe_head + 1,
         } });
+    }
+
+    /// Derives one L1 block through the derive lane's retrieval and frame queue.
+    fn derive_l1_block(verifier: *Verifier, env: *const Env, block: *const L1Block) void {
+        assert(block.batch_count <= l1_batches_max);
+        var tx_indexes: [l1_batches_max]u32 = undefined;
+        var senders: [l1_batches_max]u8 = undefined;
+        for (block.batches[0..block.batch_count], 0..) |batch, index| {
+            tx_indexes[index] = batch.tx_index;
+            senders[index] = batch.sender;
+        }
+        var provider = codec.BlockProvider.init(
+            block.number,
+            block.hash,
+            block.parent_hash,
+            env.tx_pool,
+            tx_indexes[0..block.batch_count],
+            senders[0..block.batch_count],
+            verifier.sender_check,
+        );
+        const derived = codec.derive_l1_block(&verifier.decoder, &provider);
+        verifier.invalid_batches += derived.invalid;
+        for (derived.blocks[0..derived.count]) |blocks| verifier.derive(blocks);
     }
 
     fn derive(verifier: *Verifier, batch: codec.Blocks) void {

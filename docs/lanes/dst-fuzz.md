@@ -10,6 +10,8 @@ provably robust.
 - [x] Sim: real L1 data path. Batcher model encodes through `batcher/channel` Manager
   (singular batches, zlib, frame tx data); verifiers and batcher decode with
   `consensus/protocol` (frames, Channel, decompress, BatchReader, SingleBatch).
+- [x] Sim: verifiers derive through the real `derive` retrieval + frame queue over an
+  L1 chain provider; attacker inbox-spam fault; negative test with the sender check off.
 - [ ] Sim: multi-frame channels spread over L1 blocks via the derive lane's channel bank
   (timeouts, frame loss, reorged frames) once `derive` lands it.
 - [ ] Sim: swap model nodes for real components behind `utilities.io` SimIo as lanes land.
@@ -82,3 +84,5 @@ provably robust.
   accepted, value round trip, mutated and raw input).
 - 2026-11-05: asymmetric (one-way) link cuts in the sim network; half of partition
   faults are now random directed cuts. 5000 seeds green.
+- 2026-11-05: sim verifiers derive via derive-lane Retrieval/FrameQueue (calldata source,
+  sender filter); inbox-spam fault (swarm level); sender-check negative test.

@@ -3,6 +3,9 @@
 //! opaque tx data; verifiers decode it with the consensus protocol codecs (frames,
 //! channel assembly, decompression, batch reader, singular batch decoding).
 //!
+//! Verifiers read each L1 block through the derive lane's retrieval (calldata source,
+//! inbox and batcher sender filter) and frame queue, via `BlockProvider`.
+//!
 //! Every submission is one channel in one frame, so decoding is stateless per L1
 //! transaction and L1 reorg handling stays in the follower. Multi-frame channels across
 //! L1 blocks need a channel bank; the simulator adopts the derive lane's once it lands.
@@ -18,7 +21,13 @@ const source = @import("../../batcher/source/root.zig");
 const protocol = @import("../../consensus/protocol/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 
+const derive = @import("../../consensus/derive/root.zig");
+
 const B256 = primitives.B256;
+const Address = primitives.Address;
+const BlockInfo = protocol.BlockInfo;
+const L1Transaction = derive.providers.L1Transaction;
+const ProviderError = derive.errors.ProviderError;
 const SingleBatch = protocol.batch.SingleBatch;
 const batch_reader = protocol.batch_reader;
 
@@ -26,11 +35,26 @@ pub const blocks_max = 8;
 /// Largest tx data: version byte plus one frame.
 pub const tx_data_max = 2048;
 pub const l2_block_time_s = 2;
+pub const l1_block_time_s = 12;
 const frame_size_max = tx_data_max - 1;
 const input_bytes_max = 4096;
 const decompressed_bytes_max = 16 * 1024;
-/// Decompression allocates a full zlib window (64 KiB) plus the output.
 const scratch_bytes = 256 * 1024;
+const pipeline_scratch_bytes = 64 * 1024;
+/// Batcher transactions per L1 block the provider exposes.
+pub const transactions_max = 8;
+
+/// L1 senders: the authorized batcher, and an attacker posting well-formed channels to
+/// the inbox. Derivation must only accept the batcher's.
+pub const sender_batcher: u8 = 0;
+pub const sender_attacker: u8 = 1;
+pub const batch_inbox = Address.init(@splat(0xff));
+
+pub fn sender_address(sender: u8) Address {
+    return Address.init(@splat(0xb0 | sender));
+}
+
+pub const rollup: protocol.RollupConfig = .{ .batch_inbox_address = batch_inbox };
 
 /// A contiguous run of L2 blocks recovered from one L1 transaction.
 pub const Blocks = struct {
@@ -108,28 +132,28 @@ pub const Encoder = struct {
         encoder.* = undefined;
     }
 
-    /// Encodes blocks `first .. first + count` of a chain as one single-frame channel.
+    /// Encodes `payloads.len` blocks starting at `first` as one single-frame channel.
+    /// `hashes[i]` is the hash of block `first - 1 + i` (so it starts at the parent).
     /// The result borrows the encoder and is valid until the next call.
     pub fn encode(
         encoder: *Encoder,
+        first: u64,
         hashes: []const u64,
         payloads: []const u64,
-        first: u64,
-        count: u8,
     ) []const u8 {
-        assert(first > 0 and count > 0 and count <= blocks_max);
-        assert(first + count <= hashes.len and hashes.len == payloads.len);
+        assert(first > 0 and payloads.len > 0 and payloads.len <= blocks_max);
+        assert(hashes.len == payloads.len + 1);
         const manager = &encoder.manager;
         manager.reset();
-        var number = first;
-        while (number < first + count) : (number += 1) {
+        for (payloads, 0..) |payload, offset| {
+            const number = first + offset;
             var transaction: [8]u8 = undefined;
-            std.mem.writeInt(u64, &transaction, payloads[number], .big);
+            std.mem.writeInt(u64, &transaction, payload, .big);
             const transactions = [_][]const u8{&transaction};
             const block: source.L2Block = .{
                 .number = number,
-                .hash = word_hash(hashes[number]),
-                .parent_hash = word_hash(hashes[number - 1]),
+                .hash = word_hash(hashes[offset + 1]),
+                .parent_hash = word_hash(hashes[offset]),
                 .timestamp = number * l2_block_time_s,
                 .l1_origin = .{},
                 .sequence_number = 0,
@@ -147,6 +171,7 @@ pub const Encoder = struct {
 };
 
 pub const Decoder = struct {
+    /// Decompression allocates a full zlib window (64 KiB) plus the output.
     scratch: []u8,
 
     pub fn init(allocator: std.mem.Allocator) !Decoder {
@@ -161,13 +186,19 @@ pub const Decoder = struct {
     /// Decodes one L1 transaction, or null when it is not a valid single-frame channel
     /// of contiguous model blocks (derivation then ignores it).
     pub fn decode(decoder: *Decoder, tx_data: []const u8) ?Blocks {
-        var fixed = std.heap.FixedBufferAllocator.init(decoder.scratch);
-        const allocator = fixed.allocator();
         var frames_buffer: [4]protocol.Frame = undefined;
         const frames = protocol.frame.parse_frames(tx_data, &frames_buffer) catch return null;
         assert(frames.len > 0);
-        var channel = protocol.Channel.init(frames[0].id, .{});
-        for (frames) |frame| channel.add_frame(allocator, frame, .{}) catch return null;
+        if (frames.len != 1) return null;
+        return decoder.decode_frame(frames[0]);
+    }
+
+    /// Decodes a frame that must be a complete channel on its own.
+    pub fn decode_frame(decoder: *Decoder, frame: protocol.Frame) ?Blocks {
+        var fixed = std.heap.FixedBufferAllocator.init(decoder.scratch);
+        const allocator = fixed.allocator();
+        var channel = protocol.Channel.init(frame.id, .{});
+        channel.add_frame(allocator, frame, .{}) catch return null;
         if (!channel.is_ready()) return null;
         const data = channel.frame_data_alloc(allocator) catch return null;
         const decompressed = batch_reader.decompress_channel(
@@ -179,6 +210,118 @@ pub const Decoder = struct {
         return decode_batches(allocator, decompressed);
     }
 };
+
+/// Chain provider (see `consensus/derive/providers.zig`) over the one L1 block a node is
+/// processing: the real derive stages read it as they would an L1 RPC.
+pub const BlockProvider = struct {
+    info: BlockInfo,
+    transactions: [transactions_max]L1Transaction,
+    transaction_count: u8,
+
+    pub fn init(
+        number: u64,
+        hash: u64,
+        parent_hash: u64,
+        pool: *const TxPool,
+        tx_indexes: []const u32,
+        senders: []const u8,
+        sender_check: bool,
+    ) BlockProvider {
+        assert(tx_indexes.len == senders.len and tx_indexes.len <= transactions_max);
+        var provider: BlockProvider = .{
+            .info = .{
+                .hash = word_hash(hash),
+                .number = number,
+                .parent_hash = word_hash(parent_hash),
+                .timestamp = number * l1_block_time_s,
+            },
+            .transactions = undefined,
+            .transaction_count = @intCast(tx_indexes.len),
+        };
+        for (tx_indexes, senders, 0..) |tx_index, sender, index| {
+            provider.transactions[index] = .{
+                .tx_type = L1Transaction.type_eip1559,
+                .to = batch_inbox,
+                // A disabled sender check is modelled as every sender looking authorized.
+                .from = sender_address(if (sender_check) sender else sender_batcher),
+                .input = pool.get(tx_index),
+            };
+        }
+        return provider;
+    }
+
+    pub fn l1_block_info_by_number(provider: *BlockProvider, number: u64) ProviderError!BlockInfo {
+        if (number != provider.info.number) return error.NotFound;
+        return provider.info;
+    }
+
+    pub fn l1_receipts_by_hash(
+        provider: *BlockProvider,
+        hash: B256,
+    ) ProviderError![]const protocol.log.Receipt {
+        if (!hash.eql(provider.info.hash)) return error.NotFound;
+        return &.{};
+    }
+
+    pub fn l1_transactions_by_hash(
+        provider: *BlockProvider,
+        hash: B256,
+    ) ProviderError![]const L1Transaction {
+        if (!hash.eql(provider.info.hash)) return error.NotFound;
+        return provider.transactions[0..provider.transaction_count];
+    }
+
+    pub fn blobs(
+        _: *BlockProvider,
+        _: BlockInfo,
+        _: []const B256,
+    ) ProviderError![]const *const derive.blob.Blob {
+        return error.BlobsUnavailable; // The model rollup never activates blobs.
+    }
+};
+
+pub const Derived = struct {
+    blocks: [transactions_max]Blocks = undefined,
+    count: u8 = 0,
+    /// Frames from the authorized batcher that failed to decode.
+    invalid: u8 = 0,
+};
+
+/// Runs the derive lane's L1 retrieval and frame queue over one L1 block, then decodes
+/// each single-frame channel. Only the batcher's transactions to the inbox survive the
+/// data source filter.
+pub fn derive_l1_block(decoder: *Decoder, provider: *BlockProvider) Derived {
+    var pipeline_memory: [pipeline_scratch_bytes]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&pipeline_memory);
+    const allocator = fixed.allocator();
+    var retrieval = derive.retrieval.Retrieval.init(allocator, &rollup);
+    var queue = derive.frame_queue.FrameQueue.init(allocator, &rollup);
+    const system_config: protocol.SystemConfig = .{
+        .batcher_address = sender_address(sender_batcher),
+    };
+    // Proof: the provider serves exactly this block, and the scratch fits its data.
+    retrieval.reset(provider, provider.info.id(), system_config) catch unreachable;
+    var derived: Derived = .{};
+    for (0..transactions_max * 4 + 2) |_| {
+        const frame = queue.next_frame(&retrieval, provider, provider) catch |err| switch (err) {
+            error.Eof => break,
+            error.NotEnoughData => {
+                derived.invalid += 1; // A batcher payload that held no valid frame.
+                continue;
+            },
+            else => unreachable, // Proof: provider errors are impossible for this block.
+        };
+        if (decoder.decode_frame(frame)) |blocks| {
+            assert(derived.count < transactions_max);
+            derived.blocks[derived.count] = blocks;
+            derived.count += 1;
+        } else {
+            derived.invalid += 1;
+        }
+    } else unreachable; // Proof: at most transactions_max payloads of one frame each.
+    assert(derived.count + derived.invalid <= transactions_max * 4);
+    return derived;
+}
 
 fn decode_batches(allocator: std.mem.Allocator, decompressed: []const u8) ?Blocks {
     var reader = batch_reader.BatchReader.init(decompressed);
@@ -236,7 +379,11 @@ test "codec: encode then decode round trips every batch size" {
     defer fixture.deinit();
     var count: u8 = 1;
     while (count <= blocks_max) : (count += 1) {
-        const data = fixture.encoder.encode(&fixture.hashes, &fixture.payloads, 1, count);
+        const data = fixture.encoder.encode(
+            1,
+            fixture.hashes[0 .. count + 1],
+            fixture.payloads[1..][0..count],
+        );
         const blocks = fixture.decoder.decode(data) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(@as(u64, 1), blocks.number_first);
         try testing.expectEqual(count, blocks.count);
@@ -248,7 +395,11 @@ test "codec: encode then decode round trips every batch size" {
 fn fuzz_tamper(fixture: *Fixture, smith: *std.testing.Smith) anyerror!void {
     const count: u8 = smith.valueRangeAtMost(u8, 1, blocks_max);
     const first: u64 = smith.valueRangeAtMost(u8, 1, blocks_max + 1 - count);
-    const encoded = fixture.encoder.encode(&fixture.hashes, &fixture.payloads, first, count);
+    const encoded = fixture.encoder.encode(
+        first,
+        fixture.hashes[first - 1 ..][0 .. count + 1],
+        fixture.payloads[first..][0..count],
+    );
     var data: [tx_data_max]u8 = undefined;
     @memcpy(data[0..encoded.len], encoded);
     var length: u32 = @intCast(encoded.len);
@@ -283,4 +434,26 @@ test "codec: pool keeps entries stable and reports full" {
     try testing.expectEqual(@as(?u32, null), pool.append("f"));
     try testing.expectEqualStrings("ab", pool.get(0));
     try testing.expectEqualStrings("cde", pool.get(1));
+}
+
+test "codec: derive stages keep the batcher's channel and drop an attacker's" {
+    var fixture: Fixture = undefined;
+    try fixture.init(3);
+    defer fixture.deinit();
+    var pool = try TxPool.init(testing.allocator, 4);
+    defer pool.deinit(testing.allocator);
+    const honest = fixture.encoder.encode(1, fixture.hashes[0..3], fixture.payloads[1..3]);
+    const honest_index = pool.append(honest).?;
+    var forged_payloads = fixture.payloads;
+    for (&forged_payloads) |*payload| payload.* +%= 1;
+    const forged = fixture.encoder.encode(1, fixture.hashes[0..3], forged_payloads[1..3]);
+    const forged_index = pool.append(forged).?;
+    // Order the attacker first: it must not shadow or displace the batcher's data.
+    const indexes = [_]u32{ forged_index, honest_index };
+    const senders = [_]u8{ sender_attacker, sender_batcher };
+    var provider = BlockProvider.init(5, 0xaa, 0xbb, &pool, &indexes, &senders, true);
+    const derived = derive_l1_block(&fixture.decoder, &provider);
+    try testing.expectEqual(@as(u8, 1), derived.count);
+    try testing.expectEqual(@as(u8, 0), derived.invalid);
+    try testing.expectEqualSlices(u64, fixture.payloads[1..3], derived.blocks[0].payloads[0..2]);
 }

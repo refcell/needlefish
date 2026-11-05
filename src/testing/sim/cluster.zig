@@ -4,7 +4,8 @@
 //!
 //! Phases:
 //!   1. faults:  [0, fault_end)          crashes, partitions (group and one-way), drops,
-//!                                       disk faults, clock skew, L1 reorgs
+//!                                       disk faults, clock skew, L1 reorgs, inbox
+//!                                       spam (forged channels from a non-batcher)
 //!   2. heal:    fault_end               restart everything, heal partitions, stop drops
 //!   3. drain:   [fault_end, settle_end) sequencer stops at production_end; then
 //!               liveness requires every verifier to reach the sequencer head, safe and
@@ -47,6 +48,8 @@ pub const Config = struct {
     l1_reorgs_per_minute: u32 = 0,
     /// Each non-L1 node's clock is offset by up to this much, re-drawn on restart.
     clock_skew_ns_max: u64 = 0,
+    /// Forged channels an attacker posts to the batch inbox per minute (fault phase).
+    spam_per_minute: u32 = 0,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -67,6 +70,7 @@ pub const Config = struct {
             .downtime_ns_max = prng.range(1, 120) * ns_per_s,
             .clock_skew_ns_max = swarm_level(prng, 30) * ns_per_s,
             .l1_reorgs_per_minute = @intCast(swarm_level(prng, 3)),
+            .spam_per_minute = @intCast(swarm_level(prng, 6)),
         };
         config.validate();
         return config;
@@ -90,7 +94,10 @@ pub const Config = struct {
     /// Batcher submissions over the whole run: one per submit interval, doubled for the
     /// immediate submission after each batcher restart.
     pub fn tx_count_max(config: Config) u32 {
-        return @intCast(2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16);
+        const batcher = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
+        // Chance-per-step injection can exceed the mean; four times it is ample headroom.
+        const spam = 4 * config.spam_per_minute * (config.fault_end_ns / (60 * ns_per_s) + 1);
+        return @intCast(batcher + spam);
     }
 
     pub fn l1_block_count_max(config: Config) u64 {
@@ -112,6 +119,7 @@ pub const Report = struct {
     crashes: u64 = 0,
     partitions: u64 = 0,
     asymmetric_partitions: u64 = 0,
+    spam: u64 = 0,
     disk_faults: u64 = 0,
     l1_reorgs: u64 = 0,
     sequencer_head: u64 = 0,
@@ -130,6 +138,7 @@ pub const Cluster = struct {
     sequencer: nodes.Sequencer,
     batcher: nodes.Batcher,
     tx_pool: codec.TxPool,
+    attacker: codec.Encoder,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
     restart_ns: [network_module.node_count_max]?u64 = @splat(null),
@@ -156,6 +165,8 @@ pub const Cluster = struct {
         errdefer batcher.deinit(allocator);
         var tx_pool = try codec.TxPool.init(allocator, config.tx_count_max());
         errdefer tx_pool.deinit(allocator);
+        var attacker = try codec.Encoder.init(allocator, 0x6174_7461_636b_6572);
+        errdefer attacker.deinit(allocator);
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
         errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
@@ -181,6 +192,7 @@ pub const Cluster = struct {
             },
             .batcher = batcher,
             .tx_pool = tx_pool,
+            .attacker = attacker,
             .verifiers = verifiers,
         };
     }
@@ -189,6 +201,7 @@ pub const Cluster = struct {
         for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| v.deinit(allocator);
         cluster.batcher.deinit(allocator);
         cluster.tx_pool.deinit(allocator);
+        cluster.attacker.deinit(allocator);
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -299,6 +312,9 @@ pub const Cluster = struct {
                 cluster.report.l1_reorgs += 1;
             }
         }
+        if (prng.chance(cluster.config.spam_per_minute, steps_per_minute)) {
+            cluster.inject_spam(prng);
+        }
         if (cluster.heal_ns) |heal_ns| {
             if (cluster.now_ns >= heal_ns) {
                 cluster.network.heal();
@@ -329,6 +345,28 @@ pub const Cluster = struct {
             }
         }
         cluster.report.asymmetric_partitions += 1;
+    }
+
+    /// An attacker posts a well-formed channel that rewrites recent blocks with different
+    /// payloads. Only the derive lane's sender filter keeps verifiers from adopting it.
+    fn inject_spam(cluster: *Cluster, prng: *Prng) void {
+        const head = cluster.sequencer.head;
+        if (head == 0) return;
+        const first = prng.range(1, head);
+        const count: usize = @intCast(@min(codec.blocks_max, head - first + 1));
+        var payloads: [codec.blocks_max]u64 = undefined;
+        for (payloads[0..count], first..) |*payload, number| {
+            payload.* = cluster.sequencer.chain.payloads[number] +% 1;
+        }
+        const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
+        const data = cluster.attacker.encode(first, hashes, payloads[0..count]);
+        const tx_index = cluster.tx_pool.append(data) orelse return;
+        const e = cluster.env(nodes.node_l1);
+        cluster.l1.on_message(&e, nodes.node_l1, .{ .batch_submit = .{
+            .tx_index = tx_index,
+            .sender = codec.sender_attacker,
+        } });
+        cluster.report.spam += 1;
     }
 
     fn heal_all(cluster: *Cluster) void {
@@ -511,6 +549,42 @@ test "cluster: checkers catch a batcher posting corrupt tx data" {
     }
 }
 
+test "cluster: checkers catch a verifier without the batcher sender check" {
+    // Inbox spam is harmless only because derivation filters by sender. A verifier that
+    // accepts the attacker's channels adopts forged payloads and must trip safety.
+    var seed: u64 = 0;
+    while (seed < 4) : (seed += 1) {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .spam_per_minute = 6,
+            .fault_end_ns = 120 * ns_per_s,
+            .production_end_ns = 180 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        cluster.verifiers[0].sender_check = false;
+        cluster.log_failures = false;
+        try std.testing.expectError(error.SafetyViolation, cluster.run());
+    }
+}
+
+test "cluster: inbox spam from a non-batcher sender is ignored" {
+    var cluster = try Cluster.init(std.testing.allocator, 2, .{
+        .verifier_count = 2,
+        .crashes_per_minute = 0,
+        .partitions_per_minute = 0,
+        .spam_per_minute = 6,
+        .fault_end_ns = 120 * ns_per_s,
+        .production_end_ns = 180 * ns_per_s,
+        .settle_end_ns = 400 * ns_per_s,
+    });
+    defer cluster.deinit(std.testing.allocator);
+    const report = try cluster.run();
+    try std.testing.expect(report.spam > 0);
+}
+
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     const fault_end_ns = smith.valueRangeAtMost(u64, 0, 120) * ns_per_s;
     const latency_ns_min = smith.valueRangeAtMost(u64, 1, 100) * std.time.ns_per_ms;
@@ -533,6 +607,7 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .downtime_ns_max = smith.valueRangeAtMost(u64, 1, 120) * ns_per_s,
         .clock_skew_ns_max = smith.valueRangeAtMost(u64, 0, 60) * ns_per_s,
         .l1_reorgs_per_minute = smith.valueRangeAtMost(u32, 0, 10),
+        .spam_per_minute = smith.valueRangeAtMost(u32, 0, 20),
     };
     var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
     defer cluster.deinit(std.testing.allocator);

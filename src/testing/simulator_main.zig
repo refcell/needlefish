@@ -69,12 +69,12 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
         .{ seed, report.steps, report.sequencer_head, report.l1_head },
     );
     std.debug.print(
-        "  crashes={d} partitions={d} (one-way {d}) disk_faults={d} l1_reorgs={d} sent={d} " ++
-            "delivered={d} dropped={d}\n",
+        "  crashes={d} partitions={d} (one-way {d}) disk_faults={d} l1_reorgs={d} spam={d} " ++
+            "sent={d} delivered={d} dropped={d}\n",
         .{
             report.crashes,     report.partitions, report.asymmetric_partitions,
-            report.disk_faults, report.l1_reorgs,  n.sent,
-            n.delivered,        dropped,
+            report.disk_faults, report.l1_reorgs,  report.spam,
+            n.sent,             n.delivered,       dropped,
         },
     );
 }
@@ -84,7 +84,7 @@ fn print_config(config: Config) void {
     std.debug.print(
         "  verifiers={d} latency={d}..{d}ms drop={d}ppm dup={d}ppm crashes/min={d} " ++
             "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
-            "clock_skew_max={d}ms l1_reorgs/min={d}\n",
+            "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -98,6 +98,7 @@ fn print_config(config: Config) void {
             config.fault_end_ns / ms,
             config.clock_skew_ns_max / ms,
             config.l1_reorgs_per_minute,
+            config.spam_per_minute,
         },
     );
 }
