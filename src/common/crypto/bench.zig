@@ -497,6 +497,7 @@ pub const cases = [_]Case{
     .{ .name = "bls12-381/g1 mul", .iterations = 5_000, .run = bls_bench.g1_mul },
     .{ .name = "bls12-381/g1 mul glv", .iterations = 5_000, .run = bls_bench.g1_mul_glv },
     .{ .name = "bls12-381/g2 mul", .iterations = 2_000, .run = bls_bench.g2_mul },
+    .{ .name = "bls12-381/g2 mul gls", .iterations = 2_000, .run = bls_bench.g2_mul_gls },
     .{ .name = "bls12-381/pairing-2", .iterations = 500, .run = bls_bench.pairing_2 },
     .{ .name = "bls12-381/map_fp_to_g1", .iterations = 5_000, .run = bls_bench.map_fp_to_g1 },
     .{ .name = "bls12-381/g1 msm-64", .iterations = 200, .run = bls_bench.g1_msm_64 },

@@ -43,6 +43,13 @@ pub fn g2_mul(iterations: u32) u64 {
     return point.x.c0.limbs_value[0];
 }
 
+pub fn g2_mul_gls(iterations: u32) u64 {
+    var point = g2.generator.to_jacobian();
+    for (0..iterations) |_| point = g2.mul_gls(point, scalar);
+    assert(point.is_on_curve());
+    return point.x.c0.limbs_value[0];
+}
+
 pub fn pairing_2(iterations: u32) u64 {
     const pairs = [2]pairing.Pair{
         .{ .g1 = g1.generator, .g2 = g2.generator },

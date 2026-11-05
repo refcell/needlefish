@@ -57,14 +57,14 @@ pub fn is_in_subgroup(point: Affine) bool {
 /// halves below x^2 (128 bits).
 const x_squared: u128 = @as(u128, x_abs) * x_abs;
 
-const wnaf_width = 5;
+pub const wnaf_width = 5;
 /// Odd multiples 1P, 3P, ..., 15P.
-const wnaf_table_size = 1 << (wnaf_width - 2);
+pub const wnaf_table_size = 1 << (wnaf_width - 2);
 /// A 128-bit scalar recodes to at most 129 width-5 NAF digits.
-const wnaf_digits_max = 130;
+pub const wnaf_digits_max = 130;
 
 /// Width-5 NAF of `scalar`: digits are zero or odd in [-15, 15]. Returns the length.
-fn wnaf_recode(scalar: u128, digits: *[wnaf_digits_max]i8) u32 {
+pub fn wnaf_recode(scalar: u128, digits: *[wnaf_digits_max]i8) u32 {
     var value: u130 = scalar;
     var length: u32 = 0;
     while (value != 0) : (length += 1) {

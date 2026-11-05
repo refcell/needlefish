@@ -208,3 +208,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: generic safegcd inversion: bls Fp inverse 13.8->1.8us, bn254 5.8->1.2us; map_fp_to_g1 77->41us, pairing-2 0.66->0.59ms, kzg point eval 1.01->0.88ms.
 - 2026-11-05: bls g1.mul_glv (GLV split by x^2, width-5 NAF, affine tables, mixed adds): 71->42us; kzg point eval now uses it (0.88->0.76ms).
 - 2026-11-05: bn254 add/mul/pairing precompiles (EIP-196/197) on montgomery.Field; official geth vectors, G2 subgroup check, bilinearity + seeded/coverage fuzz; bench (ReleaseFast, M-series): add 1.73us, mul 12.2us, pairing 2 pairs 0.56ms.
+- 2026-11-05: bls g2.mul_gls (psi = [x], four 64-bit digits, width-5 NAF, affine tables): 198->80us; single-point MSM (G1MSM/G2MSM with k=1) now uses GLV/GLS. Review of bn254 + BLS precompiles: no defects.

@@ -69,11 +69,19 @@ pub fn msm(comptime C: type, points: []const C.Affine, scalars: []const u256) C 
     return result;
 }
 
+/// One point: use the endomorphism-accelerated multiplication. MSM inputs are in the
+/// order-r subgroup (the precompiles check it), which those methods require.
+fn single_mul(comptime C: type, point: C.Affine, scalar: u256) C {
+    if (C == g1.G1) return g1.mul_glv(point.to_jacobian(), scalar);
+    if (C == g2.G2) return g2.mul_gls(point.to_jacobian(), scalar);
+    return point.to_jacobian().mul(scalar);
+}
+
 fn msm_chunk(comptime C: type, points: []const C.Affine, scalars: []const u256) C {
     assert(points.len <= chunk_points_max);
     assert(points.len == scalars.len);
     if (points.len == 0) return C.identity;
-    if (points.len == 1) return points[0].to_jacobian().mul(scalars[0]);
+    if (points.len == 1) return single_mul(C, points[0], scalars[0]);
     const bits = window_bits(points.len);
     var digits: [chunk_points_max][windows_max]i16 = undefined;
     var window_count: u32 = 0;

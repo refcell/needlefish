@@ -9,6 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const fields = @import("fields.zig");
 const curve = @import("curve.zig");
+const g1 = @import("g1.zig");
 const Prng = @import("../../../testing/prng.zig").Prng;
 
 const Fp = fields.Fp;
@@ -71,6 +72,62 @@ pub fn is_in_subgroup(point: Affine) bool {
     assert(point.is_on_curve());
     const jacobian = point.to_jacobian();
     return psi(jacobian).eql(mul_by_x(jacobian));
+}
+
+fn psi_affine(point: Affine) Affine {
+    if (point.infinity) return point;
+    return .{
+        .x = point.x.conjugate().mul(psi_x),
+        .y = point.y.conjugate().mul(psi_y),
+        .infinity = false,
+    };
+}
+
+inline fn add_digit(result: G2, table: *const [g1.wnaf_table_size]Affine, digit: i8) G2 {
+    if (digit > 0) return result.add_affine(table[@intCast((digit - 1) >> 1)]);
+    if (digit < 0) return result.add_affine(table[@intCast((-digit - 1) >> 1)].neg());
+    return result;
+}
+
+/// Scalar multiplication for points in G2 using the GLS endomorphism psi = [x]:
+/// k mod r = sum d_i |x|^i with four 64-bit digits, and [|x|^i] Q = (-psi)^i (Q),
+/// so kQ = sum d_i (-psi)^i (Q) with one 64-step doubling chain, width-5 NAF
+/// digits and mixed additions from affine tables. Public scalars only.
+/// Precondition: `point` is in the order-r subgroup (psi acts as [x] only there).
+pub fn mul_gls(point: G2, scalar: u256) G2 {
+    var k = scalar % fields.r;
+    if (k == 0 or point.is_identity()) return G2.identity;
+    var tables: [4][g1.wnaf_table_size]Affine = undefined;
+    var jacobian: [g1.wnaf_table_size]G2 = undefined;
+    jacobian[0] = point;
+    const twice = point.double();
+    for (1..g1.wnaf_table_size) |index| jacobian[index] = jacobian[index - 1].add(twice);
+    var scratch: [g1.wnaf_table_size]Fp2 = undefined;
+    G2.batch_to_affine(&jacobian, &tables[0], &scratch);
+    for (1..4) |power| {
+        for (&tables[power], tables[power - 1]) |*entry, source| {
+            entry.* = psi_affine(source).neg();
+        }
+    }
+    var digits: [4][g1.wnaf_digits_max]i8 = @splat(@splat(0));
+    var length: u32 = 0;
+    for (&digits) |*row| {
+        const digit: u64 = @intCast(k % x_abs);
+        k /= x_abs;
+        length = @max(length, g1.wnaf_recode(digit, row));
+    }
+    assert(k == 0);
+    assert(length <= 65);
+    var result = G2.identity;
+    var index = length;
+    while (index > 0) {
+        index -= 1;
+        if (!result.is_identity()) result = result.double();
+        inline for (0..4) |power| {
+            result = add_digit(result, &tables[power], digits[power][index]);
+        }
+    }
+    return result;
 }
 
 /// RFC 9380 clear_cofactor_bls12381_g2 (multiplication by h_eff).
@@ -136,6 +193,21 @@ pub fn decompress_unchecked(bytes: *const [compressed_length]u8) DecodeError!Aff
 }
 
 const testing = std.testing;
+
+test "g2: GLS multiplication matches plain multiplication" {
+    var prng = Prng.init(0x676c73);
+    const g = generator.to_jacobian();
+    try testing.expect(mul_gls(g, 0).is_identity());
+    try testing.expect(mul_gls(g, fields.r).is_identity());
+    try testing.expect(mul_gls(G2.identity, 99).is_identity());
+    const edges = [_]u256{ 1, 2, x_abs - 1, x_abs, x_abs + 1, fields.r - 1 };
+    for (edges) |k| try testing.expect(mul_gls(g, k).eql(g.mul(k)));
+    for (0..8) |_| {
+        const base = g.mul(prng.int(u256));
+        const k = prng.int(u256);
+        try testing.expect(mul_gls(base, k).eql(base.mul(k)));
+    }
+}
 
 /// A point on E'(Fp2) that is (almost surely) outside G2.
 pub fn test_point_off_subgroup(seed: u64) Affine {
