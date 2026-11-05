@@ -178,6 +178,24 @@ fn add_bootnodes(options: *Options, text: []const u8) Error!void {
     }
 }
 
+/// Adds bootnodes from `--p2p.bootnodes-file` contents: one ENR or enode per line, or a
+/// JSON array of strings (base/base accepts both). Blank lines and `#` comments are
+/// skipped. Entries borrow from `contents`, which must outlive `options`.
+pub fn add_bootnodes_file(options: *Options, contents: []const u8) Error!void {
+    const trimmed = std.mem.trim(u8, contents, " \t\r\n");
+    const is_json = trimmed.len > 0 and trimmed[0] == '[';
+    var lines = std.mem.tokenizeAny(u8, if (is_json) trimmed[1..] else trimmed, "\r\n,]");
+    var processed: u32 = 0;
+    while (lines.next()) |line| : (processed += 1) {
+        assert(processed <= contents.len);
+        const entry = std.mem.trim(u8, line, " \t\"");
+        if (entry.len == 0 or entry[0] == '#') continue;
+        if (options.bootnodes_count == bootnodes_max) return error.TooManyBootnodes;
+        options.bootnodes[options.bootnodes_count] = entry;
+        options.bootnodes_count += 1;
+    }
+}
+
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -234,6 +252,16 @@ test "options: rejects unknown flags, bad values, and missing values" {
     try testing.expectError(error.InvalidValue, parse(&.{"--p2p.scoring=heavy"}));
 }
 
+test "options: bootnodes file as lines or a JSON array" {
+    var options: Options = .{};
+    try add_bootnodes_file(&options, "# base\nenr:-a\n\n  enode://b@1.2.3.4:1  \r\n");
+    try add_bootnodes_file(&options, "[\"enr:-c\", \"enr:-d\"]\n");
+    const nodes = options.bootnode_slice();
+    try testing.expectEqual(@as(usize, 4), nodes.len);
+    try testing.expectEqualStrings("enode://b@1.2.3.4:1", nodes[1]);
+    try testing.expectEqualStrings("enr:-d", nodes[3]);
+}
+
 const FuzzContext = struct {};
 
 fn fuzz_one(_: FuzzContext, input: []const u8) anyerror!void {
@@ -245,7 +273,9 @@ fn fuzz_one(_: FuzzContext, input: []const u8) anyerror!void {
         args[count] = part;
         count += 1;
     }
-    const options = parse(args[0..count]) catch return;
+    var options = parse(args[0..count]) catch return;
+    assert(options.bootnodes_count <= bootnodes_max);
+    add_bootnodes_file(&options, input) catch return;
     assert(options.bootnodes_count <= bootnodes_max);
 }
 
