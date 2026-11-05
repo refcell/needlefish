@@ -7,7 +7,8 @@ const std = @import("std");
 const base = @import("base");
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
-    _ = base;
-    std.debug.print("bench: no benchmarks registered yet\n", .{});
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    const filter: ?[]const u8 = args.next();
+    base.common.crypto.bench.run(init.io, filter);
 }
