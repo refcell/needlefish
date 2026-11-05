@@ -246,8 +246,9 @@ pub fn Durable(comptime Storage: type) type {
             return database.proof_at(number, address, slots, account_proof, storage_proofs, values);
         }
 
-        /// The database's state moves to the block's parent in memory (no journal entry)
-        /// and back; see `db.witness_block`.
+        /// From the history window when it holds the block's parent (state untouched), else
+        /// the database's state moves to the block's parent in memory (no journal entry) and
+        /// back; see `db.witness_block`.
         fn witness(
             context: *anyopaque,
             generator: *db_module.witness_block.Generator,

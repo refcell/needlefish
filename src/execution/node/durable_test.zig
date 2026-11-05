@@ -61,10 +61,16 @@ const Harness = struct {
     durable: *Durable,
     node: ?*Node = null,
     genesis: consensus.Header,
+    config: db_module.database.Config,
 
     fn create(seed: u64) !*Harness {
+        return create_with(seed, config);
+    }
+
+    fn create_with(seed: u64, database_config: db_module.database.Config) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
+        harness.config = database_config;
         const parsed = genesis();
         const root = try parsed.compute_state_root(testing.allocator);
         harness.genesis = fixture.genesis_header(root.bytes);
@@ -88,7 +94,13 @@ const Harness = struct {
 
     fn open_durable(harness: *Harness) !*Durable {
         const hash = harness.genesis.hash().bytes;
-        const durable = try Durable.create(testing.allocator, &harness.sim, config, hash, 7);
+        const durable = try Durable.create(
+            testing.allocator,
+            &harness.sim,
+            harness.config,
+            hash,
+            7,
+        );
         errdefer durable.destroy(testing.allocator);
         durable.start();
         var ticks: u32 = 0;
@@ -269,6 +281,59 @@ test "durable: execution witness moves the state in memory only and restores the
     }
     // The node keeps building on the restored head.
     _ = try h.build_head(h.head(), 60, 0xfe);
+}
+
+const history_config: db_module.database.Config = blk: {
+    var result = config;
+    result.history = .{
+        .window_blocks = 3,
+        .paths_max = 8192,
+        .small_versions_max = 8192,
+        .large_versions_max = 2048,
+        .prune_per_commit = 1024,
+    };
+    break :blk result;
+};
+
+test "durable: execution witness prefers the history window and leaves the state alone" {
+    const h = try Harness.create_with(5, history_config);
+    defer h.destroy();
+    var buffers: [5][256]u8 = undefined;
+    var hashes: [7]B256 = undefined;
+    var count: usize = 6;
+    hashes[0] = h.head();
+    for (1..count) |number| {
+        try fixture.submit(h.node.?, 1, number - 1, 5, &buffers[number - 1]);
+        hashes[number] = try h.build_head(hashes[number - 1], 12 * number, 0xfe);
+    }
+    const node = h.node.?;
+    var generator = try db_module.witness_block.Generator.init(
+        testing.allocator,
+        h.durable.state(),
+        witness_config,
+    );
+    defer generator.deinit(testing.allocator);
+    const Source = db_module.witness_block.Source;
+    for (0..2) |round| {
+        const database = &h.durable.database;
+        const head = database.head_info;
+        const sequence = database.submitted_sequence;
+        const window = database.history_reader().?.window().?;
+        try testing.expectEqual(head.number, window.head);
+        for (hashes[1..count], 1..) |hash, number| {
+            try witness_module.execution_witness(&node.chain, &generator, hash.bytes);
+            const expected: Source = if (number > window.oldest) .history else .unwind;
+            try testing.expectEqual(expected, generator.source.?);
+            try testing.expect(head.eql(database.head_info));
+            try testing.expectEqual(head.state_root, try node.db.root());
+            try testing.expectEqual(sequence, database.submitted_sequence);
+        }
+        // The node keeps building between witness calls; the window moves with it.
+        if (round == 0) {
+            hashes[count] = try h.build_head(hashes[count - 1], 12 * count, 0xfe);
+            count += 1;
+        }
+    }
 }
 
 fn fuzz_scenario(seed: u64) !void {

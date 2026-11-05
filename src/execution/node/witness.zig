@@ -1,9 +1,12 @@
 //! Execution witness of a stored block for the node (`debug_executionWitness`): the
 //! trie-db lane's `db.witness_block.Generator` with the node's executor as the block
-//! executor. The state is unwound in memory to the block's parent and restored afterwards:
-//! with a durable database through its stored changesets (`Journal.witness`), otherwise
-//! through `StateDb`'s undo ring. Nothing is journaled. The executor and state must be idle
-//! for the call (the node runs RPC handlers between blocks).
+//! executor. A durable database with history (`Config.history`) serves blocks whose parent
+//! is in its window from history, without touching the state (`Journal.witness` ->
+//! `Generator.database_witness` prefers that path). Otherwise the state is unwound in memory
+//! to the block's parent and restored afterwards: with a durable database through its
+//! stored changesets, else through `StateDb`'s undo ring. Nothing is journaled. The executor
+//! must be idle for the call (the node runs RPC handlers between blocks); the history path
+//! still resets the executor's evm state, never the world state.
 
 const std = @import("std");
 const assert = std.debug.assert;
