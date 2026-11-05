@@ -8,6 +8,8 @@ pub const crypto = @import("crypto/root.zig");
 pub const rlp = @import("rlp/root.zig");
 pub const consensus = @import("consensus/root.zig");
 pub const chains = @import("chains/root.zig");
+pub const flz = @import("flz/root.zig");
+pub const l1_fees = @import("l1_fees/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

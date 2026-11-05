@@ -1,6 +1,6 @@
 # Lane: primitives
 
-Owns `src/common/{primitives,rlp,consensus,genesis,chains}`.
+Owns `src/common/{primitives,rlp,consensus,genesis,chains,flz,l1_fees}`.
 Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-alloy.
 
 ## Backlog
@@ -13,7 +13,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
 - [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
 - [ ] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
-- [ ] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
+- [x] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
 - [ ] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
 
 ## Decisions
@@ -34,6 +34,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - `chains` holds canonical per-chain data only (identity, timing, upgrade timestamps, genesis
   anchors, L1 contracts, bootnodes, L1 fork schedules). `RollupConfig`/`Upgrade` enums live in
   `consensus/protocol` and `ChainSpec` in `execution/chainspec`; they can derive from `chains`.
+- base/base `common/flz` and `common/l1-fees` map to `src/common/flz` and `src/common/l1_fees`
+  (added to this lane). The fork gate is a local `l1_fees.Rules` enum; callers map upgrades.
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
@@ -42,3 +44,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: consensus tx types + envelope, signatures, recovery; EIP-155 and Base deposit vectors.
 - 2026-11-05: header/receipts/logs/withdrawals/block/body, roots, EIP-7685; mainnet genesis + Cancun/Prague block vectors.
 - 2026-11-05: chains (mainnet/sepolia/zeronet/devnet, L1 mainnet/sepolia/holesky/hoodi/devnet).
+- 2026-11-05: flz (FastLZ length, base/base vectors) and l1_fees (Bedrock..Jovian, operator fee).
