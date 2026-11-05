@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
+const txpool = @import("../txpool/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const trie_proof = @import("../trie/proof.zig");
@@ -83,7 +84,7 @@ const Harness = struct {
         const node = harness.node;
         const head: primitives.B256 = .{ .bytes = node.chain.head_hash() };
         const hash = try fixture.build(node, head, timestamp, 0xfe);
-        const version = engine_types.forkchoice_version(fixture.spec, timestamp);
+        const version = engine_types.forkchoice_version(node.spec, timestamp);
         _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(hash), null);
         return hash;
     }
@@ -474,6 +475,78 @@ test "eth: eth_createAccessList lists touched accounts and slots beyond the pre-
     const reverted = try h.request("eth_createAccessList", revert_call);
     try expect_contains(reverted, "\"error\":\"execution reverted\"}");
     try expect_contains(try h.request("eth_createAccessList", "[{\"to\":1}]"), "error");
+}
+
+var everest_spec: chainspec.ChainSpec = chainspec.ChainSpec.presets.base_devnet;
+
+const Eip8130Built = struct {
+    sender_auth: [65]u8,
+    phase_buffer: [256]u8,
+    calls_buffer: [512]u8,
+    envelope_buffer: [1024]u8,
+
+    fn build(built: *Eip8130Built, nonce_key: u256, sequence: u64) ![]const u8 {
+        const eip8130 = consensus.tx.eip8130;
+        const target: primitives.Address = .{ .bytes = @splat(0x44) };
+        const calls = [_]eip8130.Call{.{ .to = target, .value = 0, .data = &.{} }};
+        const phase = eip8130.Phase.build(&built.phase_buffer, &calls);
+        var tx: eip8130.TxEip8130 = .{
+            .chain_id = everest_spec.chain_id,
+            .nonce_key = nonce_key,
+            .nonce_sequence = sequence,
+            .gas_limit = 300_000,
+            .max_fee_per_gas = 10_000_000_000,
+            .max_priority_fee_per_gas = 2,
+        };
+        tx.calls = eip8130.Calls.build(&built.calls_buffer, &.{phase});
+        built.sender_auth = try eip8130.sign_sender(tx, fixture.key(1));
+        const signed: eip8130.Signed = .{ .tx = tx, .sender_auth = &built.sender_auth };
+        return signed.encode_to(&built.envelope_buffer);
+    }
+};
+
+fn send_raw(h: *Harness, raw: []const u8) ![]const u8 {
+    var body: [4096]u8 = undefined;
+    const format = request_prefix_format ++ "eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{raw});
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, request, &out);
+    try json.validate(out.buffered());
+    return out.buffered();
+}
+
+test "eth: EIP-8130 transactions pool by nonce channel and are mined in order" {
+    everest_spec.upgrades = @splat(0);
+    const h = try Harness.create_for(&everest_spec);
+    defer h.destroy();
+    var built: [3]Eip8130Built = undefined;
+    const first = try built[0].build(7, 0);
+    const second = try built[1].build(7, 1);
+    const gap = try built[2].build(9, 3);
+    try expect_contains(try send_raw(h, second), "\"result\":\"0x");
+    try expect_contains(try send_raw(h, first), "\"result\":\"0x");
+    try expect_contains(try send_raw(h, gap), "\"result\":\"0x");
+    try testing.expectEqual(@as(u32, 2), h.node.pool.pending_count);
+    try testing.expectEqual(@as(u32, 1), h.node.pool.queued_count);
+    const block = try h.mine(12);
+    const stored = h.node.chain.header(block.bytes).?;
+    try testing.expect(stored.gas_used > 0);
+    // Both channel-7 transactions are in; the gapped channel-9 one stays queued.
+    try testing.expectEqual(@as(u32, 0), h.node.pool.pending_count);
+    try testing.expectEqual(@as(u32, 1), h.node.pool.queued_count);
+    const sender = fixture.address_of(1);
+    const lane: txpool.eip8130.Lane = .{
+        .address = sender,
+        .sender = sender,
+        .payer = sender,
+        .nonce_key = 7,
+    };
+    try testing.expectEqual(@as(u64, 2), h.node.chain.lane_account(lane).nonce);
+    const receipts = try h.request("eth_getBlockReceipts", "[\"latest\"]");
+    try testing.expectEqual(@as(usize, 2), count_of(receipts, "\"type\":\"0x79\""));
+    try testing.expectEqual(@as(usize, 2), count_of(receipts, "\"status\":\"0x1\""));
+    // A replay of a mined sequence is refused by the pool.
+    try expect_contains(try send_raw(h, first), "error");
 }
 
 test "eth: call and estimate gas" {

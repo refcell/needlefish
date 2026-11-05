@@ -15,6 +15,7 @@ const rlp = @import("../../common/rlp/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const chainspec = @import("../chainspec/root.zig");
 const txpool = @import("root.zig");
+const eip8130_pool = @import("eip8130.zig");
 
 const B256 = primitives.B256;
 const Envelope = consensus.Envelope;
@@ -42,6 +43,8 @@ pub const ValidateError = consensus.tx.DecodeError || error{
     GasLimitExceeded,
     ScratchTooSmall,
     BlobProofInvalid,
+    InvalidFeeCap,
+    OutsideValidityWindow,
 };
 
 pub const Sidecar = struct {
@@ -56,6 +59,8 @@ pub const Validated = struct {
     tx: txpool.Tx,
     envelope: Envelope,
     sidecar: ?Sidecar,
+    /// EIP-8130 only: the nonce lane `tx.sender` names (`eip8130.zig`).
+    lane: ?eip8130_pool.Lane = null,
 };
 
 /// Validates `raw` for inclusion at `timestamp` (the next block's time). `scratch`
@@ -69,6 +74,10 @@ pub fn validate(
 ) ValidateError!Validated {
     const pooled = try decode_pooled(raw, scratch);
     const envelope = pooled.envelope;
+    if (envelope == .eip8130) {
+        const admitted = try eip8130_pool.admit(raw, envelope.eip8130, spec, timestamp, recoverer);
+        return .{ .tx = admitted.tx, .envelope = envelope, .sidecar = null, .lane = admitted.lane };
+    }
     try check_type(envelope, spec, timestamp);
     const chain_id = envelope.chain_id() orelse return error.UnprotectedTx;
     if (chain_id != spec.chain_id) return error.WrongChainId;
@@ -148,7 +157,7 @@ fn check_type(
     timestamp: u64,
 ) ValidateError!void {
     switch (envelope) {
-        // EIP-8130 needs AA execution and Everest gating; not supported yet.
+        // EIP-8130 is admitted by `eip8130.zig` before this check.
         .deposit, .eip8130 => return error.TxTypeNotSupported,
         .eip4844 => if (spec.blob_params_at(timestamp) == null) return error.TxTypeNotSupported,
         .eip7702 => |signed| {

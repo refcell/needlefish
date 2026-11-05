@@ -524,11 +524,15 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
     api.chain.ensure_head_state() catch {
         return call.fail(rpc.code.internal_error, "head state unavailable");
     };
-    const account = api.chain.db.get_account(validated.tx.sender.bytes);
-    _ = pool.add(validated.tx, .{
-        .nonce = if (account) |a| a.nonce else 0,
-        .balance = if (account) |a| a.balance else 0,
-    }) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+    const account: txpool.Account = if (validated.lane) |lane|
+        api.chain.lane_account(lane)
+    else if (api.chain.db.get_account(validated.tx.sender.bytes)) |a|
+        .{ .nonce = a.nonce, .balance = a.balance }
+    else
+        .{ .nonce = 0, .balance = 0 };
+    _ = pool.add(validated.tx, account) catch |err| {
+        return call.fail(rpc.code.server_error, @errorName(err));
+    };
     if (api.filters) |filters| filters.note_pending(validated.tx.hash.bytes);
     try call.writer.data(&validated.tx.hash.bytes);
 }

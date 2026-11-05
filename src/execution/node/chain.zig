@@ -16,6 +16,7 @@ const consensus = @import("../../common/consensus/root.zig");
 const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
 const txpool = @import("../txpool/root.zig");
+const evm = @import("../evm/root.zig");
 const engine = @import("../engine/root.zig");
 const ordered = @import("../trie/ordered.zig");
 const executor_module = @import("executor.zig");
@@ -747,6 +748,35 @@ pub const Chain = struct {
         }
     }
 
+    /// The pool account of an EIP-8130 lane at the state's block: the channel nonce
+    /// (account nonce for key 0, nonce manager storage for 2D keys, 0 when nonce-free)
+    /// and the payer's balance.
+    pub fn lane_account(chain: *const Chain, lane: txpool.eip8130.Lane) txpool.Account {
+        const payer = chain.db.get_account(lane.payer.bytes);
+        const balance = if (payer) |account| account.balance else 0;
+        if (lane.nonce_free()) return .{ .nonce = 0, .balance = balance };
+        if (lane.nonce_key == 0) {
+            const sender = chain.db.get_account(lane.sender.bytes);
+            return .{ .nonce = if (sender) |account| account.nonce else 0, .balance = balance };
+        }
+        const slot = evm.native.nonce_slot(lane.sender.bytes, lane.nonce_key);
+        const channel = chain.db.get_storage(evm.native.nonce_manager_address, slot);
+        return .{ .nonce = @truncate(channel), .balance = balance };
+    }
+
+    /// Refreshes the lane of an included EIP-8130 transaction.
+    fn prune_lane(chain: *Chain, pool: *txpool.Pool, raw: []const u8, tx_hash: B256) void {
+        const envelope = consensus.Envelope.decode(raw) catch return;
+        assert(envelope == .eip8130);
+        const lane = txpool.eip8130.resolve(
+            envelope.eip8130,
+            tx_hash.bytes,
+            chain.executor.recoverer,
+        ) orelse return;
+        _ = pool.remove(tx_hash);
+        pool.update_account(lane.address, chain.lane_account(lane));
+    }
+
     /// Drops `hash`'s transactions from the pool and refreshes their senders' accounts.
     fn prune_pool(chain: *Chain, hash: Hash) void {
         const pool = chain.pool orelse return;
@@ -754,6 +784,10 @@ pub const Chain = struct {
         while (!stored.transactions.is_empty()) {
             const raw = stored.transactions.bytes() catch unreachable;
             const tx_hash = primitives.keccak256(raw);
+            if (raw.len > 0 and raw[0] == consensus.tx.eip8130.tx_type) {
+                chain.prune_lane(pool, raw, tx_hash);
+                continue;
+            }
             const sender = if (pool.get(tx_hash)) |tx| tx.sender else blk: {
                 const envelope = consensus.Envelope.decode(raw) catch continue;
                 break :blk envelope.recover_sender(chain.executor.recoverer) orelse continue;
