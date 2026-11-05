@@ -6,6 +6,8 @@
 //! journal plus checkpoints) and a restart resumes from it; without it state is in memory.
 //! `--proofs-history` keeps the last `--proofs-history.window` blocks (default 256) of
 //! trie nodes in memory, so state reads and eth_getProof work at older blocks.
+//! `--rehash-threads N` sets the storage-trie rehash workers (default: one per spare core,
+//! at most 4; 0 hashes on the calling thread).
 
 const std = @import("std");
 const base = @import("base");
@@ -20,7 +22,7 @@ const usage =
     \\usage: base node --chain GENESIS.json [--datadir DIR] [--http.addr IP] [--http.port P]
     \\         [--dev-l1 [--block-time S] [--beacon.port P]]
     \\         [--authrpc.port P --authrpc.jwtsecret FILE] [--log.level LEVEL]
-    \\         [--proofs-history [--proofs-history.window BLOCKS]]
+    \\         [--proofs-history [--proofs-history.window BLOCKS]] [--rehash-threads N]
     \\
 ;
 
@@ -37,6 +39,8 @@ pub const Flags = struct {
     log_level: log.Level = .info,
     proofs_history: bool = false,
     proofs_history_window: u32 = 256,
+    /// Storage-rehash workers; null picks `state_db.rehash_threads_auto` from the cores.
+    rehash_threads: ?u32 = null,
 };
 
 pub fn parse_flags(args: []const []const u8) !Flags {
@@ -77,6 +81,10 @@ pub fn parse_flags(args: []const []const u8) !Flags {
         } else if (eql(u8, arg, "--proofs-history.window")) {
             flags.proofs_history_window = try std.fmt.parseInt(u32, value, 10);
             if (flags.proofs_history_window == 0) return error.InvalidProofsHistoryWindow;
+        } else if (eql(u8, arg, "--rehash-threads")) {
+            const threads = try std.fmt.parseInt(u32, value, 10);
+            if (threads > rehash_threads_max) return error.TooManyRehashThreads;
+            flags.rehash_threads = threads;
         } else if (eql(u8, arg, "--log.level")) {
             flags.log_level = std.meta.stringToEnum(log.Level, value) orelse
                 return error.UnknownLogLevel;
@@ -107,11 +115,17 @@ fn authrpc_address(flags: Flags) ?io.Address {
     return io.Address.ip4(flags.http_addr, port);
 }
 
-/// Default limits, plus one sender-recovery thread per spare core (at most 7).
-fn limits() base.execution.node.service.Limits {
+const rehash_threads_max = base.execution.trie.state_trie.rehash_threads_max;
+
+/// Default limits, plus one sender-recovery thread per spare core (at most 7) and the
+/// storage-rehash workers (`--rehash-threads`, else one per spare core, at most 4).
+fn limits(flags: Flags) base.execution.node.service.Limits {
     var result: base.execution.node.service.Limits = .{};
-    const cores: u32 = @intCast(std.Thread.getCpuCount() catch 1);
-    result.executor.recovery_threads = @min(cores -| 1, 7);
+    const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
+    result.executor.recovery_threads = @min(cores - 1, 7);
+    const auto = node.state_db.rehash_threads_auto(cores);
+    result.state.trie.rehash_threads = flags.rehash_threads orelse auto;
+    std.debug.assert(result.state.trie.rehash_threads <= rehash_threads_max);
     return result;
 }
 
@@ -161,7 +175,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .jwt_secret = secret,
         .data_path = data_path,
         .proofs_history_window = if (flags.proofs_history) flags.proofs_history_window else 0,
-        .limits = limits(),
+        .limits = limits(flags),
     });
     defer service.deinit();
     _ = try service.start();
@@ -197,9 +211,24 @@ test "node: proofs history flags" {
         "--proofs-history", "--chain", "g.json", "--proofs-history.window", "64",
     });
     try std.testing.expect(on.proofs_history);
+    try std.testing.expectEqual(@as(?u32, null), on.rehash_threads);
     try std.testing.expectEqual(@as(u32, 64), on.proofs_history_window);
     try std.testing.expectError(
         error.InvalidProofsHistoryWindow,
         parse_flags(&.{ "--chain", "g.json", "--proofs-history.window", "0" }),
+    );
+}
+
+test "node: rehash threads flag" {
+    const off = try parse_flags(&.{ "--chain", "g.json", "--rehash-threads", "0" });
+    try std.testing.expectEqual(@as(?u32, 0), off.rehash_threads);
+    try std.testing.expectEqual(@as(u32, 0), limits(off).state.trie.rehash_threads);
+    const two = try parse_flags(&.{ "--rehash-threads", "2", "--chain", "g.json" });
+    try std.testing.expectEqual(@as(u32, 2), limits(two).state.trie.rehash_threads);
+    const auto = limits(try parse_flags(&.{ "--chain", "g.json" }));
+    try std.testing.expect(auto.state.trie.rehash_threads <= 4);
+    try std.testing.expectError(
+        error.TooManyRehashThreads,
+        parse_flags(&.{ "--chain", "g.json", "--rehash-threads", "17" }),
     );
 }

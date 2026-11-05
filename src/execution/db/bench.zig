@@ -82,6 +82,8 @@ pub const Shape = struct {
     /// Measured blocks: `rounds` rounds of `round_blocks`, a checkpoint after each round.
     rounds: u32,
     round_blocks: u32,
+    /// Storage-rehash workers of the state trie (`State.Config.rehash_threads`).
+    rehash_threads: u32 = 0,
 
     pub fn slots(shape: Shape) u32 {
         return shape.contracts * shape.slots_per_contract;
@@ -227,6 +229,7 @@ pub fn state_config(shape: Shape) state_module.Config {
         // `State.apply` wants 3 free nodes per change on top of the live trie.
         .account_nodes_max = 3 * accounts + 1024,
         .storage_nodes_max = 3 * slots + 1024,
+        .rehash_threads = shape.rehash_threads,
     };
 }
 
@@ -590,12 +593,26 @@ pub fn matches(name: []const u8, filter: ?[]const u8) bool {
 
 const name_sim = "db/commit sim (zero latency)";
 const name_os = "db/commit os (fsync)";
+const name_sim_rehash = "db/commit sim (zero latency, 4 rehash threads)";
+
+/// `shape_bench` with the rehash workers a node on 5+ cores starts (`rehash_threads_auto`).
+const shape_bench_rehash: Shape = blk: {
+    var shape = shape_bench;
+    shape.rehash_threads = 4;
+    break :blk shape;
+};
 
 /// Runs the commit-latency benchmarks whose names match `filter`.
 pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     if (matches(name_sim, filter)) {
         run_commit_sim(io, std.heap.page_allocator, shape_bench, name_sim) catch |err| {
             std.debug.print("{s}: failed: {s}\n", .{ name_sim, @errorName(err) });
+        };
+    }
+    if (matches(name_sim_rehash, filter)) {
+        const shape = shape_bench_rehash;
+        run_commit_sim(io, std.heap.page_allocator, shape, name_sim_rehash) catch |err| {
+            std.debug.print("{s}: failed: {s}\n", .{ name_sim_rehash, @errorName(err) });
         };
     }
     if (matches(name_os, filter)) {

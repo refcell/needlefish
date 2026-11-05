@@ -45,6 +45,22 @@ pub const Config = struct {
     undo_blocks_max: u32 = 1024,
 };
 
+/// Storage-rehash workers a production node starts on `cpu_count` cores: one per spare core,
+/// at most 4 (the storage rehash gains little past 4 threads, docs/PERF.md). DST, the
+/// simulator and tests keep `Config.trie.rehash_threads` at 0 (single-threaded).
+pub fn rehash_threads_auto(cpu_count: u32) u32 {
+    assert(cpu_count > 0);
+    const threads = @min(cpu_count - 1, rehash_threads_auto_max);
+    assert(threads <= state_trie.rehash_threads_max);
+    return threads;
+}
+
+const rehash_threads_auto_max = 4;
+
+comptime {
+    assert(rehash_threads_auto_max <= state_trie.rehash_threads_max);
+}
+
 pub const Error = db_module.overlay.Error || error{ CodeStoreFull, UndoUnavailable };
 
 const UndoRecord = struct { offset: u32, len: u32 };
@@ -82,6 +98,7 @@ pub const StateDb = struct {
             .code_bytes_max = config.code_bytes_max,
             .account_nodes_max = config.trie.account_nodes_max,
             .storage_nodes_max = config.trie.storage_nodes_max,
+            .rehash_threads = config.trie.rehash_threads,
         };
     }
 
@@ -385,6 +402,17 @@ test "state_db: commit of evm state matches direct writes" {
     try expected.put_storage(test_address(2), 3, 77);
     try testing.expectEqualSlices(u8, &(try expected.root()), &(try db.root()));
     try testing.expectEqual(@as(u256, 77), db.get_storage(test_address(2), 3));
+}
+
+test "state_db: rehash threads auto" {
+    try testing.expectEqual(@as(u32, 0), rehash_threads_auto(1));
+    try testing.expectEqual(@as(u32, 1), rehash_threads_auto(2));
+    try testing.expectEqual(@as(u32, 4), rehash_threads_auto(5));
+    try testing.expectEqual(@as(u32, 4), rehash_threads_auto(64));
+    var config = small_config();
+    try testing.expectEqual(@as(u32, 0), StateDb.state_config(config).rehash_threads);
+    config.trie.rehash_threads = 3;
+    try testing.expectEqual(@as(u32, 3), StateDb.state_config(config).rehash_threads);
 }
 
 test "state_db: block hash ring" {

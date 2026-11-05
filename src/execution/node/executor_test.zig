@@ -395,3 +395,97 @@ test "executor: EIP-8130 transactions run their phases from Everest and report t
     const rejected = early.executor.execute_block(&block_env(1), &.{raw}, &.{});
     try testing.expectError(error.TxTypeNotSupported, rejected);
 }
+
+const rehash_contracts = 8;
+const rehash_slots = 64;
+
+/// slot[i] += 1 for i in [0, rehash_slots): PUSH1 i SLOAD PUSH1 1 ADD PUSH1 i SSTORE, STOP.
+const rehash_code: [rehash_slots * 9 + 1]u8 = blk: {
+    var code: [rehash_slots * 9 + 1]u8 = undefined;
+    for (0..rehash_slots) |slot| {
+        const step = [9]u8{ 0x60, slot, 0x54, 0x60, 0x01, 0x01, 0x60, slot, 0x55 };
+        @memcpy(code[slot * 9 ..][0..9], &step);
+    }
+    code[rehash_slots * 9] = 0x00;
+    break :blk code;
+};
+
+fn rehash_contract(index: u32) [20]u8 {
+    var address: [20]u8 = @splat(0);
+    address[0] = 0xc0;
+    std.mem.writeInt(u32, address[16..20], index, .big);
+    return address;
+}
+
+/// Executes `blocks` storage-heavy blocks (every contract bumps all its slots) on a node
+/// whose state trie runs `threads` rehash workers; returns the last state root.
+fn storage_heavy_root(threads: u32, blocks: u32) ![32]u8 {
+    var f: Fixture = undefined;
+    f.db = try StateDb.init(testing.allocator, .{
+        .trie = .{
+            .accounts_max = 256,
+            .account_nodes_max = 4096,
+            .storage_nodes_max = 8192,
+            .rehash_threads = threads,
+        },
+        .storage_slots_max = 4096,
+        .code_bytes_max = 1 << 16,
+        .codes_max = 64,
+    });
+    defer f.db.deinit(testing.allocator);
+    const state_trie = &f.db.state.state_trie;
+    try testing.expectEqual(threads > 0, state_trie.rehash_pool != null);
+    state_trie.rehash_parallel_nodes_min = 0; // Every flush takes the parallel path.
+    f.executor = try Executor.init(testing.allocator, spec, &f.db, .{
+        .scratch_bytes = 1 << 20,
+        .transactions_max = 64,
+        .evm = .{ .memory_bytes_max = 1 << 20, .code_arena_bytes = 1 << 20 },
+        .limits = .{
+            .accounts_max = 256,
+            .slots_max = 1024,
+            .transient_slots_max = 64,
+            .journal_entries_max = 4096,
+            .logs_max = 64,
+            .log_data_bytes_max = 4096,
+            .code_bytes_max = 1 << 16,
+        },
+    });
+    defer f.executor.deinit(testing.allocator);
+    try f.db.put_account(address_of(1), eth, 0, &.{});
+    for (0..rehash_contracts) |index| {
+        try f.db.put_account(rehash_contract(@intCast(index)), 0, 1, &rehash_code);
+    }
+    var buffers: [rehash_contracts][256]u8 = undefined;
+    var raws: [rehash_contracts][]const u8 = undefined;
+    var root: [32]u8 = undefined;
+    for (0..blocks) |block| {
+        for (&buffers, &raws, 0..) |*buffer, *raw, index| {
+            const tx: consensus.Eip1559 = .{
+                .chain_id = spec.chain_id,
+                .nonce = block * rehash_contracts + index,
+                .max_priority_fee_per_gas = 1,
+                .max_fee_per_gas = 100,
+                .gas_limit = 2_000_000,
+                .to = .{ .call = .{ .bytes = rehash_contract(@intCast(index)) } },
+                .value = 0,
+                .input = &.{},
+                .access_list = .empty,
+            };
+            raw.* = (try consensus.tx.sign(tx, key(1))).encode_to(buffer);
+        }
+        const out = try f.executor.execute_block(&block_env(block + 1), &raws, &.{});
+        for (out.receipts) |receipt| try testing.expect(receipt.status);
+        root = out.state_root;
+        try testing.expectEqualSlices(u8, &root, &(try f.db.root()));
+    }
+    const contract = rehash_contract(rehash_contracts - 1);
+    try testing.expectEqual(@as(u256, blocks), f.db.get_storage(contract, rehash_slots - 1));
+    return root;
+}
+
+test "executor: parallel storage rehash commits the serial root and shuts down cleanly" {
+    const serial = try storage_heavy_root(0, 2);
+    const parallel = try storage_heavy_root(2, 2);
+    try testing.expectEqualSlices(u8, &serial, &parallel);
+    try testing.expect(!std.mem.eql(u8, &serial, &(try storage_heavy_root(0, 1))));
+}

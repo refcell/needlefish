@@ -333,6 +333,8 @@ pub fn Service(comptime IO: type) type {
             assert(options.block_time_s > 0);
             assert(!options.dev_l1 or options.beacon_address != null);
             assert((options.authrpc_address == null) == (options.jwt_secret == null));
+            // DST stays single-threaded: rehash workers would break seed determinism.
+            if (IO == io_module.SimIo) assert(options.limits.state.trie.rehash_threads == 0);
             service.* = .{
                 .allocator = allocator,
                 .io = io,

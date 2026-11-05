@@ -339,6 +339,23 @@ Tried first: one static range per thread. With 8 threads the caller hashed its 1
 on the loaded machine), so 8 threads gained little over 2. Claimed chunks fixed that.
 Not parallel: the dirty-node collect (one walk, ~28 ns per node, ~12% of the rehash).
 
+## 2026-11-05 node parallel storage rehash on (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
+
+`base node` now starts `state_db.rehash_threads_auto(cores)` = min(cores - 1, 4) storage-rehash
+workers (`--rehash-threads N` overrides, 0 disables); 4 on this machine. DST (`Service(SimIo)`
+asserts 0), the simulator, benches and tests keep 0. The node's commit path is the db commit
+path, so `db/commit sim (zero latency, 4 rehash threads)` (new case, `shape_bench` with 4
+workers) against `db/commit sim (zero latency)` measures it end to end: `execute_and_commit`
+of 1k accounts + 4k slots over 100k accounts, 128 blocks, interleaved runs, load average 15-25.
+
+| Case (`execute_and_commit` cpu p50) | 0 threads | auto (4) | Runs |
+| --- | ---: | ---: | --- |
+| db/commit sim (zero latency) | 7.81 ms | 6.79 ms | 4 each (0: 7.68-8.07, 4: 6.59-6.99) |
+
+-13% per storage-heavy block. Blocks that dirty no storage (the `node: execute block, 500
+transfers` case) never wake the pool (`flush` returns before the split), and flushes under
+1 024 dirty storage nodes rehash on the caller, so small blocks pay nothing.
+
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 | Case | ns/op | MB/s | Notes |

@@ -141,8 +141,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] evm backend `basic` hit costs ~330 ns (vs 17 ns for `State.basic`): it keccaks the
   address on every hit only to answer `has_storage` from `StateTrie`. Keep a has-storage
   flag (or slot count) per account in `State` so the vtable read stays a table lookup.
-- [ ] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
+- [x] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
   sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
+  (`--rehash-threads`, auto min(cores - 1, 4); db/commit sim cpu p50 7.81 -> 6.79 ms, PERF.md)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -157,6 +158,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - One trie pool hosts many roots (`*_in` APIs): all storage tries share a pool sized at init.
 - `StateTrie` takes hashed keys; writes mark accounts dirty, `root()` rehashes dirty storage
   tries and applies dirty accounts sorted.
+- Node rehash workers: `state_db.Config.trie.rehash_threads` reaches `db.State` through
+  `StateDb.state_config` (in-memory and durable nodes alike). `base node` sets it to
+  `state_db.rehash_threads_auto(cores)` = min(cores - 1, 4), like the sender-recovery threads
+  (min(cores - 1, 7)) but capped at 4 because 8 threads gained nothing over 4 (PERF.md); the
+  two pools run in different block phases, so they do not compete. `--rehash-threads N`
+  overrides (0 disables, > 16 rejected). `Service(SimIo).init` asserts 0, so DST cannot
+  start threads; tests and benches default to 0. The pool joins in `State.deinit`, which
+  `Service.deinit` reaches through `StateDb.deinit` or the durable database.
 - Parallel storage rehash (`StateTrie.Config.rehash_threads`, `db.state.Config`): default 0,
   so DST, the simulator and tests not asking for it stay single-threaded. With N > 0 a static
   pool (`trie/rehash_pool.zig`) is spawned at init and sleeps on a futex (`std.Io.Threaded`'s
