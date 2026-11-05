@@ -80,6 +80,8 @@ const core_methods = [_]rpc.Method(*Api){
     .{ .name = "debug_getRawReceipts", .handler = debug.get_raw_receipts },
     .{ .name = "debug_getRawTransaction", .handler = debug.get_raw_transaction },
     .{ .name = "debug_executionWitness", .handler = debug.execution_witness },
+    .{ .name = "debug_executePayload", .handler = debug.execute_payload },
+    .{ .name = "debug_proofsSyncStatus", .handler = debug.proofs_sync_status },
 };
 
 pub const Router = rpc.Router(*Api, &methods);

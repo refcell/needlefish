@@ -146,6 +146,8 @@ pub const Journal = struct {
         storage_proofs: []StateTrie.StorageProof,
         values: []u256,
     ) db_database.ProofError!?db_history.AccountState = null,
+    /// The journal's history window (oldest and newest block); null when it keeps none.
+    history_window: ?*const fn (context: *anyopaque) ?HistoryWindow = null,
 };
 
 /// Builder DA limits set by the batcher (`miner_setMaxDASize`); 0 means no limit. Sizes
@@ -162,6 +164,9 @@ pub const DaLimits = struct {
         return limits.block_bytes_max == 0 or total <= limits.block_bytes_max;
     }
 };
+
+/// Blocks whose state the history serves (`debug_proofsSyncStatus`).
+pub const HistoryWindow = struct { oldest: u64, head: u64 };
 
 pub const Chain = struct {
     pub const Built = BuiltPayload;
@@ -553,6 +558,32 @@ pub const Chain = struct {
         const number = chain.store.ref(chain.state_hash).?.number;
         store.reset(chain.db.trie(), number) catch return error.StateUnavailable;
         assert(store.window().?.head == number);
+    }
+
+    /// The block range the history serves, null without history.
+    pub fn history_window(chain: *const Chain) ?HistoryWindow {
+        if (chain.journal) |journal| {
+            const window = journal.history_window orelse return null;
+            return window(journal.context);
+        }
+        const store = chain.history orelse return null;
+        const window = store.window() orelse return null;
+        assert(window.oldest <= window.head);
+        return .{ .oldest = window.oldest, .head = window.head };
+    }
+
+    /// Builds and stores the block `attributes` describe on `parent_hash` without
+    /// registering a payload or touching the forkchoice; returns its hash
+    /// (`debug_executePayload`). The state is left at the new block.
+    pub fn build_block(
+        chain: *Chain,
+        parent_hash: Hash,
+        attributes: *const payload.PayloadAttributes,
+    ) Error!Hash {
+        const id: payload.PayloadId = @splat(0);
+        const entry = try chain.build(id, parent_hash, attributes);
+        assert(std.mem.eql(u8, &chain.state_hash, &entry.block_hash.bytes));
+        return entry.block_hash.bytes;
     }
 
     /// True when older blocks can be served: from the journal's history (durable node)

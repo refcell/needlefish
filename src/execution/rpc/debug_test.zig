@@ -4,6 +4,7 @@
 //! post root must equal the header's. The head and its state are unchanged by the call.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 const primitives = @import("../../common/primitives/root.zig");
 const json = @import("../../utilities/json/root.zig");
@@ -61,7 +62,7 @@ const Harness = struct {
     generator: db_module.witness_block.Generator,
     sparse: db_module.witness.SparseState,
     changeset: db_module.Changeset,
-    scratch: [1 << 16]u8 = undefined,
+    scratch: [1 << 18]u8 = undefined,
     out: [1 << 20]u8 = undefined,
     item: [1 << 16]u8 = undefined,
 
@@ -103,8 +104,37 @@ const Harness = struct {
 
     /// As `request`, with the response limited to `buffer` (an HTTP send buffer).
     fn request_into(harness: *Harness, comptime params: []const u8, buffer: []u8) ![]const u8 {
-        const body = request_prefix ++ "debug_executionWitness\",\"params\":" ++ params ++ "}";
+        return harness.call_into("debug_executionWitness", params, buffer);
+    }
+
+    fn call_into(
+        harness: *Harness,
+        comptime method: []const u8,
+        comptime params: []const u8,
+        buffer: []u8,
+    ) ![]const u8 {
+        const body = request_prefix ++ method ++ "\",\"params\":" ++ params ++ "}";
         var out: std.Io.Writer = .fixed(buffer);
+        _ = eth.Router.handle(&harness.api, body, &out);
+        const text = out.buffered();
+        try json.validate(text);
+        return text;
+    }
+
+    /// A request whose params are built at runtime.
+    fn call_runtime(
+        harness: *Harness,
+        comptime method: []const u8,
+        params: []const u8,
+    ) ![]const u8 {
+        var body_buffer: [4096]u8 = undefined;
+        const prefix = request_prefix ++ method ++ "\",\"params\":";
+        assert(prefix.len + params.len + 1 <= body_buffer.len);
+        @memcpy(body_buffer[0..prefix.len], prefix);
+        @memcpy(body_buffer[prefix.len..][0..params.len], params);
+        body_buffer[prefix.len + params.len] = '}';
+        const body = body_buffer[0 .. prefix.len + params.len + 1];
+        var out: std.Io.Writer = .fixed(&harness.out);
         _ = eth.Router.handle(&harness.api, body, &out);
         const text = out.buffered();
         try json.validate(text);
@@ -250,4 +280,76 @@ test "debug_executionWitness: a witness over the response bound fails cleanly" {
     harness.generator.witness.state.bytes.len = generator_config.witness.state_bytes_max;
     try testing.expect(std.mem.indexOf(u8, try full, debug.witness_too_large) != null);
     try testing.expectEqual(head_root, try harness.node.db.root());
+}
+
+const zero_hex: [64]u8 = @splat('0');
+const recipient_hex = "fefefefefefefefefefefefefefefefefefefefe";
+const execute_attributes = "{\"timestamp\":\"0x24\",\"prevRandao\":\"0x" ++ zero_hex ++
+    "\",\"suggestedFeeRecipient\":\"0x" ++ recipient_hex ++ "\",\"withdrawals\":[]," ++
+    "\"parentBeaconBlockRoot\":\"0x" ++ zero_hex ++ "\"}";
+const unknown_hex: [64]u8 = @splat('a');
+
+test "debug_executePayload: the witness equals the engine-built block's witness" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const node = harness.node;
+    var hashes: [3]Hash = undefined;
+    hashes[0] = node.chain.head_hash();
+    for (1..3) |number| hashes[number] = try harness.mine(number - 1, 12 * number);
+    var buffers: [2][256]u8 = undefined;
+    try fixture.submit(node, 1, 2, 5, &buffers[0]);
+    try fixture.submit(node, 2, 2, 6, &buffers[1]);
+    const head_root = try node.db.root();
+
+    var params_buffer: [1024]u8 = undefined;
+    const params = try std.fmt.bufPrint(&params_buffer, "[\"0x{x}\",{s}]", .{
+        &hashes[2],
+        execute_attributes,
+    });
+    const executed = try harness.call_runtime("debug_executePayload", params);
+    const executed_result = (try json.find_path(executed, &.{"result"})).?;
+    var saved: [1 << 18]u8 = undefined;
+    try testing.expect(executed_result.len <= saved.len);
+    @memcpy(saved[0..executed_result.len], executed_result);
+    // The head and its state are untouched.
+    try testing.expectEqual(hashes[2], node.chain.head_hash());
+    try testing.expectEqual(head_root, try node.db.root());
+
+    // The engine builds the same block from the same attributes and pool.
+    const built = try fixture.build(node, .{ .bytes = hashes[2] }, 36, 0xfe);
+    const version = engine_types.forkchoice_version(fixture.spec, 36);
+    _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(built), null);
+    const witnessed = try harness.request("[\"0x3\"]");
+    const witnessed_result = (try json.find_path(witnessed, &.{"result"})).?;
+    try testing.expectEqualStrings(saved[0..executed_result.len], witnessed_result);
+    try testing.expect(std.mem.indexOf(u8, witnessed_result, "\"state\":[\"0x") != null);
+}
+
+test "debug_executePayload: unknown parent, bad attributes, no generator" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const head = harness.node.chain.head_hash();
+    var params_buffer: [1024]u8 = undefined;
+    const unknown_params = "[\"0x" ++ unknown_hex ++ "\"," ++ execute_attributes ++ "]";
+    const unknown = try harness.call_runtime("debug_executePayload", unknown_params);
+    try testing.expect(std.mem.indexOf(u8, unknown, "parent block not found") != null);
+    const bad_params = try std.fmt.bufPrint(&params_buffer, "[\"0x{x}\",{{}}]", .{&head});
+    const bad = try harness.call_runtime("debug_executePayload", bad_params);
+    try testing.expect(std.mem.indexOf(u8, bad, "invalid payload attributes") != null);
+    harness.api.witness = null;
+    const good = try std.fmt.bufPrint(&params_buffer, "[\"0x{x}\",{s}]", .{
+        &head,
+        execute_attributes,
+    });
+    const off = try harness.call_runtime("debug_executePayload", good);
+    try testing.expect(std.mem.indexOf(u8, off, "execution witness unavailable") != null);
+    try testing.expectEqual(head, harness.node.chain.head_hash());
+}
+
+test "debug_proofsSyncStatus: null bounds without history" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const text = try harness.call_into("debug_proofsSyncStatus", "[]", &harness.out);
+    const expected = "\"result\":{\"earliest\":null,\"latest\":null}";
+    try testing.expect(std.mem.indexOf(u8, text, expected) != null);
 }

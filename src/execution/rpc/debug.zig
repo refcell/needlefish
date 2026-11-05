@@ -23,6 +23,9 @@ const eth = @import("eth.zig");
 const json = @import("../../utilities/json/root.zig");
 const witness_module = @import("../db/witness.zig");
 const ByteList = witness_module.ByteList;
+const engine_json = @import("engine_json.zig");
+const payload = @import("../payload/root.zig");
+const primitives = @import("../../common/primitives/root.zig");
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -114,6 +117,11 @@ pub fn execution_witness(api: *eth.Api, call: *Call) HandlerError!void {
         error.WitnessFull => return call.fail(rpc.code.server_error, witness_too_large),
         else => return call.fail(rpc.code.server_error, @errorName(err)),
     };
+    try write_built(call, generator);
+}
+
+/// Writes the generator's filled witness as the result, bounded by `response_bytes_max`.
+fn write_built(call: *Call, generator: *node.witness.Generator) HandlerError!void {
     const built = &generator.witness;
     const w = call.writer;
     const length = witness_json_length(built);
@@ -136,6 +144,88 @@ pub fn execution_witness(api: *eth.Api, call: *Call) HandlerError!void {
 }
 
 pub const witness_too_large = "witness too large";
+
+/// Bounds of the attributes `debug_executePayload` decodes (the engine's limits).
+const execute_transactions_max = 4096;
+const execute_withdrawals_max = 16;
+const execute_hashes_max = 16;
+
+/// `debug_executePayload(parentHash, attributes)` (base/base): builds the block the
+/// payload attributes describe on the parent, as `engine_forkchoiceUpdated` would but
+/// without a payload id or forkchoice change, and returns its execution witness. The
+/// block is stored as a side block; the attributes decode into the API's scratch.
+pub fn execute_payload(api: *eth.Api, call: *Call) HandlerError!void {
+    const parent = try call.params.fixed(32);
+    const raw = try call.params.raw();
+    try call.params.finish();
+    const generator = api.witness orelse
+        return call.fail(rpc.code.server_error, "execution witness unavailable");
+    var space = attribute_space(api.scratch) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    const attributes = engine_json.parse_attributes(raw, &space) catch
+        return call.fail(rpc.code.invalid_params, "invalid payload attributes");
+    if (api.chain.header(parent) == null) {
+        return call.fail(rpc.code.server_error, "parent block not found");
+    }
+    const hash = api.chain.build_block(parent, &attributes) catch |err| switch (err) {
+        error.InvalidAttributes, error.InvalidTransaction => {
+            return call.fail(rpc.code.invalid_params, @errorName(err));
+        },
+        else => return call.fail(rpc.code.server_error, @errorName(err)),
+    };
+    // The state sits at the built block; serve later reads from the head again.
+    defer api.chain.ensure_head_state() catch |err| {
+        std.log.scoped(.rpc).warn("debug_executePayload: head state: {s}", .{@errorName(err)});
+    };
+    node.witness.built_witness(api.chain, generator, hash) catch |err| switch (err) {
+        error.WitnessFull => return call.fail(rpc.code.server_error, witness_too_large),
+        else => return call.fail(rpc.code.server_error, @errorName(err)),
+    };
+    try write_built(call, generator);
+}
+
+/// Carves the attribute decoding space out of `scratch`; null when it does not fit.
+fn attribute_space(scratch: []u8) ?engine_json.Space {
+    var offset: usize = 0;
+    const transactions = carve([]const u8, scratch, &offset, execute_transactions_max) orelse
+        return null;
+    const withdrawals = carve(payload.Withdrawal, scratch, &offset, execute_withdrawals_max) orelse
+        return null;
+    const hashes = carve(primitives.B256, scratch, &offset, execute_hashes_max) orelse
+        return null;
+    if (offset >= scratch.len) return null;
+    assert(transactions.len == execute_transactions_max);
+    return .{
+        .bytes = scratch[offset..],
+        .transactions = transactions,
+        .withdrawals = withdrawals,
+        .hashes = hashes,
+    };
+}
+
+fn carve(comptime T: type, scratch: []u8, offset: *usize, count: usize) ?[]T {
+    const base = @intFromPtr(scratch.ptr);
+    const start = std.mem.alignForward(usize, base + offset.*, @alignOf(T)) - base;
+    const end = start + count * @sizeOf(T);
+    if (end > scratch.len) return null;
+    offset.* = end;
+    const typed: [*]T = @ptrCast(@alignCast(scratch[start..end].ptr));
+    return typed[0..count];
+}
+
+/// `debug_proofsSyncStatus` (base/base): `{earliest, latest}` block numbers the
+/// history serves, both null without history.
+pub fn proofs_sync_status(api: *eth.Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    const window = api.chain.history_window();
+    const w = call.writer;
+    try w.begin_object();
+    try w.key("earliest");
+    if (window) |range| try w.integer(range.oldest) else try w.null_value();
+    try w.key("latest");
+    if (window) |range| try w.integer(range.head) else try w.null_value();
+    try w.end_object();
+}
 
 /// Exact length of the `{state, codes, keys, headers}` object `execution_witness` writes.
 pub fn witness_json_length(built: *const witness_module.Witness) u64 {

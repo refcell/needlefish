@@ -221,7 +221,16 @@ pub fn Durable(comptime Storage: type) type {
                 .move_head = move_head,
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
+                .history_window = if (self.database.history != null) history_window else null,
             };
+        }
+
+        fn history_window(context: *anyopaque) ?chain_module.HistoryWindow {
+            const self = from(context);
+            const store = &(self.database.history orelse return null);
+            const window = store.window() orelse return null;
+            assert(window.oldest <= window.head);
+            return .{ .oldest = window.oldest, .head = window.head };
         }
 
         /// Historical `eth_getProof` from the database's history window. The database's

@@ -35,6 +35,25 @@ pub fn execution_witness(chain: *Chain, generator: *Generator, hash: Hash) Error
     if (number == 0) return error.BlockUnavailable;
     const canonical = chain.store.canonical_hash(number) orelse return error.BlockUnavailable;
     if (!std.mem.eql(u8, &canonical, &hash)) return error.BlockUnavailable;
+    try witness_from_state(chain, generator, stored, hash);
+}
+
+/// Fills `generator.witness` with the witness of block `hash`, which the state holds:
+/// a block just built (`Chain.build_block`, `debug_executePayload`), canonical or not.
+/// The unwind starts at that block, so only its own changeset is needed.
+pub fn built_witness(chain: *Chain, generator: *Generator, hash: Hash) Error!void {
+    assert(generator.state == chain.db.state);
+    if (!std.mem.eql(u8, &chain.state_hash, &hash)) return error.StateUnavailable;
+    const stored = chain.record(hash) orelse return error.BlockUnavailable;
+    if (stored.header.number == 0) return error.BlockUnavailable;
+    try witness_from_state(chain, generator, stored, hash);
+    assert(std.mem.eql(u8, &chain.state_hash, &hash));
+}
+
+/// Witness of stored block `hash` relative to the state's current block.
+fn witness_from_state(chain: *Chain, generator: *Generator, stored: Record, hash: Hash) Error!void {
+    const number = stored.header.number;
+    assert(number > 0);
     var run: Run = .{ .chain = chain, .record = stored };
     const execute: witness_block.Execute = .{ .context = &run, .run = Run.execute };
     defer {

@@ -35,7 +35,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] rpc: eth_createAccessList (needs an access-list inspector from the evm).
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
-- [ ] rpc: debug_executePayload; eth_simulateV1.
+- [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
+- [ ] rpc: eth_simulateV1.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
@@ -73,6 +74,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: debug_executePayload(parent, attributes) builds the block with `Chain.build_block` (as a payload build, no payload id or forkchoice change; stored as a side block) and returns the witness via the new `node.witness.built_witness`, which unwinds from the state at the built block (one changeset; durable DB head is at the block too), then `ensure_head_state`. Attributes decode into the API scratch with the engine parser. debug_proofsSyncStatus reports `{earliest, latest}` of the history window (`Chain.history_window`, journal hook `history_window` on durable nodes), null/null without history.
 - 2026-11-05: eth_config (EIP-7910) as reth's handler plus base/base's L2 sanitizing (zero blob schedule; system contracts only beacon roots from Ecotone and history storage from Isthmus). Forks are the distinct schedule times; fork id is EIP-2124 CRC32 over genesis hash plus times after genesis (no block forks on our chains; `Chain.genesis_timestamp` added). Decision: when no fork is active yet we return "no active timestamp fork found" instead of reth's fallback to the last fork. No DEPOSIT_CONTRACT_ADDRESS: the dev chains configure none.
 - 2026-11-05: perf profile after pipelining: the executing thread finishes early and spends ~half its samples helping recovery, so block time is bounded by secp256k1 ecrecover throughput (~30 us each, crypto lane) plus ~5% thread spawn; no large lever left in this lane. Added miner/base/admin pool methods (base/base shapes: `[maxTx, maxBlock]`, `{"status":"Known"|"Unknown"}`, drop returns hashes lowest nonce first); `miner_setGasLimit` caps pool selection, not the header gas limit, as base/base's standard builder.
 - 2026-11-05: perf: execution now runs behind sender recovery (`senders.Pipeline`: workers claim 8-tx batches in order and publish per-batch done flags; the executor waits per transaction and recovers unclaimed batches itself instead of idling). Interleaved A/B of ReleaseFast bench binaries on a loaded host (load 14-25 on 14 cores): 500-transfer block median 6.2 ms vs 7.5 ms before (9 runs each). Next perf targets: commit/trie root (~2 ms of the remaining main-thread time) and spawn cost (a resident pool needs std.Io-free sync; still deferred).

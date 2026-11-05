@@ -681,6 +681,8 @@ const method_names = [_][]const u8{
     "admin_dropTransaction",
     "admin_dropSenderTransactions",
     "eth_config",
+    "debug_executePayload",
+    "debug_proofsSyncStatus",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

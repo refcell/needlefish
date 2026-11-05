@@ -336,6 +336,51 @@ test "durable: execution witness prefers the history window and leaves the state
     }
 }
 
+/// `debug_executePayload` on a durable node: a side block built on a canonical parent is
+/// witnessed from the state that holds it, then the head state comes back.
+fn check_built_witness(database_config: db_module.database.Config) !void {
+    const h = try Harness.create_with(7, database_config);
+    defer h.destroy();
+    var buffers: [3][256]u8 = undefined;
+    var hashes: [4]B256 = undefined;
+    hashes[0] = h.head();
+    for (1..4) |number| {
+        try fixture.submit(h.node.?, 1, number - 1, 5, &buffers[number - 1]);
+        hashes[number] = try h.build_head(hashes[number - 1], 12 * number, 0xfe);
+    }
+    const node = h.node.?;
+    var generator = try db_module.witness_block.Generator.init(
+        testing.allocator,
+        h.durable.state(),
+        witness_config,
+    );
+    defer generator.deinit(testing.allocator);
+    const head_root = try node.db.root();
+    for ([_]usize{ 2, 3 }) |parent| {
+        const attributes = fixture.attributes(12 * parent + 6, 0xfd);
+        const built = try node.chain.build_block(hashes[parent].bytes, &attributes);
+        try witness_module.built_witness(&node.chain, &generator, built);
+        try testing.expect(generator.witness.state.count > 0);
+        try testing.expect(generator.witness.headers.count > 0);
+        try node.chain.ensure_head_state();
+        try testing.expectEqual(hashes[3].bytes, node.chain.head_hash());
+        try testing.expectEqual(head_root, try node.db.root());
+    }
+    // A block the state does not hold is refused.
+    const stale = witness_module.built_witness(&node.chain, &generator, hashes[1].bytes);
+    try testing.expectError(error.StateUnavailable, stale);
+    if (database_config.history != null) {
+        const window = node.chain.history_window().?;
+        try testing.expectEqual(@as(u64, 3), window.head);
+    } else try testing.expect(node.chain.history_window() == null);
+    _ = try h.build_head(h.head(), 60, 0xfe);
+}
+
+test "durable: built side blocks are witnessed with and without history" {
+    try check_built_witness(config);
+    try check_built_witness(history_config);
+}
+
 fn fuzz_scenario(seed: u64) !void {
     var prng = Prng.init(seed);
     const h = try Harness.create(seed);
