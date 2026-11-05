@@ -327,15 +327,17 @@ pub const L1 = struct {
     /// Orphan the top `depth` blocks and immediately mine a replacement branch of the
     /// same height, as a heavier fork would arrive on L1. Orphaned transactions go back
     /// to the mempool, so the new branch re-includes them where nonces allow.
-    pub fn reorg(l1: *L1, env: *const Env, depth: u64) void {
+    /// Each orphaned transaction is lost instead of re-injected with `loss_ppm`, as when
+    /// the new branch's L1 nodes never saw it.
+    pub fn reorg(l1: *L1, env: *const Env, depth: u64, prng: *Prng, loss_ppm: u32) void {
         const height = l1.head;
-        l1.orphan(depth);
+        l1.orphan(depth, prng, loss_ppm);
         for (0..depth) |_| l1.mine(env);
         assert(l1.head == height);
     }
 
     /// Drops the top `depth` blocks; their transactions return to the mempool front.
-    fn orphan(l1: *L1, depth: u64) void {
+    fn orphan(l1: *L1, depth: u64, prng: *Prng, loss_ppm: u32) void {
         assert(depth > 0 and depth <= l1_reorg_depth_max);
         assert(depth <= l1.head);
         const restored_max = l1_reorg_depth_max * l1_batches_max;
@@ -347,6 +349,7 @@ pub const L1 = struct {
             for (block.batches[0..block.batch_count]) |batch| {
                 // A pending replacement for the same nonce wins over the orphaned one.
                 if (batch.nonce != null and l1.has_nonce(batch.nonce.?)) continue;
+                if (prng.chance(loss_ppm, 1_000_000)) continue;
                 merged[count] = batch;
                 count += 1;
             }
@@ -368,6 +371,19 @@ pub const L1 = struct {
         @memcpy(l1.mempool[0..count], merged[0..count]);
         l1.head -= depth;
         l1.reorgs += 1;
+    }
+
+    /// Mempool eviction: a random pending transaction disappears. Returns whether one did.
+    pub fn evict(l1: *L1, prng: *Prng) bool {
+        if (l1.mempool_count == 0) return false;
+        const index: usize = @intCast(prng.below(l1.mempool_count));
+        std.mem.copyForwards(
+            Batch,
+            l1.mempool[index .. l1.mempool_count - 1],
+            l1.mempool[index + 1 .. l1.mempool_count],
+        );
+        l1.mempool_count -= 1;
+        return true;
     }
 
     fn has_nonce(l1: *const L1, nonce: u64) bool {
@@ -847,9 +863,42 @@ test "nodes: L1 includes nonced transactions in order, replaces, and survives re
     try std.testing.expectEqual(SubmitResult.nonce_too_low, l1.submit_nonced(13, 1));
     // A reorg re-mines the orphaned transactions on the replacement branch.
     const orphaned_hash = l1.blocks[2].hash;
-    l1.reorg(&env, 1);
+    l1.reorg(&env, 1, &prng, 0);
     try std.testing.expectEqual(@as(u64, 2), l1.head);
     try std.testing.expect(l1.blocks[2].hash != orphaned_hash);
     try std.testing.expectEqual(@as(u64, 2), l1.nonce_mined());
+    try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
+}
+
+test "nodes: L1 evictions and lossy reorgs drop transactions" {
+    const allocator = std.testing.allocator;
+    var l1 = try L1.init(allocator, 16, std.time.ns_per_s);
+    defer l1.deinit(allocator);
+    var network = try Net.init(allocator, .{});
+    defer network.deinit(allocator);
+    var pool = try codec.TxPool.init(allocator, 8);
+    defer pool.deinit(allocator);
+    var prng = Prng.init(2);
+    const env: Env = .{
+        .now_ns = 0,
+        .global_ns = 0,
+        .prng = &prng,
+        .network = &network,
+        .verifier_count = 0,
+        .tx_pool = &pool,
+    };
+    try std.testing.expect(!l1.evict(&prng));
+    _ = l1.submit_nonced(1, 0);
+    _ = l1.submit_nonced(2, 1);
+    try std.testing.expect(l1.evict(&prng));
+    try std.testing.expectEqual(@as(u8, 1), l1.mempool_count);
+    _ = l1.submit_nonced(3, 0);
+    _ = l1.submit_nonced(4, 1);
+    l1.mine(&env);
+    try std.testing.expectEqual(@as(u64, 2), l1.nonce_mined());
+    // Every orphaned tx is lost: the replacement block is empty and the nonce rolls back.
+    l1.reorg(&env, 1, &prng, 1_000_000);
+    try std.testing.expectEqual(@as(u8, 0), l1.blocks[1].batch_count);
+    try std.testing.expectEqual(@as(u64, 0), l1.nonce_mined());
     try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
 }

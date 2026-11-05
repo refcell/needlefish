@@ -18,8 +18,9 @@ provably robust.
   - [x] Batcher: the real `batcher/service` (txmgr, channel manager, L2 source) runs
     against model state through JSON-RPC transports (`sim/real_batcher.zig`).
   - [ ] Sequencer / verifier derivation once the consensus service is step-driven.
-- [ ] Sim: L1 transaction-loss fault (mempool eviction, a different L1 RPC node). The real
-  batcher's txmgr never refetches its nonce, so one lost tx stalls it forever (see notes).
+- [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
+- [ ] Sim: enable both tx-loss faults for the real batcher (with crashes) once txmgr recovers
+  nonce gaps (see notes); today they are drawn only where txmgr can survive them.
 - [x] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
   minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
 - [ ] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
@@ -36,6 +37,11 @@ provably robust.
   every later tx waits on L1 indefinitely. base/base resets its nonce cache on send timeout
   and requeues the frames; the service's safe-head stall reset should also reset txmgr
   (refetch the `latest` nonce, drop slots above it, requeue their frames).
+- batcher (txmgr): a fresh txmgr (startup, restart) takes its first nonce from the
+  `pending` tag, adopting mempool txs it does not track. If L1 then evicts one, nothing
+  re-sends it and every later nonce waits forever. base/base's batcher uses the default
+  `latest` tag (only infra jobs opt into pending); use `latest` and let the same-nonce
+  resubmission replace what is pending.
 - consensus (derivation): a durable checkpoint of (safe head, L1 cursor) must also name the
   hash of the L1 block it reflects, and per-L1-block records written later can be newer than
   the checkpoint after a lost write. Restore both from the checkpoint on restart.
@@ -113,3 +119,6 @@ provably robust.
 - 2026-11-05: seeded fuzz driver now emits skewed-small little-endian word inputs for half
   the iterations, so Smith values, bools, `eos` loops, and slices vary in normal
   `zig build test` runs (they were almost always the minimum). Full suite green.
+- 2026-11-05: L1 tx-loss faults (mempool evictions, reorgs that lose orphaned txs) in the
+  swarm; 3000 seeds green. Found: a fresh txmgr adopts `pending` nonces and cannot
+  recover an evicted one (noted for the batcher lane).

@@ -54,12 +54,21 @@ pub const Config = struct {
     /// Run the batcher lane's real service (JSON-RPC against model state) instead of
     /// the model batcher's submissions.
     real_batcher: bool = false,
+    /// Random pending L1 transactions evicted per minute (fault phase). The real
+    /// batcher's txmgr starts from the `pending` nonce after a restart and so cannot
+    /// recover an evicted tx it never tracked (lane notes); the swarm keeps evictions
+    /// and real-batcher crashes apart until that is fixed.
+    mempool_evictions_per_minute: u32 = 0,
+    /// Chance an orphaned transaction is lost instead of re-injected on an L1 reorg.
+    /// The real batcher's txmgr cannot recover such a nonce gap yet (lane notes), so the
+    /// swarm enables this only for the model batcher.
+    reorg_tx_loss_ppm: u32 = 0,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
     pub fn random(prng: *Prng) Config {
         const latency_ns_min = prng.range(1, 50) * std.time.ns_per_ms;
-        const config: Config = .{
+        var config: Config = .{
             .verifier_count = @intCast(prng.range(1, verifier_count_max)),
             .network = .{
                 .latency_ns_min = latency_ns_min,
@@ -77,6 +86,12 @@ pub const Config = struct {
             .spam_per_minute = @intCast(swarm_level(prng, 6)),
             .real_batcher = prng.chance(1, 2),
         };
+        const evictions_per_minute: u32 = @intCast(swarm_level(prng, 6));
+        if (!config.real_batcher or config.crashes_per_minute == 0) {
+            config.mempool_evictions_per_minute = evictions_per_minute;
+        }
+        const reorg_tx_loss_ppm: u32 = @intCast(swarm_level(prng, 500_000));
+        if (!config.real_batcher) config.reorg_tx_loss_ppm = reorg_tx_loss_ppm;
         config.validate();
         return config;
     }
@@ -127,6 +142,7 @@ pub const Report = struct {
     partitions: u64 = 0,
     asymmetric_partitions: u64 = 0,
     spam: u64 = 0,
+    evictions: u64 = 0,
     disk_faults: u64 = 0,
     l1_reorgs: u64 = 0,
     sequencer_head: u64 = 0,
@@ -353,12 +369,17 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.l1_reorgs_per_minute, steps_per_minute)) {
             const depth_max = @min(nodes.l1_reorg_depth_max, cluster.l1.head);
             if (depth_max > 0) {
-                cluster.l1.reorg(&cluster.env(nodes.node_l1), prng.range(1, depth_max));
+                const depth = prng.range(1, depth_max);
+                const loss_ppm = cluster.config.reorg_tx_loss_ppm;
+                cluster.l1.reorg(&cluster.env(nodes.node_l1), depth, prng, loss_ppm);
                 cluster.report.l1_reorgs += 1;
             }
         }
         if (prng.chance(cluster.config.spam_per_minute, steps_per_minute)) {
             cluster.inject_spam(prng);
+        }
+        if (prng.chance(cluster.config.mempool_evictions_per_minute, steps_per_minute)) {
+            cluster.report.evictions += @intFromBool(cluster.l1.evict(prng));
         }
         if (cluster.heal_ns) |heal_ns| {
             if (cluster.now_ns >= heal_ns) {
@@ -656,7 +677,7 @@ test "cluster: real batcher service drives the chain to liveness without faults"
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     const fault_end_ns = smith.valueRangeAtMost(u64, 0, 120) * ns_per_s;
     const latency_ns_min = smith.valueRangeAtMost(u64, 1, 100) * std.time.ns_per_ms;
-    const config: Config = .{
+    var config: Config = .{
         .verifier_count = smith.valueRangeAtMost(u8, 1, verifier_count_max),
         .network = .{
             .latency_ns_min = latency_ns_min,
@@ -676,7 +697,15 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .clock_skew_ns_max = smith.valueRangeAtMost(u64, 0, 60) * ns_per_s,
         .l1_reorgs_per_minute = smith.valueRangeAtMost(u32, 0, 10),
         .spam_per_minute = smith.valueRangeAtMost(u32, 0, 20),
+        .real_batcher = smith.value(bool),
     };
+    const evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
+    if (!config.real_batcher or config.crashes_per_minute == 0) {
+        config.mempool_evictions_per_minute = evictions_per_minute;
+    }
+    if (!config.real_batcher) {
+        config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
+    }
     var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
     defer cluster.deinit(std.testing.allocator);
     _ = try cluster.run();
