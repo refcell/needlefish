@@ -60,7 +60,7 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
 
         /// Element for a compile-time known integer (reduced modulo p).
         pub fn from_int_comptime(comptime value: comptime_int) Self {
-            const reduced: Int = @intCast(@mod(value, modulus));
+            const reduced: Int = @intCast(@mod(value, @as(comptime_int, modulus)));
             const mont: Int = @intCast((@as(Wide, reduced) << bits) % modulus);
             return .{ .limbs_value = comptime int_to_limbs(mont) };
         }
