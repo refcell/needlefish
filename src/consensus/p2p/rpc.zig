@@ -26,7 +26,7 @@ const Service = service_module.Service;
 const Call = rpc.Call;
 const HandlerError = rpc.HandlerError;
 
-pub const methods = [_]rpc.Method(*Service){
+const handlers = [_]rpc.Method(*Service){
     .{ .name = "opp2p_self", .handler = self_info },
     .{ .name = "opp2p_peerCount", .handler = peer_count },
     .{ .name = "opp2p_peers", .handler = peers },
@@ -46,6 +46,32 @@ pub const methods = [_]rpc.Method(*Service){
     .{ .name = "opp2p_connectPeer", .handler = connect_peer },
     .{ .name = "opp2p_disconnectPeer", .handler = disconnect_peer },
 };
+
+/// Every handler wrapped to count its calls in `Service.stats.rpc_calls` (base/base
+/// `rpc_calls{method}`).
+pub const methods = counted: {
+    var wrapped: [handlers.len]rpc.Method(*Service) = undefined;
+    for (handlers, &wrapped, 0..) |method, *out, index| out.* = .{
+        .name = method.name,
+        .handler = Counted(index, method.handler).handle,
+    };
+    break :counted wrapped;
+};
+
+pub const method_count = handlers.len;
+
+fn Counted(
+    comptime index: usize,
+    comptime handler: *const fn (*Service, *Call) HandlerError!void,
+) type {
+    return struct {
+        fn handle(service: *Service, call: *Call) HandlerError!void {
+            comptime assert(index < service_module.rpc_methods_max);
+            service.stats.rpc_calls[index] += 1;
+            return handler(service, call);
+        }
+    };
+}
 
 pub const Router = rpc.Router(*Service, &methods);
 

@@ -18,6 +18,7 @@ const service_module = @import("service.zig");
 const router_module = @import("gossip/router.zig");
 const validity = @import("gossip/validity.zig");
 const observations = @import("observations.zig");
+const rpc = @import("rpc.zig");
 
 const Service = service_module.Service;
 const Counter = metrics.Counter;
@@ -60,6 +61,15 @@ const discovery_drop_labels = [discovery_drops.len][1]metrics.Label{
     .{.{ .name = "reason", .value = discovery_drops[1] }},
 };
 
+const rpc_method_labels = labels: {
+    var labels: [rpc.method_count][1]metrics.Label = undefined;
+    for (rpc.methods, &labels) |method, *label| label.* = .{.{
+        .name = "method",
+        .value = method.name,
+    }};
+    break :labels labels;
+};
+
 const gossip_events = [_][:0]const u8{
     "message", "subscribed", "unsubscribed", "slow_peer", "not_supported",
 };
@@ -100,6 +110,7 @@ pub const Metrics = struct {
     discovery_event: [discovery_events.len]Gauge = @splat(.{}),
     discovery_dropped: [discovery_drops.len]Gauge = @splat(.{}),
     find_node_request: Gauge = .{},
+    rpc_calls: [rpc.method_count]Gauge = @splat(.{}),
     banned_peers: Gauge = .{},
     dial_peer: Gauge = .{},
     dial_peer_error: [dial_errors.len]Gauge = @splat(.{}),
@@ -124,7 +135,7 @@ pub const Metrics = struct {
     pub const entries_count = 10 + discovery_events.len + discovery_drops.len +
         4 * versions.len + connection_types.len + reasons.len + dial_errors.len +
         inbound_errors.len + 2 + gossip_events.len + retirable_versions +
-        versions.len * directions.len;
+        versions.len * directions.len + rpc.method_count;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -169,6 +180,8 @@ pub const Metrics = struct {
         }
         try self.register_validation(registry);
         try self.register_topics(registry);
+        try register_typed(registry, "base_node_rpc_calls", "Calls made to the Gossip RPC " ++
+            "module", &self.rpc_calls, &rpc_method_labels);
         try registry.register(.{
             .name = "base_node_peer_scores",
             .help = "Observations of peer scores in the gossipsub mesh",
@@ -334,6 +347,9 @@ pub const Metrics = struct {
         store(&self.p2p_bytes_sent, transport.bytes_sent);
         copy_histogram(&self.peer_scores, &service.stats.peer_scores);
         self.update_topics(service);
+        for (&self.rpc_calls, service.stats.rpc_calls[0..rpc.method_count]) |*gauge, count| {
+            gauge.set(@intCast(count));
+        }
         copy_histogram(&self.connection_duration, &service.stats.connection_durations);
         assert(self.block_validation_total.get() >= self.block_validation_success.get());
     }

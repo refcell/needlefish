@@ -37,6 +37,8 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] `rpc_calls{method}`: every opp2p handler is wrapped at comptime to count calls in
+  `Service.stats.rpc_calls`; exported as `base_node_rpc_calls`.
 - [x] discovery metrics parity (base/base `disc/src/metrics.rs`, scope `base_node_disc`):
   renamed `base_node_discovery_peer_count` -> `base_node_disc_discovery_peer_count`; added
   `discovery_event{type}`, `discovery_dropped{reason}`, `find_node_request`. `enr_store_time` is
@@ -320,3 +322,4 @@ behind a small interface and switch later.
 - 2026-11-05: discovery DSTs (loss, 16-node swarm); discv5 handshake/retry/rebootstrap fixes.
 - 2026-11-05: secp256k1 adapter on common.crypto (handshake 770 -> 633 us, EIP-778 re-sign vector).
 - 2026-11-05: discovery metrics under base/base's `base_node_disc` scope.
+- 2026-11-05: per-method admin RPC call metrics.

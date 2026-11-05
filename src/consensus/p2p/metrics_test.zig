@@ -36,7 +36,9 @@ test "p2p metrics: register, update, and render" {
     fixture.service.on_ping(0, 1000, 45 * std.time.ns_per_s);
     cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
 
-    var buffer: [16 * 1024]u8 = undefined;
+    _ = fixture.call("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"opp2p_peerCount\"}");
+    cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
+    var buffer: [32 * 1024]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     try registry.write_prometheus(&out);
     const text = out.buffered();
@@ -54,6 +56,8 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_disc_discovery_event{type=\"discovered\"} ");
     try expect_contains(text, "base_node_disc_discovery_dropped{reason=\"closed\"} 0\n");
     try expect_contains(text, "base_node_disc_find_node_request ");
+    try expect_contains(text, "base_node_rpc_calls{method=\"opp2p_peerCount\"} 1\n");
+    try expect_contains(text, "base_node_rpc_calls{method=\"opp2p_self\"} 0\n");
     try expect_contains(text, "base_node_gossip_event{type=\"slow_peer\"} 0\n");
     try expect_contains(text, "base_node_block_topic_retirements_total{version=\"v3\"} 0\n");
     try expect_contains(

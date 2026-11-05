@@ -92,7 +92,12 @@ pub const InboundError = enum(u8) {
     invalid_ip_address,
 };
 
+/// Upper bound on admin RPC methods counted in `Stats.rpc_calls`.
+pub const rpc_methods_max = 24;
+
 pub const Stats = struct {
+    /// Admin RPC calls per method, indexed like `rpc.methods`.
+    rpc_calls: [rpc_methods_max]u64 = @splat(0),
     dials: u64 = 0,
     dials_refused: u64 = 0,
     inbound_refused: u64 = 0,
