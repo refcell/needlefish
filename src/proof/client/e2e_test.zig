@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
+const Prng = @import("../../testing/prng.zig").Prng;
 
 const preimage = @import("../preimage/root.zig");
 const host = @import("../host/root.zig");
@@ -55,7 +56,9 @@ const SystemConfig = protocol.SystemConfig;
 const spec = &chainspec.ChainSpec.presets.base_devnet;
 
 /// L2 blocks derived and proven.
-const l2_blocks = 3;
+/// L2 blocks a scenario builds by default, and at most.
+const blocks_default = 3;
+const blocks_max = 6;
 /// L1 blocks at most: genesis (epoch 0), an empty epoch-1 block (only when a scenario
 /// changes epoch), and the block carrying the batches (the L1 head).
 const l1_blocks_max = 3;
@@ -123,8 +126,11 @@ const List = []const []const u8;
 
 /// The shape of one end-to-end run.
 const Scenario = struct {
-    /// Blocks `1..=epoch_zero_blocks` take L1 genesis as origin, later blocks L1 block 1.
-    epoch_zero_blocks: u32 = l2_blocks,
+    /// L2 blocks built on top of genesis, `1..=blocks_max`.
+    blocks: u32 = blocks_default,
+    /// Blocks `1..=epoch_zero_blocks` take L1 genesis as origin, later blocks L1 block 1
+    /// (clamped to `blocks`).
+    epoch_zero_blocks: u32 = blocks_max,
     batch: enum { singular, span } = .singular,
     data: enum { calldata, blob } = .calldata,
     /// The last block's batch carries a transaction execution rejects, so the node builds
@@ -146,9 +152,13 @@ const Scenario = struct {
     interval: u64 = 1,
 
     fn epoch_change(scenario: Scenario) bool {
+        return scenario.epoch_zero() < scenario.blocks;
+    }
+
+    fn epoch_zero(scenario: Scenario) u32 {
+        assert(scenario.blocks >= 1 and scenario.blocks <= blocks_max);
         assert(scenario.epoch_zero_blocks >= 1);
-        assert(scenario.epoch_zero_blocks <= l2_blocks);
-        return scenario.epoch_zero_blocks < l2_blocks;
+        return @min(scenario.epoch_zero_blocks, scenario.blocks);
     }
 };
 
@@ -309,7 +319,7 @@ const ChainView = struct {
     rollup: *const protocol.RollupConfig,
     l1: [l1_blocks_max]L1Header = undefined,
     l1_count: u32 = 0,
-    configs: [l2_blocks + 1]struct { hash: B256, config: SystemConfig } = undefined,
+    configs: [blocks_max + 1]struct { hash: B256, config: SystemConfig } = undefined,
     config_count: u32 = 0,
 
     pub fn l1_header_by_hash(view: *ChainView, hash: B256) ProviderError!L1Header {
@@ -358,7 +368,7 @@ const Fixture = struct {
     view: ChainView,
     l1_hashes: [l1_blocks_max]Hash,
     l1_count: u32,
-    blocks: [l2_blocks + 1]Built,
+    blocks: [blocks_max + 1]Built,
     agreed: Hash,
     expected: Hash,
     rollup_json: [8192]u8,
@@ -423,7 +433,7 @@ const Fixture = struct {
     /// is as old as the first of them.
     fn add_epoch_block(self: *Fixture) !void {
         assert(self.l1_count == 1);
-        const first = self.scenario.epoch_zero_blocks + 1;
+        const first = self.scenario.epoch_zero() + 1;
         var header = l1_genesis_header();
         header.parent_hash = .{ .bytes = self.l1_hashes[0] };
         header.number = 1;
@@ -439,13 +449,13 @@ const Fixture = struct {
     /// The L1 origin of L2 block `number`.
     fn epoch_of(self: *const Fixture, number: usize) protocol.BlockId {
         assert(number >= 1);
-        if (number <= self.scenario.epoch_zero_blocks) return self.rollup.genesis.l1;
+        if (number <= self.scenario.epoch_zero()) return self.rollup.genesis.l1;
         assert(self.l1_count >= 2);
         return .{ .number = 1, .hash = .{ .bytes = self.l1_hashes[1] } };
     }
 
     fn sequence_number_of(self: *const Fixture, number: usize) u64 {
-        const zero = self.scenario.epoch_zero_blocks;
+        const zero = self.scenario.epoch_zero();
         return if (number <= zero) number else number - zero - 1;
     }
 
@@ -518,7 +528,7 @@ const Fixture = struct {
             .user = &.{},
         };
         _ = try self.source.add_block(.l2, genesis, &.{});
-        for (1..l2_blocks + 1) |number| try self.build_one(number);
+        for (1..self.scenario.blocks + 1) |number| try self.build_one(number);
     }
 
     /// The batched user transactions of block `number`: two transfers, plus (when the
@@ -526,7 +536,7 @@ const Fixture = struct {
     /// below the base fee first (rejected before reading state, as revm's environment
     /// check does), or a nonce gap after the transfers.
     fn user_transactions(self: *Fixture, number: usize) !List {
-        const invalid = if (number == l2_blocks) self.scenario.invalid else .none;
+        const invalid = if (number == self.scenario.blocks) self.scenario.invalid else .none;
         const arena = self.source.arena.allocator();
         const user = try arena.alloc([]const u8, if (invalid == .none) 2 else 3);
         const first: usize = if (invalid == .fee_cap_first) 1 else 0;
@@ -562,7 +572,7 @@ const Fixture = struct {
         }
         @memcpy(all[deposits..], user[0..executed]);
         var engine_attributes = attributes.engine();
-        if (self.scenario.invalid == .nonce_gap_last and number == l2_blocks) {
+        if (self.scenario.invalid == .nonce_gap_last and number == self.scenario.blocks) {
             try self.add_attempted_witness(parent.hash, engine_attributes, user);
         }
         engine_attributes.transactions = all;
@@ -588,7 +598,7 @@ const Fixture = struct {
         user: List,
     ) !void {
         assert(number >= 1);
-        assert(number <= l2_blocks);
+        assert(number <= self.scenario.blocks);
         const parent = self.blocks[number - 1];
         self.blocks[number] = .{
             .hash = hash,
@@ -685,7 +695,7 @@ const Fixture = struct {
 
     /// Records each block's execution witness for the host's payload-witness hint.
     fn add_witnesses(self: *Fixture) !void {
-        for (self.blocks[1..]) |block| {
+        for (self.blocks[1 .. self.scenario.blocks + 1]) |block| {
             try node_witness.execution_witness(&self.node.chain, &self.generator, block.hash);
             const parent = block.info.block_info.parent_hash.bytes;
             try self.source.witnesses.put(testing.allocator, parent, try self.witness_items());
@@ -720,7 +730,7 @@ const Fixture = struct {
             .batch_bytes_max = 1 << 12,
         }, @splat(0x5a));
         defer manager.deinit(allocator);
-        for (self.blocks[1..]) |block| {
+        for (self.blocks[1 .. self.scenario.blocks + 1]) |block| {
             const item: batcher_source.L2Block = .{
                 .number = block.info.block_info.number,
                 .hash = block.info.block_info.hash,
@@ -746,8 +756,9 @@ const Fixture = struct {
     fn span_payloads(self: *Fixture, out: *[8][]const u8) !usize {
         const allocator = testing.allocator;
         const arena = self.source.arena.allocator();
-        var singles: [l2_blocks]protocol.batch.SingleBatch = undefined;
-        for (&singles, self.blocks[1..]) |*single, block| single.* = .{
+        var singles_buffer: [blocks_max]protocol.batch.SingleBatch = undefined;
+        const singles = singles_buffer[0..self.scenario.blocks];
+        for (singles, self.blocks[1 .. singles.len + 1]) |*single, block| single.* = .{
             .parent_hash = block.info.block_info.parent_hash,
             .epoch_num = block.info.l1_origin.number,
             .epoch_hash = block.info.l1_origin.hash,
@@ -756,7 +767,7 @@ const Fixture = struct {
         };
         const span = try protocol.span_batch.SpanBatch.from_singular_batches(
             arena,
-            &singles,
+            singles,
             self.blocks[1].info.sequence_number,
             self.rollup.genesis.l2_time,
             self.rollup.l2_chain_id,
@@ -874,7 +885,7 @@ const Fixture = struct {
     }
 
     fn put_boot(self: *Fixture, claim_matches: bool) !void {
-        try self.put_boot_claim(l2_blocks, claim_matches);
+        try self.put_boot_claim(self.scenario.blocks, claim_matches);
     }
 
     /// Boot values claiming the node's output root at `number` (the trace extension
@@ -884,7 +895,7 @@ const Fixture = struct {
     }
 
     fn put_boot_claim(self: *Fixture, number: u64, claim_matches: bool) !void {
-        assert(number <= l2_blocks);
+        assert(number <= self.scenario.blocks);
         self.agreed, const encoded = try self.output_root_of(self.blocks[0].hash);
         try testing.expectEqual(self.agreed, try self.store.put_keccak(&encoded));
         self.expected, _ = try self.output_root_of(self.blocks[@intCast(number)].hash);
@@ -954,11 +965,11 @@ fn prove(scenario: Scenario) !*Fixture {
     errdefer self.destroy();
     try self.put_boot(true);
     const outcome, const holds = try self.run();
-    try testing.expectEqual(@as(u64, l2_blocks), outcome.block_number);
+    try testing.expectEqual(@as(u64, self.scenario.blocks), outcome.block_number);
     try testing.expect(!outcome.exhausted);
     try testing.expectEqual(self.expected, outcome.output_root);
     try testing.expect(holds);
-    try testing.expect(self.source.witness_requests >= l2_blocks);
+    try testing.expect(self.source.witness_requests >= self.scenario.blocks);
     return self;
 }
 
@@ -999,7 +1010,7 @@ test "e2e: a wrong claimed output root fails the claim" {
     defer self.destroy();
     try self.put_boot(false);
     const outcome, const holds = try self.run();
-    try testing.expectEqual(@as(u64, l2_blocks), outcome.block_number);
+    try testing.expectEqual(@as(u64, self.scenario.blocks), outcome.block_number);
     try testing.expectEqual(self.expected, outcome.output_root);
     try testing.expect(!holds);
 }
@@ -1011,7 +1022,7 @@ test "e2e: blocks across an L1 epoch change, batched in a later L1 block" {
     // Block 1 is in epoch 0; blocks 2 and 3 in epoch 1 with sequence numbers 0 and 1.
     const expected_epochs = [_]u64{ 0, 0, 1, 1 };
     const expected_sequence = [_]u64{ 0, 1, 0, 1 };
-    for (self.blocks, expected_epochs, expected_sequence) |block, epoch, sequence| {
+    for (self.blocks[0..4], expected_epochs, expected_sequence) |block, epoch, sequence| {
         try testing.expectEqual(epoch, block.info.l1_origin.number);
         try testing.expectEqual(sequence, block.info.sequence_number);
     }
@@ -1027,7 +1038,7 @@ test "e2e: a span batch across an L1 epoch change" {
     const self = try prove(.{ .batch = .span, .epoch_zero_blocks = 2 });
     defer self.destroy();
     try testing.expectEqual(@as(u32, 3), self.l1_count);
-    try testing.expectEqual(@as(u64, 1), self.blocks[l2_blocks].info.l1_origin.number);
+    try testing.expectEqual(@as(u64, 1), self.blocks[self.scenario.blocks].info.l1_origin.number);
 }
 
 test "e2e: batches framed in an EIP-4844 blob through the host" {
@@ -1039,18 +1050,18 @@ test "e2e: batches framed in an EIP-4844 blob through the host" {
 test "e2e: Holocene replaces a block that fails to execute with its deposits only" {
     const self = try prove(.{ .invalid = .fee_cap_first });
     defer self.destroy();
-    const last = self.blocks[l2_blocks];
+    const last = self.blocks[self.scenario.blocks];
     // The batch carried three user transactions; the proven block has only the deposit.
     try testing.expectEqual(@as(usize, 3), last.user.len);
     try testing.expectEqual(@as(usize, 1), last.all.len);
     const node_header = self.node.chain.header(last.hash).?;
-    try testing.expectEqual(@as(u64, l2_blocks), node_header.number);
+    try testing.expectEqual(@as(u64, self.scenario.blocks), node_header.number);
 }
 
 test "e2e: a deposit-only retry after valid transfers uses the attempted payload's witness" {
     const self = try prove(.{ .invalid = .nonce_gap_last });
     defer self.destroy();
-    const last = self.blocks[l2_blocks];
+    const last = self.blocks[self.scenario.blocks];
     // Two transfers, then the nonce gap; the proven block has only the deposit.
     try testing.expectEqual(@as(usize, 3), last.user.len);
     try testing.expectEqual(@as(usize, 1), last.all.len);
@@ -1067,10 +1078,12 @@ test "e2e: without the attempted payload's witness the retry block cannot be pro
     try testing.expectEqual(@as(u32, 0), self.source.attempted_requests);
 }
 
-/// The output roots of node blocks `1..=l2_blocks`.
-fn node_roots(self: *Fixture) ![l2_blocks]Hash {
-    var roots: [l2_blocks]Hash = undefined;
-    for (&roots, self.blocks[1..]) |*root, block| root.*, _ = try self.output_root_of(block.hash);
+/// The output roots of node blocks `1..=blocks`, in `buffer`.
+fn node_roots(self: *Fixture, buffer: *[blocks_max]Hash) ![]const Hash {
+    const roots = buffer[0..self.scenario.blocks];
+    for (roots, self.blocks[1 .. roots.len + 1]) |*root, block| {
+        root.*, _ = try self.output_root_of(block.hash);
+    }
     return roots;
 }
 
@@ -1078,9 +1091,10 @@ test "e2e: intermediate output roots at every block and at an interval of the ra
     for ([_]u64{ 1, 3 }) |interval| {
         const self = try prove(.{ .interval = interval });
         defer self.destroy();
-        const expected = try node_roots(self);
+        var buffer: [blocks_max]Hash = undefined;
+        const expected = try node_roots(self, &buffer);
         const roots = try self.sampler.finish();
-        try testing.expectEqual(l2_blocks / interval, roots.len);
+        try testing.expectEqual(self.scenario.blocks / interval, roots.len);
         for (roots, 1..) |root, index| {
             try testing.expectEqual(expected[index * interval - 1], root);
         }
@@ -1095,7 +1109,7 @@ test "e2e: an interval that does not divide the range has no intermediate roots"
     // The claim still holds; only the sampled roots are unavailable (base/base's provers
     // refuse such a range).
     try testing.expectError(error.PartialInterval, self.sampler.finish());
-    try testing.expectEqual(@as(u64, l2_blocks), self.sampler.blocks);
+    try testing.expectEqual(@as(u64, self.scenario.blocks), self.sampler.blocks);
     try testing.expectEqual(@as(u32, 1), self.sampler.count);
 }
 
@@ -1107,4 +1121,62 @@ test "e2e: a claim at the agreed block derives nothing and samples no roots" {
     try testing.expectEqual(@as(u64, 0), outcome.block_number);
     try testing.expect(holds);
     try testing.expectError(error.EmptyRange, self.sampler.finish());
+}
+
+/// A random scenario: block count, epoch split, batch kind, data kind, an invalid
+/// transaction in the last block, and the intermediate root interval.
+fn random_scenario(prng: *Prng) Scenario {
+    const blocks: u32 = @intCast(prng.range(1, blocks_max));
+    const invalid_kinds = [_]@FieldType(Scenario, "invalid"){
+        .none, .none, .fee_cap_first, .nonce_gap_last,
+    };
+    const scenario: Scenario = .{
+        .blocks = blocks,
+        .epoch_zero_blocks = @intCast(prng.range(1, blocks)),
+        .batch = if (prng.chance(1, 2)) .span else .singular,
+        // Blob batches compute real KZG commitments: keep them rare in Debug builds.
+        .data = if (prng.chance(1, 5)) .blob else .calldata,
+        .invalid = invalid_kinds[@intCast(prng.below(invalid_kinds.len))],
+        .interval = prng.range(1, blocks),
+    };
+    assert(scenario.epoch_zero() <= scenario.blocks);
+    assert(scenario.interval <= scenario.blocks);
+    return scenario;
+}
+
+/// Proves one random scenario with a right or wrong claim and checks the verdict, the
+/// output root, and the sampled intermediate roots against the node.
+fn prove_random(seed: u64) !void {
+    var prng: Prng = .init(seed);
+    const scenario = random_scenario(&prng);
+    const claim_matches = prng.chance(3, 4);
+    const self = Fixture.create(scenario) catch |err| {
+        std.debug.print("e2e fuzz: seed {d} scenario {any}: {t}\n", .{ seed, scenario, err });
+        return err;
+    };
+    defer self.destroy();
+    try self.put_boot(claim_matches);
+    const outcome, const holds = self.run() catch |err| {
+        std.debug.print("e2e fuzz: seed {d} scenario {any}: {t}\n", .{ seed, scenario, err });
+        return err;
+    };
+    try testing.expectEqual(@as(u64, scenario.blocks), outcome.block_number);
+    try testing.expectEqual(self.expected, outcome.output_root);
+    try testing.expectEqual(claim_matches, holds);
+    var buffer: [blocks_max]Hash = undefined;
+    const expected = try node_roots(self, &buffer);
+    if (scenario.blocks % scenario.interval != 0) {
+        try testing.expectError(error.PartialInterval, self.sampler.finish());
+        return;
+    }
+    const roots = try self.sampler.finish();
+    try testing.expectEqual(scenario.blocks / scenario.interval, roots.len);
+    for (roots, 1..) |root, index| {
+        try testing.expectEqual(expected[index * scenario.interval - 1], root);
+    }
+}
+
+test "e2e: seeded random scenarios prove against the node" {
+    const seeds: u64 = 12;
+    for (1..seeds + 1) |seed| try prove_random(seed);
 }

@@ -68,9 +68,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
   holds exactly the preimages the client read; `native.run(.., witness)`; `proof run
   --out` writes it; e2e replays the witness alone with hints ignored.
-- [ ] `proof/e2e-fuzz`: seeded random e2e scenarios (block counts, epoch splits, batch
-  kinds, transfers, deposit-only retries) proving each against the node; a failing seed
-  is a bug report.
+- [x] `proof/e2e-fuzz`: seeded random e2e scenarios (1..6 blocks, epoch split, batch and
+  data kind, invalid last-block tx, interval, right or wrong claim) proven against the
+  node, with intermediate roots checked; 12 seeds in `zig build test`.
 - [ ] `proof/prover-service`: port `prover-service` + `worker` (proof request JSON-RPC
   contract, job lifecycle) with the native host as the in-process prover backend.
 
@@ -161,6 +161,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/e2e-fuzz`: e2e block count is per scenario; 12 random seeds pass.
 - 2026-11-05: `proof/witness`: recorded witness replays alone (e2e + live devnet).
 - 2026-11-05: `proof/e2e-3` landed: intermediate output roots sampled at boot key 9 (e2e:
   every block, the full range, a non-dividing interval, the trace extension); boot rejects
