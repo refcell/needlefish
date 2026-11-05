@@ -17,6 +17,7 @@ pub const fuzz_targets_sources = @import("fuzz_targets_sources.zig");
 pub const fuzz_targets_proof = @import("fuzz_targets_proof.zig");
 pub const fuzz_targets_rpc = @import("fuzz_targets_rpc.zig");
 pub const fuzz_targets_abi = @import("fuzz_targets_abi.zig");
+pub const fuzz_targets_eip8130 = @import("fuzz_targets_eip8130.zig");
 
 test {
     std.testing.refAllDecls(@This());

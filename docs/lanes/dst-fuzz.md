@@ -210,3 +210,7 @@ provably robust.
   random tuples over every `native_abi.Kind` encoded by a reference ABI encoder; round
   trip, trailing bytes, truncation (overrun or identical), one invalid value fails the
   type check, arbitrary calldata stays in bounds. 3/3 mutants caught.
+- 2026-11-05: EIP-8130 request JSON fuzz (`fuzz_targets_eip8130.zig`): random nested
+  calls and account changes written by `rpc_types/eip8130` parse back to identical RLP
+  lists (field parsers and `parse_transaction_request`); dropping any required member
+  of a nested entry fails with `InvalidField`. 2/2 mutants caught.
