@@ -546,6 +546,82 @@ pub fn batch_extension(head: u64, batch: codec.Blocks) ?struct { first: u64, las
     return .{ .first = head + 1, .last = last };
 }
 
+pub const batch_buffer_capacity = 128;
+
+/// Batches seen on L1, kept until they can extend the head: the pre-Holocene batch queue
+/// keeps a batch that starts beyond the next block (a "future" batch) instead of dropping
+/// it, so a channel that lands early (a byzantine replay of honest content, a batcher
+/// repost) applies once the gap before it fills, even long after it left the
+/// channel-timeout window. The real driver derives this way; without it the model
+/// verifiers would lag a batcher that follows the real verifier's safe head.
+///
+/// Durable with the owner's L1 cursor: entries from L1 blocks at or after a rewound or
+/// restored cursor are dropped, since those blocks are read again. When full, the entry
+/// ending lowest goes first: it is the most likely to be behind every head already.
+pub const BatchBuffer = struct {
+    entries: [batch_buffer_capacity]Entry = undefined,
+    count: u32 = 0,
+
+    const Entry = struct { l1_number: u64, blocks: codec.Blocks };
+
+    fn same(a: *const codec.Blocks, b: *const codec.Blocks) bool {
+        if (a.number_first != b.number_first or a.count != b.count) return false;
+        return std.mem.eql(u64, a.payloads[0..a.count], b.payloads[0..b.count]);
+    }
+
+    fn last(blocks: *const codec.Blocks) u64 {
+        assert(blocks.count > 0);
+        return blocks.number_first + blocks.count - 1;
+    }
+
+    /// Records `blocks` seen in L1 block `l1_number`; a replayed copy keeps the earliest.
+    pub fn put(buffer: *BatchBuffer, l1_number: u64, blocks: *const codec.Blocks) void {
+        assert(buffer.count <= batch_buffer_capacity);
+        for (buffer.entries[0..buffer.count]) |*entry| {
+            if (!same(&entry.blocks, blocks)) continue;
+            entry.l1_number = @min(entry.l1_number, l1_number);
+            return;
+        }
+        if (buffer.count == batch_buffer_capacity) {
+            var lowest: usize = 0;
+            for (buffer.entries[0..buffer.count], 0..) |*entry, index| {
+                if (last(&entry.blocks) < last(&buffer.entries[lowest].blocks)) lowest = index;
+            }
+            buffer.remove(lowest);
+        }
+        buffer.entries[buffer.count] = .{ .l1_number = l1_number, .blocks = blocks.* };
+        buffer.count += 1;
+        assert(buffer.count <= batch_buffer_capacity);
+    }
+
+    fn remove(buffer: *BatchBuffer, index: usize) void {
+        assert(index < buffer.count);
+        buffer.count -= 1;
+        buffer.entries[index] = buffer.entries[buffer.count];
+    }
+
+    /// Drops entries from L1 blocks numbered `l1_number` or higher.
+    pub fn drop_from(buffer: *BatchBuffer, l1_number: u64) void {
+        var index: usize = 0;
+        while (index < buffer.count) {
+            if (buffer.entries[index].l1_number >= l1_number) {
+                buffer.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        for (buffer.entries[0..buffer.count]) |*entry| assert(entry.l1_number < l1_number);
+    }
+
+    /// The next entry that extends `head`, if any.
+    pub fn next(buffer: *const BatchBuffer, head: u64) ?*const codec.Blocks {
+        for (buffer.entries[0..buffer.count]) |*entry| {
+            if (batch_extension(head, entry.blocks) != null) return &entry.blocks;
+        }
+        return null;
+    }
+};
+
 /// Durable copies of processed L1 blocks, index = number, and derivation over the
 /// channel-timeout window ending at a block (see `codec.derive_window`).
 pub const L1Store = struct {
@@ -605,6 +681,8 @@ pub const Batcher = struct {
     confirmed_at: []u64,
     /// Highest L2 block included contiguously on L1.
     confirmed: u64 = 0,
+    /// Our batches seen on L1, so early channels count once the gap fills.
+    batches: BatchBuffer = .{},
     /// Highest L2 block submitted to L1.
     submitted: u64 = 0,
     progress_ns: u64 = 0,
@@ -692,16 +770,17 @@ pub const Batcher = struct {
         const accepted = batcher.follower.accept(env, node_batcher, block);
         if (accepted.rewind_to) |cursor| {
             batcher.confirmed = batcher.confirmed_at[cursor - 1];
+            batcher.batches.drop_from(cursor);
             batcher.progress_ns = env.now_ns;
         }
         if (!accepted.process) return;
         // Like op-batcher, track only our own transactions (the derive sender filter).
         const derived = batcher.store.derive(&batcher.decoder, env.tx_pool, &block, true);
-        for (derived.blocks[0..derived.count]) |blocks| {
-            if (batch_extension(batcher.confirmed, blocks)) |extension| {
-                batcher.confirmed = extension.last;
-                batcher.progress_ns = env.now_ns;
-            }
+        for (derived.blocks[0..derived.count]) |*blocks| batcher.batches.put(block.number, blocks);
+        for (0..batch_buffer_capacity) |_| {
+            const blocks = batcher.batches.next(batcher.confirmed) orelse break;
+            batcher.confirmed = batch_extension(batcher.confirmed, blocks.*).?.last;
+            batcher.progress_ns = env.now_ns;
         }
         batcher.confirmed_at[block.number] = batcher.confirmed;
     }
@@ -743,6 +822,8 @@ pub const Verifier = struct {
     decoder: codec.Decoder,
     /// Safe head after each processed L1 block (durable), for rewinds on L1 reorgs.
     safe_at: []u64,
+    /// Batches seen on L1 (durable with the L1 cursor), applied once they extend.
+    batches: BatchBuffer = .{},
     /// Last two durable checkpoints. A disk fault loses the latest write.
     checkpoint: Checkpoint = .{},
     checkpoint_previous: Checkpoint = .{},
@@ -815,6 +896,7 @@ pub const Verifier = struct {
                     // L1 reorg: safe blocks derived from orphaned L1 blocks are no longer
                     // safe. Unsafe blocks stay; re-derivation will confirm or replace them.
                     verifier.safe_head = verifier.safe_at[cursor - 1];
+                    verifier.batches.drop_from(cursor);
                     // After a restart the unsafe head may sit below what the per-block
                     // record says was derived. Those blocks are on disk (the chain is
                     // durable), so take them back rather than leave a derivation gap.
@@ -879,7 +961,14 @@ pub const Verifier = struct {
             verifier.sender_check,
         );
         verifier.invalid_batches += derived.invalid;
-        for (derived.blocks[0..derived.count]) |blocks| verifier.derive(blocks);
+        for (derived.blocks[0..derived.count]) |*blocks| {
+            verifier.batches.put(block.number, blocks);
+        }
+        // Each step raises the safe head, so the buffer runs dry within its capacity.
+        for (0..batch_buffer_capacity) |_| {
+            const blocks = verifier.batches.next(verifier.safe_head) orelse break;
+            verifier.derive(blocks.*);
+        }
     }
 
     fn derive(verifier: *Verifier, batch: codec.Blocks) void {
@@ -912,6 +1001,7 @@ pub const Verifier = struct {
         verifier.safe_head = checkpoint.safe_head;
         verifier.unsafe_head = checkpoint.safe_head;
         verifier.follower.reset(checkpoint.l1_cursor);
+        verifier.batches.drop_from(checkpoint.l1_cursor);
         verifier.follower.hashes[checkpoint.l1_cursor - 1] = checkpoint.l1_hash;
         verifier.safe_at[checkpoint.l1_cursor - 1] = checkpoint.safe_head;
         verifier.checkpoint = checkpoint;
@@ -992,4 +1082,28 @@ test "nodes: L1 evictions and lossy reorgs drop transactions" {
     try std.testing.expectEqual(@as(u8, 0), l1.blocks[1].batch_count);
     try std.testing.expectEqual(@as(u64, 0), l1.nonce_mined());
     try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
+}
+
+test "nodes: batch buffer keeps future batches until they extend the head" {
+    var buffer: BatchBuffer = .{};
+    var early: codec.Blocks = .{ .number_first = 9, .count = 4, .payloads = @splat(7) };
+    const gap: codec.Blocks = .{ .number_first = 5, .count = 4, .payloads = @splat(3) };
+    buffer.put(10, &early);
+    buffer.put(12, &early); // A replay of the window keeps the earliest inclusion.
+    try std.testing.expectEqual(@as(u32, 1), buffer.count);
+    try std.testing.expect(buffer.next(4) == null); // Starts beyond the next block.
+    buffer.put(11, &gap);
+    try std.testing.expectEqual(@as(u64, 5), buffer.next(4).?.number_first);
+    try std.testing.expectEqual(@as(u64, 9), buffer.next(8).?.number_first);
+    try std.testing.expect(buffer.next(12) == null); // Behind the head.
+    buffer.drop_from(11); // An L1 rewind to block 11 drops what block 11 brought.
+    try std.testing.expectEqual(@as(u32, 1), buffer.count);
+    try std.testing.expect(buffer.next(4) == null);
+    // Full: the entry ending lowest makes room.
+    for (0..batch_buffer_capacity) |index| {
+        early.number_first = 100 + index;
+        buffer.put(20, &early);
+    }
+    try std.testing.expectEqual(@as(u32, batch_buffer_capacity), buffer.count);
+    try std.testing.expect(buffer.next(8) == null); // Block 9's entry was evicted.
 }

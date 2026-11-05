@@ -8,12 +8,21 @@
 //!   user transaction exactly as the model sequencer does (`nodes.block_hash`), so a
 //!   correctly derived block has the sequencer's hash. Its chain and forkchoice labels
 //!   are durable: a crash of the consensus node keeps them, and the restarted driver
-//!   rebuilds its heads through startup discovery, as the binary does;
+//!   rebuilds its heads through startup discovery, as the binary does. A crash with a
+//!   disk fault models an EL that did not fsync: the last label update and the newest
+//!   blocks above the finalized head are lost (`SimEngine.lose_unflushed`);
 //! - `EngineClient` polls the engine with seeded random `NotAvailable` latency.
+//!
+//! Unsafe gossip: the sequencer's `unsafe_block` messages reach the driver as full
+//! execution payloads (`on_unsafe_block`). The payload is the block the sequencer built:
+//! the L1 info deposit from the real attributes builder for the sequencer's L1 origin,
+//! then the payload transaction. Derived attributes then consolidate against these
+//! blocks instead of rebuilding them. When its unsafe head lags the gossip it has seen,
+//! the node asks the sequencer for the missing blocks (`sync_request`).
 //!
 //! The real verifier shares the first model verifier's fate (crashes, partitions): it is
 //! that node's consensus client. The model verifier keeps running beside it for the
-//! model invariants and the real batcher's rollup RPC.
+//! model invariants (and the real batcher's rollup RPC when the real verifier is off).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,6 +30,8 @@ const assert = std.debug.assert;
 const protocol = @import("../../consensus/protocol/root.zig");
 const driver_module = @import("../../consensus/service/driver.zig");
 const task = @import("../../consensus/engine/task.zig");
+const InsertEnvelope = @import("../../consensus/engine/insert_task.zig").Envelope;
+const attributes_module = @import("../../consensus/derive/attributes.zig");
 const sync_start = @import("../../consensus/engine/sync_start.zig");
 const SafeDB = @import("../../consensus/safedb/root.zig").SafeDB;
 const derive = @import("../../consensus/derive/root.zig");
@@ -46,6 +57,12 @@ pub const tx_bytes_max = 512;
 const safe_db_capacity = 64;
 /// Engine polls answered with `NotAvailable`, in percent.
 const not_available_percent = 10;
+/// Most blocks an engine disk fault loses (above the finalized head).
+pub const engine_blocks_lost_max = 16;
+/// Scratch for building one gossiped payload's attributes (the L1 info deposit).
+const gossip_scratch_bytes = 16 * 1024;
+/// Gap re-request interval, as the model verifier's (`nodes.Verifier.sync_timeout_ns`).
+const sync_timeout_ns = nodes.Verifier.sync_timeout_ns;
 
 /// What the real verifier sees this step. Pointers are rebound every step because the
 /// cluster lives by value.
@@ -156,6 +173,8 @@ const Block = struct {
     fee_recipient: primitives.Address = .zero,
     gas_limit: u64 = codec.gas_limit,
     parent_beacon_block_root: ?B256 = null,
+    /// Inserted from gossip (not built by this engine) and not yet consolidated.
+    gossiped: bool = false,
     tx_count: u8 = 0,
     tx_lengths: [block_txs_max]u16 = @splat(0),
     tx_bytes: [block_txs_max][tx_bytes_max]u8 = undefined,
@@ -203,6 +222,13 @@ pub const SimEngine = struct {
     count: u64 = 1,
     safe: u64 = 0,
     finalized: u64 = 0,
+    /// Labels before the last label update: what survives a disk fault.
+    safe_previous: u64 = 0,
+    finalized_previous: u64 = 0,
+    /// Gossiped blocks that became safe without a rebuild (consolidation).
+    consolidated_gossip: u64 = 0,
+    /// Disk faults applied (`lose_unflushed`).
+    losses: u64 = 0,
     /// Lowest block number (re)written since the checker last looked.
     written_low: u64 = std.math.maxInt(u64),
     pending: Block = undefined,
@@ -302,6 +328,11 @@ pub const SimEngine = struct {
         const finalized = engine.find(state.finalized_block_hash) orelse
             return error.InvalidForkchoiceState;
         if (finalized > safe or safe > head_number) return error.InvalidForkchoiceState;
+        if (safe > engine.safe) engine.count_consolidated(engine.safe, safe);
+        if (safe != engine.safe or finalized != engine.finalized) {
+            engine.safe_previous = engine.safe;
+            engine.finalized_previous = engine.finalized;
+        }
         engine.count = head_number + 1;
         engine.safe = safe;
         engine.finalized = finalized;
@@ -311,6 +342,36 @@ pub const SimEngine = struct {
             return .{ .payload_status = .{ .status = .invalid } };
         }
         return .{ .payload_status = .valid(head_hash), .payload_id = engine.pending_id };
+    }
+
+    /// Counts gossiped blocks in `(safe_old, safe_new]` that the safe label now covers:
+    /// the derived attributes matched them, so they were consolidated, not rebuilt.
+    fn count_consolidated(engine: *SimEngine, safe_old: u64, safe_new: u64) void {
+        assert(safe_old < safe_new);
+        assert(safe_new <= engine.head());
+        for (engine.blocks[safe_old + 1 .. safe_new + 1]) |*block| {
+            engine.consolidated_gossip += @intFromBool(block.gossiped);
+            block.gossiped = false;
+        }
+    }
+
+    /// Disk fault: the EL crashed without fsyncing its latest writes. The last label
+    /// update is lost, and so are up to `blocks_lost` of the newest blocks, never at or
+    /// below the durable finalized head. Startup discovery must recover from what is left.
+    pub fn lose_unflushed(engine: *SimEngine, blocks_lost: u64) void {
+        assert(blocks_lost <= engine_blocks_lost_max);
+        assert(engine.finalized_previous <= engine.safe_previous);
+        const finalized = engine.finalized_previous;
+        const head_new = @max(engine.head() -| blocks_lost, finalized);
+        assert(head_new <= engine.head());
+        engine.count = head_new + 1;
+        engine.finalized = finalized;
+        engine.safe = @min(engine.safe_previous, head_new);
+        engine.safe_previous = engine.safe;
+        engine.finalized_previous = engine.finalized;
+        engine.pending_id = null;
+        engine.losses += 1;
+        assert(engine.finalized <= engine.safe and engine.safe <= engine.head());
     }
 
     fn build(engine: *SimEngine, parent: u64, attributes: *const task.EngineAttributes) bool {
@@ -403,10 +464,15 @@ pub const SimEngine = struct {
             .parent_beacon_block_root = params.parent_beacon_block_root,
         };
         if (!block.store_transactions(payload.transactions)) return .{ .status = .invalid };
+        const built = engine.pending_id != null and
+            engine.pending.info.block_info.hash.eql(payload.block_hash);
+        block.gossiped = !built;
         engine.blocks[number] = block;
         engine.count = number + 1;
         engine.safe = @min(engine.safe, number - 1);
         engine.finalized = @min(engine.finalized, engine.safe);
+        engine.safe_previous = @min(engine.safe_previous, number - 1);
+        engine.finalized_previous = @min(engine.finalized_previous, engine.safe_previous);
         engine.written_low = @min(engine.written_low, number);
         assert(engine.blocks[number].info.block_info.hash.eql(payload.block_hash));
         return .valid(payload.block_hash);
@@ -422,6 +488,8 @@ pub const SimEngine = struct {
             .fee_recipient = block.fee_recipient,
             .parent_beacon_block_root = block.parent_beacon_block_root,
             .withdrawals = &.{},
+            // Canyon: empty withdrawals, so the header holds the empty trie root.
+            .withdrawals_root = primitives.empty_root_hash,
             .transactions = slices(block, &engine.read_slices),
         };
     }
@@ -482,6 +550,46 @@ pub const EngineClient = struct {
     }
 };
 
+/// The sequencer's view when it built a block: final L1 origins (never reorged, see
+/// `nodes.Sequencer.next_origin`) and the genesis system config the model never changes.
+const GossipChain = struct {
+    l1: *L1View,
+
+    pub fn l1_header_by_hash(chain: GossipChain, hash: B256) ProviderError!L1Header {
+        return chain.l1.l1_header_by_hash(hash);
+    }
+
+    pub fn l1_receipts_by_hash(
+        chain: GossipChain,
+        hash: B256,
+    ) ProviderError![]const protocol.log.Receipt {
+        return chain.l1.l1_receipts_by_hash(hash);
+    }
+
+    pub fn system_config_by_l2_hash(_: GossipChain, _: B256) ProviderError!SystemConfig {
+        return codec.rollup.genesis.system_config.?;
+    }
+};
+
+/// The sequencer's block `number` as an L2 block info (its hash, time, and L1 origin).
+fn sequencer_block_info(sequencer: *const nodes.Sequencer, number: u64) L2BlockInfo {
+    assert(number <= sequencer.head);
+    const chain = &sequencer.chain;
+    const origin = chain.origins[number];
+    const result: L2BlockInfo = .{
+        .block_info = .{
+            .hash = codec.word_hash(chain.hashes[number]),
+            .number = number,
+            .parent_hash = if (number == 0) .zero else codec.word_hash(chain.hashes[number - 1]),
+            .timestamp = codec.rollup.l2_block_timestamp(number),
+        },
+        .l1_origin = .{ .number = origin.number, .hash = codec.word_hash(origin.hash) },
+        .sequence_number = origin.sequence_number,
+    };
+    assert(result.block_info.number == number);
+    return result;
+}
+
 const Providers = struct {
     l1: *L1View,
     blobs: *L1View,
@@ -503,6 +611,13 @@ pub const RealVerifier = struct {
     restarts: u32 = 0,
     /// Blocks up to here passed the per-block derivation check.
     checked: u64 = 0,
+    /// Fixed scratch for the attributes builder of gossiped payloads (reset per payload).
+    gossip_scratch: []u8,
+    /// Highest gossiped block number seen this incarnation, and the last sync request.
+    sequencer_head_known: u64 = 0,
+    sync_ns: u64 = 0,
+    gossip_received: u64 = 0,
+    gossip_kept: u64 = 0,
 
     /// Heap-allocated: the driver keeps pointers to the rollup config and safe db.
     pub fn create(
@@ -512,6 +627,8 @@ pub const RealVerifier = struct {
     ) !*RealVerifier {
         const verifier = try allocator.create(RealVerifier);
         errdefer allocator.destroy(verifier);
+        const gossip_scratch = try allocator.alloc(u8, gossip_scratch_bytes);
+        errdefer allocator.free(gossip_scratch);
         verifier.* = .{
             .allocator = allocator,
             .rollup = codec.rollup,
@@ -519,6 +636,7 @@ pub const RealVerifier = struct {
             .client = undefined,
             .safe_db = undefined,
             .driver = undefined,
+            .gossip_scratch = gossip_scratch,
         };
         errdefer verifier.engine.deinit(allocator);
         verifier.client = .{ .engine = &verifier.engine, .prng = Prng.init(seed) };
@@ -531,6 +649,7 @@ pub const RealVerifier = struct {
         const allocator = verifier.allocator;
         verifier.stop();
         verifier.engine.deinit(allocator);
+        allocator.free(verifier.gossip_scratch);
         allocator.destroy(verifier);
     }
 
@@ -551,13 +670,89 @@ pub const RealVerifier = struct {
         verifier.safe_db.deinit(verifier.allocator);
     }
 
-    /// Crash-restart of the consensus node: all driver state is lost; the engine keeps
-    /// its chain and labels, and startup discovery rebuilds the heads from them.
-    pub fn restart(verifier: *RealVerifier) !void {
+    /// Crash-restart of the node: all driver state is lost; the engine keeps its chain
+    /// and labels, minus its unflushed writes on a disk fault (`blocks_lost` non-null),
+    /// and startup discovery rebuilds the heads from them.
+    pub fn restart(verifier: *RealVerifier, blocks_lost: ?u64) !void {
         verifier.stop();
+        if (blocks_lost) |count| verifier.engine.lose_unflushed(count);
         try verifier.start();
         verifier.restarts += 1;
+        verifier.sequencer_head_known = 0;
+        verifier.sync_ns = 0;
         assert(verifier.driver.phase == .starting);
+    }
+
+    /// The sequencer's gossip for block `number` arrived. Builds the execution payload the
+    /// sequencer built (L1 info deposit for its L1 origin, then the payload transaction)
+    /// and hands it to the driver as the real node does with gossiped payloads.
+    pub fn on_unsafe_block(
+        verifier: *RealVerifier,
+        sequencer: *const nodes.Sequencer,
+        view: View,
+        number: u64,
+        payload: u64,
+        hash: u64,
+    ) void {
+        assert(number > 0 and number <= sequencer.head);
+        verifier.gossip_received += 1;
+        verifier.sequencer_head_known = @max(verifier.sequencer_head_known, number);
+        if (verifier.driver.phase != .running) return;
+        if (number <= verifier.unsafe_number()) return; // Stale: skip the build work.
+        var fixed: std.heap.FixedBufferAllocator = .init(verifier.gossip_scratch);
+        var builder = attributes_module.AttributesBuilder.init(
+            fixed.allocator(),
+            &verifier.rollup,
+            &verifier.blob_schedule,
+        );
+        // The sequencer read L1 directly when it built the block.
+        var l1: L1View = .{ .l1 = view.l1, .pool = view.pool, .reachable = true };
+        const parent = sequencer_block_info(sequencer, number - 1);
+        const origin = sequencer_block_info(sequencer, number).l1_origin;
+        const chain: GossipChain = .{ .l1 = &l1 };
+        const attributes = builder.prepare_payload_attributes(chain, parent, origin) catch
+            unreachable; // Proof: origins are final canonical L1 blocks; scratch is ample.
+        assert(attributes.transactions.len == 1); // No deposits or upgrades in the model.
+        var tx_buffer: [codec.payload_tx_length_max]u8 = undefined;
+        const transactions = [2][]const u8{
+            attributes.transactions[0],
+            codec.payload_tx(payload, &tx_buffer),
+        };
+        const envelope: InsertEnvelope = .{
+            .payload = .{
+                .parent_hash = parent.block_info.hash,
+                .fee_recipient = attributes.suggested_fee_recipient,
+                .state_root = .zero,
+                .receipts_root = .zero,
+                .logs_bloom = .zero,
+                .prev_randao = attributes.prev_randao,
+                .block_number = number,
+                .gas_limit = attributes.gas_limit,
+                .gas_used = 0,
+                .timestamp = attributes.timestamp,
+                .extra_data = &.{},
+                .base_fee_per_gas = 7,
+                .block_hash = codec.word_hash(hash),
+                .transactions = &transactions,
+                .withdrawals = attributes.withdrawals,
+                .blob_gas_used = 0,
+                .excess_blob_gas = 0,
+            },
+            .parent_beacon_block_root = attributes.parent_beacon_block_root,
+        };
+        verifier.gossip_kept += @intFromBool(verifier.driver.insert_unsafe(&envelope));
+    }
+
+    /// The first block to request from the sequencer when the unsafe head lags the gossip
+    /// seen, at most once per `sync_timeout_ns`; null when nothing is missing.
+    pub fn sync_request(verifier: *RealVerifier, now_ns: u64) ?u64 {
+        if (verifier.driver.phase != .running) return null;
+        const unsafe = verifier.unsafe_number();
+        if (verifier.sequencer_head_known <= unsafe) return null;
+        if (now_ns < verifier.sync_ns + sync_timeout_ns) return null;
+        verifier.sync_ns = now_ns;
+        assert(unsafe + 1 <= verifier.sequencer_head_known);
+        return unsafe + 1;
     }
 
     pub fn tick(verifier: *RealVerifier, view: View) void {
@@ -589,15 +784,32 @@ pub const RealVerifier = struct {
         return head.block_info.number;
     }
 
-    /// Safety: the driver never fails critically; the safe head is a sequencer block; and
-    /// every engine block up to it carries exactly the sequencer's payload transaction and
-    /// L1 origin. Returns the violated invariant, or null.
+    /// The driver's unsafe head, or null during startup discovery.
+    pub fn unsafe_head(verifier: *const RealVerifier) ?L2BlockInfo {
+        if (verifier.driver.phase == .starting) return null;
+        return verifier.driver.sync_state().unsafe_head;
+    }
+
+    pub fn unsafe_number(verifier: *const RealVerifier) u64 {
+        const head = verifier.unsafe_head() orelse return 0;
+        return head.block_info.number;
+    }
+
+    /// Safety: the driver never fails critically; the safe and unsafe heads are sequencer
+    /// blocks with safe <= unsafe; and every engine block up to the safe head carries
+    /// exactly the sequencer's payload transaction and L1 origin. Returns the violated
+    /// invariant, or null.
     pub fn check(verifier: *RealVerifier, sequencer: *const nodes.Sequencer) ?[]const u8 {
         if (verifier.driver.stats.critical_errors != 0) return "real verifier critical error";
         const safe = (verifier.safe_head() orelse return null).block_info;
         if (safe.number > sequencer.head) return "real verifier safe > sequencer";
         const expected = codec.word_hash(sequencer.chain.hashes[safe.number]);
         if (!safe.hash.eql(expected)) return "real verifier safe head diverged";
+        const unsafe = verifier.unsafe_head().?.block_info;
+        if (unsafe.number < safe.number) return "real verifier safe > unsafe";
+        if (unsafe.number > sequencer.head) return "real verifier unsafe > sequencer";
+        const unsafe_expected = codec.word_hash(sequencer.chain.hashes[unsafe.number]);
+        if (!unsafe.hash.eql(unsafe_expected)) return "real verifier unsafe head diverged";
         const engine = &verifier.engine;
         if (engine.written_low <= verifier.checked) verifier.checked = engine.written_low - 1;
         engine.written_low = std.math.maxInt(u64);

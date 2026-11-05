@@ -39,6 +39,15 @@ provably robust.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Notes for other lanes (from simulator findings)
+- batcher + consensus: batch data that an L1 reorg orphans and L1 then loses stays safe on
+  the real driver (startup discovery keeps the labeled safe head whose L1 origin is
+  canonical, as base/base does), so a batcher that loads from the rollup node's safe head
+  never re-posts it and every other node stalls. L1 loses it in a lossy reorg, or when a
+  txmgr reset (admin stop) replaces the re-injected txs at the same nonces. Repro: swarm
+  seeds 2562 (admin ops) and 2856 (reorg tx loss) with the `BUG(batcher)` gate in
+  `Config.random` removed. Fix idea: the batcher requeues frames of txs a reorg orphaned
+  (track confirmations to depth, as op-batcher's txmgr does) instead of trusting the safe
+  head; the sim gates both faults when the real batcher and real verifier run together.
 - derive (batch queue): a pipeline reset whose L2 safe head has L1 origin `genesis.l1 + 1`
   walks back to the L2 genesis (origin `genesis.l1`); the batch queue then holds
   `[genesis.l1, genesis.l1 + 1]` (the origin change is never "behind"), so
@@ -219,3 +228,18 @@ provably robust.
   unknown chain ids; valid, flipped and garbage rollup JSON. The model predicts the first
   error in load order or every loaded value. 3/3 mutants caught. Proof decoders item done.
 - 2026-11-05: swarm 30000..39999 (ReleaseSafe, real verifier ungated): 10000 passed.
+- 2026-11-05: real verifier follows unsafe gossip: sequencer `unsafe_block`s become full
+  payloads (L1 info deposit from the real attributes builder for the sequencer's origin)
+  fed to `Driver.insert_unsafe`, plus its own gap sync requests. Derived attributes now
+  consolidate against them (fault-free: all 59 blocks consolidated, 0 rebuilds; the sim
+  engine also had to report the Canyon empty withdrawals root). With both real
+  components on, the real batcher's `optimism_syncStatus` answers from the real driver.
+  Engine disk faults: a crash with a disk fault loses the last label update and up to 16
+  newest blocks above finalized; startup discovery recovers. Model verifiers and the
+  model batcher now keep future batches (pre-Holocene batch queue) instead of dropping
+  them, else they lag a batcher that follows the real driver (seed 31). New invariants:
+  unsafe head is the sequencer's block at its number, safe <= unsafe <= sequencer, unsafe
+  liveness. Gated `BUG(batcher)` (see notes). 3000 swarm seeds green (ReleaseSafe);
+  mutants caught: forged gossip payload (unsafe head diverged), wrong gossip fee recipient
+  (no consolidation), disk fault without driver restart (critical error), no gap sync
+  (seed 16 liveness).
