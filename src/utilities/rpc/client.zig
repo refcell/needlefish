@@ -18,6 +18,8 @@ pub const RpcError = struct {
     code: i64,
     /// Raw (still escaped) message bytes from the response.
     message: []const u8,
+    /// Raw `data` string (revert data of `eth_call` / `eth_estimateGas`), when present.
+    data: []const u8 = "",
 };
 
 pub const Result = union(enum) {
@@ -88,6 +90,8 @@ fn parse_error_object(raw: []const u8) error{InvalidResponse}!RpcError {
                 return error.InvalidResponse;
         } else if (std.mem.eql(u8, key.bytes, "message") and value.tag == .string) {
             rpc_error.message = value.bytes;
+        } else if (std.mem.eql(u8, key.bytes, "data") and value.tag == .string) {
+            rpc_error.data = value.bytes;
         }
         scanner.skip(value) catch unreachable;
     }
