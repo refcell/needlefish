@@ -16,6 +16,7 @@ dated log line after each push. Other lanes may read it to find interfaces.
 | consensus | consensus.md | `src/consensus/*`, `bin/consensus` |
 | batcher-devnet | batcher-devnet.md | `src/batcher/*`, `bin/batcher`, `etc/devnet`, `docs/DEVNET.md` |
 | dst-fuzz | dst-fuzz.md | `src/testing/*`, `etc/ci/`, benches, perf |
+| p2p | p2p.md | `src/consensus/p2p/*`, `docs/P2P.md` |
 
 Future lanes (spawned when capacity frees up) are listed in `docs/ROADMAP.md`.
 

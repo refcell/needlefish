@@ -18,7 +18,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
 - [ ] `safedb`: L1→safe head mapping persisted.
-- [ ] `p2p` (stub first): unsafe block gossip later in its own lane.
+- [ ] `p2p` (stub first): real implementation is owned by the p2p lane in `src/consensus/p2p/` (see p2p.md); consume its `p2p.Service`.
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
 
 ## Decisions
