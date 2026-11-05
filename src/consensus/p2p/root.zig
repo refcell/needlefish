@@ -12,6 +12,7 @@ pub const service = @import("service.zig");
 pub const transport = @import("transport.zig");
 pub const options = @import("options.zig");
 pub const network = @import("network.zig");
+pub const rpc = @import("rpc.zig");
 
 test {
     std.testing.refAllDecls(@This());

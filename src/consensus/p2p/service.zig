@@ -100,6 +100,8 @@ pub const Service = struct {
     next_inspect_ns: u64 = 0,
     next_gater_prune_ns: u64 = 0,
     next_dial_prune_ns: u64 = 0,
+    /// Time of the latest `tick` (for calls that carry no time, like admin RPC).
+    now_ns: u64 = 0,
     stats: Stats = .{},
 
     /// Heap-allocated: the gossip handler and discovery keep internal pointers.
@@ -334,6 +336,13 @@ pub const Service = struct {
         return service.gossip.pop_block(scratch);
     }
 
+    /// Asks the transport to close every connection to `peer`. False if none exists.
+    pub fn disconnect_peer(service: *Service, peer: *const peer_id.PeerId) bool {
+        const slot = service.slot_of(peer) orelse return false;
+        service.request_disconnect(slot);
+        return true;
+    }
+
     fn request_disconnect(service: *Service, slot: Slot) void {
         const connection = &service.connected[slot];
         if (connection.disconnecting) return;
@@ -343,6 +352,7 @@ pub const Service = struct {
     // ----------------------------------------------------------------------- time
 
     pub fn tick(service: *Service, now_ns: u64) void {
+        service.now_ns = @max(service.now_ns, now_ns);
         service.discovery.tick(now_ns);
         service.dial_discovered(now_ns);
         if (now_ns >= service.next_heartbeat_ns) {

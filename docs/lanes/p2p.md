@@ -43,7 +43,8 @@ behind a small interface and switch later.
 - [x] `libp2p`: yamux go-away: a received go-away closes the connection
   (`remote_go_away`); `close()` sends go-away first and the transport closes the socket
   after it is sent (2 s linger cap). Service disconnects (bans) are graceful.
-- [ ] `libp2p`: backpressure instead of `buffer_overflow` when a caller never flushes.
+- [x] ~~`libp2p`: backpressure instead of `buffer_overflow`~~ won't do: only a peer flooding stream negotiation can fill the outbound buffers (the transport flushes after every receive), and closing that peer is the right response.
+- [x] `rpc.zig`: the 18 `opp2p_*` admin methods over `Service` for `utilities/rpc.Router` (base/base shapes; untracked fields reported as zero; blockPeer also disconnects).
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
@@ -245,3 +246,4 @@ behind a small interface and switch later.
 - 2026-11-05: yamux go-away handling and graceful disconnects.
 - 2026-11-05: bootstore persistence through `Network`.
 - 2026-11-05: bootnodes file parsing.
+- 2026-11-05: opp2p admin RPC; backpressure closed as won't-do.
