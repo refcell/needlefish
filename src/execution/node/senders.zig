@@ -3,10 +3,11 @@
 //! Recovering a sender (secp256k1 ecrecover, about 30 us) dominates the cost of executing
 //! simple transactions, and it is a pure function of the raw transaction, so a block's
 //! senders are recovered up front on scoped threads (spawned and joined per call; the
-//! calling thread takes the first chunk). The result is identical for any thread count,
-//! so execution stays deterministic. Entries that cannot be recovered (deposits,
-//! undecodable or invalid signatures) are left null and the executor recovers (and
-//! rejects) them inline as before.
+//! calling thread works too, and every thread claims small batches from a shared atomic
+//! counter so fast and slow cores stay busy until the end). The result is identical
+//! for any thread count, so execution stays deterministic. Entries that cannot be
+//! recovered (deposits, undecodable or invalid signatures) are left null and the
+//! executor recovers (and rejects) them inline as before.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,6 +24,30 @@ pub const parallel_transactions_min = 32;
 /// Recovery needs a few KiB of stack; keep the reservation small.
 const stack_size_bytes = 256 * 1024;
 
+/// Transactions claimed per grab from the shared counter: small enough to balance
+/// fast and slow cores, large enough that the atomic is noise.
+const batch_size = 8;
+
+/// Work shared by the calling thread and the workers of one `recover` call.
+const Job = struct {
+    raws: []const []const u8,
+    out: []?Address,
+    recoverer: consensus.Recoverer,
+    next: std.atomic.Value(u32) = .init(0),
+
+    /// Claims batches until none are left. Every index is claimed exactly once.
+    fn work(job: *Job) void {
+        const count: u32 = @intCast(job.raws.len);
+        var grabs: u32 = 0;
+        while (grabs <= count / batch_size) : (grabs += 1) {
+            const start = job.next.fetchAdd(batch_size, .monotonic);
+            if (start >= count) return;
+            const end = @min(start + batch_size, count);
+            recover_range(job.raws[start..end], job.out[start..end], job.recoverer);
+        }
+    }
+};
+
 /// Recovers the sender of every raw transaction into `out` using up to `threads` extra
 /// threads. `out[i]` is null when transaction `i` has no recoverable signature.
 pub fn recover(
@@ -33,38 +58,24 @@ pub fn recover(
 ) void {
     assert(out.len == raws.len);
     assert(threads <= threads_max);
-    const workers: u32 = if (raws.len < parallel_transactions_min) 0 else threads;
-    const chunks: u32 = @min(workers + 1, @as(u32, @intCast(@max(raws.len, 1))));
-    const chunk_size = std.math.divCeil(usize, raws.len, chunks) catch unreachable; // chunks>0.
+    assert(raws.len <= std.math.maxInt(u32) - batch_size);
+    if (raws.len < parallel_transactions_min or threads == 0) {
+        recover_range(raws, out, recoverer);
+        return;
+    }
+    var job: Job = .{ .raws = raws, .out = out, .recoverer = recoverer };
+    // No more workers than batches beyond the caller's first.
+    const batches: u32 = @intCast(std.math.divCeil(usize, raws.len, batch_size) catch unreachable);
+    const workers = @min(threads, batches - 1);
     var handles: [threads_max]?std.Thread = @splat(null);
-    for (1..chunks) |chunk| {
-        const range = chunk_range(raws.len, chunk_size, chunk);
-        handles[chunk - 1] = std.Thread.spawn(
-            .{ .stack_size = stack_size_bytes },
-            recover_range,
-            .{ raws[range.start..range.end], out[range.start..range.end], recoverer },
-        ) catch null;
+    for (handles[0..workers]) |*handle| {
+        // A failed spawn only means less parallelism: the remaining threads drain it.
+        handle.* = std.Thread.spawn(.{ .stack_size = stack_size_bytes }, Job.work, .{&job}) catch
+            null;
     }
-    const first = chunk_range(raws.len, chunk_size, 0);
-    recover_range(raws[first.start..first.end], out[first.start..first.end], recoverer);
-    for (1..chunks) |chunk| {
-        if (handles[chunk - 1]) |handle| {
-            handle.join();
-        } else {
-            // The spawn failed: recover that chunk here.
-            const range = chunk_range(raws.len, chunk_size, chunk);
-            recover_range(raws[range.start..range.end], out[range.start..range.end], recoverer);
-        }
-    }
-}
-
-const Range = struct { start: usize, end: usize };
-
-fn chunk_range(count: usize, chunk_size: usize, chunk: usize) Range {
-    const start = @min(chunk * chunk_size, count);
-    const end = @min(start + chunk_size, count);
-    assert(start <= end and end <= count);
-    return .{ .start = start, .end = end };
+    job.work();
+    for (handles[0..workers]) |handle| if (handle) |thread| thread.join();
+    assert(job.next.load(.monotonic) >= raws.len);
 }
 
 fn recover_range(raws: []const []const u8, out: []?Address, recoverer: consensus.Recoverer) void {

@@ -226,7 +226,11 @@ pub const State = struct {
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
-        state.transient.clearRetainingCapacity();
+        // Entries are never removed (reverts restore values in place), so an empty map
+        // has no tombstones; skip the capacity-sized metadata memset (most transactions
+        // never TSTORE).
+        if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
+        assert(state.transient.count() == 0);
     }
 
     pub fn checkpoint(state: *const State) Checkpoint {
