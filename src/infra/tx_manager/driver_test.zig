@@ -31,6 +31,8 @@ const FakeL1 = struct {
     last_to: [20]u8 = @splat(0),
     last_blob_count: u32 = 0,
     blob_base_fee_wei: u128 = 3,
+    /// Receipts report execution failure (status 0x0).
+    reverting: bool = false,
 
     const PoolTx = struct {
         hash: Hash,
@@ -115,10 +117,12 @@ const FakeL1 = struct {
             for (l1.mined[0..l1.account_nonce]) |entry| {
                 const tx = entry.?;
                 if (!std.mem.eql(u8, &tx.hash, &hash)) continue;
-                const format = "{{\"blockNumber\":\"0x{x}\",\"blockHash\":\"0x{x}\"}}";
+                const format = "{{\"blockNumber\":\"0x{x}\",\"blockHash\":\"0x{x}\"," ++
+                    "\"status\":\"0x{d}\"}}";
                 return std.fmt.bufPrint(out, format, .{
                     tx.block_number,
                     &block_hash(tx.block_number, tx.fork),
+                    @intFromBool(!l1.reverting),
                 });
             }
             return "null";
@@ -270,12 +274,26 @@ test "driver: transfers are signed, published in nonce order, and confirmed" {
     var confirmed: u32 = 0;
     while (fixture.driver.take_completion()) |completion| {
         try testing.expect(completion.outcome == .confirmed);
+        try testing.expect(completion.outcome.confirmed.success);
         try testing.expectEqual(@as(u64, 0), completion.bump_count);
         confirmed += 1;
     }
     try testing.expectEqual(@as(u32, 3), confirmed);
     try testing.expectEqual(@as(u64, 3), fixture.l1.account_nonce);
     try testing.expectEqualSlices(u8, &to.bytes, &fixture.l1.last_to);
+}
+
+test "driver: a reverted receipt confirms with success false" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var now_ms: u64 = 0;
+    fixture.l1.reverting = true;
+    _ = try fixture.driver.send(&fixture.client, .{ .to = .{ .bytes = @splat(2) } }, now_ms);
+    try fixture.run(&now_ms, 4, true);
+    const completion = fixture.driver.take_completion().?;
+    try testing.expect(!completion.outcome.confirmed.success);
+    try testing.expect(fixture.driver.take_completion() == null);
 }
 
 test "driver: a dropped transaction is re-published with bumped fees" {

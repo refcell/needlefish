@@ -315,6 +315,11 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             if (block_number_value == .null) return .not_found;
             const block_number = try rpc.quantity(u64, block_number_value);
             const block_hash = try rpc.fixed(32, try rpc.field(receipt, "blockHash"));
+            // Pre-Byzantium receipts carry a state root instead: treat them as successful.
+            const success = if (rpc.field(receipt, "status")) |status_value|
+                try rpc.quantity(u64, status_value) == 1
+            else |_|
+                true;
             // `receipt` borrows the client's arena: read everything before the next call.
             const block_params =
                 std.fmt.bufPrint(&buffer, "[\"0x{x}\",false]", .{block_number}) catch unreachable;
@@ -323,7 +328,11 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             const canonical_hash = try rpc.fixed(32, try rpc.field(block, "hash"));
             if (!std.mem.eql(u8, &canonical_hash, &block_hash)) return .not_found;
             driver.tip_number = @max(driver.tip_number, block_number);
-            return .{ .mined = .{ .block_number = block_number, .tip_number = driver.tip_number } };
+            return .{ .mined = .{
+                .block_number = block_number,
+                .tip_number = driver.tip_number,
+                .success = success,
+            } };
         }
 
         fn estimate_gas(driver: *Self, client: *rpc.Client, candidate: Candidate) Error!u64 {

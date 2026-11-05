@@ -175,7 +175,8 @@ pub const Action = union(enum) {
 pub const ReceiptStatus = union(enum) {
     /// No receipt, or its block is not canonical.
     not_found,
-    mined: struct { block_number: u64, tip_number: u64 },
+    /// `success`: the receipt's execution status (false: reverted).
+    mined: struct { block_number: u64, tip_number: u64, success: bool = true },
 };
 
 pub const Failure = enum {
@@ -187,7 +188,8 @@ pub const Failure = enum {
 };
 
 pub const Outcome = union(enum) {
-    confirmed: struct { hash: Hash, block_number: u64 },
+    /// Mined at confirmation depth; `success` false means the transaction reverted.
+    confirmed: struct { hash: Hash, block_number: u64, success: bool = true },
     failed: Failure,
 };
 
@@ -391,6 +393,7 @@ pub fn Manager(comptime limits: Limits) type {
                     slot.outcome = .{ .confirmed = .{
                         .hash = hash,
                         .block_number = mined.block_number,
+                        .success = mined.success,
                     } };
                 },
             }

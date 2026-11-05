@@ -18,11 +18,13 @@ const failure_count = std.enums.values(Failure).len;
 const latency_bounds_s = [_]f64{ 0.2, 0.4, 0.6, 1, 2, 4, 8, 16, 32, 64, 128 };
 
 /// Entries `register` adds.
-pub const entries_count = 5 + failure_count;
+pub const entries_count = 6 + failure_count;
 
 pub const Metrics = struct {
     submitted: metrics.Counter = .{},
     confirmed: metrics.Counter = .{},
+    /// Mined at depth but the receipt reports execution failure.
+    reverted: metrics.Counter = .{},
     failed: [failure_count]metrics.Counter = @splat(.{}),
     bumps: metrics.Counter = .{},
     pending: metrics.Gauge = .{},
@@ -40,7 +42,10 @@ pub const Metrics = struct {
     ) void {
         const done_before = tx_metrics.done_count();
         switch (completion.outcome) {
-            .confirmed => tx_metrics.confirmed.increment(),
+            .confirmed => |confirmed| if (confirmed.success)
+                tx_metrics.confirmed.increment()
+            else
+                tx_metrics.reverted.increment(),
             .failed => |failure| tx_metrics.failed[@backingInt(failure)].increment(),
         }
         tx_metrics.bumps.add(completion.bump_count);
@@ -56,7 +61,7 @@ pub const Metrics = struct {
 
     /// Sends confirmed or failed so far.
     pub fn done_count(tx_metrics: *const Metrics) u64 {
-        var total = tx_metrics.confirmed.get();
+        var total = tx_metrics.confirmed.get() + tx_metrics.reverted.get();
         for (&tx_metrics.failed) |*counter| total += counter.get();
         return total;
     }
@@ -70,6 +75,7 @@ pub const Metrics = struct {
             &tx_metrics.submitted,
         );
         try registry.register(outcome_entry("confirmed", &tx_metrics.confirmed));
+        try registry.register(outcome_entry("reverted", &tx_metrics.reverted));
         inline for (comptime std.enums.values(Failure)) |failure| {
             const counter = &tx_metrics.failed[@backingInt(failure)];
             try registry.register(outcome_entry("failed_" ++ @tagName(failure), counter));
@@ -122,8 +128,14 @@ test "tx_manager metrics: counts outcomes, bumps, and latency" {
     const confirmed: manager.Outcome = .{ .confirmed = .{ .hash = @splat(0), .block_number = 7 } };
     tx_metrics.on_completion(completion_of(confirmed, 1, 1000), 1300);
     tx_metrics.on_completion(completion_of(.{ .failed = .send_timeout }, 2, 1000), 61_000);
+    const reverted: manager.Outcome = .{ .confirmed = .{
+        .hash = @splat(1),
+        .block_number = 8,
+        .success = false,
+    } };
+    tx_metrics.on_completion(completion_of(reverted, 0, 1000), 1100);
     tx_metrics.set_pending(0);
-    try testing.expectEqual(@as(u64, 2), tx_metrics.done_count());
+    try testing.expectEqual(@as(u64, 3), tx_metrics.done_count());
     try testing.expectEqual(@as(u64, 3), tx_metrics.bumps.get());
     var buffer: [8192]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -135,8 +147,9 @@ test "tx_manager metrics: counts outcomes, bumps, and latency" {
         "tx_manager_completed_total{outcome=\"failed_send_timeout\"} 1",
         "tx_manager_completed_total{outcome=\"failed_nonce_too_low\"} 0",
         "tx_manager_pending 0",
-        "tx_manager_completion_seconds_bucket{le=\"0.4\"} 1",
-        "tx_manager_completion_seconds_count 2",
+        "tx_manager_completion_seconds_bucket{le=\"0.4\"} 2",
+        "tx_manager_completed_total{outcome=\"reverted\"} 1",
+        "tx_manager_completion_seconds_count 3",
     };
     for (expected) |line| {
         if (std.mem.indexOf(u8, text, line) == null) {
