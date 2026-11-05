@@ -10,7 +10,8 @@
 //!   Error!void` — execute transactions `start..end` of `block` (the next ones after
 //!   everything executed since the last `reset`, in order).
 //!
-//! `Noop` executes nothing; the executor-backed builder lands with the pending-tag RPC.
+//! `Noop` executes nothing; `state_executor.ExecutorState` re-executes on the node's
+//! `Executor` over the canonical state.
 
 const std = @import("std");
 const assert = std.debug.assert;

@@ -53,10 +53,14 @@ can drive the builder and the flashblocks consumer.
   with reconnect/backoff, ordering/validation (index, parent hash, payload id), pending
   block assembly and state builder, bounded cache keyed by block (port `processor.rs`,
   `validation.rs`, `pending_blocks.rs`, `state_builder.rs`, `cache.rs`).
-- [ ] `execution/flashblocks` executor-backed state builder: implement the `state.zig`
+- [x] `execution/flashblocks` executor-backed state builder: implement the `state.zig`
   interface over the node lane's executor (re-execute pending txs on the canonical state;
   receipts, balances, nonces, `eth_call` overrides; port `state_builder.rs`,
-  `receipt_builder.rs`) and feed `Processor.on_canonical` from the node's canonical chain.
+  `receipt_builder.rs`).
+- [ ] `execution/flashblocks` canonical feed: call `Processor.on_canonical` from the node's
+  canonical chain (forkchoice head moves, with the block's transaction hashes).
+- [ ] `execution/flashblocks` state builder: reuse the previous snapshot's per-transaction
+  results instead of re-executing on every rebuild (base/base `execute_with_cached_data`).
 - [ ] `execution/flashblocks` RPC: pending-tag overrides for `eth_getBlockByNumber`,
   `eth_getTransactionReceipt`, `eth_getBalance`, `eth_call`, `eth_getTransactionCount`,
   plus the `eth_subscribe` flashblocks pubsub (port `rpc/*`).
@@ -134,6 +138,18 @@ can drive the builder and the flashblocks consumer.
   close (base/base reconnects at once after an upstream close), and detects stalls with a
   ws ping per interval (`ws.Client.ping`/`pongs_received`, added to `utilities/ws`).
 
+- `execution/flashblocks` executor-backed state: `ExecutorState` owns an `Executor` whose
+  backend reads a `db.Overlay` over the canonical `db.State` and folds each flashblock's evm
+  state into it (never committed), so the canonical `StateDb` and its undo ring are never
+  touched (no commit/rollback window during which the node could import on pending state).
+  Pending contract code lives in a builder-owned store so the canonical code table and the
+  durable journal see only canonical code. Flashblocks of a block resume the open block
+  (`Executor.set_block_env` made `pub`); withdrawals/requests run via `finish_block` when the
+  next block starts. The pending trie root is not computed (deltas carry it); receipts are
+  copied out of the executor arena after every transaction. `has_storage` for create
+  collisions reads the canonical trie (unless wiped); BLOCKHASH of an earlier pending block
+  answers its latest delta hash. Any failure resets (base/base drops the pending state).
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -153,3 +169,6 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: `builder/core` payload service (FCU starts/cancels a job, deadline ticks build and
   publish flashblocks, getPayload resolves the last sealed block), multiplex `Builder` interface,
   seeded + fuzz model check of FCU/resolve/tick interleavings.
+- 2026-11-05: `execution/flashblocks` `ExecutorState`: pending re-execution on the node executor
+  over a canonical overlay; receipts, balances, nonces, storage, code, pending `eth_call`;
+  differential seeded + fuzz tests against the builder generator and imported blocks.

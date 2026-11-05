@@ -433,7 +433,8 @@ pub const Executor = struct {
         executor.state.begin_transaction();
     }
 
-    fn set_block_env(executor: *Executor, block: *const BlockEnv) void {
+    /// Sets the evm block context (pending-state builders resume an open block with it).
+    pub fn set_block_env(executor: *Executor, block: *const BlockEnv) void {
         var blob_base_fee: u256 = 1;
         if (executor.spec.blob_params_at(block.timestamp)) |params| {
             blob_base_fee = params.base_fee(block.excess_blob_gas orelse 0);

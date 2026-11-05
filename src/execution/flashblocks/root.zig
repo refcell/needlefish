@@ -10,6 +10,7 @@ pub const validation = @import("validation.zig");
 pub const pending = @import("pending.zig");
 pub const cache = @import("cache.zig");
 pub const state = @import("state.zig");
+pub const state_executor = @import("state_executor.zig");
 pub const processor = @import("processor.zig");
 pub const subscriber = @import("subscriber.zig");
 
@@ -17,8 +18,10 @@ pub const PendingBlocks = pending.PendingBlocks;
 pub const Cache = cache.Cache;
 pub const Processor = processor.Processor;
 pub const Subscriber = subscriber.Subscriber;
+pub const ExecutorState = state_executor.ExecutorState;
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("consumer_test.zig");
+    _ = @import("state_executor_test.zig");
 }
