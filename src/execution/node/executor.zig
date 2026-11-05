@@ -121,6 +121,9 @@ pub const Executed = struct {
     requests: []const []const u8,
     /// Priority fees paid to the beneficiary.
     fees: u256 = 0,
+    /// The sender of each transaction (deposits: `from`; EIP-8130: zero, the lane
+    /// resolves it), so callers need no second ecrecover.
+    senders: []const primitives.Address = &.{},
 };
 
 pub const Executor = struct {
@@ -211,8 +214,25 @@ pub const Executor = struct {
     ) Error!Executed {
         executor.invalid_index = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
-        // Senders are recovered on worker threads while earlier transactions execute.
-        const recovered = executor.recovery_threads > 0;
+        var building = try executor.begin_block(block);
+        errdefer executor.abort_block();
+        try executor.apply_list(&building, transactions);
+        return executor.finish_block(&building, withdrawals);
+    }
+
+    /// Applies `transactions` in order, failing on the first error (its index is in
+    /// `invalid_index`). Senders are recovered on worker threads while earlier
+    /// transactions execute.
+    pub fn apply_list(
+        executor: *Executor,
+        building: *Building,
+        transactions: []const []const u8,
+    ) Error!void {
+        if (building.count + transactions.len > executor.transactions_max) {
+            return error.TooManyTransactions;
+        }
+        assert(executor.known_sender == null);
+        const recovered = executor.recovery_threads > 0 and transactions.len > 1;
         var pipeline: senders_module.Pipeline = undefined;
         if (recovered) {
             const senders = executor.senders[0..transactions.len];
@@ -221,8 +241,6 @@ pub const Executor = struct {
             pipeline.start(transactions, senders, done, executor.recoverer, threads);
         }
         defer if (recovered) pipeline.finish();
-        var building = try executor.begin_block(block);
-        errdefer executor.abort_block();
         defer executor.known_sender = null;
         for (transactions, 0..) |raw, index| {
             executor.invalid_index = @intCast(index);
@@ -231,11 +249,9 @@ pub const Executor = struct {
                 pipeline.wait_for(index);
                 executor.known_sender = executor.senders[index];
             }
-            try executor.apply(&building, raw);
+            try executor.apply(building, raw);
         }
-        executor.known_sender = null;
         executor.invalid_index = null;
-        return executor.finish_block(&building, withdrawals);
     }
 
     /// An open block: transactions applied so far (uncommitted).
@@ -243,6 +259,7 @@ pub const Executor = struct {
         block: *const BlockEnv,
         fork: evm.Fork,
         receipts: []Receipt,
+        senders: []primitives.Address,
         count: u32 = 0,
         gas_used: u64 = 0,
         blob_gas_used: u64 = 0,
@@ -263,6 +280,7 @@ pub const Executor = struct {
             .block = block,
             .fork = fork,
             .receipts = try executor.alloc(Receipt, executor.transactions_max),
+            .senders = try executor.alloc(primitives.Address, executor.transactions_max),
         };
     }
 
@@ -284,6 +302,7 @@ pub const Executor = struct {
         receipt.cumulative_gas_used = building.gas_used;
         bloom_or(&building.logs_bloom, &receipt.logs_bloom);
         building.receipts[building.count] = receipt;
+        building.senders[building.count] = result.sender;
         building.count += 1;
     }
 
@@ -308,6 +327,7 @@ pub const Executor = struct {
             .state_root = try executor.backend.root(executor.backend.context),
             .requests = requests,
             .fees = building.fees,
+            .senders = building.senders[0..building.count],
         };
     }
 
@@ -518,7 +538,13 @@ pub const Executor = struct {
         return executor.arena.allocator().alloc(T, n) catch error.ScratchFull;
     }
 
-    const Applied = struct { receipt: Receipt, gas_used: u64, blob_gas_used: u64, fees: u256 };
+    const Applied = struct {
+        receipt: Receipt,
+        gas_used: u64,
+        blob_gas_used: u64,
+        fees: u256,
+        sender: primitives.Address,
+    };
 
     fn apply_transaction(
         executor: *Executor,
@@ -570,6 +596,7 @@ pub const Executor = struct {
             .gas_used = executed.gas_used,
             .blob_gas_used = blob_gas,
             .fees = @as(u256, executed.gas_used) * tip,
+            .sender = .{ .bytes = tx.caller },
         };
     }
 

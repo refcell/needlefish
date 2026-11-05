@@ -202,6 +202,52 @@ pub const DaLimits = struct {
 /// Blocks whose state the history serves (`debug_proofsSyncStatus`).
 pub const HistoryWindow = struct { oldest: u64, head: u64 };
 
+/// The senders of the last few executed blocks, by block hash: pool pruning on
+/// forkchoice reuses them instead of recovering every included transaction again.
+const RecentSenders = struct {
+    const blocks_max = 4;
+
+    hashes: [blocks_max]Hash = @splat(@splat(0)),
+    lengths: [blocks_max]u32 = @splat(0),
+    valid: [blocks_max]bool = @splat(false),
+    buffer: []primitives.Address = &.{},
+    per_block: u32 = 0,
+    next: u32 = 0,
+
+    fn init(allocator: std.mem.Allocator, per_block: u32) !RecentSenders {
+        assert(per_block > 0);
+        const buffer = try lazy.alloc(allocator, primitives.Address, blocks_max * per_block);
+        return .{ .buffer = buffer, .per_block = per_block };
+    }
+
+    fn deinit(recent: *RecentSenders, allocator: std.mem.Allocator) void {
+        if (recent.buffer.len > 0) lazy.free(allocator, recent.buffer);
+        recent.* = .{};
+    }
+
+    fn put(recent: *RecentSenders, hash: Hash, senders: []const primitives.Address) void {
+        if (recent.per_block == 0 or senders.len > recent.per_block) return;
+        const slot = recent.next;
+        recent.next = (recent.next + 1) % blocks_max;
+        const start = slot * recent.per_block;
+        @memcpy(recent.buffer[start..][0..senders.len], senders);
+        recent.hashes[slot] = hash;
+        recent.lengths[slot] = @intCast(senders.len);
+        recent.valid[slot] = true;
+        assert(recent.next < blocks_max);
+    }
+
+    fn get(recent: *const RecentSenders, hash: Hash) ?[]const primitives.Address {
+        for (0..blocks_max) |slot| {
+            if (!recent.valid[slot]) continue;
+            if (!std.mem.eql(u8, &recent.hashes[slot], &hash)) continue;
+            const start = slot * recent.per_block;
+            return recent.buffer[start..][0..recent.lengths[slot]];
+        }
+        return null;
+    }
+};
+
 pub const Chain = struct {
     pub const Built = BuiltPayload;
 
@@ -222,6 +268,7 @@ pub const Chain = struct {
     staging: []u8,
     select_buffer: []*const txpool.Tx,
     transactions_buffer: [][]const u8,
+    recent_senders: RecentSenders = .{},
     build_bytes: []u8,
     build_len: usize = 0,
     tx_index: std.AutoHashMapUnmanaged(Hash, TxLocation),
@@ -291,6 +338,8 @@ pub const Chain = struct {
                 .finalized_block_hash = .zero,
             },
         };
+        chain.recent_senders = try RecentSenders.init(allocator, executor.transactions_max);
+        errdefer chain.recent_senders.deinit(allocator);
         const genesis_record = try chain.encode_record(genesis, &.{}, null, &.{}, &.{});
         try chain.store.put(ref_of(genesis, hash), genesis_record);
         chain.store.set_canonical(0, hash);
@@ -300,6 +349,7 @@ pub const Chain = struct {
 
     pub fn deinit(chain: *Chain, allocator: std.mem.Allocator) void {
         allocator.free(chain.tx_ring);
+        chain.recent_senders.deinit(allocator);
         chain.tx_index.deinit(allocator);
         lazy.free(allocator, chain.build_bytes);
         allocator.free(chain.transactions_buffer);
@@ -599,6 +649,7 @@ pub const Chain = struct {
         executed: *const executor_module.Executed,
     ) Error!void {
         const hash = child.hash().bytes;
+        chain.recent_senders.put(hash, executed.senders);
         const receipts = executed.receipts;
         const bytes =
             try chain.encode_record(child, transactions, withdrawals, receipts, executed.requests);
@@ -907,14 +958,19 @@ pub const Chain = struct {
     fn prune_pool(chain: *Chain, hash: Hash) void {
         const pool = chain.pool orelse return;
         var stored = chain.record(hash) orelse return;
-        while (!stored.transactions.is_empty()) {
+        // Senders recorded at execution save an ecrecover per transaction.
+        const known = chain.recent_senders.get(hash);
+        var index: usize = 0;
+        while (!stored.transactions.is_empty()) : (index += 1) {
             const raw = stored.transactions.bytes() catch unreachable;
             const tx_hash = primitives.keccak256(raw);
             if (raw.len > 0 and raw[0] == consensus.tx.eip8130.tx_type) {
                 chain.prune_lane(pool, raw, tx_hash);
                 continue;
             }
-            const sender = if (pool.get(tx_hash)) |tx| tx.sender else blk: {
+            const sender = if (pool.get(tx_hash)) |tx| tx.sender else if (known) |senders|
+                senders[index]
+            else blk: {
                 const envelope = consensus.Envelope.decode(raw) catch continue;
                 break :blk envelope.recover_sender(chain.executor.recoverer) orelse continue;
             };
@@ -938,13 +994,11 @@ pub const Chain = struct {
         const env = env_of(&child);
         chain.build_len = 0;
         var building = try chain.executor.begin_block(&env);
-        var count: u32 = 0;
         errdefer chain.executor.abort_block();
-        for (attributes.transactions orelse &.{}) |raw| {
-            try chain.executor.apply(&building, raw);
-            chain.transactions_buffer[count] = raw;
-            count += 1;
-        }
+        const forced = attributes.transactions orelse &.{};
+        try chain.executor.apply_list(&building, forced);
+        @memcpy(chain.transactions_buffer[0..forced.len], forced);
+        var count: u32 = @intCast(forced.len);
         if (!(attributes.no_tx_pool orelse false)) {
             count = try chain.apply_pool(&building, &env, count);
         }
@@ -1206,4 +1260,33 @@ pub fn canonical_form(raw: []const u8, out: []u8) error{StagingFull}![]const u8 
 
 test {
     _ = @import("chain_test.zig");
+}
+
+test "chain: recent senders ring keeps the last blocks and skips oversized ones" {
+    var recent = try RecentSenders.init(std.testing.allocator, 3);
+    defer recent.deinit(std.testing.allocator);
+    const a: primitives.Address = .{ .bytes = @splat(0xaa) };
+    const b: primitives.Address = .{ .bytes = @splat(0xbb) };
+    recent.put(@splat(1), &.{ a, b });
+    try std.testing.expectEqualSlices(primitives.Address, &.{ a, b }, recent.get(@splat(1)).?);
+    recent.put(@splat(9), &.{ a, b, a, b });
+    try std.testing.expect(recent.get(@splat(9)) == null);
+    for (2..2 + RecentSenders.blocks_max) |n| recent.put(@splat(@intCast(n)), &.{b});
+    try std.testing.expect(recent.get(@splat(1)) == null);
+    const last: Hash = @splat(@intCast(1 + RecentSenders.blocks_max));
+    try std.testing.expectEqualSlices(primitives.Address, &.{b}, recent.get(last).?);
+    var prng = @import("../../testing/prng.zig").Prng.init(7);
+    for (0..256) |_| {
+        const count = prng.below(5);
+        var list: [4]primitives.Address = undefined;
+        for (list[0..@min(count, 4)]) |*item| {
+            item.* = .{ .bytes = @splat(@truncate(prng.int(u8))) };
+        }
+        const hash: Hash = @splat(@truncate(prng.int(u8)));
+        recent.put(hash, list[0..@min(count, 4)]);
+        if (count <= 3) {
+            const got = recent.get(hash).?;
+            try std.testing.expectEqualSlices(primitives.Address, list[0..count], got);
+        }
+    }
 }
