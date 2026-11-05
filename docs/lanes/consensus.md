@@ -16,7 +16,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] batch validity rules (singular, span, Holocene)
 - [x] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
   - [x] L2 chain provider (`l2_block_info_by_number`/`_by_hash`, `system_config_by_l2_hash`)
-  - [ ] engine `getPayloadBodies`/`exchangeCapabilities` if needed
+  - [x] engine `getPayloadBodiesByHashV1`/`ByRangeV1` and `exchangeCapabilities` on `EngineClient` (client-only, like base/base; no node caller)
 - [x] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
@@ -177,6 +177,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: engine: payload bodies by hash/range and capability exchange on the engine client, with codecs and fuzz.
 - 2026-11-05: rpc: `base_upgradeReadiness` evaluates the L1 upgrade-signal schedule with base/base's readiness predicates.
 - 2026-11-05: service: `SignerWatcher` reads the unsafe block signer from the L1 SystemConfig storage slot and updates gossip validation on change.
 - 2026-11-05: rpc: admin_postUnsafePayload decodes the posted envelope and queues it like a gossiped block.

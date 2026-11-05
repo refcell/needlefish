@@ -1,7 +1,8 @@
 //! L2 Engine API client: `engine_forkchoiceUpdatedV2/V3`, `engine_newPayloadV2/V3/V4`,
 //! `engine_getPayloadV2..V5` (the versions base/base selects per fork in
 //! `crates/consensus/engine/src/versions.rs`), and `eth_getBlockByNumber` on the same
-//! authenticated endpoint to build `L2BlockInfo`s or full, verified `L2Block`s. Every
+//! authenticated endpoint to build `L2BlockInfo`s or full, verified `L2Block`s, plus
+//! `engine_getPayloadBodiesByHashV1`/`ByRangeV1` and `engine_exchangeCapabilities`. Every
 //! request carries a fresh `Authorization: Bearer <jwt>` with `iat` from the injected IO's
 //! wall clock.
 //!
@@ -36,6 +37,8 @@ pub const ExecutionPayload = engine_json.ExecutionPayload;
 pub const NewPayloadParams = engine_json.NewPayloadParams;
 pub const PayloadEnvelope = engine_json.PayloadEnvelope;
 pub const PayloadId = engine_json.PayloadId;
+pub const PayloadBody = engine_json.PayloadBody;
+pub const Hash = protocol.block.Hash;
 
 pub const BlockTag = union(enum) { number: u64, latest, safe, finalized };
 
@@ -46,6 +49,10 @@ pub const Response = union(enum) {
     l2_block: L2BlockInfo,
     /// Borrows the client's arena until the next response.
     l2_block_full: l2_block_full.L2Block,
+    /// One entry per requested block, null when the client lacks it; borrows the arena.
+    payload_bodies: []const ?PayloadBody,
+    /// The execution client's supported methods; borrows the arena.
+    capabilities: []const []const u8,
 };
 
 pub const Error = rpc.client.Error || l2_block_full.Error || error{
@@ -69,7 +76,15 @@ pub const Options = struct {
     retain_bytes: usize = 4 * 1024 * 1024,
 };
 
-const Method = enum { forkchoice_updated, new_payload, get_payload, block, block_full };
+const Method = enum {
+    forkchoice_updated,
+    new_payload,
+    get_payload,
+    block,
+    block_full,
+    payload_bodies,
+    capabilities,
+};
 
 /// Maps an Engine API error code (execution-apis `common.md`).
 pub fn error_from_code(code: i64) Error {
@@ -224,6 +239,55 @@ pub fn EngineClient(comptime IO: type) type {
             try engine.client.call(*Self, engine, on_result, method, &tag, write_block_tag);
         }
 
+        /// `engine_getPayloadBodiesByHashV1`; `hashes` must stay valid until the call returns.
+        pub fn payload_bodies_by_hash(
+            engine: *Self,
+            hashes: []const Hash,
+            comptime Context: type,
+            context: Context,
+            comptime callback: fn (Context, *Self, Error!Response) void,
+        ) !void {
+            assert(hashes.len > 0);
+            assert(hashes.len <= engine_json.payload_bodies_max);
+            const method = "engine_getPayloadBodiesByHashV1";
+            try engine.start(.payload_bodies, Context, context, callback);
+            errdefer engine.pending = null;
+            try engine.client.call(*Self, engine, on_result, method, &hashes, write_hashes);
+        }
+
+        /// `engine_getPayloadBodiesByRangeV1` for blocks `start .. start + count`.
+        pub fn payload_bodies_by_range(
+            engine: *Self,
+            start_number: u64,
+            count: u64,
+            comptime Context: type,
+            context: Context,
+            comptime callback: fn (Context, *Self, Error!Response) void,
+        ) !void {
+            assert(start_number > 0); // Execution-apis: start must be at least 1.
+            assert(count > 0 and count <= engine_json.payload_bodies_max);
+            const range: Range = .{ .start = start_number, .count = count };
+            const method = "engine_getPayloadBodiesByRangeV1";
+            try engine.start(.payload_bodies, Context, context, callback);
+            errdefer engine.pending = null;
+            try engine.client.call(*Self, engine, on_result, method, &range, write_range);
+        }
+
+        /// `engine_exchangeCapabilities` with the methods this node calls.
+        pub fn exchange_capabilities(
+            engine: *Self,
+            comptime Context: type,
+            context: Context,
+            comptime callback: fn (Context, *Self, Error!Response) void,
+        ) !void {
+            const method = "engine_exchangeCapabilities";
+            const names: []const []const u8 = &engine_json.capabilities;
+            assert(names.len > 0);
+            try engine.start(.capabilities, Context, context, callback);
+            errdefer engine.pending = null;
+            try engine.client.call(*Self, engine, on_result, method, &names, write_names);
+        }
+
         fn start(
             engine: *Self,
             method: Method,
@@ -285,6 +349,12 @@ pub fn EngineClient(comptime IO: type) type {
                     if (std.mem.eql(u8, raw, "null")) return error.BlockNotFound;
                     return .{ .l2_block = try l2_block.decode(raw, &engine.options.genesis) };
                 },
+                .payload_bodies => .{
+                    .payload_bodies = try engine_json.decode_payload_bodies(allocator, raw, limits),
+                },
+                .capabilities => .{
+                    .capabilities = try engine_json.decode_capabilities(allocator, raw),
+                },
                 .block_full => {
                     if (std.mem.eql(u8, raw, "null")) return error.BlockNotFound;
                     const genesis = &engine.options.genesis;
@@ -333,6 +403,28 @@ fn write_new_payload(
     writer: *json.Writer,
 ) json.Writer.WriteError!void {
     try engine_json.write_new_payload_params(writer, call.version, call.payload, call.params);
+}
+
+const Range = struct { start: u64, count: u64 };
+
+fn write_range(range: *const Range, writer: *json.Writer) json.Writer.WriteError!void {
+    try writer.quantity(range.start);
+    try writer.quantity(range.count);
+}
+
+fn write_hashes(hashes: *const []const Hash, writer: *json.Writer) json.Writer.WriteError!void {
+    try writer.begin_array();
+    for (hashes.*) |hash| try writer.data(&hash.bytes);
+    try writer.end_array();
+}
+
+fn write_names(
+    names: *const []const []const u8,
+    writer: *json.Writer,
+) json.Writer.WriteError!void {
+    try writer.begin_array();
+    for (names.*) |name| try writer.string(name);
+    try writer.end_array();
 }
 
 fn write_payload_id(id: *const PayloadId, writer: *json.Writer) json.Writer.WriteError!void {

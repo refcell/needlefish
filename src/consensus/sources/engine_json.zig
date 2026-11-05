@@ -465,3 +465,114 @@ pub fn decode_payload_envelope(
     try seen.require(0b11);
     return envelope;
 }
+
+/// `ExecutionPayloadBodyV1` (`engine_getPayloadBodiesByHashV1`/`ByRangeV1`): the block's
+/// transactions and withdrawals (null before Shanghai).
+pub const PayloadBody = struct {
+    transactions: []const []const u8,
+    withdrawals: ?[]const Withdrawal,
+};
+
+/// The most bodies one request may ask for (execution-apis `shanghai.md`: clients must
+/// support at least 32 and may reject more than 1024 with `-38004`).
+pub const payload_bodies_max = 1024;
+
+/// Decodes an array of bodies; unknown blocks are null entries.
+pub fn decode_payload_bodies(
+    allocator: Allocator,
+    raw: []const u8,
+    limits: Limits,
+) Error![]const ?PayloadBody {
+    const count = try object.array_count(raw, payload_bodies_max);
+    const bodies = try allocator.alloc(?PayloadBody, count);
+    var iterator = try object.ArrayIterator.init(raw);
+    for (bodies) |*body| {
+        const element = (try iterator.next()) orelse unreachable; // Counted above.
+        body.* = if (element.value.tag == .null)
+            null
+        else
+            try decode_payload_body(allocator, element.raw, limits);
+    }
+    assert(try iterator.next() == null);
+    assert(bodies.len <= payload_bodies_max);
+    return bodies;
+}
+
+fn decode_payload_body(allocator: Allocator, raw: []const u8, limits: Limits) Error!PayloadBody {
+    var iterator = try object.ObjectIterator.init(raw);
+    var body: PayloadBody = .{ .transactions = &.{}, .withdrawals = null };
+    var seen: object.Seen(2) = .{};
+    var count: u32 = 0;
+    while (try iterator.next()) |field| : (count += 1) {
+        assert(count <= raw.len);
+        if (std.mem.eql(u8, field.key, "transactions")) {
+            try seen.see(0);
+            body.transactions = try decode_data_list(
+                allocator,
+                field.raw,
+                limits.transactions_max,
+                limits.transaction_size_max,
+            );
+        } else if (std.mem.eql(u8, field.key, "withdrawals")) {
+            try seen.see(1);
+            if (field.value.tag != .null) {
+                body.withdrawals = try decode_withdrawals(allocator, field.raw, limits);
+            }
+        }
+    }
+    try seen.require(0b01);
+    return body;
+}
+
+pub fn write_payload_body(writer: *Writer, body: *const PayloadBody) WriteError!void {
+    try writer.begin_object();
+    try write_data_list(writer, "transactions", body.transactions);
+    if (body.withdrawals) |withdrawals| {
+        try write_withdrawals(writer, withdrawals);
+    } else {
+        try writer.key("withdrawals");
+        try writer.null_value();
+    }
+    try writer.end_object();
+}
+
+/// The Engine API methods this node calls, sent with `engine_exchangeCapabilities`.
+pub const capabilities = [_][]const u8{
+    "engine_forkchoiceUpdatedV2",       "engine_forkchoiceUpdatedV3",
+    "engine_newPayloadV2",              "engine_newPayloadV3",
+    "engine_newPayloadV4",              "engine_getPayloadV2",
+    "engine_getPayloadV3",              "engine_getPayloadV4",
+    "engine_getPayloadV5",              "engine_getPayloadBodiesByHashV1",
+    "engine_getPayloadBodiesByRangeV1",
+};
+
+pub const capabilities_max = 128;
+pub const capability_size_max = 64;
+
+/// Decodes the execution client's capability list (method names).
+pub fn decode_capabilities(allocator: Allocator, raw: []const u8) Error![]const []const u8 {
+    const count = try object.array_count(raw, capabilities_max);
+    const names = try allocator.alloc([]const u8, count);
+    var iterator = try object.ArrayIterator.init(raw);
+    for (names) |*name| {
+        const element = (try iterator.next()) orelse unreachable; // Counted above.
+        const token = element.value;
+        if (token.tag != .string or token.escaped) return error.InvalidField;
+        if (token.bytes.len == 0 or token.bytes.len > capability_size_max) {
+            return error.InvalidField;
+        }
+        name.* = try allocator.dupe(u8, token.bytes);
+    }
+    assert(try iterator.next() == null);
+    assert(names.len <= capabilities_max);
+    return names;
+}
+
+/// Whether `name` is in `list` (a decoded capability list).
+pub fn has_capability(list: []const []const u8, name: []const u8) bool {
+    assert(name.len > 0);
+    for (list) |item| {
+        if (std.mem.eql(u8, item, name)) return true;
+    }
+    return false;
+}

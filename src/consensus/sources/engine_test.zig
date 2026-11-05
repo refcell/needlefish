@@ -169,6 +169,49 @@ test "engine json: unsafe payload envelope (admin_postUnsafePayload)" {
     );
 }
 
+test "engine json: payload bodies and capabilities" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const withdrawals = [_]engine_json.Withdrawal{.{
+        .index = 1,
+        .validator_index = 2,
+        .address = .{ .bytes = @splat(0x33) },
+        .amount_gwei = 4,
+    }};
+    const bodies = [_]engine_json.PayloadBody{
+        .{ .transactions = &.{ "\x02\x01", "\x7e" }, .withdrawals = &withdrawals },
+        .{ .transactions = &.{}, .withdrawals = null },
+    };
+    var buffer: [2048]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var writer = json.Writer.init(&out);
+    try writer.begin_array();
+    try engine_json.write_payload_body(&writer, &bodies[0]);
+    try writer.null_value();
+    try engine_json.write_payload_body(&writer, &bodies[1]);
+    try writer.end_array();
+    const decoded = try engine_json.decode_payload_bodies(allocator, out.buffered(), .{});
+    try testing.expectEqual(@as(usize, 3), decoded.len);
+    try testing.expectEqualSlices(u8, "\x7e", decoded[0].?.transactions[1]);
+    try testing.expectEqual(@as(u64, 4), decoded[0].?.withdrawals.?[0].amount_gwei);
+    try testing.expect(decoded[1] == null);
+    try testing.expect(decoded[2].?.withdrawals == null);
+    try testing.expectEqual(@as(usize, 0), decoded[2].?.transactions.len);
+    try testing.expectError(
+        error.MissingField,
+        engine_json.decode_payload_bodies(allocator, "[{\"withdrawals\":null}]", .{}),
+    );
+    const names = try engine_json.decode_capabilities(allocator,
+        \\["engine_newPayloadV4","engine_getPayloadV5"]
+    );
+    try testing.expect(engine_json.has_capability(names, "engine_getPayloadV5"));
+    try testing.expect(!engine_json.has_capability(names, "engine_getPayloadV2"));
+    try testing.expectError(error.InvalidField, engine_json.decode_capabilities(allocator, "[1]"));
+    const empty_name = engine_json.decode_capabilities(allocator, "[\"\"]");
+    try testing.expectError(error.InvalidField, empty_name);
+}
+
 test "engine json: payload status and forkchoice results" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -307,6 +350,49 @@ test "engine client: authenticated calls over SimIo" {
     try testing.expectError(error.BlockNotFound, outcome.response.?);
 }
 
+test "engine client: payload bodies and capabilities over SimIo" {
+    var fake: FakeRpc = .{};
+    fake.add(.{ .method = "engine_getPayloadBodiesByHashV1", .result =
+        \\[{"transactions":["0x7e01"],"withdrawals":[]},null]
+    });
+    const range = "engine_getPayloadBodiesByRangeV1";
+    fake.add(.{ .method = range, .params_contain = "\"0x5\",\"0x2\"", .result =
+        \\[{"transactions":[],"withdrawals":null}]
+    });
+    fake.add(.{ .method = "engine_exchangeCapabilities", .result =
+        \\["engine_newPayloadV4","engine_forkchoiceUpdatedV3"]
+    });
+    var harness: Harness = undefined;
+    try harness.init(&fake, 0x34);
+    defer harness.deinit();
+    var engine: Engine = undefined;
+    const secret: jwt.Secret = .{ .bytes = @splat(0x12) };
+    const http_options = harness_module.client_options;
+    try engine.init(testing.allocator, &harness.client_io, harness.address, http_options, secret, .{
+        .genesis = .{},
+        .request_size_max = 4096,
+    });
+    defer engine.deinit();
+    var outcome: Outcome = .{};
+    const hashes = [_]engine_client.Hash{ .{ .bytes = @splat(1) }, .{ .bytes = @splat(2) } };
+    try engine.payload_bodies_by_hash(&hashes, *Outcome, &outcome, Outcome.on_response);
+    harness.run();
+    const by_hash = (try outcome.response.?).payload_bodies;
+    try testing.expectEqual(@as(usize, 2), by_hash.len);
+    try testing.expectEqualSlices(u8, "\x7e\x01", by_hash[0].?.transactions[0]);
+    try testing.expect(by_hash[1] == null);
+    try testing.expect(contains(fake.body(), "[[\"0x0101"));
+    try engine.payload_bodies_by_range(5, 2, *Outcome, &outcome, Outcome.on_response);
+    harness.run();
+    const by_range = (try outcome.response.?).payload_bodies;
+    try testing.expect(by_range[0].?.withdrawals == null);
+    try engine.exchange_capabilities(*Outcome, &outcome, Outcome.on_response);
+    harness.run();
+    const names = (try outcome.response.?).capabilities;
+    try testing.expect(engine_json.has_capability(names, "engine_forkchoiceUpdatedV3"));
+    try testing.expect(contains(fake.body(), "\"engine_getPayloadBodiesByRangeV1\""));
+}
+
 fn decode_engine_arbitrary(input: []const u8) void {
     var memory: [32 * 1024]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&memory);
@@ -317,6 +403,10 @@ fn decode_engine_arbitrary(input: []const u8) void {
     _ = engine_json.decode_unsafe_envelope(allocator, input, .{}) catch {};
     fixed.reset();
     _ = engine_json.decode_forkchoice_updated(allocator, input, .{}) catch {};
+    fixed.reset();
+    _ = engine_json.decode_payload_bodies(allocator, input, .{}) catch {};
+    fixed.reset();
+    _ = engine_json.decode_capabilities(allocator, input) catch {};
     const genesis: protocol.rollup_config.ChainGenesis = .{};
     _ = l2_block.decode(input, &genesis) catch {};
 }
@@ -329,6 +419,10 @@ test "engine json: seeded fuzz of mutated results" {
         \\{"payloadStatus":{"status":"VALID","latestValidHash":null},"payloadId":"0x0102030405060708"}
         ,
         \\{"executionPayload":{"parentHash":"0x00","transactions":["0x01"],"withdrawals":[]},"blockValue":"0x1"}
+        ,
+        \\[{"transactions":["0x02"],"withdrawals":null},null]
+        ,
+        \\["engine_newPayloadV3","engine_getPayloadV4"]
     };
     var prng = Prng.init(0xe9);
     var buffer: [4096]u8 = undefined;
