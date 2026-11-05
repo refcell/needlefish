@@ -27,8 +27,10 @@ const TxId = interfaces.TxId;
 const RecoveredState = target.RecoveredState;
 const Dispatcher = dispatcher_module.Dispatcher;
 
-/// Largest game `initData` (proof bytes) the collector forwards.
-pub const init_data_bytes_max = 4096;
+/// Largest game `initData` (proof bytes) the collector forwards: a TEE proof is 130 bytes,
+/// the native prover's witness archive is hundreds of KiB (`base proposer` sizes its
+/// submitter to match).
+pub const init_data_bytes_max = 4 << 20;
 /// `createWithInitData(uint32,bytes32,bytes,bytes)` calldata upper bound.
 pub const calldata_bytes_max = 4 + 6 * 32 + 64 +
     recovery_module.extra_data_bytes_max + init_data_bytes_max;
