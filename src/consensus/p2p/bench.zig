@@ -371,6 +371,7 @@ const EndToEnd = struct {
             .unsafe_block_signer = signer,
             .disc = .{ .chain_id = 8453 },
             .mcache = .{ .entries_max = 64, .arena_bytes = 16 * payload_bytes },
+            .accepted_bytes = 16 * payload_bytes,
         }, secret, record, fixture.prngs[index].random());
     }
 

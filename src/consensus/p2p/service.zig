@@ -62,6 +62,8 @@ pub const Config = struct {
     gater_prune_interval_ns: u64 = 60 * ns_per_s,
     pending_dial_prune_interval_ns: u64 = 5 * ns_per_s,
     mcache: @import("gossip/mcache.zig").Config = .{},
+    /// Compressed accepted blocks held until consensus pops them (`handler.Config`).
+    accepted_bytes: u32 = 32 * (1 << 20),
     mesh: gossip_handler.Mesh = .{},
     score_level: @import("peers/score.zig").Level = .light,
     topic_scoring: bool = true,
@@ -230,6 +232,7 @@ pub const Service = struct {
             .unsafe_block_signer = config.unsafe_block_signer,
             .block_time_s = config.block_time_s,
             .mcache = config.mcache,
+            .accepted_bytes = config.accepted_bytes,
             .mesh = config.mesh,
             .score_level = config.score_level,
             .topic_scoring = config.topic_scoring,

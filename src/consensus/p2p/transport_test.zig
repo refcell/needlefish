@@ -148,6 +148,7 @@ const Cluster = struct {
                 .table = .{ .subnet_bucket_max = 0, .subnet_table_max = 0 },
             },
             .mcache = .{ .entries_max = 64, .arena_bytes = 1 << 20 },
+            .accepted_bytes = 1 << 20,
             .ban_enabled = true,
         }, secret, node.record, node.prng.random());
         try node.transport.init(allocator, &node.io, node.service, .{
@@ -711,5 +712,93 @@ test "p2p transport: Denim 200 ms blocks reach every node within their slot" {
         try std.testing.expectEqual(@as(u64, 0), stats.accepted_dropped);
         try std.testing.expectEqual(@as(u64, blocks), stats.accepted);
         try std.testing.expectEqual(@as(u64, 0), stats.rejected);
+    }
+}
+
+/// Sends `count` junk publishes (random payloads that fail snappy or decoding) on the
+/// live block topic over every open link of `node`. Returns how many frames were queued.
+fn send_junk_publishes(node: *Node, random: std.Random, count: u32, size: u32) u32 {
+    const rpc = @import("gossip/rpc.zig");
+    const router = &node.service.gossip.router;
+    const topic = router.topic_name(@intCast(router.topics_count - 1));
+    var data: [16 * 1024]u8 = undefined;
+    assert(size <= data.len);
+    var message: rpc.RpcDefault = undefined;
+    var frame: [rpc.varint_length_max + 8 * (16 * 1024 + 256)]u8 = undefined;
+    var queued: u32 = 0;
+    for (node.transport.links) |*link| {
+        if (link.state != .open or !link.connection_live) continue;
+        if (!link.connection.is_established()) continue;
+        var sent: u32 = 0;
+        while (sent < count) {
+            message.reset();
+            var batch: u32 = 0;
+            while (batch < 8 and sent < count) : ({
+                batch += 1;
+                sent += 1;
+            }) {
+                random.bytes(data[0..size]);
+                message.add_publish(.{ .topic = topic, .data = data[0..size] }) catch break;
+            }
+            const bytes = message.encode_framed(&frame);
+            link.connection.send_gossip(bytes) catch break; // Send queue full: drop.
+            queued += 1;
+        }
+    }
+    node.transport.pump_all();
+    return queued;
+}
+
+test "p2p transport: a junk-publish flood does not cost a slow consumer accepted blocks" {
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init_options(0xf100d, nodes, 0, 0, .denim);
+    defer cluster.deinit();
+    cluster.run(8 * ns_per_s);
+    // Production default: topic scoring off, so junk costs the flooder no score.
+    for (cluster.all()) |*node| node.service.gossip.router.config.peer_params.?.topic = null;
+    const attacker = nodes - 1;
+    var prng = Prng.init(0xf100d);
+    const random = prng.random();
+    const first = cluster.world.now_ns / (slot_ms * ns_per_ms) + 1;
+    const blocks = 40; // 8 s of 200 ms blocks.
+    var next_pop: u64 = 0;
+    var popped: [nodes]u64 = @splat(0);
+    for (0..blocks) |offset| {
+        const number = first + offset;
+        const seal_ns = (number * slot_ms + 150) * ns_per_ms;
+        while (cluster.world.now_ns < seal_ns) {
+            _ = send_junk_publishes(&cluster.storage[attacker], random, 8, 1024);
+            cluster.run(10 * ns_per_ms);
+        }
+        const value = try denim_payload(cluster, number);
+        const sequencer = &cluster.storage[0];
+        const now = sequencer.io.now_realtime_ns();
+        _ = try sequencer.service.publish_block(cluster.sequencer_secret, beacon_root, value, now);
+        sequencer.transport.execute_commands();
+        sequencer.transport.pump_all();
+        // A busy consensus loop drains its gossip queue only once a second.
+        if (offset < next_pop) continue;
+        next_pop = offset + 5;
+        for (cluster.all()[1..attacker], 1..) |*node, index| {
+            while (node.service.pop_block(scratch)) |envelope| {
+                try std.testing.expectEqual(first + popped[index], envelope.payload.block_number);
+                popped[index] += 1;
+            }
+        }
+    }
+    cluster.run(1 * ns_per_s);
+    for (cluster.all()[1..attacker], 1..) |*node, index| {
+        while (node.service.pop_block(scratch)) |_| popped[index] += 1;
+        const stats = &node.service.gossip.stats;
+        if (popped[index] != blocks) {
+            std.debug.print("flood: node {d} popped {d}/{d}, rejected {d}\n", .{
+                index, popped[index], blocks, stats.rejected,
+            });
+        }
+        try std.testing.expect(stats.rejected > 0); // The flood arrived and was validated.
+        try std.testing.expectEqual(@as(u64, blocks), popped[index]);
     }
 }

@@ -6,8 +6,11 @@
 //!
 //! Memory is allocated once at `init`: one 10 MiB scratch buffer for snappy
 //! decompression (message ids and validation take turns) and one buffer for publishing.
-//! Accepted blocks are queued by message id; `pop_block` re-decodes the cached message
-//! into a caller buffer, so a queued block costs 20 bytes, not a payload copy.
+//! Accepted blocks are copied (still compressed) into their own FIFO store, which only
+//! accepted blocks enter, so no amount of junk gossip cycling through the router's cache
+//! can evict a block consensus has not popped yet. `pop_block` decodes from that store
+//! into a caller buffer. Only a consumer that falls `accepted_bytes` (or 64 blocks)
+//! behind loses blocks, counted in `accepted_evicted`/`accepted_dropped`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,6 +29,7 @@ pub const Slot = router_module.Slot;
 const ns_per_s = std.time.ns_per_s;
 const versions = [_]block.Version{ .v1, .v2, .v3, .v4 };
 const accepted_max = 64;
+const mcache_module = @import("mcache.zig");
 /// Largest signed message we publish (base/base `MAX_GOSSIP_SIZE`).
 const publish_size_max = snappy.gossip_size_max;
 
@@ -36,7 +40,10 @@ pub const Config = struct {
     block_time_s: u64 = 2,
     score_level: score.Level = .light,
     topic_scoring: bool = true,
-    mcache: @import("mcache.zig").Config = .{},
+    mcache: mcache_module.Config = .{},
+    /// Bytes of compressed accepted blocks held until consensus pops them (>= one
+    /// largest message, `snappy.max_compressed_length(gossip_size_max)`, in production).
+    accepted_bytes: u32 = 32 * (1 << 20),
     mesh: Mesh = .{},
 };
 
@@ -55,6 +62,8 @@ pub const Stats = struct {
     rejected: u64 = 0,
     ignored: u64 = 0,
     accepted_dropped: u64 = 0,
+    /// Accepted blocks pushed out of the accepted store before consensus popped them.
+    accepted_evicted: u64 = 0,
     published: u64 = 0,
     /// Messages that did not decode as a payload envelope (rejected before validation).
     decode_failed: u64 = 0,
@@ -90,6 +99,8 @@ pub const BlockGossip = struct {
     checked_hash: primitives.B256 = undefined,
     accepted_head: u32 = 0,
     accepted_count: u32 = 0,
+    /// Compressed accepted blocks, by message id, until `pop_block` (never time-expired).
+    accepted_store: mcache_module.Cache,
     stats: Stats = .{},
 
     /// Heap-allocates the handler: the router keeps a pointer to it for message ids.
@@ -104,6 +115,13 @@ pub const BlockGossip = struct {
         const output_length: usize = @intCast(snappy.max_compressed_length(publish_size_max));
         const publish_output = try allocator.alloc(u8, output_length);
         errdefer allocator.free(publish_output);
+        var accepted_store = try mcache_module.Cache.init(allocator, .{
+            .history_length = std.math.maxInt(u8),
+            .history_gossip = 0,
+            .entries_max = accepted_max,
+            .arena_bytes = config.accepted_bytes,
+        });
+        errdefer accepted_store.deinit(allocator);
         gossip.* = .{
             .router = undefined,
             .validator = .{
@@ -115,6 +133,7 @@ pub const BlockGossip = struct {
             .scratch = scratch,
             .publish_scratch = publish_scratch,
             .publish_output = publish_output,
+            .accepted_store = accepted_store,
         };
         gossip.router = try Router.init(allocator, .{
             .message_id = message_id,
@@ -143,6 +162,7 @@ pub const BlockGossip = struct {
 
     pub fn destroy(gossip: *BlockGossip, allocator: std.mem.Allocator) void {
         gossip.router.deinit(allocator);
+        gossip.accepted_store.deinit(allocator);
         allocator.free(gossip.publish_output);
         allocator.free(gossip.publish_scratch);
         allocator.free(gossip.scratch);
@@ -189,7 +209,7 @@ pub const BlockGossip = struct {
             switch (verdict) {
                 .accept => {
                     gossip.stats.accepted += 1;
-                    gossip.queue_accepted(&event.id, gossip.checked_hash);
+                    gossip.queue_accepted(&event, gossip.checked_hash);
                 },
                 .reject => gossip.stats.rejected += 1,
                 .ignore => gossip.stats.ignored += 1,
@@ -245,7 +265,18 @@ pub const BlockGossip = struct {
         return block.decode(version, data, gossip.scratch);
     }
 
-    fn queue_accepted(gossip: *BlockGossip, id: *const Id, payload_hash: primitives.B256) void {
+    fn queue_accepted(
+        gossip: *BlockGossip,
+        event: *const router_module.Event,
+        payload_hash: primitives.B256,
+    ) void {
+        const id = &event.id;
+        // `check` just decoded these bytes from the router's cache.
+        const data = gossip.router.message_data(id) orelse unreachable;
+        _ = gossip.accepted_store.put(id, event.topic, data, true) orelse {
+            gossip.stats.accepted_dropped += 1; // Larger than the whole store.
+            return;
+        };
         if (gossip.accepted_count == accepted_max) {
             gossip.accepted_head = (gossip.accepted_head + 1) % accepted_max;
             gossip.accepted_count -= 1;
@@ -258,8 +289,8 @@ pub const BlockGossip = struct {
         assert(gossip.accepted_count <= accepted_max);
     }
 
-    /// Next accepted block for consensus, decoded into `scratch` (>= 10 MiB). Blocks whose
-    /// message already left the cache are skipped.
+    /// Next accepted block for consensus, decoded into `scratch` (>= 10 MiB). Blocks the
+    /// accepted store had to evict (a consumer `accepted_bytes` behind) are skipped.
     pub fn pop_block(gossip: *BlockGossip, scratch: []u8) ?block.Envelope {
         assert(scratch.len >= snappy.gossip_size_max);
         while (gossip.accepted_count > 0) {
@@ -267,9 +298,16 @@ pub const BlockGossip = struct {
             const payload_hash = gossip.accepted_hashes[gossip.accepted_head];
             gossip.accepted_head = (gossip.accepted_head + 1) % accepted_max;
             gossip.accepted_count -= 1;
-            const entry = gossip.router.cache.find(&id) orelse continue;
-            const data = gossip.router.cache.data(entry);
+            const entry = gossip.accepted_store.find(&id) orelse {
+                gossip.stats.accepted_evicted += 1;
+                continue;
+            };
+            const data = gossip.accepted_store.data(entry);
             const version = gossip.version_of(entry.topic);
+            // The envelope borrows `scratch`, so the stored copy can go now; its bytes are
+            // reclaimed when it reaches the store's head.
+            gossip.accepted_store.forget(entry);
+            assert(gossip.accepted_store.find(&id) == null);
             // Validation already decoded this exact message successfully.
             return block.decode_known_hash(version, data, scratch, payload_hash) catch
                 unreachable;

@@ -45,6 +45,7 @@ const Net = struct {
                 .rollup = &net.rollup,
                 .unsafe_block_signer = signer,
                 .mcache = .{ .entries_max = 64, .arena_bytes = 1 << 20 },
+                .accepted_bytes = 1 << 20,
             }, net.prngs[index].random());
         }
         for (0..nodes) |a| for (a + 1..nodes) |b| net.connect(a, b);
@@ -138,6 +139,32 @@ test "block gossip: a signed block reaches every node and is delivered once" {
         try std.testing.expectEqual(@as(u64, 7), envelope.payload.block_number);
         try std.testing.expect(envelope.payload.block_hash.eql(value.block_hash));
         try std.testing.expect(gossip.pop_block(scratch) == null);
+    }
+}
+
+test "block gossip: a consumer that falls behind loses only the oldest blocks, in order" {
+    const net = try std.testing.allocator.create(Net);
+    defer std.testing.allocator.destroy(net);
+    try net.init();
+    defer net.deinit();
+    for (0..3) |_| try net.heartbeat();
+    const published = 100; // More than the 64 queued blocks, and than the router's cache.
+    for (1..published + 1) |number| {
+        const value = try net.payload(number);
+        _ = try net.gossips[0].publish(net.secret, beacon_root, value, net.now_ns);
+        try net.flush();
+    }
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    for (net.gossips[1..]) |gossip| {
+        try std.testing.expectEqual(@as(u64, published), gossip.stats.accepted);
+        try std.testing.expectEqual(@as(u64, published - 64), gossip.stats.accepted_dropped);
+        var expected: u64 = published - 64 + 1;
+        while (gossip.pop_block(scratch)) |envelope| : (expected += 1) {
+            try std.testing.expectEqual(expected, envelope.payload.block_number);
+        }
+        try std.testing.expectEqual(@as(u64, published + 1), expected);
+        try std.testing.expectEqual(@as(u64, 0), gossip.stats.accepted_evicted);
     }
 }
 

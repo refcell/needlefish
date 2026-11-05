@@ -78,6 +78,7 @@ const Net = struct {
                     .table = .{ .subnet_bucket_max = 0, .subnet_table_max = 0 },
                 },
                 .mcache = .{ .entries_max = 64, .arena_bytes = 1 << 20 },
+                .accepted_bytes = 1 << 20,
                 .ban_enabled = true,
             }, secret, net.records[index], net.prngs[index].random());
         }

@@ -37,6 +37,22 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+  Skipped for now (coordinator, 2026-11-05): no external peer is available; the
+  loopback, in-process, and devnet interop tests cover our own stack end to end.
+- [x] Bounded memory under gossip floods: an authenticated peer floods decodable junk
+  publishes (8 per 10 ms) on the live block topic while 200 ms blocks flow, with topic
+  scoring off (the production default, so junk costs no score) and consensus popping
+  only once a second. Found: accepted blocks lived only in the router's mcache, so
+  junk cycling through its FIFO evicted unpopped accepted blocks and `pop_block`
+  silently skipped them. Fix: accepted blocks are copied (compressed) into their own
+  FIFO store (`handler.Config.accepted_bytes`, default 32 MiB, 64 entries) that only
+  signature-checked blocks enter; new `accepted_evicted` stat. Tests: the flood DST
+  (`transport_test`, failed before the fix) and a slow-consumer unit test
+  (`handler_test`: oldest dropped, the rest in order).
+- [x] Scoring parity: `peers/score.zig` already mirrors base/base `score.rs` formula for
+  formula (thresholds, topic and peer params, `score_decay`); covered by its tests.
+- [x] Req/resp sync at 5 blocks/s: not applicable; base/base has no p2p req/resp
+  (its `gossip/src/rpc` is the admin RPC). Decision below unchanged.
 - [x] Fuzz: hostile bytes on a live, authenticated connection.
   Connection level (`connection_test.zig`): an established pair is snapshotted (struct +
   backing memory + the dialer's noise transport) and rewound per input; the dialer seals
@@ -461,3 +477,4 @@ behind a small interface and switch later.
 - 2026-11-05: real-socket loopback interop (IPv4+IPv6, kqueue+io_uring); fixed republish crash.
 - 2026-11-05: hostile in-session discv5 fuzz (seeded + run_bytes).
 - 2026-11-05: direction change (no flashblocks, 200 ms blocks): Denim gossip DST added; nothing to remove.
+- 2026-11-05: gossip flood DST found accepted blocks evictable by junk; added a dedicated accepted-block store.
