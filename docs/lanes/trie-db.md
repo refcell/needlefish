@@ -80,9 +80,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] (blocked: base/base commits no reth witness fixtures and running reth is out of scope)
   Byte-compare our `debug_executionWitness` against reth's output for public fixture blocks;
   revisit when public fixtures exist. Meanwhile: the `witness-diff` port below.
-- [ ] `witness-diff` tool (port of base/base `etc/tools/witness-diff`): compare two witness
+- [x] `witness-diff` tool (port of base/base `etc/tools/witness-diff`): compare two witness
   JSON files (or one file vs a node's `debug_executionWitness`), report differing trie nodes,
   codes, keys, and the accounts/slots whose leaves diverge.
+  (`db/witness_diff.zig` + `db/witness_diff_test.zig`, binary `bin/witness-diff/main.zig`:
+  `witness-diff --local FILE (--remote FILE | --rpc-url URL --block N)`)
 - [x] Witness generator memory: default limits allocate ~40-60 MB at node start even if
   `debug_executionWitness` is never called; size from limits more tightly or allocate through
   `utilities.lazy_alloc` (node lane pattern). Large witnesses can exceed the 1 MiB HTTP buffer.
@@ -384,6 +386,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   ancestors is not a forgery). Failures are `error.InvalidHeaderChain` (`witness.Error`). The
   builder's scratch is unbound (private `clear`), since it never serves BLOCKHASH.
 
+- witness-diff (base/base `etc/tools/witness-diff`): library `db/witness_diff.zig` is pure
+  (parse, diff, render to a `std.Io.Writer`); the binary does file/HTTP IO. Parser accepts
+  the `result` object or a whole JSON-RPC response (`error` -> `RpcError`), each list as an
+  array, a hash-keyed object (older reth maps; keys recomputed), null, or absent. Keys are
+  normalized: reth's RLP `0x94 ++ address` / `0xa0 ++ slot` become raw 20/32 bytes, so ours
+  and reth's compare equal; other keys over 32 bytes are rejected. Sets compare by keccak256
+  of distinct items, as the reference. Leaf attribution walks each witness's account trie
+  from its own pre-state root (last header's state root if present, else the only
+  decodable unreferenced node; ambiguous -> walk skipped and reported) and descends into
+  reachable storage tries, so leaves carry full hashed keys (account, slot) instead of the
+  reference's partial-path matching; preimages from both witnesses name addresses/slots.
+  Sections, wording, and exit codes mirror the reference (0 when the diff ran, identical or
+  not; 1 error; 2 usage), labels "local"/"remote", plus listing of one-sided codes/keys and
+  per-walk stats. `--rpc-url` uses `std.http.Client` in the binary (std only, like
+  `bin/base/http_transport.zig`; `utilities.http.client` needs an event loop and caps
+  bodies at 1 MiB). Bounds: tool limits 512Ki nodes/keys, 16Ki codes, 1 GiB input, 1 MiB
+  per item, lazily committed; walk bounded by `leaves_max`, `walk_steps_max`, and a
+  fixed DFS stack (`stack_frames_max`), truncation reported.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -548,3 +569,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   buffer, busy pool), the witness over real HTTP with a 2 KiB send buffer equals the router's
   output byte for byte, over-bound and over-buffer still -32000, the node's large buffers
   reserved but not resident at init.
+- 2026-11-05: witness-diff port: `db/witness_diff.zig` (parser for our/reth JSON shapes,
+  set diff of nodes/codes/keys, account + storage trie walk from the pre-state root naming
+  diverging accounts and slots, stable text report) and `bin/witness-diff`. Tests: identical
+  -> empty, changed storage leaf -> account + slot named, missing code / extra key, leaf only
+  in one walk, parser shapes and errors, `std.testing.fuzz` + seeded mutated-JSON fuzz.
