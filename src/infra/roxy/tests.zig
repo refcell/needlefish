@@ -409,3 +409,33 @@ test "roxy: per-client rate limits, with clients behind a trusted proxy told apa
     try testing.expectEqual(@as(u16, 200), result.status);
     try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_rate_limit.get());
 }
+
+test "roxy: routed methods stay on their upstreams, also across retries" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.routes = try roxy.Routes.parse("eth_sendRawTransaction=2;eth_getProof=0", 3);
+    try harness.init(56, .{ true, true, true }, options);
+    defer harness.deinit();
+    const send = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"eth_sendRawTransaction\"," ++
+        "\"params\":[\"0x00\"]}";
+    for (0..3) |_| {
+        const result = try harness.call("/", send);
+        try testing.expectEqual(@as(u16, 200), result.status);
+    }
+    try testing.expectEqual(@as(u32, 3), harness.upstreams[2].calls);
+    try testing.expectEqual(@as(u32, 0), harness.upstreams[0].calls + harness.upstreams[1].calls);
+    // Unrouted methods spread over every upstream.
+    for (0..3) |_| _ = try harness.call("/", chain_id_body);
+    try testing.expect(harness.upstreams[0].calls > 0 and harness.upstreams[1].calls > 0);
+    // A failing pinned upstream is not retried elsewhere.
+    harness.upstreams[2].mode = .status_500;
+    const before = harness.upstreams[0].calls + harness.upstreams[1].calls;
+    var result = try harness.call("/", send);
+    try testing.expectEqual(@as(u16, 500), result.status);
+    try testing.expectEqual(before, harness.upstreams[0].calls + harness.upstreams[1].calls);
+    // A batch whose routes share no upstream is answered by the proxy.
+    const proof = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"eth_getProof\",\"params\":[]}";
+    result = try harness.call("/", "[" ++ send ++ "," ++ proof ++ "]");
+    try testing.expect(contains(result.text(), "-32600"));
+    try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_route.get());
+}

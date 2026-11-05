@@ -11,6 +11,9 @@ pub const methods = @import("methods.zig");
 pub const pool = @import("pool.zig");
 pub const proxy = @import("proxy.zig");
 pub const rate_limit = @import("rate_limit.zig");
+pub const routes = @import("routes.zig");
+pub const Routes = routes.Routes;
+pub const Mask = pool.Mask;
 
 pub const Allowlist = allowlist.Allowlist;
 pub const Pool = pool.Pool;

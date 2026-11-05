@@ -71,6 +71,8 @@ allocation after startup.
   (after `infra/withdrawer` lands).
 - [ ] `infra/telemetry` EL reachability probe: needs RLPx (ECIES + devp2p Hello), which no
   lane has yet; revisit when execution p2p exists.
+- [x] `infra/roxy` method routing (proxyd `rpc_method_mappings`): `--routes m=0|1;...` pins
+  methods to upstreams (e.g. raw-tx sends to the sequencer); retries stay inside the route.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -105,6 +107,9 @@ allocation after startup.
 - fee-jobs takes its first nonce from `latest` (the shared driver's tag), not base/base's
   `pending`: overlapping runs on one key may replace rather than queue behind each other.
   The key is env-only (`BASE_FEE_JOBS_PRIVATE_KEY`), never a flag.
+- roxy routes: a batch whose methods share no upstream is rejected (-32600) rather than split
+  across upstreams (proxyd splits); splitting needs response reassembly, left for later.
+  A failing pinned upstream is never failed over outside its route.
 - roxy rate limiting keys on the client IP only (no API keys yet); an evicted bucket refills
   to the full burst, so table pressure can only loosen limits, never block a client wrongly.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
@@ -190,3 +195,5 @@ allocation after startup.
 - 2026-11-05: tx_manager `Metrics` (caller-driven, registry entries `tx_manager_*`).
 - 2026-11-05: fee-jobs disburse/process/sweep; live on dev-l1: sweep confirmed at depth 2,
   process skipped on a 0 balance, missing key exits 2.
+- 2026-11-05: roxy method routing (`routes.zig` + fuzz, SimIo test, `--routes`); live: pinned
+  method served by its upstream, a dead pinned upstream returns 502 without failover.

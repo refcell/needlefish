@@ -30,6 +30,7 @@ pub const Spec = struct {
     rate_limit_rps: u32 = 0,
     rate_limit_burst: u32 = 20,
     trusted_proxies: []const u8 = "",
+    routes: []const u8 = "",
 
     pub const help = .{
         .listen_addr = "Address to serve on, IPv4:PORT",
@@ -47,6 +48,7 @@ pub const Spec = struct {
         .rate_limit_rps = "Requests per second per client IP (0: unlimited)",
         .rate_limit_burst = "Requests a client may burst after idling",
         .trusted_proxies = "Comma-separated CIDRs whose X-Forwarded-For is trusted",
+        .routes = "Pin methods to upstreams: m1,m2=0|1;m3=2 (indices into --upstreams)",
     };
 };
 
@@ -102,6 +104,7 @@ pub fn settings_of(spec: Spec) !Settings {
         settings.cidr_count += 1;
     }
     settings.options = options_of(spec, settings.options.allowlist);
+    settings.options.routes = try roxy.Routes.parse(spec.routes, settings.upstream_count);
     settings.options.rate_limit = .{
         .requests_per_s = spec.rate_limit_rps,
         .burst = spec.rate_limit_burst,
@@ -223,6 +226,17 @@ test "roxy: flags to settings" {
     });
     try testing.expectEqual(@as(u32, 2), limited.cidr_count);
     try testing.expectEqual(@as(u32, 50), limited.options.rate_limit.requests_per_s);
+    const routed = try settings_of(.{
+        .upstreams = "http://127.0.0.1:8545,http://127.0.0.1:9545",
+        .routes = "eth_sendRawTransaction=1",
+    });
+    try testing.expectEqual(@as(?roxy.Mask, 0b10), routed.options.routes.mask_for(
+        "eth_sendRawTransaction",
+    ));
+    try testing.expectError(error.UpstreamIndexTooLarge, settings_of(.{
+        .upstreams = "http://127.0.0.1:8545",
+        .routes = "eth_call=1",
+    }));
     try testing.expectError(error.InvalidCidr, settings_of(.{
         .upstreams = "http://127.0.0.1:8545",
         .trusted_proxies = "10.0.0.0/33",

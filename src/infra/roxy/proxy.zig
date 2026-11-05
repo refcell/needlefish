@@ -11,6 +11,9 @@
 //! With a non-empty allowlist every request (and every entry of a batch) is checked before
 //! it is queued: a disallowed method gets JSON-RPC error -32601 without touching upstreams.
 //!
+//! With `routes`, a method may be pinned to some upstreams (retries stay inside that set); a
+//! batch whose methods share no upstream gets JSON-RPC error -32600.
+//!
 //! With `rate_limit.requests_per_s > 0`, each client IP (resolved through `trusted_proxy`,
 //! so clients behind a trusted load balancer are told apart) has a token bucket; a client
 //! over its rate gets 429 and JSON-RPC error -32016 before anything else is checked.
@@ -36,6 +39,7 @@ const methods = @import("methods.zig");
 const Allowlist = @import("allowlist.zig").Allowlist;
 const trusted_proxy = @import("../../utilities/trusted_proxy/root.zig");
 const rate_limit = @import("rate_limit.zig");
+const Routes = @import("routes.zig").Routes;
 
 /// Client buckets tracked at once (about 40 bytes each).
 pub const rate_limit_buckets_max = 4096;
@@ -54,6 +58,8 @@ pub const Options = struct {
     attempts_max: u32 = 3,
     pool: pool_module.Options = .{},
     allowlist: Allowlist = .{},
+    /// Upstream indices refer to `upstreams`.
+    routes: Routes = .{},
     rate_limit: rate_limit.Options = .{},
     /// Proxies whose forwarding header is trusted when resolving the client IP.
     trusted_proxy: trusted_proxy.Config = .{},
@@ -63,7 +69,7 @@ pub const Options = struct {
 };
 
 const label_size_max = 24;
-const metrics_max = 9 + 3 * upstreams_max;
+const metrics_max = 10 + 3 * upstreams_max;
 const content_type_json = [_]http.parser.Header{
     .{ .name = "Content-Type", .value = "application/json" },
 };
@@ -114,6 +120,7 @@ pub fn Proxy(comptime IO: type) type {
         dispatch_again: bool = false,
         /// Scratch for the allowlist check.
         entries: [methods.batch_max]methods.Entry = undefined,
+        entries_count: u32 = 0,
         limiter: ?*Limiter = null,
 
         registry: metrics.Registry(metrics_max) = .{},
@@ -123,6 +130,7 @@ pub fn Proxy(comptime IO: type) type {
         rejected_invalid: metrics.Counter = .{},
         rejected_overload: metrics.Counter = .{},
         rejected_rate_limit: metrics.Counter = .{},
+        rejected_route: metrics.Counter = .{},
         unavailable: metrics.Counter = .{},
         pending: metrics.Gauge = .{},
         upstream_failures: [upstreams_max]metrics.Counter = @splat(.{}),
@@ -235,6 +243,7 @@ pub fn Proxy(comptime IO: type) type {
             try registry.register(rejected_entry("invalid", &proxy.rejected_invalid));
             try registry.register(rejected_entry("overload", &proxy.rejected_overload));
             try registry.register(rejected_entry("rate_limit", &proxy.rejected_rate_limit));
+            try registry.register(rejected_entry("route", &proxy.rejected_route));
             try registry.counter(
                 "roxy_unavailable_total",
                 "Requests answered 502 because every attempt failed.",
@@ -242,7 +251,7 @@ pub fn Proxy(comptime IO: type) type {
             );
             try registry.gauge("roxy_pending", "Requests queued or in flight.", &proxy.pending);
             for (0..count) |index| try proxy.register_upstream(@intCast(index));
-            assert(registry.count == 8 + 3 * count);
+            assert(registry.count == 9 + 3 * count);
         }
 
         fn rejected_entry(comptime reason: []const u8, counter: *metrics.Counter) metrics.Entry {
@@ -349,9 +358,8 @@ pub fn Proxy(comptime IO: type) type {
         ) void {
             assert(request.method == .POST);
             if (proxy.over_rate_limit(request, response)) return;
-            if (!proxy.options.allowlist.allows_all()) {
-                if (proxy.reject_disallowed(request.body, response)) return;
-            }
+            const allowed_upstreams = proxy.inspect(request.body, response) orelse return;
+            assert(allowed_upstreams != 0);
             if (proxy.free_count == 0) {
                 proxy.rejected_overload.increment();
                 return response.fail(503);
@@ -365,6 +373,8 @@ pub fn Proxy(comptime IO: type) type {
                 .token = response.defer_response(),
                 .target = request.target,
                 .body = request.body,
+                // Upstreams outside the route count as tried, so retries stay inside it.
+                .tried = ~allowed_upstreams,
             };
             proxy.requests.increment();
             proxy.queue_push(index);
@@ -388,8 +398,44 @@ pub fn Proxy(comptime IO: type) type {
             return true;
         }
 
+        /// The upstreams that may serve `body`, or null when it was answered here: invalid,
+        /// a disallowed method (in a batch every entry gets an error), or a batch whose routes
+        /// share no upstream. Parses the body only when an allowlist or routes are set.
+        fn inspect(proxy: *Self, body: []const u8, response: *http.ResponseBuilder) ?Mask {
+            const all = pool_module.mask_all(proxy.pool.count);
+            const allows_all = proxy.options.allowlist.allows_all();
+            if (allows_all and proxy.options.routes.empty()) return all;
+            if (!allows_all and proxy.reject_disallowed(body, response)) return null;
+            if (allows_all) {
+                // Not parsed yet: invalid bodies still get the upstream's own error.
+                const summary = methods.extract(body, &proxy.entries) catch return all;
+                return proxy.route_mask(proxy.entries[0..summary.count], response);
+            }
+            return proxy.route_mask(proxy.entries[0..proxy.entries_count], response);
+        }
+
+        fn route_mask(
+            proxy: *Self,
+            entries: []const methods.Entry,
+            response: *http.ResponseBuilder,
+        ) ?Mask {
+            assert(entries.len > 0);
+            const all = pool_module.mask_all(proxy.pool.count);
+            var mask = all;
+            for (entries) |*entry| {
+                const name = entry.name() orelse continue;
+                mask &= proxy.options.routes.mask_for(name) orelse all;
+            }
+            if (mask != 0) return mask;
+            proxy.rejected_route.increment();
+            const message = "batch mixes methods routed to different upstreams";
+            methods.write_error(response.writer(), "null", rpc.code.invalid_request, message) catch
+                response.fail(500);
+            return null;
+        }
+
         /// Answers a request that is invalid or calls a disallowed method; returns true if it
-        /// did. In a batch with a disallowed method every entry gets an error.
+        /// did. Leaves the extracted entries in `entries[0..entries_count]`.
         fn reject_disallowed(
             proxy: *Self,
             body: []const u8,
@@ -406,6 +452,7 @@ pub fn Proxy(comptime IO: type) type {
                 methods.write_error(out, "null", code, message) catch response.fail(500);
                 return true;
             };
+            proxy.entries_count = summary.count;
             const entries = proxy.entries[0..summary.count];
             var disallowed: u32 = 0;
             for (entries) |*entry| disallowed += @intFromBool(!proxy.allowed(entry));
