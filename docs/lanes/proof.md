@@ -33,10 +33,13 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/driver` + `proof/client`: prologue / derive-and-execute loop to the claimed
   L2 block / epilogue that compares the computed output root with the claim (port
   `driver/src/*`, `client/src/*`). End-to-end test with an in-memory recorded oracle.
-- [ ] `proof/e2e`: record a real oracle (sim or devnet: L1 with batcher frames, L2 blocks
-  and witnesses) and run the client through derive + execute of several blocks, checking
-  the claimed output root; include a Holocene deposit-only retry case. (The current client
-  test covers boot, safe head, providers, pipeline reset and L1 exhaustion only.)
+- [x] `proof/e2e`: node-built L2 blocks (derived attributes + user transfers), batcher
+  frames signed to the inbox on L1, everything served through the host handler from an
+  empty store; the client derives + executes to the claim and matches the node's output
+  root (`client/e2e_test.zig`).
+- [ ] `proof/e2e-2`: extend the e2e: epoch change across L1 blocks, span batches, blob
+  batches (l1-blob through the host), a Holocene deposit-only retry (invalid user tx in a
+  batch), and intermediate output roots (boot key 9).
 - [ ] `proof/host`: KV stores (mem, disk via io, split, boot), online backend that
   serves hints by fetching from L1/L2/beacon RPC and records preimages, offline backend
   that replays them, server loop over the preimage channel (port `host/src/*`).
@@ -105,6 +108,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/e2e` landed: real derive + execute of 3 L2 blocks through the host.
 - 2026-11-05: host: hint handler over a chain `Source` (headers, list tries, blobs,
   code/state nodes, payload witness); providers served from an empty store in tests.
 - 2026-11-05: host: preimage `Store` (keccak, ordered list tries via the new trie

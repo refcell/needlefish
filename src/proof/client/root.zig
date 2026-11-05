@@ -13,4 +13,5 @@ pub const claim_holds = client.claim_holds;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("client_test.zig");
+    _ = @import("e2e_test.zig");
 }
