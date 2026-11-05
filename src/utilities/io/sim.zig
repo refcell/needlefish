@@ -437,6 +437,7 @@ pub const SimIo = struct {
         callback: *const fn (?*anyopaque, *Completion) void = undefined,
         next: ?*Completion = null,
         ready_ns: u64 = 0,
+        canceled: bool = false,
     };
     pub const Fd = FdSim;
 
@@ -614,6 +615,14 @@ pub const SimIo = struct {
         }
     }
 
+    /// See `common` for the contract. The operation completes with `error.Canceled` on the
+    /// next tick unless it is already finished.
+    pub fn cancel(io: *SimIo, target: *Completion) void {
+        _ = io;
+        if (!common.cancelable(FdSim, target.operation)) return;
+        target.canceled = true;
+    }
+
     pub fn reset_connection(io: *SimIo, fd: Fd) void {
         const descriptor = io.descriptors[fd];
         assert(descriptor == .stream);
@@ -622,6 +631,7 @@ pub const SimIo = struct {
 
     pub fn enqueue(io: *SimIo, completion: *Completion) void {
         assert(completion.next == null);
+        completion.canceled = false;
         const world = io.world;
         completion.ready_ns = switch (completion.operation) {
             .none => unreachable,
@@ -687,7 +697,9 @@ pub const SimIo = struct {
         var next: ?u64 = null;
         var cursor = io.pending_head;
         while (cursor) |completion| : (cursor = completion.next) {
-            const event_ns: ?u64 = switch (completion.operation) {
+            const event_ns: ?u64 = if (completion.canceled)
+                now_ns
+            else switch (completion.operation) {
                 .recv => |op| io.recv_next_ns(op.socket),
                 .accept, .send => null,
                 else => completion.ready_ns,
@@ -710,6 +722,10 @@ pub const SimIo = struct {
     }
 
     fn try_complete(io: *SimIo, completion: *Completion) bool {
+        if (completion.canceled) {
+            completion.result = common.canceled_result(FdSim, completion.operation);
+            return true;
+        }
         const now_ns = io.world.now_ns;
         switch (completion.operation) {
             .none => unreachable,

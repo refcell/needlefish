@@ -26,6 +26,8 @@ const linux = std.os.linux;
 const entries_default = 256;
 const cqes_batch_max = 256;
 const loop_iterations_max = 1 << 20;
+/// `user_data` of cancel SQEs. Completions are never at address zero.
+const cancel_user_data: u64 = 0;
 
 fn Queue(comptime Completion: type) type {
     return struct {
@@ -49,6 +51,34 @@ fn Queue(comptime Completion: type) type {
             completion.next = null;
             queue.count -= 1;
             return completion;
+        }
+
+        /// Unlinks `target` if queued. O(n); used only by `cancel`.
+        fn remove(queue: *Self, target: *Completion) bool {
+            var previous: ?*Completion = null;
+            var cursor = queue.head;
+            var budget = queue.count;
+            while (cursor) |completion| : (budget -= 1) {
+                assert(budget > 0);
+                if (completion == target) {
+                    if (previous) |p| p.next = completion.next else queue.head = completion.next;
+                    if (queue.tail == completion) queue.tail = previous;
+                    completion.next = null;
+                    queue.count -= 1;
+                    return true;
+                }
+                previous = completion;
+                cursor = completion.next;
+            }
+            return false;
+        }
+
+        fn contains(queue: *const Self, target: *const Completion) bool {
+            var cursor = queue.head;
+            while (cursor) |completion| : (cursor = completion.next) {
+                if (completion == target) return true;
+            }
+            return false;
         }
     };
 }
@@ -84,6 +114,8 @@ const LinuxIoUring = struct {
     completed: Queue(Completion) = .{},
     /// SQEs submitted to the kernel whose CQE has not been reaped.
     in_kernel: u32 = 0,
+    /// In-kernel operations whose cancel SQE did not fit in the SQ yet.
+    to_cancel: Queue(Completion) = .{},
 
     pub const Options = struct { entries: u16 = entries_default };
 
@@ -153,6 +185,24 @@ const LinuxIoUring = struct {
         os.close(fd);
     }
 
+    /// See `common` for the contract. Operations still waiting for SQ space are unlinked;
+    /// in-kernel ones get an `IORING_OP_ASYNC_CANCEL` (user_data 0, its CQE is ignored) and
+    /// report `-ECANCELED` through their own CQE.
+    pub fn cancel(io: *LinuxIoUring, target: *Completion) void {
+        if (!common.cancelable(Fd, target.operation)) return;
+        if (io.completed.contains(target) or io.to_cancel.contains(target)) return;
+        if (io.unqueued.remove(target)) {
+            target.result = common.canceled_result(Fd, target.operation);
+            io.completed.push(target);
+            return;
+        }
+        io.prepare_cancel(target) catch io.to_cancel.push(target);
+    }
+
+    fn prepare_cancel(io: *LinuxIoUring, target: *Completion) error{SubmissionQueueFull}!void {
+        _ = try io.ring.cancel(cancel_user_data, @intFromPtr(target), 0);
+    }
+
     pub fn enqueue(io: *LinuxIoUring, completion: *Completion) void {
         assert(completion.operation != .none);
         io.prepare(completion) catch |err| switch (err) {
@@ -193,7 +243,15 @@ const LinuxIoUring = struct {
         };
         io.in_kernel += submitted;
         io.reap();
-        // Retry overflowed operations now that SQ space has been freed.
+        // Retry deferred cancels and overflowed operations now that SQ space has been freed.
+        var cancels = io.to_cancel.count;
+        while (cancels > 0) : (cancels -= 1) {
+            const target = io.to_cancel.pop().?;
+            io.prepare_cancel(target) catch {
+                io.to_cancel.push(target);
+                break;
+            };
+        }
         var budget = io.unqueued.count;
         while (budget > 0) : (budget -= 1) {
             const completion = io.unqueued.pop().?;
@@ -211,9 +269,12 @@ const LinuxIoUring = struct {
             const count = io.ring.copy_cqes(&cqes, 0) catch return;
             if (count == 0) return;
             for (cqes[0..count]) |cqe| {
-                const completion: *Completion = @ptrFromInt(cqe.user_data);
                 assert(io.in_kernel > 0);
                 io.in_kernel -= 1;
+                // Cancel requests report only whether they found the target; ignore them.
+                if (cqe.user_data == cancel_user_data) continue;
+                const completion: *Completion = @ptrFromInt(cqe.user_data);
+                if (io.to_cancel.count > 0) _ = io.to_cancel.remove(completion);
                 io.store_result(completion, cqe);
             }
         }

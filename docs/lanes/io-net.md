@@ -13,7 +13,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [x] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [x] Linux CI coverage for io_uring (`just test-linux`).
-- [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
+- [x] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
   server can stop with an accept in flight and a client can abandon a request on timeout.
 - [x] `http`: per-connection idle/read timeouts on the server; request timeout on client.
 
@@ -51,6 +51,10 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - Timeouts are driven by the owner calling `tick()` from its loop; expired sockets are
   `shutdown_now`-ed so their pending op completes and normal teardown runs. No timers are
   left in flight, which avoids needing `cancel` for teardown.
+- `cancel(target)` is synchronous with no completion of its own; the target's callback
+  runs exactly once (Canceled or its real result). io_uring uses ASYNC_CANCEL with
+  user_data 0 (CQE ignored) and a deferred queue when the SQ is full; kqueue unlinks queued
+  ops or EV_DELETEs parked kevents synchronously; SimIo flags the completion.
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -76,3 +80,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: http: server idle/io timeouts and client request timeout via tick() + shutdown_now; SimIo tests.
 - 2026-11-05: test-linux (io_uring, Docker): 1040/1047 pass incl. ws/shutdown; fixed a timing-flaky file test (waits for each callback instead of a fixed 1 ms).
 - 2026-11-05: `-Drequire-io-uring=true` (CI ubuntu + `just test-linux`) turns io_uring-unavailable skips into failures; shared `io.init_for_test()`. test-linux green with it.
+- 2026-11-05: io: `cancel` on io_uring/kqueue/SimIo; tests for timeout/accept/recv cancel and completion reuse, green on io_uring in Docker.

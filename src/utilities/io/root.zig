@@ -76,4 +76,5 @@ test {
     _ = @import("sim_test.zig");
     _ = @import("os_test.zig");
     _ = @import("shutdown_test.zig");
+    _ = @import("cancel_test.zig");
 }

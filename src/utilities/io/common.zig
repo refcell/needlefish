@@ -6,6 +6,10 @@
 //! context pointer, and the callback runs from `tick()` / `run_for_ns()` once the
 //! operation finishes. A completion must stay alive and untouched until its callback runs;
 //! the callback may immediately reuse it for the next operation.
+//!
+//! `cancel(target)` asks for an in-flight operation to finish early. The target's callback
+//! still runs exactly once, from a later `tick`: with `error.Canceled` if it had not finished,
+//! or with its real result if it had. Canceling an idle completion or a `close` does nothing.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -223,6 +227,29 @@ pub fn Result(comptime Fd: type) type {
         fsync: FsyncError!void,
         timeout: TimeoutError!void,
         close: CloseError!void,
+    };
+}
+
+/// The result a canceled operation reports. `close` cannot be canceled.
+pub fn canceled_result(comptime Fd: type, operation: Operation(Fd)) Result(Fd) {
+    return switch (operation) {
+        .none, .close => unreachable,
+        .accept => .{ .accept = error.Canceled },
+        .connect => .{ .connect = error.Canceled },
+        .recv => .{ .recv = error.Canceled },
+        .send => .{ .send = error.Canceled },
+        .read => .{ .read = error.Canceled },
+        .write => .{ .write = error.Canceled },
+        .fsync => .{ .fsync = error.Canceled },
+        .timeout => .{ .timeout = error.Canceled },
+    };
+}
+
+/// Whether `cancel` applies to a completion in this state: in flight and not a close.
+pub fn cancelable(comptime Fd: type, operation: Operation(Fd)) bool {
+    return switch (operation) {
+        .none, .close => false,
+        else => true,
     };
 }
 

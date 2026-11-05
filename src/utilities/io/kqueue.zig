@@ -52,6 +52,34 @@ fn Queue(comptime Completion: type) type {
             queue.count -= 1;
             return completion;
         }
+
+        /// Unlinks `target` if queued. O(n); used only by `cancel`.
+        fn remove(queue: *Self, target: *Completion) bool {
+            var previous: ?*Completion = null;
+            var cursor = queue.head;
+            var budget = queue.count;
+            while (cursor) |completion| : (budget -= 1) {
+                assert(budget > 0);
+                if (completion == target) {
+                    if (previous) |p| p.next = completion.next else queue.head = completion.next;
+                    if (queue.tail == completion) queue.tail = previous;
+                    completion.next = null;
+                    queue.count -= 1;
+                    return true;
+                }
+                previous = completion;
+                cursor = completion.next;
+            }
+            return false;
+        }
+
+        fn contains(queue: *const Self, target: *const Completion) bool {
+            var cursor = queue.head;
+            while (cursor) |completion| : (cursor = completion.next) {
+                if (completion == target) return true;
+            }
+            return false;
+        }
     };
 }
 
@@ -149,6 +177,55 @@ const KqueueImpl = struct {
         os.close(fd);
     }
 
+    /// See `common` for the contract. Queued operations are unlinked; parked ones have their
+    /// kevent removed synchronously, so the kernel never reports them afterwards.
+    pub fn cancel(io: *KqueueImpl, target: *Completion) void {
+        if (!common.cancelable(Fd, target.operation)) return;
+        if (io.completed.contains(target)) return; // Finished; its real result stands.
+        const removed = io.unqueued.remove(target) or io.timeouts.remove(target);
+        if (!removed) io.unpark(target);
+        target.result = common.canceled_result(Fd, target.operation);
+        io.completed.push(target);
+    }
+
+    fn unpark(io: *KqueueImpl, target: *Completion) void {
+        assert(io.parked_count > 0);
+        io.parked_count -= 1;
+        const udata = @intFromPtr(target);
+        for (io.changes[0..io.changes_count], 0..) |change, index| {
+            if (change.udata != udata) continue;
+            // Not registered yet: drop the pending change (order is irrelevant).
+            io.changes_count -= 1;
+            io.changes[index] = io.changes[io.changes_count];
+            return;
+        }
+        const fd: Fd, const filter: i16 = park_target(target);
+        const change: [1]os.system.Kevent = .{.{
+            .ident = @intCast(fd),
+            .filter = filter,
+            .flags = os.system.EV.DELETE,
+            .fflags = 0,
+            .data = 0,
+            .udata = udata,
+        }};
+        var none: [0]os.system.Kevent = .{};
+        const zero: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+        // ENOENT (descriptor already closed, knote gone) leaves the same end state.
+        _ = os.system.kevent(io.kq, &change, 1, &none, 0, &zero);
+    }
+
+    fn park_target(completion: *const Completion) struct { Fd, i16 } {
+        const read_filter: i16 = os.system.EVFILT.READ;
+        const write_filter: i16 = os.system.EVFILT.WRITE;
+        return switch (completion.operation) {
+            .accept => |op| .{ op.socket, read_filter },
+            .recv => |op| .{ op.socket, read_filter },
+            .connect => |op| .{ op.socket, write_filter },
+            .send => |op| .{ op.socket, write_filter },
+            else => unreachable, // Only socket operations can block.
+        };
+    }
+
     pub fn enqueue(io: *KqueueImpl, completion: *Completion) void {
         assert(completion.operation != .none);
         if (completion.operation == .timeout) {
@@ -241,15 +318,7 @@ const KqueueImpl = struct {
     }
 
     fn park(io: *KqueueImpl, completion: *Completion) void {
-        const read_filter: i16 = os.system.EVFILT.READ;
-        const write_filter: i16 = os.system.EVFILT.WRITE;
-        const fd: Fd, const filter: i16 = switch (completion.operation) {
-            .accept => |op| .{ op.socket, read_filter },
-            .recv => |op| .{ op.socket, read_filter },
-            .connect => |op| .{ op.socket, write_filter },
-            .send => |op| .{ op.socket, write_filter },
-            else => unreachable, // Only socket operations can block.
-        };
+        const fd: Fd, const filter: i16 = park_target(completion);
         if (io.changes_count == io.changes.len) {
             // Change list full: retry next tick instead of dropping the operation.
             io.unqueued.push(completion);
