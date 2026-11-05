@@ -197,3 +197,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `1m`, bare seconds): "nonce too high" schedules a re-send of the same signed tx from
   `poll` (step machine, no sleeping); once exhausted the error surfaces and the slot falls
   back to normal resubmission. Previously such a tx waited a full resubmission period.
+- 2026-11-05: devnet `up` started while another lane's devnet held :8545; our components
+  died with AddressInUse, `up` still said "up" and `smoke` passed against the other devnet.
+  `up` now refuses a cold start while any devnet port is taken and fails when a component
+  exits during startup. Re-ran smoke on our own devnet (a2d588d): all checks pass.

@@ -33,6 +33,9 @@ scripts) and the lanes that own each binary. If you change a flag or port here, 
 | L2 verifier EL | `base node` | http 10545, engine 10551 | `.devnet/ver-el` |
 | L2 verifier CL | `base consensus` | rpc 8547 | `.devnet/ver-cl` |
 
+The ports are fixed, so one devnet runs per machine: a cold `up` refuses to start while
+any of them is taken, and `up` fails if a component exits during startup.
+
 L1 contracts are placed in the L1 genesis alloc (no deployment step): a minimal
 deposit portal at `0x000000000000000000000000000000000000de90` (any call deposits
 `msg.value` to `msg.sender` on L2, see `src/batcher/devnet/portal.zig`) and the system

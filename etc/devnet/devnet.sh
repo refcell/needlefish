@@ -66,10 +66,38 @@ wait_rpc() {
 
 genesis_hash() { rpc "$1" eth_getBlockByNumber '["0x0",false]' | json_field hash; }
 
+# The devnet uses fixed ports, so only one runs per machine. A cold `up` refuses to start
+# when one is taken: otherwise our components die with AddressInUse and `smoke` silently
+# checks whichever devnet owns the ports.
+ports_free() {
+  local name port taken=0
+  for name in $COMPONENTS; do pid_alive "$name" && return 0; done
+  for port in "$PORT_L1_HTTP" "$PORT_L1_BEACON" "$PORT_SEQUENCER_HTTP" \
+    "$PORT_SEQUENCER_ENGINE" "$PORT_SEQUENCER_RPC" "$PORT_VERIFIER_HTTP" \
+    "$PORT_VERIFIER_ENGINE" "$PORT_VERIFIER_RPC" "$PORT_BATCHER_METRICS"; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      log "port $port is in use (another devnet?)"; taken=1
+    fi
+  done
+  [ "$taken" = 0 ] || { log "not starting: free the ports above first"; exit 1; }
+}
+
+# Fails `up` when a component exited during startup (a port clash, a bad flag).
+all_alive() {
+  local name dead=0
+  for name in $COMPONENTS; do
+    if [ -f "$DIR/pids/$name.pid" ] && ! pid_alive "$name"; then
+      log "$name exited during startup:"; tail -n 3 "$DIR/logs/$name.log" >&2; dead=1
+    fi
+  done
+  [ "$dead" = 0 ] || { log "up failed; 'just devnet down' cleans up"; exit 1; }
+}
+
 up() {
   zig build -Doptimize="${DEVNET_OPTIMIZE:-ReleaseSafe}"
   fresh_state
   env_load
+  ports_free
   local l1="http://127.0.0.1:$PORT_L1_HTTP"
   local seq_el="http://127.0.0.1:$PORT_SEQUENCER_HTTP"
   local ver_el="http://127.0.0.1:$PORT_VERIFIER_HTTP"
@@ -82,6 +110,8 @@ up() {
   start batcher batcher --rollup-config "$DIR/rollup.json" --l1 "$l1" \
     --sequencer-urls "$seq_el=http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
     --metrics.port "$PORT_BATCHER_METRICS"
+  sleep 1
+  all_alive
   log "up; 'just devnet status' to inspect, 'just devnet smoke' to verify"
 }
 
