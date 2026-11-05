@@ -512,6 +512,27 @@ pub const cases = [_]Case{
         .iterations = 50,
         .run = kzg_bench.verify_blob_kzg_proof_batch_6,
     },
+    .{ .name = "kzg/compute_cells", .iterations = 20, .run = kzg_bench.compute_cells },
+    .{
+        .name = "kzg/compute_cells_and_kzg_proofs",
+        .iterations = 5,
+        .run = kzg_bench.compute_cells_and_kzg_proofs,
+    },
+    .{
+        .name = "kzg/verify_cell_kzg_proof_batch (1)",
+        .iterations = 100,
+        .run = kzg_bench.verify_cell_kzg_proof_batch_1,
+    },
+    .{
+        .name = "kzg/verify_cell_kzg_proof_batch (128)",
+        .iterations = 10,
+        .run = kzg_bench.verify_cell_kzg_proof_batch_128,
+    },
+    .{
+        .name = "kzg/recover_cells_and_kzg_proofs (64)",
+        .iterations = 5,
+        .run = kzg_bench.recover_cells_and_kzg_proofs,
+    },
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
     .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },

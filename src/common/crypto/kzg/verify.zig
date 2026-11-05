@@ -70,8 +70,9 @@ pub fn verify_kzg_proof_points(
     return pairing_check_fixed_g2(left, proof);
 }
 
-/// Miller loop lines of the two fixed G2 points, computed at compile time.
-const prepared_generator: bls.pairing.PreparedG2 = blk: {
+/// Miller loop lines of the two fixed G2 points, computed at compile time (the generator
+/// lines are shared with the EIP-7594 cell verifier).
+pub const prepared_generator: bls.pairing.PreparedG2 = blk: {
     @setEvalBranchQuota(100_000_000);
     break :blk bls.pairing.prepare(bls.g2.generator);
 };

@@ -209,6 +209,35 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
   checked against the setup in tests. Vectors: all 114 fixed-length c-kzg-4844
   verify_kzg_proof cases (the 8 wrong-length ones cannot occur through the precompile).
 
+- EIP-7594 cells (`kzg/cells.zig`, re-exported as `kzg.cells`): spec names
+  `compute_cells`, `compute_cells_and_kzg_proofs`, `verify_cell_kzg_proof_batch`,
+  `recover_cells_and_kzg_proofs` (+ `recover_cells` without proofs). No allocation:
+  `Settings.Storage` (~1.15 MiB: 8193 roots of the order-8192 domain, 64 monomial G1
+  points, prepared [tau^64]G2 lines, FK20 tables 128 x 64 affine points) and `Workspace`
+  (~1.1 MiB) come from the caller; `Settings.init_verifier` skips the FK20 tables.
+  Verification batch scratch is caller-provided (`VerifyStorage(n)`, ~240 B per cell).
+  Malformed input (length mismatch, index >= 128, non-canonical element, invalid point)
+  is an error, never `false`, as in c-kzg; every proof, commitment, and cell is validated
+  before hashing. Recovery requires strictly ascending indices (spec) and recomputes all
+  cells from the degree < 4096 polynomial even when all 128 cells are given (spec; c-kzg
+  copies them through, which only differs for inconsistent inputs).
+- FFTs (`kzg/fft.zig`) are iterative radix-2 (bit-reversal permutation + log2 n passes), in
+  place, any power of two up to 8192 by striding the shared root table. G1 FFT butterflies
+  use GLV scalar multiplication and skip the unit twiddle. FK20 follows c-kzg `fk20.c`
+  (circulant size 128, the 1/128 of the inverse G1 FFT folded into the MSM scalars); the
+  128 per-row MSMs use the generic `msm.msm` (64 points each); c-kzg's optional fixed-base
+  tables (`wbits`, 96 MiB at 8 bits) are not implemented.
+- EIP-7594 vectors: c-kzg-4844 `tests/{compute_cells,compute_cells_and_kzg_proofs,
+  verify_cell_kzg_proof_batch,recover_cells_and_kzg_proofs,
+  compute_verify_cell_kzg_proof_batch_challenge}` curated into `kzg/cell_vectors.txt`
+  (155 KiB): cells are references into the cells of the seven blobs already committed in
+  `blob_vectors.bin` (checked against the sha256 of each vector's full cell output), proofs
+  are stored in full. Covered: all 7+4 compute cases (wrong-length blobs map to the
+  synthetic invalid blobs; the type makes other lengths impossible), all 32 verify cases,
+  all 18 recover cases, 8 of 10 challenge cases (the two ~1 MB ones are dropped; the
+  128-cell verify cases exercise the same hash). Debug runs cells, recovery of cells, and
+  small verify batches; FK20 proofs and 128-cell batches run in ReleaseSafe/ReleaseFast.
+
 - montgomery.mul accumulates each row as two straight carry chains (low halves, then high
   halves) instead of per-limb u128 multiply-add; the old form made LLVM spill NZCV
   (mrs/msr) and use adds+cinc pairs on AArch64.
@@ -283,3 +312,7 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: p256 verify: safegcd s^-1 (was Fermat), affine Q table via one shared inversion + mixed adds: 50.7->47.7us.
 - 2026-11-05: safegcd Wide rounded to whole words (i318 -> i320); secp256k1 switched to the generic safegcd (ecrecover 28.5us, unchanged) and modinv.zig removed.
 - 2026-11-05: coverage fuzz pass (ReleaseSafe): keccak 1.4M runs; sha256, ripemd160, blake2f, modexp, secp256k1, p256, kzg verify/framing/blob, safegcd, montgomery, bls precompile 20K each (bn254 shares the bls filter name): no failures.
+- 2026-11-05: kzg EIP-7594 cells: G1 monomial setup, Fr/G1 FFT, FK20 compute_cells_and_kzg_proofs,
+  verify_cell_kzg_proof_batch, recover_cells_and_kzg_proofs; all c-kzg vectors (see Decisions).
+  Bench (ReleaseFast, M4 Pro, loaded host): compute_cells 1.38 ms, compute_cells_and_kzg_proofs
+  189 ms, verify batch 1 cell 2.11 ms / 128 cells 13.7 ms, recover from 64 cells + proofs 207 ms.

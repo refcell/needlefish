@@ -117,6 +117,10 @@ pub const verify = @import("verify.zig");
 pub const verify_kzg_proof = verify.verify_kzg_proof;
 pub const blob = @import("blob.zig");
 pub const fft = @import("fft.zig");
+pub const fk20 = @import("fk20.zig");
+/// EIP-7594 cells: `compute_cells`, `compute_cells_and_kzg_proofs`,
+/// `verify_cell_kzg_proof_batch`, `recover_cells_and_kzg_proofs`.
+pub const cells = @import("cells.zig");
 pub const bench = @import("bench.zig");
 pub const precompile_point_evaluation = verify.precompile_point_evaluation;
 
