@@ -324,6 +324,34 @@ fn fp_from_u256(value: u256) Fp {
 }
 
 /// u1 * G + u2 * Q in one interleaved wNAF pass (variable time).
+/// Q, 3Q, ..., 15Q in affine form with one shared inversion (Montgomery's trick).
+/// The group has prime order, so no multiple below n is the identity.
+fn odd_multiples_affine(q: Affine) [q_table_len]Affine {
+    var jacobian: [q_table_len]Point = undefined;
+    jacobian[0] = Point.from_affine(q);
+    const q_double = double(jacobian[0]);
+    for (1..q_table_len) |index| jacobian[index] = add(jacobian[index - 1], q_double);
+    var prefix: [q_table_len]Fp = undefined;
+    prefix[0] = jacobian[0].z;
+    for (1..q_table_len) |index| prefix[index] = prefix[index - 1].mul(jacobian[index].z);
+    assert(!prefix[q_table_len - 1].is_zero());
+    var inverse = prefix[q_table_len - 1].inverse();
+    var table: [q_table_len]Affine = undefined;
+    var index: usize = q_table_len;
+    while (index > 0) {
+        index -= 1;
+        const z_inverse = if (index > 0) inverse.mul(prefix[index - 1]) else inverse;
+        inverse = inverse.mul(jacobian[index].z);
+        const z_inverse_squared = z_inverse.square();
+        table[index] = .{
+            .x = jacobian[index].x.mul(z_inverse_squared),
+            .y = jacobian[index].y.mul(z_inverse_squared).mul(z_inverse),
+        };
+    }
+    assert(is_on_curve(table[q_table_len - 1].x, table[q_table_len - 1].y));
+    return table;
+}
+
 fn double_scalar_mul(u1_int: u256, u2_int: u256, q: Affine) Point {
     assert(u1_int < n_int and u2_int < n_int);
     assert(is_on_curve(q.x, q.y));
@@ -332,10 +360,7 @@ fn double_scalar_mul(u1_int: u256, u2_int: u256, q: Affine) Point {
     const g_count = wnaf(g_window, u1_int, &g_digits);
     const q_count = wnaf(q_window, u2_int, &q_digits);
 
-    var q_table: [q_table_len]Point = undefined;
-    q_table[0] = Point.from_affine(q);
-    const q_double = double(q_table[0]);
-    for (1..q_table_len) |index| q_table[index] = add(q_table[index - 1], q_double);
+    const q_table = odd_multiples_affine(q);
 
     var acc = Point.identity;
     var position = @max(g_count, q_count);
@@ -350,34 +375,12 @@ fn double_scalar_mul(u1_int: u256, u2_int: u256, q: Affine) Point {
         }
         const q_digit = q_digits[position];
         if (q_digit > 0) {
-            acc = add(acc, q_table[@intCast(q_digit >> 1)]);
+            acc = add_mixed(acc, q_table[@intCast(q_digit >> 1)]);
         } else if (q_digit < 0) {
-            acc = add(acc, negate(q_table[@intCast((-q_digit) >> 1)]));
+            acc = add_mixed(acc, negate_affine(q_table[@intCast((-q_digit) >> 1)]));
         }
     }
     return acc;
-}
-
-/// a^-1 for a != 0 using fixed 4-bit windows over the public exponent p - 2.
-fn invert(comptime F: type, a: F) F {
-    assert(!a.is_zero());
-    var table: [16]F = undefined;
-    table[0] = F.one;
-    table[1] = a;
-    for (2..16) |index| table[index] = table[index - 1].mul(a);
-    const exponent = F.modulus - 2;
-    var result = F.one;
-    var nibble_index: u32 = F.bits / 4;
-    while (nibble_index > 0) {
-        nibble_index -= 1;
-        const nibble: usize = @intCast((exponent >> @intCast(4 * nibble_index)) & 15);
-        if (nibble_index + 1 != F.bits / 4) {
-            result = result.square().square().square().square();
-        }
-        if (nibble != 0) result = result.mul(table[nibble]);
-    }
-    assert(result.mul(a).eql(F.one));
-    return result;
 }
 
 fn read_int(bytes: *const [32]u8) u256 {
@@ -400,7 +403,7 @@ pub fn verify(
     if (x.is_zero() and y.is_zero()) return false;
     if (!is_on_curve(x, y)) return false;
 
-    const s_inverse = invert(Fn, Fn.from_int(s_int));
+    const s_inverse = Fn.from_int(s_int).inverse();
     const u1_int = Fn.from_int(read_int(&hash)).mul(s_inverse).to_int();
     const u2_int = Fn.from_int(r_int).mul(s_inverse).to_int();
     const result = double_scalar_mul(u1_int, u2_int, .{ .x = x, .y = y });
@@ -441,7 +444,7 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 fn to_affine(p: Point) Affine {
     assert(!p.is_identity());
-    const z_inverse = invert(Fp, p.z);
+    const z_inverse = p.z.inverse();
     const z_inverse_squared = z_inverse.square();
     return .{ .x = p.x.mul(z_inverse_squared), .y = p.y.mul(z_inverse_squared).mul(z_inverse) };
 }

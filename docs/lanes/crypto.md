@@ -17,7 +17,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [x] modexp: faster inner loops for moduli > 512 bits (4-way unrolled row MAC): 2048b full exp
   2.60->1.87ms, 4096b 22.3->15.8ms.
-- [ ] modexp: window 6 above ~700 exponent bits; Karatsuba squaring above ~32 limbs.
+- [x] modexp window 6 / Karatsuba squaring: closed by analysis (window 6 saves ~1.3% of
+  multiplications at 2048 bits for 2x table scratch; Karatsuba only pays above 2048-bit moduli).
 - [x] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
 - [x] bn254 perf: lazy-reduction Fp2 (pairing 559->494us). Precomputed G2 lines do not apply
   (EVM pairing inputs are variable); Fp6-level lazy reduction does not fit (4p^2 headroom only).
@@ -250,3 +251,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: tried replacing secp256k1/modinv.zig with generic safegcd.Modulus(u256, ...): ecrecover 28.6->31.7us (same algorithm, codegen difference); kept the specialized copy.
 - 2026-11-05: bls SSWU (Fp) single exponentiation via sqrt(-Z) trick: map_fp_to_g1 41->34us. Closed keccak single-message item (see backlog).
 - 2026-11-05: modexp large-modulus Montgomery rows unrolled 4-way (small comptime lengths keep fused loops): 2048b full exp 2.60->1.87ms, 4096b 22.3->15.8ms, 256b unchanged.
+- 2026-11-05: p256 verify: safegcd s^-1 (was Fermat), affine Q table via one shared inversion + mixed adds: 50.7->47.7us.
