@@ -13,7 +13,9 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
 - [ ] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
-- [ ] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
+- [x] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
+- [ ] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets, sqrt_ratio SSWU,
+  dedicated Fp squaring and lazy reduction in Fp2/Fp6 (G1 mul and map are ~2-3x blst).
 - [ ] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [ ] Benchmarks for each; target parity with or better than best-known C implementations.
@@ -121,6 +123,22 @@ fallback but hot paths should be our own, optimized implementations.
   advancing it) or HMAC(private key) for `public_key`; this halved sign time (19 -> 11us).
   std's ECDSA adds 32 zero "noise" bytes to its RFC 6979 input, so it is not an RFC 6979
   oracle; vectors (EIP-155 example, key 1 / "Satoshi Nakamoto") cover the nonce instead.
+- BLS12-381 (`bls12_381/`): tower Fp2 (u^2 = -1), Fp6 (v^3 = u + 1), Fp12 (w^2 = v) over
+  `montgomery.Field(6, p)`; Frobenius/psi/beta constants are hardcoded and re-derived in tests.
+  One generic Jacobian `curve.Curve(F, b)` serves G1 and G2. Subgroup checks are the
+  endomorphism tests (G1: phi(P) = -x^2 P; G2: psi(P) = x P), cross-checked against [r]P.
+  Pairing: Miller loop with Jacobian T and sparse 014 line products (zkcrypto-style
+  formulas), at most 16 pairs per loop pass, one shared final exponentiation (HHT hard part).
+- BLS12-381 bounds: no allocation. MSM runs signed-digit Pippenger in chunks of 256 points
+  (window <= 7, stack digits + 64 buckets); the EIP-2537 MSM/pairing entry points decode in
+  the same chunks, so input length only bounds time (callers apply Base's input caps).
+  Code is variable time (public inputs only: precompiles and KZG verification).
+- EIP-2537 vectors: a curated 72 KB binary subset of go-ethereum's public
+  `core/vm/testdata/precompiles/bls*.json` (all hand-written `bls_*` cases, a few `matter_*`
+  and `jwasinger` MSMs, all `fail-*` cases) in `bls12_381/vectors/eip2537.bin`; outputs, gas,
+  and error kinds are checked. RFC 9380 J.9.1/J.10.1 hash-to-curve vectors are text files.
+- `montgomery.Field.from_int_comptime` now reduces negative comptime ints (needed for
+  Z = -(2 + u)).
 
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
@@ -131,3 +149,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: secp256r1 P256VERIFY (EIP-7951) on montgomery.Field; vectors, differential fuzz vs std ecdsa, coverage fuzz; bench (ReleaseFast: verify 51-71us depending on machine load vs std 108us).
 - 2026-11-05: secp256k1: ecrecover/precompile 0x01, tx recovery (low s), RFC 6979 signing, public key/address; vectors, seeded differential fuzz vs std (mul, recovery, ecdsa verify), coverage fuzz of precompile vs std reference; bench (ReleaseFast, Apple M4, loaded host): ecrecover 28.8us (std verify 62us), sign 10.7us (std 75us), public_key 8.9us (std 65us).
 - 2026-11-05: modexp: pre-Osaka moduli above 1024 bytes via caller-provided scratch (`precompile_modexp_run_with_scratch`, `scratch_limbs_needed`); 1025-byte Berlin example (5547 gas) and differential fuzz vs std big ints for 1025..3000-byte odd/even moduli.
+- 2026-11-05: BLS12-381 + EIP-2537 precompiles 0x0b-0x11 (official geth vectors incl. fail cases and gas), RFC 9380 hash-to-curve G1/G2 + expand_message_xmd vectors, ZCash compressed G1/G2, seeded + coverage fuzz; bench (ReleaseFast, M-series): g1 add 477ns, g1 mul 87us, g2 mul 233us, pairing-2 0.72ms, map_fp_to_g1 95us, g1 msm-64 1.62ms.

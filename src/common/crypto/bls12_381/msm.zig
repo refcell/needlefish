@@ -139,7 +139,15 @@ test "msm: signed recoding reconstructs the scalar" {
     }
 }
 
-fn check_msm(comptime C: type, generator: C.Affine, count: usize, seed: u64) !void {
+const max_scalar: u256 = std.math.maxInt(u256);
+
+fn check_msm(
+    comptime C: type,
+    generator: C.Affine,
+    count: usize,
+    seed: u64,
+    scalar_mask: u256,
+) !void {
     var prng = Prng.init(seed);
     var points: [300]C.Affine = undefined;
     var scalars: [300]u256 = undefined;
@@ -151,8 +159,8 @@ fn check_msm(comptime C: type, generator: C.Affine, count: usize, seed: u64) !vo
         points[index] = if (index % 17 == 5) C.Affine.identity else point.to_affine();
         scalars[index] = switch (index % 11) {
             3 => 0,
-            4 => std.math.maxInt(u256),
-            else => prng.int(u256),
+            4 => scalar_mask,
+            else => prng.int(u256) & scalar_mask,
         };
         if (!points[index].infinity) {
             expected = expected.add(point.mul(scalars[index]));
@@ -163,14 +171,17 @@ fn check_msm(comptime C: type, generator: C.Affine, count: usize, seed: u64) !vo
 
 test "msm: G1 matches the sum of scalar multiplications" {
     for ([_]usize{ 0, 1, 2, 3, 9, 40 }, 0..) |count, seed| {
-        try check_msm(g1.G1, g1.generator, count, seed);
+        try check_msm(g1.G1, g1.generator, count, seed, max_scalar);
     }
 }
 
 test "msm: G2 matches the sum of scalar multiplications" {
-    for ([_]usize{ 2, 7 }, 0..) |count, seed| try check_msm(g2.G2, g2.generator, count, seed);
+    for ([_]usize{ 2, 7 }, 0..) |count, seed| {
+        try check_msm(g2.G2, g2.generator, count, seed, max_scalar);
+    }
 }
 
 test "msm: chunking across the chunk bound" {
-    try check_msm(g1.G1, g1.generator, chunk_points_max + 3, 99);
+    // Short scalars keep the reference scalar multiplications cheap in Debug.
+    try check_msm(g1.G1, g1.generator, chunk_points_max + 3, 99, std.math.maxInt(u24));
 }
