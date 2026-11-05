@@ -184,7 +184,9 @@ pub const ChainStore = struct {
         return null;
     }
 
-    fn evict_oldest(self: *ChainStore) void {
+    /// Drops the oldest-inserted block. Callers that need deterministic retention evict
+    /// explicitly before `insert` so the ring never evicts on its own.
+    pub fn evict_oldest(self: *ChainStore) void {
         assert(self.slot_count > 0);
         const slot = &self.slots[self.slot_head];
         const hashes = self.bytes[slot.offset + slot.header_len + slot.body_len +

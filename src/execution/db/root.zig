@@ -14,6 +14,7 @@ pub const overlay = @import("overlay.zig");
 pub const chain = @import("chain.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const evm_backend = @import("evm_backend.zig");
+pub const database = @import("database.zig");
 
 pub const Changeset = changeset.Changeset;
 pub const AccountInfo = changeset.AccountInfo;
@@ -25,4 +26,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("state_test.zig");
     _ = @import("chain_test.zig");
+    _ = @import("database_test.zig");
 }
