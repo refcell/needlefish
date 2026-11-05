@@ -54,3 +54,5 @@ provably robust.
 - 2026-11-05: sim L1 reorgs (hash-linked L1, follower rewind, per-L1-block safe/confirmed
   records). Swarm found 3 model bugs, all durable-state atomicity: checkpoint without its
   L1 hash; rewind above post-restart unsafe head; clamp leaving a gap. 10k seeds green.
+- 2026-11-05: pinned regression configs (`simulator regression SEED`), byzantine negative
+  test (equivocating sequencer must trip checkers), coverage-guided fuzz over cluster configs.

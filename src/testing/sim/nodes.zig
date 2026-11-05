@@ -123,6 +123,9 @@ pub const Sequencer = struct {
     block_time_ns: u64,
     next_block_ns: u64,
     producing: bool = true,
+    /// Byzantine mode for checker tests: at this height, gossip a conflicting block to
+    /// the first verifier. Honest runs leave it null.
+    equivocate_at: ?u64 = null,
 
     pub fn tick(sequencer: *Sequencer, env: *const Env) void {
         if (!sequencer.producing) return;
@@ -139,6 +142,15 @@ pub const Sequencer = struct {
                 .number = number,
                 .payload = payload,
                 .hash = hash,
+            } });
+        }
+        if (sequencer.equivocate_at == number) {
+            const forged = payload +% 1;
+            const parent_hash = sequencer.chain.hashes[number - 1];
+            env.send(node_sequencer, node_verifier_first, .{ .unsafe_block = .{
+                .number = number,
+                .payload = forged,
+                .hash = block_hash(parent_hash, number, forged),
             } });
         }
     }

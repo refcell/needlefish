@@ -129,6 +129,9 @@ pub const Cluster = struct {
     /// Follower rewinds seen per verifier; an L1 reorg may legitimately lower safe heads.
     rewinds_seen: [verifier_count_max]u64 = @splat(0),
     report: Report = .{},
+    /// Print a diagnosis on violation. Negative tests turn it off: the test runner treats
+    /// stderr output as a failure.
+    log_failures: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, config: Config) !Cluster {
         config.validate();
@@ -372,6 +375,15 @@ pub const Cluster = struct {
     }
 
     fn fail(cluster: *const Cluster, reason: []const u8, node: NodeId) Failure {
+        if (cluster.log_failures) cluster.print_failure(reason, node);
+        return if (std.mem.indexOf(u8, reason, "lags") != null or
+            std.mem.indexOf(u8, reason, "did not") != null)
+            error.LivenessViolation
+        else
+            error.SafetyViolation;
+    }
+
+    fn print_failure(cluster: *const Cluster, reason: []const u8, node: NodeId) void {
         std.debug.print(
             "simulator: violation at t={d}ms node={d}: {s} (sequencer={d} confirmed={d})\n",
             .{
@@ -384,11 +396,6 @@ pub const Cluster = struct {
                 v.id, v.safe_head, v.unsafe_head, v.follower.cursor,
             });
         }
-        return if (std.mem.indexOf(u8, reason, "lags") != null or
-            std.mem.indexOf(u8, reason, "did not") != null)
-            error.LivenessViolation
-        else
-            error.SafetyViolation;
     }
 };
 
@@ -421,4 +428,62 @@ test "cluster: same seed, same run" {
     try std.testing.expectEqual(a.network.delivered, b.network.delivered);
     try std.testing.expectEqual(a.crashes, b.crashes);
     try std.testing.expectEqual(a.sequencer_head, b.sequencer_head);
+}
+
+test "cluster: checkers catch an equivocating sequencer" {
+    // Negative test: the honest model never trips the checkers, so prove they can trip.
+    var detected: u32 = 0;
+    var seed: u64 = 0;
+    while (seed < 8) : (seed += 1) {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .fault_end_ns = 60 * ns_per_s,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 300 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        cluster.sequencer.equivocate_at = 10;
+        cluster.log_failures = false;
+        _ = cluster.run() catch |err| {
+            try std.testing.expectEqual(error.SafetyViolation, err);
+            detected += 1;
+            continue;
+        };
+    }
+    // The forged block can lose the race to the honest one; most seeds must still detect.
+    try std.testing.expect(detected >= 4);
+}
+
+fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
+    const fault_end_ns = smith.valueRangeAtMost(u64, 0, 120) * ns_per_s;
+    const latency_ns_min = smith.valueRangeAtMost(u64, 1, 100) * std.time.ns_per_ms;
+    const config: Config = .{
+        .verifier_count = smith.valueRangeAtMost(u8, 1, verifier_count_max),
+        .network = .{
+            .latency_ns_min = latency_ns_min,
+            .latency_ns_max = latency_ns_min +
+                smith.valueRangeAtMost(u64, 0, 1000) * std.time.ns_per_ms,
+            .drop_ppm = smith.valueRangeAtMost(u32, 0, 500_000),
+            .duplicate_ppm = smith.valueRangeAtMost(u32, 0, 500_000),
+            .capacity = 4096,
+        },
+        .fault_end_ns = fault_end_ns,
+        .production_end_ns = fault_end_ns + 30 * ns_per_s,
+        .settle_end_ns = fault_end_ns + 330 * ns_per_s,
+        .crashes_per_minute = smith.valueRangeAtMost(u32, 0, 20),
+        .partitions_per_minute = smith.valueRangeAtMost(u32, 0, 20),
+        .disk_fault_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000),
+        .downtime_ns_max = smith.valueRangeAtMost(u64, 1, 120) * ns_per_s,
+        .clock_skew_ns_max = smith.valueRangeAtMost(u64, 0, 60) * ns_per_s,
+        .l1_reorgs_per_minute = smith.valueRangeAtMost(u32, 0, 10),
+    };
+    var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
+    defer cluster.deinit(std.testing.allocator);
+    _ = try cluster.run();
+}
+
+test "cluster: fuzz configs (extreme fault rates)" {
+    try @import("../fuzz.zig").run({}, fuzz_cluster, .{ .iterations = 12 });
 }
