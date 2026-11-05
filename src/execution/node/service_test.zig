@@ -149,6 +149,7 @@ const Harness = struct {
             .dev_l1 = true,
             .block_time_s = block_time_s,
             .beacon_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 5052),
+            .verify_blob_proofs = false, // Fake proofs; KZG is covered in release tests.
             .limits = test_limits,
         });
         return harness;

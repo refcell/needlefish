@@ -13,16 +13,16 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
-- [ ] `txpool/validate`: verify blob proofs with `common.consensus.sidecar.Sidecar.verify_kzg`
+- [x] `txpool/validate`: verify blob proofs with `common.consensus.sidecar.Sidecar.verify_kzg`
   (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
-- [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
+- [x] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
 - [x] Block executor (L1 + L2/OP): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
 - [x] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
 - [x] `payload`: (attributes, payload ID, validation, extra data done) payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
 - [x] `engine`: Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
 - [ ] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
-- [ ] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
+- [x] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
 - [ ] Persistence + restart, reorg handling via forkchoice.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 
@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: blob tx KZG proof verification on eth_sendRawTransaction (txpool.validate.verify_blob_proofs + long-lived verifier in the service, L1 mode). Decision: EIP-7594 cell proofs accepted unverified until the crypto lane exposes cell verification (Osaka off on the dev chain). KZG test is release-only, like the crypto lane's.
 - 2026-11-05: executor OP mode: BlockEnv.op from the upgrade schedule, deposits (mint, deposit nonce/receipt version), Regolith deposit gas accounting, Jovian DA footprint as blob gas used, Canyon create2 deployer (base/base timestamp-2 heuristic) and Everest nonce-manager transitions, no EIP-7685 requests on L2, L2 envelopes passed for L1 fees. Decision: Denim BaseTime predeploy transition skipped (not in the evm's Transition set yet).
 - 2026-11-05: Engine API JSON (rpc/engine_json + rpc/engine): fcU V1-3, newPayload V1-4, getPayload V1-4 (OP envelope with parentBeaconBlockRoot), exchangeCapabilities, getClientVersionV1; authrpc also serves eth_*. JWT-checked authrpc server in Service; `--authrpc.port/--authrpc.jwtsecret` in `base node`. Builder/follower JSON agreement test. Raised the rpc Router comptime branch quota (io-net lane, integration fix).
 - 2026-11-05: `base node` binary (flags per etc/devnet/devnet.sh): --dev-l1 mines and serves beacon API; smoke-tested with curl. Decisions: state in memory, --datadir created but unused; devnet-sized default limits (~485 MB RSS ReleaseSafe); past slots since genesis are mined back-to-back at startup.

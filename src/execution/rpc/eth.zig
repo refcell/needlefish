@@ -29,6 +29,8 @@ pub const Api = struct {
     chain: *Chain,
     pool: ?*txpool.Pool,
     client_version: []const u8 = "needlefish/v0.0.0",
+    /// Verifies blob transaction KZG proofs on submission when set.
+    kzg: ?consensus.sidecar.KzgVerifier = null,
     /// Decoding space for raw transactions and call data (bounded request size).
     scratch: []u8,
 };
@@ -449,6 +451,11 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
         head.timestamp + 1,
         api.chain.executor.recoverer,
     ) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+    if (validated.sidecar != null) {
+        if (api.kzg) |verifier| txpool.validate.verify_blob_proofs(raw, verifier) catch |err| {
+            return call.fail(rpc.code.server_error, @errorName(err));
+        };
+    }
     api.chain.ensure_head_state() catch {
         return call.fail(rpc.code.internal_error, "head state unavailable");
     };

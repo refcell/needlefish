@@ -27,6 +27,32 @@ const state_db = @import("state_db.zig");
 const chain_module = @import("chain.zig");
 const genesis_loader = @import("genesis.zig");
 const beacon_module = @import("beacon.zig");
+const consensus = @import("../../common/consensus/root.zig");
+const kzg_blob = @import("../../common/crypto/kzg/root.zig").blob;
+
+/// Long-lived KZG verification memory (decoded setup, workspace, batch scratch).
+const KzgMemory = struct {
+    storage: kzg_blob.Settings.Storage,
+    settings: kzg_blob.Settings,
+    workspace: kzg_blob.Workspace,
+    batch: kzg_blob.BatchStorage(consensus.sidecar.blobs_per_tx_max),
+
+    fn create(allocator: std.mem.Allocator) !*KzgMemory {
+        const memory = try allocator.create(KzgMemory);
+        errdefer allocator.destroy(memory);
+        memory.settings = try kzg_blob.Settings.init(&memory.storage);
+        memory.batch = .{};
+        return memory;
+    }
+
+    fn verifier(memory: *KzgMemory) consensus.sidecar.KzgVerifier {
+        return .{
+            .settings = &memory.settings,
+            .workspace = &memory.workspace,
+            .batch = &memory.batch,
+        };
+    }
+};
 
 const Chain = chain_module.Chain;
 const Engine = engine_module.Engine(Chain);
@@ -42,6 +68,9 @@ pub const Options = struct {
     /// Engine API (plus eth_*) behind JWT authentication; both or neither.
     authrpc_address: ?io_module.Address = null,
     jwt_secret: ?jwt.Secret = null,
+    /// Verify blob transaction KZG proofs on submission (needs ~1.1 MiB and a setup
+    /// decode at startup; L1 mode only, since L2 has no blob transactions).
+    verify_blob_proofs: bool = true,
     limits: Limits = .{},
 };
 
@@ -120,6 +149,7 @@ pub fn Service(comptime IO: type) type {
         api: eth.Api,
         http_server: HttpServer,
         engine_api: ?engine_rpc.EngineApi = null,
+        kzg: ?*KzgMemory = null,
         auth_server: ?AuthServer = null,
         beacon: ?beacon_module.Beacon = null,
         beacon_server: ?BeaconServer = null,
@@ -195,6 +225,11 @@ pub fn Service(comptime IO: type) type {
                 .scratch = try allocator.alloc(u8, limits.rpc_scratch_bytes),
             };
             errdefer allocator.free(service.api.scratch);
+            if (service.options.verify_blob_proofs and service.spec.mode == .l1) {
+                service.kzg = try KzgMemory.create(allocator);
+                service.api.kzg = service.kzg.?.verifier();
+            }
+            errdefer if (service.kzg) |memory| allocator.destroy(memory);
             try service.http_server.init(allocator, service.io, service, limits.http);
             errdefer service.http_server.deinit();
             try service.init_authrpc();
@@ -237,6 +272,7 @@ pub fn Service(comptime IO: type) type {
             service.deinit_authrpc();
             service.http_server.deinit();
             service.allocator.free(service.api.scratch);
+            if (service.kzg) |memory| service.allocator.destroy(memory);
             service.deinit_state();
             service.* = undefined;
         }

@@ -5,8 +5,8 @@
 //! sender. Produces the `Tx` descriptor the pool stores. Stateful checks (nonce,
 //! balance) happen in `Pool.add` against the caller-supplied account.
 //!
-//! KZG proof verification of sidecars is not done yet (crypto lane has no blob proof
-//! verification); commitments are checked against the versioned hashes.
+//! Commitments are checked against the versioned hashes here; `verify_blob_proofs`
+//! adds the (expensive) batched KZG proof check with a long-lived verifier.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -41,6 +41,7 @@ pub const ValidateError = consensus.tx.DecodeError || error{
     InitCodeTooLarge,
     GasLimitExceeded,
     ScratchTooSmall,
+    BlobProofInvalid,
 };
 
 pub const Sidecar = struct {
@@ -197,6 +198,26 @@ fn check_sidecar(
     if (index != hashes.count()) return error.BlobSidecarInvalid;
 }
 
+/// Verifies the EIP-4844 blob proofs of a pooled blob transaction that passed
+/// `validate`. EIP-7594 cell proofs cannot be verified yet and are accepted (the dev
+/// chain keeps Osaka off).
+pub fn verify_blob_proofs(
+    raw: []const u8,
+    verifier: consensus.sidecar.KzgVerifier,
+) ValidateError!void {
+    assert(raw.len > 0 and raw[0] == @backingInt(consensus.TxType.eip4844));
+    var outer = rlp.Decoder.init(raw[1..]);
+    var items = try outer.list();
+    _ = try items.raw(); // The transaction body.
+    const sidecar = consensus.Sidecar.decode_fields(&items) catch {
+        return error.BlobSidecarInvalid;
+    };
+    sidecar.verify_kzg(verifier) catch |err| switch (err) {
+        error.CellProofsUnsupported => return,
+        error.InvalidKzgInput, error.KzgProofMismatch => return error.BlobProofInvalid,
+    };
+}
+
 pub fn kzg_to_versioned_hash(commitment: []const u8) B256 {
     assert(commitment.len == bytes_per_commitment);
     var out: B256 = undefined;
@@ -346,5 +367,68 @@ test "validate: seeded fuzz mutations of a valid tx" {
         for (0..flips) |_| mutated[prng.below(raw.len)] ^= @intCast(prng.range(1, 255));
         const len = raw.len - prng.below(3);
         _ = run(mutated[0..len], &scratch, spec) catch {};
+    }
+}
+
+const kzg_blob = @import("../../common/crypto/kzg/root.zig").blob;
+var test_kzg_storage: kzg_blob.Settings.Storage = undefined;
+var test_kzg_workspace: kzg_blob.Workspace = undefined;
+var test_kzg_batch: kzg_blob.BatchStorage(consensus.sidecar.blobs_per_tx_max) = .{};
+var test_blob: kzg_blob.Blob = undefined;
+var test_blob_list: [bytes_per_blob + 8]u8 = undefined;
+var test_pooled: [bytes_per_blob + 1024]u8 = undefined;
+var test_scratch: [1024]u8 = undefined;
+
+test "validate: blob proofs verified with KZG" {
+    // Decoding the setup and proving take seconds in Debug builds.
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
+    const settings = try kzg_blob.Settings.init(&test_kzg_storage);
+    const verifier: consensus.sidecar.KzgVerifier = .{
+        .settings = &settings,
+        .workspace = &test_kzg_workspace,
+        .batch = &test_kzg_batch,
+    };
+    @memset(&test_blob, 0);
+    for (0..kzg_blob.field_elements) |element| test_blob[element * 32 + 31] = @truncate(element);
+    const workspace = &test_kzg_workspace;
+    const commitment = try kzg_blob.blob_to_kzg_commitment(&settings, workspace, &test_blob);
+    var proof = try kzg_blob.compute_blob_kzg_proof(
+        &settings,
+        &test_kzg_workspace,
+        &test_blob,
+        &commitment,
+    );
+    for (0..2) |round| {
+        if (round == 1) proof[47] ^= 1; // A wrong proof (or an invalid point).
+        var hash_buffer: [64]u8 = undefined;
+        const tx: consensus.Eip4844 = .{
+            .chain_id = 1337,
+            .nonce = 0,
+            .max_priority_fee_per_gas = 1,
+            .max_fee_per_gas = 10,
+            .gas_limit = 21_000,
+            .to = primitives.Address.zero,
+            .value = 0,
+            .input = &.{},
+            .access_list = .empty,
+            .max_fee_per_blob_gas = 1,
+            .blob_versioned_hashes = consensus.HashList.build(
+                &hash_buffer,
+                &.{kzg_to_versioned_hash(&commitment)},
+            ),
+        };
+        const envelope = try consensus.tx.sign(tx, test_key);
+        var commitment_list: [64]u8 = undefined;
+        var proof_list: [64]u8 = undefined;
+        const pooled: consensus.PooledBlobTx = .{ .signed = envelope.eip4844, .sidecar = .{
+            .blobs = consensus.sidecar.BlobList.build(&test_blob_list, &.{test_blob}),
+            .commitments = consensus.sidecar.CommitmentList.build(&commitment_list, &.{commitment}),
+            .proofs = consensus.sidecar.ProofList.build(&proof_list, &.{proof}),
+        } };
+        const raw = pooled.encode_to(&test_pooled);
+        const l1 = &chainspec.ChainSpec.presets.l1_dev;
+        _ = try validate(raw, &test_scratch, l1, 1, consensus.recover_address);
+        const result = verify_blob_proofs(raw, verifier);
+        if (round == 0) try result else try testing.expectError(error.BlobProofInvalid, result);
     }
 }
