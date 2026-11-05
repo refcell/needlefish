@@ -291,3 +291,50 @@ test "flashblocks: fuzz encode round trip" {
         }
     }.run, .{});
 }
+
+test "flashblocks: id parse matches Rust u64::from_str" {
+    const Id = flashblocks.FlashblockId;
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("1_0-2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("1-2_0"));
+    try testing.expectEqual(Id{ .block_number = 61, .index = 2 }, try Id.parse("+61-2"));
+    try testing.expectEqual(Id{ .block_number = 61, .index = 2 }, try Id.parse("61-+2"));
+    try testing.expectEqual(Id{ .block_number = 7, .index = 0 }, try Id.parse("007-0"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("+-2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("++1-2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("1--2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("-1-2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse(" 1-2"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("18446744073709551616-0"));
+    try testing.expectError(error.InvalidFlashblockId, Id.parse("1-2-3"));
+    const max = Id.parse_decimal("+18446744073709551615");
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), max);
+}
+
+/// Independent model: validate, drop leading zeros, then accumulate in u128 so overflow
+/// is a range check.
+fn model_decimal(text: []const u8) ?u64 {
+    var digits = text;
+    if (digits.len > 0 and digits[0] == '+') digits = digits[1..];
+    if (digits.len == 0) return null;
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const significant = std.mem.trimStart(u8, digits, "0");
+    if (significant.len > 20) return null;
+    var value: u128 = 0;
+    for (significant) |byte| value = value * 10 + (byte - '0');
+    return std.math.cast(u64, value);
+}
+
+test "flashblocks: seeded fuzz decimal parse against a model" {
+    const alphabet = "0123456789+-_ a9";
+    var prng = Prng.init(0xdec1_3a1);
+    var text: [40]u8 = undefined;
+    for (0..20_000) |_| {
+        const length = prng.below(text.len + 1);
+        for (text[0..length]) |*byte| byte.* = alphabet[prng.below(alphabet.len)];
+        if (prng.chance(1, 4) and length > 0) text[0] = '+';
+        try testing.expectEqual(
+            model_decimal(text[0..length]),
+            flashblocks.FlashblockId.parse_decimal(text[0..length]),
+        );
+    }
+}

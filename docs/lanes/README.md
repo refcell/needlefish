@@ -17,7 +17,7 @@ dated log line after each push. Other lanes may read it to find interfaces.
 | batcher-devnet | batcher-devnet.md | `src/batcher/*`, `bin/batcher`, `etc/devnet`, `docs/DEVNET.md` |
 | dst-fuzz | dst-fuzz.md | `src/testing/*`, `etc/ci/`, benches, perf |
 | p2p | p2p.md | `src/consensus/p2p/*`, `docs/P2P.md` |
-| flashblocks-builder | flashblocks-builder.md | `src/builder/*`, `src/execution/flashblocks/*`, `bin/base builder` |
+| flashblocks-builder | flashblocks-builder.md | `src/builder/*`, `src/execution/flashblocks/*`, `src/common/flashblocks`, `bin/base builder` |
 | proof | proof.md | `src/proof/*`, `bin/base {proof,proposer,challenger}` |
 
 Future lanes (spawned when capacity frees up) are listed in `docs/ROADMAP.md`.

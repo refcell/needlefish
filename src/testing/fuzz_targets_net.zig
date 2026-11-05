@@ -1417,10 +1417,6 @@ fn fuzz_flashblock_id(_: void, smith: *Smith) anyerror!void {
     var prng = Prng.init(smith.value(u64));
     const length = generate_id_text(&input, smith, &prng);
     const text = input[0..length];
-    // BUG(common): `FlashblockId.parse` uses `std.fmt.parseUnsigned`, which accepts digit
-    // separators ("1_0-2" parses as 10-2) and rejects a leading '+', while base/base's
-    // `u64::from_str` rejects '_' and accepts '+'. Skip both input classes until fixed.
-    if (std.mem.indexOfAny(u8, text, "_+") != null) return;
     const actual = flashblocks.FlashblockId.parse(text) catch null;
     try expectEqual(reference_id(text), actual);
 }

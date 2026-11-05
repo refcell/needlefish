@@ -31,11 +31,25 @@ pub const FlashblockId = struct {
 
     pub fn parse(text: []const u8) error{InvalidFlashblockId}!FlashblockId {
         const dash = std.mem.indexOfScalar(u8, text, '-') orelse return error.InvalidFlashblockId;
-        const block_number = std.fmt.parseUnsigned(u64, text[0..dash], 10) catch
-            return error.InvalidFlashblockId;
-        const index = std.fmt.parseUnsigned(u64, text[dash + 1 ..], 10) catch
-            return error.InvalidFlashblockId;
+        const block_number = parse_decimal(text[0..dash]) orelse return error.InvalidFlashblockId;
+        const index = parse_decimal(text[dash + 1 ..]) orelse return error.InvalidFlashblockId;
         return .{ .block_number = block_number, .index = index };
+    }
+
+    /// Rust `u64::from_str`: an optional single leading '+', then one or more ASCII
+    /// digits, no separators, no overflow. (`std.fmt.parseUnsigned` accepts '_' and
+    /// rejects '+', which diverges from base/base.)
+    pub fn parse_decimal(text: []const u8) ?u64 {
+        const digits = if (text.len > 0 and text[0] == '+') text[1..] else text;
+        if (digits.len == 0) return null;
+        var value: u64 = 0;
+        for (digits) |byte| {
+            if (byte < '0' or byte > '9') return null;
+            value = std.math.mul(u64, value, 10) catch return null;
+            value = std.math.add(u64, value, byte - '0') catch return null;
+        }
+        assert(digits.len > 0);
+        return value;
     }
 
     /// Writes the id into `buffer` (at least 41 bytes) and returns the text.

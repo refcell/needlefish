@@ -1,7 +1,7 @@
 # Lane: flashblocks-builder
 
 Owns `src/builder/*` (submodules `core`, `publish`, `multiplex`, `metering`),
-`src/execution/flashblocks/*`, and the `builder` subcommand of `bin/base`. Reference:
+`src/execution/flashblocks/*`, `src/common/flashblocks` (taken over from primitives), and the `builder` subcommand of `bin/base`. Reference:
 base/base `crates/builder/{core,publish,multiplex,metering,cli}` (~20k lines),
 `crates/execution/{flashblocks,flashblocks-node}` (~12k lines) and
 `crates/common/flashblocks`.
@@ -60,3 +60,5 @@ can drive the builder and the flashblocks consumer.
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
+- 2026-11-05: own `src/common/flashblocks`; `FlashblockId.parse` now matches Rust
+  `u64::from_str` (leading '+', no '_'), dst-fuzz skip removed.
