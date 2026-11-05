@@ -35,9 +35,10 @@ behind a small interface and switch later.
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
   OP Stack message id (sha256 of domain + snappy-decoded payload) [id: block worker].
-- [ ] `gossip`: router follow-ups: score retention across reconnects (`retain_score`),
-  outbound mesh quota (D_out), IWANT retransmission limit, IDONTWANT (v1.2), peer
-  exchange on PRUNE (disabled in base/base, so low priority).
+- [x] `gossip`: router follow-ups: score retention across reconnects (`retain_score`),
+  outbound mesh quota (D_out = 2), IWANT retransmission limit.
+- [ ] `gossip`: IDONTWANT (v1.2) and peer exchange on PRUNE (both off in base/base's
+  libp2p config; low priority).
 - [ ] `gossip`: snappy block-format codec (own implementation, fuzzed round trip) [done],
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
@@ -95,6 +96,9 @@ behind a small interface and switch later.
   peers above the publish threshold (no persistent fanout map). One IWANT promise per
   IHAVE (random id), like libp2p. Graylisted peers' RPCs are dropped. Slow peers drop
   their oldest queued message (queue 256, base/base `MAX_OUTBOUND_QUEUE`).
+  Retained scores: 64 entries, soonest-expiring replaced. IWANT retransmission limit
+  is 1 per peer per message (libp2p default is 3); the D_out swap may displace one of
+  the D_score best peers.
 - Seen cache: open addressing + backward-shift deletion + insertion FIFO; when full it
   evicts the oldest early (costs a re-validation, never correctness).
 - Message cache: FIFO byte arena allocated once (64 MiB default); arena pressure evicts
@@ -116,3 +120,4 @@ behind a small interface and switch later.
   router; 20-node seeded cluster delivers every message deterministically, attacker
   publishing invalid blocks is scored negative and pruned, IHAVE/IWANT path tested.
 - 2026-11-05: shrank discv5 cluster test (73 s -> <2 s); large run behind -Dslow-tests.
+- 2026-11-05: router follow-ups: score retention, outbound quota, IWANT resend limit.
