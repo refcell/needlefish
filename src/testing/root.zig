@@ -8,6 +8,7 @@ pub const fuzz = @import("fuzz.zig");
 pub const sim = @import("sim/root.zig");
 pub const bench = @import("bench.zig");
 pub const fuzz_targets = @import("fuzz_targets.zig");
+pub const fuzz_targets_p2p = @import("fuzz_targets_p2p.zig");
 
 test {
     std.testing.refAllDecls(@This());
