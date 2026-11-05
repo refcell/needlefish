@@ -122,7 +122,8 @@ pub fn transaction(
         try w.key("to");
         try w.null_value();
     }
-    try field_quantity(w, "nonce", envelope.nonce() orelse 0);
+    // Deposits have no nonce field; their receipt carries the deposit nonce.
+    if (envelope.nonce()) |nonce| try field_quantity(w, "nonce", nonce);
     try field_quantity(w, "gas", envelope.gas_limit());
     try field_quantity(w, "value", envelope.value());
     try field_data(w, "input", envelope.input());
@@ -130,7 +131,18 @@ pub fn transaction(
     try fee_fields(w, envelope, inclusion);
     try inclusion_fields(w, inclusion);
     try signature_fields(w, envelope);
+    if (envelope == .deposit) try deposit_fields(w, envelope.deposit);
     try w.end_object();
+}
+
+/// OP deposit fields (op-geth `RPCTransaction`): source hash, mint, system flag, and
+/// the zero signature values tooling expects on every transaction.
+fn deposit_fields(w: *Writer, deposit: consensus.Deposit) WriteError!void {
+    try field_data(w, "sourceHash", &deposit.source_hash.bytes);
+    try field_quantity(w, "mint", deposit.mint);
+    try w.key("isSystemTx");
+    try w.boolean(deposit.is_system_transaction);
+    inline for (.{ "v", "r", "s" }) |name| try field_quantity(w, name, @as(u8, 0));
 }
 
 fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!void {
@@ -237,6 +249,10 @@ pub fn receipt(w: *Writer, value: consensus.Receipt, context: ReceiptContext) Wr
         try field_quantity(w, "blobGasUsed", context.blob_gas_used);
         try field_quantity(w, "blobGasPrice", price);
     }
+    if (value.deposit_nonce) |nonce| try field_quantity(w, "depositNonce", nonce);
+    if (value.deposit_receipt_version) |version| {
+        try field_quantity(w, "depositReceiptVersion", version);
+    }
     try w.key("logs");
     try w.begin_array();
     var it = value.logs.iterator();
@@ -303,4 +319,66 @@ test "format: header fields and transaction object" {
     try testing.expect(std.mem.indexOf(u8, text, "\"size\":\"0x258\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "withdrawalsRoot") == null);
     try json.validate(text);
+}
+
+fn no_recovery(hash: primitives.B256, signature: consensus.Signature) ?primitives.Address {
+    _ = hash;
+    _ = signature;
+    return null;
+}
+
+test "format: deposit transaction and receipt carry the OP fields" {
+    const deposit: Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x5c) },
+        .from = .{ .bytes = @splat(0xde) },
+        .to = .{ .call = .{ .bytes = @splat(0x15) } },
+        .mint = 7,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = &.{ 1, 2 },
+    } };
+    var raw_buffer: [256]u8 = undefined;
+    const raw = deposit.encode_to(&raw_buffer);
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var w: Writer = .init(&out);
+    try transaction(&w, raw, null, no_recovery);
+    const text = out.buffered();
+    try json.validate(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"type\":\"0x7e\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"mint\":\"0x7\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"isSystemTx\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"from\":\"0xdede") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "sourceHash") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"nonce\"") == null);
+
+    out = .fixed(&buffer);
+    w = .init(&out);
+    const value: consensus.Receipt = .{
+        .tx_type = .deposit,
+        .status = true,
+        .cumulative_gas_used = 50_000,
+        .logs_bloom = .zero,
+        .logs = .{ .payload = &.{}, .count = 0 },
+        .deposit_nonce = 3,
+        .deposit_receipt_version = 1,
+    };
+    try receipt(&w, value, .{
+        .inclusion = .{ .block_hash = @splat(1), .block_number = 1, .index = 0, .base_fee = 1 },
+        .tx_hash = @splat(2),
+        .from = .{ .bytes = @splat(0xde) },
+        .to = null,
+        .contract_address = null,
+        .gas_used = 50_000,
+        .effective_gas_price = 0,
+        .first_log_index = 0,
+        .blob_gas_used = 0,
+        .blob_gas_price = null,
+    });
+    const receipt_text = out.buffered();
+    try json.validate(receipt_text);
+    try testing.expect(std.mem.indexOf(u8, receipt_text, "\"depositNonce\":\"0x3\"") != null);
+    const version = "\"depositReceiptVersion\":\"0x1\"";
+    try testing.expect(std.mem.indexOf(u8, receipt_text, version) != null);
 }
