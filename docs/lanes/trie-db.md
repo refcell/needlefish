@@ -105,10 +105,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `Builder.build_with` + `BuildOptions.verify_root`; storage-heavy build 36.9 -> 15.8-16.0 ms
   verified, 4.6-4.7 ms unverified; byte-identical witnesses checked against the old
   collection by `db/witness_differential_test.zig`; docs/PERF.md "db witness")
-- [ ] Witness build with `verify_root` is now dominated by the sparse apply (~9 ms of 16 on
+- [x] Witness build with `verify_root` is now dominated by the sparse apply (~9 ms of 16 on
   the storage-heavy block: node resolution + RLP decode + per-write keccak of slot and
   address keys) and the post-root (~2.6 ms). Pass the hashed keys the walk already computed
   into the apply, and batch-hash keys with `keccak256_batch`.
+  (`SparseState.apply_hashed` + `ChangesetHashes` from `Builder.hash_keys`; batched
+  `SparseTrie.update_root_refs`; one account lookup per storage run; storage-heavy build
+  15.7 -> 12.5 ms, verifier replay 9.9 -> 8.2-9.4 ms; docs/PERF.md "db witness: hashed keys")
+- [ ] The verified witness build is still ~8 ms of sparse apply on the storage-heavy block,
+  split between node keccak, RLP decode (~15k pool nodes resolved, `decode_node` again for
+  dirty branches' unloaded children at rehash) and pool-node copies. Cache decoded child refs
+  or decode lazily per item.
 - [x] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
   size the rpc response buffer for witnesses or stream the JSON.
   (shared lazy large send buffers in `http.server` (`Options.large_send_buffers_max/size`,
@@ -432,6 +439,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `Witness.state` order is now walk order (codec encoding sorts by hash, so encoded bytes
   are unchanged). The old per-key collection lives on as the reference in
   `db/witness_differential_test.zig`.
+- Witness key hashing: the builder hashes every touched key once, batched in `touched` order,
+  and derives the changeset's hashes (`ChangesetHashes`, changeset order) by insertion-index
+  lookup (`SetList.index` maps item -> index), so the walks and `SparseState.apply_hashed` share
+  them. The verifier's `apply` hashes slots and account addresses in batches of 64
+  (`KeyCursor`); one keccak per storage run address. `apply` runs in three phases: every storage
+  run (recording the run's address hash, pre-state account leaf and root in per-state scratch
+  bounded by `storage_tries_max`), one batched rehash of all written storage roots, then the
+  account leaves in address order reusing the run records. The account trie still sees reads
+  before writes, so the decoded node set (the witness) is unchanged: 72 builds of the
+  differential test encode to the same bytes as before the change.
+- `SparseTrie` root: dirty nodes are collected with their depth across any number of roots,
+  counting-sorted deepest first, and each level hashed with equal-length encodings paired
+  through `keccak256_batch` (one waiting slot per length and batch lane, flushed one by one at
+  the end of the level) instead of sorting by length. The serial post-order rehash stays as
+  `root_hash_serial`, fuzzed against it ("seeded differential of the batched root").
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -615,3 +637,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (skip to one RLP item). Storage-heavy build 36.9 -> 15.9 ms (4.6 ms unverified), 1k-account
   7.8 -> 3.2 ms (0.63-0.71 ms), evm block 4.0 -> 2.2 ms (0.40-0.45 ms); witnesses
   byte-identical (differential test vs the old collection on random states, both sources).
+- 2026-11-05: witness apply with shared hashed keys: builder hashes touched keys once (batched)
+  and passes the changeset's to `SparseState.apply_hashed`; verifier `apply` batch-hashes;
+  storage applied per account run with one account lookup; batched level-ordered rehash in
+  `SparseTrie.update_root_refs` across all storage tries. Storage-heavy verified build 15.7 ->
+  12.5 ms, 1k-account 3.2 -> 2.5 ms, evm block 2.2 -> 1.8-2.0 ms; verifier replay 9.9 ->
+  8.2-9.4 ms. Witness bytes identical to before (differential digests across 72 builds);
+  new seeded differential of batched vs serial sparse roots over three tries per pool.

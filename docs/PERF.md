@@ -217,6 +217,36 @@ Takeaways:
   keys) and its root. Next: pass the walk's hashed keys into the apply and batch-hash keys.
 - Collection alone (unverified, no deletions) is ~0.6x the full-state apply.
 
+## 2026-11-05 db witness: hashed keys and batched sparse rehash (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+Same bench (`zig build bench -Doptimize=ReleaseFast -- db/witness`), medians of 11; the
+machine was loaded (load average 35-80), so ranges are over 3-4 runs and the "before" column
+is the same tree just before the change. The builder hashes every touched key once (batched)
+and hands the changeset's hashes to `SparseState.apply_hashed`; the verifier's `apply` hashes
+keys in batches; storage is applied per account run with one account lookup per run; storage
+and account roots are rehashed level by level with equal-length encodings paired through
+`keccak256_batch` (all written storage tries in one pass). Witnesses are byte-identical (same
+node counts and bytes below; differential-test witness digests equal before and after).
+
+| Block | build before | build after | unverified before | unverified after | replay before | replay after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k account writes | 3.2-3.3 ms | 2.5-2.6 ms | 0.66-0.84 ms | 0.64-0.68 ms | 1.10-1.23 ms | 1.04-1.07 ms |
+| 1k acct + 4k slot writes | 15.7 ms | 12.5-13.1 ms | 4.6-4.75 ms | 4.2-4.65 ms | 9.9 ms | 8.2-9.4 ms |
+| 200 evm SLOAD+SSTORE calls | 2.2-2.4 ms | 1.8-2.0 ms | 0.41-0.56 ms | 0.45-0.47 ms | 1.08-1.13 ms | 0.94-0.97 ms |
+
+Stateless evm re-execution (`apply_evm`) 1.54 -> 1.31-1.34 ms. Two "before" storage-heavy
+samples (30-33 ms build, 15-21 ms replay) were load spikes and are left out.
+
+Takeaways:
+- Hashing keys was a smaller share than estimated: the verified storage-heavy build still
+  spends ~8 ms in the sparse apply. A whole-run `sample` profile (setup included) puts the
+  rest in node keccak (the rehash itself), RLP decode (`decode_item`, `decode_node`, which
+  also re-decodes dirty witness branches for their unloaded children's refs at rehash), and
+  memmove of pool nodes. Decode is the next target.
+- Do not hash read keys and changeset keys separately: the first cut (changeset hashed, then
+  reads hashed for the walk) made the unverified build 30% slower (6.0-6.4 ms) because reads
+  repeat the written keys; hashing `touched` once and looking up changeset entries fixed it.
+
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `TrieType` nodes keep only what their kind needs: a packed path (2 nibbles per byte, stored in

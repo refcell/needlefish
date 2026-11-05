@@ -12,9 +12,14 @@
 //! `error.InvalidWitness`. Many tries share one fixed node pool (`*_in` style roots), sized
 //! at init. Children of a node decoded from the witness are materialized lazily from its
 //! preimage, so an untouched branch costs one pool node, not seventeen. No recursion.
+//!
+//! Root computation rehashes dirty nodes level by level, deepest first, across any number
+//! of tries at once (`update_root_refs`), batching equal-length encodings through
+//! `keccak256_batch`; `root_hash_serial` (the post-order reference) is fuzzed against it.
 
 const std = @import("std");
 const lazy = @import("../../utilities/lazy_alloc/root.zig");
+const keccak = @import("../../common/crypto/keccak.zig");
 const assert = std.debug.assert;
 
 const rlp = @import("rlp.zig");
@@ -30,6 +35,29 @@ pub const key_nibbles = 64;
 pub const value_bytes_max = 112;
 /// Nodes on one path: at most one branch and one extension per nibble, then a leaf.
 pub const depth_max = key_nibbles * 2 + 2;
+/// Longest node encoding: a branch of sixteen hashed children and no value.
+const encoding_bytes_max = 3 + 16 * 33 + 1;
+const batch_width = keccak.batch_width;
+/// Encodings waiting for a batch partner: `batch_width - 1` per encoding length.
+const pending_bytes = (encoding_bytes_max + 1) * (batch_width - 1) * encoding_bytes_max;
+
+comptime {
+    assert(batch_width >= 2);
+    assert(encoding_bytes_max == 532);
+    // A leaf (hex-prefixed path and the largest value) and an extension fit too.
+    assert(3 + 34 + 2 + value_bytes_max <= encoding_bytes_max);
+}
+
+/// keccak256 of each of `inputs` (all of one length) into `out`, `batch_width` at a time.
+pub fn keccak256_many(inputs: []const []const u8, out: []Hash) void {
+    assert(inputs.len == out.len);
+    var start: usize = 0;
+    while (inputs.len - start >= batch_width) : (start += batch_width) {
+        keccak.keccak256_batch(inputs[start..][0..batch_width], out[start..][0..batch_width]);
+    }
+    for (inputs[start..], out[start..]) |input, *digest| digest.* = node.keccak256(input);
+    assert(inputs.len - start < batch_width);
+}
 
 pub const Error = error{ WitnessIncomplete, InvalidWitness, SparseFull };
 pub const DecodeError = error{InvalidNode};
@@ -135,6 +163,12 @@ pub const SparseTrie = struct {
     /// Nodes at and above this index are untouched since `clear`.
     fresh: u32 = 0,
     resolver: Resolver,
+    /// Root computation scratch (one entry per pool node): `depth << 32 | index` of every
+    /// dirty node, then the same nodes ordered deepest level first.
+    dirty: []u64,
+    levels: []NodeIndex,
+    /// Encodings waiting for equal-length partners within one level (`pending_bytes`).
+    pending: []u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -143,12 +177,28 @@ pub const SparseTrie = struct {
     ) !SparseTrie {
         assert(nodes_max > 0 and nodes_max < unloaded);
         const nodes = try lazy.alloc(allocator, Node, nodes_max);
-        var result: SparseTrie = .{ .nodes = nodes, .resolver = resolver };
+        errdefer lazy.free(allocator, nodes);
+        const dirty = try lazy.alloc(allocator, u64, nodes_max);
+        errdefer lazy.free(allocator, dirty);
+        const levels = try lazy.alloc(allocator, NodeIndex, nodes_max);
+        errdefer lazy.free(allocator, levels);
+        const pending = try lazy.alloc(allocator, u8, pending_bytes);
+        var result: SparseTrie = .{
+            .nodes = nodes,
+            .resolver = resolver,
+            .dirty = dirty,
+            .levels = levels,
+            .pending = pending,
+        };
         result.clear();
+        assert(result.dirty.len == result.nodes.len and result.levels.len == result.nodes.len);
         return result;
     }
 
     pub fn deinit(self: *SparseTrie, allocator: std.mem.Allocator) void {
+        lazy.free(allocator, self.pending);
+        lazy.free(allocator, self.levels);
+        lazy.free(allocator, self.dirty);
         lazy.free(allocator, self.nodes);
         self.* = undefined;
     }
@@ -623,6 +673,51 @@ pub const SparseTrie = struct {
         return ref;
     }
 
+    /// The child reference of a dirty extension. A witness extension that only changed its
+    /// path (a parent branch collapsed into it) keeps its child unloaded: the reference then
+    /// comes from its source.
+    fn extension_target_ref(self: *const SparseTrie, index: NodeIndex) RlpNode {
+        const current = &self.nodes[index];
+        assert(current.kind == .extension);
+        const target = current.body.children[0];
+        assert(target != none);
+        // Validated when the node was resolved; decoding is deterministic.
+        const target_ref = if (target == unloaded)
+            (decode_node(current.source) catch unreachable).children[0]
+        else
+            self.child_ref(target);
+        assert(target_ref.len > 0);
+        return target_ref;
+    }
+
+    /// The child references of a dirty branch, in nibble order, and their mask.
+    fn branch_refs(
+        self: *const SparseTrie,
+        index: NodeIndex,
+        refs: *[16]RlpNode,
+        mask: *u16,
+    ) u32 {
+        const current = &self.nodes[index];
+        assert(current.kind == .branch);
+        var decoded: ?Decoded = null;
+        var count: u32 = 0;
+        mask.* = 0;
+        for (current.body.children, 0..) |child_index, nibble| {
+            if (child_index == none) continue;
+            mask.* |= @as(u16, 1) << @intCast(nibble);
+            if (child_index == unloaded) {
+                // Validated when the node was resolved; decoding is deterministic.
+                if (decoded == null) decoded = decode_node(current.source) catch unreachable;
+                refs[count] = decoded.?.children[nibble];
+            } else {
+                refs[count] = self.child_ref(child_index);
+            }
+            count += 1;
+        }
+        assert(count >= 1 and count == @popCount(mask.*));
+        return count;
+    }
+
     fn compute_ref(self: *SparseTrie, index: NodeIndex) void {
         const current = &self.nodes[index];
         assert(current.ref.len == 0);
@@ -633,37 +728,13 @@ pub const SparseTrie = struct {
                 current.ref = node.leaf_ref(node_path, value);
             },
             .extension => {
-                const target = current.body.children[0];
-                assert(target != none);
-                // A witness extension that only changed its path (a parent branch collapsed
-                // into it) keeps its child unloaded: take the child ref from its source.
-                const target_ref = if (target == unloaded)
-                    (decode_node(current.source) catch unreachable).children[0]
-                else
-                    self.child_ref(target);
-                assert(target_ref.len > 0);
+                const target_ref = self.extension_target_ref(index);
                 current.ref = node.extension_ref(node_path, &target_ref);
             },
             .branch => {
-                var decoded: ?Decoded = null;
                 var refs: [16]RlpNode = undefined;
                 var mask: u16 = 0;
-                var count: u32 = 0;
-                for (current.body.children, 0..) |child_index, nibble| {
-                    if (child_index == none) continue;
-                    mask |= @as(u16, 1) << @intCast(nibble);
-                    if (child_index == unloaded) {
-                        // Validated when the node was resolved; decoding is deterministic.
-                        if (decoded == null) {
-                            decoded = decode_node(current.source) catch unreachable;
-                        }
-                        refs[count] = decoded.?.children[nibble];
-                    } else {
-                        refs[count] = self.child_ref(child_index);
-                    }
-                    count += 1;
-                }
-                assert(count >= 1);
+                const count = self.branch_refs(index, &refs, &mask);
                 current.ref = node.branch_ref(mask, refs[0..count], &.{});
             },
             .free, .unresolved => unreachable, // Unresolved nodes are never dirty.
@@ -671,8 +742,38 @@ pub const SparseTrie = struct {
         assert(current.ref.len > 0);
     }
 
-    /// Recomputes the references of every dirty node below `root`, children first.
-    fn update_refs(self: *SparseTrie, root: NodeIndex) void {
+    /// The full encoding of a dirty node whose children are all clean.
+    fn encode_dirty(
+        self: *const SparseTrie,
+        index: NodeIndex,
+        buffer: *[encoding_bytes_max]u8,
+    ) []const u8 {
+        const current = &self.nodes[index];
+        assert(current.ref.len == 0);
+        var sink: node.BufferSink = .{ .buffer = buffer };
+        const node_path = current.path[0..current.path_len];
+        switch (current.kind) {
+            .leaf => node.encode_leaf(&sink, node_path, current.body.value[0..current.value_len]),
+            .extension => {
+                const target_ref = self.extension_target_ref(index);
+                node.encode_extension(&sink, node_path, &target_ref);
+            },
+            .branch => {
+                var refs: [16]RlpNode = undefined;
+                var mask: u16 = 0;
+                const count = self.branch_refs(index, &refs, &mask);
+                node.encode_branch(&sink, mask, refs[0..count], &.{});
+            },
+            .free, .unresolved => unreachable, // Unresolved nodes are never dirty.
+        }
+        const encoded = sink.result();
+        assert(encoded.len > 0);
+        return encoded;
+    }
+
+    /// Recomputes the references of every dirty node below `root`, children first, one
+    /// keccak at a time (the reference for the batched `update_root_refs`).
+    fn update_refs_serial(self: *SparseTrie, root: NodeIndex) void {
         const Frame = struct { index: NodeIndex, expanded: bool };
         var stack: [depth_max * 16]Frame = undefined;
         var stack_len: u32 = 0;
@@ -705,10 +806,144 @@ pub const SparseTrie = struct {
         }
     }
 
+    /// Recomputes the references of every dirty node below `roots` (distinct tries of this
+    /// pool, `none` allowed), deepest level first: a node depends only on its children, one
+    /// level deeper, so the nodes of a level are independent and share hash batches. Later
+    /// `root_hash` calls on these roots are then free.
+    pub fn update_root_refs(self: *SparseTrie, roots: []const NodeIndex) void {
+        var depth_counts: [depth_max + 1]u32 = @splat(0);
+        const count = self.collect_dirty(roots, &depth_counts);
+        // Counting sort by depth, deepest first.
+        var depth_starts: [depth_max + 1]u32 = undefined;
+        var offset: u32 = 0;
+        var depth: u32 = depth_max + 1;
+        while (depth > 0) {
+            depth -= 1;
+            depth_starts[depth] = offset;
+            offset += depth_counts[depth];
+        }
+        assert(offset == count);
+        var next = depth_starts;
+        for (self.dirty[0..count]) |entry| {
+            const entry_depth: u32 = @intCast(entry >> 32);
+            self.levels[next[entry_depth]] = @truncate(entry);
+            next[entry_depth] += 1;
+        }
+        depth = depth_max + 1;
+        while (depth > 0) {
+            depth -= 1;
+            if (depth_counts[depth] == 0) continue;
+            const start = depth_starts[depth];
+            self.hash_level(self.levels[start..][0..depth_counts[depth]]);
+        }
+        for (roots) |root| assert(root == none or self.nodes[root].ref.len > 0);
+    }
+
+    /// Writes `depth << 32 | index` into `dirty` for every dirty node below `roots` and
+    /// counts the nodes of each depth. Returns the number of dirty nodes.
+    fn collect_dirty(
+        self: *SparseTrie,
+        roots: []const NodeIndex,
+        depth_counts: *[depth_max + 1]u32,
+    ) u32 {
+        // Each pop pushes at most sixteen children, one level deeper.
+        var stack: [depth_max * 16]u64 = undefined;
+        var count: u32 = 0;
+        for (roots) |root| {
+            if (root == none or self.nodes[root].ref.len > 0) continue;
+            stack[0] = root;
+            var stack_len: u32 = 1;
+            while (stack_len > 0) {
+                stack_len -= 1;
+                const entry = stack[stack_len];
+                const index: NodeIndex = @truncate(entry);
+                const depth: u32 = @intCast(entry >> 32);
+                assert(depth <= depth_max);
+                assert(count < self.dirty.len);
+                self.dirty[count] = entry;
+                count += 1;
+                depth_counts[depth] += 1;
+                const current = &self.nodes[index];
+                assert(current.ref.len == 0);
+                const children: []const NodeIndex = switch (current.kind) {
+                    .leaf => &.{},
+                    .extension => current.body.children[0..1],
+                    .branch => current.body.children[0..],
+                    .free, .unresolved => unreachable, // Unresolved nodes are never dirty.
+                };
+                for (children) |child_index| {
+                    if (child_index == none or child_index == unloaded) continue;
+                    if (self.nodes[child_index].ref.len > 0) continue;
+                    assert(stack_len < stack.len);
+                    stack[stack_len] = @as(u64, depth + 1) << 32 | child_index;
+                    stack_len += 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    fn pending_slot(self: *SparseTrie, length: usize, slot: usize) []u8 {
+        assert(length <= encoding_bytes_max and slot < batch_width - 1);
+        const start = (length * (batch_width - 1) + slot) * encoding_bytes_max;
+        return self.pending[start..][0..length];
+    }
+
+    /// References of one level's nodes. An encoding of 32 bytes or more waits in `pending`
+    /// until `batch_width` encodings of its length are there, then they hash together;
+    /// leftovers hash one by one at the end of the level.
+    fn hash_level(self: *SparseTrie, level: []const NodeIndex) void {
+        assert(level.len > 0);
+        var waiting: [encoding_bytes_max + 1]u8 = @splat(0);
+        var waiting_index: [encoding_bytes_max + 1][batch_width - 1]NodeIndex = undefined;
+        var buffer: [encoding_bytes_max]u8 = undefined;
+        for (level) |index| {
+            const encoded = self.encode_dirty(index, &buffer);
+            const length = encoded.len;
+            if (length < 32) {
+                self.nodes[index].ref = RlpNode.from_rlp(encoded);
+                continue;
+            }
+            if (waiting[length] + 1 < batch_width) {
+                @memcpy(self.pending_slot(length, waiting[length]), encoded);
+                waiting_index[length][waiting[length]] = index;
+                waiting[length] += 1;
+                continue;
+            }
+            var inputs: [batch_width][]const u8 = undefined;
+            for (inputs[0 .. batch_width - 1], 0..) |*input, slot| {
+                input.* = self.pending_slot(length, slot);
+            }
+            inputs[batch_width - 1] = encoded;
+            var digests: [batch_width]Hash = undefined;
+            keccak.keccak256_batch(&inputs, &digests);
+            for (waiting_index[length], digests[0 .. batch_width - 1]) |waiting_node, digest| {
+                self.nodes[waiting_node].ref = RlpNode.from_hash(digest);
+            }
+            self.nodes[index].ref = RlpNode.from_hash(digests[batch_width - 1]);
+            waiting[length] = 0;
+        }
+        for (waiting, 0..) |waiting_count, length| {
+            for (waiting_index[length][0..waiting_count], 0..) |waiting_node, slot| {
+                const encoded = self.pending_slot(length, slot);
+                self.nodes[waiting_node].ref = RlpNode.from_hash(node.keccak256(encoded));
+            }
+        }
+        for (level) |index| assert(self.nodes[index].ref.len > 0);
+    }
+
     /// The root hash of the trie at `root` after all updates.
     pub fn root_hash(self: *SparseTrie, root: NodeIndex) Hash {
         if (root == none) return node.empty_root;
-        self.update_refs(root);
+        self.update_root_refs(&.{root});
+        assert(self.nodes[root].ref.len > 0);
+        return self.nodes[root].ref.root_hash();
+    }
+
+    /// `root_hash` through the serial post-order rehash.
+    fn root_hash_serial(self: *SparseTrie, root: NodeIndex) Hash {
+        if (root == none) return node.empty_root;
+        self.update_refs_serial(root);
         assert(self.nodes[root].ref.len > 0);
         return self.nodes[root].ref.root_hash();
     }
@@ -953,6 +1188,78 @@ test "sparse: seeded differential against the full trie with shared prefixes" {
             const actual = try sparse.get(root, &probe);
             try testing.expectEqual(expected == null, actual == null);
             if (expected) |bytes| try testing.expectEqualSlices(u8, bytes, actual.?);
+        }
+    }
+}
+
+test "sparse: seeded differential of the batched root against the serial root" {
+    const trie_module = @import("trie.zig");
+    const Trie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 64 });
+    const tries_count = 3;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const Collect = struct {
+        store: *TestStore,
+        arena: std.mem.Allocator,
+        pub fn visit(self: @This(), visit_info: trie_module.Visit) !void {
+            if (visit_info.encoding.len < 32 and visit_info.path.len > 0) return;
+            const copy = try self.arena.dupe(u8, visit_info.encoding);
+            try self.store.preimages.put(self.arena, node.keccak256(copy), copy);
+        }
+    };
+    for (0..8) |seed| {
+        var prng = Prng.init(0xba7c4ed + seed);
+        var full = try Trie.init(testing.allocator, 2048);
+        defer full.deinit(testing.allocator);
+        try full.track_changes(testing.allocator);
+        var keys: [64][32]u8 = undefined;
+        for (&keys) |*key| {
+            key.* = clustered_key(&prng);
+            try full.put(key, &.{ 0x82, 1, 2 });
+        }
+        var store: TestStore = .{};
+        const collect: Collect = .{ .store = &store, .arena = arena_state.allocator() };
+        const pre_root = full.root_hash();
+        try full.visit_nodes(full.root, .all, collect);
+        const resolver: Resolver = .{ .context = &store, .resolve = TestStore.resolve };
+        // The same updates on every trie of two pools: `batched` rehashes all its tries in
+        // one `update_root_refs`, `serial` one post-order walk per trie.
+        var batched = try SparseTrie.init(testing.allocator, 8192, resolver);
+        defer batched.deinit(testing.allocator);
+        var serial = try SparseTrie.init(testing.allocator, 8192, resolver);
+        defer serial.deinit(testing.allocator);
+        var batched_roots: [tries_count]NodeIndex = undefined;
+        var serial_roots: [tries_count]NodeIndex = undefined;
+        for (&batched_roots, &serial_roots) |*a, *b| {
+            a.* = try batched.root_from_hash(pre_root);
+            b.* = try serial.root_from_hash(pre_root);
+        }
+        for (0..24) |_| {
+            for (&batched_roots, &serial_roots, 0..) |*a, *b, trie_index| {
+                for (0..prng.range(0, 6)) |_| {
+                    const key = if (prng.chance(1, 2))
+                        keys[prng.below(keys.len)]
+                    else
+                        clustered_key(&prng);
+                    if (prng.chance(1, 3)) {
+                        try batched.delete(a, &key);
+                        try serial.delete(b, &key);
+                        if (trie_index == 0) _ = full.delete(&key);
+                        continue;
+                    }
+                    var value: [64]u8 = undefined;
+                    prng.fill(&value);
+                    const length = prng.range(1, value.len);
+                    try batched.put(a, &key, value[0..length]);
+                    try serial.put(b, &key, value[0..length]);
+                    if (trie_index == 0) try full.put(&key, value[0..length]);
+                }
+            }
+            batched.update_root_refs(&batched_roots);
+            for (batched_roots, serial_roots) |a, b| {
+                try testing.expectEqual(serial.root_hash_serial(b), batched.root_hash(a));
+            }
+            try testing.expectEqual(full.root_hash(), batched.root_hash(batched_roots[0]));
         }
     }
 }

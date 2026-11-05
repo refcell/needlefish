@@ -142,7 +142,8 @@ fn SetList(comptime T: type) type {
 
         items: []T,
         len: u32 = 0,
-        index: std.AutoHashMapUnmanaged(T, void) = .empty,
+        /// Item -> insertion index.
+        index: std.AutoHashMapUnmanaged(T, u32) = .empty,
 
         fn init(allocator: std.mem.Allocator, items_max: u32) !Self {
             assert(items_max > 0);
@@ -167,7 +168,7 @@ fn SetList(comptime T: type) type {
         fn add(self: *Self, item: T) error{KeysFull}!void {
             if (self.index.contains(item)) return;
             if (self.len == self.items.len) return error.KeysFull;
-            self.index.putAssumeCapacityNoClobber(item, {});
+            self.index.putAssumeCapacityNoClobber(item, self.len);
             self.items[self.len] = item;
             self.len += 1;
             assert(self.index.count() == self.len);
@@ -175,6 +176,13 @@ fn SetList(comptime T: type) type {
 
         pub fn slice(self: *const Self) []const T {
             return self.items[0..self.len];
+        }
+
+        /// The insertion index of `item`, or null when absent.
+        fn index_of(self: *const Self, item: T) ?u32 {
+            const found = self.index.get(item) orelse return null;
+            assert(found < self.len);
+            return found;
         }
     };
 }
@@ -480,6 +488,110 @@ fn address_order(a: *const Address, b: *const Address) std.math.Order {
 
 const HeaderEntry = struct { number: u64, hash: Hash };
 
+/// One account's storage writes in `SparseState.apply`.
+const StorageRun = struct {
+    /// Index of the run's first storage change.
+    start: u32,
+    address_hash: Hash,
+    /// The account leaf before the block (null: created by it).
+    account: ?history.AccountState,
+};
+
+/// keccak256 of a changeset's keys, in changeset order (`SparseState.apply_hashed`).
+pub const ChangesetHashes = struct {
+    /// Of each account change's address.
+    accounts: []const Hash,
+    /// Of each storage change's address.
+    storage_addresses: []const Hash,
+    /// Of each storage change's slot (32 bytes, big-endian).
+    slots: []const Hash,
+
+    fn matches(self: *const ChangesetHashes, changeset: *const Changeset) bool {
+        const storage_len = changeset.storage_changes().len;
+        return self.accounts.len == changeset.account_changes().len and
+            self.storage_addresses.len == storage_len and self.slots.len == storage_len;
+    }
+};
+
+/// Keys hashed per `keccak256_batch` round trip of the helpers below.
+const key_chunk = 64;
+
+/// keccak256 of the addresses of `items` (`Address`es, or structs with an `address`) into
+/// `out`, batched.
+fn hash_addresses(comptime T: type, items: []const T, out: []Hash) void {
+    assert(items.len == out.len);
+    var inputs: [key_chunk][]const u8 = undefined;
+    var start: usize = 0;
+    while (start < items.len) : (start += key_chunk) {
+        const len = @min(key_chunk, items.len - start);
+        for (inputs[0..len], items[start..][0..len]) |*input, *item| {
+            input.* = if (T == Address) item else &item.address;
+        }
+        sparse.keccak256_many(inputs[0..len], out[start..][0..len]);
+    }
+}
+
+/// keccak256 of the 32-byte big-endian `slot` of each of `items` into `out`, batched.
+fn hash_slots(comptime T: type, items: []const T, out: []Hash) void {
+    assert(items.len == out.len);
+    var keys: [key_chunk][32]u8 = undefined;
+    var inputs: [key_chunk][]const u8 = undefined;
+    var start: usize = 0;
+    while (start < items.len) : (start += key_chunk) {
+        const len = @min(key_chunk, items.len - start);
+        for (keys[0..len], inputs[0..len], items[start..][0..len]) |*key, *input, *item| {
+            std.mem.writeInt(u256, key, item.slot, .big);
+            input.* = key;
+        }
+        sparse.keccak256_many(inputs[0..len], out[start..][0..len]);
+    }
+}
+
+/// The key hashes of a changeset served in order to `SparseState.apply`: the caller's, or
+/// batch-hashed `key_chunk` keys at a time as the indices move forward.
+const KeyCursor = struct {
+    changeset: *const Changeset,
+    given: ?ChangesetHashes,
+    slots: [key_chunk]Hash = undefined,
+    slots_start: usize = 0,
+    slots_len: usize = 0,
+    accounts: [key_chunk]Hash = undefined,
+    accounts_start: usize = 0,
+    accounts_len: usize = 0,
+
+    fn slot(self: *KeyCursor, index: usize) Hash {
+        if (self.given) |given| return given.slots[index];
+        const changes = self.changeset.storage_changes();
+        assert(index < changes.len);
+        if (index < self.slots_start or index >= self.slots_start + self.slots_len) {
+            self.slots_start = index;
+            self.slots_len = @min(key_chunk, changes.len - index);
+            const out = self.slots[0..self.slots_len];
+            hash_slots(StorageChange, changes[index..][0..self.slots_len], out);
+        }
+        return self.slots[index - self.slots_start];
+    }
+
+    fn account(self: *KeyCursor, index: usize) Hash {
+        if (self.given) |given| return given.accounts[index];
+        const accounts = self.changeset.account_changes();
+        assert(index < accounts.len);
+        if (index < self.accounts_start or index >= self.accounts_start + self.accounts_len) {
+            self.accounts_start = index;
+            self.accounts_len = @min(key_chunk, accounts.len - index);
+            const out = self.accounts[0..self.accounts_len];
+            hash_addresses(AccountChange, accounts[index..][0..self.accounts_len], out);
+        }
+        return self.accounts[index - self.accounts_start];
+    }
+
+    /// The address hash of the storage run starting at change `index`.
+    fn storage_address(self: *const KeyCursor, index: usize) Hash {
+        if (self.given) |given| return given.storage_addresses[index];
+        return node.keccak256(&self.changeset.storage_changes()[index].address);
+    }
+};
+
 /// A stateless state provider backed only by a witness, bound to the parent of the block it
 /// verifies: BLOCKHASH is served only from a header chain that ends at that parent.
 pub const SparseState = struct {
@@ -516,6 +628,11 @@ pub const SparseState = struct {
     /// Storage trie roots by address hash, opened on first use from the account leaf.
     storage_roots: std.AutoHashMapUnmanaged(Hash, sparse.NodeIndex) = .empty,
     storage_tries_max: u32,
+    /// Per-block scratch of `apply`, one entry per storage trie written (at most
+    /// `storage_tries_max`): the run's address hash and pre-state account, and the storage
+    /// trie roots (contiguous, for one batched rehash).
+    runs: []StorageRun,
+    run_roots: []sparse.NodeIndex,
     /// A read through `database()` failed for want of witness data (the evm only sees
     /// `DatabaseFailure`).
     incomplete: bool = false,
@@ -546,12 +663,18 @@ pub const SparseState = struct {
             .resolve = NodeStore.resolve,
         });
         errdefer sparse_trie.deinit(allocator);
+        const runs = try lazy.alloc(allocator, StorageRun, config.storage_tries_max);
+        errdefer lazy.free(allocator, runs);
+        const run_roots = try lazy.alloc(allocator, sparse.NodeIndex, config.storage_tries_max);
+        errdefer lazy.free(allocator, run_roots);
         var result: SparseState = .{
             .nodes = nodes,
             .codes = codes,
             .headers = headers,
             .trie = sparse_trie,
             .storage_tries_max = config.storage_tries_max,
+            .runs = runs,
+            .run_roots = run_roots,
         };
         try result.storage_roots.ensureTotalCapacity(allocator, config.storage_tries_max);
         return result;
@@ -559,6 +682,8 @@ pub const SparseState = struct {
 
     pub fn deinit(self: *SparseState, allocator: std.mem.Allocator) void {
         self.storage_roots.deinit(allocator);
+        lazy.free(allocator, self.run_roots);
+        lazy.free(allocator, self.runs);
         self.trie.deinit(allocator);
         allocator.free(self.headers);
         self.codes.deinit(allocator);
@@ -672,8 +797,17 @@ pub const SparseState = struct {
     /// The root slot of the account's storage trie, opened from its leaf on first use.
     fn storage_root_slot(self: *SparseState, address_hash: *const Hash) Error!*sparse.NodeIndex {
         if (self.storage_roots.getPtr(address_hash.*)) |root| return root;
+        return self.open_storage_root(address_hash, try self.account_state(address_hash));
+    }
+
+    /// `storage_root_slot` with the account's current leaf already decoded.
+    fn open_storage_root(
+        self: *SparseState,
+        address_hash: *const Hash,
+        account: ?history.AccountState,
+    ) Error!*sparse.NodeIndex {
+        if (self.storage_roots.getPtr(address_hash.*)) |root| return root;
         if (self.storage_roots.count() == self.storage_tries_max) return error.SparseFull;
-        const account = try self.account_state(address_hash);
         var root = sparse.none;
         if (account) |info| root = try self.trie.root_from_hash(info.storage_root);
         self.storage_roots.putAssumeCapacityNoClobber(address_hash.*, root);
@@ -734,37 +868,76 @@ pub const SparseState = struct {
 
     /// Applies a block's changes: storage first (storage roots come from pre-state account
     /// leaves; a destroyed account's storage is dropped whole, not slot by slot), then every
-    /// account with a change or new storage, in address order.
+    /// storage root in one batched rehash, then every account with a change or new storage,
+    /// in address order. Keys are hashed here, in batches.
     pub fn apply(self: *SparseState, changeset: *const Changeset) Error!void {
-        const accounts = changeset.account_changes();
-        const changes = changeset.storage_changes();
-        var cursor: usize = 0;
+        try self.apply_with(changeset, null);
+    }
+
+    /// `apply` with the changeset's key hashes already computed (the witness builder's).
+    pub fn apply_hashed(
+        self: *SparseState,
+        changeset: *const Changeset,
+        hashes: ChangesetHashes,
+    ) Error!void {
+        assert(hashes.matches(changeset));
+        try self.apply_with(changeset, hashes);
+    }
+
+    fn apply_with(
+        self: *SparseState,
+        changeset: *const Changeset,
+        hashes: ?ChangesetHashes,
+    ) Error!void {
+        var cursor: KeyCursor = .{ .changeset = changeset, .given = hashes };
+        const runs = try self.apply_storage(&cursor);
+        self.trie.update_root_refs(self.run_roots[0..runs]);
+        try self.apply_accounts(&cursor, runs);
+    }
+
+    /// Writes the storage runs of every account that is not destroyed, recording each run in
+    /// `runs` and `run_roots`. Returns the number of runs.
+    fn apply_storage(self: *SparseState, cursor: *KeyCursor) Error!u32 {
+        const accounts = cursor.changeset.account_changes();
+        const changes = cursor.changeset.storage_changes();
+        var account_index: usize = 0;
         var start: usize = 0;
+        var runs: u32 = 0;
         while (start < changes.len) {
             const address = &changes[start].address;
             var end = start + 1;
             while (end < changes.len and std.mem.eql(u8, &changes[end].address, address)) end += 1;
-            while (cursor < accounts.len and
-                address_order(&accounts[cursor].address, address) == .lt) cursor += 1;
-            const destroyed = cursor < accounts.len and
-                std.mem.eql(u8, &accounts[cursor].address, address) and
-                accounts[cursor].new == null;
-            if (!destroyed) try self.apply_slots(address, changes[start..end]);
+            while (account_index < accounts.len and
+                address_order(&accounts[account_index].address, address) == .lt) account_index += 1;
+            const destroyed = account_index < accounts.len and
+                std.mem.eql(u8, &accounts[account_index].address, address) and
+                accounts[account_index].new == null;
+            if (!destroyed) {
+                if (runs == self.runs.len) return error.SparseFull;
+                try self.apply_slots(cursor, start, end, runs);
+                runs += 1;
+            }
             start = end;
         }
-        try self.apply_accounts(accounts, changes);
+        assert(runs <= self.storage_roots.count());
+        return runs;
     }
 
     fn apply_slots(
         self: *SparseState,
-        address: *const Address,
-        run: []const StorageChange,
+        cursor: *KeyCursor,
+        start: usize,
+        end: usize,
+        run: u32,
     ) Error!void {
-        assert(run.len > 0);
-        const root = try self.storage_root_slot(&node.keccak256(address));
-        for (run) |*change| {
-            assert(std.mem.eql(u8, &change.address, address));
-            const slot_hash = slot_hash_of(change.slot);
+        assert(start < end);
+        const changes = cursor.changeset.storage_changes();
+        const address_hash = cursor.storage_address(start);
+        const account = try self.account_state(&address_hash);
+        const root = try self.open_storage_root(&address_hash, account);
+        for (changes[start..end], start..) |*change, index| {
+            assert(std.mem.eql(u8, &change.address, &changes[start].address));
+            const slot_hash = cursor.slot(index);
             if (change.new == 0) {
                 try self.trie.delete(root, &slot_hash);
             } else {
@@ -773,16 +946,22 @@ pub const SparseState = struct {
                 try self.trie.put(root, &slot_hash, encoded);
             }
         }
+        self.runs[run] = .{
+            .start = @intCast(start),
+            .address_hash = address_hash,
+            .account = account,
+        };
+        self.run_roots[run] = root.*;
     }
 
-    /// Merges the sorted account changes with the sorted storage addresses.
-    fn apply_accounts(
-        self: *SparseState,
-        accounts: []const AccountChange,
-        changes: []const StorageChange,
-    ) Error!void {
+    /// Merges the sorted account changes with the sorted storage addresses (whose runs are
+    /// the first `runs` of `self.runs`, in order).
+    fn apply_accounts(self: *SparseState, cursor: *KeyCursor, runs: u32) Error!void {
+        const accounts = cursor.changeset.account_changes();
+        const changes = cursor.changeset.storage_changes();
         var account_index: usize = 0;
         var storage_index: usize = 0;
+        var run: u32 = 0;
         var steps: usize = 0;
         while (account_index < accounts.len or storage_index < changes.len) : (steps += 1) {
             assert(steps <= accounts.len + changes.len);
@@ -800,24 +979,41 @@ pub const SparseState = struct {
             }
             while (storage_index < changes.len and
                 std.mem.eql(u8, &changes[storage_index].address, &address)) storage_index += 1;
-            try self.apply_account(&address, change);
+            const has_run = run < runs and
+                std.mem.eql(u8, &changes[self.runs[run].start].address, &address);
+            if (has_run) {
+                try self.apply_account(&self.runs[run].address_hash, change, run);
+                run += 1;
+            } else {
+                // Storage-only addresses always have a run (only a destroyed account skips).
+                assert(change != null);
+                const address_hash = cursor.account(account_index - 1);
+                try self.apply_account(&address_hash, change, null);
+            }
         }
+        assert(run == runs);
     }
 
+    /// Writes one account leaf. `run` is the account's storage run in `self.runs` (its
+    /// pre-state leaf and rehashed storage root), else both are looked up.
     fn apply_account(
         self: *SparseState,
-        address: *const Address,
+        address_hash: *const Hash,
         change: ?*const AccountChange,
+        run: ?u32,
     ) Error!void {
-        const address_hash = node.keccak256(address);
         if (change) |account_change| {
             if (account_change.new == null) {
-                try self.trie.delete(&self.account_root, &address_hash);
-                _ = self.storage_roots.remove(address_hash);
+                assert(run == null);
+                try self.trie.delete(&self.account_root, address_hash);
+                _ = self.storage_roots.remove(address_hash.*);
                 return;
             }
         }
-        const current = try self.account_state(&address_hash);
+        const current = if (run) |index|
+            self.runs[index].account
+        else
+            try self.account_state(address_hash);
         // Storage changed for an account that neither exists nor is created: bad changeset.
         if (change == null and current == null) return error.InvalidWitness;
         const info: AccountInfo = if (change) |account_change| account_change.new.? else .{
@@ -826,7 +1022,11 @@ pub const SparseState = struct {
             .code_hash = current.?.code_hash,
         };
         var storage_root = if (current) |account| account.storage_root else node.empty_root;
-        if (self.storage_roots.get(address_hash)) |root| storage_root = self.trie.root_hash(root);
+        if (run) |index| {
+            storage_root = self.trie.root_hash(self.run_roots[index]);
+        } else if (self.storage_roots.get(address_hash.*)) |root| {
+            storage_root = self.trie.root_hash(root);
+        }
         const account: trie.Account = .{
             .nonce = info.nonce,
             .balance = info.balance,
@@ -834,7 +1034,7 @@ pub const SparseState = struct {
         };
         var buffer: [trie.state_trie.account_rlp_bytes_max]u8 = undefined;
         const encoded = trie.state_trie.encode_account(&account, &storage_root, &buffer);
-        try self.trie.put(&self.account_root, &address_hash, encoded);
+        try self.trie.put(&self.account_root, address_hash, encoded);
     }
 
     /// Folds the evm's journaled block `State` into `changeset` and applies it: the rules of
@@ -1018,6 +1218,11 @@ pub const Builder = struct {
     /// Reads plus changeset slots, then one account's slot paths at a time.
     storage_targets: []StorageTarget,
     storage_paths: []trie.PathTarget,
+    /// keccak256 of the touched keys, then of the changeset's keys (`hash_keys`): twice the
+    /// key limits, like the targets.
+    account_hashes: []Hash,
+    storage_address_hashes: []Hash,
+    slot_hashes: []Hash,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Builder {
         var scratch = try SparseState.init(allocator, config.sparse);
@@ -1035,6 +1240,12 @@ pub const Builder = struct {
         const storage_targets = try lazy.alloc(allocator, StorageTarget, slots_max);
         errdefer lazy.free(allocator, storage_targets);
         const storage_paths = try lazy.alloc(allocator, trie.PathTarget, slots_max);
+        errdefer lazy.free(allocator, storage_paths);
+        const account_hashes = try lazy.alloc(allocator, Hash, accounts_max);
+        errdefer lazy.free(allocator, account_hashes);
+        const storage_address_hashes = try lazy.alloc(allocator, Hash, slots_max);
+        errdefer lazy.free(allocator, storage_address_hashes);
+        const slot_hashes = try lazy.alloc(allocator, Hash, slots_max);
         return .{
             .scratch = scratch,
             .touched = touched,
@@ -1043,10 +1254,16 @@ pub const Builder = struct {
             .account_targets = account_targets,
             .storage_targets = storage_targets,
             .storage_paths = storage_paths,
+            .account_hashes = account_hashes,
+            .storage_address_hashes = storage_address_hashes,
+            .slot_hashes = slot_hashes,
         };
     }
 
     pub fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
+        lazy.free(allocator, self.slot_hashes);
+        lazy.free(allocator, self.storage_address_hashes);
+        lazy.free(allocator, self.account_hashes);
         lazy.free(allocator, self.storage_paths);
         lazy.free(allocator, self.storage_targets);
         lazy.free(allocator, self.account_targets);
@@ -1114,12 +1331,13 @@ pub const Builder = struct {
             try self.touched.add_slot(change.address, change.slot);
         }
         self.scratch.clear(pre_root);
-        try self.collect_accounts(source, reads, changeset);
-        try self.collect_storage(source, reads, changeset);
+        const hashes = self.hash_keys(changeset);
+        try self.collect_accounts(source, reads, changeset, &hashes);
+        try self.collect_storage(source, reads, changeset, &hashes);
         const apply = options.verify_root or has_deletions(changeset);
         var post_root: ?Hash = null;
         if (apply) {
-            try self.scratch.apply(changeset);
+            try self.scratch.apply_hashed(changeset, hashes);
             if (options.verify_root) post_root = self.scratch.state_root();
         }
         const nodes = self.scratch.nodes;
@@ -1162,26 +1380,31 @@ pub const Builder = struct {
     };
 
     /// One walk of the account trie: every touched account (reads, a prefix of `touched`,
-    /// marked) and the siblings of destroyed ones.
+    /// marked) and the siblings of destroyed ones. Hashes come from `hash_keys`.
     fn collect_accounts(
         self: *Builder,
         source: anytype,
         reads: *const KeySet,
         changeset: *const Changeset,
+        hashes: *const ChangesetHashes,
     ) !void {
         const touched = self.touched.accounts.slice();
         const targets = self.account_targets;
         assert(touched.len <= targets.len / 2 and reads.accounts.len <= touched.len);
-        for (touched, targets[0..touched.len], 0..) |*address, *target, index| {
+        for (targets[0..touched.len], self.account_hashes[0..touched.len], 0..) |
+            *target,
+            hash,
+            index,
+        | {
             assert(index >= reads.accounts.len or
-                std.mem.eql(u8, address, &reads.accounts.items[index]));
-            target.* = .{ .path = node.keccak256(address), .mark = index < reads.accounts.len };
+                std.mem.eql(u8, &touched[index], &reads.accounts.items[index]));
+            target.* = .{ .path = hash, .mark = index < reads.accounts.len };
         }
         var count: u32 = @intCast(touched.len);
-        for (changeset.account_changes()) |*change| {
+        for (changeset.account_changes(), hashes.accounts) |*change, hash| {
             if (change.new != null) continue;
             if (count == targets.len) return error.KeysFull;
-            targets[count] = .{ .path = node.keccak256(&change.address), .siblings = true };
+            targets[count] = .{ .path = hash, .siblings = true };
             count += 1;
         }
         const unique = trie.path_targets.sort_unique(targets[0..count]);
@@ -1191,56 +1414,123 @@ pub const Builder = struct {
     }
 
     /// One walk per touched storage trie: every touched slot (reads, a prefix of `touched`,
-    /// marked) and the siblings of deleted ones.
+    /// marked) and the siblings of deleted ones. Hashes come from `hash_keys`.
     fn collect_storage(
         self: *Builder,
         source: anytype,
         reads: *const KeySet,
         changeset: *const Changeset,
+        hashes: *const ChangesetHashes,
     ) !void {
         const touched = self.touched.slots.slice();
         const targets = self.storage_targets;
         assert(touched.len <= targets.len / 2 and reads.slots.len <= touched.len);
-        // Slots of one account usually come together: hash each run's address once.
-        var run_address: Address = undefined;
-        var run_hash: Hash = undefined;
-        for (touched, targets[0..touched.len], 0..) |*key, *target, index| {
-            if (index == 0 or !std.mem.eql(u8, &key.address, &run_address)) {
-                run_address = key.address;
-                run_hash = node.keccak256(&run_address);
-            }
+        for (
+            targets[0..touched.len],
+            self.storage_address_hashes[0..touched.len],
+            self.slot_hashes[0..touched.len],
+            0..,
+        ) |*target, address_hash, slot_hash, index| {
             target.* = .{
-                .address_hash = run_hash,
-                .target = .{ .path = slot_hash_of(key.slot), .mark = index < reads.slots.len },
+                .address_hash = address_hash,
+                .target = .{ .path = slot_hash, .mark = index < reads.slots.len },
             };
         }
         var count: u32 = @intCast(touched.len);
-        for (changeset.storage_changes()) |*change| {
+        for (
+            changeset.storage_changes(),
+            hashes.storage_addresses,
+            hashes.slots,
+        ) |*change, address_hash, slot_hash| {
             if (change.new != 0) continue;
             if (count == targets.len) return error.KeysFull;
             targets[count] = .{
-                .address_hash = node.keccak256(&change.address),
-                .target = .{ .path = slot_hash_of(change.slot), .siblings = true },
+                .address_hash = address_hash,
+                .target = .{ .path = slot_hash, .siblings = true },
             };
             count += 1;
         }
         std.sort.pdq(StorageTarget, targets[0..count], {}, storage_target_less);
+        const unique_total = try self.walk_storage(source, targets[0..count]);
+        assert(unique_total == touched.len);
+    }
+
+    /// Walks each storage trie of `targets` (sorted by address hash, then path) once.
+    /// Returns the number of distinct slots.
+    fn walk_storage(self: *Builder, source: anytype, targets: []const StorageTarget) !u32 {
         const collector: Collector = .{ .store = self.scratch.nodes };
-        var start: u32 = 0;
-        while (start < count) {
+        var unique_total: u32 = 0;
+        var start: usize = 0;
+        while (start < targets.len) {
             const address_hash = &targets[start].address_hash;
             var end = start;
             var unique: u32 = 0;
-            while (end < count and std.mem.eql(u8, &targets[end].address_hash, address_hash)) {
+            while (end < targets.len and
+                std.mem.eql(u8, &targets[end].address_hash, address_hash))
+            {
                 self.storage_paths[unique] = targets[end].target;
                 unique += 1;
                 end += 1;
             }
             unique = trie.path_targets.sort_unique(self.storage_paths[0..unique]);
             try source.visit_storage_paths(address_hash, self.storage_paths[0..unique], collector);
+            unique_total += unique;
             assert(end > start);
             start = end;
         }
+        return unique_total;
+    }
+
+    /// keccak256 of every touched key, batched, in `touched` order (the first half of the
+    /// hash buffers; a slot's entry in `storage_address_hashes` is its address's hash), then
+    /// the changeset's key hashes looked up from them (the second half), for `apply_hashed`.
+    fn hash_keys(self: *Builder, changeset: *const Changeset) ChangesetHashes {
+        const accounts = self.touched.accounts.slice();
+        const slots = self.touched.slots.slice();
+        const accounts_half = self.account_hashes.len / 2;
+        const slots_half = self.slot_hashes.len / 2;
+        assert(accounts.len <= accounts_half and slots.len <= slots_half);
+        hash_addresses(Address, accounts, self.account_hashes[0..accounts.len]);
+        hash_slots(SlotKey, slots, self.slot_hashes[0..slots.len]);
+        for (slots, self.storage_address_hashes[0..slots.len], 0..) |*key, *hash, index| {
+            if (index > 0 and std.mem.eql(u8, &key.address, &slots[index - 1].address)) {
+                hash.* = self.storage_address_hashes[index - 1];
+            } else {
+                hash.* = self.account_hash(key.address);
+            }
+        }
+        const changes = changeset.storage_changes();
+        const account_changes = changeset.account_changes();
+        const account_out = self.account_hashes[accounts_half..][0..account_changes.len];
+        const address_out = self.storage_address_hashes[slots_half..][0..changes.len];
+        const slot_out = self.slot_hashes[slots_half..][0..changes.len];
+        for (account_changes, account_out) |*change, *hash| {
+            hash.* = self.account_hash(change.address);
+        }
+        for (changes, address_out, slot_out, 0..) |*change, *address_hash, *slot_hash, index| {
+            if (index > 0 and std.mem.eql(u8, &change.address, &changes[index - 1].address)) {
+                address_hash.* = address_out[index - 1];
+            } else {
+                address_hash.* = self.account_hash(change.address);
+            }
+            const key: SlotKey = .{ .address = change.address, .slot = change.slot };
+            // Every changeset slot was added to `touched` by `build_with`.
+            slot_hash.* = self.slot_hashes[self.touched.slots.index_of(key).?];
+        }
+        const hashes: ChangesetHashes = .{
+            .accounts = account_out,
+            .storage_addresses = address_out,
+            .slots = slot_out,
+        };
+        assert(hashes.matches(changeset));
+        return hashes;
+    }
+
+    /// The hash of a touched account, from `hash_keys`.
+    fn account_hash(self: *const Builder, address: Address) Hash {
+        // Every changeset account and slot address was added to `touched` by `build_with`.
+        const index = self.touched.accounts.index_of(address).?;
+        return self.account_hashes[index];
     }
 };
 
