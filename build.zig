@@ -66,6 +66,22 @@ pub fn build(b: *std.Build) void {
         .description = "Run micro benchmarks",
     });
 
+    add_vector_tools(b, base, target, optimize);
+
+    // Compile-only check for editors and CI speed.
+    const check_step = b.step("check", "Compile everything without running");
+    check_step.dependOn(&unit_tests.step);
+    check_step.dependOn(&sim.step);
+    check_step.dependOn(&bench.step);
+}
+
+/// Runners over public vectors fetched by `just vectors`.
+fn add_vector_tools(
+    b: *std.Build,
+    base: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
     // ethereum/tests GeneralStateTests runner (vectors from `just vectors`).
     _ = add_tool(b, base, target, optimize, .{
         .name = "statetest",
@@ -74,11 +90,13 @@ pub fn build(b: *std.Build) void {
         .description = "Run state tests: zig build statetest -- <file-or-dir>",
     });
 
-    // Compile-only check for editors and CI speed.
-    const check_step = b.step("check", "Compile everything without running");
-    check_step.dependOn(&unit_tests.step);
-    check_step.dependOn(&sim.step);
-    check_step.dependOn(&bench.step);
+    // base/base genesis parity (files from `just vectors`).
+    _ = add_tool(b, base, target, optimize, .{
+        .name = "genesischeck",
+        .path = "src/common/genesis/check_main.zig",
+        .step = "genesischeck",
+        .description = "Check genesis files: zig build genesischeck -- <genesis.json>...",
+    });
 }
 
 const Tool = struct {

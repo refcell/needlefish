@@ -6,4 +6,12 @@ mkdir -p .cache/vectors
 if [ ! -d .cache/vectors/ethereum-tests ]; then
   git clone --depth 1 https://github.com/ethereum/tests .cache/vectors/ethereum-tests
 fi
+# Public base/base genesis files for `zig build genesischeck`.
+mkdir -p .cache/vectors/base-genesis
+for name in base sepolia_base zeronet_base; do
+  if [ ! -f ".cache/vectors/base-genesis/$name.json" ]; then
+    curl -fsSL -o ".cache/vectors/base-genesis/$name.json" \
+      "https://raw.githubusercontent.com/base/base/main/crates/common/chains/res/genesis/$name.json"
+  fi
+done
 echo "vectors in .cache/vectors"

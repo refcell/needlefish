@@ -38,6 +38,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   gas (nonce key, bytecode, account changes, sender/payer auth, EIP-7623 payload floor).
 - [x] `rpc_types/transaction.zig`: parse RPC transaction objects (types 0-4, 0x79, deposit) back
   into envelopes; the rebuilt envelope must hash to the reported `hash`.
+- [x] Genesis parity: `zig build genesischeck -- .cache/vectors/base-genesis/*.json` (files from
+  `just vectors`) recomputes state root + header hash of base/base's mainnet, sepolia and
+  zeronet genesis and matches `chains.*.genesis_l2_hash` (all three pass, 2026-11-05).
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -129,3 +132,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: EIP-8130 intrinsic gas (`eip8130_gas`).
 - 2026-11-05: RPC transaction JSON parsing with hash check.
 - 2026-11-05: EIP-7594 v1 sidecar cell-proof verification (`CellVerifier`).
+- 2026-11-05: `genesischeck` tool; base/base mainnet/sepolia/zeronet genesis hashes match.
