@@ -190,7 +190,7 @@ pub fn run_range(allocator: std.mem.Allocator, seed_first: u64, count: u64) !Ran
     return result;
 }
 
-const reduction_count = 17;
+const reduction_count = 19;
 
 /// Apply reduction `index` to `config`. Returns null when it would change nothing.
 fn reduce(config: Config, index: u32) ?Config {
@@ -220,6 +220,8 @@ fn reduce(config: Config, index: u32) ?Config {
         14 => next.reorg_tx_loss_ppm = 0,
         15 => next.frame_size = @import("codec.zig").frame_size_full,
         16 => next.l1_block_txs_min = @import("nodes.zig").l1_batches_max,
+        17 => next.byzantine_per_minute = 0,
+        18 => next.admin_ops_per_minute = 0,
         else => unreachable,
     }
     if (std.meta.eql(next, config)) return null;

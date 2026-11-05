@@ -6,6 +6,8 @@
 //!   1. faults:  [0, fault_end)          crashes, partitions (group and one-way), drops,
 //!                                       disk faults, clock skew, L1 reorgs, inbox
 //!                                       spam (forged channels from a non-batcher)
+//!                                       byzantine batcher posts (replayed, shuffled,
+//!                                       truncated, garbage, and oversize frames)
 //!   2. heal:    fault_end               restart everything, heal partitions, stop drops
 //!   3. drain:   [fault_end, settle_end) sequencer stops at production_end; then
 //!               liveness requires every verifier to reach the sequencer head, safe and
@@ -31,6 +33,18 @@ const NodeId = network_module.NodeId;
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
 pub const step_ns: u64 = 10 * std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
+
+/// Byzantine channels use mid-size frames: a few frames each, so shuffling matters but
+/// they do not crowd honest batches out of the L1 mempool.
+const byzantine_frame_size = 512;
+const byzantine_frames_max = 8;
+
+comptime {
+    assert(byzantine_frames_max <= codec.frames_max);
+    // Proof: blocks_max blocks never exceed byzantine_frames_max frames of this size.
+    assert(codec.blocks_max * (codec.payload_tx_length_max + 8) <=
+        byzantine_frames_max * (byzantine_frame_size - 23));
+}
 
 pub const Config = struct {
     verifier_count: u8 = 2,
@@ -71,6 +85,10 @@ pub const Config = struct {
     /// Real batcher only: admin stop/start/flush calls per minute (fault phase). Healing
     /// starts the batcher again, so liveness must survive any stop/start/flush sequence.
     admin_ops_per_minute: u32 = 0,
+    /// Byzantine posts from the batcher's own key: honest content in non-canonical
+    /// channels (replays with shuffled and duplicated frames, truncated channels), plus
+    /// garbage and oversize frames. Derivation must stay safe and live.
+    byzantine_per_minute: u32 = 0,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -106,6 +124,7 @@ pub const Config = struct {
         config.l1_block_txs_min = txs_min[@intCast(prng.below(txs_min.len))];
         const admin_ops_per_minute: u32 = @intCast(swarm_level(prng, 6));
         if (config.real_batcher) config.admin_ops_per_minute = admin_ops_per_minute;
+        config.byzantine_per_minute = @intCast(swarm_level(prng, 6));
         config.validate();
         return config;
     }
@@ -137,10 +156,12 @@ pub const Config = struct {
         const submissions = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
         const batcher = frames * submissions;
         // Chance-per-step injection can exceed the mean; four times it is ample headroom.
-        const spam = 4 * config.spam_per_minute * (config.fault_end_ns / (60 * ns_per_s) + 1);
+        const minutes = config.fault_end_ns / (60 * ns_per_s) + 1;
+        const spam = 4 * config.spam_per_minute * minutes;
+        const byzantine = 4 * config.byzantine_per_minute * minutes * (byzantine_frames_max + 1);
         // The real txmgr appends every attempt, including fee-bump resubmissions.
         const real = if (config.real_batcher) 8 * frames * (config.settle_end_ns / ns_per_s) else 0;
-        return @intCast(batcher + spam + real);
+        return @intCast(batcher + spam + byzantine + real);
     }
 
     pub fn l1_block_count_max(config: Config) u64 {
@@ -163,6 +184,7 @@ pub const Report = struct {
     partitions: u64 = 0,
     asymmetric_partitions: u64 = 0,
     spam: u64 = 0,
+    byzantine: u64 = 0,
     evictions: u64 = 0,
     disk_faults: u64 = 0,
     l1_reorgs: u64 = 0,
@@ -184,6 +206,7 @@ pub const Cluster = struct {
     batcher: nodes.Batcher,
     tx_pool: codec.TxPool,
     attacker: codec.Encoder,
+    byzantine: codec.Encoder,
     real: ?*real_batcher.RealBatcher,
     allocator: std.mem.Allocator,
     verifiers: [verifier_count_max]nodes.Verifier,
@@ -220,6 +243,8 @@ pub const Cluster = struct {
         const attacker_seed = 0x6174_7461_636b_6572;
         var attacker = try codec.Encoder.init(allocator, attacker_seed, codec.frame_size_full);
         errdefer attacker.deinit(allocator);
+        var byzantine = try codec.Encoder.init(allocator, 0x6279_7a61, byzantine_frame_size);
+        errdefer byzantine.deinit(allocator);
         const RealBatcher = real_batcher.RealBatcher;
         const frame_size = config.frame_size;
         const real = if (config.real_batcher)
@@ -254,6 +279,7 @@ pub const Cluster = struct {
             .batcher = batcher,
             .tx_pool = tx_pool,
             .attacker = attacker,
+            .byzantine = byzantine,
             .real = real,
             .allocator = allocator,
             .verifiers = verifiers,
@@ -265,6 +291,7 @@ pub const Cluster = struct {
         cluster.batcher.deinit(allocator);
         cluster.tx_pool.deinit(allocator);
         cluster.attacker.deinit(allocator);
+        cluster.byzantine.deinit(allocator);
         if (cluster.real) |real| real.destroy(allocator);
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
@@ -410,6 +437,9 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.spam_per_minute, steps_per_minute)) {
             cluster.inject_spam(prng);
         }
+        if (prng.chance(cluster.config.byzantine_per_minute, steps_per_minute)) {
+            cluster.inject_byzantine(prng);
+        }
         if (prng.chance(cluster.config.mempool_evictions_per_minute, steps_per_minute)) {
             cluster.report.evictions += @intFromBool(cluster.l1.evict(prng));
         }
@@ -486,6 +516,60 @@ pub const Cluster = struct {
         cluster.report.admin_ops += 1;
     }
 
+    /// The batcher's key posts something non-canonical. Content is the sequencer's own,
+    /// so derivation may adopt it early but never diverges.
+    fn inject_byzantine(cluster: *Cluster, prng: *Prng) void {
+        const head = cluster.sequencer.head;
+        if (head == 0) return;
+        cluster.report.byzantine += 1;
+        var garbage: [codec.tx_data_max]u8 = undefined;
+        switch (prng.below(4)) {
+            0, 1 => {
+                const first = prng.range(1, head);
+                const count: usize = @intCast(@min(codec.blocks_max, head - first + 1));
+                const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
+                const payloads = cluster.sequencer.chain.payloads[first..][0..count];
+                var frames_buffer: [codec.frames_max][]const u8 = undefined;
+                const frames = cluster.byzantine.encode(first, hashes, payloads);
+                assert(frames.len <= byzantine_frames_max);
+                @memcpy(frames_buffer[0..frames.len], frames);
+                // Fisher-Yates: frames arrive in any order.
+                var index = frames.len;
+                while (index > 1) : (index -= 1) {
+                    const other: usize = @intCast(prng.below(index));
+                    std.mem.swap([]const u8, &frames_buffer[index - 1], &frames_buffer[other]);
+                }
+                // Half the time the channel is truncated and never completes.
+                const truncated = frames.len > 1 and prng.chance(1, 2);
+                const posted = if (truncated) prng.range(1, frames.len - 1) else frames.len;
+                for (frames_buffer[0..posted]) |frame| {
+                    cluster.post_batcher_tx(frame);
+                    if (prng.chance(1, 4)) cluster.post_batcher_tx(frame); // Duplicate.
+                }
+            },
+            2 => {
+                const length: usize = @intCast(prng.range(1, 256));
+                prng.fill(garbage[0..length]);
+                if (prng.chance(1, 2)) garbage[0] = 0; // Derivation version: frames follow.
+                cluster.post_batcher_tx(garbage[0..length]);
+            },
+            else => {
+                // A frame declaring more data than the transaction holds.
+                const length: usize = 1 + 16 + 2 + 4 + 8 + 1;
+                prng.fill(garbage[0..length]);
+                garbage[0] = 0;
+                std.mem.writeInt(u32, garbage[19..23], 0xffff_ffff, .big);
+                cluster.post_batcher_tx(garbage[0..length]);
+            },
+        }
+    }
+
+    fn post_batcher_tx(cluster: *Cluster, data: []const u8) void {
+        const tx_index = cluster.tx_pool.append(data) orelse return;
+        const e = cluster.env(nodes.node_l1);
+        cluster.l1.on_message(&e, nodes.node_l1, .{ .batch_submit = .{ .tx_index = tx_index } });
+    }
+
     fn heal_all(cluster: *Cluster) void {
         if (cluster.real) |real| real.service.start();
         cluster.network.heal();
@@ -548,7 +632,11 @@ pub const Cluster = struct {
             cluster.safe_floor[index] = v.safe_head;
             if (v.reorgs != 0) return cluster.fail("unexpected reorg", v.id);
             if (v.equivocations != 0) return cluster.fail("equivocation", v.id);
-            if (v.invalid_batches != 0) return cluster.fail("undecodable batch", v.id);
+            // Byzantine posts are undecodable on purpose; head checks still catch harm.
+            const garbage_expected = cluster.config.byzantine_per_minute != 0;
+            if (v.invalid_batches != 0 and !garbage_expected) {
+                return cluster.fail("undecodable batch", v.id);
+            }
             // Heads only: earlier blocks were checked when they were heads, and parent
             // hashes chain them, so a head match implies the whole prefix matches.
             if (v.chain.hashes[v.unsafe_head] != sequencer.chain.hashes[v.unsafe_head]) {
@@ -709,6 +797,24 @@ test "cluster: inbox spam from a non-batcher sender is ignored" {
     try std.testing.expect(report.spam > 0);
 }
 
+test "cluster: byzantine batcher posts with honest content are harmless" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 6, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_batcher = real,
+            .byzantine_per_minute = 12,
+            .fault_end_ns = 120 * ns_per_s,
+            .production_end_ns = 180 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        try std.testing.expect(report.byzantine > 0);
+    }
+}
+
 test "cluster: real batcher service drives the chain to liveness without faults" {
     var cluster = try Cluster.init(std.testing.allocator, 3, .{
         .verifier_count = 2,
@@ -790,6 +896,7 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .spam_per_minute = smith.valueRangeAtMost(u32, 0, 20),
         .frame_size = smith.valueRangeAtMost(u32, 256, codec.frame_size_full),
         .l1_block_txs_min = smith.valueRangeAtMost(u8, 2, nodes.l1_batches_max),
+        .byzantine_per_minute = smith.valueRangeAtMost(u32, 0, 12),
         .real_batcher = smith.value(bool),
     };
     const evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);

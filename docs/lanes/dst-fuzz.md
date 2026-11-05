@@ -24,7 +24,7 @@ provably robust.
 - [x] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
   minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
 - [x] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
-- [ ] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
+- [x] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
@@ -148,3 +148,7 @@ provably robust.
   (`fuzz_targets_derive.zig`): ChannelBank (arrival order, pre/post-Granite selection,
   timeouts, size accounting, queue) and the Holocene ChannelAssembler against spec
   models; 4/4 model mutants caught. No derive bugs found.
+- 2026-11-05: byzantine batcher fault (`byzantine_per_minute`): the batcher key posts
+  replayed honest ranges as fresh channels with shuffled and duplicated frames,
+  truncated channels, garbage, and oversize frames. The undecodable-batch check is
+  waived for such seeds (head checks remain). 5000 seeds green.
