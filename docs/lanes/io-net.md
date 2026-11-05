@@ -38,3 +38,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   SimIo echo/partition/crash/timeout tests + seeded and std.testing fuzz; Linux green.
 - 2026-11-05: time: Clock(IO) with monotonic clamp, Deadline, drift-free Ticker, ManualClock.
 - 2026-11-05: json: validating zero-alloc Scanner (skip, unescape), Writer, QUANTITY/DATA hex; fuzzed.
+- 2026-11-05: http: incremental HTTP/1.1 parser (pipelining, in-place chunked, smuggling checks); fuzzed.
