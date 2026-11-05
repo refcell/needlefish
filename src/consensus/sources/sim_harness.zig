@@ -9,7 +9,7 @@ const http = @import("../../utilities/http/root.zig");
 const http_client = @import("../../utilities/http/client.zig");
 const object = @import("json_object.zig");
 
-pub const limits: http.Limits = .{ .head_size_max = 2048, .body_size_max = 512 * 1024 };
+pub const limits: http.Limits = .{ .head_size_max = 2048, .body_size_max = 1024 * 1024 };
 
 pub const client_options: http_client.Options = .{
     .send_buffer_size = 8 * 1024,

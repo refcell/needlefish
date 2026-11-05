@@ -11,9 +11,13 @@ pub const transaction_json = @import("transaction_json.zig");
 pub const receipt_json = @import("receipt_json.zig");
 pub const l1_provider = @import("l1_provider.zig");
 pub const L1Provider = l1_provider.L1Provider;
+pub const beacon_json = @import("beacon_json.zig");
+pub const blob_provider = @import("blob_provider.zig");
+pub const BlobProvider = blob_provider.BlobProvider;
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("l1_json_test.zig");
     _ = @import("l1_provider_test.zig");
+    _ = @import("blob_provider_test.zig");
 }
