@@ -35,6 +35,17 @@ pub const Config = struct {
     poll_interval_ms: u64 = 12_000,
     rpc_timeout_ms: u64 = 30_000,
     private_key: ?[32]u8 = null,
+    /// `--prover-rpc native` proves in-process (`native_prover.zig`) over the L1/L2
+    /// endpoints, booting with this rollup config file (required then).
+    rollup_config: []const u8 = "",
+    /// Custom L1 chains only, with the native prover: the L1 genesis JSON file.
+    l1_genesis: []const u8 = "",
+    /// Stop after this many poll intervals (smoke tests); runs forever when null.
+    ticks_max: ?u64 = null,
+
+    pub fn native_prover(config: *const Config) bool {
+        return std.mem.eql(u8, config.prover_rpc, "native");
+    }
 };
 
 /// Durations up to one day: `500ms`, `12s`, `2m`, `1h`, or bare seconds.
@@ -73,6 +84,9 @@ const Flag = enum {
     poll_interval,
     rpc_timeout,
     private_key,
+    rollup_config,
+    l1_genesis,
+    ticks_max,
 };
 
 fn flag_of(name: []const u8) Error!Flag {
@@ -119,6 +133,10 @@ fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
         .poll_interval => config.poll_interval_ms = try parse_duration_ms(value),
         .rpc_timeout => config.rpc_timeout_ms = try parse_duration_ms(value),
         .private_key => config.private_key = try parse_fixed(32, value),
+        .rollup_config => config.rollup_config = value,
+        .l1_genesis => config.l1_genesis = value,
+        .ticks_max => config.ticks_max = std.fmt.parseUnsigned(u64, value, 10) catch
+            return error.InvalidValue,
     }
 }
 
@@ -139,6 +157,7 @@ fn validate(config: *const Config) Error!void {
     if (config.poll_interval_ms == 0) return error.ZeroPollInterval;
     if (config.rpc_timeout_ms == 0) return error.InvalidValue;
     if (!config.dry_run and config.private_key == null) return error.MissingSigner;
+    if (config.native_prover() and config.rollup_config.len == 0) return error.MissingFlag;
 }
 
 const testing = std.testing;
@@ -171,6 +190,13 @@ test "proposer config: flags, defaults and validation" {
     try testing.expectEqual(@as(u64, 500), signed.poll_interval_ms);
     try testing.expectEqual(@as(u64, 120_000), signed.rpc_timeout_ms);
     try testing.expectError(error.MissingFlag, parse(&.{"--dry-run"}));
+    const native_args = [_][]const u8{ "--dry-run", "--prover-rpc", "native" };
+    try testing.expectError(error.MissingFlag, parse(&(required ++ native_args)));
+    const native = try parse(&(required ++ native_args ++ [_][]const u8{
+        "--rollup-config", "rollup.json", "--ticks-max", "3",
+    }));
+    try testing.expect(native.native_prover());
+    try testing.expectEqual(@as(?u64, 3), native.ticks_max);
     try testing.expectError(error.UnknownFlag, parse(&.{"--nope"}));
     try testing.expectError(error.MissingValue, parse(&.{"--game-type"}));
     try testing.expectError(error.ZeroPollInterval, parse(&(required ++ [_][]const u8{
