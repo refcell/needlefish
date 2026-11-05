@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 const primitives = @import("primitives.zig");
 const transaction = @import("transaction.zig");
 const Harness = @import("evm_test.zig").Harness;
+const Evm = @import("evm.zig").Evm;
 const Fork = @import("fork.zig").Fork;
 const Address = primitives.Address;
 
@@ -235,7 +236,67 @@ fn erc20_transfer(iterations: u32) u64 {
 }
 
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
-const Case = @import("../../testing/bench.zig").Case;
+const bench = @import("../../testing/bench.zig");
+const Case = bench.Case;
+
+/// `just vectors` fetches the public snailtracer bytecode (revm's bench fixture) here.
+pub const snailtracer_path = ".cache/vectors/bench/snailtracer.hex";
+const snailtracer_bytes_max = 32 * 1024;
+const snailtracer_selector = [4]u8{ 0x30, 0x62, 0x7b, 0x7c }; // Benchmark()
+var snailtracer_code: [snailtracer_bytes_max]u8 = undefined;
+var snailtracer_length: u32 = 0;
+var snailtracer_config = false;
+
+/// One snailtracer `Benchmark()` call (~1.1G gas of arithmetic, memory, and jumps).
+fn snailtracer(iterations: u32) u64 {
+    assert(snailtracer_length > 0);
+    const h = harness();
+    if (!snailtracer_config) {
+        // The test harness caps memory at 1 MiB; run with the production defaults.
+        h.evm.deinit(std.heap.page_allocator);
+        h.evm = Evm.init(std.heap.page_allocator, .{}, &h.state) catch @panic("bench: evm");
+        snailtracer_config = true;
+    }
+    const code = snailtracer_code[0..snailtracer_length];
+    h.database.put_account(contract, 0, 1, code) catch @panic("bench: put code");
+    const limit: u64 = 1_000_000_000;
+    var gas_used: u64 = 0;
+    var iteration: u32 = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        h.state.reset(h.database.interface());
+        const outcome = h.call(fork, contract, &snailtracer_selector, limit) catch
+            @panic("bench: call");
+        assert(outcome.status == .success);
+        gas_used += limit - outcome.gas_remaining;
+    }
+    return gas_used;
+}
+
+const fixture_cases = [_]Case{
+    .{ .name = "evm: snailtracer", .iterations = 20, .run = snailtracer },
+};
+
+/// Cases whose bytecode is a fetched fixture; skipped (with a note) when it is missing.
+pub fn run_fixtures(io: std.Io, filter: ?[]const u8) void {
+    if (!bench.matches(fixture_cases[0].name, filter)) return;
+    load_snailtracer(io) catch |err| {
+        std.debug.print("evm: snailtracer skipped ({s}; run `just vectors`)\n", .{
+            @errorName(err),
+        });
+        return;
+    };
+    bench.run_cases(io, fixture_cases, filter);
+}
+
+fn load_snailtracer(io: std.Io) !void {
+    var text: [2 * snailtracer_bytes_max + 16]u8 = undefined;
+    const read = try std.Io.Dir.cwd().readFile(io, snailtracer_path, &text);
+    const hex = std.mem.trim(u8, read, " \n\r\t");
+    if (hex.len % 2 != 0 or hex.len / 2 > snailtracer_bytes_max) return error.BadFixture;
+    const code = try std.fmt.hexToBytes(&snailtracer_code, hex);
+    snailtracer_length = @intCast(code.len);
+    assert(snailtracer_length == hex.len / 2);
+}
 
 pub const cases = [_]Case{
     // ~96k gas: 1000 loop iterations of 13 instructions.

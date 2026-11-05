@@ -341,6 +341,17 @@ op against a freshly reset state (Prague rules).
 | evm/value_transfer_tx | 701.5 | validate, buy gas, warm, settle, state reset |
 | evm/erc20_transfer_tx | 1442.9 | 2 cold slots read+written, 2 keccak, LOG3 (~51k gas) |
 
+Snailtracer (`just vectors` fetches the public bytecode from revm's bench fixtures), one
+`Benchmark()` call of 165 962 868 gas, ReleaseFast, Apple M4 Pro, 2026-11-05, measured with
+the shared machine at load average ~35, so treat it as a ceiling:
+
+| case | ns/op | notes |
+|---|---|---|
+| evm: snailtracer | 50 479 625 | ~3.3 Ggas/s; arithmetic, memory, and jump heavy |
+
+Not yet compared with revm on the same machine: building revm needs a Rust toolchain build
+the shared disk cannot spare right now.
+
 ## Test suite time
 
 `zig build test` runs on every push of every lane, so its wall time is a shared budget.

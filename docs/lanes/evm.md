@@ -79,7 +79,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   ReleaseSafe soak clean. The GeneralStateTests are the differential check against the
   reference clients (zero dependencies rules out linking another EVM).
 - [x] Performance: micro benchmarks (`evm/bench.zig`, results in docs/PERF.md).
-- [ ] EIP-8130 execution (Everest, type 0x79). The tx type, structure checks, and intrinsic
+- [x] EIP-8130 execution (Everest, type 0x79). The tx type, structure checks, and intrinsic
   gas live in `src/common/consensus/eip8130*.zig` (common lane); the EVM side mirrors base
   `crates/execution/eip8130/src` (~8k non-test lines) and `crates/common/evm2/src`
   (`everest.rs`, `transaction.rs`, `handler.rs`). Order: (1) AccountConfiguration storage
@@ -107,8 +107,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   Left: the node lane must map consensus 0x79
   envelopes to `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw }` and
   wire RPC estimation to `eip8130_simulate.simulate`.
-- [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
-  compare with revm on the same machine; profile call-frame and keccak paths.
+- [x] Performance: snailtracer contract workload (`just vectors` fetches revm's public fixture;
+  `evm: snailtracer` in `zig build bench`, ~50 ms / 166M gas, docs/PERF.md).
+- [ ] Performance: compare with revm on the same machine; profile call-frame and keccak
+  paths.
 
 ## Decisions
 - EIP-8130 pre-call reads warm the accounts and slots they touch (base's gas-free journal
@@ -159,6 +161,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: snailtracer bench (fetched public fixture) and EIP-8130 simulation.
 - 2026-11-05: EIP-8130 execution: nonce manager storage, journaled code installs, the
   enshrined executor (`eip8130_execute.zig`), end-to-end tests and an executor fuzz.
 - 2026-11-05: B-20 core, Asset/Stablecoin V1 tokens, and factory native precompiles.

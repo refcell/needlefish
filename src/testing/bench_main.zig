@@ -21,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
     base.execution.db.bench.run_commit(init.io, filter);
     base.execution.db.bench.witness.run(init.io, filter);
     bench.run_cases(init.io, base.execution.evm.bench.cases, filter);
+    base.execution.evm.bench.run_fixtures(init.io, filter);
     bench.run_cases(init.io, base.execution.node.bench.cases, filter);
     bench.run_cases(init.io, base.consensus.p2p.bench.cases, filter);
 }
