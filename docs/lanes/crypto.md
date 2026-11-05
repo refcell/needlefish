@@ -377,3 +377,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: fuzz campaign: p256 precompile 300K runs clean.
 - 2026-11-05: crypto suite passes on x86_64 (baseline and x86_64_v3) under Rosetta.
 - 2026-11-05: x86_64_v3 cells failure traced to Rosetta (qemu -cpu max passes all kzg tests for v3 ReleaseSafe/ReleaseFast); documented the qemu path.
+- 2026-11-05: full crypto suite x86_64_v3 ReleaseSafe under qemu -cpu max: 262/262 pass (incl. heavy KZG/cells); blob fuzz 20K runs clean.
