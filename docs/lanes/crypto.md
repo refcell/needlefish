@@ -209,3 +209,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: bls g1.mul_glv (GLV split by x^2, width-5 NAF, affine tables, mixed adds): 71->42us; kzg point eval now uses it (0.88->0.76ms).
 - 2026-11-05: bn254 add/mul/pairing precompiles (EIP-196/197) on montgomery.Field; official geth vectors, G2 subgroup check, bilinearity + seeded/coverage fuzz; bench (ReleaseFast, M-series): add 1.73us, mul 12.2us, pairing 2 pairs 0.56ms.
 - 2026-11-05: bls g2.mul_gls (psi = [x], four 64-bit digits, width-5 NAF, affine tables): 198->80us; single-point MSM (G1MSM/G2MSM with k=1) now uses GLV/GLS. Review of bn254 + BLS precompiles: no defects.
+- 2026-11-05: bls msm: stateless Booth digits, one pass over all points (no 256-point chunks), window up to 10 (G1) / 9 (G2): msm-4096 / blob_to_kzg_commitment 56.8->44.0ms.

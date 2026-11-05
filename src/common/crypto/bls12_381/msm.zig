@@ -1,102 +1,77 @@
 //! Multi-scalar multiplication sum_i [s_i] P_i with Pippenger's bucket method,
 //! generic over the curve (G1 or G2).
 //!
-//! Scalars are recoded into signed base-2^c digits in [-2^(c-1), 2^(c-1)], so a
-//! window needs 2^(c-1) buckets. Inputs are processed in chunks of at most
-//! `chunk_points_max` points with stack-resident digit and bucket arrays, so the
-//! memory bound is static and independent of the input length.
+//! Scalars are read as signed base-2^c (Booth) digits in [-2^(c-1), 2^(c-1)],
+//! computed statelessly from three bit ranges of the scalar, so no digit array is
+//! stored and all points share one pass per window. The only memory is the bucket
+//! array, statically bounded by the per-curve maximum window width.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
+/// Batch size the precompiles use to decode inputs into stack arrays.
 pub const chunk_points_max = 256;
 const window_bits_min = 2;
-const window_bits_max = 7;
 const scalar_bits = 256;
-const windows_max = scalar_bits / window_bits_min + 1;
-const buckets_max = 1 << (window_bits_max - 1);
 
-comptime {
-    assert(std.math.log2_int(u32, chunk_points_max) - 1 <= window_bits_max);
-    assert(windows_max * window_bits_min > scalar_bits);
+/// Widest window for curve C: 512 G1 buckets (74 KiB) or 256 G2 buckets (74 KiB).
+fn window_bits_max(comptime C: type) u32 {
+    return if (@sizeOf(C) > 200) 9 else 10;
 }
 
 /// Window width for `count` points: about log2(count) - 1, clamped.
-fn window_bits(count: usize) u32 {
+fn window_bits(comptime C: type, count: usize) u32 {
     assert(count > 0);
     const log = std.math.log2_int(usize, count);
-    const bits: u32 = @intCast(std.math.clamp(log -| 1, window_bits_min, window_bits_max));
-    assert(bits >= window_bits_min and bits <= window_bits_max);
+    const bits: u32 = @intCast(std.math.clamp(log -| 1, window_bits_min, window_bits_max(C)));
+    assert(bits >= window_bits_min and bits <= window_bits_max(C));
     return bits;
 }
 
-/// Signed base-2^c recoding of a 256-bit scalar into `digits`; returns the count.
-fn recode(scalar: u256, bits: u32, digits: *[windows_max]i16) u32 {
-    const window_count = scalar_bits / bits + 1;
-    assert(window_count <= windows_max);
-    const half: i32 = @as(i32, 1) << @intCast(bits - 1);
-    const mask: u256 = (@as(u256, 1) << @intCast(bits)) - 1;
-    var carry: i32 = 0;
-    for (0..window_count) |window| {
-        const shift = window * bits;
-        const chunk: i32 = if (shift >= scalar_bits)
-            0
-        else
-            @intCast((scalar >> @intCast(shift)) & mask);
-        var value = chunk + carry;
-        carry = 0;
-        if (value > half) {
-            value -= half << 1;
-            carry = 1;
-        }
-        digits[window] = @intCast(value);
+fn scalar_bit(scalar: u256, index: i64) i32 {
+    if (index < 0 or index >= scalar_bits) return 0;
+    return @intCast((scalar >> @intCast(index)) & 1);
+}
+
+/// Booth digit `window` of width `bits`: -2^(c-1) b[(w+1)c-1] + sum_{i<c-1} 2^i b[wc+i]
+/// + b[wc-1]. Over windows 0..256/c these reconstruct the scalar exactly.
+fn digit_at(scalar: u256, window: u32, bits: u32) i32 {
+    assert(bits >= window_bits_min and bits <= 16);
+    const start: i64 = @as(i64, window) * bits;
+    var low: i32 = 0;
+    if (start < scalar_bits) {
+        const mask: u256 = (@as(u256, 1) << @intCast(bits - 1)) - 1;
+        low = @intCast((scalar >> @intCast(start)) & mask);
     }
-    assert(carry == 0);
-    return window_count;
+    const top = scalar_bit(scalar, start + bits - 1);
+    const digit = low + scalar_bit(scalar, start - 1) - (top << @intCast(bits - 1));
+    assert(@abs(digit) <= @as(u32, 1) << @intCast(bits - 1));
+    return digit;
+}
+
+fn window_count_for(bits: u32) u32 {
+    return scalar_bits / bits + 1;
 }
 
 /// sum_i [scalars[i]] points[i] for any number of points.
 pub fn msm(comptime C: type, points: []const C.Affine, scalars: []const u256) C {
     assert(points.len == scalars.len);
-    var result = C.identity;
-    var start: usize = 0;
-    while (start < points.len) {
-        const end = @min(points.len, start + chunk_points_max);
-        result = result.add(msm_chunk(C, points[start..end], scalars[start..end]));
-        start = end;
-    }
-    assert(start == points.len);
-    return result;
-}
-
-/// One point: use the endomorphism-accelerated multiplication. MSM inputs are in the
-/// order-r subgroup (the precompiles check it), which those methods require.
-fn single_mul(comptime C: type, point: C.Affine, scalar: u256) C {
-    if (C == g1.G1) return g1.mul_glv(point.to_jacobian(), scalar);
-    if (C == g2.G2) return g2.mul_gls(point.to_jacobian(), scalar);
-    return point.to_jacobian().mul(scalar);
-}
-
-fn msm_chunk(comptime C: type, points: []const C.Affine, scalars: []const u256) C {
-    assert(points.len <= chunk_points_max);
-    assert(points.len == scalars.len);
     if (points.len == 0) return C.identity;
     if (points.len == 1) return single_mul(C, points[0], scalars[0]);
-    const bits = window_bits(points.len);
-    var digits: [chunk_points_max][windows_max]i16 = undefined;
-    var window_count: u32 = 0;
-    for (scalars, 0..) |scalar, index| window_count = recode(scalar, bits, &digits[index]);
+    const bits = window_bits(C, points.len);
     const bucket_count = @as(usize, 1) << @intCast(bits - 1);
-    var buckets: [buckets_max]C = undefined;
+    var buckets: [1 << (window_bits_max(C) - 1)]C = undefined;
     var result = C.identity;
-    var window = window_count;
+    var window = window_count_for(bits);
     while (window > 0) {
         window -= 1;
-        for (0..bits) |_| result = result.double();
+        if (!result.is_identity()) {
+            for (0..bits) |_| result = result.double();
+        }
         @memset(buckets[0..bucket_count], C.identity);
-        for (points, 0..) |point, index| {
+        for (points, scalars) |point, scalar| {
             if (point.infinity) continue;
-            const digit = digits[index][window];
+            const digit = digit_at(scalar, window, bits);
             if (digit > 0) {
                 const slot: usize = @intCast(digit - 1);
                 buckets[slot] = buckets[slot].add_affine(point);
@@ -108,6 +83,14 @@ fn msm_chunk(comptime C: type, points: []const C.Affine, scalars: []const u256) 
         result = result.add(sum_buckets(C, buckets[0..bucket_count]));
     }
     return result;
+}
+
+/// One point: use the endomorphism-accelerated multiplication. MSM inputs are in the
+/// order-r subgroup (the precompiles check it), which those methods require.
+fn single_mul(comptime C: type, point: C.Affine, scalar: u256) C {
+    if (C == g1.G1) return g1.mul_glv(point.to_jacobian(), scalar);
+    if (C == g2.G2) return g2.mul_gls(point.to_jacobian(), scalar);
+    return point.to_jacobian().mul(scalar);
 }
 
 /// sum_j (j + 1) buckets[j] with a running sum.
@@ -133,15 +116,12 @@ test "msm: signed recoding reconstructs the scalar" {
     var prng = Prng.init(0x4d534d);
     for (0..50) |round| {
         const scalar: u256 = if (round == 0) std.math.maxInt(u256) else prng.int(u256);
-        const bits: u32 = @intCast(window_bits_min + round % (window_bits_max - 1));
-        var digits: [windows_max]i16 = undefined;
-        const count = recode(scalar, bits, &digits);
+        const bits: u32 = @intCast(window_bits_min + round % 9);
         var value: i512 = 0;
-        var index = count;
+        var index = window_count_for(bits);
         while (index > 0) {
             index -= 1;
-            value = (value << @intCast(bits)) + digits[index];
-            try testing.expect(@abs(digits[index]) <= @as(u16, 1) << @intCast(bits - 1));
+            value = (value << @intCast(bits)) + digit_at(scalar, index, bits);
         }
         try testing.expectEqual(@as(i512, scalar), value);
     }
@@ -189,7 +169,7 @@ test "msm: G2 matches the sum of scalar multiplications" {
     }
 }
 
-test "msm: chunking across the chunk bound" {
+test "msm: many points with a wide window" {
     // Short scalars keep the reference scalar multiplications cheap in Debug.
     try check_msm(g1.G1, g1.generator, chunk_points_max + 3, 99, std.math.maxInt(u24));
 }

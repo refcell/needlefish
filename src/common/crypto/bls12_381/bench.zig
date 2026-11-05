@@ -72,6 +72,24 @@ pub fn map_fp_to_g1(iterations: u32) u64 {
     return accumulator;
 }
 
+var msm_4096_points: [4096]g1.Affine = undefined;
+var msm_4096_scalars: [4096]u256 = undefined;
+
+pub fn g1_msm_4096(iterations: u32) u64 {
+    var point = g1.generator.to_jacobian();
+    for (&msm_4096_points, &msm_4096_scalars, 0..) |*slot, *value, index| {
+        point = point.double().add(g1.generator.to_jacobian());
+        slot.* = point.to_affine();
+        value.* = scalar *% (index + 1) % fields.r;
+    }
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const result = msm.msm(g1.G1, &msm_4096_points, &msm_4096_scalars);
+        accumulator +%= result.x.limbs_value[0];
+    }
+    return accumulator;
+}
+
 pub fn g1_msm_64(iterations: u32) u64 {
     var points: [64]g1.Affine = undefined;
     var scalars: [64]u256 = undefined;

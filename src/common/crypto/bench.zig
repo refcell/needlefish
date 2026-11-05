@@ -522,6 +522,7 @@ pub const cases = [_]Case{
     .{ .name = "bls12-381/pairing-2", .iterations = 500, .run = bls_bench.pairing_2 },
     .{ .name = "bls12-381/map_fp_to_g1", .iterations = 5_000, .run = bls_bench.map_fp_to_g1 },
     .{ .name = "bls12-381/g1 msm-64", .iterations = 200, .run = bls_bench.g1_msm_64 },
+    .{ .name = "bls12-381/g1 msm-4096", .iterations = 10, .run = bls_bench.g1_msm_4096 },
     .{ .name = "modexp/256b full exp", .iterations = 20_000, .run = bench_modexp(32, 32, false) },
     .{ .name = "modexp/2048b e=65537", .iterations = 2_000, .run = bench_modexp(256, 3, false) },
     .{ .name = "modexp/2048b full exp", .iterations = 20, .run = bench_modexp(256, 256, false) },
