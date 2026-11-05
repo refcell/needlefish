@@ -99,6 +99,10 @@ fallback but hot paths should be our own, optimized implementations.
   and without tables; seeded + coverage-guided differential vs `msm`. Batcher should attach.
 - [x] recover_cells_and_kzg_proofs with the prover tables (FK20 is the proof half):
   193 -> 98 ms for 64 present cells (new bench `... (64, tables)`).
+- [x] vartime safegcd inner loop `divsteps_var` (port of libsecp256k1 modinv64_divsteps_62_var:
+  ctz zero skipping, up to 4/6 bits of g per multiply), checked against the branch-free loop
+  (seeded 20K + coverage-guided fuzz). Inverse bn254 1.22 -> 0.84 us, BLS 1.83 -> 1.33 us;
+  bn254 add precompile 1.72 -> 1.22 us (11.5 -> 8.1 ns/gas, below ecrecover).
 - [x] Wycheproof vectors (C2SP, Apache-2.0) in `wycheproof_tests.zig`: secp256k1 ECDSA P1363
   SHA-256 (234 tests), secp256r1 ECDSA P1363 SHA-256 (241, EIP-7951 semantics), secp256k1
   ECDH on raw points (495, incl. 21 invalid-curve / invalid-point rejections). Converted by
@@ -138,16 +142,16 @@ fallback but hot paths should be our own, optimized implementations.
 | ecrecover (0x01) | 3000 | 28.5 us | 9.5 |
 | p256verify, RIP-7212 pricing (Fjord..pre-Azul) | 3450 | 47.7 us | 13.8 |
 | p256verify, EIP-7951 pricing (Osaka/Azul) | 6900 | 47.7 us | 6.9 |
-| bn254 add (0x06) | 150 | 1.72 us | 11.5 |
+| bn254 add (0x06) | 150 | 1.22 us | 8.1 |
 | bn254 mul (0x07) | 6000 | 12.2 us | 2.0 |
 | bn254 pairing, 2 pairs (0x08) | 113000 | 494 us | 4.4 |
 | bls12-381 pairing, 2 pairs (0x0f) | 102900 | 588 us | 5.7 |
 | bls12-381 map_fp_to_g1 (0x10) | 5500 | 34 us | 6.2 |
 | kzg point evaluation (0x0a) | 50000 | 650 us | 13.0 |
 
-ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: bn254 add (11.5, dominated by
-input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point evaluation
-(13.0). All stay within ~1.5x of ecrecover, so none is a block-time outlier.
+ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 pricing
+(13.8) and kzg point evaluation (13.0); bn254 add dropped from 11.5 to 8.1 with
+`divsteps_var`. All stay within ~1.5x of ecrecover, so none is a block-time outlier.
 
 ## Decisions
 
@@ -416,3 +420,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: second fuzz pass complete (sha256/ripemd160/blake2f/keccak 300K, kzg verify/framing 20K, all clean); fuzz item closed.
 - 2026-11-05: recovery with prover tables 193 -> 98 ms.
 - 2026-11-05: bench snapshot table refreshed (full crypto bench run).
+- 2026-11-05: divsteps_var: field inverses ~1.4x faster; bn254 add 8.1 ns/gas.

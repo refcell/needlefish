@@ -2,9 +2,10 @@
 //! generic over the modulus width (used by secp256k1 and `montgomery.Field.inverse`).
 //!
 //! Only for public inputs: the number of outer iterations depends on the value.
-//! Batches of 62 divsteps run on the low 64 bits of (f, g) with a branch-free
-//! inner loop; the resulting 2x2 transition matrix is then applied to the full values
-//! in signed 62-bit limbs. With f0 = m and g0 = x, the invariants f = d x, g = e x
+//! Batches of 62 divsteps run on the low 64 bits of (f, g) (`divsteps_var`, after
+//! libsecp256k1's modinv64_divsteps_62_var: zero runs skipped with ctz, several low bits
+//! of g cleared per multiply); the resulting 2x2 transition matrix is then applied to the
+//! full values in signed 62-bit limbs. With f0 = m and g0 = x, the invariants f = d x, g = e x
 //! (mod m) hold throughout, and the loop ends at g = 0, f = +-1, so x^-1 = +-d.
 
 const std = @import("std");
@@ -50,7 +51,7 @@ pub fn Modulus(comptime Int: type, comptime modulus: Int) type {
                 assert(batches < batch_count_max);
                 const low_f = low_bits(&f);
                 const low_g = low_bits(&g);
-                const matrix = divsteps(&delta, low_f, low_g);
+                const matrix = divsteps_var(&delta, low_f, low_g);
                 update_fg(&f, &g, matrix);
                 update_de(&d, &e, matrix);
             }
@@ -194,6 +195,62 @@ pub fn Modulus(comptime Int: type, comptime modulus: Int) type {
     };
 }
 
+/// The same 62 divsteps and matrix as `Modulus(..).divsteps`, in variable time: runs of
+/// zero bits of g are skipped with ctz, and while f stays put one multiply clears up to
+/// 4 (no swap) or 6 (after a swap) low bits of g, using w = -g / f mod 2^limit.
+fn divsteps_var(delta: *i64, f_low: u64, g_low: u64) Matrix {
+    assert(f_low & 1 == 1);
+    var f = f_low;
+    var g = g_low;
+    var u: u64 = 1;
+    var v: u64 = 0;
+    var q: u64 = 0;
+    var r: u64 = 1;
+    var eta: i64 = -delta.*;
+    var remaining: u32 = limb_bits;
+    var rounds: u32 = 0;
+    while (true) : (rounds += 1) {
+        assert(rounds <= limb_bits);
+        const zeros: u32 = @ctz(g | (~@as(u64, 0) << @intCast(remaining)));
+        assert(zeros <= remaining);
+        g >>= @intCast(zeros);
+        u <<= @intCast(zeros);
+        v <<= @intCast(zeros);
+        eta -= zeros;
+        remaining -= zeros;
+        if (remaining == 0) break;
+        var w: u64 = undefined;
+        var mask: u64 = undefined;
+        if (eta < 0) {
+            eta = -eta;
+            const old_f = f;
+            f = g;
+            g = 0 -% old_f;
+            const old_u = u;
+            u = q;
+            q = 0 -% old_u;
+            const old_v = v;
+            v = r;
+            r = 0 -% old_v;
+            const limit: u32 = @intCast(@min(eta + 1, remaining));
+            mask = (~@as(u64, 0) >> @intCast(64 - limit)) & 63;
+            w = (f *% g *% (f *% f -% 2)) & mask;
+        } else {
+            const limit: u32 = @intCast(@min(eta + 1, remaining));
+            mask = (~@as(u64, 0) >> @intCast(64 - limit)) & 15;
+            w = f +% (((f +% 1) & 4) << 1);
+            w = (0 -% w) *% g & mask;
+        }
+        g +%= f *% w;
+        q +%= u *% w;
+        r +%= v *% w;
+        assert(g & mask == 0);
+    }
+    delta.* = -eta;
+    assert(f & 1 == 1);
+    return .{ .u = @bitCast(u), .v = @bitCast(v), .q = @bitCast(q), .r = @bitCast(r) };
+}
+
 const testing = std.testing;
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -245,4 +302,40 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
 
 test "safegcd: coverage-guided fuzz" {
     try testing.fuzz({}, fuzz_one, .{});
+}
+
+/// Compares `divsteps_var` with the branch-free reference for one (delta, f, g).
+fn expect_divsteps_match(delta: i64, f_low: u64, g_low: u64) !void {
+    const Reference = Modulus(u256, secp256k1_modulus);
+    var delta_reference = delta;
+    var delta_var = delta;
+    const expected = Reference.divsteps(&delta_reference, f_low | 1, g_low);
+    const actual = divsteps_var(&delta_var, f_low | 1, g_low);
+    try testing.expectEqual(expected, actual);
+    try testing.expectEqual(delta_reference, delta_var);
+}
+
+test "safegcd: divsteps_var matches the branch-free divsteps (seeded)" {
+    var prng = Prng.init(0x64697673);
+    try expect_divsteps_match(1, 1, 0);
+    try expect_divsteps_match(1, std.math.maxInt(u64), std.math.maxInt(u64));
+    for (0..20_000) |round| {
+        const delta: i64 = switch (round % 4) {
+            0 => 1,
+            1 => @as(i64, @intCast(prng.below(1200))) - 600,
+            else => @as(i64, @intCast(prng.below(40))) - 20,
+        };
+        var g = prng.int(u64);
+        if (prng.chance(1, 4)) g <<= @intCast(prng.below(64));
+        try expect_divsteps_match(delta, prng.int(u64), g);
+    }
+}
+
+fn fuzz_divsteps(_: void, smith: *testing.Smith) anyerror!void {
+    const delta: i64 = @as(i64, smith.value(i16));
+    try expect_divsteps_match(delta, smith.value(u64), smith.value(u64));
+}
+
+test "safegcd: coverage-guided fuzz of divsteps_var vs branch-free divsteps" {
+    try testing.fuzz({}, fuzz_divsteps, .{});
 }
