@@ -33,6 +33,25 @@ pub const Config = struct {
 
 pub const Error = error{TrieFull};
 
+pub const VisitMode = enum {
+    /// Changed nodes; their marks stay (a dry run, to check capacity first).
+    count,
+    /// Changed nodes; their marks are cleared.
+    drain,
+    /// Every node; marks are cleared.
+    all,
+};
+
+/// What `visit_nodes` reports for one node.
+pub const Visit = struct {
+    /// Nibbles from the root to this node.
+    path: []const u8,
+    /// The full node encoding, also for nodes embedded in their parent.
+    encoding: []const u8,
+    /// For a leaf, the nibbles of its whole key; empty otherwise.
+    leaf_key: []const u8,
+};
+
 pub fn TrieType(comptime config: Config) type {
     comptime assert(config.key_bytes_max > 0);
     comptime assert(config.key_bytes_max <= nibbles_module.key_bytes_max);
@@ -240,6 +259,9 @@ pub fn TrieType(comptime config: Config) type {
         /// Scratch for the batched rehash: one `key << 32 | index` entry per dirty node, keyed
         /// first by depth, then by encoding length. Empty when hashing is not batched.
         order: []u64,
+        /// One bit per node, set when the node is rehashed; read and cleared by `visit_nodes`
+        /// (historical proofs). Empty, and never touched, unless `track_changes` was called.
+        changed: []u64 = &.{},
 
         pub fn init(allocator: std.mem.Allocator, node_count_max: u32) !Self {
             assert(node_count_max >= nodes_per_insert_max);
@@ -262,6 +284,7 @@ pub fn TrieType(comptime config: Config) type {
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.changed);
             allocator.free(self.order);
             allocator.free(self.cache);
             allocator.free(self.nodes);
@@ -280,6 +303,7 @@ pub fn TrieType(comptime config: Config) type {
             }
             self.free_count = @intCast(self.nodes.len);
             self.root = none;
+            @memset(self.changed, 0);
         }
 
         pub fn node_count(self: *const Self) u32 {
@@ -304,6 +328,7 @@ pub fn TrieType(comptime config: Config) type {
                 .branch => result.body.branch = @splat(none),
             }
             self.cache[index] = .{};
+            self.set_changed(index, false);
             return index;
         }
 
@@ -725,6 +750,7 @@ pub fn TrieType(comptime config: Config) type {
                 }
                 self.cache[frame.index] = self.encode_ref(current);
                 assert(self.cache[frame.index].len > 0);
+                self.set_changed(frame.index, true);
                 stack_len -= 1;
             }
         }
@@ -766,6 +792,7 @@ pub fn TrieType(comptime config: Config) type {
                     count += 1;
                     const current = &self.nodes[index];
                     assert(self.cache[index].len == 0);
+                    self.set_changed(index, true);
                     const children: []const NodeIndex = switch (current.kind) {
                         .free => unreachable, // Reachable nodes are never on the free list.
                         .leaf => &.{},
@@ -944,6 +971,125 @@ pub fn TrieType(comptime config: Config) type {
                 },
             }
             return sink.result();
+        }
+
+        /// Starts recording which nodes get rehashed. Nodes hashed before this call count as
+        /// unchanged, so a consumer takes every node once first (`VisitMode.all`).
+        pub fn track_changes(self: *Self, allocator: std.mem.Allocator) !void {
+            assert(self.changed.len == 0);
+            const words = (self.nodes.len + 63) / 64;
+            self.changed = try allocator.alloc(u64, words);
+            @memset(self.changed, 0);
+            assert(self.changed.len * 64 >= self.nodes.len);
+        }
+
+        fn set_changed(self: *Self, index: NodeIndex, changed: bool) void {
+            if (self.changed.len == 0) return;
+            assert(index < self.nodes.len);
+            const bit = @as(u64, 1) << @as(u6, @truncate(index));
+            if (changed) {
+                self.changed[index >> 6] |= bit;
+            } else {
+                self.changed[index >> 6] &= ~bit;
+            }
+        }
+
+        fn is_changed(self: *const Self, index: NodeIndex) bool {
+            assert(self.changed.len > 0);
+            assert(index < self.nodes.len);
+            return self.changed[index >> 6] & (@as(u64, 1) << @as(u6, @truncate(index))) != 0;
+        }
+
+        const VisitFrame = struct { index: NodeIndex, next_child: u8, path_len: u8 };
+
+        /// Calls `visitor.visit(Visit)` for nodes below `root`, depth first, parents first.
+        /// `count` and `drain` visit only nodes rehashed since their last drain: rehashing a
+        /// node rehashes its ancestors, so every clean subtrie is skipped whole. The trie must
+        /// be hashed (`root_hash_of(root)`) first, and tracking enabled.
+        pub fn visit_nodes(self: *Self, root: NodeIndex, mode: VisitMode, visitor: anytype) !void {
+            assert(self.changed.len > 0);
+            if (root == none) return;
+            assert(self.cache[root].len > 0);
+            if (mode != .all and !self.is_changed(root)) return;
+            var stack: [depth_max]VisitFrame = undefined;
+            var path: [path_max]u8 = undefined;
+            stack[0] = .{ .index = root, .next_child = 0, .path_len = 0 };
+            var stack_len: u32 = 1;
+            try self.visit_one(root, path[0..0], mode, visitor);
+            var steps: u64 = 0;
+            while (stack_len > 0) : (steps += 1) {
+                assert(steps <= @as(u64, self.nodes.len) * 17 + 1);
+                const frame = &stack[stack_len - 1];
+                const child = self.next_visit_child(frame, &path);
+                if (child.index == none) {
+                    stack_len -= 1;
+                    continue;
+                }
+                if (mode != .all and !self.is_changed(child.index)) continue;
+                assert(stack_len < depth_max);
+                try self.visit_one(child.index, path[0..child.path_len], mode, visitor);
+                stack[stack_len] = child;
+                stack_len += 1;
+            }
+        }
+
+        /// The next child of `frame`, with its path written into `path`; `none` at the end.
+        fn next_visit_child(self: *const Self, frame: *VisitFrame, path: *[path_max]u8) VisitFrame {
+            const current = &self.nodes[frame.index];
+            const end: VisitFrame = .{ .index = none, .next_child = 0, .path_len = 0 };
+            switch (current.kind) {
+                .free => unreachable, // Reachable nodes are never on the free list.
+                .leaf => return end,
+                .extension => {
+                    if (frame.next_child > 0) return end;
+                    frame.next_child = 1;
+                    const len: u32 = @as(u32, frame.path_len) + current.path_len;
+                    assert(len <= path_max);
+                    for (path[frame.path_len..len], 0..) |*nibble, index| {
+                        nibble.* = current.path_nibble(@intCast(index));
+                    }
+                    const child = current.body.extension.child;
+                    return .{ .index = child, .next_child = 0, .path_len = @intCast(len) };
+                },
+                .branch => {
+                    while (frame.next_child < 16) {
+                        const nibble = frame.next_child;
+                        frame.next_child += 1;
+                        const child = current.body.branch[nibble];
+                        if (child == none) continue;
+                        assert(frame.path_len < path_max);
+                        path[frame.path_len] = nibble;
+                        return .{ .index = child, .next_child = 0, .path_len = frame.path_len + 1 };
+                    }
+                    return end;
+                },
+            }
+        }
+
+        fn visit_one(
+            self: *Self,
+            index: NodeIndex,
+            path: []const u8,
+            mode: VisitMode,
+            visitor: anytype,
+        ) !void {
+            const current = &self.nodes[index];
+            assert(self.cache[index].len > 0);
+            var buffer: [node_bytes_max]u8 = undefined;
+            const encoding = self.encode_full(current, &buffer);
+            assert(self.cache[index].is_hash() == (encoding.len >= 32));
+            var key: [path_max]u8 = undefined;
+            var key_len: usize = 0;
+            if (current.kind == .leaf) {
+                key_len = path.len + current.path_len;
+                assert(key_len <= path_max);
+                @memcpy(key[0..path.len], path);
+                for (key[path.len..key_len], 0..) |*nibble, offset| {
+                    nibble.* = current.path_nibble(@intCast(offset));
+                }
+            }
+            if (mode != .count) self.set_changed(index, false);
+            try visitor.visit(.{ .path = path, .encoding = encoding, .leaf_key = key[0..key_len] });
         }
 
         /// Merkle proof for `key`, in the format of `eth_getProof`: the root node, then every

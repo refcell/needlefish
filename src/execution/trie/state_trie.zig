@@ -269,6 +269,76 @@ pub const StateTrie = struct {
         return self.accounts.root_hash();
     }
 
+    /// Largest full encoding of one account-trie node and one storage-trie node.
+    pub const account_node_bytes_max = AccountTrie.node_bytes_max;
+    pub const storage_node_bytes_max = StorageTrie.node_bytes_max;
+
+    /// One trie node reported by `visit_nodes`.
+    pub const NodeVisit = struct {
+        /// Null for the account trie, else the address hash owning the storage trie.
+        owner: ?Hash,
+        /// Nibbles from the trie root to the node.
+        path: []const u8,
+        encoding: []const u8,
+    };
+
+    /// Starts recording rehashed nodes in both pools (see `TrieType.track_changes`).
+    pub fn track_changes(self: *StateTrie, allocator: std.mem.Allocator) !void {
+        try self.accounts.track_changes(allocator);
+        try self.storage.track_changes(allocator);
+        assert(self.accounts.changed.len > 0 and self.storage.changed.len > 0);
+    }
+
+    /// Calls `visitor.visit(NodeVisit)` for account-trie nodes (see `TrieType.visit_nodes`)
+    /// and, after each visited account leaf, for that account's storage-trie nodes. A storage
+    /// trie that changed changes its account leaf, so walking only changed account nodes still
+    /// reaches every changed storage node. Call `root()` first.
+    pub fn visit_nodes(
+        self: *StateTrie,
+        mode: trie_module.VisitMode,
+        visitor: anytype,
+    ) !void {
+        assert(self.dirty_len == 0);
+        const account_root = self.accounts.root;
+        assert(account_root == AccountTrie.none or self.accounts.cache[account_root].len > 0);
+        const Storage = struct {
+            owner: Hash,
+            inner: @TypeOf(visitor),
+            pub fn visit(wrapper: @This(), visit_info: trie_module.Visit) !void {
+                try wrapper.inner.visit(NodeVisit{
+                    .owner = wrapper.owner,
+                    .path = visit_info.path,
+                    .encoding = visit_info.encoding,
+                });
+            }
+        };
+        const Accounts = struct {
+            state: *StateTrie,
+            mode: trie_module.VisitMode,
+            inner: @TypeOf(visitor),
+            pub fn visit(wrapper: @This(), visit_info: trie_module.Visit) !void {
+                try wrapper.inner.visit(NodeVisit{
+                    .owner = null,
+                    .path = visit_info.path,
+                    .encoding = visit_info.encoding,
+                });
+                if (visit_info.leaf_key.len == 0) return;
+                assert(visit_info.leaf_key.len == 64);
+                var address_hash: Hash = undefined;
+                for (&address_hash, 0..) |*byte, index| {
+                    const high = visit_info.leaf_key[2 * index];
+                    byte.* = high << 4 | visit_info.leaf_key[2 * index + 1];
+                }
+                // After a flush every account leaf has an entry and every entry a leaf.
+                const entry = wrapper.state.entries.getPtr(address_hash) orelse unreachable;
+                const storage: Storage = .{ .owner = address_hash, .inner = wrapper.inner };
+                try wrapper.state.storage.visit_nodes(entry.storage_root, wrapper.mode, storage);
+            }
+        };
+        const accounts: Accounts = .{ .state = self, .mode = mode, .inner = visitor };
+        try self.accounts.visit_nodes(self.accounts.root, mode, accounts);
+    }
+
     pub const AccountProof = AccountTrie.Proof;
     pub const StorageProof = StorageTrie.Proof;
 

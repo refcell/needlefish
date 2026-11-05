@@ -26,15 +26,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
 - [x] Compact node layout (packed paths, per-kind body, cached refs out of line).
-- [ ] Historical proofs store (base/base `crates/execution/trie`, `BaseProofsStore`): per-block
+- [x] Historical proofs store (base/base `crates/execution/trie`, `BaseProofsStore`): per-block
   versioned account/storage leaves + trie node preimages for a retention window, so
   `eth_getProof` works at any block in the fault-proof window without re-execution.
+  (`db/history.zig`; in memory only, not yet journaled or fed by `Database`)
 - [ ] Window pruner: bounded work per tick, removes history older than the window; crash-safe
   through the storage engine journal.
 - [ ] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
   block, verified by re-executing statelessly against a sparse trie built from the witness.
 - [ ] Differential tests: historical proof at block N == proof from a State unwound to N;
   witness-only re-execution root == stored root (base/base `witness_differential`).
+  (historical half done in `db/history_test.zig`; witness half pending)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -134,6 +136,27 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   take 8 more bytes per entry. Storage tries were never created or destroyed per block, so
   nothing to fix there.
 
+- Historical proofs (`db/history.zig`, `HistoryStore`): versioned trie node preimages keyed
+  by (trie owner, path), newest-first version chain per path; a proof at block N walks from
+  N's state root and takes at each path the newest version at or before N, checking every
+  node against its parent's reference (hash or inline bytes). Paths, not hashes: one node per
+  path per block, so the lookup is exact whenever N's parent points there, and pruning is per
+  path (a version is freed once a newer one is at or before the window start). No tombstones:
+  removed nodes are never pointed at by a parent of N. No separate leaf history or reverse
+  changesets: account and slot values decode from the leaf nodes, and unwinding drops the
+  versions of the removed blocks. Feed: `TrieType.track_changes` adds one bit per pool node,
+  set when the node is rehashed (both hash paths) and drained by `visit_nodes` (path +
+  encoding, skipping clean subtries since a rehash also rehashes all ancestors);
+  `StateTrie.visit_nodes` descends into the storage trie of each changed account leaf (a
+  changed storage trie always changes its leaf). Untracked tries pay one branch per rehashed
+  node. `commit_block` does a `count` walk first, so `HistoryFull` stores nothing; versions
+  equal to the path's newest one are skipped (after an unwind, rehashed-back nodes repeat).
+  Two version size classes (160 B: leaves, extensions, sparse branches; 646 B: dense
+  branches). Lookup is O(versions at the path newer than N), at most the window length; fine
+  for windows in the thousands, a jump-pointer chain is the upgrade if long windows need it.
+  Paths are never freed (stale paths keep one base version): bounded by `paths_max`; the
+  window pruner item should reclaim them.
+
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
   all ethereum/tests TrieTests vectors pass.
@@ -163,3 +186,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: storage-heavy block apply+root 10.3 -> 7.9 ms (changeset index sort, one
   address hash per slot run, batched key hashing); remaining gap is 2x dirty accounts plus
   storage rehash (docs/PERF.md).
+- 2026-11-05: historical proofs store: `eth_getProof` at any block of the window from
+  versioned node preimages; differential against a State unwound to each block (6 seeds,
+  reorgs, window 10), proofs verified against each block's root.

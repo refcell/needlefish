@@ -415,3 +415,89 @@ test "trie: node layout sizes" {
     comptime assert(@sizeOf(Storage.Node) == 72);
     comptime assert(@sizeOf(node.RlpNode) == 34);
 }
+
+/// Applies drained node changes to `model` (path -> encoding), then checks that every node of
+/// the trie sits in `model` at its path with its encoding.
+fn ChangeModel(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Key = [T.path_max + 1]u8;
+        const Value = struct { bytes: [T.node_bytes_max]u8, len: u32 };
+        map: std.AutoHashMapUnmanaged(Key, Value) = .empty,
+        checking: bool = false,
+        visited: u32 = 0,
+
+        fn key_of(path: []const u8) Key {
+            var key: Key = @splat(0xff);
+            key[0] = @intCast(path.len);
+            @memcpy(key[1..][0..path.len], path);
+            return key;
+        }
+
+        pub fn visit(self: *Self, visit_info: trie_module.Visit) !void {
+            assert(visit_info.encoding.len <= T.node_bytes_max);
+            self.visited += 1;
+            const key = key_of(visit_info.path);
+            if (self.checking) {
+                const stored = self.map.getPtr(key) orelse return error.TestUnexpectedResult;
+                const bytes = stored.bytes[0..stored.len];
+                try testing.expectEqualSlices(u8, bytes, visit_info.encoding);
+                return;
+            }
+            var value: Value = .{ .bytes = undefined, .len = @intCast(visit_info.encoding.len) };
+            @memcpy(value.bytes[0..value.len], visit_info.encoding);
+            try self.map.put(testing.allocator, key, value);
+        }
+    };
+}
+
+fn check_change_tracking(comptime T: type, seed: u64) !void {
+    var prng = Prng.init(seed);
+    var trie = try T.init(testing.allocator, 2048);
+    defer trie.deinit(testing.allocator);
+    try trie.track_changes(testing.allocator);
+    var model: ChangeModel(T) = .{};
+    defer model.map.deinit(testing.allocator);
+    for (0..60) |round| {
+        for (0..prng.range(1, 20)) |_| {
+            var key: [4]u8 = undefined;
+            std.mem.writeInt(u32, &key, @intCast(prng.below(300)), .big);
+            if (prng.chance(1, 3)) {
+                _ = trie.delete(&key);
+            } else {
+                var value: [8]u8 = undefined;
+                prng.fill(&value);
+                try trie.put(&key, value[0..prng.range(1, 8)]);
+            }
+        }
+        _ = trie.root_hash();
+        model.checking = false;
+        const mode: trie_module.VisitMode = if (round == 0) .all else .drain;
+        model.visited = 0;
+        try trie.visit_nodes(trie.root, .count, &model);
+        const counted = model.visited;
+        model.visited = 0;
+        try trie.visit_nodes(trie.root, mode, &model);
+        if (round > 0) try testing.expectEqual(counted, model.visited);
+        // Nothing changed since the drain: a second drain visits nothing.
+        model.visited = 0;
+        try trie.visit_nodes(trie.root, .drain, &model);
+        try testing.expectEqual(@as(u32, 0), model.visited);
+        model.checking = true;
+        try trie.visit_nodes(trie.root, .all, &model);
+        try testing.expectEqual(trie.node_count(), model.visited);
+    }
+}
+
+test "trie: change tracking reports every rehashed node at its path (batched and serial)" {
+    const Batched = trie_module.TrieType(.{ .key_bytes_max = 4, .value_size_max = 8 });
+    const Serial = trie_module.TrieType(.{
+        .key_bytes_max = 4,
+        .value_size_max = 8,
+        .hash_batched = false,
+    });
+    for (0..4) |seed| {
+        try check_change_tracking(Batched, 0xc4a0 + seed);
+        try check_change_tracking(Serial, 0xc4b0 + seed);
+    }
+}
