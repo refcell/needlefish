@@ -103,6 +103,11 @@ fallback but hot paths should be our own, optimized implementations.
   ctz zero skipping, up to 4/6 bits of g per multiply), checked against the branch-free loop
   (seeded 20K + coverage-guided fuzz). Inverse bn254 1.22 -> 0.84 us, BLS 1.83 -> 1.33 us;
   bn254 add precompile 1.72 -> 1.22 us (11.5 -> 8.1 ns/gas, below ecrecover).
+- [x] precompile hot spots after divsteps_var (closed by analysis): p256 verify 45.8 us is
+  ~75% the 256 Jacobian doublings Q needs (no endomorphism; G already uses a static window-7
+  table, one inversion, projective compare); only a faster Fp mul (Solinas reduction / asm,
+  ~20%) remains. kzg point evaluation is pairing-bound (prepared lines, G1-only scalar work).
+  Both stay within 1.5x of ecrecover per gas.
 - [x] Wycheproof vectors (C2SP, Apache-2.0) in `wycheproof_tests.zig`: secp256k1 ECDSA P1363
   SHA-256 (234 tests), secp256r1 ECDSA P1363 SHA-256 (241, EIP-7951 semantics), secp256k1
   ECDH on raw points (495, incl. 21 invalid-curve / invalid-point rejections). Converted by
