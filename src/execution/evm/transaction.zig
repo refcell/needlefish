@@ -237,14 +237,14 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     _ = try evm.state.access(tx.caller);
     if (tx.to) |to| _ = try evm.state.access(to);
     if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
-    const op_rules = evm.op_rules();
+    const op_upgrade = evm.op_upgrade();
     var number: u64 = 1;
     while (number <= 0x11) : (number += 1) {
         const address = primitives.address_from_int(number);
-        if (precompiles.is_precompile(fork, op_rules, address)) _ = try evm.state.access(address);
+        if (precompiles.is_precompile(fork, op_upgrade, address)) _ = try evm.state.access(address);
     }
     const p256 = primitives.address_from_int(0x100);
-    if (precompiles.is_precompile(fork, op_rules, p256)) _ = try evm.state.access(p256);
+    if (precompiles.is_precompile(fork, op_upgrade, p256)) _ = try evm.state.access(p256);
     for (tx.access_list) |item| {
         const access = try evm.state.access(item.address);
         for (item.storage_keys) |key| {
@@ -302,8 +302,8 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
     var fees_storage: op.Fees = undefined;
     var fees: ?*const op.Fees = null;
     if (evm.block.op) |context| {
-        const params = try op.load_params(evm.state, context.rules);
-        fees_storage = op.Fees.compute(params, context.rules, tx.envelope, tx.gas_limit);
+        const params = try op.load_params(evm.state, context.rules());
+        fees_storage = op.Fees.compute(params, context.rules(), tx.envelope, tx.gas_limit);
         fees = &fees_storage;
     }
     if (try validate_and_buy_gas(fork, evm, tx, fees)) |invalid| {
@@ -348,7 +348,7 @@ fn execute_top(
 fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
     assert(tx.tx_type == .deposit);
     const context = evm.block.op orelse return .{ .invalid = .type_not_supported };
-    if (context.rules.at_least(.regolith) and tx.is_system_transaction) {
+    if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
         return .{ .invalid = .deposit_system_transaction };
     }
     evm.state.begin_transaction();
@@ -430,7 +430,7 @@ fn pay_fees(
     var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
     var operator_used: u256 = 0;
     if (fees) |f| {
-        operator_used = f.operator_used(evm.block.op.?.rules, tx.envelope, gas_used);
+        operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
         reimbursement += f.operator_charge - operator_used;
     }
     try credit(evm, tx.caller, reimbursement, false);

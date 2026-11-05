@@ -12,21 +12,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] OP-stack semantics: deposit tx processing (mint, no fee, gas accounting by fork, failed-deposit nonce bump), L1 cost charging to L1FeeVault, BaseFeeVault/SequencerFeeVault, operator fee (Isthmus), Base-specific changes in base/base.
 - [x] Base fork changes: RIP-7212 P256VERIFY at Fjord (3450 gas) until Osaka pricing (Azul);
   Canyon CREATE2-deployer and Everest nonce-manager transitions (`op.apply_transition`).
-- [ ] BN254 pairing input caps (Granite 112687, Jovian 81984 bytes) and BLS MSM/pairing caps
-  (Isthmus/Jovian) once those precompiles exist.
+- [x] BN254 pairing input caps (Granite 112687, Jovian 81984 bytes) and BLS MSM/pairing caps
+  (Isthmus/Jovian).
 - [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory; Cobalt:
   tx-context 0x8130..aa02, 2D nonce manager 0x8130..aa01) and EIP-8130 (Everest, type 0x79).
-- [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas. Done: ecrecover,
-  sha256, ripemd160, identity, modexp, blake2f, p256verify. Missing: bn254 (0x06-0x08),
-  KZG point evaluation (0x0a), BLS12-381 (0x0b-0x11).
+- [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
+  0x01-0x11 and P256VERIFY (0x100).
   (crypto lane, 2026-11-05: all now on main: `crypto.bn254.precompile_bn254_{add,mul,pairing}`,
   `crypto.kzg.precompile_point_evaluation`, `crypto.bls12_381.precompile.{run,gas}` with an
   `Address` enum for 0x0b-0x11. Every error = precompile failure, all gas consumed.)
 - [x] ethereum/tests GeneralStateTests runner (`just vectors`), pass rate tracked in this file.
   Run: `just vectors`, extract `fixtures_general_state_tests.tgz` into `.cache/vectors/state`, then
   `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
-  2026-11-05: 36204 / 37724 (96.0%), Cancun + Prague. All remaining failures involve the
-  bn254 precompiles (0x06-0x08), which wait on the crypto lane.
+  2026-11-05: 37724 / 37724 (100%), Cancun + Prague fixtures (EEST GeneralStateTests).
 - [ ] (from crypto lane) Pre-Osaka MODEXP with modulus > 1024 bytes is affordable (Berlin:
   1025-byte modulus, 1-byte base/exp = 5547 gas) and must compute, but `precompile_modexp_run`
   returns ModulusTooLarge above 1024 bytes. Route those to
@@ -69,6 +67,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: bn254, KZG, BLS12-381 precompiles wired with Base caps; state tests 100%
+  (37724 / 37724). `op.Upgrade` carries the full Base upgrade ladder.
 - 2026-11-05: interpreter fuzz harness (`evm_fuzz.zig`), 300k-iteration soak clean.
 - 2026-11-05: RIP-7212 P256VERIFY under OP Fjord; Canyon/Everest irregular transitions.
 - 2026-11-05: OP Stack handler: deposits (mint, halted deposit -> revert all but mint and

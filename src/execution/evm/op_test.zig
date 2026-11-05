@@ -38,7 +38,7 @@ test "op: deposit mints, skips fees, and refunds normally" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
-    h.evm.block.op = .{ .rules = .isthmus };
+    h.evm.block.op = .{ .upgrade = .isthmus };
     h.evm.block.base_fee = 7;
     h.evm.block.coinbase = coinbase;
     try h.database.put_account(target, 0, 1, &store_code);
@@ -58,7 +58,7 @@ test "op: halted deposit keeps mint and nonce, consumes the gas limit" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
-    h.evm.block.op = .{ .rules = .jovian };
+    h.evm.block.op = .{ .upgrade = .jovian };
     try h.database.put_account(target, 0, 1, &halt_code);
     try h.database.put_account(depositor, 10, 4, &.{});
     const tx = deposit(target, 100_000);
@@ -86,7 +86,7 @@ test "op: deposits need OP rules and reject system transactions since Regolith" 
     var tx = deposit(target, 100_000);
     const plain = try transaction.transact(&h.evm, .prague, &tx);
     try testing.expectEqual(transaction.Invalid.type_not_supported, plain.invalid);
-    h.evm.block.op = .{ .rules = .regolith };
+    h.evm.block.op = .{ .upgrade = .regolith };
     tx.is_system_transaction = true;
     const system = try transaction.transact(&h.evm, .shanghai, &tx);
     try testing.expectEqual(transaction.Invalid.deposit_system_transaction, system.invalid);
@@ -110,7 +110,7 @@ test "op: L1 fee, base fee, and operator fee go to their vaults" {
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
     try put_l1_block(&h);
-    h.evm.block.op = .{ .rules = .isthmus };
+    h.evm.block.op = .{ .upgrade = .isthmus };
     h.evm.block.base_fee = 7;
     h.evm.block.coinbase = coinbase;
     const initial: u256 = 1_000_000_000_000;
@@ -148,7 +148,7 @@ test "op: L1 and operator fees count toward the balance check" {
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
     try put_l1_block(&h);
-    h.evm.block.op = .{ .rules = .isthmus };
+    h.evm.block.op = .{ .upgrade = .isthmus };
     const gas_cost: u256 = 21_000 * 10;
     try h.database.put_account(sender_address, gas_cost, 0, &.{});
     const envelope = [_]u8{ 0x02, 0x01, 0x02, 0x03 };

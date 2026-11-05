@@ -37,9 +37,46 @@ const da_footprint_scalar_offset = 18;
 const operator_fee_scalar_offset = 20;
 const operator_fee_constant_offset = 24;
 
+/// Base / OP Stack upgrades that change execution, in activation order (base/base
+/// `BaseUpgrade`). Azul and later run on the Osaka execution fork.
+pub const Upgrade = enum(u8) {
+    bedrock,
+    regolith,
+    canyon,
+    ecotone,
+    fjord,
+    granite,
+    holocene,
+    isthmus,
+    jovian,
+    azul,
+    beryl,
+    cobalt,
+    denim,
+    everest,
+
+    pub fn at_least(upgrade: Upgrade, other: Upgrade) bool {
+        return @backingInt(upgrade) >= @backingInt(other);
+    }
+
+    /// The L1 fee rule set in force.
+    pub fn rules(upgrade: Upgrade) Rules {
+        if (upgrade.at_least(.jovian)) return .jovian;
+        if (upgrade.at_least(.isthmus)) return .isthmus;
+        if (upgrade.at_least(.fjord)) return .fjord;
+        if (upgrade.at_least(.ecotone)) return .ecotone;
+        if (upgrade.at_least(.regolith)) return .regolith;
+        return .bedrock;
+    }
+};
+
 /// Per-block OP context; null on `BlockEnv.op` means plain Ethereum semantics.
 pub const Context = struct {
-    rules: Rules,
+    upgrade: Upgrade,
+
+    pub fn rules(context: Context) Rules {
+        return context.upgrade.rules();
+    }
 };
 
 fn word_field(word: u256, comptime offset: usize, comptime T: type) T {
