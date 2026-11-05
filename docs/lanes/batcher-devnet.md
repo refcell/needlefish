@@ -13,8 +13,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   patched by `base devnet rollup` after ELs start; predeploys still TODO)
 - [x] devnet genesis: genesis hashes computed in-process (common/genesis state root + header);
   `base devnet init` writes a correct rollup.json up front (devnet.sh still re-patches from ELs).
-- [ ] devnet genesis: predeploys (L1Block, GasPriceOracle, fee vaults, proxies) from public allocs.
-- [ ] (orig) `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
+- [~] devnet genesis: predeploys skipped for now (decision 2026-11-05: base-ref only ships mainnet/
+  sepolia genesis whose L1Block predates Ecotone and cannot take Jovian L1-info calls; without code
+  the L1-info system call is a no-op and L1 fees are zero, fine for the devnet).
+- [x] (orig, superseded by the items above) `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
 - [x] `batcher/frame`: frame encode/decode, tx data parse (fuzzed).
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
 - [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
