@@ -384,3 +384,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: x86_64_v3 cells failure traced to Rosetta (qemu -cpu max passes all kzg tests for v3 ReleaseSafe/ReleaseFast); documented the qemu path.
 - 2026-11-05: full crypto suite x86_64_v3 ReleaseSafe under qemu -cpu max: 262/262 pass (incl. heavy KZG/cells); blob fuzz 20K runs clean.
 - 2026-11-05: Wycheproof ECDSA (secp256k1, P-256) and secp256k1 ECDH vectors, all pass.
+- 2026-11-05: modexp raw-input fuzz 300K runs clean but shallow (47 coverage points: inputs stop at header parsing); added a structured operand target checked against the std.math.big oracle.

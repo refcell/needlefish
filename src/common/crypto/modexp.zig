@@ -824,6 +824,27 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     try precompile_modexp_run(parsed, out[0..@intCast(parsed.modulus.len)]);
 }
 
+/// Structured operands (lengths up to 96 bytes) checked against the big-int oracle; the
+/// raw-input target above mostly stops at header parsing.
+fn fuzz_operands(_: void, smith: *testing.Smith) anyerror!void {
+    var base: [96]u8 = undefined;
+    var exponent: [16]u8 = undefined;
+    var modulus: [96]u8 = undefined;
+    const base_len = smith.slice(&base);
+    const exponent_len = smith.slice(&exponent);
+    const modulus_len = smith.slice(&modulus);
+    if (modulus_len == 0) return;
+    try expect_matches_oracle(
+        base[0..base_len],
+        exponent[0..exponent_len],
+        modulus[0..modulus_len],
+    );
+}
+
+test "modexp: coverage-guided fuzz of operands vs big-int oracle" {
+    try testing.fuzz({}, fuzz_operands, .{});
+}
+
 test "modexp: coverage-guided fuzz never crashes" {
     try testing.fuzz({}, fuzz_one, .{});
 }
