@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+pub const preimage = @import("preimage/root.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

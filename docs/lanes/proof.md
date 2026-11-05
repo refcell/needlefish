@@ -15,7 +15,7 @@ interface hook). All file, pipe and socket IO goes through `src/utilities/io` so
 program can run against an in-memory oracle in tests and the cluster simulator.
 
 ## Backlog
-- [ ] `proof/preimage`: `PreimageKey` (types: local, keccak256, global generic,
+- [x] `proof/preimage`: `PreimageKey` (types: local, keccak256, global generic,
   sha256, blob, precompile), hint encoding, oracle/hint reader-writer over a bidirectional
   channel (port `key.rs`, `hint.rs`, `oracle.rs`, `native_channel.rs`). In-memory pipe
   channel for tests; seeded + `std.testing.fuzz` round trips of keys and frames.
@@ -47,5 +47,16 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   roots, bond claiming, `bin/base challenger` (port `challenge/src/*`), DST test.
 
 ## Decisions
+- Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
+  `Pump` (one host server step) when a client read would block, so client and host
+  interleave deterministically on one thread. Channel writes are all-or-nothing over a
+  list of parts so a full pipe never tears a frame. An fd-backed channel for split
+  client/host processes comes with `proof/host`.
+- Oracle reader drains the payload on `BufferTooSmall`/`BufferLengthMismatch` (Rust
+  leaves the stream unframed). Preimages above 16 MiB and hints above 64 KiB are
+  rejected; the hint host still acknowledges so the client never deadlocks.
+- Generic `<type> 0x<hex>` hint text parse/encode lives in `preimage/hint.zig`; the typed
+  `HintType` enum lands with `proof/program`.
 
 ## Log
+- 2026-11-05: `proof/preimage` landed (key, channel/duplex, oracle, hint + fuzz).
