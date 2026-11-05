@@ -16,6 +16,7 @@ const env = @import("env.zig");
 const gas = @import("gas.zig");
 const interpreter = @import("interpreter.zig");
 const precompiles = @import("precompiles.zig");
+const crypto = @import("../../common/crypto/root.zig");
 const Fork = @import("fork.zig").Fork;
 const Address = primitives.Address;
 const State = state_module.State;
@@ -150,6 +151,7 @@ pub const Evm = struct {
     shared_memory: memory_module.SharedMemory,
     arena: bytecode.Arena,
     return_buffer: []u8,
+    precompile_scratch: []u64,
     return_len: u32 = 0,
     pending: Pending = .none,
     fatal_error: ?Error = null,
@@ -166,6 +168,9 @@ pub const Evm = struct {
         var arena = try bytecode.Arena.init(allocator, config.code_arena_bytes);
         errdefer arena.deinit(allocator);
         const return_buffer = try allocator.alloc(u8, config.memory_bytes_max);
+        errdefer allocator.free(return_buffer);
+        const scratch_limbs = crypto.modexp.scratch_limbs_needed(config.modexp_modulus_bytes_max);
+        const precompile_scratch = try allocator.alloc(u64, @intCast(scratch_limbs));
         return .{
             .config = config,
             .state = state,
@@ -174,6 +179,7 @@ pub const Evm = struct {
             .shared_memory = shared_memory,
             .arena = arena,
             .return_buffer = return_buffer,
+            .precompile_scratch = precompile_scratch,
         };
     }
 
@@ -183,6 +189,7 @@ pub const Evm = struct {
         evm.shared_memory.deinit(allocator);
         evm.arena.deinit(allocator);
         allocator.free(evm.return_buffer);
+        allocator.free(evm.precompile_scratch);
         evm.* = undefined;
     }
 
@@ -338,7 +345,10 @@ pub const Evm = struct {
         request: CallRequest,
         checkpoint: state_module.Checkpoint,
     ) Step {
-        const result = precompile(request.input, request.gas_limit, evm.return_buffer);
+        const result = precompile(request.input, request.gas_limit, .{
+            .out = evm.return_buffer,
+            .scratch = evm.precompile_scratch,
+        });
         if (result.status != .success) {
             evm.state.revert(checkpoint);
             return failed(0, .precompile_failure);

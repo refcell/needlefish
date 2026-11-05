@@ -20,7 +20,14 @@ pub const Result = struct {
     output_len: u32 = 0,
 };
 
-pub const Precompile = *const fn (input: []const u8, gas_limit: u64, out: []u8) Result;
+/// Output space and working memory, both allocated by the EVM at startup.
+pub const Buffers = struct {
+    out: []u8,
+    /// MODEXP limbs for moduli wider than the stack path (pre-Osaka; see env.Config).
+    scratch: []u64,
+};
+
+pub const Precompile = *const fn (input: []const u8, gas_limit: u64, buffers: Buffers) Result;
 
 /// Highest precompile address number per fork (Osaka adds P256VERIFY at 0x100).
 fn last_address(comptime fork: Fork) u64 {
@@ -117,7 +124,8 @@ fn fail(gas_limit: u64) Result {
 /// EIP-196 / EIP-1108 (Istanbul repricing).
 fn bn254_add(comptime istanbul: bool) Precompile {
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             const cost: u64 = if (istanbul) 150 else 500;
             if (charge(gas_limit, cost)) |failure| return failure;
             out[0..64].* = bn254.precompile_bn254_add(input) catch return fail(gas_limit);
@@ -128,7 +136,8 @@ fn bn254_add(comptime istanbul: bool) Precompile {
 
 fn bn254_mul(comptime istanbul: bool) Precompile {
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             const cost: u64 = if (istanbul) 6_000 else 40_000;
             if (charge(gas_limit, cost)) |failure| return failure;
             out[0..64].* = bn254.precompile_bn254_mul(input) catch return fail(gas_limit);
@@ -140,7 +149,8 @@ fn bn254_mul(comptime istanbul: bool) Precompile {
 /// EIP-197 pairing check; `cap` is the Base input byte limit (inclusive).
 fn bn254_pairing(comptime istanbul: bool, comptime cap: ?usize) Precompile {
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             if (cap) |limit| {
                 if (input.len > limit) return fail(gas_limit);
             }
@@ -154,7 +164,8 @@ fn bn254_pairing(comptime istanbul: bool, comptime cap: ?usize) Precompile {
 }
 
 /// EIP-4844 point evaluation (0x0a).
-fn point_evaluation(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn point_evaluation(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const cost = 50_000;
     if (charge(gas_limit, cost)) |failure| return failure;
     out[0..64].* = crypto.kzg.precompile_point_evaluation(input) catch return fail(gas_limit);
@@ -164,7 +175,8 @@ fn point_evaluation(input: []const u8, gas_limit: u64, out: []u8) Result {
 /// EIP-2537 BLS12-381 (0x0b-0x11); `cap` is the Base input byte limit (inclusive).
 fn bls(comptime address: Bls, comptime cap: ?usize) Precompile {
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             if (cap) |limit| {
                 if (input.len > limit) return fail(gas_limit);
             }
@@ -205,7 +217,8 @@ fn words(len: usize) u64 {
     return (@as(u64, len) + 31) / 32;
 }
 
-fn identity(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn identity(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const cost = 15 + 3 * words(input.len);
     if (charge(gas_limit, cost)) |failure| return failure;
     assert(out.len >= input.len);
@@ -213,7 +226,8 @@ fn identity(input: []const u8, gas_limit: u64, out: []u8) Result {
     return .{ .status = .success, .gas_used = cost, .output_len = @intCast(input.len) };
 }
 
-fn sha256(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn sha256(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const cost = 60 + 12 * words(input.len);
     if (charge(gas_limit, cost)) |failure| return failure;
     assert(out.len >= 32);
@@ -221,7 +235,8 @@ fn sha256(input: []const u8, gas_limit: u64, out: []u8) Result {
     return .{ .status = .success, .gas_used = cost, .output_len = 32 };
 }
 
-fn ecrecover(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn ecrecover(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const cost = 3000;
     if (charge(gas_limit, cost)) |failure| return failure;
     // An unrecoverable signature succeeds with empty output.
@@ -232,14 +247,16 @@ fn ecrecover(input: []const u8, gas_limit: u64, out: []u8) Result {
     return .{ .status = .success, .gas_used = cost, .output_len = 32 };
 }
 
-fn ripemd160(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn ripemd160(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const cost = 600 + 120 * words(input.len);
     if (charge(gas_limit, cost)) |failure| return failure;
     out[0..32].* = crypto.ripemd160.precompile_ripemd160(input);
     return .{ .status = .success, .gas_used = cost, .output_len = 32 };
 }
 
-fn blake2f(input: []const u8, gas_limit: u64, out: []u8) Result {
+fn blake2f(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+    const out = buffers.out;
     const rounds = crypto.blake2f.input_rounds(input) orelse {
         return .{ .status = .failure, .gas_used = gas_limit };
     };
@@ -255,7 +272,8 @@ fn blake2f(input: []const u8, gas_limit: u64, out: []u8) Result {
 fn p256verify(comptime cost: u64) Precompile {
     comptime assert(cost == 3450 or cost == 6900);
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             if (charge(gas_limit, cost)) |failure| return failure;
             const word = crypto.precompile_p256verify(input) orelse {
                 return .{ .status = .success, .gas_used = cost };
@@ -268,6 +286,9 @@ fn p256verify(comptime cost: u64) Precompile {
 
 const ModexpRules = crypto.modexp.Rules;
 
+/// Largest modulus `precompile_modexp_run` computes without caller scratch.
+const modexp_stack_bytes = 1024;
+
 fn modexp_rules(comptime fork: Fork) ModexpRules {
     if (fork.at_least(.osaka)) return .osaka;
     if (fork.at_least(.berlin)) return .berlin;
@@ -277,7 +298,8 @@ fn modexp_rules(comptime fork: Fork) ModexpRules {
 /// EIP-198 / EIP-2565 / EIP-7883 gas; EIP-7823 operand limits from Osaka.
 fn modexp(comptime rules: ModexpRules) Precompile {
     return struct {
-        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+        fn run(input: []const u8, gas_limit: u64, buffers: Buffers) Result {
+            const out = buffers.out;
             const parsed = crypto.modexp.precompile_modexp_parse(input) catch {
                 return .{ .status = .out_of_gas, .gas_used = gas_limit };
             };
@@ -291,13 +313,49 @@ fn modexp(comptime rules: ModexpRules) Precompile {
             const modulus_len = parsed.modulus.len;
             if (modulus_len > out.len) return .{ .status = .failure, .gas_used = gas_limit };
             const output = out[0..@intCast(modulus_len)];
-            // Moduli wider than 8192 bits cost far more gas than any block holds.
-            crypto.modexp.precompile_modexp_run(parsed, output) catch {
-                return .{ .status = .failure, .gas_used = gas_limit };
-            };
+            if (modulus_len <= modexp_stack_bytes) {
+                // Proof: the stack path handles every modulus up to its capacity.
+                crypto.modexp.precompile_modexp_run(parsed, output) catch unreachable;
+            } else {
+                // Only pre-Osaka (EIP-7823 caps operands at 1024 bytes); the scratch is
+                // sized for any modulus a transaction can afford (env.Config).
+                const scratch = buffers.scratch;
+                crypto.modexp.precompile_modexp_run_with_scratch(parsed, output, scratch) catch
+                    @panic("modexp scratch too small: raise Config.modexp_modulus_bytes_max");
+            }
             return .{ .status = .success, .gas_used = cost, .output_len = @intCast(modulus_len) };
         }
     }.run;
+}
+
+fn test_buffers(out: []u8) Buffers {
+    return .{ .out = out, .scratch = &.{} };
+}
+
+test "precompiles: pre-Osaka MODEXP with a modulus wider than 1024 bytes" {
+    const modulus_len = 1025;
+    var input: [96 + 1 + 1 + modulus_len]u8 = @splat(0);
+    input[31] = 1; // base length
+    input[63] = 1; // exponent length
+    std.mem.writeInt(u32, input[92..96], modulus_len, .big);
+    input[96] = 2; // base
+    input[97] = 3; // exponent
+    input[98] = 0xff; // modulus, odd and large
+    input[input.len - 1] = 0x01;
+    const limbs = crypto.modexp.scratch_limbs_needed(modulus_len);
+    const scratch = try std.testing.allocator.alloc(u64, limbs);
+    defer std.testing.allocator.free(scratch);
+    var out: [modulus_len]u8 = undefined;
+    const buffers = Buffers{ .out = &out, .scratch = scratch };
+    const modexp_address = primitives.address_from_int(5);
+    const berlin = lookup(.berlin, null, modexp_address).?(&input, 100_000, buffers);
+    try std.testing.expectEqual(Status.success, berlin.status);
+    try std.testing.expectEqual(@as(u32, modulus_len), berlin.output_len);
+    try std.testing.expectEqual(@as(u8, 8), out[modulus_len - 1]);
+    for (out[0 .. modulus_len - 1]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    // Osaka rejects operands over 1024 bytes (EIP-7823).
+    const osaka = lookup(.osaka, null, modexp_address).?(&input, 1 << 30, buffers);
+    try std.testing.expectEqual(Status.failure, osaka.status);
 }
 
 test "precompiles: sets by fork" {
@@ -314,21 +372,21 @@ test "precompiles: sets by fork" {
     try std.testing.expect(is_precompile(.cancun, .fjord, p256_address));
     const rip7212 = lookup(.cancun, .fjord, p256_address).?;
     var out: [32]u8 = undefined;
-    const result = rip7212(&.{}, 10_000, &out);
+    const result = rip7212(&.{}, 10_000, test_buffers(&out));
     try std.testing.expectEqual(@as(u64, 3450), result.gas_used);
     try std.testing.expectEqual(@as(u32, 0), result.output_len);
     const eip7951 = lookup(.osaka, .jovian, p256_address).?;
-    try std.testing.expectEqual(@as(u64, 6900), eip7951(&.{}, 10_000, &out).gas_used);
+    try std.testing.expectEqual(@as(u64, 6900), eip7951(&.{}, 10_000, test_buffers(&out)).gas_used);
 }
 
 test "precompiles: identity and sha256" {
     var out: [64]u8 = undefined;
-    const result = identity("abc", 100, &out);
+    const result = identity("abc", 100, test_buffers(&out));
     try std.testing.expectEqual(Status.success, result.status);
     try std.testing.expectEqual(@as(u64, 18), result.gas_used);
     try std.testing.expectEqualStrings("abc", out[0..3]);
-    try std.testing.expectEqual(Status.out_of_gas, identity("abc", 17, &out).status);
-    const digest = sha256("", 100, &out);
+    try std.testing.expectEqual(Status.out_of_gas, identity("abc", 17, test_buffers(&out)).status);
+    const digest = sha256("", 100, test_buffers(&out));
     try std.testing.expectEqual(@as(u64, 60), digest.gas_used);
     try std.testing.expectEqual(@as(u8, 0xe3), out[0]);
 }
@@ -337,20 +395,20 @@ test "precompiles: bn254 gas by fork and Base pairing caps" {
     const pairing = primitives.address_from_int(0x08);
     var out: [256]u8 = undefined;
     // Empty pairing input is a successful check.
-    const byzantium = lookup(.byzantium, null, pairing).?(&.{}, 200_000, &out);
+    const byzantium = lookup(.byzantium, null, pairing).?(&.{}, 200_000, test_buffers(&out));
     try std.testing.expectEqual(@as(u64, 100_000), byzantium.gas_used);
     try std.testing.expectEqual(@as(u8, 1), out[31]);
-    const istanbul = lookup(.istanbul, null, pairing).?(&.{}, 200_000, &out);
+    const istanbul = lookup(.istanbul, null, pairing).?(&.{}, 200_000, test_buffers(&out));
     try std.testing.expectEqual(@as(u64, 45_000), istanbul.gas_used);
     const add = primitives.address_from_int(0x06);
-    const add_result = lookup(.cancun, null, add).?(&.{}, 1_000, &out);
+    const add_result = lookup(.cancun, null, add).?(&.{}, 1_000, test_buffers(&out));
     try std.testing.expectEqual(@as(u64, 150), add_result.gas_used);
 
     // Over the Jovian cap fails before any pairing work; Granite still accepts it.
     var input: [Caps.bn254_pairing_jovian + 192]u8 = @splat(0);
-    const jovian = lookup(.prague, .jovian, pairing).?(&input, 1 << 30, &out);
+    const jovian = lookup(.prague, .jovian, pairing).?(&input, 1 << 30, test_buffers(&out));
     try std.testing.expectEqual(Status.failure, jovian.status);
-    const granite = lookup(.cancun, .granite, pairing).?(&input, 1 << 30, &out);
+    const granite = lookup(.cancun, .granite, pairing).?(&input, 1 << 30, test_buffers(&out));
     try std.testing.expectEqual(Status.success, granite.status);
 }
 
@@ -358,10 +416,10 @@ test "precompiles: BLS caps under Base and failures consume all gas" {
     const g1_msm = primitives.address_from_int(0x0c);
     var out: [256]u8 = undefined;
     var input: [Caps.g1_msm_jovian + 160]u8 = @splat(0);
-    const capped = lookup(.prague, .jovian, g1_msm).?(&input, 1 << 40, &out);
+    const capped = lookup(.prague, .jovian, g1_msm).?(&input, 1 << 40, test_buffers(&out));
     try std.testing.expectEqual(Status.failure, capped.status);
     try std.testing.expectEqual(@as(u64, 1 << 40), capped.gas_used);
-    const empty = lookup(.prague, null, g1_msm).?(&.{}, 100_000, &out);
+    const empty = lookup(.prague, null, g1_msm).?(&.{}, 100_000, test_buffers(&out));
     try std.testing.expectEqual(Status.failure, empty.status);
     try std.testing.expectEqual(@as(u64, 100_000), empty.gas_used);
 }

@@ -25,12 +25,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   Run: `just vectors`, extract `fixtures_general_state_tests.tgz` into `.cache/vectors/state`, then
   `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
   2026-11-05: 37724 / 37724 (100%), Cancun + Prague fixtures (EEST GeneralStateTests).
-- [ ] (from crypto lane) Pre-Osaka MODEXP with modulus > 1024 bytes is affordable (Berlin:
-  1025-byte modulus, 1-byte base/exp = 5547 gas) and must compute, but `precompile_modexp_run`
-  returns ModulusTooLarge above 1024 bytes. Route those to
-  `crypto.modexp.precompile_modexp_run_with_scratch(parsed, out, scratch)` with
-  `scratch_limbs_needed(modulus_len)` limbs from an arena sized at startup by the block gas
-  limit. The comment "wider than 8192 bits cost far more gas than any block holds" is wrong.
+- [x] (from crypto lane) Pre-Osaka MODEXP with modulus > 1024 bytes: routed to
+  `precompile_modexp_run_with_scratch` with an EVM-owned scratch arena sized by
+  `Config.modexp_modulus_bytes_max` (576 KiB default covers ~1e9-gas transactions).
 - [x] Differential fuzzing harness (random bytecode, seeded) + `std.testing.fuzz` targets.
   `evm_fuzz.zig`: random programs as transactions on every fork; oracles are interpreter
   asserts, determinism, gas bounds, no ether creation, and revert atomicity. 300k-iteration
@@ -69,6 +66,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: pre-Osaka wide-modulus MODEXP via startup-sized scratch (`precompiles.Buffers`).
 - 2026-11-05: EVM micro benchmarks: 0.74 ns/instruction, 117 ns/call frame, 0.70 us/tx.
 - 2026-11-05: bn254, KZG, BLS12-381 precompiles wired with Base caps; state tests 100%
   (37724 / 37724). `op.Upgrade` carries the full Base upgrade ladder.

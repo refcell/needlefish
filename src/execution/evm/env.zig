@@ -43,6 +43,9 @@ pub const Config = struct {
     code_size_max: u32 = 24_576,
     /// EIP-3860 init code size limit.
     initcode_size_max: u32 = 2 * 24_576,
+    /// Widest pre-Osaka MODEXP modulus the scratch arena supports. Byzantium pricing is the
+    /// cheapest (gas >= len^2 / 320), so 576 KiB covers any transaction up to ~1e9 gas.
+    modexp_modulus_bytes_max: u32 = 576 << 10,
 
     pub fn validate(config: Config) void {
         assert(config.depth_max >= 1 and config.depth_max <= 1024);
