@@ -53,6 +53,11 @@ provably robust.
   L1 carries indices into an append-only tx pool (no rewrite, so stale messages stay
   valid). Cost: ~6.5 ms/seed ReleaseSafe (was 1-4 ms).
 
+- Push loop: main lands ~1 commit/min while a full test run takes 2-3 min under load,
+  so strict re-test-on-every-reject never wins. After a green full run, if upstream
+  commits since the tested base touch none of our files nor build.zig/src/base.zig,
+  rebase and push without another run (each upstream commit passed its author's run).
+
 ## Log
 - 2026-11-05: simulator v1 (sim/network, model nodes, cluster, swarm config, safety +
   liveness checks; mutation-tested), `testing.fuzz` helpers (Smith seeded + coverage).
