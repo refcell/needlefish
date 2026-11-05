@@ -139,6 +139,13 @@ behind a small interface and switch later.
   records ignored until expiry; re-banning keeps the later expiry. The Service will ban
   gossip peers scoring under -100 for 1 h every 15 s (base/base `PeerMonitoring`).
 
+- Block gossip handler (`gossip/handler.zig`): heap-allocated so the router's
+  message-id hook (now `fn(context, topic, data)`) can use its 10 MiB scratch. Blocks
+  are validated synchronously inside `on_rpc`, so valid ones are forwarded before it
+  returns. Accepted blocks queue by id (64, oldest dropped) and `pop_block` re-decodes
+  from the message cache. Our own published blocks enter the seen-hash table. Topics
+  retire on heartbeat once their fork leaves the 60 s window and are never rejoined.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -160,3 +167,4 @@ behind a small interface and switch later.
 - 2026-11-05: `gossip` SSZ payloads v1-v4, block topics/ids/envelopes, validity (worker,
   06d1ae2..8e11d37).
 - 2026-11-05: `disc` node bans.
+- 2026-11-05: `gossip` block handler (validate before forward, publish, topic retirement).
