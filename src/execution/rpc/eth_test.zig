@@ -153,6 +153,52 @@ test "eth: getProof account and storage proofs verify against the state root" {
     try expect_contains(try h.request("eth_getProof", historical), "error");
 }
 
+/// Decodes a `"result":"0x..."` response into `out`.
+fn result_data(text: []const u8, out: []u8) ![]u8 {
+    const prefix = "\"result\":\"";
+    try testing.expect(std.mem.startsWith(u8, text, prefix));
+    return json.parse_data(text[prefix.len .. text.len - 1], out);
+}
+
+test "eth: debug raw header, block, receipts and transaction" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var tx_buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 5, &tx_buffer);
+    const hash = try h.mine(12);
+    var buffer: [4096]u8 = undefined;
+    const header = try result_data(try h.request("debug_getRawHeader", "[\"latest\"]"), &buffer);
+    try testing.expectEqualSlices(u8, &hash.bytes, &primitives.keccak256(header).bytes);
+    const block_bytes = try result_data(try h.request("debug_getRawBlock", "[\"0x1\"]"), &buffer);
+    const block = try consensus.block.Block.decode(block_bytes);
+    try testing.expectEqualSlices(u8, &hash.bytes, &block.header.hash().bytes);
+    try testing.expectEqual(@as(usize, 1), block.body.transactions.count);
+    try testing.expect(block.body.withdrawals != null);
+    var record = h.node.chain.record(hash.bytes).?;
+    const raw_tx = try record.transactions.bytes();
+    const tx_hash = primitives.keccak256(raw_tx).bytes;
+    var request_buffer: [256]u8 = undefined;
+    const tx_request = try std.fmt.bufPrint(
+        &request_buffer,
+        request_prefix_format ++ "debug_getRawTransaction\",\"params\":[\"0x{x}\"]}}",
+        .{&tx_hash},
+    );
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, tx_request, &out);
+    try expect_contains(out.buffered(), "0x02");
+    const receipts = try h.request("debug_getRawReceipts", "[\"latest\"]");
+    try expect_contains(receipts, "[\"0x02");
+    try expect_contains(try h.request("debug_getRawBlock", "[\"0x7\"]"), "error");
+    const by_hash = try std.fmt.bufPrint(
+        &request_buffer,
+        request_prefix_format ++ "debug_getRawHeader\",\"params\":[\"0x{x}\"]}}",
+        .{&hash.bytes},
+    );
+    out = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, by_hash, &out);
+    try expect_contains(out.buffered(), "\"result\":\"0x");
+}
+
 test "eth: send raw transaction, mine, receipt, logs and nonce" {
     const h = try Harness.create();
     defer h.destroy();
@@ -233,6 +279,10 @@ const method_names = [_][]const u8{
     "eth_getBlockByHash",
     "eth_getProof",
     "miner_setMaxDASize",
+    "debug_getRawHeader",
+    "debug_getRawBlock",
+    "debug_getRawReceipts",
+    "debug_getRawTransaction",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

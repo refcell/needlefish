@@ -12,6 +12,7 @@ const chainspec = @import("../chainspec/root.zig");
 const txpool = @import("../txpool/root.zig");
 const node = @import("../node/root.zig");
 const format = @import("format.zig");
+const debug = @import("debug.zig");
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -62,6 +63,10 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "eth_getLogs", .handler = get_logs },
     .{ .name = "eth_getProof", .handler = @import("eth_proof.zig").get_proof },
     .{ .name = "miner_setMaxDASize", .handler = set_max_da_size },
+    .{ .name = "debug_getRawHeader", .handler = debug.get_raw_header },
+    .{ .name = "debug_getRawBlock", .handler = debug.get_raw_block },
+    .{ .name = "debug_getRawReceipts", .handler = debug.get_raw_receipts },
+    .{ .name = "debug_getRawTransaction", .handler = debug.get_raw_transaction },
 };
 
 pub const Router = rpc.Router(*Api, &methods);
@@ -270,8 +275,18 @@ fn canonical_header(api: *Api, number: u64) ?consensus.Header {
     return api.chain.header(hash);
 }
 
-/// Resolves a block parameter (tag, number, or `{"blockHash": ...}`) to a hash.
-fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+/// Resolves a block parameter (tag, number, bare hash, or `{"blockHash": ...}`) to a
+/// hash.
+pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+    if (raw.len == 2 + 2 + 64 and raw[0] == '"') {
+        const hash = json.parse_fixed(32, raw[1 .. raw.len - 1]) catch {
+            return error.InvalidParams;
+        };
+        if (api.chain.store.ref(hash) == null) {
+            return call.fail(rpc.code.server_error, "block not found");
+        }
+        return hash;
+    }
     if (raw.len > 0 and raw[0] == '{') {
         var scanner = json.Scanner.init(raw);
         if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
