@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const protocol = @import("protocol/root.zig");
+pub const p2p = @import("p2p/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

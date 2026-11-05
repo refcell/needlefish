@@ -14,7 +14,7 @@ Crypto (secp256k1, sha256, keccak, AES-GCM/ChaCha20-Poly1305, X25519) comes from
 behind a small interface and switch later.
 
 ## Backlog
-- [ ] `peers`: node records (ENR, EIP-778: RLP, `v4` identity scheme, secp256k1 sig,
+- [x] `peers`: node records (ENR, EIP-778: RLP, `v4` identity scheme, secp256k1 sig,
   `opstack` key with chain id + version), ENR text form (`enr:` base64url), peer ids
   (libp2p multihash of secp256k1 pubkey, base58), multiaddr encode/decode, boot node
   lists for Base mainnet/sepolia (public, from base/base `boot.rs`), node key load/gen.
@@ -48,6 +48,19 @@ behind a small interface and switch later.
 ## Decisions
 - Lives under `src/consensus/p2p/` (matches base/base `crates/consensus/*`), owned by this
   lane even though the consensus lane owns the rest of `src/consensus/`.
+- secp256k1 comes from `std.crypto` (Keccak-256 ECDSA, ECDH) behind
+  `peers/secp256k1.zig` until `common/crypto` lands one. Signing normalizes to low-s;
+  verification accepts both halves, like the `enr`/`discv5` crates.
+- ENR signing uses std's deterministic nonce, so locally built records differ
+  byte-for-byte from geth/rust signers for the same key; only verification is
+  vector-tested (EIP-778 record + every public Base boot record).
+- Spec test private keys are not committed (AGENTS rule 3); tests derive keys from
+  `Prng` or tiny scalars instead.
+- Multiaddr supports ip4/ip6/tcp/udp/dns/dns4/dns6/p2p/quic-v1 only; anything else is
+  `UnsupportedProtocol`. Empty binary multiaddrs are rejected (no text form).
+- Node key files are hex text; library code takes file contents, never paths.
 
 ## Log
 - 2026-11-05: lane created by coordinator.
+- 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
+  base58, varint, ip text, multiaddr, enode, Base boot nodes, node keys; all fuzzed.
