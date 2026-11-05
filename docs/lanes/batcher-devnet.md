@@ -116,3 +116,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   Decision: a builder answering method-not-found disables throttling with a log line instead
   of exiting (base/base bails unless `--no-throttle`), so the devnet runs before the EL lane
   serves the miner API. Backlog = (unsafe - safe) x EMA of per-block FastLZ DA estimates.
+- 2026-11-05: txmgr liveness fix (dst-fuzz finding): a nonce gap (no slot holds `latest`
+  while later slots wait) that outlives `resubmit_after_ms` makes the service reset channels and
+  txmgr; the stall watchdog resets txmgr too. After a reset the nonce comes from `latest` and
+  dropped nonces are refilled with fees bumped over the dropped txs (replace pooled copies).
+  Frames are requeued by reloading blocks from safe + 1.

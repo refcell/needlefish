@@ -111,6 +111,13 @@ pub const Service = struct {
         report.throttle = service.throttle.update(clients.l2, report.da_backlog_bytes, now_ms);
         try service.submit_frames(clients.l1, now_ms, &report);
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
+        if (service.txs.needs_reset(now_ms)) {
+            // A lost nonce: drop the waiting txs and reload from safe + 1, which requeues
+            // the lost frames' blocks (base/base resets its nonce and requeues frames).
+            service.channels.reset();
+            service.txs.reset();
+            report.resets += 1;
+        }
         assert(report.txs_submitted <= service.txs.slots.len);
         return report;
     }
@@ -127,6 +134,9 @@ pub const Service = struct {
         if (next <= heads.safe_l2 + 1) return;
         if (heads.l1 < service.safe_seen_at_l1 + service.stall_l1_blocks) return;
         service.channels.reset();
+        // Txs carrying the abandoned channels go too; the next submit refetches the
+        // `latest` nonce, so a lost nonce cannot block the resubmission.
+        service.txs.reset();
         service.safe_seen_at_l1 = heads.l1;
         report.resets += 1;
         assert(service.channels.next_block_number() == null);
@@ -464,6 +474,8 @@ test "service: a stalled safe head triggers resubmission from safe + 1" {
     }
     // Safe head never moved: one reset after 10 L1 blocks, and blocks 1..4 reloaded.
     try testing.expectEqual(@as(u32, 1), resets);
+    // The reset also reset txmgr: the next nonce comes from `latest`, filling any gap.
+    try testing.expectEqualStrings("latest", service.txs.nonce_tag);
     try testing.expectEqual(@as(u32, 8), loaded);
     // Once the safe head advances there is no further reset.
     chains.safe_l2 = 4;

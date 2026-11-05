@@ -79,9 +79,20 @@ pub const TxManager = struct {
     config: Config,
     slots: []Slot,
     next_nonce: ?u64,
+    /// Account nonce tag read when `next_nonce` is unknown: "pending" at startup (keep a
+    /// previous run's pooled txs), "latest" after a reset (refill nonces that were lost).
+    nonce_tag: []const u8 = "pending",
+    /// After a reset: the highest dropped nonce and the fees it carried. A new tx at a
+    /// nonce up to this one bumps those fees, so it replaces a dropped copy still pooled.
+    replaced: ?Replaced = null,
+    /// When a nonce gap (no slot holds the account's `latest` nonce while later slots
+    /// wait) was first seen; `needs_reset` reports it once it outlives a resubmit period.
+    gap_since_ms: ?u64 = null,
     raw_buffer: []u8,
     params_buffer: []u8,
     prover: ?*kzg.Prover,
+
+    const Replaced = struct { nonce_max: u64, fees: txdata.Fees, blob_fee: u128 };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !TxManager {
         assert(config.slots_max > 0);
@@ -177,9 +188,16 @@ pub const TxManager = struct {
         const slot = for (manager.slots) |*slot| {
             if (slot.state == .free) break slot;
         } else return error.NoFreeSlot;
-        const nonce = manager.next_nonce orelse try manager.account_nonce(client, "pending");
-        const fees = try manager.suggested_fees(client);
-        const blob_fee = if (manager.prover != null) try manager.suggested_blob_fee(client) else 0;
+        const nonce = manager.next_nonce orelse
+            try manager.account_nonce(client, manager.nonce_tag);
+        var fees = try manager.suggested_fees(client);
+        var blob_fee = if (manager.prover != null) try manager.suggested_blob_fee(client) else 0;
+        if (manager.replaced) |replaced| {
+            if (nonce <= replaced.nonce_max) {
+                fees = txdata.bump_fees(replaced.fees, fees, manager.replacement_bump_percent());
+                blob_fee = @max(blob_fee, replaced.blob_fee *| 2);
+            } else manager.replaced = null;
+        }
         if (manager.prover) |prover| {
             slot.blob_count = 0;
             while (slot.blob_count < manager.config.blobs_per_tx) : (slot.blob_count += 1) {
@@ -214,6 +232,7 @@ pub const TxManager = struct {
     pub fn poll(manager: *TxManager, client: *rpc.Client, now_ms: u64) Error!u32 {
         if (manager.pending_count() == 0) return 0;
         const mined_nonce = try manager.account_nonce(client, "latest");
+        manager.watch_gap(mined_nonce, now_ms);
         var confirmed: u32 = 0;
         for (manager.slots) |*slot| {
             if (slot.state != .pending) continue;
@@ -230,10 +249,60 @@ pub const TxManager = struct {
         return confirmed;
     }
 
-    /// Forgets all pending work, e.g. after a reset; nonces are re-read on next submit.
+    /// Tracks a nonce gap: pending slots wait while none holds the `latest` nonce. That
+    /// happens when a confirmed tx is reorged out and L1 then drops it; nothing would
+    /// ever fill the nonce, so every later tx would wait forever.
+    fn watch_gap(manager: *TxManager, mined_nonce: u64, now_ms: u64) void {
+        var lowest_pending: ?u64 = null;
+        for (manager.slots) |slot| {
+            if (slot.state != .pending) continue;
+            lowest_pending = @min(lowest_pending orelse slot.nonce, slot.nonce);
+        }
+        const gap = if (lowest_pending) |lowest| lowest > mined_nonce else false;
+        if (!gap) {
+            manager.gap_since_ms = null;
+        } else if (manager.gap_since_ms == null) {
+            manager.gap_since_ms = now_ms;
+        }
+        assert(manager.gap_since_ms == null or lowest_pending != null);
+    }
+
+    /// True once a nonce gap has lasted a full resubmit period (a reorged-out tx had time
+    /// to return). The caller must then `reset` and requeue the dropped frames' data.
+    pub fn needs_reset(manager: *const TxManager, now_ms: u64) bool {
+        const since = manager.gap_since_ms orelse return false;
+        return now_ms -| since >= manager.config.resubmit_after_ms;
+    }
+
+    /// Forgets all pending work after a reset (the caller regenerates their data). The
+    /// next submit reads the `latest` nonce, filling any gap, and replaces dropped txs
+    /// that may still sit in the pool with bumped fees.
     pub fn reset(manager: *TxManager) void {
-        for (manager.slots) |*slot| slot.state = .free;
+        for (manager.slots) |*slot| {
+            if (slot.state != .pending) continue;
+            slot.state = .free;
+            var replaced: Replaced = manager.replaced orelse
+                .{ .nonce_max = slot.nonce, .fees = slot.fees, .blob_fee = slot.blob_fee };
+            replaced.nonce_max = @max(replaced.nonce_max, slot.nonce);
+            replaced.fees = .{
+                .max_fee_per_gas = @max(replaced.fees.max_fee_per_gas, slot.fees.max_fee_per_gas),
+                .max_priority_fee_per_gas = @max(
+                    replaced.fees.max_priority_fee_per_gas,
+                    slot.fees.max_priority_fee_per_gas,
+                ),
+            };
+            replaced.blob_fee = @max(replaced.blob_fee, slot.blob_fee);
+            manager.replaced = replaced;
+        }
         manager.next_nonce = null;
+        manager.nonce_tag = "latest";
+        manager.gap_since_ms = null;
+        assert(manager.pending_count() == 0);
+    }
+
+    fn replacement_bump_percent(manager: *const TxManager) u8 {
+        if (manager.prover != null) return blob_tx.blob_bump_percent;
+        return manager.config.bump_percent;
     }
 
     fn bump(manager: *TxManager, client: *rpc.Client, slot: *Slot) Error!void {
@@ -369,6 +438,8 @@ fn benign_send_error(message: []const u8) bool {
 }
 
 const testing = std.testing;
+const consensus = @import("../../common/consensus/root.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 const accounts = @import("../devnet/accounts.zig");
 
 /// Scripted L1: tracks the mined nonce and records sent transactions.
@@ -468,7 +539,6 @@ test "txmgr: nonces, confirmation, resubmission with bumped fees" {
 }
 
 test "txmgr: blob mode sends a 4844 tx committing to the frame and doubles fees on bump" {
-    const consensus = @import("../../common/consensus/root.zig");
     const rlp = @import("../../common/rlp/root.zig");
     const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
     var l1: FakeL1 = .{ .mined_nonce = 0 };
@@ -572,4 +642,203 @@ test "txmgr: blob mode packs up to blobs_per_tx frames per transaction" {
     try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 0));
     try testing.expect(!try manager.submit_from(&client, list.source(), 0));
     try testing.expectEqual(@as(u32, 2), l1.sends);
+}
+
+/// An L1 with a nonce-indexed pool, reorgs, and tx loss: `mined` advances over contiguous
+/// pooled nonces; a reorg returns mined txs to the pool; a loss drops pooled txs.
+const LossyL1 = struct {
+    mined: u64 = 0,
+    pool: [pool_size]bool = @splat(false),
+    sends: u32 = 0,
+
+    const pool_size = 512;
+
+    fn transport(l1: *LossyL1) rpc.Transport {
+        return .{ .context = l1, .send_fn = send };
+    }
+
+    fn mine(l1: *LossyL1, count_max: u64) void {
+        var count: u64 = 0;
+        while (count < count_max and l1.mined < pool_size and l1.pool[l1.mined]) : (count += 1) {
+            l1.pool[l1.mined] = false;
+            l1.mined += 1;
+        }
+    }
+
+    /// Unmines the top `depth` txs back into the pool, then drops each pooled tx whose
+    /// nonce is at least `mined` with probability `loss_percent`.
+    fn reorg_and_lose(l1: *LossyL1, prng: *Prng, depth: u64, loss_percent: u64) void {
+        const back = @min(depth, l1.mined);
+        for (l1.mined - back..l1.mined) |nonce| l1.pool[nonce] = true;
+        l1.mined -= back;
+        for (l1.pool[@intCast(l1.mined)..]) |*pooled| {
+            if (pooled.* and prng.chance(loss_percent, 100)) pooled.* = false;
+        }
+    }
+
+    fn pending_nonce(l1: *const LossyL1) u64 {
+        var nonce = l1.mined;
+        while (nonce < pool_size and l1.pool[nonce]) nonce += 1;
+        return nonce;
+    }
+
+    fn send(context: *anyopaque, body: []const u8, response: []u8) rpc.TransportError!usize {
+        const l1: *LossyL1 = @ptrCast(@alignCast(context));
+        const id_start = std.mem.indexOf(u8, body, "\"id\":").? + 5;
+        const id = body[id_start..][0..std.mem.indexOfScalar(u8, body[id_start..], ',').?];
+        var buffer: [64]u8 = undefined;
+        const is_nonce_query = std.mem.indexOf(u8, body, "eth_getTransactionCount") != null;
+        const result: []const u8 = if (is_nonce_query) blk: {
+            const latest = std.mem.indexOf(u8, body, "\"latest\"") != null;
+            const nonce = if (latest) l1.mined else l1.pending_nonce();
+            break :blk std.fmt.bufPrint(&buffer, "\"0x{x}\"", .{nonce}) catch unreachable;
+        } else if (std.mem.indexOf(u8, body, "eth_getBlockByNumber")) |_|
+            "{\"baseFeePerGas\":\"0x64\"}"
+        else if (std.mem.indexOf(u8, body, "eth_maxPriorityFeePerGas")) |_|
+            "\"0x2\""
+        else blk: {
+            l1.sends += 1;
+            const nonce = sent_nonce(body) catch return error.TransportFailed;
+            if (nonce >= pool_size) return error.TransportFailed;
+            if (nonce >= l1.mined) l1.pool[@intCast(nonce)] = true;
+            break :blk "\"0x00\"";
+        };
+        const envelope = "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}";
+        const text = std.fmt.bufPrint(response, envelope, .{ id, result }) catch
+            return error.ResponseTooLarge;
+        return text.len;
+    }
+
+    fn sent_nonce(body: []const u8) !u64 {
+        const hex_start = std.mem.indexOf(u8, body, "[\"0x").? + 4;
+        const hex_end = std.mem.indexOfScalarPos(u8, body, hex_start, '"').?;
+        var raw: [2048]u8 = undefined;
+        const bytes = try std.fmt.hexToBytes(&raw, body[hex_start..hex_end]);
+        const envelope = try consensus.Envelope.decode(bytes);
+        return envelope.eip1559.tx.nonce;
+    }
+};
+
+fn lossy_manager(l1: *LossyL1, client: *rpc.Client) !TxManager {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    client.* = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 8192,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    errdefer client.deinit(testing.allocator);
+    return TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 4,
+        .tx_data_bytes_max = 256,
+        .resubmit_after_ms = 1000,
+    });
+}
+
+test "txmgr: a confirmed tx reorged out and lost is detected and its nonce refilled" {
+    var l1: LossyL1 = .{};
+    var client: rpc.Client = undefined;
+    var manager = try lossy_manager(&l1, &client);
+    defer manager.deinit(testing.allocator);
+    defer client.deinit(testing.allocator);
+    try manager.submit(&client, "\x00a", 0);
+    try manager.submit(&client, "\x00b", 0);
+    l1.mine(2);
+    try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 100));
+    // Nonce 1 is reorged out and the pool loses it; nonce 2 then waits forever.
+    var prng = Prng.init(1);
+    l1.reorg_and_lose(&prng, 1, 100);
+    try testing.expectEqual(@as(u64, 1), l1.mined);
+    try manager.submit(&client, "\x00c", 200);
+    try testing.expectEqual(@as(u64, 2), manager.slots[0].nonce);
+    _ = try manager.poll(&client, 300);
+    try testing.expect(!manager.needs_reset(300)); // A reorged tx may still return.
+    _ = try manager.poll(&client, 1300);
+    try testing.expect(manager.needs_reset(1300));
+    const dropped_fee = manager.slots[0].fees.max_fee_per_gas;
+    manager.reset();
+    try testing.expect(!manager.needs_reset(1300));
+    // The requeued data goes out under the lost nonce, outbidding the dropped tx.
+    try manager.submit(&client, "\x00b-again", 1400);
+    try testing.expectEqual(@as(u64, 1), manager.slots[0].nonce);
+    try testing.expect(manager.slots[0].fees.max_fee_per_gas > dropped_fee);
+    try manager.submit(&client, "\x00c-again", 1400);
+    l1.mine(8);
+    try testing.expectEqual(@as(u64, 3), l1.mined);
+    try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 1500));
+    try testing.expect(manager.replaced == null or manager.next_nonce.? > 2);
+}
+
+test "txmgr: seeded fuzz over reorgs and tx loss keeps the nonce stream live" {
+    for (0..12) |seed| {
+        var prng = Prng.init(0x10_55 + seed);
+        var l1: LossyL1 = .{};
+        var client: rpc.Client = undefined;
+        var manager = try lossy_manager(&l1, &client);
+        defer manager.deinit(testing.allocator);
+        defer client.deinit(testing.allocator);
+        var now_ms: u64 = 0;
+        // Faulty phase, then a quiet phase in which mining must make progress.
+        for (0..160) |round| {
+            now_ms += prng.range(50, 600);
+            const faulty = round < 100;
+            if (manager.has_capacity() and prng.chance(2, 3)) {
+                try manager.submit(&client, "\x00f", now_ms);
+            }
+            if (prng.chance(1, 2)) l1.mine(prng.range(1, 3));
+            if (faulty and prng.chance(1, 10)) l1.reorg_and_lose(&prng, prng.range(1, 3), 50);
+            _ = try manager.poll(&client, now_ms);
+            if (manager.needs_reset(now_ms)) manager.reset();
+            try testing.expect(manager.pending_count() <= manager.slots.len);
+        }
+        const mined_before = l1.mined;
+        for (0..60) |_| {
+            now_ms += 500;
+            if (manager.has_capacity()) try manager.submit(&client, "\x00q", now_ms);
+            l1.mine(4);
+            _ = try manager.poll(&client, now_ms);
+            if (manager.needs_reset(now_ms)) manager.reset();
+        }
+        try testing.expect(l1.mined >= mined_before + 40);
+    }
+}
+
+test "txmgr: fuzz reorg and loss schedules" {
+    try testing.fuzz({}, fuzz_lossy, .{});
+}
+
+fn fuzz_lossy(_: void, smith: *testing.Smith) anyerror!void {
+    var events: [128]u8 = undefined;
+    const length = smith.slice(&events);
+    var l1: LossyL1 = .{};
+    var client: rpc.Client = undefined;
+    var manager = try lossy_manager(&l1, &client);
+    defer manager.deinit(testing.allocator);
+    defer client.deinit(testing.allocator);
+    var prng = Prng.init(length);
+    var now_ms: u64 = 0;
+    for (events[0..length]) |event| {
+        now_ms += 300;
+        switch (event % 4) {
+            0 => if (manager.has_capacity()) try manager.submit(&client, "\x00z", now_ms),
+            1 => l1.mine(1 + event / 64),
+            2 => l1.reorg_and_lose(&prng, event / 64, 50),
+            else => {},
+        }
+        _ = try manager.poll(&client, now_ms);
+        if (manager.needs_reset(now_ms)) manager.reset();
+    }
+    // Quiet tail: the stream must move again.
+    const mined_before = l1.mined;
+    for (0..40) |_| {
+        now_ms += 500;
+        if (manager.has_capacity()) try manager.submit(&client, "\x00q", now_ms);
+        l1.mine(4);
+        _ = try manager.poll(&client, now_ms);
+        if (manager.needs_reset(now_ms)) manager.reset();
+    }
+    try testing.expect(l1.mined >= mined_before + 20);
 }
