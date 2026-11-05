@@ -9,7 +9,7 @@ provably robust.
 - [x] Fuzz infrastructure: shared helpers over `std.testing.fuzz` + seeded deterministic fuzz runs in `zig build test`; a `just fuzz` corpus dir under `.cache/`.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
-- [ ] Bench harness in `bench_main.zig` (filterable, ns/op, throughput) and perf tracking file `docs/PERF.md`.
+- [x] Bench harness in `bench_main.zig` (filterable, ns/op, throughput) and perf tracking file `docs/PERF.md`.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Decisions
@@ -35,3 +35,4 @@ provably robust.
 - 2026-11-05: tidy fn-length gate, `just assert-density`, build.zig split into helpers.
 - 2026-11-05: swarm runner + greedy minimizer + regression seed list; batcher model
   interval fixed (minimizer showed fault-free liveness relied on resubmits); CI swarm/fuzz jobs.
+- 2026-11-05: bench harness (calibrated, best-of-5, MB/s) over lane case tables; docs/PERF.md baseline.
