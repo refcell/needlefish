@@ -26,6 +26,13 @@ provably robust.
     disk faults on its durable db.
   - [ ] P2P: the consensus p2p gossip stack (envelope encode/validate, signer checks)
     carrying unsafe blocks over the sim network instead of model messages.
+- [ ] Sim at native 200 ms blocks (project owner direction, AGENTS.md rule 10): sim rollup
+  activates every fork through Denim at genesis (subsecond blocks, Holocene derivation,
+  `BaseTimeUpdateTx`), model sequencer/verifiers/batcher move to ms timestamps (5 blocks
+  per second), real sequencer requests a payload every 200 ms slot and seals 150 ms in.
+  Invariants: one block per slot or an explained skip; verifiers replay sealed blocks
+  identically; no getPayload past the slot end. Swarm keeps a pre-Denim (2 s) config
+  family so legacy derivation stays covered.
 - [ ] Sim: drop the `BUG(batcher)` gates (admin ops, reorg tx loss, `evict_reorged`) when
   the batcher tracks confirmation depth and re-queues reorged frames (reported to
   nf-batcher-devnet).
