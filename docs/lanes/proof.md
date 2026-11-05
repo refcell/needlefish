@@ -71,12 +71,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   assembly mirrors the node's `Chain.child_header`/`seal`; the e2e test rebuilds
   node-built L2 blocks and must match their hashes, so drift is caught. Per-account
   `l2-account-proof` hints are not sent: the `l2-payload-witness` hint prefetches all.
+- Boot: optional local keys the host lacks are served as empty preimages (the oracle
+  wire has no not-found). Outside the devnet the host's rollup config must match the
+  built-in chain config's identity fields (chain ids, genesis, inbox, deposit/system
+  config contracts, block time); upgrade timestamps come from the host. The L1 fork
+  config comes from `chains.l1_by_chain_id` (local key 7 is not read).
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/program` started: `boot.zig` (local keys 1-11, trust checks).
 - 2026-11-05: `proof/executor` landed (stateless builder, oracle fallback, output root;
   e2e rebuild of node-built L2 blocks over the in-process oracle).
 - 2026-11-05: `proof/mpt` landed (oracle resolver, node decode, list walker, differential
