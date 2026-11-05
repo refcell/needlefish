@@ -93,6 +93,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             .to = rollup.batch_inbox_address,
             .tx_data_bytes_max = tx_data_bytes_max,
         },
+        // 30 L1 blocks without safe-head progress: resubmit from the safe head.
+        .stall_l1_blocks = 30,
     }, seed);
     defer service.deinit(init.gpa);
     return run(init, flags, &service, l1_url, l2_url);

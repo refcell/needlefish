@@ -24,7 +24,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
 - [ ] `batcher/source`: EIP-7702 (type 4) transactions.
 - [x] `batcher/service` + `base batcher`: step loop (heads, load, frames, txmgr), calldata DA.
-- [ ] `base batcher`: metrics endpoint, blob DA, channel timeout / sub-safety margin handling.
+- [x] `batcher/service`: safe-head stall watchdog (resubmit from safe+1; covers timed-out channels).
+- [ ] `base batcher`: metrics endpoint, blob DA.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
@@ -55,6 +56,14 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: default channel compression is zlib via std.compress.flate (still valid
   after Fjord, decoder in std for the consensus lane); brotli (version byte 0x01) follows.
 
+## Decisions addendum
+
+- 2026-11-05: Channel timeouts are handled by a safe-head stall watchdog: if the rollup node's
+  safe head does not advance for 30 L1 blocks while the batcher holds later blocks, it drops its
+  channels and reloads from safe+1. Simpler than op-batcher's per-channel inclusion tracking and
+  also recovers from dropped txs and rollup-node restarts; duplicate batches are dropped by
+  derivation.
+
 ## Log
 - 2026-11-05: DEVNET.md contract; batcher frame + blob codecs with fuzz tests.
 - 2026-11-05: batcher/frame reuses consensus Frame; comp: zlib + stored brotli (verified
@@ -70,3 +79,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   loop; end-to-end test decodes the L1 txs back into the L2 blocks' batches.
 - 2026-11-05: `base batcher` binary (calldata DA). Live: 20 fake L2 blocks -> 1 batch tx mined on
   anvil L1. Blobs DA rejected with a clear error until EIP-4844 signing lands.
+- 2026-11-05: safe-head stall watchdog instead of per-channel inclusion tracking (decision below).

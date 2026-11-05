@@ -21,6 +21,10 @@ pub const Config = struct {
     txs: txmgr.Config,
     source: source.Limits = .{},
     blocks_per_step_max: u32 = 64,
+    /// Reset and resubmit from the safe head when it has not advanced for this many L1
+    /// blocks while we hold later blocks (lost or timed-out channels). 0 disables it;
+    /// it needs a rollup node.
+    stall_l1_blocks: u64 = 0,
 };
 
 pub const Clients = struct {
@@ -30,7 +34,13 @@ pub const Clients = struct {
     rollup: ?*rpc.Client,
 };
 
-pub const Heads = struct { l1: u64, safe_l2: u64, unsafe_l2: u64 };
+pub const Heads = struct {
+    l1: u64,
+    safe_l2: u64,
+    unsafe_l2: u64,
+    /// False when no rollup node answered and `safe_l2` is a placeholder 0.
+    safe_known: bool = false,
+};
 
 pub const Report = struct {
     heads: Heads = .{ .l1 = 0, .safe_l2 = 0, .unsafe_l2 = 0 },
@@ -47,6 +57,10 @@ pub const Service = struct {
     txs: txmgr.TxManager,
     decoder: source.Decoder,
     blocks_per_step_max: u32,
+    stall_l1_blocks: u64,
+    /// Highest safe head seen and the L1 head when it was first seen.
+    safe_seen: u64,
+    safe_seen_at_l1: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, channel_id_seed: [16]u8) !Service {
         assert(config.blocks_per_step_max > 0);
@@ -61,6 +75,9 @@ pub const Service = struct {
             .txs = txs,
             .decoder = decoder,
             .blocks_per_step_max = config.blocks_per_step_max,
+            .stall_l1_blocks = config.stall_l1_blocks,
+            .safe_seen = 0,
+            .safe_seen_at_l1 = 0,
         };
     }
 
@@ -75,11 +92,29 @@ pub const Service = struct {
         var report: Report = .{};
         report.heads = try read_heads(clients);
         service.channels.on_l1_head(report.heads.l1);
+        if (report.heads.safe_known) service.watch_safe_head(report.heads, &report);
         try service.load_blocks(clients, report.heads, &report);
         try service.submit_frames(clients.l1, now_ms, &report);
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
         assert(report.txs_submitted <= service.txs.slots.len);
         return report;
+    }
+
+    /// Resets when the safe head stalls behind blocks we already loaded.
+    fn watch_safe_head(service: *Service, heads: Heads, report: *Report) void {
+        if (heads.safe_l2 > service.safe_seen or service.safe_seen_at_l1 == 0) {
+            service.safe_seen = @max(service.safe_seen, heads.safe_l2);
+            service.safe_seen_at_l1 = heads.l1;
+            return;
+        }
+        if (service.stall_l1_blocks == 0) return;
+        const next = service.channels.next_block_number() orelse return;
+        if (next <= heads.safe_l2 + 1) return;
+        if (heads.l1 < service.safe_seen_at_l1 + service.stall_l1_blocks) return;
+        service.channels.reset();
+        service.safe_seen_at_l1 = heads.l1;
+        report.resets += 1;
+        assert(service.channels.next_block_number() == null);
     }
 
     fn load_blocks(service: *Service, clients: Clients, heads: Heads, report: *Report) Error!void {
@@ -160,6 +195,7 @@ fn read_heads(clients: Clients) Error!Heads {
                 .l1 = l1,
                 .safe_l2 = try rpc.number(try rpc.field(safe, "number")),
                 .unsafe_l2 = try rpc.number(try rpc.field(unsafe, "number")),
+                .safe_known = true,
             };
         } else |_| {}
     }
@@ -182,6 +218,7 @@ const accounts = @import("../devnet/accounts.zig");
 const FakeChains = struct {
     l1_head: u64 = 100,
     l2_head: u64 = 0,
+    safe_l2: u64 = 0,
     mined_nonce: u64 = 0,
     sent: [16][4096]u8 = undefined,
     sent_lengths: [16]usize = @splat(0),
@@ -226,6 +263,10 @@ const FakeChains = struct {
             return std.fmt.bufPrint(out, "\"0x{x}\"", .{chains.mined_nonce});
         }
         if (eql(u8, method, "eth_maxPriorityFeePerGas")) return "\"0x1\"";
+        if (eql(u8, method, "optimism_syncStatus")) {
+            return std.fmt.bufPrint(out, "{{\"safe_l2\":{{\"number\":{d}}}," ++
+                "\"unsafe_l2\":{{\"number\":{d}}}}}", .{ chains.safe_l2, chains.l2_head });
+        }
         if (eql(u8, method, "eth_sendRawTransaction")) {
             const raw_hex = between(body, "\"params\":[\"0x", "\"");
             const slot = &chains.sent[chains.sent_count];
@@ -344,4 +385,60 @@ test "service: rollup fields from the devnet rollup.json" {
     try testing.expectEqual(@as(u64, 900), fields.l1_chain_id);
     try testing.expectEqual(@as(u8, 0xff), fields.batch_inbox_address.bytes[0]);
     try testing.expectError(error.MalformedResponse, RollupFields.parse(testing.allocator, "{}"));
+}
+
+test "service: a stalled safe head triggers resubmission from safe + 1" {
+    var chains: FakeChains = .{ .l2_head = 4 };
+    const info: l1_info.L1BlockInfo = .{ .format = .jovian, .number = 90, .sequence_number = 0 };
+    var calldata: [l1_info.calldata_length_max]u8 = undefined;
+    const hex = std.fmt.bufPrint(&chains.info_hex, "{x}", .{info.encode_calldata(&calldata)}) catch
+        unreachable;
+    chains.info_hex_length = hex.len;
+    var l1_role: FakeChains.Role = .{ .chains = &chains, .is_l1 = true };
+    var l2_role: FakeChains.Role = .{ .chains = &chains, .is_l1 = false };
+    const limits: rpc.Limits = .{ .response_bytes_max = 16384, .parse_bytes_max = 256 * 1024 };
+    const l1_transport: rpc.Transport = .{ .context = &l1_role, .send_fn = FakeChains.send };
+    const l2_transport: rpc.Transport = .{ .context = &l2_role, .send_fn = FakeChains.send };
+    var l1 = try rpc.Client.init(testing.allocator, l1_transport, limits);
+    defer l1.deinit(testing.allocator);
+    var l2 = try rpc.Client.init(testing.allocator, l2_transport, limits);
+    defer l2.deinit(testing.allocator);
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var service = try Service.init(testing.allocator, .{
+        .channels = .{
+            .channel = .{ .frame_size_max = 1000, .input_bytes_max = 64 * 1024 },
+            .max_channel_duration_l1_blocks = 1,
+            .batch_bytes_max = 4096,
+        },
+        .txs = .{
+            .chain_id = 900,
+            .private_key = batcher.private_key,
+            .from = batcher.address,
+            .to = .{ .bytes = @splat(0xff) },
+            .tx_data_bytes_max = 1024,
+        },
+        .source = .{ .tx_count_max = 8, .tx_bytes_max = 4096, .input_bytes_max = 1024 },
+        .stall_l1_blocks = 10,
+    }, @splat(4));
+    defer service.deinit(testing.allocator);
+    const clients: Clients = .{ .l1 = &l1, .l2 = &l2, .rollup = &l2 };
+
+    var resets: u32 = 0;
+    var loaded: u32 = 0;
+    for (0..12) |round| {
+        const report = try service.step(clients, round * 2000);
+        resets += report.resets;
+        loaded += report.blocks_loaded;
+        chains.l1_head += 1;
+    }
+    // Safe head never moved: one reset after 10 L1 blocks, and blocks 1..4 reloaded.
+    try testing.expectEqual(@as(u32, 1), resets);
+    try testing.expectEqual(@as(u32, 8), loaded);
+    // Once the safe head advances there is no further reset.
+    chains.safe_l2 = 4;
+    for (12..30) |round| {
+        const report = try service.step(clients, round * 2000);
+        try testing.expectEqual(@as(u32, 0), report.resets);
+        chains.l1_head += 1;
+    }
 }
