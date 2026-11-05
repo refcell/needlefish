@@ -10,6 +10,7 @@ pub const snapshotter = @import("snapshotter/root.zig");
 pub const sidecrush = @import("sidecrush/root.zig");
 pub const roxy = @import("roxy/root.zig");
 pub const basectl = @import("basectl/root.zig");
+pub const withdrawer = @import("withdrawer/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
