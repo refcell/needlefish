@@ -68,7 +68,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `--data-availability-type`, `--resubmission-timeout`, `--max-blobs-per-tx`,
   `--max-calldata-size-bytes`).
 - [x] `batcher`: `--network-timeout` (needs a request timeout in the HTTP transport).
-- [ ] `batcher`: `--compressed-size-target` (close the channel once compressed output passes
+- [x] `batcher`: `--compressed-size-target` (close the channel once compressed output passes
   the target, keeping the batch that reached it).
 - [x] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
@@ -187,3 +187,6 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   so HttpTransport races the fetch against a sleep with `std.Io.Select`, cancels a late fetch
   (fails as TransportFailed, retried next step) and replaces the client so no cancelled
   connection is reused. Without Io concurrency it falls back to no timeout. Smoke passes.
+- 2026-11-05: `--compressed-size-target B`: replaces `target_frames` full frames as the
+  channel's compressed target; met through the ratio estimate (we compress once at close),
+  so a channel rejects the batch that would cross it instead of keeping it like base/base.

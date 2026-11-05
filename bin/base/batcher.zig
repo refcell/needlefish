@@ -19,7 +19,7 @@ const usage =
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
-    \\         --network-timeout S (0 disables)
+    \\         --network-timeout S (0 disables) --compressed-size-target B
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
@@ -78,6 +78,8 @@ const Flags = struct {
     force_blobs_when_throttling: bool = true,
     /// Per-request RPC timeout (base/base `--network-timeout`, seconds); 0 disables it.
     network_timeout_ms: u64 = 10 * std.time.ms_per_s,
+    /// Compressed bytes a channel aims for before it closes; 0 = one full frame.
+    compressed_size_target: u32 = 0,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -188,6 +190,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
                 .frame_size_max = payload_max - 1,
                 .input_bytes_max = 4 << 20,
                 .algorithm = flags.compression,
+                .compressed_bytes_target = flags.compressed_size_target,
             },
             .max_channel_duration_l1_blocks = flags.max_channel_duration - flags.sub_safety_margin,
         },
@@ -385,6 +388,9 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
         const seconds = try parse(u64, value, 10);
         if (seconds == 0 or seconds > 3600) return error.InvalidResubmissionTimeout;
         flags.resubmit_after_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--compressed-size-target")) {
+        flags.compressed_size_target = try parse(u32, value, 10);
+        if (flags.compressed_size_target == 0) return error.InvalidCompressedSizeTarget;
     } else if (eql(u8, arg, "--max-calldata-size-bytes")) {
         flags.calldata_bytes_max = try parse(u32, value, 10);
         // Room for the version byte and a frame header plus data; at most the tx cap.
@@ -619,6 +625,11 @@ test "batcher: flags" {
     const inverted = [_][]const u8{ "--throttle-full-threshold", "1" };
     try std.testing.expectError(error.InvalidThrottleConfig, parse_flags(&inverted));
     try std.testing.expectEqual(@as(u64, 10_000), (try parse_flags(&.{})).network_timeout_ms);
+    const size_target = [_][]const u8{ "--compressed-size-target", "4096" };
+    const sized = try parse_flags(&size_target);
+    try std.testing.expectEqual(@as(u32, 4096), sized.compressed_size_target);
+    const size_zero = [_][]const u8{ "--compressed-size-target", "0" };
+    try std.testing.expectError(error.InvalidCompressedSizeTarget, parse_flags(&size_zero));
     const timeout_off = [_][]const u8{ "--network-timeout", "0" };
     try std.testing.expectEqual(@as(u64, 0), (try parse_flags(&timeout_off)).network_timeout_ms);
     const timeout_big = [_][]const u8{ "--network-timeout", "3601" };
@@ -656,6 +667,7 @@ const fuzz_flag_names = [_][]const u8{
     "--throttle-tx-size-lower-limit",
     "--no-force-blobs-when-throttling",
     "--network-timeout",
+    "--compressed-size-target",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 

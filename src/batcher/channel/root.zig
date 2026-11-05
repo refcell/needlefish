@@ -27,6 +27,10 @@ pub const Config = struct {
     /// Hard cap on uncompressed batch bytes per channel (sizes the input buffer).
     input_bytes_max: u32 = 4 * 1024 * 1024,
     algorithm: comp.Algorithm = .zlib,
+    /// Compressed bytes a channel aims for (base/base `--compressed-size-target`); 0 means
+    /// `target_frames` full frames. Like the frame target it is met through the ratio
+    /// estimate, since the channel compresses once at close.
+    compressed_bytes_target: u32 = 0,
 
     pub fn validate(config: Config) void {
         assert(config.frame_size_max > Frame.encoded_overhead);
@@ -40,7 +44,10 @@ pub const Config = struct {
     /// Uncompressed bytes at which the ratio estimate fills `target_frames` frames.
     pub fn input_bytes_target(config: Config) u64 {
         const data_per_frame: u64 = config.frame_size_max - Frame.encoded_overhead;
-        const compressed_target = data_per_frame * config.target_frames;
+        const compressed_target: u64 = if (config.compressed_bytes_target > 0)
+            config.compressed_bytes_target
+        else
+            data_per_frame * config.target_frames;
         const target = compressed_target * 100 / config.compression_ratio_percent;
         return @max(1, @min(target, config.input_bytes_max));
     }
@@ -251,6 +258,46 @@ test "channel: fills, closes, and frames reassemble" {
     try testing.expectEqualSlices(u8, channel.compressed(), data);
 }
 
+test "channel: compressed size target overrides the frame target" {
+    const frames: Config = .{ .frame_size_max = 23 + 100, .target_frames = 2 };
+    var sized = frames;
+    sized.compressed_bytes_target = 60;
+    try testing.expectEqual(@as(u64, 333), frames.input_bytes_target());
+    try testing.expectEqual(@as(u64, 100), sized.input_bytes_target());
+    var channel = try ChannelOut.init(testing.allocator, sized, @splat(2));
+    defer channel.deinit(testing.allocator);
+    var batch: [60]u8 = @splat(9);
+    try channel.add_batch(&batch);
+    try testing.expectError(error.ChannelFull, channel.add_batch(&batch));
+    sized.compressed_bytes_target = std.math.maxInt(u32);
+    try testing.expectEqual(@as(u64, sized.input_bytes_max), sized.input_bytes_target());
+}
+
+test "channel: fuzz the input target" {
+    try testing.fuzz({}, fuzz_input_target, .{});
+}
+
+fn fuzz_input_target(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [16]u8 = @splat(0);
+    _ = smith.slice(&bytes);
+    const config: Config = .{
+        .frame_size_max = @max(24, std.mem.readInt(u32, bytes[0..4], .little) % 200_000),
+        .target_frames = @max(1, std.mem.readInt(u16, bytes[4..6], .little)),
+        .compression_ratio_percent = @max(1, bytes[6] % 101),
+        .input_bytes_max = @max(1, std.mem.readInt(u32, bytes[8..12], .little)),
+        .compressed_bytes_target = std.mem.readInt(u32, bytes[12..16], .little),
+    };
+    if (config.frame_size_max - Frame.encoded_overhead > Frame.frame_data_length_max) return;
+    config.validate();
+    const target = config.input_bytes_target();
+    try testing.expect(target >= 1 and target <= config.input_bytes_max);
+    if (config.compressed_bytes_target > 0 and config.compressed_bytes_target < 1000) {
+        var bigger = config;
+        bigger.compressed_bytes_target += 1;
+        try testing.expect(bigger.input_bytes_target() >= target);
+    }
+}
+
 test "channel: oversized first batch still accepted" {
     const config: Config = .{ .frame_size_max = 23 + 10, .input_bytes_max = 1000 };
     var channel = try ChannelOut.init(testing.allocator, config, @splat(1));
@@ -277,6 +324,7 @@ test "channel: seeded fuzz round trip through consensus channel" {
             .compression_ratio_percent = @intCast(prng.range(10, 100)),
             .input_bytes_max = 64 * 1024,
             .algorithm = if (round % 2 == 0) .zlib else .brotli,
+            .compressed_bytes_target = if (prng.chance(1, 2)) 0 else @intCast(prng.range(1, 8192)),
         };
         var channel = try ChannelOut.init(testing.allocator, config, @splat(@truncate(round)));
         defer channel.deinit(testing.allocator);
