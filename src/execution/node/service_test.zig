@@ -482,7 +482,15 @@ test "service: --builder.enabled routes FCU and getPayload through the payload s
     var text: [64 * 1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&text);
     try devnet.genesis.write_l2_genesis(&writer, &.{ .genesis_timestamp = genesis_time });
-    const parsed = try genesis.parse(testing.allocator, writer.buffered());
+    // Payload routing only: Denim (200 ms blocks with a BaseTime deposit) is pushed past
+    // the test's blocks so plain attributes stay valid.
+    var pre_denim: [64 * 1024 + 16]u8 = undefined;
+    const at_genesis = "\"denim\": 0";
+    const later = "\"denim\": 4000000000";
+    const replaced = std.mem.replace(u8, writer.buffered(), at_genesis, later, &pre_denim);
+    try testing.expect(replaced > 0);
+    const size = std.mem.replacementSize(u8, writer.buffered(), at_genesis, later);
+    const parsed = try genesis.parse(testing.allocator, pre_denim[0..size]);
     defer parsed.deinit();
     var log_buffer: [4096]u8 = undefined;
     var memory: log.MemorySink = .{ .buffer = &log_buffer };
