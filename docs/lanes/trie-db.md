@@ -42,10 +42,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (historical half: `db/history_test.zig`; witness half: changeset replay in
   `db/witness_test.zig`, real evm re-execution over `SparseState` in
   `db/witness_evm_test.zig`)
-- [ ] Witness entry point for the node: move the durable database to the block's parent
+- [x] Witness entry point for the node: move the durable database to the block's parent
   (`set_head`, no re-journal), wrap the evm Database with `witness.Recorder`, run the caller's
   executor (`node.Executor.execute_block` over the recorded database), build the witness,
   restore the head. Bounded scratch; refuses blocks outside retention.
+  (`db/witness_block.zig`: `Generator.generate` / `database_witness`; in-memory unwind of
+  stored changesets instead of `set_head`, see Decisions)
 - [ ] `debug_executionWitness(block)` handler in `rpc/debug.zig` (small additive integration
   edit in the rpc lane) returning `{state, codes, keys, headers}` as hex arrays.
 - [ ] Feed the history store from the durable database: every head move (apply/unwind) updates
@@ -205,6 +207,22 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `reset(state_trie, head)` at the recovered head; proofs for blocks before that head are
   unavailable until the window refills (one window of blocks). Journaling every node
   version would multiply the journal volume per block for data the node can regenerate.
+- Witness of a stored block (`db/witness_block.zig`): the state is unwound in memory with the
+  stored changesets (head down to the block) and re-applied afterwards, instead of
+  `set_head(parent)`, so nothing is journaled, the chain index and head never move, and the
+  block-hash ring is untouched. Chosen over a state copy (too much memory for a full state)
+  and over a historical-state overlay (none exists). It requires the state's users (the
+  node executor) to be idle for the call; the node is single-threaded and runs RPC handlers
+  between blocks. The root after unwinding the descendants is the block's stored root, and
+  the witness-only post root must equal it (`WitnessMismatch`); the head root is checked
+  after the re-apply (`StateCorrupted` fails the database). The caller's executor returns
+  its uncommitted evm block `State`, folded with `commit_evm` + `build_changeset` (the
+  node's commit rules, nothing applied). BLOCKHASH during the run answers from the
+  caller's canonical chain view (the ring slots for numbers above the block were
+  overwritten by descendants). Headers: contiguous ancestors from the lowest BLOCKHASH
+  number read up to the parent (reth), so a verifier can link each hash to the parent.
+  `Generator` is bound to one `State` and owns all scratch (allocated at init); depth is
+  bounded by `Config.depth_max` and by retention (`BlockUnavailable`).
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -319,3 +337,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (SLOAD/SSTORE/LOG1/BALANCE/EXTCODEHASH/EXTCODESIZE/BLOCKHASH/CALL/SELFDESTRUCT/CREATE),
   6 seeds x 3 blocks of calls and transfers through the real evm; witness-only re-execution
   gives identical results and post root, and every witness node is required (~0.8 s Debug).
+- 2026-11-05: `witness_block.Generator`: witness of a retained canonical block of the durable
+  database (unwind in memory to the parent, run, build, verify root, restore); test runs 6
+  evm blocks through `execute_and_commit`, witnesses the last 5, re-executes each over
+  `SparseState.database()` to the stored root, head/root/journal unchanged, deeper/unknown/
+  genesis refused.

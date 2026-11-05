@@ -36,7 +36,7 @@ const AccountInfo = state_module.AccountInfo;
 const Hash = state_module.Hash;
 const TxEnv = evm.transaction.TxEnv;
 
-const fork: evm.Fork = .cancun;
+pub const fork: evm.Fork = .cancun;
 const senders_total = 8;
 const addresses_total = 64;
 const random_accounts = 24;
@@ -56,14 +56,14 @@ const coinbase_index = 63;
 
 /// `slot = cd[0]; old = SLOAD(slot); SSTORE(slot, cd[32]); LOG1(old, topic = caller);
 /// return old`.
-const code_storage = [_]u8{
+pub const code_storage = [_]u8{
     op.PUSH1, 0x20, op.CALLDATALOAD, op.PUSH1,  0,         op.CALLDATALOAD, op.DUP1,   op.SLOAD,
     op.PUSH1, 0,    op.MSTORE,       op.SSTORE, op.CALLER, op.PUSH1,        0x20,      op.PUSH1,
     0,        log1, op.PUSH1,        0x20,      op.PUSH1,  0,               op.RETURN,
 };
 
 /// Returns `BALANCE`, `EXTCODEHASH`, `EXTCODESIZE` of address `cd[0]` and `BLOCKHASH(cd[32])`.
-const code_inspector = [_]u8{
+pub const code_inspector = [_]u8{
     op.PUSH1, 0,    op.CALLDATALOAD, op.BALANCE,     op.PUSH1,  0,    op.MSTORE,
     op.PUSH1, 0,    op.CALLDATALOAD, op.EXTCODEHASH, op.PUSH1,  0x20, op.MSTORE,
     op.PUSH1, 0,    op.CALLDATALOAD, op.EXTCODESIZE, op.PUSH1,  0x40, op.MSTORE,
@@ -161,14 +161,14 @@ const witness_config: witness.Witness.Config = .{
 };
 
 /// Both runs use the same evm configuration; the programs nest at most three calls deep.
-const evm_config: evm.env.Config = .{
+pub const evm_config: evm.env.Config = .{
     .depth_max = 64,
     .memory_bytes_max = 1 << 16,
     .code_arena_bytes = 1 << 20,
     .modexp_modulus_bytes_max = 4096,
 };
 
-const evm_limits: evm.state.Limits = .{
+pub const evm_limits: evm.state.Limits = .{
     .accounts_max = 256,
     .slots_max = 1024,
     .transient_slots_max = 16,
