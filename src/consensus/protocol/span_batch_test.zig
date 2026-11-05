@@ -172,7 +172,8 @@ test "span batch: transaction column truncation and auth proofs" {
     var out = Writer.init(encoded);
     try decoded.encode(&out);
     try testing.expectEqualSlices(u8, writer.written(), out.written());
-    try testing.expectError(error.Eip8130Unsupported, decoded.full_txs(arena, 1));
+    // `0xc0` is not valid EIP-8130 span data (no fields).
+    try testing.expectError(error.InvalidTransactionData, decoded.full_txs(arena, 1));
 }
 
 const call_target = Address{ .bytes = @splat(0x01) };
@@ -290,8 +291,9 @@ test "span batch: transactions build/encode/decode/full_txs roundtrip" {
     } });
     const typed_deposit = Transactions.build(arena, &.{valid_deposit}, 1);
     try testing.expectError(error.InvalidTransactionType, typed_deposit);
-    const eip8130: []const u8 = &.{ 0x79, 0xc0 };
-    try testing.expectError(error.Eip8130Unsupported, Transactions.build(arena, &.{eip8130}, 1));
+    const empty_eip8130: []const u8 = &.{ 0x79, 0xc0 };
+    const bad_eip8130 = Transactions.build(arena, &.{empty_eip8130}, 1);
+    try testing.expectError(error.InvalidTransactionData, bad_eip8130);
 }
 
 test "span batch: legacy protected bit drives EIP-155 v" {
@@ -956,4 +958,130 @@ fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
 
 test "span batch: fuzz decode" {
     try testing.fuzz({}, fuzz_decode, .{});
+}
+
+const eip8130 = consensus.eip8130;
+
+fn eip8130_raw(arena: Allocator, signed: eip8130.Signed) ![]const u8 {
+    return encode_envelope(arena, .{ .eip8130 = signed });
+}
+
+fn eip8130_calls(buffers: *[2][256]u8) eip8130.Calls {
+    const call: eip8130.Call = .{ .to = call_target, .value = 7, .data = &.{ 0xde, 0xad } };
+    const phase = eip8130.Phase.build(&buffers[0], &.{ call, call });
+    return eip8130.Calls.build(&buffers[1], &.{phase});
+}
+
+test "span batch: EIP-8130 transactions roundtrip through the auth column" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var call_buffers: [2][256]u8 = undefined;
+    const calls = eip8130_calls(&call_buffers);
+    const k1_signature: [65]u8 = @splat(0x1b);
+    const authenticator = eip8130.k1_authenticator.bytes;
+    const sender_auth = authenticator ++ @as([65]u8, @splat(0x1c));
+    const payer: Address = .{ .bytes = @splat(0x42) };
+    const base_tx: eip8130.TxEip8130 = .{
+        .chain_id = 8453,
+        .nonce_key = 9,
+        .nonce_sequence = 3,
+        .valid_before = 2_000,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 100,
+        .gas_limit = 90_000,
+        .calls = calls,
+        .metadata = &.{0x01},
+    };
+    // EOA self-pay: the whole k1 signature is the proof.
+    const eoa = try eip8130_raw(arena, .{ .tx = base_tx, .sender_auth = &k1_signature });
+    // Account sender with a named payer: authenticators inline, proofs in the column.
+    var account_tx = base_tx;
+    account_tx.sender = .{ .bytes = @splat(0x55) };
+    account_tx.payer = payer;
+    const account = try eip8130_raw(arena, .{
+        .tx = account_tx,
+        .sender_auth = &sender_auth,
+        .payer_auth = &authenticator, // Authenticator with an empty proof.
+    });
+    // Open payer: the payer proof is a raw k1 signature and no authenticator.
+    var open_tx = base_tx;
+    open_tx.payer = eip8130.open_payer;
+    const open = try eip8130_raw(arena, .{
+        .tx = open_tx,
+        .sender_auth = &k1_signature,
+        .payer_auth = &k1_signature,
+    });
+    const legacy = (try sample_envelopes(arena, 8453))[0];
+    const raws = [_][]const u8{ eoa, legacy, account, open, legacy };
+    try expect_transactions_roundtrip(arena, &raws, 8453);
+    for (raws[0..4]) |raw| try expect_transactions_roundtrip(arena, &.{raw}, 8453);
+    const txs = try Transactions.build(arena, &raws, 8453);
+    try testing.expectEqual(@as(usize, 3), txs.eip8130_auth_data.len);
+    // EIP-8130 transactions set the contract-creation bit and take no `to` slot.
+    const legacy_creations = (try Transactions.build(arena, &.{legacy}, 8453))
+        .contract_creation_count();
+    try testing.expectEqual(3 + 2 * legacy_creations, txs.contract_creation_count());
+    try testing.expectEqualSlices(u8, sender_auth[20..], txs.eip8130_auth_data[1].sender_proof);
+    try testing.expectEqual(@as(usize, 0), txs.eip8130_auth_data[1].payer_proof.len);
+    // Wrong chain id, and an account sender whose auth is shorter than an authenticator.
+    try testing.expectError(error.InvalidTransactionData, Transactions.build(arena, &.{eoa}, 1));
+    const short = try eip8130_raw(arena, .{ .tx = account_tx, .sender_auth = &.{0x01} });
+    try testing.expectError(error.InvalidAuthData, Transactions.build(arena, &.{short}, 8453));
+}
+
+test "span batch: EIP-8130 span data rejects inconsistent authenticators" {
+    const Eip8130 = span_batch.tx_data.Eip8130;
+    var buffer: [256]u8 = undefined;
+    const data: Eip8130 = .{ .sender = .{ .bytes = @splat(1) }, .sender_authenticator = &.{} };
+    var encoder = @import("../../common/rlp/root.zig").Encoder.init(&buffer);
+    data.encode(&encoder);
+    try testing.expectError(error.InvalidTransactionData, Eip8130.decode(encoder.written()));
+    const valid: Eip8130 = .{ .payer = eip8130.open_payer };
+    encoder = .init(&buffer);
+    valid.encode(&encoder);
+    const decoded = try Eip8130.decode(encoder.written());
+    try testing.expect(decoded.payer.?.eql(eip8130.open_payer));
+    try testing.expect(!Eip8130.named_payer(decoded.payer));
+}
+
+test "span batch: seeded fuzz of EIP-8130 transaction columns" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = Prng.init(0x8130);
+    var call_buffers: [2][256]u8 = undefined;
+    const calls = eip8130_calls(&call_buffers);
+    for (0..200) |_| {
+        _ = arena_state.reset(.retain_capacity);
+        var tx: eip8130.TxEip8130 = .{
+            .chain_id = 10,
+            .nonce_key = prng.int(u64),
+            .nonce_sequence = prng.int(u64),
+            .valid_after = prng.below(1_000),
+            .max_fee_per_gas = prng.int(u64),
+            .gas_limit = prng.int(u32),
+            .calls = if (prng.chance(1, 2)) calls else .empty,
+        };
+        const proof_length = prng.below(100);
+        const proof = try arena.alloc(u8, 20 + proof_length);
+        prng.fill(proof);
+        if (prng.chance(1, 2)) tx.sender = .{ .bytes = proof[0..20].* };
+        tx.payer = switch (prng.below(3)) {
+            0 => null,
+            1 => eip8130.open_payer,
+            else => .{ .bytes = @splat(0x77) },
+        };
+        const sender_auth = if (tx.sender != null) proof else proof[20..];
+        const named = tx.payer != null and !tx.payer.?.eql(eip8130.open_payer);
+        const payer_auth: []const u8 = if (tx.payer == null)
+            &.{}
+        else if (named) proof else proof[20..];
+        const raw = try eip8130_raw(arena, .{
+            .tx = tx,
+            .sender_auth = sender_auth,
+            .payer_auth = payer_auth,
+        });
+        try expect_transactions_roundtrip(arena, &.{raw}, 10);
+    }
 }

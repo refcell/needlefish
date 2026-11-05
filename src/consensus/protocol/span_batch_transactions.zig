@@ -35,10 +35,14 @@ pub const signature_length = 64;
 pub const address_length = 20;
 
 /// The `(sender_proof, payer_proof)` pair of one EIP-8130 transaction.
-pub const AuthProofs = struct {
-    sender_proof: []const u8,
-    payer_proof: []const u8,
-};
+pub const AuthProofs = tx_data_module.AuthProofs;
+
+/// The `to` column entry: EIP-8130 transactions have none (their contract-creation bit
+/// is set, as in base/base `add_txs`).
+fn span_to(envelope: Envelope) ?Address {
+    if (envelope == .eip8130) return null;
+    return envelope.kind().to();
+}
 
 /// Reads one transaction's span tx data (`type || rlp_list` or `rlp_list`) and
 /// returns it, borrowed from `r`.
@@ -206,7 +210,7 @@ pub const Transactions = struct {
         };
     }
 
-    const Cursor = struct { to_index: usize = 0, protected_index: u64 = 0 };
+    const Cursor = struct { to_index: usize = 0, protected_index: u64 = 0, auth_index: usize = 0 };
 
     /// Rebuilds every signed EIP-2718 transaction (base/base `full_txs`).
     pub fn full_txs(
@@ -242,15 +246,28 @@ pub const Transactions = struct {
             to = Address.from_slice(txs.tx_tos[offset..][0..address_length]);
             cursor.to_index += 1;
         }
+        const nonce = txs.tx_nonces[index];
+        const gas = txs.tx_gases[index];
+        if (tx_data == .eip8130) {
+            // Reassembled from the remainder and the trailing auth column.
+            if (cursor.auth_index >= txs.eip8130_auth_data.len) return error.InvalidTransactionData;
+            const proofs = txs.eip8130_auth_data[cursor.auth_index];
+            cursor.auth_index += 1;
+            const data = &tx_data.eip8130;
+            const signed = try data.to_signed(arena, chain_id, nonce, gas, proofs);
+            return encode_envelope_alloc(arena, .{ .eip8130 = signed });
+        }
         const signature = try txs.signature_at(index);
         var protected = true;
         if (tx_data == .legacy) {
             protected = (txs.protected_bits.get_bit(cursor.protected_index) orelse 0) == 1;
             cursor.protected_index += 1;
         }
-        const nonce = txs.tx_nonces[index];
-        const gas = txs.tx_gases[index];
         const envelope = try tx_data.to_envelope(nonce, gas, to, chain_id, signature, protected);
+        return encode_envelope_alloc(arena, envelope);
+    }
+
+    fn encode_envelope_alloc(arena: Allocator, envelope: Envelope) Error![]const u8 {
         const buffer = try arena.alloc(u8, envelope.encoded_length());
         const encoded = envelope.encode_to(buffer);
         assert(encoded.len == buffer.len);
@@ -266,14 +283,14 @@ pub const Transactions = struct {
     ) Error!Transactions {
         if (raw_txs.len > max_span_batch_elements) return error.TooBigSpanBatchSize;
         const envelopes = try arena.alloc(Envelope, raw_txs.len);
-        var legacy_count: u64 = 0;
-        var to_count: usize = 0;
+        var counts: Builder.Counts = .{};
         for (raw_txs, envelopes) |raw, *envelope| {
             envelope.* = try decode_envelope(raw, chain_id);
-            legacy_count += @intFromBool(envelope.* == .legacy);
-            to_count += @intFromBool(envelope.kind().to() != null);
+            counts.legacy += @intFromBool(envelope.* == .legacy);
+            counts.to += @intFromBool(span_to(envelope.*) != null);
+            counts.eip8130 += @intFromBool(envelope.* == .eip8130);
         }
-        var builder = try Builder.init(arena, raw_txs.len, legacy_count, to_count);
+        var builder = try Builder.init(arena, raw_txs.len, counts);
         for (envelopes, 0..) |envelope, i| try builder.add(arena, i, envelope);
         return builder.finish();
     }
@@ -287,13 +304,19 @@ pub const Transactions = struct {
         datas: [][]const u8,
         nonces: []u64,
         gases: []u64,
+        auth: []AuthProofs,
         legacy_count: u64,
         to_index: usize = 0,
         legacy_index: u64 = 0,
+        auth_index: usize = 0,
 
-        fn init(arena: Allocator, total: usize, legacy_count: u64, to_count: usize) Error!Builder {
+        const Counts = struct { legacy: u64 = 0, to: usize = 0, eip8130: usize = 0 };
+
+        fn init(arena: Allocator, total: usize, counts: Counts) Error!Builder {
+            const legacy_count = counts.legacy;
+            const to_count = counts.to;
             assert(legacy_count <= total);
-            assert(to_count <= total);
+            assert(to_count + counts.eip8130 <= total);
             return .{
                 .contract_bits = try zeroed(arena, bits_module.bits_buffer_length(total)),
                 .parity_bits = try zeroed(arena, bits_module.bits_buffer_length(total)),
@@ -303,18 +326,29 @@ pub const Transactions = struct {
                 .datas = try arena.alloc([]const u8, total),
                 .nonces = try arena.alloc(u64, total),
                 .gases = try arena.alloc(u64, total),
+                .auth = try arena.alloc(AuthProofs, counts.eip8130),
                 .legacy_count = legacy_count,
             };
         }
 
         fn add(builder: *Builder, arena: Allocator, index: usize, envelope: Envelope) Error!void {
             assert(index < builder.datas.len);
-            const signature = envelope.signature().?;
+            // EIP-8130 carries a zero signature in the column (base/base `add_txs`).
+            const zero: Signature = .{ .y_parity = false, .r = 0, .s = 0 };
+            const signature = envelope.signature() orelse zero;
+            assert(envelope.signature() != null or envelope == .eip8130);
             Bits.set_bit(builder.parity_bits, index, signature.y_parity);
             const sig = builder.sigs[index * signature_length ..][0..signature_length];
             sig[0..32].* = primitives.u256_to_bytes(signature.r);
             sig[32..64].* = primitives.u256_to_bytes(signature.s);
-            if (envelope.kind().to()) |address| {
+            if (envelope == .eip8130) {
+                // Proof: decode_envelope already split this envelope successfully.
+                const split = tx_data_module.Eip8130.from_signed(envelope.eip8130) catch
+                    unreachable;
+                builder.auth[builder.auth_index] = split.proofs;
+                builder.auth_index += 1;
+            }
+            if (span_to(envelope)) |address| {
                 const offset = builder.to_index * address_length;
                 builder.tos[offset..][0..address_length].* = address.bytes;
                 builder.to_index += 1;
@@ -335,6 +369,7 @@ pub const Transactions = struct {
         fn finish(builder: *const Builder) Transactions {
             assert(builder.to_index * address_length == builder.tos.len);
             assert(builder.legacy_index == builder.legacy_count);
+            assert(builder.auth_index == builder.auth.len);
             return .{
                 .total_block_tx_count = builder.datas.len,
                 .contract_creation_bits = .{ .bytes = builder.contract_bits },
@@ -346,6 +381,7 @@ pub const Transactions = struct {
                 .tx_gases = builder.gases,
                 .protected_bits = .{ .bytes = builder.protected_bits },
                 .legacy_tx_count = builder.legacy_count,
+                .eip8130_auth_data = builder.auth,
             };
         }
     };
@@ -359,9 +395,6 @@ pub const Transactions = struct {
 
     /// Decodes one signed transaction and checks it may be carried in a span batch.
     fn decode_envelope(raw: []const u8, chain_id: u64) Error!Envelope {
-        if (raw.len > 0 and raw[0] == tx_data_module.tx_type_eip8130) {
-            return error.Eip8130Unsupported;
-        }
         const envelope = Envelope.decode(raw) catch return error.InvalidTransactionData;
         _ = try TxData.from_envelope(envelope);
         assert(envelope != .deposit and envelope != .eip4844);

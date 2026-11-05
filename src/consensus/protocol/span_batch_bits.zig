@@ -34,9 +34,6 @@ pub const Error = error{
     InvalidTransactionData,
     InvalidAuthData,
     InvalidTransactionSignature,
-    /// EIP-8130 transactions decode and re-encode as raw columns, but rebuilding the
-    /// signed transaction (or splitting one into columns) is not implemented yet.
-    Eip8130Unsupported,
     /// A derived timestamp or epoch number left the u64 range (base/base wraps).
     ArithmeticOverflow,
 } || Allocator.Error;

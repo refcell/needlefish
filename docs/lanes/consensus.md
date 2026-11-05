@@ -8,8 +8,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] frames (zero-copy codec, payload parser), channels, `BlockInfo`/`L2BlockInfo`
   - [x] singular batches (codec + validity rules), batch drop reasons (uses `common/rlp`)
   - [x] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
-  - [ ] span batch EIP-8130 tx data: `common/consensus/eip8130.zig` now decodes/encodes 0x79
-    (`TxEip8130`, `Signed`), so `error.Eip8130Unsupported` can be replaced.
+  - [x] span batch EIP-8130 tx data (`span_batch_tx_data.Eip8130`): authenticators inline,
+    proofs in the trailing auth column, zero signature + contract-creation bit; `full_txs`
+    rebuilds and `build` splits 0x79 transactions (`Eip8130Unsupported` removed)
   - [x] rollup config + hardfork activation, system config + L1 log updates
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
@@ -177,6 +178,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: protocol: span batches carry EIP-8130 transactions (base/base `SpanBatchEip8130TransactionData`).
 - 2026-11-05: engine: payload bodies by hash/range and capability exchange on the engine client, with codecs and fuzz.
 - 2026-11-05: rpc: `base_upgradeReadiness` evaluates the L1 upgrade-signal schedule with base/base's readiness predicates.
 - 2026-11-05: service: `SignerWatcher` reads the unsafe block signer from the L1 SystemConfig storage slot and updates gossip validation on change.
