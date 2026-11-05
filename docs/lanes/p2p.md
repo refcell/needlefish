@@ -60,7 +60,16 @@ behind a small interface and switch later.
   RPCs while the victim's messages reach an honest mesh-less peer only via IHAVE/IWANT;
   all delivered, budgets hold, attacker sinks below the gossip threshold. Negative
   control: unlimited budgets fail it.
-- [ ] Bound connection memory when one peer opens many yamux streams.
+- [x] Bound connection memory when one peer opens many yamux streams. Memory was already
+  static (16 streams x 256 KiB windows, buffers from `init`), inbound capped at 12 so
+  outbound slots stay free, one inbound meshsub stream per peer. Gap found: a stream
+  that never finishes multistream negotiation held its inbound slot forever. Fix:
+  inbound streams not negotiated within `stream_negotiation_timeout_ns` (10 s,
+  rust-libp2p's substream upgrade timeout) are reset (`stream_negotiation_timeouts`).
+  Test (`connection_test`): through the real noise session a peer opens 40 stalled
+  streams, waits out the timeout, then churns 2000 SYN+RST pairs and duplicate meshsub
+  streams; inbound stays <= 12, gossip_in <= 1, gossip flows both ways throughout.
+  Negative control: a 1000 s timeout fails it.
 - [x] Scoring parity: `peers/score.zig` already mirrors base/base `score.rs` formula for
   formula (thresholds, topic and peer params, `score_decay`); covered by its tests.
 - [x] Req/resp sync at 5 blocks/s: not applicable; base/base has no p2p req/resp
@@ -491,3 +500,4 @@ behind a small interface and switch later.
 - 2026-11-05: direction change (no flashblocks, 200 ms blocks): Denim gossip DST added; nothing to remove.
 - 2026-11-05: gossip flood DST found accepted blocks evictable by junk; added a dedicated accepted-block store.
 - 2026-11-05: per-peer IWANT/IDONTWANT id budgets (control flood 3.8 ms -> 53 us per RPC).
+- 2026-11-05: inbound yamux stream negotiation timeout (10 s); many-streams bound test.

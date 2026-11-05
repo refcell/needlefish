@@ -710,3 +710,101 @@ test "connection: fuzz plaintext bytes from an authenticated peer" {
         .corpus = &.{ corpus_frame[0..32], "\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" },
     });
 }
+
+/// Seals `plaintext` as the dialer and feeds it to the listener, then routes the
+/// listener's replies back to the dialer so both noise sessions stay in step. The dialer
+/// ignores replies for streams its own yamux never opened.
+fn inject(pair: *Pair, mutation: *Mutation, plaintext: []const u8) !void {
+    var sealed: [4096 + noise.prefix_length + noise.tag_length]u8 = undefined;
+    const frame = try pair.dialer.transport.encrypt_frame(plaintext, &sealed);
+    pair.now_ns += ns_per_ms;
+    try testing.expectEqual(frame.len, try pair.listener.receive(frame, pair.now_ns));
+    pair.listener_record.drain(&pair.listener);
+    try pair.pump(mutation);
+}
+
+const InboundCounts = struct { total: u32 = 0, negotiating: u32 = 0, gossip: u32 = 0 };
+
+fn inbound_counts(connection: *const Connection) InboundCounts {
+    var counts: InboundCounts = .{};
+    for (&connection.channels) |*channel| {
+        switch (channel.kind) {
+            .inbound => counts.negotiating += 1,
+            .gossip_in => counts.gossip += 1,
+            .identify_in, .ping_in => {},
+            else => continue,
+        }
+        counts.total += 1;
+    }
+    var streams: u32 = 0;
+    for (&connection.session.streams) |*stream| streams += @intFromBool(stream.inbound);
+    assert(streams <= connection_module.stream_count_max);
+    return counts;
+}
+
+fn expect_gossip_flows(pair: *Pair, prng: *Prng, mutation: *Mutation) !void {
+    const frame = try make_frame(prng, 64);
+    defer testing.allocator.free(frame);
+    const listener_before = pair.listener_record.gossip_count;
+    const dialer_before = pair.dialer_record.gossip_count;
+    try pair.dialer.send_gossip(frame);
+    try pair.listener.send_gossip(frame);
+    try pair.pump(mutation);
+    try testing.expectEqual(listener_before + 1, pair.listener_record.gossip_count);
+    try testing.expectEqual(dialer_before + 1, pair.dialer_record.gossip_count);
+}
+
+test "connection: a peer opening many streams stays inside the stream bounds" {
+    var prng = Prng.init(0x7374_726d);
+    var pair = try Pair.init(&prng);
+    defer pair.deinit();
+    var mutation: Mutation = .{ .prng = &prng, .chunk_max = 4096 };
+    try pair.pump(&mutation);
+    try expect_established(&pair, null);
+    // Opens both meshsub streams before the flood (their ids precede the hostile ones).
+    try expect_gossip_flows(&pair, &prng, &mutation);
+    var plaintext: [4096]u8 = undefined;
+    var stream: u32 = 1001;
+    // 40 SYNs that start multistream and stall: 12 inbound slots at most, the rest reset.
+    for (0..40) |_| {
+        yamux_header(&plaintext, 0, yamux.flag_syn, stream, 5);
+        @memcpy(plaintext[12..17], multistream.header[0..5]);
+        stream += 2;
+        try inject(&pair, &mutation, plaintext[0..17]);
+        const counts = inbound_counts(&pair.listener);
+        try testing.expect(counts.total <= connection_module.inbound_stream_count_max);
+    }
+    try testing.expect(inbound_counts(&pair.listener).negotiating > 0);
+    try expect_gossip_flows(&pair, &prng, &mutation); // Outbound slots stayed free.
+    // Stalled negotiations time out and free the inbound slots.
+    pair.now_ns += connection_module.stream_negotiation_timeout_ns;
+    pair.listener.tick(pair.now_ns);
+    pair.dialer.tick(pair.now_ns);
+    try pair.pump(&mutation);
+    try testing.expect(pair.listener.stream_negotiation_timeouts > 0);
+    try testing.expectEqual(@as(u32, 0), inbound_counts(&pair.listener).negotiating);
+    // Churn: SYN+RST pairs and duplicate meshsub streams, 2000 times.
+    for (0..2000) |round| {
+        var used: usize = 0;
+        if (round % 4 == 0) {
+            var body: [64]u8 = undefined;
+            var length = multistream_line(&body, multistream.header);
+            length += multistream_line(body[length..], "/meshsub/1.1.0");
+            yamux_header(plaintext[used..], 0, yamux.flag_syn, stream, @intCast(length));
+            @memcpy(plaintext[used + 12 ..][0..length], body[0..length]);
+            used += 12 + length;
+        } else {
+            yamux_header(plaintext[used..], 1, yamux.flag_syn, stream, 0);
+            yamux_header(plaintext[used + 12 ..], 1, yamux.flag_rst, stream, 0);
+            used += 24;
+        }
+        stream += 2;
+        try inject(&pair, &mutation, plaintext[0..used]);
+        const counts = inbound_counts(&pair.listener);
+        try testing.expect(counts.total <= connection_module.inbound_stream_count_max);
+        try testing.expect(counts.gossip <= 1);
+    }
+    try testing.expect(pair.listener.is_established());
+    try expect_gossip_flows(&pair, &prng, &mutation);
+    try testing.expect(pair.listener_record.closed == null and pair.dialer_record.closed == null);
+}

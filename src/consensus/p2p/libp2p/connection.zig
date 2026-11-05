@@ -46,6 +46,10 @@ pub const handshake_timeout_ns: u64 = 10 * std.time.ns_per_s;
 pub const stream_count_max = 16;
 /// Inbound streams beyond this are reset so the peer cannot starve our outbound streams.
 pub const inbound_stream_count_max = 12;
+/// An inbound stream that has not selected a protocol this long after we accepted it is
+/// reset, so stalled negotiations cannot pin the inbound slots (rust-libp2p's 10 s
+/// substream upgrade timeout).
+pub const stream_negotiation_timeout_ns: u64 = 10 * std.time.ns_per_s;
 pub const event_count_max = 64;
 /// Slots kept free of gossip frames for established, identified, ping, and closed.
 const event_reserve = 4;
@@ -204,6 +208,8 @@ const Channel = struct {
     close_after_tx: bool = false,
     echo: [ping.payload_length]u8 = undefined,
     echo_fill: u8 = 0,
+    /// When we accepted the (inbound) stream, for `stream_negotiation_timeout_ns`.
+    accepted_ns: u64 = 0,
 };
 
 /// A byte queue over a fixed region: linear with compaction for small buffers.
@@ -279,6 +285,8 @@ pub const Connection = struct {
     gossip_events_pending: u32 = 0,
     /// `close` queued a go-away; the connection closes once it is flushed.
     closing: bool = false,
+    /// Inbound streams reset for not negotiating within `stream_negotiation_timeout_ns`.
+    stream_negotiation_timeouts: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, role: Role, config: Config) !Connection {
         assert(config.gossip_frame_size_max > 0);
@@ -724,7 +732,7 @@ pub const Connection = struct {
                 continue;
             }
             const channel = &connection.channels[slot.?];
-            channel.* = .{ .id = id, .kind = .inbound };
+            channel.* = .{ .id = id, .kind = .inbound, .accepted_ns = connection.now_ns };
             var length: u32 = 0;
             const buffer = connection.channel_buffer(slot.?);
             channel.negotiator = start_negotiator(.listener, &supported_protocols, buffer, &length);
@@ -755,6 +763,12 @@ pub const Connection = struct {
         if (!channel.negotiated) {
             connection.negotiate_channel(slot);
             if (channel.kind == .free or connection.phase != .established) return;
+            if (!channel.negotiated and channel.kind == .inbound and
+                connection.now_ns - channel.accepted_ns >= stream_negotiation_timeout_ns)
+            {
+                connection.stream_negotiation_timeouts += 1;
+                return connection.reject_channel(slot);
+            }
             if (!channel.negotiated) return connection.reject_if_remote_closed(slot);
         }
         switch (channel.kind) {
