@@ -797,7 +797,7 @@ pub const Chain = struct {
     }
 
     /// Header fields known before execution.
-    fn child_header(
+    pub fn child_header(
         chain: *Chain,
         parent: *const Header,
         parent_hash: Hash,
@@ -843,7 +843,7 @@ pub const Chain = struct {
     }
 
     /// Fills the execution results into `child`.
-    fn seal(
+    pub fn seal(
         chain: *Chain,
         child: *Header,
         transactions: []const []const u8,

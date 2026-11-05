@@ -27,11 +27,18 @@ can drive the builder and the flashblocks consumer.
   over injected time, exhaustive + fuzz tests of schedule invariants.
 - [x] `builder/core` best-transactions iterator: priority-ordered txpool view that
   skips already-included and invalid txs across flashblocks (port `best_txs.rs`).
-- [ ] `builder/core` flashblock generator: build index 0 (deposits + system txs) then
+- [x] `builder/core` flashblock generator: build index 0 (deposits + system txs) then
   incremental flashblocks from the pending state, each producing a delta (txs,
   receipts root, state root, gas used, withdrawals, logs bloom, block hash) and
   metadata (receipts, new balances); final sealed block identical to a non-flashblocks
   build of the same txs (port `generator.rs`, `payload.rs`, `context.rs`, `handler.rs`).
+- [ ] `builder/core` generator: flashblock metadata `receipts` and `new_account_balances`
+  (base/base non-compact `FlashblocksMetadata`; extend `common/flashblocks.Metadata`).
+- [ ] `builder/core` generator: Jovian per-flashblock DA footprint target
+  (`da_footprint_per_batch`, cumulative DA bytes x scalar); the executor's block-level
+  footprint limit is enforced today.
+- [ ] `builder/core` generator: incremental intermediate roots (executor "continue block"
+  after a commit) instead of re-executing the block prefix per flashblock.
 - [ ] `builder/core` service: Engine API integration (`forkchoiceUpdated` with
   attributes starts a job, `getPayload` returns the best sealed payload), resting /
   cancellation on new FCU (port `service.rs`, `resting.rs`).
@@ -75,6 +82,21 @@ can drive the builder and the flashblocks consumer.
   `Config.validate` rejects interval 0, flashblocks leeway > interval, block time < interval,
   and durations over one hour (bounds keep all u64 sums in range).
 
+- `builder/core/generator`: intermediate roots come from re-executing the block's accepted
+  prefix each flashblock, committing once, sealing with `Chain.seal`, and `StateDb.rollback`;
+  no executor change (only `Chain.child_header`/`seal` made `pub`). One undo record per
+  flashblock is pushed and popped; the database stays at the parent state between
+  flashblocks, so the last delta is exactly `Chain`'s build of the same list. Cost is
+  O(flashblocks x prefix) executions; incremental roots are a backlog item.
+- Every delta carries the real state root and the hash of the block sealed there, where
+  base/base leaves `state_root` zero in flashblock deltas (it computes the root only in the
+  final payload); a consumer can therefore verify each delta.
+- Budgets follow base/base: `gas_per_batch = gas_limit / count`, `da_per_batch =
+  block_bytes_max / count`, flashblock `j` fills up to `j * per_batch` (cumulative, deposits
+  included in gas); over-budget or failing pool txs skip their sender's later nonces
+  (`mark_invalid`). Accepted transactions are copied into a generator-owned buffer so pool
+  eviction cannot dangle them.
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -85,3 +107,5 @@ can drive the builder and the flashblocks consumer.
   replay, base/base metrics, and a SimIo DST (resets, partitions, floods, reconnects).
 - 2026-11-05: `builder/core` best-transactions view and rejection cache, model-checked fuzz.
 - 2026-11-05: `builder/multiplex` router (Denim one-shot selection, shadow builds, health).
+- 2026-11-05: builder/core flashblock generator (index 0 + cumulative-budget deltas with
+  per-delta roots and block hash; final block equals a `Chain` build), seeded + fuzz tests.
