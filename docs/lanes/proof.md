@@ -76,12 +76,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   built-in chain config's identity fields (chain ids, genesis, inbox, deposit/system
   config contracts, block time); upgrade timestamps come from the host. The L1 fork
   config comes from `chains.l1_by_chain_id` (local key 7 is not read).
+- Program providers: derivation's `ProviderError` has no fatal member, so oracle
+  failures return `NotFound` and set the provider's `failure`; the program driver aborts
+  when it is set after a pipeline step. The L1 provider recovers senders only for
+  transactions to the batch inbox (`recover_to`); others keep a zero `from`.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: program: typed hints and the oracle-backed L1 chain provider (headers,
+  by-number walk, ordered-trie transactions/receipts); shared `test_oracle.zig`.
 - 2026-11-05: `proof/program` started: `boot.zig` (local keys 1-11, trust checks).
 - 2026-11-05: `proof/executor` landed (stateless builder, oracle fallback, output root;
   e2e rebuild of node-built L2 blocks over the in-process oracle).
