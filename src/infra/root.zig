@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const tx_manager = @import("tx_manager/root.zig");
+pub const balance_monitor = @import("balance_monitor/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

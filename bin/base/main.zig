@@ -8,6 +8,7 @@ const batcher = @import("batcher.zig");
 const node = @import("node.zig");
 const consensus = @import("consensus.zig");
 const proof = @import("proof.zig");
+const balance_monitor = @import("balance_monitor.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -19,6 +20,7 @@ const usage =
     \\  node       execution node (--dev-l1 for a standalone L1 dev chain)
     \\  consensus  consensus (rollup) node: derivation, engine driving, optimism_* RPC
     \\  proof      fault-proof tooling (replay a recorded preimage archive)
+    \\  balance-monitor  poll an account balance, serve metrics and health
     \\
 ;
 
@@ -28,6 +30,7 @@ test {
     _ = node;
     _ = consensus;
     _ = proof;
+    _ = balance_monitor;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -59,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "proof")) {
         std.process.exit(try proof.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "balance-monitor")) {
+        std.process.exit(try balance_monitor.main(init, args[2..]));
     }
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);

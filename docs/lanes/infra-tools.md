@@ -39,8 +39,8 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
 - [ ] `infra/withdrawer`: L2→L1 withdrawal flow: initiate on L2, prove against an
   output root/dispute game, finalize after the challenge window; journal so a restart
   resumes (port `withdrawer/src/*`). Sim/devnet test over the proof lane's contracts.
-- [ ] `bin/base balance-monitor`: wire `src/utilities/balance_monitor` into a
-  subcommand with metrics + health endpoints.
+- [x] `bin/base balance-monitor`: wire `src/utilities/balance_monitor` into a
+  subcommand with metrics + health endpoints (`src/infra/balance_monitor` exporter).
 - [ ] `infra/basectl` core: `sync-status`, `block`, `txpool`, `batcher`, `p2p`,
   `sequencer`, `conductor`, `proofs`, `upgrade-readiness`, `doctor` as plain-text CLI
   commands over the node/consensus/batcher RPCs (port `basectl/src/{commands,rpc}`).
@@ -62,6 +62,9 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   only on a bump, which happens only while nothing is mined, so no mined version is lost.
 - The driver reuses `batcher/rpc` (injected-transport JSON-RPC client) and `batcher/txdata`
   signing instead of duplicating them; binaries plug in `bin/base/http_transport.zig`.
+- `balance-monitor` is a standalone tool (base/base only has the library layer): `/metrics`,
+  `/`, `/healthz`, plus `/readyz` (503 once reads are older than N poll intervals). Flags use
+  `utilities/cli` with `BASE_BALANCE_MONITOR_*` env fallback.
 - Deviation from base/base: "nonce too low" before any publish also resets the nonce cache
   so the next send refetches the chain nonce instead of failing the same way.
 
@@ -70,3 +73,6 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   sans-IO manager) with unit tests, seeded + std.testing fuzz, and a faulty-L1 sim.
 - 2026-11-05: tx_manager JSON-RPC driver (sign, publish, canonical receipts, gas estimate)
   with fake-L1 tests for ordering, drop + bump, reorged receipts, and rejections.
+- 2026-11-05: `base balance-monitor` (exporter + sim tests); smoke-tested against
+  `base node --dev-l1`. Seen there, node lane's: `miner: block failed err=InternalError` on a
+  fresh `devnet init` L1 genesis.
