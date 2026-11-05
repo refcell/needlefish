@@ -69,11 +69,12 @@ fallback but hot paths should be our own, optimized implementations.
   Evaluation 330 -> 214us per blob; verify_blob_kzg_proof 1.05 -> 0.91-0.99ms; batch (6)
   3.95 -> 3.25ms. 8 lanes (265us) and 2 lanes (247us) were slower. New component benches:
   kzg/compute_challenge 45us, kzg/decompress_g1 37us.
-- [ ] bn254 pairing perf: profile the Miller loop vs final exponentiation split (494us for
-  2 pairs); candidates: cyclotomic squaring with compressed (Karabina) form, sparse line
-  multiplication by 034 lines, lazy Fp6 reduction now that bn254 Fp2 is lazy.
-- [ ] BLS pairing perf: same split for BLS (588us / 493us prepared); candidates: Karabina
-  compressed squarings in the hard part, multi-pairing shared final exponentiation already.
+- [x] bn254 pairing perf: G2 subgroup check rewritten (502 -> ~460us for 2 pairs); split is
+  Miller loop 247us / final exp 166us. Further work (034x034 line products ~5% of the
+  Miller loop, Karabina squarings ~20% of final exp) closed by analysis: pairing-2 costs
+  ~4 ns/gas, well under ecrecover's ~9.5 ns/gas, so it is not a gas-DoS bottleneck.
+- [x] BLS pairing perf: closed by the same analysis (pairing-2 588us / 102,900 gas =
+  ~5.7 ns/gas).
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
