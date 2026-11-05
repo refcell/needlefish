@@ -24,7 +24,10 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
-- [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify.
+- [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
+  recover. (in progress, worker)
+- [ ] bls: GLV-split scalars inside large G1 MSM (halves windows); prepared G2 lines for the
+  fixed KZG G2 points in pairing checks.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
