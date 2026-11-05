@@ -34,5 +34,6 @@ test {
     _ = @import("chain_test.zig");
     _ = @import("history_test.zig");
     _ = @import("witness_test.zig");
+    _ = @import("witness_evm_test.zig");
     _ = @import("database_test.zig");
 }

@@ -658,6 +658,82 @@ pub const SparseState = struct {
         try self.trie.put(&self.account_root, &address_hash, encoded);
     }
 
+    /// Folds the evm's journaled block `State` into `changeset` and applies it: the rules of
+    /// `evm_backend.commit_evm` then `Overlay.build_changeset` (old values read from the
+    /// witness, no-op changes dropped). A wiped account that survives gets its storage trie
+    /// dropped whole (its old slots are not in the witness) and always an account entry, so
+    /// its leaf takes the new storage root. Codes are not recorded: only roots are needed.
+    pub fn apply_evm(
+        self: *SparseState,
+        evm_state: *const evm.State,
+        changeset: *Changeset,
+    ) (Error || changeset_module.Error)!void {
+        changeset.clear();
+        try self.fold_evm_accounts(evm_state, changeset);
+        try self.fold_evm_slots(evm_state, changeset);
+        changeset.sort();
+        try self.apply(changeset);
+        assert(changeset.account_changes().len <= evm_state.accounts.count());
+    }
+
+    fn fold_evm_accounts(
+        self: *SparseState,
+        evm_state: *const evm.State,
+        changeset: *Changeset,
+    ) (Error || changeset_module.Error)!void {
+        var accounts = evm_state.accounts.valueIterator();
+        while (accounts.next()) |account| {
+            if (!account.dirty) continue;
+            const old = try self.basic(account.address);
+            const new: ?AccountInfo = if (account.in_database) .{
+                .nonce = account.info.nonce,
+                .balance = account.info.balance,
+                .code_hash = account.info.code_hash,
+            } else null;
+            const wiped = account.in_database and account.storage_cleared;
+            if (wiped) {
+                const root = try self.storage_root_slot(&node.keccak256(&account.address));
+                root.* = sparse.none;
+            }
+            const same = if (old != null and new != null)
+                old.?.eql(new.?)
+            else
+                old == null and new == null;
+            if (wiped or !same) {
+                assert(old != null or new != null);
+                const change: AccountChange = .{
+                    .address = account.address,
+                    .old = old,
+                    .new = new,
+                };
+                try changeset.add_account(change);
+            }
+        }
+    }
+
+    fn fold_evm_slots(
+        self: *SparseState,
+        evm_state: *const evm.State,
+        changeset: *Changeset,
+    ) (Error || changeset_module.Error)!void {
+        var slots = evm_state.slots.iterator();
+        while (slots.next()) |entry| {
+            if (!entry.value_ptr.dirty) continue;
+            const key = entry.key_ptr;
+            const account = evm_state.accounts.getPtr(key.address) orelse continue;
+            if (!account.in_database) continue;
+            if (entry.value_ptr.epoch != account.storage_epoch) continue;
+            const old = try self.storage(key.address, key.slot);
+            if (old == entry.value_ptr.present) continue;
+            try changeset.add_storage(.{
+                .address = key.address,
+                .slot = key.slot,
+                .old = old,
+                .new = entry.value_ptr.present,
+            });
+        }
+    }
+
     const vtable: evm.state.Database.VTable = .{
         .basic = database_basic,
         .code_by_hash = database_code_by_hash,

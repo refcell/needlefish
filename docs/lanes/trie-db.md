@@ -37,10 +37,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   block, verified by re-executing statelessly against a sparse trie built from the witness.
   (`db/witness.zig`, `trie/sparse.zig`; verification replays reads + the block's changeset,
   `SparseState.database()` is the evm backend for real stateless re-execution)
-- [ ] Differential tests: historical proof at block N == proof from a State unwound to N;
+- [x] Differential tests: historical proof at block N == proof from a State unwound to N;
   witness-only re-execution root == stored root (base/base `witness_differential`).
-  (historical half done in `db/history_test.zig`; witness-only changeset replay root == full
-  root in `db/witness_test.zig`; EVM re-execution over `SparseState` pending a block executor)
+  (historical half: `db/history_test.zig`; witness half: changeset replay in
+  `db/witness_test.zig`, real evm re-execution over `SparseState` in
+  `db/witness_evm_test.zig`)
 - [ ] Witness entry point for the node: move the durable database to the block's parent
   (`set_head`, no re-journal), wrap the evm Database with `witness.Recorder`, run the caller's
   executor (`node.Executor.execute_block` over the recorded database), build the witness,
@@ -156,6 +157,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   tail > half the journal), which now counts two checkpoints of entries, so checkpoints run
   about twice as often (each covers ~1/4 of the journal) and Busy/JournalFull clears after at
   most two back-to-back checkpoints.
+- Witness evm differential (`db/witness_evm_test.zig`) drives the evm directly
+  (`transaction.transact` over a `TxEnv` list), not the node executor: the executor takes
+  signed RLP transactions over `node.StateDb` and adds system calls, so it has no entry over
+  an arbitrary evm `Database`. `SparseState.apply_evm` folds the evm block state with the
+  `commit_evm` + `Overlay.build_changeset` rules (old values from the witness, no-op changes
+  dropped) and applies that changeset, so it touches the same trie nodes in the same order as
+  the builder's replay; a wiped account that survives drops its storage trie whole.
 
 - History window pruner (`db/history.zig`): `commit_block` only moves the window; the block
   that becomes the oldest appends its versions to a FIFO prune queue (versions linked through
@@ -297,3 +305,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   removed nodes so deleted subtries free their paths, atomic `commit_block`; tests: 360-block
   run with reorgs within the N + window * B bound, budget-1 steps, freed storage trie paths,
   base versions == trie nodes of the oldest block after a drain.
+- 2026-11-05: witness evm differential: random pre-state with hand-assembled contracts
+  (SLOAD/SSTORE/LOG1/BALANCE/EXTCODEHASH/EXTCODESIZE/BLOCKHASH/CALL/SELFDESTRUCT/CREATE),
+  6 seeds x 3 blocks of calls and transfers through the real evm; witness-only re-execution
+  gives identical results and post root, and every witness node is required (~0.8 s Debug).
