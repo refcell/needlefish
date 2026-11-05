@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const ct = @import("../ct.zig");
 
 /// The field prime p.
 pub const p_int: u256 = 0xFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFE_FFFFFC2F;
@@ -321,7 +322,7 @@ pub const Fe = struct {
 
     /// Constant-time select: `b` when `flag` is 1, else `a`.
     pub fn select(a: Fe, b: Fe, flag: u1) Fe {
-        const mask = 0 -% @as(u64, flag);
+        const mask = ct.mask(flag);
         var result: Fe = undefined;
         inline for (0..4) |index| {
             result.limbs[index] = (a.limbs[index] & ~mask) | (b.limbs[index] & mask);

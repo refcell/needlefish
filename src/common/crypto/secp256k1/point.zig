@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const ct = @import("../ct.zig");
 const field = @import("field.zig");
 const scalar_module = @import("scalar.zig");
 const table = @import("table.zig");
@@ -279,13 +280,13 @@ const Projective = struct {
 
 /// Scans a whole row and returns entry |digit| - 1, negated when digit < 0 (zero
 /// when digit is 0). Memory access and branches do not depend on the digit.
-fn lookup(row: *const [table.gen_row_size]Affine, digit: i8) Affine {
+pub fn lookup(row: *const [table.gen_row_size]Affine, digit: i8) Affine {
     const sign: u8 = @bitCast(digit >> 7);
     const magnitude: u8 = (@as(u8, @bitCast(digit)) ^ sign) -% sign;
     assert(magnitude <= table.gen_row_size);
     var result: Affine = .{ .x = Fe.zero, .y = Fe.zero };
     for (row, 1..) |entry, position| {
-        const flag: u1 = @intFromBool(magnitude == position);
+        const flag = ct.equal(magnitude, position);
         result.x = result.x.select(entry.x, flag);
         result.y = result.y.select(entry.y, flag);
     }
@@ -335,7 +336,7 @@ pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
     var acc = Projective.identity;
     for (&table.gen_rows, digits) |*row, digit| {
         const sum = acc.add_affine(lookup(row, digit));
-        acc = acc.select(sum, @intFromBool(digit != 0));
+        acc = acc.select(sum, ct.nonzero(@as(u8, @bitCast(digit))));
     }
     if (k.is_zero()) return null;
     return to_affine_blinded(acc, blind);
@@ -385,7 +386,7 @@ pub fn mul_ct(base: Affine, k: Scalar, blind: Fe) ?Affine {
         index -= 1;
         for (0..4) |_| acc = acc.dbl();
         const sum = acc.add_affine(lookup(&multiples, digits[index]));
-        acc = acc.select(sum, @intFromBool(digits[index] != 0));
+        acc = acc.select(sum, ct.nonzero(@as(u8, @bitCast(digits[index]))));
     }
     if (k.is_zero()) return null;
     return to_affine_blinded(acc, blind);

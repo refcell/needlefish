@@ -307,10 +307,10 @@ pub fn sign(private_key: [32]u8, hash: [32]u8) Error!Signature {
         if (s.is_zero()) continue;
         const x_overflow: u2 = @intFromBool(Scalar.from_bytes(&x_bytes) == null);
         var recovery_id: u2 = (x_overflow << 1) | @intFromBool(r_point.y.is_odd());
-        if (s.is_high()) {
-            s = s.neg();
-            recovery_id ^= 1;
-        }
+        // Low-s normalization without a branch on the secret-derived s.
+        const high = s.is_high_bit();
+        s = s.select(s.neg(), high);
+        recovery_id ^= high;
         assert(!s.is_high());
         return .{ .r = r.to_bytes(), .s = s.to_bytes(), .recovery_id = recovery_id };
     }

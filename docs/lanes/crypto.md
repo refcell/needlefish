@@ -48,8 +48,13 @@ fallback but hot paths should be our own, optimized implementations.
   `compress_public_key`, `decompress_public_key`, `decode_public_key`, `verify` (plain ECDSA,
   accepts high s like std; `is_low_s` for libsecp/k256 semantics), `ecdh` (discv5: compressed
   shared point, constant time via `point.mul_ct`). verify 24us (std 63us), ecdh 29us (std 69us).
-- [ ] constant-time audit of secret paths (sign, public_key, ecdh, P256 has none secret, BLS
-  none): advisor review + a dudect-style timing smoke test on fixed vs random secrets.
+- [x] constant-time audit of secret paths (advisor, gpt-sol): LLVM turned mask selects into
+  branches/selective loads on x86_64 (table lookup, accumulator select) and `sign` branched
+  on high s. Fixed with `ct.zig` (asm value barrier on masks; `ct.equal`/`ct.nonzero`),
+  `Scalar.is_high_bit`/`select`. Verified by emitting ReleaseFast asm for x86_64 and aarch64:
+  no data-dependent branches in lookup/select/low-s (only the public 8-entry loop edge), all
+  table rows loaded. No measurable bench cost. Accepted residuals (standard): key validation
+  exits, RFC 6979 retry loop, zero-blind fallback, blinded (not fixed-time) inversions.
 - [x] sha256 ARMv8 SHA2: already in place (`sha256.hardware_accelerated`, sha256h/h2 asm +
   su0/su1 intrinsics); closed by inspection.
 - [x] secp256k1 batch ecrecover: deferred. Senders are recovered one envelope at a time via
@@ -97,6 +102,8 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 (13.0). All stay within ~1.5x of ecrecover, so none is a block-time outlier.
 
 ## Decisions
+
+- Constant-time code must route every secret-derived mask or flag through `ct.barrier` (`ct.mask`, `ct.equal`, `ct.nonzero`); plain `(a & ~m) | (b & m)` is not enough, LLVM re-branches it on x86_64. Check new secret paths by emitting ReleaseFast asm for x86_64-linux and aarch64-linux.
 - Keccak permutation is generic over the lane type (`u64` or `@Vector(n, u64)`); batch width
   is 2 on NEON (LLVM emits EOR3/BCAX/XAR/RAX1), 4 on AVX2, 8 on AVX-512. Unrolling the
   round loop measured slower on aarch64, so it is not unrolled.
@@ -335,3 +342,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: montgomery.pow sliding window (w=5, public exponents): bls map_fp_to_g1 34->31.8us, bls inverse_constant_time 13.8->11.1us, bn254 5.8->5.2us.
 - 2026-11-05: cell verify cost model (128 cells, 12.1 ms): ~5 ms proof decompression (sqrt ~15 us + subgroup check ~25 us each; no sound batched subgroup check because G1 cofactor has small factors), ~5 ms two 128-point MSMs, 1.3 ms 64-point MSM, 0.5 ms pairing. A 6-blob v1 sidecar is ~70-80 ms. No further work planned.
 - 2026-11-05: secp256k1 SEC1 encode/decode, plain verify, constant-time ecdh (`point.mul_ct`, RCB15 complete doubling) with std-oracle tests and a coverage fuzz target. BLS signatures (sign/aggregate) not added: base/base uses BLS12-381 only for the EIP-2537 precompiles, not p2p/consensus.
+- 2026-11-05: constant-time hardening (`ct.zig` value barrier) after advisor audit; verify r+n and infinity vectors added.

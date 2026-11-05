@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const ct = @import("../ct.zig");
 
 /// The group order n.
 pub const n_int: u256 = 0xFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFE_BAAEDCE6_AF48A03B_BFD25E8C_D0364141;
@@ -98,6 +99,29 @@ pub const Scalar = struct {
     /// True when the scalar exceeds n / 2 (a "high-s" signature value).
     pub fn is_high(scalar: Scalar) bool {
         return scalar.to_int() > n_int / 2;
+    }
+
+    /// 1 when scalar > n / 2, from the borrow of n / 2 - scalar. Branch-free.
+    pub fn is_high_bit(scalar: Scalar) u1 {
+        const half = from_int_unchecked(n_int / 2);
+        var borrow: u1 = 0;
+        inline for (0..4) |index| {
+            const step = @subWithOverflow(half.limbs[index], scalar.limbs[index]);
+            const step_borrow = @subWithOverflow(step[0], borrow);
+            borrow = step[1] | step_borrow[1];
+        }
+        return @truncate(ct.barrier(borrow));
+    }
+
+    /// `b` when `flag` is 1, else `a`, in constant time.
+    pub fn select(a: Scalar, b: Scalar, flag: u1) Scalar {
+        const mask = ct.mask(flag);
+        var result: Scalar = undefined;
+        inline for (0..4) |index| {
+            result.limbs[index] = (a.limbs[index] & ~mask) | (b.limbs[index] & mask);
+        }
+        assert(@popCount(mask) == 0 or @popCount(mask) == 64);
+        return result;
     }
 
     /// Reduces `value = top * 2^256 + limbs` (value < 2n) to below n. Branch-free.
@@ -338,6 +362,7 @@ test "scalar: arithmetic matches u512 reference" {
         try testing.expectEqual(@as(u256, @intCast((x * y) % n)), a.mul(b).to_int());
         try testing.expectEqual(@as(u256, @intCast((n - x) % n)), a.neg().to_int());
         try testing.expectEqual(x > n / 2, a.is_high());
+        try testing.expectEqual(@intFromBool(x > n / 2), a.is_high_bit());
     }
     for (0..50) |_| {
         const a = random_scalar(&prng);

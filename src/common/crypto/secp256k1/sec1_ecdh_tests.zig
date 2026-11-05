@@ -143,6 +143,22 @@ test "secp256k1: verify rejects out-of-range r and s" {
     try testing.expect(!secp.verify(hash, signature.r, signature.s, &off_curve));
 }
 
+test "secp256k1: verify accepts the r + n case and rejects an infinity result" {
+    // Q with x = n + 2 (< p): with r = s = 2 and hash 0, R = 0 G + 1 Q = Q and
+    // x(R) mod n = 2 = r, so only the (r + n) comparison accepts it. std.crypto rejects a
+    // zero hash outright, so it cannot serve as the oracle here.
+    var compressed: secp.CompressedPublicKey = undefined;
+    compressed[0] = 0x02;
+    compressed[1..33].* = int_bytes(n_int + 2);
+    const q = secp.decompress_public_key(&compressed).?;
+    const zero: [32]u8 = @splat(0);
+    try testing.expect(secp.verify(zero, int_bytes(2), int_bytes(2), &q));
+    try testing.expect(!secp.verify(zero, int_bytes(3), int_bytes(2), &q));
+    // Q = G, hash n - 1, r = s = 1: R = -G + G is the identity and must be rejected.
+    const generator = try secp.public_key(int_bytes(1));
+    try testing.expect(!secp.verify(int_bytes(n_int - 1), int_bytes(1), int_bytes(1), &generator));
+}
+
 test "secp256k1: SEC1 compression round trip and rejection" {
     var prng = Prng.init(0x7365633121);
     for (0..32) |_| {
