@@ -37,6 +37,13 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [ ] DST: crash-restart under loss: `SimIo.crash` a node mid-gossip (pending ops vanish),
+  rebuild its `Network` on the same disk (needs an `abandon` path that frees without
+  draining), and require it to rejoin from its bootstore and receive new blocks.
+- [ ] Devnet: run both CLs with discovery + bootstore (ENR bootnode instead of enode) once
+  the batcher-devnet lane agrees; verified by hand on 2026-11-05 (see above).
+- [ ] Peerstore/bootstore observability: local metrics for peerstore size and evictions
+  and bootstore file save/load errors (not in base/base; keep names under `base_node_p2p_`).
 - [x] Real-process interop on the all-Zig devnet (`just devnet up`, kqueue sockets),
   checked by hand on 2026-11-05:
   1. As scripted (enode bootnode, discovery off): the verifier CL's unsafe head tracked
