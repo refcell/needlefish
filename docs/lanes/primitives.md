@@ -19,6 +19,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] Denim BaseTime metadata deposit (`base_time.rs`): calldata, deposit, validation.
 - [x] `rpc_types`: JSON-RPC forms of logs, transactions (deposit, 0x79), receipts (L1 fee,
   phaseStatuses), headers and blocks, streamed to `std.Io.Writer`.
+- [x] `flashblocks`: payload/base/delta/metadata types, JSON or brotli message decode
+  (5 MiB cap), JSON writer, `FlashblockId`.
 - [ ] `rpc_types`: request parsing (TransactionRequest, block tags) once `utilities/json` lands.
 
 ## Decisions
@@ -59,6 +61,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 - rpc_types writes JSON directly (no DOM); callers pass block/position context. Addresses
   are EIP-55 checksummed like reth; `l1FeeScalar` is a caller-formatted decimal string.
+- flashblocks parse with `std.json` into a per-message arena (the feed is not a hot
+  consensus path) and reuse the consensus lane's brotli decoder.
 
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
@@ -75,3 +79,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: benchmarks (`common/consensus/bench.zig`, results in docs/PERF.md).
 - 2026-11-05: predeploys and Denim BaseTime metadata deposit.
 - 2026-11-05: rpc_types JSON writers (alloy field names; checksummed addresses).
+- 2026-11-05: flashblocks types and message decoding.

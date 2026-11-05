@@ -12,6 +12,7 @@ pub const flz = @import("flz/root.zig");
 pub const l1_fees = @import("l1_fees/root.zig");
 pub const genesis = @import("genesis/root.zig");
 pub const rpc_types = @import("rpc_types/root.zig");
+pub const flashblocks = @import("flashblocks/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
