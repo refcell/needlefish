@@ -9,6 +9,7 @@ const io = @import("../../utilities/io/root.zig");
 const http = @import("../../utilities/http/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const roxy = @import("root.zig");
+const trusted_proxy = @import("../../utilities/trusted_proxy/root.zig");
 
 const Address = io.Address;
 const SimIo = io.SimIo;
@@ -158,10 +159,19 @@ const Harness = struct {
 
     /// Sends one request and runs until it is answered (or 2 s pass).
     fn call(harness: *Harness, target: []const u8, body: []const u8) !Result {
+        return harness.call_with(target, &.{}, body);
+    }
+
+    fn call_with(
+        harness: *Harness,
+        target: []const u8,
+        headers: []const http.parser.Header,
+        body: []const u8,
+    ) !Result {
         var test_client = try harness.client();
         defer test_client.deinit();
         var result: Result = .{};
-        try test_client.request(*Result, &result, Result.on_response, .POST, target, &.{}, body);
+        try test_client.request(*Result, &result, Result.on_response, .POST, target, headers, body);
         var elapsed_ns: u64 = 0;
         while (result.calls == 0 and elapsed_ns < 2000 * ms) : (elapsed_ns += 10 * ms) {
             harness.run_ticking(10 * ms);
@@ -368,4 +378,34 @@ test "roxy: a full pending set answers 503 at once" {
     try testing.expectEqual(@as(u32, 1), results[0].calls);
     try testing.expectEqual(@as(u32, 1), results[1].calls);
     try testing.expectEqual(@as(u16, 502), results[0].status);
+}
+
+test "roxy: per-client rate limits, with clients behind a trusted proxy told apart" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.rate_limit = .{ .requests_per_s = 1, .burst = 2 };
+    // The test client (10.0.0.20) acts as a trusted load balancer.
+    var cidrs = [_]trusted_proxy.Cidr{try trusted_proxy.Cidr.parse("10.0.0.20/32")};
+    options.trusted_proxy = .{ .cidrs = &cidrs };
+    try harness.init(55, .{ true, true, true }, options);
+    defer harness.deinit();
+    const alice = [_]http.parser.Header{.{ .name = "X-Forwarded-For", .value = "203.0.113.1" }};
+    const bob = [_]http.parser.Header{.{ .name = "X-Forwarded-For", .value = "203.0.113.2" }};
+    for (0..2) |_| {
+        const result = try harness.call_with("/", &alice, chain_id_body);
+        try testing.expectEqual(@as(u16, 200), result.status);
+    }
+    var result = try harness.call_with("/", &alice, chain_id_body);
+    try testing.expectEqual(@as(u16, 429), result.status);
+    try testing.expect(contains(result.text(), "-32016"));
+    // Bob has his own bucket; the balancer itself (no header) has a third.
+    result = try harness.call_with("/", &bob, chain_id_body);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    result = try harness.call("/", chain_id_body);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    // A second later Alice has one token again.
+    harness.run_ticking(1000 * ms);
+    result = try harness.call_with("/", &alice, chain_id_body);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_rate_limit.get());
 }

@@ -2,7 +2,7 @@
 //! fork). base/base ships only the scaffold (listen address, `/healthz`, `/readyz`); this
 //! module extends it toward that intent: load balancing over N upstreams, passive health
 //! with bounded exponential ejection backoff and fail-open, retries on another upstream, and
-//! a method allowlist.
+//! a method allowlist, and per-client rate limits (client IPs via `utilities/trusted_proxy`).
 
 const std = @import("std");
 
@@ -10,6 +10,7 @@ pub const allowlist = @import("allowlist.zig");
 pub const methods = @import("methods.zig");
 pub const pool = @import("pool.zig");
 pub const proxy = @import("proxy.zig");
+pub const rate_limit = @import("rate_limit.zig");
 
 pub const Allowlist = allowlist.Allowlist;
 pub const Pool = pool.Pool;

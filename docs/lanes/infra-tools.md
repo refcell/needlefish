@@ -59,6 +59,10 @@ allocation after startup.
   chain_prep,accounts}.rs`). Lets the devnet load test exceed 10 dev accounts.
 - [ ] `infra/load_test` payloads: `storage`, `precompile`, `looper` (gas-heavy), and a real
   ERC-20 transfer against the deployed token (port `payloads/*`); `--json` report.
+- [x] `infra/roxy` rate limits: per-client token buckets (bounded table, idlest evicted),
+  client IPs through `utilities/trusted_proxy`, 429 + JSON-RPC -32016 like proxyd.
+- [ ] `infra/tx_manager` metrics: pending sends, publishes, bumps, failures by kind, and
+  confirmation latency, exported by `load-test` and `withdrawer` (`--metrics-port`).
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -90,6 +94,8 @@ allocation after startup.
   whole-second header timestamps cannot resolve 200 ms blocks. Thresholds keep base/base's
   defaults (2 s grace, 3 s unhealthy). The StatsD heartbeat becomes per-state Prometheus
   tick counters.
+- roxy rate limiting keys on the client IP only (no API keys yet); an evicted bucket refills
+  to the full burst, so table pressure can only loosen limits, never block a client wrongly.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
   address; deploying a token is future work), open-loop pacer with 2x catch-up, one
   tx_manager driver per sender, latency via reservoir sampling. Default senders are dev
@@ -167,3 +173,6 @@ allocation after startup.
 - 2026-11-05: sidecrush (`HeadState` classifier + fuzz, `Checker(IO)` with metrics/readiness,
   SimIo tests at 200 ms slots) and `base sidecrush`; on the devnet: healthy/200, then error/503
   after the sequencer EL was killed.
+- 2026-11-05: roxy per-client rate limits (`rate_limit.zig` + fuzz, trusted-proxy client IPs,
+  SimIo test) and `--rate-limit-rps/--rate-limit-burst/--trusted-proxies`; live: 429 on the
+  third request with burst 2.

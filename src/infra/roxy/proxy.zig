@@ -11,6 +11,10 @@
 //! With a non-empty allowlist every request (and every entry of a batch) is checked before
 //! it is queued: a disallowed method gets JSON-RPC error -32601 without touching upstreams.
 //!
+//! With `rate_limit.requests_per_s > 0`, each client IP (resolved through `trusted_proxy`,
+//! so clients behind a trusted load balancer are told apart) has a token bucket; a client
+//! over its rate gets 429 and JSON-RPC error -32016 before anything else is checked.
+//!
 //! Endpoints: `POST` any path (proxied to the same path), `GET /` and `GET /healthz`
 //! (`utilities/health`), `GET /readyz` (200 once listening with at least one upstream not
 //! ejected), `GET /metrics` (Prometheus text).
@@ -30,6 +34,12 @@ const io_common = @import("../../utilities/io/common.zig");
 const pool_module = @import("pool.zig");
 const methods = @import("methods.zig");
 const Allowlist = @import("allowlist.zig").Allowlist;
+const trusted_proxy = @import("../../utilities/trusted_proxy/root.zig");
+const rate_limit = @import("rate_limit.zig");
+
+/// Client buckets tracked at once (about 40 bytes each).
+pub const rate_limit_buckets_max = 4096;
+const Limiter = rate_limit.Limiter(rate_limit_buckets_max);
 
 pub const Address = io_common.Address;
 pub const Mask = pool_module.Mask;
@@ -44,13 +54,16 @@ pub const Options = struct {
     attempts_max: u32 = 3,
     pool: pool_module.Options = .{},
     allowlist: Allowlist = .{},
+    rate_limit: rate_limit.Options = .{},
+    /// Proxies whose forwarding header is trusted when resolving the client IP.
+    trusted_proxy: trusted_proxy.Config = .{},
     server: http.server.Options = .{},
     client: http.client.Options = .{},
     version: []const u8 = "unknown",
 };
 
 const label_size_max = 24;
-const metrics_max = 8 + 3 * upstreams_max;
+const metrics_max = 9 + 3 * upstreams_max;
 const content_type_json = [_]http.parser.Header{
     .{ .name = "Content-Type", .value = "application/json" },
 };
@@ -101,6 +114,7 @@ pub fn Proxy(comptime IO: type) type {
         dispatch_again: bool = false,
         /// Scratch for the allowlist check.
         entries: [methods.batch_max]methods.Entry = undefined,
+        limiter: ?*Limiter = null,
 
         registry: metrics.Registry(metrics_max) = .{},
         requests: metrics.Counter = .{},
@@ -108,6 +122,7 @@ pub fn Proxy(comptime IO: type) type {
         rejected_method: metrics.Counter = .{},
         rejected_invalid: metrics.Counter = .{},
         rejected_overload: metrics.Counter = .{},
+        rejected_rate_limit: metrics.Counter = .{},
         unavailable: metrics.Counter = .{},
         pending: metrics.Gauge = .{},
         upstream_failures: [upstreams_max]metrics.Counter = @splat(.{}),
@@ -149,6 +164,12 @@ pub fn Proxy(comptime IO: type) type {
                 proxy.free[options.pending_max - 1 - index] = @intCast(index);
             }
             proxy.free_count = options.pending_max;
+            if (options.rate_limit.enabled()) {
+                const limiter = try allocator.create(Limiter);
+                limiter.* = Limiter.init(options.rate_limit);
+                proxy.limiter = limiter;
+            }
+            errdefer if (proxy.limiter) |limiter| allocator.destroy(limiter);
             try proxy.init_clients(count);
             errdefer proxy.deinit_clients();
             try proxy.server.init(allocator, io, proxy, options.server);
@@ -191,6 +212,7 @@ pub fn Proxy(comptime IO: type) type {
             assert(proxy.slots.len > 0);
             proxy.server.deinit();
             proxy.deinit_clients();
+            if (proxy.limiter) |limiter| proxy.allocator.destroy(limiter);
             proxy.allocator.free(proxy.free);
             proxy.allocator.free(proxy.queue);
             proxy.allocator.free(proxy.slots);
@@ -212,6 +234,7 @@ pub fn Proxy(comptime IO: type) type {
             try registry.register(rejected_entry("method", &proxy.rejected_method));
             try registry.register(rejected_entry("invalid", &proxy.rejected_invalid));
             try registry.register(rejected_entry("overload", &proxy.rejected_overload));
+            try registry.register(rejected_entry("rate_limit", &proxy.rejected_rate_limit));
             try registry.counter(
                 "roxy_unavailable_total",
                 "Requests answered 502 because every attempt failed.",
@@ -219,7 +242,7 @@ pub fn Proxy(comptime IO: type) type {
             );
             try registry.gauge("roxy_pending", "Requests queued or in flight.", &proxy.pending);
             for (0..count) |index| try proxy.register_upstream(@intCast(index));
-            assert(registry.count == 7 + 3 * count);
+            assert(registry.count == 8 + 3 * count);
         }
 
         fn rejected_entry(comptime reason: []const u8, counter: *metrics.Counter) metrics.Entry {
@@ -325,6 +348,7 @@ pub fn Proxy(comptime IO: type) type {
             response: *http.ResponseBuilder,
         ) void {
             assert(request.method == .POST);
+            if (proxy.over_rate_limit(request, response)) return;
             if (!proxy.options.allowlist.allows_all()) {
                 if (proxy.reject_disallowed(request.body, response)) return;
             }
@@ -345,6 +369,23 @@ pub fn Proxy(comptime IO: type) type {
             proxy.requests.increment();
             proxy.queue_push(index);
             proxy.dispatch();
+        }
+
+        /// Answers 429 when the request's client is over its rate; returns true if it did.
+        fn over_rate_limit(
+            proxy: *Self,
+            request: *const http.Request,
+            response: *http.ResponseBuilder,
+        ) bool {
+            const limiter = proxy.limiter orelse return false;
+            const headers = request.headers.slice();
+            const client = proxy.options.trusted_proxy.client_ip(response.peer, headers);
+            const now_ms = proxy.io.now_monotonic_ns() / std.time.ns_per_ms;
+            if (limiter.allow(client, now_ms)) return false;
+            proxy.rejected_rate_limit.increment();
+            response.status = 429;
+            response.writer().writeAll(rate_limit.over_limit_body) catch response.fail(500);
+            return true;
         }
 
         /// Answers a request that is invalid or calls a disallowed method; returns true if it

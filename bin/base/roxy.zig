@@ -9,6 +9,7 @@ const consensus = @import("consensus.zig");
 const io = base.utilities.io;
 const cli = base.utilities.cli;
 const roxy = base.infra.roxy;
+const trusted_proxy = base.utilities.trusted_proxy;
 const Proxy = roxy.Proxy(io.IO);
 
 const env_prefix = "BASE_ROXY_";
@@ -26,6 +27,9 @@ pub const Spec = struct {
     ejection_backoff_max_ms: u32 = 60_000,
     request_size_max: u32 = 512 * 1024,
     response_size_max: u32 = 4 * 1024 * 1024,
+    rate_limit_rps: u32 = 0,
+    rate_limit_burst: u32 = 20,
+    trusted_proxies: []const u8 = "",
 
     pub const help = .{
         .listen_addr = "Address to serve on, IPv4:PORT",
@@ -40,6 +44,9 @@ pub const Spec = struct {
         .ejection_backoff_max_ms = "Longest ejection duration",
         .request_size_max = "Largest request body in bytes",
         .response_size_max = "Largest upstream response body in bytes",
+        .rate_limit_rps = "Requests per second per client IP (0: unlimited)",
+        .rate_limit_burst = "Requests a client may burst after idling",
+        .trusted_proxies = "Comma-separated CIDRs whose X-Forwarded-For is trusted",
     };
 };
 
@@ -47,21 +54,31 @@ pub const Settings = struct {
     listen: io.Address,
     upstreams: [roxy.pool.upstreams_max]io.Address = undefined,
     upstream_count: u32 = 0,
+    cidrs: [trusted_proxies_max]trusted_proxy.Cidr = undefined,
+    cidr_count: u32 = 0,
     options: roxy.Options,
 
     pub fn upstream_list(settings: *const Settings) []const io.Address {
         return settings.upstreams[0..settings.upstream_count];
     }
+
+    pub fn cidr_list(settings: *const Settings) []const trusted_proxy.Cidr {
+        return settings.cidrs[0..settings.cidr_count];
+    }
 };
 
-/// Validates parsed flags into runtime settings. `options.upstreams` is left empty: point it
-/// at `upstream_list()` once the settings are at their final address.
+const trusted_proxies_max = 16;
+
+/// Validates parsed flags into runtime settings. `options.upstreams` and
+/// `options.trusted_proxy.cidrs` are left empty: point them at `upstream_list()` and
+/// `cidr_list()` once the settings are at their final address.
 pub fn settings_of(spec: Spec) !Settings {
     const values_valid = spec.clients_per_upstream > 0 and spec.pending_max > 0 and
         spec.upstream_timeout_ms > 0 and spec.failures_to_eject > 0 and
         spec.ejection_backoff_ms > 0 and
         spec.ejection_backoff_ms <= spec.ejection_backoff_max_ms and
-        spec.request_size_max > 0 and spec.response_size_max > 0 and spec.retries < 64;
+        spec.request_size_max > 0 and spec.response_size_max > 0 and spec.retries < 64 and
+        spec.rate_limit_burst > 0;
     if (!values_valid) return error.InvalidValue;
     var settings: Settings = .{ .listen = try parse_listen(spec.listen_addr), .options = .{
         .upstreams = &.{},
@@ -76,7 +93,19 @@ pub fn settings_of(spec: Spec) !Settings {
         settings.upstream_count += 1;
     }
     if (settings.upstream_count == 0) return error.NoUpstreams;
+    var cidr_parts = std.mem.splitScalar(u8, spec.trusted_proxies, ',');
+    while (cidr_parts.next()) |part| {
+        const text = std.mem.trim(u8, part, " ");
+        if (text.len == 0) continue;
+        if (settings.cidr_count == settings.cidrs.len) return error.TooManyTrustedProxies;
+        settings.cidrs[settings.cidr_count] = try trusted_proxy.Cidr.parse(text);
+        settings.cidr_count += 1;
+    }
     settings.options = options_of(spec, settings.options.allowlist);
+    settings.options.rate_limit = .{
+        .requests_per_s = spec.rate_limit_rps,
+        .burst = spec.rate_limit_burst,
+    };
     return settings;
 }
 
@@ -154,6 +183,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     settings.options.upstreams = settings.upstream_list();
+    settings.options.trusted_proxy.cidrs = settings.cidr_list();
     var os_io = if (@import("builtin").os.tag == .linux) try io.IO.init(.{}) else try io.IO.init();
     defer os_io.deinit();
     const proxy = try init.gpa.create(Proxy);
@@ -186,6 +216,17 @@ test "roxy: flags to settings" {
     try testing.expect(settings.options.allowlist.allows("eth_call"));
     try testing.expect(!settings.options.allowlist.allows("eth_sendRawTransaction"));
     try testing.expectError(error.NoUpstreams, settings_of(.{ .upstreams = " , " }));
+    const limited = try settings_of(.{
+        .upstreams = "http://127.0.0.1:8545",
+        .rate_limit_rps = 50,
+        .trusted_proxies = "10.0.0.0/8, 192.168.0.0/16",
+    });
+    try testing.expectEqual(@as(u32, 2), limited.cidr_count);
+    try testing.expectEqual(@as(u32, 50), limited.options.rate_limit.requests_per_s);
+    try testing.expectError(error.InvalidCidr, settings_of(.{
+        .upstreams = "http://127.0.0.1:8545",
+        .trusted_proxies = "10.0.0.0/33",
+    }));
     try testing.expectError(error.InvalidValue, settings_of(.{
         .upstreams = "http://127.0.0.1:8545",
         .ejection_backoff_ms = 10,
