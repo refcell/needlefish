@@ -18,7 +18,7 @@ can drive the builder and the flashblocks consumer.
 - [x] `common/flashblocks` encoder: JSON (and brotli, if the compressor exists, else
   plain JSON) encode of `FlashblocksPayloadV1`, byte-exact round trip with the decoder;
   seeded + `std.testing.fuzz` round-trip tests.
-- [ ] `builder/publish`: bounded broadcast ring of encoded flashblocks, WebSocket
+- [x] `builder/publish`: bounded broadcast ring of encoded flashblocks, WebSocket
   publisher with per-subscriber send queues and slow-subscriber eviction, listener
   accept loop, metrics (port `broadcast.rs`, `publisher.rs`, `listener.rs`). DST test
   with N simulated subscribers, loss and slow readers.
@@ -53,6 +53,12 @@ can drive the builder and the flashblocks consumer.
   sequence for a block replays to exactly the sealed block.
 
 ## Decisions
+- Publisher replays inside `on_open` on the event loop, so replay and live messages
+  cannot interleave and base/base's dedup set is unnecessary. A subscriber whose replay
+  backlog overflows its send buffer is closed (base/base: replay send timeout). Slow
+  subscribers are disconnected on broadcast (`SlowConsumer`) instead of tokio's lag.
+- The replay ring stores at most `ring_entries_max` messages and `ring_bytes_max` bytes;
+  a position older than the newest (a restarted payload job) clears it.
 - Wire format published is plain JSON text (base/base `publisher.rs` sends `Utf8Bytes`);
   `encode_brotli` exists for consumers/tests and emits a bare brotli stream (no channel
   version byte), reusing the batcher lane's encoder.
@@ -68,3 +74,5 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: own `src/common/flashblocks`; `FlashblockId.parse` now matches Rust
   `u64::from_str` (leading '+', no '_'), dst-fuzz skip removed.
 - 2026-11-05: builder/core timing schedule (deadline.rs, config.rs) with exhaustive + fuzz tests.
+- 2026-11-05: `builder/publish` replay ring + `Publisher(IO)` over the ws server with resume
+  replay, base/base metrics, and a SimIo DST (resets, partitions, floods, reconnects).
