@@ -125,6 +125,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] End-to-end rpc test with a real witness over 1 MiB (storage-heavy fixture block) through
   the large send buffers; today only a 3 MiB generic response covers that path.
   (`rpc/debug_large_test.zig`: code-heavy block instead of storage-heavy, see Log)
+- [ ] Persist the history window across restarts: today `open` resets history at the head,
+  so `eth_getProof` / witnesses for older blocks are unavailable until the window refills.
+  Rebuild the window on open by replaying retained blocks' changesets from the checkpoint
+  (or checkpoint the history store), bounded by the window.
+- [ ] Linux io_uring run of the storage engine: run `IoStorage` engine/database tests under
+  `just test-linux` (Docker) and fix any backend differences (fsync vs fdatasync, short
+  writes); record results.
+- [ ] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
+  hit/miss latency on 100k accounts and the overlay read path; compare with trie `get`.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
