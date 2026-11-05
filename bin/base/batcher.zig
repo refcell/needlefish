@@ -14,7 +14,8 @@ const usage =
     \\         [--poll-interval-ms MS] [--metrics.port P] [--data-availability calldata|blobs]
     \\         [--compression brotli|zlib] [--no-throttle]
     \\         [--throttle-strategy off|step|linear|quadratic]
-    \\         [--admin-port P [--admin-addr IP]] [--stopped]
+    \\         [--admin-port P [--admin-addr IP]] [--stopped] [--num-confirmations N]
+    \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
     \\
 ;
 
@@ -39,6 +40,12 @@ const Flags = struct {
     stopped: bool = false,
     /// DA throttling of the sequencer (base/base default: quadratic).
     throttle_strategy: batcher.throttle.Strategy = .quadratic,
+    /// base/base txmgr flags.
+    confirmations: u64 = 1,
+    min_tip_wei: u128 = 0,
+    min_base_fee_wei: u128 = 0,
+    /// In-flight tx slots (base/base `--max-pending-transactions`; ours defaults to 8).
+    pending_max: u8 = 8,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -80,6 +87,16 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--num-confirmations")) {
+            flags.confirmations = try std.fmt.parseInt(u64, value, 10);
+            if (flags.confirmations == 0) return error.InvalidConfirmations;
+        } else if (eql(u8, arg, "--min-tip-cap")) {
+            flags.min_tip_wei = try parse_gwei(value);
+        } else if (eql(u8, arg, "--min-basefee")) {
+            flags.min_base_fee_wei = try parse_gwei(value);
+        } else if (eql(u8, arg, "--max-pending-transactions")) {
+            flags.pending_max = try std.fmt.parseInt(u8, value, 10);
+            if (flags.pending_max == 0) return error.InvalidPendingMax;
         } else if (eql(u8, arg, "--admin-port")) {
             flags.admin_port = try std.fmt.parseInt(u16, value, 10);
         } else if (eql(u8, arg, "--admin-addr")) {
@@ -140,6 +157,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             .data_availability = flags.data_availability,
             // op-batcher's blob default: up to 6 frames (blobs) per transaction.
             .blobs_per_tx = if (flags.data_availability == .blobs) 6 else 1,
+            .slots_max = flags.pending_max,
+            .confirmations = flags.confirmations,
+            .min_tip_wei = flags.min_tip_wei,
+            .min_base_fee_wei = flags.min_base_fee_wei,
         },
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
@@ -216,6 +237,22 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
     }
 }
 
+/// Parses a decimal gwei amount ("2", "0.25", up to 9 fraction digits) into wei.
+fn parse_gwei(text: []const u8) !u128 {
+    const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
+    if (dot == 0) return error.InvalidGwei;
+    const whole = try std.fmt.parseInt(u64, text[0..dot], 10);
+    var fraction_wei: u128 = 0;
+    if (dot < text.len) {
+        const digits = text[dot + 1 ..];
+        if (digits.len == 0 or digits.len > 9) return error.InvalidGwei;
+        const fraction = try std.fmt.parseInt(u64, digits, 10);
+        fraction_wei = fraction * std.math.pow(u128, 10, 9 - digits.len);
+    }
+    std.debug.assert(fraction_wei < 1_000_000_000);
+    return @as(u128, whole) * 1_000_000_000 + fraction_wei;
+}
+
 /// Starts the optional HTTP endpoints. Each failure is logged and only disables that
 /// endpoint: batching never depends on them. Returns false when none is serving.
 fn start_servers(
@@ -286,6 +323,18 @@ test "batcher: flags" {
     try std.testing.expectEqual(@as(u8, 0), admin_flags.admin_address.bytes[0]);
     const bad_addr = [_][]const u8{ "--admin-addr", "localhost" };
     try std.testing.expectError(error.InvalidAddress, parse_flags(&bad_addr));
+    const fees = [_][]const u8{
+        "--min-tip-cap",       "0.01", "--min-basefee",              "2",
+        "--num-confirmations", "3",    "--max-pending-transactions", "4",
+    };
+    const fee_flags = try parse_flags(&fees);
+    try std.testing.expectEqual(@as(u128, 10_000_000), fee_flags.min_tip_wei);
+    try std.testing.expectEqual(@as(u128, 2_000_000_000), fee_flags.min_base_fee_wei);
+    try std.testing.expectEqual(@as(u64, 3), fee_flags.confirmations);
+    try std.testing.expectEqual(@as(u8, 4), fee_flags.pending_max);
+    try std.testing.expectError(error.InvalidGwei, parse_gwei("1.0000000001"));
+    try std.testing.expectError(error.InvalidGwei, parse_gwei(".5"));
+    try std.testing.expectEqual(@as(u128, 1_500_000_000), try parse_gwei("1.5"));
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };

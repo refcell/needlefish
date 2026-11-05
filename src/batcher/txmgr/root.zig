@@ -34,6 +34,13 @@ pub const Config = struct {
     data_availability: DataAvailability = .calldata,
     /// Blob mode: frames (one per blob) packed into each transaction, 1..6.
     blobs_per_tx: u8 = 1,
+    /// L1 blocks a tx must be buried under before its slot is freed (base/base
+    /// `--num-confirmations`; 1 = included in the latest block).
+    confirmations: u64 = 1,
+    /// Floors for the suggested tip and the base fee the fee cap is computed from
+    /// (base/base `--min-tip-cap`, `--min-basefee`).
+    min_tip_wei: u128 = 0,
+    min_base_fee_wei: u128 = 0,
 };
 
 /// Pull interface for transaction payloads (the channel manager's frames). A returned
@@ -96,6 +103,7 @@ pub const TxManager = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !TxManager {
         assert(config.slots_max > 0);
+        assert(config.confirmations >= 1);
         assert(config.bump_percent >= 10);
         const slots = try allocator.alloc(Slot, config.slots_max);
         errdefer allocator.free(slots);
@@ -234,15 +242,18 @@ pub const TxManager = struct {
     pub fn poll(manager: *TxManager, client: *rpc.Client, now_ms: u64) Error!u32 {
         if (manager.pending_count() == 0) return 0;
         const mined_nonce = try manager.account_nonce(client, "latest");
+        const confirmed_nonce = try manager.nonce_buried(client, mined_nonce);
+        assert(confirmed_nonce <= mined_nonce or manager.config.confirmations > 1);
         manager.watch_gap(mined_nonce, now_ms);
         var confirmed: u32 = 0;
         for (manager.slots) |*slot| {
             if (slot.state != .pending) continue;
-            if (slot.nonce < mined_nonce) {
+            if (slot.nonce < confirmed_nonce) {
                 slot.state = .free;
                 confirmed += 1;
                 continue;
             }
+            if (slot.nonce < mined_nonce) continue; // Mined; waiting for confirmations.
             if (slot.replace_now or now_ms >= slot.sent_at_ms + manager.config.resubmit_after_ms) {
                 try manager.bump(client, slot);
                 try manager.send(client, slot, now_ms);
@@ -378,6 +389,19 @@ pub const TxManager = struct {
         };
     }
 
+    /// The account nonce as of `confirmations - 1` blocks below the head: txs below it
+    /// are buried deep enough to free their slots.
+    fn nonce_buried(manager: *TxManager, client: *rpc.Client, mined_nonce: u64) Error!u64 {
+        const depth = manager.config.confirmations;
+        if (depth <= 1) return mined_nonce;
+        const head = try rpc.quantity(u64, try client.call("eth_blockNumber", "[]"));
+        if (head + 1 < depth) return 0; // Nothing is buried deep enough yet.
+        var tag_buffer: [24]u8 = undefined;
+        const tag = std.fmt.bufPrint(&tag_buffer, "0x{x}", .{head + 1 - depth}) catch
+            unreachable; // A u64 quantity fits.
+        return manager.account_nonce(client, tag);
+    }
+
     fn account_nonce(manager: *TxManager, client: *rpc.Client, tag: []const u8) Error!u64 {
         var buffer: [96]u8 = undefined;
         const params = std.fmt.bufPrint(&buffer, "[\"0x{x}\",\"{s}\"]", .{
@@ -389,13 +413,16 @@ pub const TxManager = struct {
 
     fn suggested_fees(manager: *TxManager, client: *rpc.Client) Error!txdata.Fees {
         const head = try client.call("eth_getBlockByNumber", "[\"latest\",false]");
-        const base_fee = try rpc.quantity(u128, try rpc.field(head, "baseFeePerGas"));
+        const base_fee = @max(
+            try rpc.quantity(u128, try rpc.field(head, "baseFeePerGas")),
+            manager.config.min_base_fee_wei,
+        );
         const tip = blk: {
             const value = client.call("eth_maxPriorityFeePerGas", "[]") catch
                 break :blk manager.config.tip_wei_default;
             break :blk rpc.quantity(u128, value) catch manager.config.tip_wei_default;
         };
-        return txdata.suggest_fees(base_fee, @max(tip, 1));
+        return txdata.suggest_fees(base_fee, @max(tip, manager.config.min_tip_wei, 1));
     }
 
     /// Twice the current blob base fee (`eth_blobBaseFee`, else from `excessBlobGas`).
@@ -664,8 +691,12 @@ const LossyL1 = struct {
     mined: u64 = 0,
     fees: [pool_size]u128 = @splat(0),
     sends: u32 = 0,
+    /// Every `mine` call produces a block; `nonce_at[b]` is the account nonce after it.
+    head: u64 = 0,
+    nonce_at: [history_size]u64 = @splat(0),
 
     const pool_size = 512;
+    const history_size = 4096;
 
     fn transport(l1: *LossyL1) rpc.Transport {
         return .{ .context = l1, .send_fn = send };
@@ -677,12 +708,15 @@ const LossyL1 = struct {
             l1.mined += 1;
             count += 1;
         }
+        l1.head = @min(l1.head + 1, history_size - 1);
+        l1.nonce_at[@intCast(l1.head)] = l1.mined;
     }
 
     /// Unmines the top `depth` txs back into the pool, then evicts each pooled tx with
     /// probability `loss_percent`.
     fn reorg_and_lose(l1: *LossyL1, prng: *Prng, depth: u64, loss_percent: u64) void {
         l1.mined -= @min(depth, l1.mined);
+        for (l1.nonce_at[0..@intCast(l1.head + 1)]) |*nonce| nonce.* = @min(nonce.*, l1.mined);
         for (l1.fees[@intCast(l1.mined)..]) |*fee| {
             if (fee.* > 0 and prng.chance(loss_percent, 100)) fee.* = 0;
         }
@@ -702,9 +736,20 @@ const LossyL1 = struct {
         const is_nonce_query = std.mem.indexOf(u8, body, "eth_getTransactionCount") != null;
         const result: []const u8 = if (is_nonce_query) blk: {
             const latest = std.mem.indexOf(u8, body, "\"latest\"") != null;
-            const nonce = if (latest) l1.mined else l1.pending_nonce();
+            const pending = std.mem.indexOf(u8, body, "\"pending\"") != null;
+            const at_block = !latest and !pending;
+            const nonce = if (latest) l1.mined else if (pending) l1.pending_nonce() else blk2: {
+                const tag_start = std.mem.lastIndexOf(u8, body, ",\"0x").? + 4;
+                const tag_end = std.mem.indexOfScalarPos(u8, body, tag_start, '"').?;
+                const block = std.fmt.parseInt(u64, body[tag_start..tag_end], 16) catch
+                    return error.TransportFailed;
+                break :blk2 l1.nonce_at[@intCast(@min(block, history_size - 1))];
+            };
+            assert(!at_block or nonce <= l1.mined);
             break :blk std.fmt.bufPrint(&buffer, "\"0x{x}\"", .{nonce}) catch unreachable;
-        } else if (std.mem.indexOf(u8, body, "eth_getBlockByNumber")) |_|
+        } else if (std.mem.indexOf(u8, body, "eth_blockNumber")) |_|
+            std.fmt.bufPrint(&buffer, "\"0x{x}\"", .{l1.head}) catch unreachable
+        else if (std.mem.indexOf(u8, body, "eth_getBlockByNumber")) |_|
             "{\"baseFeePerGas\":\"0x64\"}"
         else if (std.mem.indexOf(u8, body, "eth_maxPriorityFeePerGas")) |_|
             "\"0x2\""
@@ -804,6 +849,7 @@ test "txmgr: seeded fuzz over reorgs and tx loss keeps the nonce stream live" {
         var manager = try lossy_manager(&l1, &client);
         defer manager.deinit(testing.allocator);
         defer client.deinit(testing.allocator);
+        manager.config.confirmations = 1 + seed % 3;
         var now_ms: u64 = 0;
         // Faulty phase, then a quiet phase in which mining must make progress.
         for (0..160) |round| {
@@ -902,4 +948,38 @@ test "txmgr: a restart replaces untracked pooled txs; an eviction cannot stall i
     try testing.expectEqual(@as(u64, 2), l1.mined);
     try testing.expectEqual(@as(u32, 0), manager.pending_count());
     try testing.expect(l1.fees[1] != 1_000);
+}
+
+test "txmgr: confirmations hold slots until buried and skip resubmitting mined txs" {
+    var l1: LossyL1 = .{};
+    var client: rpc.Client = undefined;
+    var manager = try lossy_manager(&l1, &client);
+    defer manager.deinit(testing.allocator);
+    defer client.deinit(testing.allocator);
+    manager.config.confirmations = 3;
+    try manager.submit(&client, "\x00a", 0);
+    l1.mine(1); // Included in block 1.
+    try testing.expectEqual(@as(u32, 0), try manager.poll(&client, 5_000));
+    try testing.expectEqual(@as(u32, 1), l1.sends); // Mined: no resubmission.
+    l1.mine(1);
+    try testing.expectEqual(@as(u32, 0), try manager.poll(&client, 6_000));
+    l1.mine(1); // Block 3: the tx has 3 confirmations.
+    try testing.expectEqual(@as(u32, 1), try manager.poll(&client, 7_000));
+    try testing.expectEqual(@as(u32, 0), manager.pending_count());
+}
+
+test "txmgr: minimum tip and base fee floor the suggested fees" {
+    var l1: LossyL1 = .{};
+    var client: rpc.Client = undefined;
+    var manager = try lossy_manager(&l1, &client);
+    defer manager.deinit(testing.allocator);
+    defer client.deinit(testing.allocator);
+    const plain = try manager.suggested_fees(&client);
+    try testing.expectEqual(@as(u128, 2), plain.max_priority_fee_per_gas); // Node: 2, base 100.
+    try testing.expectEqual(@as(u128, 202), plain.max_fee_per_gas);
+    manager.config.min_tip_wei = 50;
+    manager.config.min_base_fee_wei = 1_000;
+    const floored = try manager.suggested_fees(&client);
+    try testing.expectEqual(@as(u128, 50), floored.max_priority_fee_per_gas);
+    try testing.expectEqual(@as(u128, 2_050), floored.max_fee_per_gas);
 }

@@ -52,7 +52,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
 - [x] `batcher/admin`: base/base admin JSON-RPC (start/stop/flush/status/throttle info) and
   `--stopped`, `--admin-port`, `--admin-addr`; one event loop serves admin + metrics.
-- [ ] `batcher`: `--num-confirmations` (free a slot only N blocks after inclusion), `--min-tip-cap`,
+- [x] `batcher`: `--num-confirmations` (free a slot only N blocks after inclusion), `--min-tip-cap`,
   `--min-basefee`, `--max-pending-transactions` (base/base txmgr flags).
 - [ ] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
   the channel time out on L1 (base/base `sub_safety_margin`).
@@ -139,3 +139,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   L1 evicts left a gap nothing re-sent). An underpriced same-nonce send bumps and resends on
   the next poll. Test: restart with pooled txs, then eviction (mutation-checked).
 - 2026-11-05: batcher admin API; backlog extended with remaining base/base batcher features.
+- 2026-11-05: txmgr confirmations (no resubmission of mined-but-unconfirmed txs), min tip /
+  base fee floors, `--max-pending-transactions` (default stays 8, base/base uses 1).
