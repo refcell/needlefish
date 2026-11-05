@@ -663,6 +663,9 @@ pub const Chain = struct {
             const da_bytes = if (limit_da) flz.estimated_size_bytes(raw) else 0;
             if (!chain.da_limits.admits(da_used_bytes, da_bytes)) continue;
             if (raw.ptr != tx.raw.ptr) chain.build_len += raw.len;
+            // The pool recovered the sender at admission; skip a second ecrecover.
+            chain.executor.known_sender = tx.sender;
+            defer chain.executor.known_sender = null;
             chain.executor.apply(building, raw) catch |err| switch (err) {
                 error.InvalidTransaction,
                 error.BlockGasExceeded,

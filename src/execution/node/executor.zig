@@ -20,6 +20,7 @@ const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
 const StateDb = @import("state_db.zig").StateDb;
 const op_rules = @import("executor_op.zig");
+const senders_module = @import("senders.zig");
 
 const Address = [20]u8;
 const Hash = [32]u8;
@@ -45,6 +46,8 @@ pub const Config = struct {
     transactions_max: u32 = 1 << 14,
     evm: evm.env.Config = .{},
     limits: evm.state.Limits = .{},
+    /// Extra threads recovering a block's senders up front in `execute_block` (0: inline).
+    recovery_threads: u32 = 0,
 };
 
 /// Block context, from a header or from payload attributes when building.
@@ -92,6 +95,11 @@ pub const Executor = struct {
     arena: std.heap.FixedBufferAllocator,
     transactions_max: u32,
     recoverer: consensus.Recoverer,
+    recovery_threads: u32,
+    /// Senders recovered up front by `execute_block` (one per transaction).
+    senders: []?primitives.Address,
+    /// The sender of the transaction being applied, when already known.
+    known_sender: ?primitives.Address = null,
     /// Index of the last transaction rejected by `execute_block`.
     invalid_index: ?u32 = null,
 
@@ -112,7 +120,10 @@ pub const Executor = struct {
         evm_config.chain_id = spec.chain_id;
         machine.* = try evm.Evm.init(allocator, evm_config, state);
         errdefer machine.deinit(allocator);
+        assert(config.recovery_threads <= senders_module.threads_max);
         const scratch = try allocator.alloc(u8, config.scratch_bytes);
+        errdefer allocator.free(scratch);
+        const senders = try allocator.alloc(?primitives.Address, config.transactions_max);
         return .{
             .spec = spec,
             .db = db,
@@ -122,10 +133,13 @@ pub const Executor = struct {
             .arena = std.heap.FixedBufferAllocator.init(scratch),
             .transactions_max = config.transactions_max,
             .recoverer = consensus.recover_address,
+            .recovery_threads = config.recovery_threads,
+            .senders = senders,
         };
     }
 
     pub fn deinit(executor: *Executor, allocator: std.mem.Allocator) void {
+        allocator.free(executor.senders);
         allocator.free(executor.scratch);
         executor.machine.deinit(allocator);
         allocator.destroy(executor.machine);
@@ -144,12 +158,21 @@ pub const Executor = struct {
     ) Error!Executed {
         executor.invalid_index = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        const recovered = executor.recovery_threads > 0;
+        if (recovered) {
+            const senders = executor.senders[0..transactions.len];
+            const threads = executor.recovery_threads;
+            senders_module.recover(transactions, senders, executor.recoverer, threads);
+        }
         var building = try executor.begin_block(block);
         errdefer executor.abort_block();
+        defer executor.known_sender = null;
         for (transactions, 0..) |raw, index| {
             executor.invalid_index = @intCast(index);
+            executor.known_sender = if (recovered) executor.senders[index] else null;
             try executor.apply(&building, raw);
         }
+        executor.known_sender = null;
         executor.invalid_index = null;
         return executor.finish_block(&building, withdrawals);
     }
@@ -384,8 +407,8 @@ pub const Executor = struct {
     /// Converts a decoded envelope into the evm's transaction environment.
     fn tx_env(executor: *Executor, envelope: Envelope, raw: []const u8) Error!TxEnv {
         if (envelope == .deposit) return executor.deposit_env(envelope.deposit);
-        const sender = envelope.recover_sender(executor.recoverer) orelse
-            return error.InvalidTransaction;
+        const sender = executor.known_sender orelse
+            envelope.recover_sender(executor.recoverer) orelse return error.InvalidTransaction;
         var tx: TxEnv = .{
             .tx_type = @fromBackingInt(@intCast(@backingInt(envelope.tx_type()))),
             .caller = sender.bytes,

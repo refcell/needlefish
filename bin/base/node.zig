@@ -94,6 +94,14 @@ fn authrpc_address(flags: Flags) ?io.Address {
     return io.Address.ip4(flags.http_addr, port);
 }
 
+/// Default limits, plus one sender-recovery thread per spare core (at most 7).
+fn limits() base.execution.node.service.Limits {
+    var result: base.execution.node.service.Limits = .{};
+    const cores: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+    result.executor.recovery_threads = @min(cores -| 1, 7);
+    return result;
+}
+
 fn now_ns(context: ?*anyopaque) u64 {
     const os_io: *io.IO = @ptrCast(@alignCast(context.?));
     return os_io.now_realtime_ns();
@@ -139,6 +147,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .authrpc_address = authrpc_address(flags),
         .jwt_secret = secret,
         .data_path = data_path,
+        .limits = limits(),
     });
     defer service.deinit();
     _ = try service.start();
