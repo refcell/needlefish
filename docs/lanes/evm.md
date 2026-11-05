@@ -115,7 +115,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   overlay lookups dominate after the interpreter; try a flat open-addressed slot table.
 - [ ] Performance: frame entry copies `Frame` by value (`run` local); measure the call loop
   with a pointer-based frame and keep it if `evm: call loop` improves.
-- [ ] Fuzz: differential opcode fuzz of the arithmetic family (DIV/SDIV/MOD/SMOD/ADDMOD/
+- [x] Fuzz: differential opcode fuzz of the arithmetic family (`arith_fuzz.zig`) (DIV/SDIV/MOD/SMOD/ADDMOD/
   MULMOD/EXP/SIGNEXTEND/shifts) through the interpreter against reference formulas.
 - [x] Performance: compare with revm on the same machine (snailtracer: revm 31-46 ms,
   needlefish 27 ms after the `uint.zig` division rewrite; docs/PERF.md).
