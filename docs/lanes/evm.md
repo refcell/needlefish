@@ -111,6 +111,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `evm: snailtracer` in `zig build bench`, ~50 ms / 166M gas, docs/PERF.md).
 - [x] Performance: profile snailtracer (interpreter loop ~80%, memory ops ~15%, keccak ~2%;
   docs/PERF.md).
+- [ ] Performance: erc20/storage path — the state slot map (`State.slot_for`, wyhash) and
+  overlay lookups dominate after the interpreter; try a flat open-addressed slot table.
+- [ ] Performance: frame entry copies `Frame` by value (`run` local); measure the call loop
+  with a pointer-based frame and keep it if `evm: call loop` improves.
+- [ ] Fuzz: differential opcode fuzz of the arithmetic family (DIV/SDIV/MOD/SMOD/ADDMOD/
+  MULMOD/EXP/SIGNEXTEND/shifts) through the interpreter against reference formulas.
 - [x] Performance: compare with revm on the same machine (snailtracer: revm 31-46 ms,
   needlefish 27 ms after the `uint.zig` division rewrite; docs/PERF.md).
 
