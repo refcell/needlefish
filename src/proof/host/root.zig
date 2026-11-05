@@ -7,6 +7,7 @@ pub const store = @import("store.zig");
 pub const handler = @import("handler.zig");
 pub const archive = @import("archive.zig");
 pub const offline = @import("offline.zig");
+pub const rpc_source = @import("rpc_source.zig");
 
 pub const Store = store.Store;
 pub const BootValues = store.BootValues;
@@ -16,4 +17,5 @@ pub const Source = handler.Source;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("host_test.zig");
+    _ = @import("rpc_source_test.zig");
 }

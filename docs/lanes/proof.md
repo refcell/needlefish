@@ -106,12 +106,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Offline replay uses one canonical archive file (`host/archive.zig`, "NFPA": sorted
   keys, LE lengths, strict decoder) instead of a disk KV store; the CLI reads and writes
   it through `utilities.io`.
+- RPC source: raw `debug_getRaw*` encodings (no JSON re-encoding); the payload witness is
+  `debug_executionWitness(parent + 1)` of the canonical child (base/base calls
+  `debug_executePayload`, which the needlefish node lacks); on a dishonest chain the client
+  fails with a missing preimage instead of proving a wrong state. Blobs and single
+  preimages are `NotFound` until the beacon client exists.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host: RPC-backed source over the node's debug endpoints (SimIo HTTP test).
 - 2026-11-05: `base proof replay <archive>`: offline client run over a recorded archive.
 - 2026-11-05: host: canonical preimage archive for record/replay (strict decoder, fuzz).
 - 2026-11-05: `proof/e2e` landed: real derive + execute of 3 L2 blocks through the host.
