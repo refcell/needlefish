@@ -37,6 +37,18 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] Real-process interop on the all-Zig devnet (`just devnet up`, kqueue sockets),
+  checked by hand on 2026-11-05:
+  1. As scripted (enode bootnode, discovery off): the verifier CL's unsafe head tracked
+     the sequencer (54 vs 53) ahead of its safe head (49).
+  2. Both CLs rerun with discovery on, the verifier given only the sequencer's ENR plus
+     `--p2p.bootstore`: found over real UDP, unsafe heads equal (152 / 152, safe 127),
+     and the bootstore file was written with the sequencer's ENR after 60 s.
+  3. Verifier restarted with only the bootstore: gossip resumed (unsafe 215 = sequencer,
+     safe 209). Not conclusive for the file alone, since the sequencer may redial; the
+     sim DST covers that.
+  Gap for the consensus lane: the CL RPC server does not mount the `opp2p_*` methods
+  (`p2p.rpc`), so `opp2p_peers` answers "method not found".
 - [x] In-process interop (`interop_test.zig`): two full `Network`s find each other via discv5
   over SimIo UDP only (ENR bootnodes, no enode), gossip randomized Ecotone (v3) and Isthmus
   (v4) blocks both ways, and every received block round-trips through the consensus
@@ -361,3 +373,4 @@ behind a small interface and switch later.
 - 2026-11-05: bootstore file persistence through utilities.io (StoreFile + crash fuzz + restart DST).
 - 2026-11-05: --p2p.bootnodes-file read through the io layer.
 - 2026-11-05: identify peerstore + opp2p_peers(false) disconnected peers.
+- 2026-11-05: devnet real-process interop checked (enode, discv5 ENR, bootstore restart).
