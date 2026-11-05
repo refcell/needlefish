@@ -17,6 +17,7 @@ const usage =
     \\usage: base consensus --rollup-config ROLLUP.json --l1 URL --l2 URL --l2-jwt FILE
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
     \\         [--rpc.ws-enabled [--rpc.ws-port P]] [--rpc.enable-admin] [--rpc.dev-enabled]
+    \\         [--rpc.disabled]
     \\         [--l1.verifier-confs N] [--sequencer.l1-confs N] [--sequencer.recover]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
@@ -43,6 +44,8 @@ pub const Flags = struct {
     rpc_port: u16 = 7545,
     /// WebSocket RPC on its own port (base/base serves it on the HTTP port).
     rpc_ws_enabled: bool = false,
+    /// No HTTP or WebSocket RPC server at all (base/base `--rpc.disabled`).
+    rpc_disabled: bool = false,
     rpc_admin: bool = false,
     /// base/base defaults: derive from the L1 head, pick origins 4 blocks below it.
     verifier_l1_confs: u64 = 0,
@@ -127,6 +130,10 @@ fn apply_switch(flags: *Flags, arg: []const u8) bool {
     }
     if (std.mem.eql(u8, arg, "--rpc.ws-enabled")) {
         flags.rpc_ws_enabled = true;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--rpc.disabled")) {
+        flags.rpc_disabled = true;
         return true;
     }
     if (std.mem.eql(u8, arg, "--sequencer.stopped")) {
@@ -265,7 +272,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .l1_beacon = flags.l1_beacon,
         .l2 = flags.l2.?,
         .jwt_secret = secret,
-        .rpc_address = io.Address.ip4(flags.rpc_addr, flags.rpc_port),
+        .rpc_address = if (flags.rpc_disabled)
+            null
+        else
+            io.Address.ip4(flags.rpc_addr, flags.rpc_port),
         .sequencer = flags.sequencer,
         .driver = .{
             .sequencer = flags.sequencer,
@@ -283,7 +293,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .follow_source = flags.source_l2_rpc,
         .rpc_admin = flags.rpc_admin,
         .rpc_dev = flags.rpc_dev,
-        .ws_address = if (flags.rpc_ws_enabled)
+        .ws_address = if (flags.rpc_ws_enabled and !flags.rpc_disabled)
             io.Address.ip4(flags.rpc_addr, flags.rpc_ws_port)
         else
             null,
@@ -414,6 +424,9 @@ test "consensus: flags" {
     try std.testing.expect(with_ws.rpc_ws_enabled);
     try std.testing.expectEqual(@as(u16, 9546), with_ws.rpc_ws_port);
     try std.testing.expect(!with_ws.rpc_admin and !with_ws.rpc_dev);
+    try std.testing.expect(!with_ws.rpc_disabled);
+    const no_rpc = try parse_flags(&(ws_args ++ [_][]const u8{"--rpc.disabled"}));
+    try std.testing.expect(no_rpc.rpc_disabled and no_rpc.rpc_ws_enabled);
     const admin_args = required ++ [_][]const u8{ "--rpc.enable-admin", "--rpc.dev-enabled" };
     const with_admin = try parse_flags(&admin_args);
     try std.testing.expect(with_admin.rpc_admin and with_admin.rpc_dev);

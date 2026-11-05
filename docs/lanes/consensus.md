@@ -66,7 +66,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] `--l1.verifier-confs` (default 0) / `--sequencer.l1-confs` (default 4): derive and
     pick origins at the L1 head minus confirmations
   - [x] `--sequencer.recover` (initial recover mode)
-  - [ ] `--rpc.disabled`
+  - [x] `--rpc.disabled`
   - [x] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
@@ -232,6 +232,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: `--rpc.disabled` starts no HTTP or WebSocket RPC server (`Options.rpc_address` is optional; `start` returns null and logs "rpc disabled").
 - 2026-11-05: safedb: `service/safedb_store.zig` persists the L1->safe-head entries (`--safedb.path`) as one crc-checked image (`magic | count | 80-byte records | crc32`) through `store_file`; `SafeDB.version` drives writes; the driver waits for the load.
 - 2026-11-05: devnet smoke passes at native 200 ms blocks on main (Denim at genesis from batcher-devnet, EL fixes from node): 25 blocks/5 s, verifier derives, load test 99/99.
 - 2026-11-05: confs: `service/conf_depth.zig` hides L1 blocks within N of the head from derivation (`--l1.verifier-confs`, no head: no gate) and from sequencer origin selection (`--sequencer.l1-confs`, default 4, no head: nothing); `--sequencer.recover`.

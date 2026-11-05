@@ -99,7 +99,8 @@ pub const Options = struct {
     l1_beacon: ?Address = null,
     l2: Address,
     jwt_secret: jwt.Secret,
-    rpc_address: Address,
+    /// HTTP JSON-RPC; no RPC server at all when null (`--rpc.disabled`).
+    rpc_address: ?Address,
     /// Follow mode (`--source-l2-rpc`): insert blocks from this source node's execution RPC
     /// instead of deriving them.
     follow_source: ?Address = null,
@@ -851,10 +852,19 @@ pub fn Node(comptime IO: type) type {
         }
 
         /// Starts serving RPC; returns the bound address.
-        pub fn start(node: *Self) !Address {
-            const address = try node.rpc_server.listen(node.options.rpc_address);
-            node.logger.log(.info, "consensus", "rpc listening", .{ .port = address.port });
-            assert(address.family == node.options.rpc_address.family);
+        /// Binds the servers and starts the background services; returns the RPC address
+        /// (null when RPC is disabled).
+        pub fn start(node: *Self) !?Address {
+            const address: ?Address = if (node.options.rpc_address) |wanted| blk: {
+                const bound = try node.rpc_server.listen(wanted);
+                node.logger.log(.info, "consensus", "rpc listening", .{ .port = bound.port });
+                assert(bound.family == wanted.family);
+                break :blk bound;
+            } else blk: {
+                assert(node.options.ws_address == null); // `--rpc.disabled` disables both.
+                node.logger.log(.info, "consensus", "rpc disabled", .{});
+                break :blk null;
+            };
             if (node.ws_rpc) |ws_rpc| {
                 const bound = try ws_rpc.listen(node.options.ws_address.?);
                 node.logger.log(.info, "consensus", "ws rpc listening", .{ .port = bound.port });
@@ -1486,7 +1496,7 @@ test "node: observes the upgrade signal and serves base_upgradeReadiness" {
         .l1 = harness.address,
         .l2 = harness.address,
         .jwt_secret = .{ .bytes = @splat(7) },
-        .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
+        .rpc_address = null, // `--rpc.disabled`: the test calls the router directly.
         .http_client = harness_module.client_options,
         .version = "1.5.0",
         .upgrade_signal = .{ .contract = @splat(0xc0) },
@@ -1499,7 +1509,8 @@ test "node: observes the upgrade signal and serves base_upgradeReadiness" {
     var out: std.Io.Writer = .fixed(&buffer);
     _ = rollup_rpc.NodeRouter.handle(&node.backend, request, &out);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "-32006") != null);
-    _ = try node.start();
+    try testing.expectEqual(@as(?sim.Address, null), try node.start());
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "rpc disabled") != null);
     for (0..20) |_| {
         node.tick();
         harness.world.run_for_ns(std.time.ns_per_s / 10);
