@@ -49,11 +49,16 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     `base consensus` subcommand with the docs/DEVNET.md flags
   - [x] sequencer: next-block attributes on the unsafe head (origin selection, consistency
     check, pool gating; resets reported to the caller)
-  - [ ] service node stage 2: startup forkchoice, derivation → engine queue, safedb updates,
-    finalization; sequencer block building
+  - [x] service driver: startup forkchoice → synchronize + pipeline reset, derivation →
+    consolidate, safedb + finalizer, sequencer build → seal (one loop, client-generic)
+  - [ ] service node stage 2: run the driver in `Node` over real providers (L1Provider,
+    BlobProvider + KZG, L2Provider with `l2_block_by_number`, polling engine client)
   - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
+- Driver: one tick-driven loop instead of base/base's actors; the engine queue owns the
+  heads. Sequencer builds at the block's timestamp and seals right after the payload id
+  (base/base seals on the next tick at block time); good enough until gossip lands.
 - Frame `is_last` byte other than 0/1 is rejected (OP Stack spec / op-node), stricter
   than base/base's `== 1`.
 - Decoded frames borrow the input (zero-copy); channels copy frame data into allocator-owned
@@ -138,6 +143,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   fallback builds with the leading-deposits prefix of the attributes' transactions.
 
 ## Log
+- 2026-11-05: service: driver (startup, derivation, finalization, sequencing), fuzzed.
 - 2026-11-05: sequencer: next-block attributes (build_on, pool gating), fuzzed.
 - 2026-11-05: service: node stage 1 (heads + RPC); bin: `base consensus` subcommand.
 - 2026-11-05: sources: L2 provider label queries; service: L1 head watcher.

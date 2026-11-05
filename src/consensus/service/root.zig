@@ -3,9 +3,11 @@
 
 pub const l1_watcher = @import("l1_watcher.zig");
 pub const node = @import("node.zig");
+pub const driver = @import("driver.zig");
 pub const Node = node.Node;
 
 test {
     _ = l1_watcher;
     _ = node;
+    _ = driver;
 }
