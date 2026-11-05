@@ -11,6 +11,24 @@ const montgomery = @import("montgomery.zig");
 const bls_bench = @import("bls12_381/bench.zig");
 const modexp = @import("modexp.zig");
 const p256 = @import("p256.zig");
+const kzg = @import("kzg/root.zig");
+
+const kzg_bench_input_hex = "01e798154708fe7789429634053cbf9f99b619f9f084048927333fce637f" ++
+    "549b564c0a11a0f704f4fc3e8acfe0f8245f0ad1347b378fbf96e206da11a5d3630624d25032e67a7e6a" ++
+    "4910df5834b8fe70e6bcfeeac0352434196bdf4b2485d5a18f59a8d2a1a625a17f3fea0fe5eb8c896db3" ++
+    "764f3185481bc22f91b4aaffcca25f26936857bc3a7c2539ea8ec3a952b7873033e038326e87ed3e1276" ++
+    "fd140253fa08e9fc25fb2d9a98527fc22a2c9612fbeafdad446cbc7bcdbdcd780af2c16a";
+
+fn bench_kzg_point_evaluation(iterations: u32) u64 {
+    var input: [kzg.input_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&input, kzg_bench_input_hex) catch unreachable; // Constant.
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const output = kzg.precompile_point_evaluation(&input) catch unreachable; // Valid.
+        accumulator +%= output[31];
+    }
+    return accumulator;
+}
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const Bn254Fp = montgomery.Field(
@@ -372,6 +390,7 @@ fn bench_verify_std(iterations: u32) u64 {
 }
 
 pub const cases = [_]Case{
+    .{ .name = "kzg/point evaluation", .iterations = 200, .run = bench_kzg_point_evaluation },
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
     .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },

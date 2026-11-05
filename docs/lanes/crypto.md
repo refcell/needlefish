@@ -16,7 +16,11 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
 - [ ] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets, sqrt_ratio SSWU,
   dedicated Fp squaring and lazy reduction in Fp2/Fp6 (G1 mul and map are ~2-3x blst).
-- [ ] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
+- [x] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
+- [ ] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
+  Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
+  compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
+- [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [ ] Benchmarks for each; target parity with or better than best-known C implementations.
 
@@ -140,6 +144,11 @@ fallback but hot paths should be our own, optimized implementations.
 - `montgomery.Field.from_int_comptime` now reduces negative comptime ints (needed for
   Z = -(2 + u)).
 
+- Point evaluation checks e(C - [y]G1 + [z]proof, G2) * e(-proof, [tau]G2) == 1 (equivalent to
+  c-kzg's form, but both G2 inputs fixed and no G2 scalar mul); [tau]G2 is a decoded constant
+  checked against the setup in tests. Vectors: all 114 fixed-length c-kzg-4844
+  verify_kzg_proof cases (the 8 wrong-length ones cannot occur through the precompile).
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
@@ -150,3 +159,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: secp256k1: ecrecover/precompile 0x01, tx recovery (low s), RFC 6979 signing, public key/address; vectors, seeded differential fuzz vs std (mul, recovery, ecdsa verify), coverage fuzz of precompile vs std reference; bench (ReleaseFast, Apple M4, loaded host): ecrecover 28.8us (std verify 62us), sign 10.7us (std 75us), public_key 8.9us (std 65us).
 - 2026-11-05: modexp: pre-Osaka moduli above 1024 bytes via caller-provided scratch (`precompile_modexp_run_with_scratch`, `scratch_limbs_needed`); 1025-byte Berlin example (5547 gas) and differential fuzz vs std big ints for 1025..3000-byte odd/even moduli.
 - 2026-11-05: BLS12-381 + EIP-2537 precompiles 0x0b-0x11 (official geth vectors incl. fail cases and gas), RFC 9380 hash-to-curve G1/G2 + expand_message_xmd vectors, ZCash compressed G1/G2, seeded + coverage fuzz; bench (ReleaseFast, M-series): g1 add 477ns, g1 mul 87us, g2 mul 233us, pairing-2 0.72ms, map_fp_to_g1 95us, g1 msm-64 1.62ms.
+- 2026-11-05: kzg verify_kzg_proof + 0x0A precompile on BLS12-381; c-kzg + geth vectors; 1.01 ms per call (1.26 ms before the G2-free rearrangement). Fixed kzg tests not running (missing refAllDecls).

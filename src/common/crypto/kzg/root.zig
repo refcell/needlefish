@@ -3,8 +3,7 @@
 //! Holds the public Ethereum KZG ceremony output (the c-kzg-4844
 //! `trusted_setup.txt`: 4096 G1 points in Lagrange form and 65 G2 points in
 //! monomial form, compressed) and the input framing of the point evaluation
-//! precompile (address 0x0A). The pairing check itself lives with the BLS12-381
-//! code and plugs in through `precompile_point_evaluation`.
+//! precompile (address 0x0A). Proof verification lives in `verify.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -102,26 +101,15 @@ pub const success_output: [64]u8 = blk: {
     break :blk out;
 };
 
-/// Point evaluation precompile with the proof check injected:
-/// `verify(commitment, z, y, proof)` must return true iff the KZG proof is valid
-/// and both points decode to G1 subgroup elements.
-pub fn precompile_point_evaluation(
-    input: []const u8,
-    comptime verify: fn (
-        commitment: *const [bytes_per_commitment]u8,
-        z: *const [32]u8,
-        y: *const [32]u8,
-        proof: *const [bytes_per_proof]u8,
-    ) bool,
-) PrecompileError![64]u8 {
-    const parsed = try parse_input(input);
-    if (!verify(&parsed.commitment, &parsed.z, &parsed.y, &parsed.proof)) {
-        return error.VerificationFailed;
-    }
-    return success_output;
-}
+pub const verify = @import("verify.zig");
+pub const verify_kzg_proof = verify.verify_kzg_proof;
+pub const precompile_point_evaluation = verify.precompile_point_evaluation;
 
 const testing = std.testing;
+
+test {
+    testing.refAllDecls(@This());
+}
 const Prng = @import("../../../testing/prng.zig").Prng;
 
 test "kzg: trusted setup layout" {
@@ -179,20 +167,11 @@ test "kzg: precompile framing (seeded)" {
     }
 }
 
-fn reject_all(
-    _: *const [bytes_per_commitment]u8,
-    _: *const [32]u8,
-    _: *const [32]u8,
-    _: *const [bytes_per_proof]u8,
-) bool {
-    return false;
-}
-
 fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     var buffer: [256]u8 = undefined;
     const length = smith.slice(&buffer);
-    const result = precompile_point_evaluation(buffer[0..length], reject_all);
-    try testing.expect(std.meta.isError(result));
+    const result = parse_input(buffer[0..length]);
+    if (length != input_length) try testing.expect(std.meta.isError(result));
 }
 
 test "kzg: coverage-guided fuzz of framing" {
