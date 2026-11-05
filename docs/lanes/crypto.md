@@ -27,6 +27,12 @@ fallback but hot paths should be our own, optimized implementations.
 - Prime fields share `montgomery.Field(limbs, modulus)`: comptime-derived constants, CIOS
   multiplication, masked final subtraction, Fermat inverse, p = 3 mod 4 sqrt.
 
+- KZG setup: the public c-kzg-4844 `trusted_setup.txt` is stored as raw compressed bytes in
+  `kzg/trusted_setup.bin` (4096 G1 Lagrange + 65 G2 monomial points, 202848 bytes,
+  sha256 2721e57b...6a7e, asserted in tests). G1 monomial points (EIP-7594 cells) are
+  omitted until PeerDAS work needs them.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
+- 2026-11-05: kzg: embedded public trusted setup, versioned hash, 0x0A input framing + output; pairing check plugs in once BLS12-381 lands.
