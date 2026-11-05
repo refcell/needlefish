@@ -15,11 +15,12 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
 - [x] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
-- [ ] bn254 perf: lazy-reduction Fp2/Fp12, precomputed G2 line coefficients, mixed-affine
-  Miller adds, batch normalization of the GLV tables.
+- [x] bn254 perf: lazy-reduction Fp2 (pairing 559->494us). Precomputed G2 lines do not apply
+  (EVM pairing inputs are variable); Fp6-level lazy reduction does not fit (4p^2 headroom only).
 - [x] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
-- [ ] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets, sqrt_ratio SSWU,
-  dedicated Fp squaring and lazy reduction in Fp2/Fp6 (G1 mul and map are ~2-3x blst).
+- [x] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets (done); dedicated
+  squaring and lazy Fp2 evaluated, both slower on M4 (not adopted).
+- [ ] BLS12-381: single-exponentiation sqrt_ratio in SSWU (map_fp_to_g1 41us, ~2 pows today).
 - [x] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
 - [x] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
