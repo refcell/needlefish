@@ -11,7 +11,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
 - [ ] Benchmarks: state root of N updates, random reads, commit latency. (trie cases landed in
   `trie/bench.zig`; commit latency waits on the storage engine)
-- [ ] Durable database facade (`db/database.zig`): journal block/head entries, state moves
+- [x] Durable database facade (`db/database.zig`): journal block/head entries, state moves
   only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
 - [ ] Real storage backend over `utilities.io` (io_uring/kqueue) once io lands.
 - [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
@@ -56,6 +56,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   previous format never validates. Journal: hash-chained entries, logical positions, clean
   end vs corrupt classification, valid prefix accepted after torn tail. Checkpoints: pulled
   producer, per-block checksums. Journal space freed only after all superblock copies durable.
+- `DatabaseType(Storage)`: one operation per journal entry (block insert or head move);
+  apply in memory first, journal only on success; state moves only on head moves; the
+  database (not ChainStore) drives block retention so live and checkpoint-rebuilt stores
+  match; checkpoints = header + State snapshot + retained blocks, started when the journal is
+  half full and the queue is empty. Genesis = first `execute_and_commit` after format.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -71,4 +76,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: evm backend adapter (Database vtable + commit_evm fold into Overlay).
 - 2026-11-05: storage engine (superblock, journal, A/B checkpoints, engine) with seeded
   crash/torn-write/bit-rot fault injection over SimStorage; mutation-checked.
+- 2026-11-05: durable database facade over the storage engine; crash-recovery tests
+  (24 seeds x 4 crashes) recover a head/root between last acked and last submitted op.
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
