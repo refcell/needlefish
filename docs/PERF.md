@@ -538,6 +538,24 @@ Moving the commit off the block's critical path was evaluated and not done: at ~
 200 ms slot it does not pay for a second history state (proofs at the head would have to
 wait or fall back to live state) and the ordering it adds under DST.
 
+## 2026-11-05 node Engine API slot at 200 ms (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "node: 200"`: one Denim slot is FCU with
+attributes (build), getPayload, the follower's newPayload, then FCU on both nodes; 500
+transfers (10.5 Mgas) plus the L1-info stand-in and BaseTime deposits, forced through the
+attributes; recovery threads as `base node` (cores - 1, at most 7). In-memory state.
+
+| step | before | after |
+|---|---|---|
+| whole slot | 56.5 ms | 11.7 ms (894 Mgas/s) |
+| build (FCU with attributes) | 18-44 ms | 5-7 ms |
+| follower newPayload | 6-12 ms | 6 ms |
+| adopting FCUs (builder + follower) | 17-33 ms each | 0.1-0.2 ms each |
+
+Fixes: forkchoice pool pruning no longer recovers every included sender (the executor
+reports senders and the chain keeps the last 4 blocks'); forced attribute transactions
+are recovered in parallel. Well under the 150 ms seal offset.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

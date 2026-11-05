@@ -42,9 +42,10 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] Engine API for the regular builder at 200 ms: serve `src/builder` payload jobs
   (FCU starts, getPayload seals, new FCU cancels): `--builder.enabled`, `Chain.payload_builder`
   (nf-builder, 2026-11-05).
-- [ ] FCU+getPayload+newPayload latency benchmark at 200 ms well under the 150 ms seal offset;
-  record in docs/PERF.md.
-- [ ] rpc: Denim `timestampMs` on blocks and BaseTime-aware pending/`eth_call` timestamps.
+- [x] FCU+getPayload+newPayload latency benchmark at 200 ms well under the 150 ms seal offset;
+  record in docs/PERF.md (`node/bench_engine.zig`: 11.7 ms per 10.5 Mgas slot).
+- [x] rpc: Denim `timestampMs` on blocks, `blockTimestampMs` on transactions and logs.
+- [ ] Durable-mode slot bench (cost of `settle_head` unwind + re-apply per slot).
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
@@ -86,6 +87,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: Denim RPC timestamps as base/base `rpc-types`: blocks get `timestampMs`, transactions and logs (incl. receipt logs, eth_getLogs) get `blockTimestampMs`, from the validated tx[1] BaseTime deposit (`format.timestamp_ms`), omitted otherwise. Not ported: base/base's 256-entry LRU (decoding tx[1] per request is cheap) and pending-block timestamps (no pending block here).
 - 2026-11-05: (reported by dst-fuzz) durable restart resumed on the last executed block, not the forkchoice head. Fix: `Chain.settle_head` keeps the database head at the forkchoice head at rest in durable mode. After a payload build (`start_build`) or a valid newPayload stores a non-head block, its changeset is unwound immediately; the adopting FCU re-applies it. Side builds (`build_block`, debug_executePayload/witness) keep the state at the built block as before. Safe/finalized labels are still not persisted (no database label API); recorded for later.
 - 2026-11-05: 200 ms slot bench (`node/bench_engine.zig`, Denim spec, 500 transfers = 10.5 Mgas forced via attributes, builder + follower, recovery threads as `base node`): 56 ms -> 11.7 ms per slot (build ~6 ms, import ~6 ms, adopting FCUs ~0.15 ms; Apple M-series, ReleaseFast). Fixes: forkchoice pool pruning recovered every included sender again (~17 ms per FCU per node); the executor now reports senders (`Executed.senders`) and Chain keeps the last 4 blocks' senders (`RecentSenders`). The build path recovers forced attribute transactions in parallel (`Executor.apply_list`, shared with `execute_block`).
 - 2026-11-05: (reported by nf-consensus) chainspec from genesis now maps `config.base` azul/beryl/cobalt/denim/everest into the upgrade schedule (Zenith has no execution rules, ignored) and reads `config.blockTime` (base/base extra field) into `block_time_seconds`; zero is `InvalidBlockTime`. Small additive edit in `common/genesis` (Config.block_time + JSON key).
