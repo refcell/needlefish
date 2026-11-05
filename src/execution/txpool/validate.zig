@@ -376,7 +376,7 @@ var test_kzg_workspace: kzg_blob.Workspace = undefined;
 var test_kzg_batch: kzg_blob.BatchStorage(consensus.sidecar.blobs_per_tx_max) = .{};
 var test_blob: kzg_blob.Blob = undefined;
 var test_blob_list: [bytes_per_blob + 8]u8 = undefined;
-var test_pooled: [bytes_per_blob + 1024]u8 = undefined;
+var test_pooled: [bytes_per_blob + 8192]u8 = undefined;
 var test_scratch: [1024]u8 = undefined;
 
 test "validate: blob proofs verified with KZG" {
@@ -431,4 +431,80 @@ test "validate: blob proofs verified with KZG" {
         const result = verify_blob_proofs(raw, verifier);
         if (round == 0) try result else try testing.expectError(error.BlobProofInvalid, result);
     }
+}
+
+const kzg_cells = @import("../../common/crypto/kzg/root.zig").cells;
+const cells_per_blob = consensus.sidecar.cells_per_ext_blob;
+var test_cell_storage: kzg_cells.Settings.Storage = undefined;
+var test_cell_workspace: kzg_cells.Workspace = undefined;
+var test_cell_batch: kzg_cells.VerifyStorage(cells_per_blob) = .{};
+var test_cells: kzg_cells.Cells = undefined;
+var test_cell_proofs: kzg_cells.Proofs = undefined;
+var test_cell_proof_list: [cells_per_blob * 49 + 8]u8 = undefined;
+
+/// A pooled v1 (EIP-7594) blob transaction carrying `test_blob` and `test_cell_proofs`.
+fn cell_proof_transaction(commitment: *const kzg_blob.Commitment) ![]const u8 {
+    var hash_buffer: [64]u8 = undefined;
+    const tx: consensus.Eip4844 = .{
+        .chain_id = 1337,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 10,
+        .gas_limit = 21_000,
+        .to = primitives.Address.zero,
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+        .max_fee_per_blob_gas = 1,
+        .blob_versioned_hashes = consensus.HashList.build(
+            &hash_buffer,
+            &.{kzg_to_versioned_hash(commitment)},
+        ),
+    };
+    const envelope = try consensus.tx.sign(tx, test_key);
+    var commitment_list: [64]u8 = undefined;
+    const pooled: consensus.PooledBlobTx = .{ .signed = envelope.eip4844, .sidecar = .{
+        .version = .eip7594,
+        .blobs = consensus.sidecar.BlobList.build(&test_blob_list, &.{test_blob}),
+        .commitments = consensus.sidecar.CommitmentList.build(&commitment_list, &.{commitment.*}),
+        .proofs = consensus.sidecar.ProofList.build(&test_cell_proof_list, &test_cell_proofs),
+    } };
+    return pooled.encode_to(&test_pooled);
+}
+
+test "validate: EIP-7594 cell proofs verified with a cell verifier" {
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
+    const settings = try kzg_blob.Settings.init(&test_kzg_storage);
+    // Full cell settings: the test computes the proofs with FK20.
+    const cell_settings = try kzg_cells.Settings.init(&test_cell_storage);
+    var verifier: consensus.sidecar.KzgVerifier = .{
+        .settings = &settings,
+        .workspace = &test_kzg_workspace,
+        .batch = &test_kzg_batch,
+    };
+    @memset(&test_blob, 0);
+    for (0..kzg_blob.field_elements) |element| test_blob[element * 32 + 31] = @truncate(element);
+    const workspace = &test_kzg_workspace;
+    const commitment = try kzg_blob.blob_to_kzg_commitment(&settings, workspace, &test_blob);
+    const cell_workspace = &test_cell_workspace;
+    try kzg_cells.compute_cells_and_kzg_proofs(
+        &cell_settings,
+        cell_workspace,
+        &test_blob,
+        &test_cells,
+        &test_cell_proofs,
+    );
+    var raw = try cell_proof_transaction(&commitment);
+    // Without cell state the proofs are not checked (accepted as before).
+    try verify_blob_proofs(raw, verifier);
+    verifier.cells = .{
+        .settings = &cell_settings,
+        .workspace = cell_workspace,
+        .batch = &test_cell_batch,
+        .cells = &test_cells,
+    };
+    try verify_blob_proofs(raw, verifier);
+    test_cell_proofs[3] = test_cell_proofs[4]; // A proof for another cell.
+    raw = try cell_proof_transaction(&commitment);
+    try testing.expectError(error.BlobProofInvalid, verify_blob_proofs(raw, verifier));
 }

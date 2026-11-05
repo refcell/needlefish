@@ -32,19 +32,30 @@ const db_module = @import("../db/root.zig");
 const io_storage = @import("../db/storage/io_storage.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const kzg_blob = @import("../../common/crypto/kzg/root.zig").blob;
+const kzg_cells = @import("../../common/crypto/kzg/root.zig").cells;
 
-/// Long-lived KZG verification memory (decoded setup, workspace, batch scratch).
+/// Long-lived KZG verification memory (decoded setups, workspaces, batch scratch) for
+/// v0 blob proofs and v1 (EIP-7594) cell proofs.
 const KzgMemory = struct {
     storage: kzg_blob.Settings.Storage,
     settings: kzg_blob.Settings,
     workspace: kzg_blob.Workspace,
     batch: kzg_blob.BatchStorage(consensus.sidecar.blobs_per_tx_max),
+    /// Verifier-only cell settings: the FK20 columns in `cell_storage` stay untouched.
+    cell_storage: kzg_cells.Settings.Storage,
+    cell_settings: kzg_cells.Settings,
+    cell_workspace: kzg_cells.Workspace,
+    cell_batch: kzg_cells.VerifyStorage(consensus.sidecar.cells_per_ext_blob),
+    cells: kzg_cells.Cells,
 
     fn create(allocator: std.mem.Allocator) !*KzgMemory {
         const memory = try allocator.create(KzgMemory);
         errdefer allocator.destroy(memory);
         memory.settings = try kzg_blob.Settings.init(&memory.storage);
         memory.batch = .{};
+        memory.cell_settings = try kzg_cells.Settings.init_verifier(&memory.cell_storage);
+        memory.cell_batch = .{};
+        assert(memory.cell_settings.columns == null);
         return memory;
     }
 
@@ -53,6 +64,12 @@ const KzgMemory = struct {
             .settings = &memory.settings,
             .workspace = &memory.workspace,
             .batch = &memory.batch,
+            .cells = .{
+                .settings = &memory.cell_settings,
+                .workspace = &memory.cell_workspace,
+                .batch = &memory.cell_batch,
+                .cells = &memory.cells,
+            },
         };
     }
 };

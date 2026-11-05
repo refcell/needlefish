@@ -15,7 +15,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
 - [x] `txpool/validate`: verify blob proofs with `common.consensus.sidecar.Sidecar.verify_kzg`
   (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
-- [ ] txpool: pass a `consensus.sidecar.CellVerifier` (`kzg.cells.Settings.init_verifier`) in
+- [x] txpool: pass a `consensus.sidecar.CellVerifier` (`kzg.cells.Settings.init_verifier`) in
   `KzgVerifier.cells` so v1 (EIP-7594) sidecars are verified instead of skipped.
 - [ ] txpool/evm: admit 0x79 using `common.consensus.eip8130_gas.compute` (intrinsic gas,
   `Input.worst_case` for admission/estimation, `max_payer_auth_cost` for block reservation).
@@ -55,6 +55,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: v1 (EIP-7594) blob sidecars are now KZG-verified on submission: the service's KzgMemory carries verifier-only cell settings (`kzg.cells.Settings.init_verifier`; FK20 columns untouched, so no RSS for them). A verifier without cell state still accepts v1 sidecars unchecked (tests, embedders).
 - 2026-11-05: `base node --datadir DIR` persists state and chain in `DIR/node.db` (journal + A/B checkpoints, io_storage over the node's IO) and resumes from it after a restart or crash; storage callbacks run from a 2 ms IO timer. Integration addition in the trie-db lane (additive): `IoStorage.process()` = `tick()` without the re-entrant `io.tick` (calling `tick` from an IO callback corrupted the kqueue completed queue). devnet.sh unchanged: cold `up` already wipes the datadirs, so a stale chain is never reopened (and would be refused: format id carries the genesis hash).
 - 2026-11-05: durable node state (`node/durable.zig`): the trie-db `db.database` owns the State, StateDb executes on it (`init_shared`), the chain journals each stored block right after execution and moves state on reorgs via database head moves (stored changesets, no re-execution). Restart restores the canonical retained blocks into the BlockStore (`Chain.restore`). Integration addition in the trie-db lane (additive): `Database.commit_applied` (insert + head move for a block whose changeset the caller already applied, one block_and_head entry; replay goes through the normal path). Decisions: the format id carries the genesis hash prefix (a datadir from another chain is refused); side branches are not restored after a restart (only the canonical retained chain); checkpoints are requested once the journal is half full.
 - 2026-11-05: incident: a local smoke test ran `pkill -f "base node"` and also killed another lane's running devnet ELs (`.devnet/`). Rule for this lane: smoke tests kill their own PIDs only, never by pattern.
