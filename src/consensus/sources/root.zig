@@ -18,6 +18,8 @@ pub const engine_json = @import("engine_json.zig");
 pub const l2_block = @import("l2_block.zig");
 pub const engine_client = @import("engine_client.zig");
 pub const EngineClient = engine_client.EngineClient;
+pub const l2_provider = @import("l2_provider.zig");
+pub const L2Provider = l2_provider.L2Provider;
 
 test {
     std.testing.refAllDecls(@This());
@@ -25,4 +27,5 @@ test {
     _ = @import("l1_provider_test.zig");
     _ = @import("blob_provider_test.zig");
     _ = @import("engine_test.zig");
+    _ = @import("l2_provider_test.zig");
 }

@@ -15,8 +15,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
   - [x] batch validity rules (singular, span, Holocene)
 - [x] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
-  - [ ] L2 chain provider (`l2_block_info_by_number`, system config by L2 hash) for the
-    attributes builder, and engine `getPayloadBodies`/`exchangeCapabilities` if needed.
+  - [x] L2 chain provider (`l2_block_info_by_number`/`_by_hash`, `system_config_by_l2_hash`)
+  - [ ] engine `getPayloadBodies`/`exchangeCapabilities` if needed
 - [x] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
@@ -108,6 +108,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 
 
 ## Log
+- 2026-11-05: sources: L2 chain provider; protocol: system config from L2 blocks.
 - 2026-11-05: sources: L1 JSON decoders, caching L1 provider, beacon blob provider, engine
   client with L2 block info.
 - 2026-11-05: sequencer: non-blocking L1 origin selector, fuzzed.

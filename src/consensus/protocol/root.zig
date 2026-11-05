@@ -10,6 +10,7 @@ pub const brotli = @import("brotli.zig");
 pub const rollup_config = @import("rollup_config.zig");
 pub const rollup_json = @import("rollup_json.zig");
 pub const system_config = @import("system_config.zig");
+pub const l2_system_config = @import("l2_system_config.zig");
 pub const log = @import("log.zig");
 pub const deposits = @import("deposits.zig");
 pub const l1_info = @import("l1_info.zig");
