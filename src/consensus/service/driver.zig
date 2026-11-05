@@ -117,6 +117,8 @@ pub const Driver = struct {
     sealing: ?AttributesWithParent = null,
     /// A build or seal task is queued.
     building: bool = false,
+    /// Runtime sequencer switch (`admin_startSequencer`/`admin_stopSequencer`).
+    sequencer_active: bool = false,
     stats: Stats = .{},
     /// The most recent failure of any kind, for logs; `error_sequence` counts them.
     last_error: ?anyerror = null,
@@ -151,6 +153,7 @@ pub const Driver = struct {
             .finalizer = finalizer,
             .selector = .init(rollup),
             .builder = .init(allocator, rollup, blob_schedule),
+            .sequencer_active = options.sequencer,
         };
         assert(driver.phase == .starting);
     }
@@ -178,7 +181,7 @@ pub const Driver = struct {
                 driver.derive(providers);
                 if (driver.phase != .running) return;
                 driver.finalize(providers.l1_finalized);
-                if (driver.options.sequencer) driver.sequence(providers, now_s);
+                if (driver.sequencer_active) driver.sequence(providers, now_s);
             },
         }
         assert(driver.queue.state.sync_state.is_ordered());
@@ -218,6 +221,32 @@ pub const Driver = struct {
         };
         driver.phase = .running;
         assert(driver.pipeline.origin() != null);
+    }
+
+    /// `admin_startSequencer`: resume sequencing on `unsafe_head`, the current unsafe head.
+    pub fn start_sequencer(driver: *Driver, unsafe_head: Hash) error{
+        NotSequencer,
+        AlreadyActive,
+        UnsafeHeadMismatch,
+        NotReady,
+    }!void {
+        if (!driver.options.sequencer) return error.NotSequencer;
+        if (driver.sequencer_active) return error.AlreadyActive;
+        if (driver.phase != .running) return error.NotReady;
+        const head = driver.queue.state.sync_state.unsafe_head.block_info.hash;
+        if (!head.eql(unsafe_head)) return error.UnsafeHeadMismatch;
+        driver.sequencer_active = true;
+        assert(driver.sequencer_active);
+    }
+
+    /// `admin_stopSequencer`: stop building; returns the unsafe head to resume from. A block
+    /// already being built is still sealed.
+    pub fn stop_sequencer(driver: *Driver) error{ NotSequencer, NotActive }!Hash {
+        if (!driver.options.sequencer) return error.NotSequencer;
+        if (!driver.sequencer_active) return error.NotActive;
+        driver.sequencer_active = false;
+        assert(!driver.sequencer_active);
+        return driver.queue.state.sync_state.unsafe_head.block_info.hash;
     }
 
     /// Starts over from startup discovery (engine reset, base/base `ResetRequest`).
@@ -557,6 +586,29 @@ test "driver: sequencer builds and seals the next block on time" {
     try testing.expectEqual(@as(u64, 0), head.l1_origin.number);
     try testing.expect(!driver.building);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+test "driver: admin sequencer stop and start" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{ .sequencer = true });
+    defer scenario.deinit();
+    scenario.chain.unavailable_from = 3;
+    const driver = &scenario.driver;
+    for (0..8) |_| driver.tick(scenario.providers(), Scenario.genesis_time + 1);
+    const head = try driver.stop_sequencer();
+    try testing.expect(head.eql(scenario.rollup.genesis.l2.hash));
+    try testing.expectError(error.NotActive, driver.stop_sequencer());
+    driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    try testing.expect(!driver.building);
+    try testing.expectError(error.UnsafeHeadMismatch, driver.start_sequencer(.zero));
+    try driver.start_sequencer(head);
+    try testing.expectError(error.AlreadyActive, driver.start_sequencer(head));
+    driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    try testing.expect(driver.building);
+    var verifier: Scenario = undefined;
+    try verifier.init(.{});
+    defer verifier.deinit();
+    try testing.expectError(error.NotSequencer, verifier.driver.stop_sequencer());
 }
 
 test "driver: engine reset severity restarts discovery" {

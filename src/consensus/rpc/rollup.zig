@@ -76,6 +76,8 @@ pub const Backend = struct {
     vtable: *const VTable,
     version: []const u8,
     rollup: *const RollupConfig,
+    /// `admin_*` methods; null disables them.
+    admin: ?*const admin_module.VTable = null,
 
     pub const VTable = struct {
         sync_status: *const fn (context: *anyopaque) SyncStatus,
@@ -97,6 +99,10 @@ pub const methods = [_]rpc.Method(*const Backend){
 };
 
 pub const Router = rpc.Router(*const Backend, &methods);
+const admin_module = @import("admin.zig");
+/// `optimism_*` plus `admin_*` and `healthz`: everything the node serves.
+pub const node_methods = methods ++ admin_module.methods;
+pub const NodeRouter = rpc.Router(*const Backend, &node_methods);
 
 const safe_head_unavailable_code: i32 = -32000;
 

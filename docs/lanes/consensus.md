@@ -36,11 +36,13 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] EL sync mode, checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
-  - [ ] build ticker + attributes for sequenced blocks, seal, admin start/stop
+  - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
   - [x] optimism_outputAtBlock, safeHeadAtL1Block, syncStatus, version
   - [x] rollup.json codec (protocol) + optimism_rollupConfig
-  - [ ] admin_* (sequencer control, resetDerivationPipeline, postUnsafePayload), base_*
+  - [x] admin_* sequencer control (active/start/stop), recover mode, resetDerivationPipeline,
+    conductorEnabled, healthz
+  - [ ] admin_postUnsafePayload (payload envelope decode → insert task), base_*
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [ ] `p2p` (stub first): real implementation is owned by the p2p lane in `src/consensus/p2p/` (see p2p.md); consume its `p2p.Service`.
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
@@ -165,6 +167,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: admin_* sequencer control, recover mode, pipeline reset, healthz.
 - 2026-11-05: rpc: optimism_outputAtBlock output roots from Isthmus L2 headers.
 - 2026-11-05: sources: L2 provider full safe blocks (arena slots, TTL) for span checks.
 - 2026-11-05: devnet smoke green; driver/L1 failure logging; L1 server connection limit.

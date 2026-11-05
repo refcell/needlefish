@@ -17,6 +17,7 @@ const jwt = @import("../../utilities/jwt/root.zig");
 const log = @import("../../utilities/log/root.zig");
 const protocol = @import("../protocol/root.zig");
 const rollup_rpc = @import("../rpc/rollup.zig");
+const admin_rpc = @import("../rpc/admin.zig");
 const safedb = @import("../safedb/root.zig");
 const l2_provider = @import("../sources/l2_provider.zig");
 const l2_block = @import("../sources/l2_block.zig");
@@ -152,6 +153,14 @@ pub fn Node(comptime IO: type) type {
         const Blobs = blob_provider.BlobProvider(IO, blob_provider.KzgVerifier);
         const Engine = engine_client.EngineClient(IO);
         const Polling = polling_client.PollingClient(IO);
+        const admin_vtable: admin_rpc.VTable = .{
+            .sequencer_active = admin_sequencer_active,
+            .start_sequencer = admin_start_sequencer,
+            .stop_sequencer = admin_stop_sequencer,
+            .recover_mode = admin_recover_mode,
+            .set_recover_mode = admin_set_recover_mode,
+            .reset_derivation_pipeline = admin_reset_derivation_pipeline,
+        };
         const backend_vtable: rollup_rpc.Backend.VTable = .{
             .sync_status = backend_sync_status,
             .output_at_block = backend_output_at_block,
@@ -225,6 +234,7 @@ pub fn Node(comptime IO: type) type {
                     .vtable = &backend_vtable,
                     .version = options.version,
                     .rollup = rollup,
+                    .admin = &admin_vtable,
                 },
                 .safe_db = try safedb.SafeDB.init(allocator, options.safedb_entries),
             };
@@ -438,7 +448,7 @@ pub fn Node(comptime IO: type) type {
         ) void {
             if (request.method != .POST) return response.fail(405);
             const out = response.writer();
-            const outcome = rollup_rpc.Router.handle(&node.backend, request.body, out);
+            const outcome = rollup_rpc.NodeRouter.handle(&node.backend, request.body, out);
             if (outcome == .empty) response.status = 204;
         }
 
@@ -470,6 +480,37 @@ pub fn Node(comptime IO: type) type {
                 else => error.NotAvailable,
             };
             return output_of(node.rollup, &block);
+        }
+
+        fn admin_sequencer_active(context: *anyopaque) bool {
+            return from_context(context).driver.sequencer_active;
+        }
+
+        fn admin_start_sequencer(context: *anyopaque, head: Hash) admin_rpc.StartError!void {
+            const node = from_context(context);
+            try node.driver.start_sequencer(head);
+            node.logger.log(.info, "consensus", "sequencer started", .{});
+        }
+
+        fn admin_stop_sequencer(context: *anyopaque) admin_rpc.StopError!Hash {
+            const node = from_context(context);
+            const head = try node.driver.stop_sequencer();
+            node.logger.log(.info, "consensus", "sequencer stopped", .{});
+            return head;
+        }
+
+        fn admin_recover_mode(context: *anyopaque) bool {
+            return from_context(context).driver.options.recovery_mode;
+        }
+
+        fn admin_set_recover_mode(context: *anyopaque, mode: bool) void {
+            from_context(context).driver.options.recovery_mode = mode;
+        }
+
+        fn admin_reset_derivation_pipeline(context: *anyopaque) void {
+            const node = from_context(context);
+            node.driver.request_reset();
+            node.logger.log(.info, "consensus", "derivation pipeline reset requested", .{});
         }
 
         fn backend_safe_db(context: *anyopaque) ?*const safedb.SafeDB {
@@ -530,6 +571,17 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         \\{"jsonrpc":"2.0","id":1,"method":"optimism_syncStatus"}
     , &out);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"unsafe_l2\":{\"hash\"") != null);
+    var admin_buffer: [512]u8 = undefined;
+    var admin_out: std.Io.Writer = .fixed(&admin_buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend,
+        \\{"jsonrpc":"2.0","id":2,"method":"admin_stopSequencer"}
+    , &admin_out);
+    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "not a sequencer") != null);
+    admin_out = .fixed(&admin_buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend,
+        \\{"jsonrpc":"2.0","id":3,"method":"admin_sequencerActive"}
+    , &admin_out);
+    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "\"result\":false") != null);
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
