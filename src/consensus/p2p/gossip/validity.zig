@@ -18,8 +18,8 @@
 //! Every failure is a gossipsub Reject except an already seen block, which is Ignore.
 //!
 //! Deviations: transactions decode with `common/consensus` `Envelope`, which matches
-//! `BaseTxEnvelope` except that it cannot decode EIP-8130 (type 0x79) yet, so those are
-//! accepted undecoded, and EIP-4844 (type 0x03) is rejected explicitly. A v1/v2 payload
+//! `BaseTxEnvelope` (EIP-8130 type 0x79 included); EIP-4844 (type 0x03) is rejected
+//! explicitly. A v1/v2 payload
 //! after Isthmus has no contiguous header encoding with a requests hash, so it fails the
 //! block hash check without hashing (alloy would hash placeholders; the hash never
 //! matches a real sequencer block either way).
@@ -183,7 +183,6 @@ pub fn check_transactions(transactions: ssz.Transactions) Error!void {
     while (index < transactions.count) : (index += 1) {
         const item = transactions.get(index);
         if (item.len == 0) return error.Transaction;
-        if (item[0] == eip8130_type) continue;
         if (item[0] == @backingInt(consensus_types.tx.TxType.eip4844)) {
             return error.Transaction;
         }
@@ -191,8 +190,6 @@ pub fn check_transactions(transactions: ssz.Transactions) Error!void {
     }
     assert(index == transactions.count);
 }
-
-const eip8130_type: u8 = 0x79;
 
 /// Recomputes the block hash of `payload` (alloy `into_block_raw` + `hash_slow`).
 pub fn block_hash(
@@ -479,14 +476,14 @@ test "validity: block hash, extra data, base fee, transactions, withdrawals" {
     value.withdrawals = try ssz.Withdrawals.decode(&withdrawal_bytes);
     try testing.expectError(error.Withdrawals, block_hash(&context.config, &value, null));
     var tx_bytes: [64]u8 = undefined;
-    const bad_lists = [_][]const []const u8{ &.{""}, &.{"\x02\xc0"}, &.{"\x03\xc0"}, &.{"\xff"} };
+    const bad_lists = [_][]const []const u8{
+        &.{""}, &.{"\x02\xc0"}, &.{"\x03\xc0"}, &.{"\xff"}, &.{"\x79\x01"},
+    };
     for (bad_lists) |items| {
         value = context.payload(.v2, 3);
         value.transactions = ssz.Transactions.encode(&tx_bytes, items);
         try testing.expectError(error.Transaction, block_hash(&context.config, &value, null));
     }
-    value.transactions = ssz.Transactions.encode(&tx_bytes, &.{"\x79\x01"});
-    _ = try block_hash(&context.config, &value, null);
 }
 
 test "validity: v3/v4 blob gas, excess blob gas, and beacon root rules" {
@@ -668,6 +665,29 @@ fn hex_b256(text: []const u8) !B256 {
     var result: B256 = undefined;
     _ = try std.fmt.hexToBytes(&result.bytes, text);
     return result;
+}
+
+test "validity: EIP-8130 transactions decode, malformed ones reject" {
+    const eip8130 = consensus_types.eip8130;
+    const auth: [65]u8 = @splat(0x11);
+    const envelope: consensus_types.Envelope = .{ .eip8130 = .{
+        .tx = .{ .chain_id = chain_id_test, .nonce_sequence = 1, .gas_limit = 50_000 },
+        .sender_auth = &auth,
+    } };
+    var tx_buffer: [256]u8 = undefined;
+    const encoded = envelope.encode_to(&tx_buffer);
+    try testing.expectEqual(eip8130.tx_type, encoded[0]);
+    var storage: [512]u8 = undefined;
+    try check_transactions(ssz.Transactions.encode(&storage, &.{encoded}));
+    const truncated = encoded[0 .. encoded.len - 1];
+    try testing.expectError(
+        error.Transaction,
+        check_transactions(ssz.Transactions.encode(&storage, &.{truncated})),
+    );
+    try testing.expectError(
+        error.Transaction,
+        check_transactions(ssz.Transactions.encode(&storage, &.{&.{eip8130.tx_type}})),
+    );
 }
 
 test "validity: at most five blocks per height" {

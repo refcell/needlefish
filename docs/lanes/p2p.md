@@ -73,7 +73,8 @@ behind a small interface and switch later.
   `common/consensus/base_time` and the rollup Denim schedule), before the seen table.
 - [x] `gossip`: real Base mainnet block 30000000 (public base/base bench fixture) as a
   block-hash vector through `validity.header_from_payload`.
-- [ ] `gossip`: EIP-8130 (0x79) tx decoding in validity (once `common/consensus` decodes 0x79).
+- [x] `gossip`: EIP-8130 (0x79) transactions decode through `Envelope` in validity
+  (malformed ones reject instead of passing undecoded).
 - [x] `Service` (`service.zig`): IO-free state machine tying disc + gater + connection
   limits + block gossip; dials every valid discovered record, bans peers under -100 for
   1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
@@ -267,3 +268,4 @@ behind a small interface and switch later.
 - 2026-11-05: ChaCha20 16-block passes (+8% seal+open).
 - 2026-11-05: Denim BaseTime schedule check in block gossip validity.
 - 2026-11-05: real Base mainnet block-hash vector.
+- 2026-11-05: block validity decodes EIP-8130 transactions.
