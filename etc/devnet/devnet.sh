@@ -68,7 +68,7 @@ genesis_hash() { rpc "$1" eth_getBlockByNumber '["0x0",false]' | json_field hash
 
 up() {
   zig build -Doptimize="${DEVNET_OPTIMIZE:-ReleaseSafe}"
-  "$BASE" devnet init --out "$DIR"
+  fresh_state
   env_load
   local l1="http://127.0.0.1:$PORT_L1_HTTP"
   local seq_el="http://127.0.0.1:$PORT_SEQUENCER_HTTP"
@@ -83,6 +83,23 @@ up() {
     --rollup-rpc "http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
     --metrics.port "$PORT_BATCHER_METRICS"
   log "up; 'just devnet status' to inspect, 'just devnet smoke' to verify"
+}
+
+COMPONENTS="l1 seq-el seq-cl batcher ver-el ver-cl"
+
+# A cold `up` (nothing running) starts from a fresh genesis: a stale genesis timestamp
+# makes the dev L1 backfill hours of blocks and leaves the sequencer that far behind.
+# DEVNET_KEEP=1 keeps the existing chain state and configs.
+fresh_state() {
+  local name
+  for name in $COMPONENTS; do
+    if pid_alive "$name"; then
+      log "$name running: keeping existing state"; "$BASE" devnet init --out "$DIR"; return
+    fi
+  done
+  if [ "${DEVNET_KEEP:-0}" = 1 ]; then "$BASE" devnet init --out "$DIR"; return; fi
+  for name in $COMPONENTS; do rm -rf "${DIR:?}/$name"; done
+  "$BASE" devnet init --out "$DIR" --force
 }
 
 start_l2_el() {
@@ -131,7 +148,7 @@ down() {
 status() {
   [ -f "$DIR/devnet.env" ] || { log "not initialized ('just devnet up')"; return 0; }
   env_load
-  for name in l1 seq-el seq-cl batcher ver-el ver-cl; do
+  for name in $COMPONENTS; do
     if pid_alive "$name"; then
       printf '  %-8s running (pid %s)\n' "$name" "$(cat "$DIR/pids/$name.pid")"
     else

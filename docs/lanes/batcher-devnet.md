@@ -146,3 +146,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   off after a push keeps pushing the unthrottled limits).
 - 2026-11-05: `--wait-node-sync`, `--check-recent-txs-depth` (binary search over the batcher
   nonce, base/base `recent_txs.rs`), `--wait-node-sync-timeout`.
+- 2026-11-05: smoke repro: all 6 components start, L2 head stays 0 because `Node.tick` does not
+  run the driver yet (consensus lane "service node stage 2"). Devnet side: cold `up` now writes
+  a fresh genesis (stale genesis made dev L1 backfill hours); smoke step 0 fails fast on a stuck
+  sequencer.

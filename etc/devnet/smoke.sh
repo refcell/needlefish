@@ -37,6 +37,16 @@ for url in "$L1" "$SEQ" "$VER"; do
   [ -n "$(rpc "$url" eth_chainId '[]' | field result)" ] || fail "no JSON-RPC at $url"
 done
 
+# 0. Liveness: the sequencer EL head advances (the sequencer CL drives it over the engine
+# API). Fails fast and names the stalled side instead of timing out on the transfer.
+l2_head() { echo $(($(rpc "$SEQ" eth_blockNumber '[]' | field result))); }
+first_l2=$(l2_head)
+l2_advances() { [ "$(l2_head)" -gt "$first_l2" ]; }
+for _ in $(seq 1 $((L2_BLOCK_TIME * 10))); do l2_advances && break; sleep 1; done
+l2_advances || fail "sequencer L2 head stuck at $first_l2 for $((L2_BLOCK_TIME * 10))s: seq-cl" \
+  "is not building blocks through the engine API (see $DIR/logs/seq-cl.log)"
+ok "sequencer L2 head advancing (block $(l2_head))"
+
 # L1 scan start for step 2, taken before the L2 transfer can possibly be batched.
 start_l1=$(($(rpc "$L1" eth_blockNumber '[]' | field result)))
 

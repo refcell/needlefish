@@ -1,7 +1,8 @@
 # Devnet
 
 `just devnet up` starts a local, all-Zig Base devnet as native processes (no Docker).
-`just devnet smoke` proves it works end to end. Everything the devnet writes lives in
+`just devnet smoke` proves it works end to end. A cold `up` (nothing running) wipes chain
+state and writes a fresh genesis; `DEVNET_KEEP=1 just devnet up` keeps it. Everything the devnet writes lives in
 `.devnet/` (git-ignored): generated configs, the JWT secret, data dirs, pids, logs.
 
 This file is the **process contract** between the batcher-devnet lane (which owns the
@@ -113,6 +114,9 @@ Each binary must accept at least the flags below. Lanes may add more.
 ## Smoke test
 
 `just devnet smoke` passes when, within 120 s of `up`:
+
+0. **Liveness.** The sequencer EL head advances within 10 L2 block times; otherwise the
+   smoke fails at once and names the sequencer CL.
 
 1. **Sequencing.** The smoke user sends an L2 transfer to the sequencer EL; it is in
    an L2 block (receipt status 1).
