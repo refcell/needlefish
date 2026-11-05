@@ -105,6 +105,13 @@ pub fn run_bytes(
 
 /// Fill a prefix of `buffer` with seeded bytes. Lengths skew small: most decoder
 /// bugs live in short inputs, and short inputs keep the suite fast.
+///
+/// `Smith` replays `.in` bytes literally: a value reads 8 little-endian bytes and
+/// falls back to its minimum when they miss the range, `eos` ends on any nonzero
+/// byte, and a slice reads a u32 length. Uniform random bytes therefore yield
+/// minimums, instant loop ends, and empty slices. Half of the inputs are words
+/// instead: little-endian u64s with skewed-small values, which land in typical ranges
+/// and read as mostly-zero `eos` bytes.
 fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
     assert(input_size_max <= buffer.len);
     var prng = Prng.init(seed);
@@ -115,6 +122,10 @@ fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
     };
     const len: usize = @intCast(prng.range(0, len_max));
     const input = buffer[0..len];
+    if (prng.chance(1, 2)) {
+        generate_words(&prng, input);
+        return input;
+    }
     // Mix fully random bytes with structured fills that decoders find interesting.
     switch (prng.below(4)) {
         0 => @memset(input, 0),
@@ -129,6 +140,53 @@ fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
         }
     }
     return input;
+}
+
+fn generate_words(prng: *Prng, input: []u8) void {
+    var offset: usize = 0;
+    while (offset < input.len) : (offset += 8) {
+        const word: u64 = switch (prng.below(8)) {
+            // Booleans and `u1`s accept only 0 or 1.
+            0, 1 => prng.below(2),
+            2, 3 => prng.below(16),
+            4, 5 => prng.below(256),
+            6 => prng.below(1 << 16),
+            else => prng.int(u64),
+        };
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, word, .little);
+        const length = @min(8, input.len - offset);
+        @memcpy(input[offset..][0..length], bytes[0..length]);
+    }
+    assert(offset >= input.len);
+}
+
+const Spread = struct {
+    seen: [21]bool = @splat(false),
+    true_count: u32 = 0,
+    loop_max: u32 = 0,
+    slice_max: u32 = 0,
+};
+
+fn spread_values(spread: *Spread, smith: *Smith) anyerror!void {
+    spread.seen[smith.valueRangeAtMost(u32, 0, 20)] = true;
+    spread.true_count += @intFromBool(smith.value(bool));
+    var loop: u32 = 0;
+    while (loop < 64 and !smith.eosWeightedSimple(7, 1)) loop += 1;
+    spread.loop_max = @max(spread.loop_max, loop);
+    var buffer: [32]u8 = undefined;
+    spread.slice_max = @max(spread.slice_max, smith.slice(&buffer));
+}
+
+test "fuzz: seeded inputs drive Smith past its minimums" {
+    var spread: Spread = .{};
+    try run_seeded(&spread, spread_values, .{ .iterations = 512 });
+    var distinct: u32 = 0;
+    for (spread.seen) |seen| distinct += @intFromBool(seen);
+    try std.testing.expect(distinct >= 15);
+    try std.testing.expect(spread.true_count >= 16);
+    try std.testing.expect(spread.loop_max >= 4);
+    try std.testing.expect(spread.slice_max >= 4);
 }
 
 test "fuzz: iteration seeds are distinct and stable" {

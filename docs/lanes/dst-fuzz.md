@@ -20,8 +20,9 @@ provably robust.
   - [ ] Sequencer / verifier derivation once the consensus service is step-driven.
 - [ ] Sim: L1 transaction-loss fault (mempool eviction, a different L1 RPC node). The real
   batcher's txmgr never refetches its nonce, so one lost tx stalls it forever (see notes).
-- [ ] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
+- [x] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
   minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
+- [ ] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
 - [ ] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
@@ -109,3 +110,6 @@ provably robust.
 - 2026-11-05: the real batcher service runs in the sim (`real_batcher=true`, half of
   swarm seeds); L1 enforces nonces and reorgs re-mine at once. 1000 seeds green. Found:
   txmgr cannot recover a lost nonce (noted for the batcher lane).
+- 2026-11-05: seeded fuzz driver now emits skewed-small little-endian word inputs for half
+  the iterations, so Smith values, bools, `eos` loops, and slices vary in normal
+  `zig build test` runs (they were almost always the minimum). Full suite green.
