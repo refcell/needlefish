@@ -115,7 +115,7 @@ pub fn verify_cell_kzg_proof_batch(
     // Decoding (subgroup checks) and the field check of every cell come before any
     // hashing, so malformed input is always an error, never `false`.
     for (proofs, scratch.points[0..count]) |*bytes, *point| point.* = try decode_g1(bytes);
-    try aggregate_columns(settings, workspace, batch, null);
+    try aggregate_columns(workspace, batch, null);
     const unique_count = deduplicate(commitments, scratch.commitment_indices[0..count]);
     const unique_points = scratch.points[count..][0..unique_count];
     for (unique_points, 0..) |*point, unique_index| {
@@ -225,13 +225,8 @@ pub fn compute_challenge(batch: Batch, commitment_indices: []const u32) Fr {
 
 /// Adds r^k * cell_k into the cell's column of `workspace.extended` (one column of 64
 /// elements per cell index). With `powers == null` it only validates the cells.
-fn aggregate_columns(
-    settings: *const Settings,
-    workspace: *Workspace,
-    batch: Batch,
-    powers: ?[]const Fr,
-) Error!void {
-    _ = settings;
+fn aggregate_columns(workspace: *Workspace, batch: Batch, powers: ?[]const Fr) Error!void {
+    assert(powers == null or powers.?.len == batch.cells.len);
     @memset(&workspace.extended, Fr.zero);
     for (batch.cell_indices, batch.cells, 0..) |cell_index, *cell, position| {
         assert(cell_index < cells_per_ext_blob);
@@ -300,7 +295,7 @@ fn check(
     const total = count + unique_count;
     const rlc_plus_rlp = bls.msm.msm(G1, scratch.points[0..total], scratch.scalars[0..total]);
     // RLI: commitment to the aggregated interpolation polynomial.
-    try aggregate_columns(settings, workspace, batch, powers);
+    try aggregate_columns(workspace, batch, powers);
     var interpolation: [field_elements_per_cell]Fr = undefined;
     aggregated_interpolation(settings, workspace, batch, &interpolation);
     var interpolation_scalars: [field_elements_per_cell]u256 = undefined;
@@ -316,6 +311,8 @@ fn check(
 }
 
 const testing = std.testing;
+const Prng = @import("../../../testing/prng.zig").Prng;
+const blob_api = @import("blob.zig");
 
 test "cells verify: deduplication keeps first-appearance order" {
     var commitments: [5]Commitment = undefined;
@@ -409,6 +406,95 @@ test "cells verify: zero cells with identity commitment and proofs verify" {
         &.{one_cell},
         &.{identity},
     ));
+}
+
+var seeded_cells: cells.Cells = undefined;
+var seeded_proofs: cells.Proofs = undefined;
+
+test "cells verify: random subsets verify, corruptions fail (seeded)" {
+    if (!cells.heavy_tests) return error.SkipZigTest; // FK20 proofs are slow in Debug.
+    const settings = try cells.shared_settings();
+    const workspace = cells.shared_workspace();
+    const blob_settings_storage = &seeded_blob_storage;
+    const blob_settings = try blob_api.Settings.init(blob_settings_storage);
+    var prng = Prng.init(0xce11_0e21);
+    var blob: cells.Blob = undefined;
+    for (0..kzg.field_elements_per_blob) |index| {
+        prng.fill(blob[index * 32 ..][0..32]);
+        blob[index * 32] &= 0x3f;
+    }
+    const blob_workspace = &seeded_blob_workspace;
+    const commitment = try blob_api.blob_to_kzg_commitment(&blob_settings, blob_workspace, &blob);
+    const inputs = .{ settings, workspace, &blob };
+    const outputs = .{ &seeded_cells, &seeded_proofs };
+    try @call(.auto, cells.compute_cells_and_kzg_proofs, inputs ++ outputs);
+    var storage: VerifyStorage(8) = .{};
+    var commitments: [8]Commitment = @splat(commitment);
+    var indices: [8]u64 = undefined;
+    var picked_cells: [8]Cell = undefined;
+    var picked_proofs: [8]Proof = undefined;
+    for (0..6) |_| {
+        const count: usize = @intCast(prng.range(1, 8));
+        for (0..count) |slot| {
+            const cell_index = prng.below(cells_per_ext_blob);
+            indices[slot] = cell_index;
+            picked_cells[slot] = seeded_cells[cell_index];
+            picked_proofs[slot] = seeded_proofs[cell_index];
+        }
+        const args = .{ settings, workspace, storage.scratch(), commitments[0..count] };
+        const tail = .{ indices[0..count], picked_cells[0..count], picked_proofs[0..count] };
+        try testing.expect(try @call(.auto, verify_cell_kzg_proof_batch, args ++ tail));
+        // A wrong index, a changed element, or a swapped proof breaks the batch.
+        const victim = prng.below(count);
+        indices[victim] = (indices[victim] + 1) % cells_per_ext_blob;
+        try testing.expect(!try @call(.auto, verify_cell_kzg_proof_batch, args ++ tail));
+        indices[victim] = (indices[victim] + cells_per_ext_blob - 1) % cells_per_ext_blob;
+        picked_cells[victim][31 + 32 * prng.below(field_elements_per_cell)] ^= 1;
+        try testing.expect(!try @call(.auto, verify_cell_kzg_proof_batch, args ++ tail));
+        picked_cells[victim] = seeded_cells[indices[victim]];
+        picked_proofs[victim] = seeded_proofs[(indices[victim] + 3) % cells_per_ext_blob];
+        try testing.expect(!try @call(.auto, verify_cell_kzg_proof_batch, args ++ tail));
+    }
+    commitments[0][0] ^= 0x20; // Negated commitment: valid point, wrong polynomial.
+    try testing.expect(!try verify_cell_kzg_proof_batch(
+        settings,
+        workspace,
+        storage.scratch(),
+        commitments[0..1],
+        &.{0},
+        seeded_cells[0..1],
+        seeded_proofs[0..1],
+    ));
+}
+
+var seeded_blob_storage: blob_api.Settings.Storage = undefined;
+var seeded_blob_workspace: blob_api.Workspace = undefined;
+
+test "cells verify: random inputs never crash (seeded)" {
+    var prng = Prng.init(0xf022);
+    var commitments: [2]Commitment = undefined;
+    var proofs: [2]Proof = undefined;
+    var cell_values: [2]Cell = @splat(@splat(0));
+    var indices: [2]u64 = undefined;
+    for (0..8) |_| {
+        for (0..2) |slot| {
+            prng.fill(&commitments[slot]);
+            prng.fill(&proofs[slot]);
+            // Valid-looking flags half the time, so decoding reaches the curve checks.
+            if (prng.chance(1, 2)) commitments[slot][0] = 0x80 | (commitments[slot][0] & 0x1f);
+            if (prng.chance(1, 2)) proofs[slot] = bls.g1.compress(G1Affine.identity);
+            prng.fill(cell_values[slot][0..64]);
+            indices[slot] = prng.below(140);
+        }
+        const count: usize = @intCast(prng.below(3));
+        const result = verify_for_test(
+            commitments[0..count],
+            indices[0..count],
+            cell_values[0..count],
+            proofs[0..count],
+        );
+        if (count == 0) try testing.expect(try result);
+    }
 }
 
 fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {

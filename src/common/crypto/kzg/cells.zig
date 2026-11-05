@@ -184,7 +184,8 @@ pub fn monomial_to_proofs(
     coefficients: *const [field_elements_per_blob]Fr,
     proofs: *Proofs,
 ) void {
-    const columns = settings.columns orelse unreachable; // Documented precondition.
+    assert(settings.columns != null); // Documented precondition: `Settings.init`.
+    const columns = settings.columns.?;
     fk20.compute_cell_proofs(settings.roots, columns, coefficients, &workspace.fk20, proofs);
 }
 
