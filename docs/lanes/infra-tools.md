@@ -65,6 +65,12 @@ allocation after startup.
   bumps, pending, submit-to-completion latency histogram; `Completion.submitted_at_ms`.
 - [ ] Export tx_manager metrics from `load-test` and `withdrawer` (`--metrics-port`), after
   their in-flight workers land.
+- [x] `infra/fee_jobs` + `base fee-jobs disburse|process|sweep` (port `fee-jobs`): precondition
+  reads, one tx_manager send, fail on revert (tx_manager now reports receipt status).
+- [ ] `base fee-jobs confirm`: prove/finalize `FeeDisburser` withdrawals via the withdrawer
+  (after `infra/withdrawer` lands).
+- [ ] `infra/telemetry` EL reachability probe: needs RLPx (ECIES + devp2p Hello), which no
+  lane has yet; revisit when execution p2p exists.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -96,6 +102,9 @@ allocation after startup.
   whole-second header timestamps cannot resolve 200 ms blocks. Thresholds keep base/base's
   defaults (2 s grace, 3 s unhealthy). The StatsD heartbeat becomes per-state Prometheus
   tick counters.
+- fee-jobs takes its first nonce from `latest` (the shared driver's tag), not base/base's
+  `pending`: overlapping runs on one key may replace rather than queue behind each other.
+  The key is env-only (`BASE_FEE_JOBS_PRIVATE_KEY`), never a flag.
 - roxy rate limiting keys on the client IP only (no API keys yet); an evicted bucket refills
   to the full burst, so table pressure can only loosen limits, never block a client wrongly.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
@@ -179,3 +188,5 @@ allocation after startup.
   SimIo test) and `--rate-limit-rps/--rate-limit-burst/--trusted-proxies`; live: 429 on the
   third request with burst 2.
 - 2026-11-05: tx_manager `Metrics` (caller-driven, registry entries `tx_manager_*`).
+- 2026-11-05: fee-jobs disburse/process/sweep; live on dev-l1: sweep confirmed at depth 2,
+  process skipped on a 0 balance, missing key exits 2.
