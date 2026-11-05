@@ -4,6 +4,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 `just devnet` recipes. Goal: **`just devnet up` brings up a working all-Zig devnet.**
 
 ## Backlog
+- [ ] (from crypto lane) `common.crypto.kzg.blob` now provides `blob_to_kzg_commitment`,
+  `compute_blob_kzg_proof`, `verify_blob_kzg_proof[_batch]` (c-kzg vector tested); consider
+  replacing `src/batcher/blobs/kzg.zig` with it. EIP-7594 cell proofs (Fusaka sidecars) are next
+  in the crypto lane.
 - [x] `docs/DEVNET.md`: topology, ports, process contract (see draft below), smoke test definition.
 - [x] `base devnet init` (first cut: funded accounts, portal stub, rollup.json; genesis hashes
   patched by `base devnet rollup` after ELs start; predeploys still TODO)
