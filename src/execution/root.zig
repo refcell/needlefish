@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+pub const chainspec = @import("chainspec/root.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

@@ -4,7 +4,7 @@ Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
 Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
-- [ ] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
+- [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
 - [ ] Block executor: apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
 - [ ] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
 - [ ] `payload`: payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
@@ -15,5 +15,15 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 
 ## Decisions
+- chainspec is self-contained (no dependency on `common/chains`, which has not landed):
+  presets copy the public base/base `ChainConfig` timestamps. When `common/chains` lands,
+  build `ChainSpec` from it instead of duplicating.
+- Every chain starts post-merge (Paris at genesis, London base fee at genesis).
+- L2 Ethereum forks are implied by Base upgrades (Shanghai=Canyon, Cancun=Ecotone,
+  Prague=Isthmus, Osaka=Azul); L2 has no blob params (OP rejects blob txs).
+- `--dev-l1` default schedule: Shanghai+Cancun+Prague at genesis, Osaka off, because Osaka
+  requires EIP-7594 cell-proof sidecars from the batcher.
+- Fork-order validation skips unscheduled forks (mainnet leaves Pectra blob schedule unset).
 
 ## Log
+- 2026-11-05: chainspec (fork schedule, EIP-1559 + Holocene/Jovian extra data, blob params).
