@@ -60,9 +60,9 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
 - [ ] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
   (base/base `sequencers.rs`).
-- [ ] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
+- [x] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
   already on L1 after a restart (base/base `recent_txs.rs`).
-- [ ] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
+- [x] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
 - [ ] DST: a sim scenario driving admin stop/start/flush on the real batcher.
 
 ## Draft devnet contract
@@ -144,3 +144,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   base fee floors, `--max-pending-transactions` (default stays 8, base/base uses 1).
 - 2026-11-05: admin_setThrottleController (missing fields keep current values; switching to
   off after a push keeps pushing the unthrottled limits).
+- 2026-11-05: `--wait-node-sync`, `--check-recent-txs-depth` (binary search over the batcher
+  nonce, base/base `recent_txs.rs`), `--wait-node-sync-timeout`.

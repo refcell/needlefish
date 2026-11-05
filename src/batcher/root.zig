@@ -16,6 +16,7 @@ pub const service = @import("service/root.zig");
 pub const metrics = @import("metrics/root.zig");
 pub const throttle = @import("throttle/root.zig");
 pub const admin = @import("admin/root.zig");
+pub const sync = @import("sync/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -16,7 +16,8 @@ const usage =
     \\         [--throttle-strategy off|step|linear|quadratic]
     \\         [--admin-port P [--admin-addr IP]] [--stopped] [--num-confirmations N]
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
-    \\         [--sub-safety-margin L1_BLOCKS]
+    \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
+    \\         [--wait-node-sync-timeout SECONDS]]
     \\
 ;
 
@@ -50,6 +51,11 @@ const Flags = struct {
     min_base_fee_wei: u128 = 0,
     /// In-flight tx slots (base/base `--max-pending-transactions`; ours defaults to 8).
     pending_max: u8 = 8,
+    /// Wait for the rollup node to reach an L1 target before batching (base/base).
+    wait_node_sync: bool = false,
+    wait_node_sync_timeout_s: u64 = 600,
+    /// Recent-tx window selecting the sync target; 0 = the L1 head.
+    check_recent_txs_depth: u64 = 0,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -61,8 +67,7 @@ fn parse_flags(args: []const []const u8) !Flags {
     const eql = std.mem.eql;
     while (i < args.len) {
         const arg = args[i];
-        if (eql(u8, arg, "--no-throttle") or eql(u8, arg, "--stopped")) {
-            if (eql(u8, arg, "--stopped")) flags.stopped = true else flags.throttle_strategy = .off;
+        if (parse_switch(&flags, arg)) {
             i += 1; // A switch takes no value.
             continue;
         }
@@ -91,6 +96,10 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--check-recent-txs-depth")) {
+            flags.check_recent_txs_depth = try std.fmt.parseInt(u64, value, 10);
+        } else if (eql(u8, arg, "--wait-node-sync-timeout")) {
+            flags.wait_node_sync_timeout_s = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, arg, "--sub-safety-margin")) {
             flags.sub_safety_margin = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, arg, "--num-confirmations")) {
@@ -117,8 +126,7 @@ fn parse_flags(args: []const []const u8) !Flags {
         i += 2;
     }
     if (i != args.len) return error.MissingValue;
-    // base/base rejects a margin that leaves no channel duration.
-    if (flags.sub_safety_margin >= flags.max_channel_duration) return error.SubSafetyMarginTooLarge;
+    try validate_flags(flags);
     return flags;
 }
 
@@ -205,6 +213,7 @@ fn run(
         .rollup = if (flags.rollup_rpc != null) &rollup else null,
     };
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
+    if (flags.wait_node_sync) try wait_for_node_sync(init, flags, &l1, &rollup, service);
     var metrics: batcher.metrics.Metrics = .{};
     try metrics.register();
     var admin: batcher.admin.Admin = .{ .service = service };
@@ -243,6 +252,73 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
             .{},
         ),
     }
+}
+
+/// Valueless flags; returns false for flags that take a value.
+fn parse_switch(flags: *Flags, arg: []const u8) bool {
+    const eql = std.mem.eql;
+    if (eql(u8, arg, "--stopped")) {
+        flags.stopped = true;
+    } else if (eql(u8, arg, "--wait-node-sync")) {
+        flags.wait_node_sync = true;
+    } else if (eql(u8, arg, "--no-throttle")) {
+        flags.throttle_strategy = .off;
+    } else return false;
+    return true;
+}
+
+/// Cross-flag checks (base/base config validation).
+fn validate_flags(flags: Flags) !void {
+    // base/base rejects a margin that leaves no channel duration.
+    if (flags.sub_safety_margin >= flags.max_channel_duration) return error.SubSafetyMarginTooLarge;
+    const recent_depth_max = batcher.sync.recent_txs_depth_max;
+    if (flags.check_recent_txs_depth > recent_depth_max) return error.RecentTxsDepthTooLarge;
+    if (flags.check_recent_txs_depth > 0 and !flags.wait_node_sync)
+        return error.RecentTxsDepthRequiresWaitNodeSync;
+    // Node sync is read from the rollup node: required, not optional, with the flag.
+    if (flags.wait_node_sync and flags.rollup_rpc == null)
+        return error.WaitNodeSyncRequiresRollupRpc;
+}
+
+/// Waits until the rollup node's `current_l1` reaches the sync target, retrying RPC
+/// failures, for at most `--wait-node-sync-timeout` (then exits, as base/base does).
+fn wait_for_node_sync(
+    init: std.process.Init,
+    flags: Flags,
+    l1: *batcher.rpc.Client,
+    rollup: *batcher.rpc.Client,
+    service: *const batcher.service.Service,
+) !void {
+    std.debug.assert(flags.wait_node_sync);
+    const start_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
+    const deadline_ms = start_ms + flags.wait_node_sync_timeout_s * std.time.ms_per_s;
+    var target: ?u64 = null;
+    while (true) {
+        const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
+        if (now_ms >= deadline_ms) return error.NodeSyncTimeout;
+        if (target == null) target = sync_target(flags, l1, service) catch null;
+        if (target) |target_l1| {
+            if (batcher.sync.node_synced(rollup, target_l1)) |synced| {
+                if (synced) {
+                    std.debug.print("batcher: rollup node synced to L1 {d}\n", .{target_l1});
+                    return;
+                }
+            } else |_| {}
+        }
+        try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
+    }
+}
+
+fn sync_target(
+    flags: Flags,
+    l1: *batcher.rpc.Client,
+    service: *const batcher.service.Service,
+) !u64 {
+    if (flags.check_recent_txs_depth == 0) {
+        return batcher.rpc.quantity(u64, try l1.call("eth_blockNumber", "[]"));
+    }
+    const from = service.txs.config.from;
+    return batcher.sync.recent_tx_target(l1, from, flags.check_recent_txs_depth);
 }
 
 /// Parses a decimal gwei amount ("2", "0.25", up to 9 fraction digits) into wei.
@@ -347,6 +423,21 @@ test "batcher: flags" {
     try std.testing.expectEqual(@as(u64, 4), (try parse_flags(&margin)).sub_safety_margin);
     const no_room = [_][]const u8{ "--max-channel-duration", "4", "--sub-safety-margin", "4" };
     try std.testing.expectError(error.SubSafetyMarginTooLarge, parse_flags(&no_room));
+    const sync_ok = [_][]const u8{
+        "--wait-node-sync", "--check-recent-txs-depth", "128",
+        "--rollup-rpc",     "http://127.0.0.1:7545",    "--wait-node-sync-timeout",
+        "5",
+    };
+    const sync_flags = try parse_flags(&sync_ok);
+    try std.testing.expect(sync_flags.wait_node_sync);
+    try std.testing.expectEqual(@as(u64, 128), sync_flags.check_recent_txs_depth);
+    try std.testing.expectEqual(@as(u64, 5), sync_flags.wait_node_sync_timeout_s);
+    const too_deep = [_][]const u8{ "--wait-node-sync", "--check-recent-txs-depth", "129" };
+    try std.testing.expectError(error.RecentTxsDepthTooLarge, parse_flags(&too_deep));
+    const no_wait = [_][]const u8{ "--check-recent-txs-depth", "3" };
+    try std.testing.expectError(error.RecentTxsDepthRequiresWaitNodeSync, parse_flags(&no_wait));
+    const no_rollup = [_][]const u8{"--wait-node-sync"};
+    try std.testing.expectError(error.WaitNodeSyncRequiresRollupRpc, parse_flags(&no_rollup));
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
