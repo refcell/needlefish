@@ -197,6 +197,8 @@ pub const Completion = struct {
     outcome: Outcome,
     publish_error: ?PublishError,
     bump_count: u64,
+    /// When `submit` was called; completion latency is the caller's now minus this.
+    submitted_at_ms: u64,
 };
 
 pub const Limits = struct {
@@ -226,6 +228,7 @@ pub fn Manager(comptime limits: Limits) type {
             /// Fees of the version currently being published.
             publishing_fees: Fees = .{ .tip_wei = 0, .fee_cap_wei = 0 },
             publishing_bump: bool = false,
+            submitted_at_ms: u64 = 0,
             publish_at_ms: u64 = 0,
             bump_at_ms: u64 = 0,
             receipt_at_ms: u64 = 0,
@@ -289,6 +292,7 @@ pub fn Manager(comptime limits: Limits) type {
                 .nonce = nonce,
                 .is_blob = is_blob,
                 .fees = first_fees,
+                .submitted_at_ms = now_ms,
                 .publish_at_ms = now_ms,
                 .retries_left = config.publish_max_retries,
                 .deadline_ms = if (config.tx_send_timeout_ms == 0)
@@ -402,6 +406,7 @@ pub fn Manager(comptime limits: Limits) type {
                     .outcome = slot.outcome,
                     .publish_error = slot.publish_error,
                     .bump_count = slot.send_state.bump_count,
+                    .submitted_at_ms = slot.submitted_at_ms,
                 };
                 slot.* = .{};
                 assert(slot.state == .free);

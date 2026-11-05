@@ -14,6 +14,7 @@ pub const nonce = @import("nonce.zig");
 pub const send_state = @import("send_state.zig");
 pub const manager = @import("manager.zig");
 pub const driver = @import("driver.zig");
+pub const metrics = @import("metrics.zig");
 
 pub const Manager = manager.Manager;
 pub const Driver = driver.Driver;

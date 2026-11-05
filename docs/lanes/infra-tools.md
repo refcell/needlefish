@@ -61,8 +61,10 @@ allocation after startup.
   ERC-20 transfer against the deployed token (port `payloads/*`); `--json` report.
 - [x] `infra/roxy` rate limits: per-client token buckets (bounded table, idlest evicted),
   client IPs through `utilities/trusted_proxy`, 429 + JSON-RPC -32016 like proxyd.
-- [ ] `infra/tx_manager` metrics: pending sends, publishes, bumps, failures by kind, and
-  confirmation latency, exported by `load-test` and `withdrawer` (`--metrics-port`).
+- [x] `infra/tx_manager` metrics core (`metrics.zig`): submitted, completed by outcome,
+  bumps, pending, submit-to-completion latency histogram; `Completion.submitted_at_ms`.
+- [ ] Export tx_manager metrics from `load-test` and `withdrawer` (`--metrics-port`), after
+  their in-flight workers land.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -176,3 +178,4 @@ allocation after startup.
 - 2026-11-05: roxy per-client rate limits (`rate_limit.zig` + fuzz, trusted-proxy client IPs,
   SimIo test) and `--rate-limit-rps/--rate-limit-burst/--trusted-proxies`; live: 429 on the
   third request with burst 2.
+- 2026-11-05: tx_manager `Metrics` (caller-driven, registry entries `tx_manager_*`).
