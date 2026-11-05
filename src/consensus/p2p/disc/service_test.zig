@@ -12,6 +12,9 @@ const Endpoint = service_module.Endpoint;
 const enr = @import("../peers/enr.zig");
 const secp256k1 = @import("../peers/secp256k1.zig");
 const packet = @import("packet.zig");
+const messages = @import("messages.zig");
+const session_module = @import("session.zig");
+const fuzz = @import("../../../testing/fuzz.zig");
 const Prng = @import("../../../testing/prng.zig").Prng;
 
 const chain_id = 8453;
@@ -164,9 +167,14 @@ const Cluster = struct {
     }
 
     fn run(cluster: *Cluster, duration_ns: u64) void {
+        cluster.run_at(0, duration_ns);
+    }
+
+    /// `run` starting at `start_ns` instead of zero, so time keeps moving across calls.
+    fn run_at(cluster: *Cluster, start_ns: u64, duration_ns: u64) void {
         const step_ns = 10 * ns_per_ms;
-        var now_ns: u64 = 0;
-        while (now_ns < duration_ns) : (now_ns += step_ns) {
+        var now_ns: u64 = start_ns;
+        while (now_ns < start_ns + duration_ns) : (now_ns += step_ns) {
             while (cluster.queue.peek()) |flight| {
                 if (flight.deliver_ns > now_ns) break;
                 const due = cluster.queue.pop().?;
@@ -336,4 +344,217 @@ test "disc service: rejects records for other chains and garbage packets" {
         service.on_packet(Cluster.endpoint(1), &garbage, 0);
     }
     try std.testing.expectEqual(@as(u64, 64), service.stats.packets_invalid);
+}
+
+// ------------------------------------------------------- hostile in-session messages
+//
+// Node 0 completes a real handshake with node 1, then uses its session keys to send node 1
+// hostile messages that pass AES-GCM: junk plaintext, PINGs with huge sequence numbers,
+// PONGs with spoofed endpoints, FINDNODE with junk distances, NODES answering node 1's real
+// pending FINDNODE with bogus totals and junk, truncated, or foreign records, and TALK*.
+// Node 1 must not crash, must not let invented nodes into its table, and must keep its
+// honest peer (node 2) and keep discovering with it.
+
+const attacker = 0;
+const victim = 1;
+const honest = 2;
+
+/// The victim's live request to the attacker of `kind`, if any (a real request id to
+/// answer, which reaches the response handlers instead of being dropped as unsolicited).
+fn pending_to_attacker(cluster: *Cluster, kind: anytype) ?messages.RequestId {
+    const attacker_id = cluster.services[attacker].local_id;
+    for (cluster.services[victim].pending) |*pending| {
+        if (!pending.used or pending.kind != kind) continue;
+        if (!std.mem.eql(u8, &pending.node_id, &attacker_id)) continue;
+        return pending.request_id;
+    }
+    return null;
+}
+
+fn random_request_id(random: std.Random) messages.RequestId {
+    var id: messages.RequestId = .{ .length = random.uintAtMost(u8, 8) };
+    random.bytes(id.bytes[0..id.length]);
+    return id;
+}
+
+/// A NODES message with a bogus total and up to 20 junk, truncated, or valid foreign
+/// records; `storage` backs the record bytes.
+fn hostile_nodes(cluster: *Cluster, random: std.Random, storage: []u8) !messages.Message {
+    const pending = pending_to_attacker(cluster, .findnode);
+    // Answering a real request: mostly a valid total, so the records get examined.
+    const bogus_total = random.uintLessThan(u8, if (pending != null) 8 else 2) == 0;
+    var nodes: messages.Nodes = .{
+        .request_id = pending orelse random_request_id(random),
+        .total = if (!bogus_total)
+            1 + random.uintAtMost(u64, 5)
+        else if (random.boolean()) 0 else random.int(u64),
+    };
+    var used: usize = 0;
+    const count = 1 + random.uintAtMost(u8, if (random.boolean()) 2 else messages.records_max - 1);
+    for (0..count) |_| {
+        var record_bytes: []const u8 = undefined;
+        if (random.uintLessThan(u8, 3) == 0) {
+            var secret: secp256k1.SecretKey = undefined;
+            random.bytes(&secret);
+            secp256k1.validate_secret_key(secret) catch continue;
+            const record = try enr.build(secret, .{
+                .ip4 = .{ 10, 9, random.int(u8), 1 },
+                .udp = 9000,
+                .opstack = .{ .chain_id = if (random.boolean()) chain_id else 10 },
+            });
+            const encoded = storage[used..][0..record.raw().len];
+            @memcpy(encoded, record.raw());
+            const truncate = random.boolean();
+            const keep = if (truncate) random.uintAtMost(usize, encoded.len) else encoded.len;
+            record_bytes = encoded[0..keep];
+        } else {
+            const length = random.uintAtMost(usize, 60);
+            random.bytes(storage[used..][0..length]);
+            record_bytes = storage[used..][0..length];
+        }
+        if (used + 400 > storage.len) break;
+        used += record_bytes.len;
+        nodes.records[nodes.records_count] = record_bytes;
+        nodes.records_count += 1;
+    }
+    return .{ .nodes = nodes };
+}
+
+fn hostile_message(cluster: *Cluster, random: std.Random, storage: []u8) !messages.Message {
+    if (pending_to_attacker(cluster, .findnode) != null and random.boolean()) {
+        return hostile_nodes(cluster, random, storage);
+    }
+    return switch (random.uintLessThan(u8, 6)) {
+        0 => .{ .ping = .{ .request_id = random_request_id(random), .enr_seq = random.int(u64) } },
+        1 => .{ .pong = .{
+            .request_id = pending_to_attacker(cluster, .ping) orelse random_request_id(random),
+            .enr_seq = random.int(u64),
+            .address = .{ .ip4 = .{ random.int(u8), 0, 0, 1 } },
+            .port = random.int(u16),
+        } },
+        2 => blk: {
+            var findnode: messages.Findnode = .{ .request_id = random_request_id(random) };
+            findnode.distances_count = random.uintAtMost(u8, messages.distances_max);
+            for (findnode.distances[0..findnode.distances_count]) |*distance| {
+                distance.* = if (random.boolean()) random.uintAtMost(u16, 256) else random.int(u16);
+            }
+            break :blk .{ .findnode = findnode };
+        },
+        3, 4 => try hostile_nodes(cluster, random, storage),
+        else => .{ .talkreq = .{
+            .request_id = random_request_id(random),
+            .protocol = storage[0..random.uintAtMost(usize, 32)],
+            .request = storage[32..][0..random.uintAtMost(usize, 300)],
+        } },
+    };
+}
+
+/// Hostile plaintext: an encoded hostile message, or raw junk with a random type byte.
+fn hostile_plaintext(cluster: *Cluster, random: std.Random, output: []u8) ![]const u8 {
+    var storage: [8192]u8 = undefined;
+    random.bytes(storage[0..512]);
+    if (random.uintLessThan(u8, 5) == 0) {
+        const length = random.uintAtMost(usize, 300) + 1;
+        random.bytes(output[0..length]);
+        output[0] = random.uintAtMost(u8, 8);
+        return output[0..length];
+    }
+    const message = try hostile_message(cluster, random, &storage);
+    return messages.encode(output, &message) catch |err| switch (err) {
+        error.TooLarge => output[0..1], // Too many records for one packet: send a stub.
+        else => return err,
+    };
+}
+
+/// Seals `plaintext` with the attacker's real session to the victim and delivers it.
+fn inject(cluster: *Cluster, random: std.Random, plaintext: []const u8, now_ns: u64) bool {
+    const victim_service = &cluster.services[victim];
+    const attacker_service = &cluster.services[attacker];
+    const session = attacker_service.sessions.get(
+        victim_service.local_id,
+        Cluster.endpoint(victim),
+    ) orelse return false;
+    const nonce = session_module.next_nonce(session, random, now_ns) orelse return false;
+    var outgoing: packet.Outgoing = .{
+        .dest_id = victim_service.local_id,
+        .masking_iv = undefined,
+        .nonce = nonce,
+        .authdata = .{ .message = attacker_service.local_id },
+        .plaintext = plaintext,
+        .key = session.write_key,
+    };
+    random.bytes(&outgoing.masking_iv);
+    var buffer: [packet.size_max]u8 = undefined;
+    const bytes = packet.encode(&buffer, &outgoing) catch return false; // Over the cap.
+    victim_service.on_packet(Cluster.endpoint(attacker), bytes, now_ns);
+    cluster.collect(victim, now_ns);
+    return true;
+}
+
+test "disc service: hostile messages inside an established session" {
+    const cluster = try Cluster.init(std.testing.allocator, 0x686f_7374, 3, 0);
+    defer cluster.deinit();
+    cluster.boot_all_from(victim);
+    cluster.run_at(0, 3000 * ns_per_ms);
+    const victim_service = &cluster.services[victim];
+    const honest_id = cluster.services[honest].local_id;
+    try std.testing.expect(victim_service.table.get(honest_id) != null);
+    var prng = Prng.init(0x6469_7363);
+    const random = prng.random();
+    var now_ns: u64 = 3000 * ns_per_ms;
+    var injected: u32 = 0;
+    var plaintext: [packet.size_max]u8 = undefined;
+    for (0..512) |round| {
+        const bytes = try hostile_plaintext(cluster, random, &plaintext);
+        if (inject(cluster, random, bytes, now_ns)) injected += 1;
+        if (round % 16 == 15) {
+            // Let replies, timeouts, and lookups (new pending requests to answer) run.
+            cluster.run_at(now_ns, 250 * ns_per_ms);
+            now_ns += 250 * ns_per_ms;
+        }
+    }
+    cluster.run_at(now_ns, 5000 * ns_per_ms);
+    // Most messages rode the authenticated session (it may be re-established midway).
+    try std.testing.expect(injected > 256);
+    // Junk records were counted and rejected; none of the invented nodes got in.
+    try std.testing.expect(victim_service.stats.records_rejected > 0);
+    try std.testing.expect(victim_service.table.live_count() <= 2);
+    // The honest peer survived the attack and the two still talk.
+    try std.testing.expect(victim_service.table.get(honest_id) != null);
+    try std.testing.expect(cluster.services[honest].table.get(victim_service.local_id) != null);
+}
+
+const SessionFixture = struct {
+    cluster: *Cluster,
+    prng: Prng,
+    now_ns: u64,
+};
+
+fn fuzz_session_plaintext(fixture: *SessionFixture, input: []const u8) anyerror!void {
+    if (input.len == 0) return;
+    const random = fixture.prng.random();
+    fixture.now_ns += ns_per_ms;
+    _ = inject(fixture.cluster, random, input[0..@min(input.len, 1100)], fixture.now_ns);
+    const victim_service = &fixture.cluster.services[victim];
+    // Invented nodes may be learned (sigp discv5 does too) but never become live.
+    try std.testing.expect(victim_service.table.live_count() <= 2);
+}
+
+test "disc service: fuzz plaintext sealed into an established session" {
+    const cluster = try Cluster.init(std.testing.allocator, 0x7365_7373, 3, 0);
+    defer cluster.deinit();
+    cluster.boot_all_from(victim);
+    cluster.run_at(0, 3000 * ns_per_ms);
+    var fixture: SessionFixture = .{
+        .cluster = cluster,
+        .prng = Prng.init(0x7365),
+        .now_ns = 3000 * ns_per_ms,
+    };
+    try fuzz.run_bytes(&fixture, fuzz_session_plaintext, .{
+        .input_size_max = 1100,
+        .corpus = &.{ "\x01\xc6\x84\x00\x00\x00\x01\x01", "\x04\xc5\x80\x05\xc2\x80\x80" },
+    });
+    // The honest node is still known after every input.
+    const honest_id = cluster.services[honest].local_id;
+    try std.testing.expect(cluster.services[victim].table.get(honest_id) != null);
 }

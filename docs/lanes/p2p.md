@@ -70,10 +70,16 @@ behind a small interface and switch later.
   gossips a block each way and drains the UDP completions on stop. Negative control:
   dropping received datagrams in the transport fails it with `NotConnected`. Decision:
   this replaces the devnet recheck of completion UDP, whose p2p ports are fixed.
-- [ ] Fuzz: hostile discv5 messages inside an established session (valid session keys:
-  FINDNODE with junk distance lists, NODES with oversized/invalid ENR sets and bogus
-  totals, PONG with spoofed endpoints, TALKREQ): the service must not crash, must bound
-  table/verifier growth, and must keep serving honest nodes (mirror of the libp2p one).
+- [x] Fuzz: hostile discv5 messages inside an established session (`disc/service_test`).
+  Node 0 completes a real handshake with node 1, then seals hostile plaintext with its
+  session keys: junk with random type bytes, PING with huge seq, PONG with spoofed
+  endpoints (answering a real pending ping when one exists), FINDNODE with junk distances,
+  NODES answering node 1's real pending FINDNODE (valid and bogus totals; junk, truncated,
+  foreign-chain, and valid random records), TALKREQ. 512 seeded rounds plus `run_bytes`.
+  Invariants: no crash, junk records rejected, invented nodes never become live, the
+  honest node stays in the table and keeps talking. Decision: records at a requested
+  distance from the responder are learned unverified, as in sigp discv5; liveness (a
+  ping/handshake) is what keeps them out of the live set.
 - [x] Fix: publishing the same block again, or more than `blocks_per_height_max` blocks at
   one height, hit the `SeenHashes.insert` assert (a crash in a retrying sequencer). Our
   own block is now recorded only when `check` passes; regression test in `service_test`.
@@ -442,3 +448,4 @@ behind a small interface and switch later.
 
 - 2026-11-05: gossip validation reuses the message-id decompression.
 - 2026-11-05: real-socket loopback interop (IPv4+IPv6, kqueue+io_uring); fixed republish crash.
+- 2026-11-05: hostile in-session discv5 fuzz (seeded + run_bytes).
