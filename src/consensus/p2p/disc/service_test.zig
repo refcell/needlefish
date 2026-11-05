@@ -23,6 +23,7 @@ const Flight = struct {
     deliver_ns: u64,
     sequence: u64,
     from: u8,
+    from_port: u16,
     to: u8,
     length: u16,
     bytes: [packet.size_max]u8,
@@ -44,9 +45,25 @@ const Cluster = struct {
     drop_ppm: u32,
     discovered: [node_count_max][node_count_max]bool = @splat(@splat(false)),
     trace: std.hash.Wyhash = std.hash.Wyhash.init(0),
+    /// Port-translating NAT in front of one node: peers that sent to its advertised port
+    /// get replies from that port (conntrack); everything else leaves from :9000.
+    nat_index: ?u8 = null,
+    nat_port: u16 = 0,
+    nat_flows: [node_count_max]bool = @splat(false),
 
     fn endpoint(index: u8) Endpoint {
-        return .{ .address = .{ .ip4 = .{ 10, 0, index, 1 } }, .port = 9000 };
+        return endpoint_port(index, 9000);
+    }
+
+    fn endpoint_port(index: u8, port: u16) Endpoint {
+        return .{ .address = .{ .ip4 = .{ 10, 0, index, 1 } }, .port = port };
+    }
+
+    fn source_port(cluster: *Cluster, from: u8, to: u8, to_port: u16) u16 {
+        const nat = cluster.nat_index orelse return 9000;
+        if (to == nat and to_port == cluster.nat_port) cluster.nat_flows[from] = true;
+        if (from == nat and cluster.nat_flows[to]) return cluster.nat_port;
+        return 9000;
     }
 
     fn index_of(target: Endpoint) ?u8 {
@@ -58,6 +75,18 @@ const Cluster = struct {
     }
 
     fn init(allocator: std.mem.Allocator, seed: u64, node_count: u8, drop_ppm: u32) !*Cluster {
+        return init_nat(allocator, seed, node_count, drop_ppm, null);
+    }
+
+    /// `nat` makes one node advertise another UDP port than it sends from (port-translating
+    /// NAT); the simulated network still delivers to it on either port.
+    fn init_nat(
+        allocator: std.mem.Allocator,
+        seed: u64,
+        node_count: u8,
+        drop_ppm: u32,
+        nat: ?struct { index: u8, port: u16 },
+    ) !*Cluster {
         assert(node_count >= 2 and node_count <= node_count_max);
         const cluster = try allocator.create(Cluster);
         cluster.* = .{
@@ -67,6 +96,10 @@ const Cluster = struct {
             .queue = .empty,
             .drop_ppm = drop_ppm,
         };
+        if (nat) |value| {
+            cluster.nat_index = value.index;
+            cluster.nat_port = value.port;
+        }
         try cluster.queue.ensureTotalCapacity(allocator, in_flight_max);
         var key_prng = Prng.init(seed ^ 0x6b65_7973);
         for (0..node_count) |index| {
@@ -77,9 +110,10 @@ const Cluster = struct {
                 break;
             }
             const octet: u8 = @intCast(index);
+            const is_nat = if (nat) |value| value.index == index else false;
             const record = try enr.build(secret, .{
                 .ip4 = .{ 10, 0, octet, 1 },
-                .udp = 9000,
+                .udp = if (is_nat) nat.?.port else 9000,
                 .tcp = 9222,
                 .opstack = .{ .chain_id = chain_id },
             });
@@ -111,6 +145,7 @@ const Cluster = struct {
                 .deliver_ns = now_ns + cluster.network_prng.range(1, 40) * ns_per_ms,
                 .sequence = cluster.sequence,
                 .from = from,
+                .from_port = cluster.source_port(from, to, datagram.endpoint.port),
                 .to = to,
                 .length = datagram.length,
                 .bytes = undefined,
@@ -136,7 +171,8 @@ const Cluster = struct {
                 if (flight.deliver_ns > now_ns) break;
                 const due = cluster.queue.pop().?;
                 const service = &cluster.services[due.to];
-                service.on_packet(endpoint(due.from), due.bytes[0..due.length], due.deliver_ns);
+                const source = endpoint_port(due.from, due.from_port);
+                service.on_packet(source, due.bytes[0..due.length], due.deliver_ns);
                 cluster.collect(due.to, now_ns);
             }
             for (0..cluster.node_count) |index| {
@@ -244,6 +280,24 @@ test "disc service: 10% packet loss, retries keep every node discovered" {
     }
     try std.testing.expect(retried > 0);
     try std.testing.expect(cluster.discovered_fraction_min() >= 0.99);
+}
+
+test "disc service: a NAT-translated handshake record is verified by a ping, then added" {
+    const cluster = try Cluster.init_nat(std.testing.allocator, 0x4a7, 3, 0, .{
+        .index = 1,
+        .port = 9100,
+    });
+    defer cluster.deinit();
+    cluster.boot_all_from(0);
+    cluster.run(3000 * ns_per_ms);
+    const boot = &cluster.services[0];
+    // Node 1's handshakes come from :9000 but its record says :9100.
+    try std.testing.expect(boot.stats.unverifiable_enr >= 1);
+    try std.testing.expect(boot.stats.unverifiable_enr_verified >= 1);
+    const entry = boot.table.get(cluster.services[1].local_id).?;
+    try std.testing.expectEqual(@as(u16, 9100), entry.endpoint.port);
+    // It was forwarded for dialing either way.
+    try std.testing.expect(cluster.discovered[0][1]);
 }
 
 test "disc service: same seed, same execution" {

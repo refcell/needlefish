@@ -37,6 +37,11 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] discv5 unverifiable ENRs (sigp `UnverifiableEnr` + base/base NAT handling): a handshake
+  record enters the table only if it advertises the packet's source socket; otherwise it is
+  forwarded for dialing and, when only the port differs, its advertised socket is pinged and a
+  PONG there inserts it. Tested with a conntrack-style NAT in the disc sim. Also: the
+  one-handshake-per-node rule now keys on (node, endpoint).
 - [x] `rpc_calls{method}`: every opp2p handler is wrapped at comptime to count calls in
   `Service.stats.rpc_calls`; exported as `base_node_rpc_calls`.
 - [x] discovery metrics parity (base/base `disc/src/metrics.rs`, scope `base_node_disc`):
@@ -323,3 +328,4 @@ behind a small interface and switch later.
 - 2026-11-05: secp256k1 adapter on common.crypto (handshake 770 -> 633 us, EIP-778 re-sign vector).
 - 2026-11-05: discovery metrics under base/base's `base_node_disc` scope.
 - 2026-11-05: per-method admin RPC call metrics.
+- 2026-11-05: discv5 unverifiable-ENR handling (table poisoning guard + NAT verification ping).

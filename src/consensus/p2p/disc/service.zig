@@ -64,7 +64,20 @@ pub const Stats = struct {
     discovered: u64 = 0,
     /// Random-target lookups started (base/base `find_node_request`).
     lookups: u64 = 0,
+    /// Handshake records whose advertised endpoint differs from the packet source
+    /// (sigp `UnverifiableEnr`), and those that then answered a ping there.
+    unverifiable_enr: u64 = 0,
+    unverifiable_enr_verified: u64 = 0,
 };
+
+/// A record from a handshake whose advertised socket is being pinged before insertion.
+const Verifying = struct {
+    used: bool = false,
+    deadline_ns: u64 = 0,
+    record: enr.Record = undefined,
+};
+
+const verifying_max = 8;
 
 pub const Datagram = struct {
     endpoint: Endpoint,
@@ -151,6 +164,7 @@ pub const Service = struct {
     /// boot nodes in its table, so a node that lost its first exchanges retries them).
     boot_records: [boot_records_max]enr.Record = undefined,
     boot_records_count: u8 = 0,
+    verifying: [verifying_max]Verifying = @splat(.{}),
     stats: Stats = .{},
     bans: [bans_max]Ban = undefined,
     bans_count: u32 = 0,
@@ -369,6 +383,7 @@ pub const Service = struct {
     fn handshake_leader(service: *Service, pending: *const Pending) ?*Pending {
         for (service.pending) |*other| {
             if (!other.used or other == pending or other.awaiting_session) continue;
+            if (!other.endpoint.eql(pending.endpoint)) continue;
             if (std.mem.eql(u8, &other.node_id, &pending.node_id)) return other;
         }
         return null;
@@ -742,9 +757,56 @@ pub const Service = struct {
         const write_key = keys.recipient_key;
         _ = service.sessions.put(handshake.src_id, from, write_key, keys.initiator_key, now_ns);
         service.stats.handshakes_completed += 1;
-        if (handshake.record.len > 0) service.learn(record, now_ns);
+        if (handshake.record.len > 0) service.learn_from_handshake(record, from, now_ns);
         service.handle_message(from, handshake.src_id, opened, now_ns);
         service.flush_awaiting(handshake.src_id, now_ns);
+    }
+
+    /// A handshake record enters the table only if it advertises the packet's source
+    /// socket (sigp discv5). Otherwise it is still forwarded for dialing, and if only the
+    /// port differs (port-translating NAT) its advertised socket is pinged; a PONG
+    /// there inserts it (base/base `UnverifiableEnr` handling).
+    fn learn_from_handshake(
+        service: *Service,
+        record: *const enr.Record,
+        from: Endpoint,
+        now_ns: u64,
+    ) void {
+        const advertised = endpoint_of(record) orelse return;
+        if (advertised.eql(from)) return service.learn(record, now_ns);
+        service.stats.unverifiable_enr += 1;
+        if (service.is_banned(record.node_id(), now_ns)) return;
+        service.publish(record);
+        if (!std.meta.eql(advertised.address, from.address)) return;
+        const slot = for (&service.verifying) |*verifying| {
+            if (!verifying.used or verifying.deadline_ns <= now_ns) break verifying;
+        } else return;
+        slot.* = .{
+            .used = true,
+            .deadline_ns = now_ns + service.config.handshake_timeout_ns +
+                2 * service.config.request_timeout_ns,
+            .record = record.*,
+        };
+        service.send_ping(record.node_id(), advertised, record.public_key, now_ns);
+    }
+
+    /// A PONG from `node_id` at `from`: insert a record awaiting verification there.
+    fn finish_verification(
+        service: *Service,
+        node_id: enr.NodeId,
+        from: Endpoint,
+        now_ns: u64,
+    ) void {
+        for (&service.verifying) |*verifying| {
+            if (!verifying.used) continue;
+            if (!std.mem.eql(u8, &verifying.record.node_id(), &node_id)) continue;
+            verifying.used = false;
+            const advertised = endpoint_of(&verifying.record) orelse return;
+            if (!advertised.eql(from)) return;
+            service.stats.unverifiable_enr_verified += 1;
+            service.learn(&verifying.record, now_ns);
+            return;
+        }
     }
 
     /// The initiator's record: from the handshake (verified, id must match) or our table.
@@ -909,6 +971,7 @@ pub const Service = struct {
         if (pending.kind != .ping) return;
         pending.used = false;
         service.table.mark_alive(src_id, now_ns);
+        service.finish_verification(src_id, pending.endpoint, now_ns);
     }
 
     fn on_nodes(

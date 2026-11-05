@@ -8,8 +8,7 @@
 //! failures are rejected before validation, as in base/base); validation duration is not
 //! exported because the state machines have no wall clock. `gossip_event{type="not_supported"}`
 //! stays 0: peers without gossipsub fail stream negotiation and are closed by the transport.
-//! Discovery: `unverifiable_enr*` and `discovery_dropped{closed}` stay 0 (no such paths:
-//! records are checked on receipt and the discovered queue cannot close).
+//! Discovery: `discovery_dropped{closed}` stays 0 (the discovered queue cannot close).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -227,7 +226,10 @@ pub const Metrics = struct {
         const discovery = &service.discovery;
         self.discovery_peer_count.set(discovery.table.live_count());
         const events = [discovery_events.len]u64{
-            discovery.stats.discovered, discovery.stats.handshakes_completed, 0, 0,
+            discovery.stats.discovered,
+            discovery.stats.handshakes_completed,
+            discovery.stats.unverifiable_enr,
+            discovery.stats.unverifiable_enr_verified,
         };
         for (&self.discovery_event, events) |*gauge, count| gauge.set(@intCast(count));
         self.discovery_dropped[0].set(@intCast(discovery.stats.discovered_dropped));
