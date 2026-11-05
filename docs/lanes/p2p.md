@@ -37,6 +37,15 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [ ] Fuzz: hostile bytes on a live, authenticated connection (random yamux frames,
+  multistream, and gossipsub protobuf after the noise handshake) against a full `Network`
+  in SimIo; the node must stay up, keep serving honest peers, and score/close the attacker.
+- [ ] Bench: end-to-end gossip in SimIo (sequencer -> N verifiers, 128 KiB blocks):
+  CPU per block for encode, sign, snappy, noise, and validate; record in `docs/PERF.md`.
+- [ ] Completion-based UDP (`recvfrom`/`sendto` completions) for discovery on io_uring,
+  replacing the polled path; coordinate with io-net (`just test-linux`).
+- Survey 2026-11-05: base/base `peers/monitoring.rs` (ban threshold/duration) and
+  `peers/nodes.rs` (per-chain bootnodes) are already covered; gossipsub IDONTWANT exists.
 - [x] DST: crash-restart under loss (4 seeds, 10% datagram loss, 0.05% resets):
   `SimIo.crash` node 0 while a block is in flight, rebuild it on the same disk via
   `Network.deinit_after_crash` (`Transport`/`StoreFile.forget_after_crash`: nothing is
@@ -387,5 +396,4 @@ behind a small interface and switch later.
 - 2026-11-05: devnet real-process interop checked (enode, discv5 ENR, bootstore restart).
 - 2026-11-05: opp2p_* served by the consensus node RPC via p2p.rpc.Merged.
 - 2026-11-05: crash-restart DST under packet loss.
-
 - 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.
