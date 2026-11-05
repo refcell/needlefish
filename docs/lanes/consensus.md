@@ -4,16 +4,21 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 (kona-derived), OP Stack derivation spec.
 
 ## Backlog
-- [ ] `protocol`: (split below) rollup config, system config (+ updates from L1 logs), L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian formats), user deposits from TransactionDeposited logs, frames, channels, singular + span batches, batch validity rules (Holocene strict ordering), block info.
+- [x] `protocol`: (split below) rollup config, system config (+ updates from L1 logs), L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian formats), user deposits from TransactionDeposited logs, frames, channels, singular + span batches, batch validity rules (Holocene strict ordering), block info.
   - [x] frames (zero-copy codec, payload parser), channels, `BlockInfo`/`L2BlockInfo`
   - [x] singular batches (codec + validity rules), batch drop reasons (uses `common/rlp`)
-  - [ ] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
+  - [x] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
   - [x] rollup config + hardfork activation, system config + L1 log updates
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
-  - [ ] batch validity rules (singular, span, Holocene)
+  - [x] batch validity rules (singular, span, Holocene)
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
-- [ ] `derive`: pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
+- [ ] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
+  - [x] blob codec, error kinds, provider contracts, L1 traversal
+  - [ ] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
+  - [ ] channel bank / assembler / reader
+  - [ ] batch stream, batch queue, batch validator
+  - [ ] stateful attributes builder + attributes queue, pipeline core (step, reset, signals)
 - [ ] `engine`: engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
@@ -35,7 +40,19 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - Invalid system config logs are skipped (base/base collects them as non-fatal errors).
 - Zig 0.17 has no array `**` operator: use `@splat`.
 
+- Derivation stages are plain structs whose methods take the previous stage and the
+  providers as `anytype`; providers never block and return `error.NotAvailable`
+  (temporary) while a fetch is in flight. Error kind (temporary/reset/critical) is a pure
+  function of the Zig error (`derive/errors.zig`).
+- L1 transactions reach the data sources with a recovered `from`; providers over an
+  untrusted RPC must recover the sender themselves.
+- Span batches: EIP-8130 txs decode but cannot be expanded yet (`error.Eip8130Unsupported`)
+  until `common/consensus` has 8130 decoding. Overflow returns errors where base/base wraps.
+- Brotli: own RFC 7932 decoder, static dictionary committed (CRC checked vs RFC).
+
 ## Log
+- 2026-11-05: derive: blob codec, error kinds, provider contracts, L1 traversal.
+- 2026-11-05: span batches (codec, tx data, derive, validity), brotli decoder, batch reader.
 - 2026-11-05: singular batch codec + validity (Holocene, Denim same-second, Jovian).
 - 2026-11-05: L1 info deposit (4 formats, base/base vectors), fork selection, blob fee.
 - 2026-11-05: user deposits, deposit tx 2718 encoding (base/base vectors), source hashes.
