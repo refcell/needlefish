@@ -21,6 +21,11 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   `peer_address(fd)` on every IO backend) so `trusted_proxy` can be wired in.
 - [x] `balance_monitor`: periodic balance polling over `rpc.Client` with `tick()`.
 - [x] `l1_head`: shared L1 head helpers for proof services (`json.find_path` added for it).
+- [x] `upgrade_signal` core: packed versions, `ProtocolVersions` ABI (strict), upgrade IDs,
+  default contracts, IO `Reader` pinned to one L1 block. Applying schedules (modes, chain spec
+  / rollup config) is left to execution/consensus, which own those types.
+- [ ] `upgrade_signal` observer: live polling on the tag interval + startup retry policy +
+  metrics (`base_upgrade_signal_*`), once a consumer lane needs it.
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -91,3 +96,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: `io.peer_address(fd)` (getpeername; SimIo records host+ephemeral port per side); http handlers read `response.peer`; resolve with `trusted_proxy.Config.client_ip(response.peer, request.headers.slice())`.
 - 2026-11-05: balance_monitor: own rpc.Client + Ticker, immediate first poll, publish every success (`updates` as watch version), skip polls while a read is in flight; `Ticker.stop` now cancels its pending timeout.
 - 2026-11-05: json.find_path (raw value at an object key path); l1_head: `cap_head` + `Calculator(IO)` (outputAtBlock -> finalized -> capped block hash), SimIo-tested against a fake node.
+- 2026-11-05: upgrade_signal core (version, contract ABI with comptime keccak selectors, Reader: block by tag -> eth_call x2 at blockHash); decode fails closed (canonical offset, length <= 256, zero-padded uint64).
