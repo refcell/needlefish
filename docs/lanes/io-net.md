@@ -15,7 +15,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [ ] Linux CI coverage for io_uring (`just test-linux`).
 - [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
   server can stop with an accept in flight and a client can abandon a request on timeout.
-- [ ] `http`: per-connection idle/read timeouts on the server; request timeout on client.
+- [x] `http`: per-connection idle/read timeouts on the server; request timeout on client.
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -48,6 +48,9 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   it and get hooks via `@fieldParentPtr`. Server broadcast drops consumers whose send buffer
   is full (`SlowConsumer`) instead of blocking the feed. Protocol violations fail without a
   close frame; handshake rejections flush a 400 first.
+- Timeouts are driven by the owner calling `tick()` from its loop; expired sockets are
+  `shutdown_now`-ed so their pending op completes and normal teardown runs. No timers are
+  left in flight, which avoids needing `cancel` for teardown.
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -70,3 +73,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: io: `shutdown_now(fd)` on all backends: wakes pending recvs with 0 and sends FIN, so components with concurrent recv+send can tear down before `close_now` without fd reuse races.
 - 2026-11-05: ws: Client(IO, Context) with concurrent recv/send, ping auto-reply, fragment reassembly, close handshake, shutdown-based teardown; SimIo tests with 7-byte segments. Next: ws server.
 - 2026-11-05: ws: shared Stream engine, Server(IO, Context) with connection ids, broadcast, slow-consumer drop, 400 on non-upgrade; client refactored onto Stream. Tests: client<->server on SimIo (13-byte segments) and kqueue.
+- 2026-11-05: http: server idle/io timeouts and client request timeout via tick() + shutdown_now; SimIo tests.

@@ -6,6 +6,12 @@
 //! synchronously by a comptime `handler` that writes the body into a `ResponseBuilder`.
 //! Pipelined requests already in the receive buffer are answered in order before reading
 //! more. When the pool is full, new connections are closed immediately.
+//!
+//! Timeouts: the owner calls `tick()` from its event loop (every few hundred milliseconds).
+//! A connection waiting for a new request longer than `idle_timeout_ns`, or making no
+//! progress on a partial request or a response for `io_timeout_ns`, is shut down; its pending
+//! operation then completes and the connection closes normally. There are no per-connection
+//! timers, so nothing is left in flight after `stop`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +31,10 @@ pub const Options = struct {
     send_buffer_size: u32 = 256 * 1024,
     backlog: u31 = 128,
     limits: parser.Limits = .{ .head_size_max = 8 * 1024, .body_size_max = 56 * 1024 },
+    /// Keep-alive connections with no request in progress. Zero disables.
+    idle_timeout_ns: u64 = 60 * std.time.ns_per_s,
+    /// No progress on a partially received request or an unsent response. Zero disables.
+    io_timeout_ns: u64 = 30 * std.time.ns_per_s,
 };
 
 pub fn reason_phrase(status: u16) []const u8 {
@@ -137,6 +147,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             /// Bytes of `recv_buffer` used by the request being answered.
             consumed: u32 = 0,
             keep_alive: bool = false,
+            last_progress_ns: u64 = 0,
+            timed_out: bool = false,
         };
 
         io: *IO,
@@ -151,6 +163,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         memory: []u8,
         requests_handled: u64 = 0,
         connections_rejected: u64 = 0,
+        connections_timed_out: u64 = 0,
 
         /// `server` must not move after `init`.
         pub fn init(
@@ -215,6 +228,27 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             return count;
         }
 
+        /// Shuts down connections that exceeded their timeout. Call periodically.
+        pub fn tick(server: *Self) void {
+            const now_ns = server.io.now_monotonic_ns();
+            for (server.connections) |*connection| {
+                if (connection.timed_out) continue;
+                const timeout_ns = switch (connection.state) {
+                    .free, .closing => continue,
+                    .receiving => if (connection.recv_size == 0)
+                        server.options.idle_timeout_ns
+                    else
+                        server.options.io_timeout_ns,
+                    .sending => server.options.io_timeout_ns,
+                };
+                if (timeout_ns == 0) continue;
+                if (now_ns -| connection.last_progress_ns < timeout_ns) continue;
+                connection.timed_out = true;
+                server.connections_timed_out += 1;
+                server.io.shutdown_now(connection.fd);
+            }
+        }
+
         fn accept(server: *Self) void {
             server.io.accept(*Self, server, on_accept, &server.accept_completion, server.listener);
         }
@@ -242,6 +276,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             };
             connection.fd = fd;
             connection.recv_size = 0;
+            connection.timed_out = false;
+            connection.last_progress_ns = server.io.now_monotonic_ns();
             connection_recv(connection);
         }
 
@@ -282,6 +318,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             assert(connection.state == .receiving);
             const size = result catch return connection_close(connection);
             if (size == 0) return connection_close(connection);
+            connection.last_progress_ns = connection.server.io.now_monotonic_ns();
             connection.recv_size += @intCast(size);
             assert(connection.recv_size <= connection.recv_buffer.len);
             connection_process(connection);
@@ -342,6 +379,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             assert(connection.state == .sending);
             const size = result catch return connection_close(connection);
             assert(size <= connection.send_remaining.len);
+            connection.last_progress_ns = connection.server.io.now_monotonic_ns();
             connection.send_remaining = connection.send_remaining[size..];
             if (connection.send_remaining.len > 0) {
                 return connection_send(connection, connection.send_remaining);

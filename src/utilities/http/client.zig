@@ -6,6 +6,10 @@
 //! byte arrives) the request is retried once on a fresh connection; requests are only resent
 //! when no response was observed, so a request is never processed twice by a live server
 //! that answered it. Buffers are allocated at `init`.
+//!
+//! Request timeout: the owner calls `tick()` periodically; a request older than
+//! `request_timeout_ns` has its socket shut down and completes with `error.Timeout` once the
+//! pending operation returns (a connect in progress is bounded by the OS connect timeout).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,6 +25,8 @@ pub const Options = struct {
     limits: parser.Limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 * 1024 },
     /// `Host` header value. Defaults to the server address when empty.
     host: []const u8 = "",
+    /// Zero disables the timeout.
+    request_timeout_ns: u64 = 30 * std.time.ns_per_s,
 };
 
 pub const Error = error{
@@ -30,6 +36,7 @@ pub const Error = error{
     RecvFailed,
     InvalidResponse,
     ResponseTooLarge,
+    Timeout,
 };
 
 pub const RequestError = error{ Busy, RequestTooLarge };
@@ -63,6 +70,8 @@ pub fn Client(comptime IO: type) type {
         /// The connection served at least one response before this request.
         reused: bool = false,
         retried: bool = false,
+        started_ns: u64 = 0,
+        timed_out: bool = false,
         callback: Callback = undefined,
         context: ?*anyopaque = null,
 
@@ -127,7 +136,19 @@ pub fn Client(comptime IO: type) type {
                 }
             }.erased;
             client.retried = false;
+            client.timed_out = false;
+            client.started_ns = client.io.now_monotonic_ns();
             client.start();
+        }
+
+        /// Times out the request in flight if it is older than `request_timeout_ns`.
+        pub fn tick(client: *Self) void {
+            if (client.state == .idle or client.timed_out) return;
+            const timeout_ns = client.options.request_timeout_ns;
+            if (timeout_ns == 0) return;
+            if (client.io.now_monotonic_ns() -| client.started_ns < timeout_ns) return;
+            client.timed_out = true;
+            if (client.fd) |fd| client.io.shutdown_now(fd);
         }
 
         fn write_request(
@@ -189,6 +210,10 @@ pub fn Client(comptime IO: type) type {
         ) void {
             assert(completion == &client.completion);
             assert(client.state == .connecting);
+            if (client.timed_out) {
+                client.disconnect();
+                return client.finish(error.Timeout);
+            }
             result catch {
                 client.disconnect();
                 return client.finish(error.ConnectFailed);
@@ -261,7 +286,8 @@ pub fn Client(comptime IO: type) type {
         fn fail_or_retry(client: *Self, err: Error) void {
             client.disconnect();
             // A stale keep-alive socket fails before any response byte: retry once.
-            if (client.reused and !client.retried and client.recv_size == 0) {
+            const retry = client.reused and !client.retried and !client.timed_out;
+            if (retry and client.recv_size == 0) {
                 client.retried = true;
                 return client.start();
             }
@@ -275,7 +301,7 @@ pub fn Client(comptime IO: type) type {
 
         fn finish(client: *Self, err: Error) void {
             client.state = .idle;
-            client.callback(client.context, client, err);
+            client.callback(client.context, client, if (client.timed_out) error.Timeout else err);
         }
     };
 }

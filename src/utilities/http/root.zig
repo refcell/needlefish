@@ -21,4 +21,5 @@ pub const Client = client.Client;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("server_test.zig");
+    _ = @import("timeout_test.zig");
 }
