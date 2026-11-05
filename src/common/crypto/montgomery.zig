@@ -240,6 +240,111 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
             return result;
         }
 
+        // Lazy reduction: double-width products reduced once (Montgomery REDC), for
+        // extension-field formulas that combine several products before reducing.
+        // Needs 4p < R so unreduced sums (< 2p) and combinations (< 2p^2 < pR) fit.
+
+        /// A 2 * limbs product, little-endian, not reduced.
+        pub const WideLimbs = [2 * limbs]u64;
+        pub const lazy_supported = modulus < (@as(Int, 1) << (bits - 2));
+        const modulus_squared_wide: WideLimbs = wide_from_int(@as(Wide, modulus) * modulus);
+
+        fn wide_from_int(value: Wide) WideLimbs {
+            var out: WideLimbs = undefined;
+            inline for (0..2 * limbs) |index| out[index] = @truncate(value >> (64 * index));
+            return out;
+        }
+
+        /// a + b without reduction; the result is below 2p and only valid as an input to
+        /// `mul_wide`.
+        pub fn add_unreduced(a: Self, b: Self) Self {
+            comptime assert(lazy_supported);
+            var sum: [limbs]u64 = undefined;
+            var carry: u1 = 0;
+            inline for (0..limbs) |index| {
+                const step1 = @addWithOverflow(a.limbs_value[index], b.limbs_value[index]);
+                const step2 = @addWithOverflow(step1[0], carry);
+                sum[index] = step2[0];
+                carry = step1[1] | step2[1];
+            }
+            assert(carry == 0);
+            return .{ .limbs_value = sum };
+        }
+
+        /// The full product a * b (inputs below 2p), as 2 * limbs words.
+        pub fn mul_wide(a: Self, b: Self) WideLimbs {
+            comptime assert(lazy_supported);
+            var t: WideLimbs = @splat(0);
+            inline for (0..limbs) |i| {
+                var carry: u64 = 0;
+                inline for (0..limbs) |j| {
+                    const step = multiply_add(a.limbs_value[j], b.limbs_value[i], t[i + j], carry);
+                    t[i + j] = step[0];
+                    carry = step[1];
+                }
+                t[i + limbs] = carry;
+            }
+            // Inputs below 2p < R / 2 give a product below R^2 / 4.
+            assert(t[2 * limbs - 1] >> 62 == 0);
+            return t;
+        }
+
+        pub fn wide_add(a: WideLimbs, b: WideLimbs) WideLimbs {
+            var out: WideLimbs = undefined;
+            var carry: u1 = 0;
+            inline for (0..2 * limbs) |index| {
+                const step1 = @addWithOverflow(a[index], b[index]);
+                const step2 = @addWithOverflow(step1[0], carry);
+                out[index] = step2[0];
+                carry = step1[1] | step2[1];
+            }
+            assert(carry == 0);
+            return out;
+        }
+
+        /// a - b; the caller guarantees a >= b.
+        pub fn wide_sub(a: WideLimbs, b: WideLimbs) WideLimbs {
+            var out: WideLimbs = undefined;
+            var borrow: u1 = 0;
+            inline for (0..2 * limbs) |index| {
+                const step1 = @subWithOverflow(a[index], b[index]);
+                const step2 = @subWithOverflow(step1[0], borrow);
+                out[index] = step2[0];
+                borrow = step1[1] | step2[1];
+            }
+            assert(borrow == 0);
+            return out;
+        }
+
+        /// a - b + p^2, nonnegative for a, b below p^2.
+        pub fn wide_sub_plus_p_squared(a: WideLimbs, b: WideLimbs) WideLimbs {
+            return wide_sub(wide_add(a, modulus_squared_wide), b);
+        }
+
+        /// Montgomery reduction t * R^-1 mod p for t < p * R.
+        pub fn reduce_wide(value: WideLimbs) Self {
+            comptime assert(lazy_supported);
+            var t = value;
+            var carry_top: u64 = 0;
+            inline for (0..limbs) |i| {
+                const m = t[i] *% inverse_word;
+                var carry: u64 = 0;
+                inline for (0..limbs) |j| {
+                    const step = multiply_add(m, modulus_limbs[j], t[i + j], carry);
+                    t[i + j] = step[0];
+                    carry = step[1];
+                }
+                assert(t[i] == 0);
+                const step1 = @addWithOverflow(t[i + limbs], carry);
+                const step2 = @addWithOverflow(step1[0], carry_top);
+                t[i + limbs] = step2[0];
+                carry_top = @as(u64, step1[1]) + step2[1];
+            }
+            const result = reduce_once(t[limbs..].*, carry_top);
+            assert(result.is_canonical());
+            return result;
+        }
+
         pub fn square(a: Self) Self {
             return a.mul(a);
         }
@@ -307,6 +412,32 @@ const bls_p = (0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf << 192) |
     0x6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab;
 
 const testing = std.testing;
+
+fn check_lazy_reduction(comptime F: type, seed: u64) !void {
+    var prng = Prng.init(seed);
+    for (0..500) |round| {
+        const random = F.from_int(prng.int(F.Int) % F.modulus);
+        const a = if (round == 0) F.from_int(F.modulus - 1) else random;
+        const b = if (round == 0) a else F.from_int(prng.int(F.Int) % F.modulus);
+        const c = F.from_int(prng.int(F.Int) % F.modulus);
+        const d = F.from_int(prng.int(F.Int) % F.modulus);
+        try testing.expect(F.reduce_wide(F.mul_wide(a, b)).eql(a.mul(b)));
+        // Karatsuba Fp2 combinations as used by the towers.
+        const ab = F.mul_wide(a, b);
+        const cd = F.mul_wide(c, d);
+        const real = F.reduce_wide(F.wide_sub_plus_p_squared(ab, cd));
+        try testing.expect(real.eql(a.mul(b).sub(c.mul(d))));
+        const cross = F.mul_wide(F.add_unreduced(a, c), F.add_unreduced(b, d));
+        const imaginary = F.reduce_wide(F.wide_sub(F.wide_sub(cross, ab), cd));
+        try testing.expect(imaginary.eql(a.mul(d).add(c.mul(b))));
+    }
+}
+
+test "montgomery: lazy reduction matches mul for bn254 and bls12-381" {
+    try check_lazy_reduction(Field(4, bn254_p), 0x6c617a);
+    try check_lazy_reduction(Field(6, bls_p), 0x6c617b);
+    try testing.expect(!Field(4, p256_p).lazy_supported);
+}
 
 fn check_field_against_big_ints(comptime F: type, seed: u64) !void {
     const Wide = @Int(.unsigned, 2 * F.bits);

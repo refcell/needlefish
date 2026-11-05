@@ -50,10 +50,15 @@ pub const Fp2 = struct {
 
     /// Karatsuba: three base-field multiplications.
     pub fn mul(a: Fp2, b: Fp2) Fp2 {
-        const v0 = a.c0.mul(b.c0);
-        const v1 = a.c1.mul(b.c1);
-        const cross = a.c0.add(a.c1).mul(b.c0.add(b.c1));
-        return .{ .c0 = v0.sub(v1), .c1 = cross.sub(v0).sub(v1) };
+        // Karatsuba with lazy reduction: three double-width products, two reductions.
+        const F = @TypeOf(a.c0);
+        const v0 = F.mul_wide(a.c0, b.c0);
+        const v1 = F.mul_wide(a.c1, b.c1);
+        const cross = F.mul_wide(F.add_unreduced(a.c0, a.c1), F.add_unreduced(b.c0, b.c1));
+        return .{
+            .c0 = F.reduce_wide(F.wide_sub_plus_p_squared(v0, v1)),
+            .c1 = F.reduce_wide(F.wide_sub(F.wide_sub(cross, v0), v1)),
+        };
     }
 
     /// Complex squaring: two base-field multiplications.
