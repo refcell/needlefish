@@ -102,7 +102,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   non-k1 actors) turns on at Zenith; Everest runs `authorize_without_keystore`.
   `eip8130_simulate.zig` covers `eth_call`/`eth_estimateGas` (unsigned, from the request's
   `from`; estimate binary-searches the call pool for EIP-150 forwarding).
-  Left: keystore (Zenith) end-to-end tests; the node lane must map consensus 0x79
+  End-to-end tests cover self-pay, open-payer sponsorship, phase rollback, rejections, 2D
+  nonces, and a Zenith config change authorizing an actor that then signs.
+  Left: the node lane must map consensus 0x79
   envelopes to `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw }` and
   wire RPC estimation to `eip8130_simulate.simulate`.
 - [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);

@@ -11,6 +11,9 @@ const native = @import("native.zig");
 const nonce = @import("eip8130_nonce.zig");
 const execute = @import("eip8130_execute.zig");
 const simulate = @import("eip8130_simulate.zig");
+const config = @import("eip8130_config.zig");
+const auth = @import("eip8130_auth.zig");
+const signature_module = @import("../../common/consensus/signature.zig");
 const Harness = @import("evm_test.zig").Harness;
 const eip8130 = @import("../../common/consensus/eip8130.zig");
 const common = @import("../../common/primitives/root.zig");
@@ -83,6 +86,7 @@ const Built = struct {
     signed: eip8130.Signed,
     sender_auth: [65]u8,
     payer_auth: [65]u8,
+    configured_auth: [85]u8,
     envelope_buffer: [1024]u8,
     envelope: []const u8,
     calls_buffer: [512]u8,
@@ -106,12 +110,25 @@ const Built = struct {
         }
         var tx = base;
         tx.calls = eip8130.Calls.build(&built.calls_buffer, phase_lists[0..phases.len]);
-        built.sender_auth = try eip8130.sign_sender(tx, dev_key);
+        built.sender_auth = if (tx.sender == null)
+            try eip8130.sign_sender(tx, dev_key)
+        else
+            @splat(0); // Replaced by `sign_configured`.
         built.signed = .{ .tx = tx, .sender_auth = &built.sender_auth };
         built.envelope = built.signed.encode_to(&built.envelope_buffer);
     }
 
-    /// re-sign with `key` as the open payer (`tx.payer` must be the open marker).
+    /// Re-sign for an explicit `tx.sender` as a configured k1 actor holding `key`.
+    fn sign_configured(built: *Built, key: [32]u8) !void {
+        std.debug.assert(built.signed.tx.sender != null);
+        const hash = built.signed.tx.sender_signature_hash();
+        built.configured_auth[0..20].* = config.k1_authenticator;
+        built.configured_auth[20..85].* = try raw_k1(key, hash);
+        built.signed.sender_auth = &built.configured_auth;
+        built.envelope = built.signed.encode_to(&built.envelope_buffer);
+    }
+
+    /// Re-sign with `key` as the open payer (`tx.payer` must be the open marker).
     fn sponsor(built: *Built, key: [32]u8) !void {
         const sender = common.Address.init(dev_address);
         built.payer_auth = try eip8130.sign_payer(built.signed.tx, sender, key);
@@ -421,4 +438,91 @@ test "eip8130 simulate: the estimate covers EIP-150 forwarding" {
     const executed = (try transaction.transact(&h.evm, .osaka, &tight_env)).executed;
     try testing.expectEqual(evm_module.Status.success, executed.status);
     try testing.expectEqual(@as(u256, 1), try h.storage(store_target, 0));
+}
+
+fn raw_k1(key: [32]u8, hash: common.B256) ![65]u8 {
+    var raw = (try signature_module.sign(key, hash)).to_bytes();
+    raw[64] += 27;
+    return raw;
+}
+
+/// abi.encode(actorId, (authenticator, expiry, scope), bytes("")).
+fn authorize_payload(buffer: *[192]u8, actor_id: primitives.B256, scope: u16) []const u8 {
+    @memset(buffer, 0);
+    buffer[0..32].* = actor_id;
+    buffer[44..64].* = config.k1_authenticator;
+    std.mem.writeInt(u256, buffer[96..128], scope, .big);
+    std.mem.writeInt(u256, buffer[128..160], 160, .big);
+    return buffer;
+}
+
+/// A local-channel config change authorizing `actor_id`, signed by the inline EOA key.
+fn authorize_change(
+    payload_buffer: *[192]u8,
+    items_buffer: *[256]u8,
+    change_auth: *[85]u8,
+    actor_id: primitives.B256,
+) !eip8130.ConfigChange {
+    const items = [1]eip8130.SignedChange{.{
+        .change_type = .authorize_actor,
+        .payload = authorize_payload(payload_buffer, actor_id, eip8130.scope_unrestricted),
+    }};
+    var change = eip8130.ConfigChange{
+        .channel = .local,
+        .sequence = 0,
+        .changes = eip8130.SignedChanges.build(items_buffer, &items),
+        .signature = &.{},
+    };
+    change_auth[0..20].* = config.k1_authenticator;
+    const digest = auth.changes_digest(dev_address, chain_id, change);
+    change_auth[20..85].* = try raw_k1(dev_key, .init(digest));
+    change.signature = change_auth;
+    return change;
+}
+
+test "eip8130 execute: at Zenith a config change authorizes an actor that then signs" {
+    var h: Harness = undefined;
+    try setup(&h);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .zenith };
+    const actor_id = auth.address_actor_id(payer_address);
+    var payload_buffer: [192]u8 = undefined;
+    var items_buffer: [256]u8 = undefined;
+    var change_auth: [85]u8 = undefined;
+    const change = try authorize_change(&payload_buffer, &items_buffer, &change_auth, actor_id);
+    const account_changes = [1]eip8130.AccountChange{.{ .config = change }};
+    var changes_buffer: [512]u8 = undefined;
+    var configure = base_tx();
+    configure.account_changes = eip8130.AccountChanges.build(&changes_buffer, &account_changes);
+    var built: Built = undefined;
+    const phases = [_][]const Address{&.{store_target}};
+    try built.init(configure, &phases);
+    const env = built.env();
+    const first = (try transaction.transact(&h.evm, .osaka, &env)).executed;
+    try testing.expectEqual(evm_module.Status.success, first.status);
+    try testing.expectEqual(@as(usize, 1), first.logs.len);
+    try testing.expectEqualSlices(u8, &config.address, &first.logs[0].address);
+    const store = config.Store{ .state = &h.state };
+    try testing.expect(try store.is_actor(dev_address, actor_id));
+
+    // The new actor signs for the account; the inline EOA key is not involved.
+    var delegated = base_tx();
+    delegated.sender = .init(dev_address);
+    delegated.nonce_sequence = 1;
+    try built.init(delegated, &phases);
+    try built.sign_configured(payer_key);
+    const second_env = built.env();
+    const second = (try transaction.transact(&h.evm, .osaka, &second_env)).executed;
+    try testing.expectEqual(evm_module.Status.success, second.status);
+    try testing.expectEqual(@as(u256, 2), try h.storage(store_target, 0));
+    try testing.expectEqual(@as(u64, 2), (try h.state.load(dev_address)).info.nonce);
+
+    // Before Zenith the same configured actor is rejected.
+    h.evm.block.op = .{ .upgrade = .everest };
+    delegated.nonce_sequence = 2;
+    try built.init(delegated, &phases);
+    try built.sign_configured(payer_key);
+    const keystoreless = built.env();
+    const rejected = try transaction.transact(&h.evm, .osaka, &keystoreless);
+    try testing.expectEqual(transaction.Invalid.eip8130_rejected, rejected.invalid);
 }
