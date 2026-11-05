@@ -64,6 +64,17 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   already on L1 after a restart (base/base `recent_txs.rs`).
 - [x] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
 - [x] DST: a sim scenario driving admin stop/start/flush on the real batcher.
+- [ ] `batcher`: base/base flag names as aliases (`--l1-rpc-url`, `--poll-interval` seconds,
+  `--data-availability-type`, `--resubmission-timeout`, `--max-blobs-per-tx`,
+  `--compressed-size-target`, `--max-calldata-size-bytes`, `--network-timeout`).
+- [ ] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
+  `--throttle-{block,tx}-size-{upper,lower}-limit`).
+- [ ] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
+- [ ] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
+- [ ] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
+- [ ] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
+  validator's derived hashes with the leader's.
+- [ ] `batcher`: batcher balance metric (base/base `BalanceMonitorLayer`).
 
 ## Draft devnet contract
 - L1: `node --dev-l1` (auto-mine, 2s blocks?), HTTP :8545, beacon API :5052.
