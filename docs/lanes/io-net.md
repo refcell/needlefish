@@ -8,7 +8,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `json`: fast zero-alloc JSON tokenizer/writer for JSON-RPC (hex quantities, 0x data) — fuzzed.
 - [x] `http`: HTTP/1.1 server + client on the IO interface (keep-alive, pipelining, bounded buffers), fuzzed parser.
 - [x] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
-- [ ] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
+- [x] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [ ] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [ ] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
@@ -53,3 +53,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: http: incremental HTTP/1.1 parser (pipelining, in-place chunked, smuggling checks); fuzzed.
 - 2026-11-05: http: Server(IO, Ctx, handler) and Client(IO) with keep-alive and pipelining; SimIo + kqueue + io_uring tests.
 - 2026-11-05: rpc: JSON-RPC 2.0 Router (batches, notifications, typed params, error rewind) and Client; fuzzed.
+- 2026-11-05: jwt: HS256 create/verify, +-60s iat window, alg-none rejection, hex secret; fuzzed.
