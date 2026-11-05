@@ -7,6 +7,11 @@ const std = @import("std");
 pub const packet = @import("packet.zig");
 pub const crypto = @import("crypto.zig");
 pub const messages = @import("messages.zig");
+pub const table = @import("table.zig");
+pub const session = @import("session.zig");
+pub const lookup = @import("lookup.zig");
+pub const service = @import("service.zig");
+pub const Service = service.Service;
 
 test {
     std.testing.refAllDecls(@This());
