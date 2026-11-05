@@ -37,6 +37,18 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] metrics parity: `block_validation_failed{reason}` (base/base reasons incl.
+  `timestamp_future`/`timestamp_past` and `invalid_base_time_schedule`), `block_version{version}`;
+  validation counters count decoded envelopes only (`stats.decode_failed` separate).
+- [ ] metrics parity: `dial_peer_error{type}` and `inbound_connection_error{type}` from the
+  service/gater refusal reasons.
+- [ ] metrics parity: `peer_scores` and `gossip_peer_connection_duration_seconds` histograms,
+  observed on disconnect.
+- [ ] metrics parity: `gossip_event{type}`, `block_topic_retirements_total{version}`,
+  `block_topic_blocked_total{version,direction}`.
+- [ ] DST: discovery-only swarm (16 nodes, one ENR bootnode, no enode dial) converges over SimIo
+  UDP with `datagram_loss_ppm` and a healed partition (`-Dslow-tests`).
+- [ ] DST: 10% datagram loss; discv5 handshakes and lookups still fill tables (retry paths).
 - [x] Transport closes with io `shutdown_now`, then `close_now` once the link is idle, so a
   reused descriptor never meets a stale recv (asserted on every new descriptor).
 - [x] UDP discovery over io: added a minimal polled UDP path to io (all backends, noted in
@@ -232,6 +244,10 @@ behind a small interface and switch later.
   60 min, peers.hi 30). `Service`/handler library defaults keep topic scoring on, which
   the handler tests rely on; the options layer sets base/base's CLI value.
 
+- Req/resp (block sync by number): base/base has none; its `opp2p_peerStats` reports
+  `ReqRespScores` as zeros, so this lane does the same and does not implement req/resp.
+- Validation duration histogram is not exported: the gossip state machine has no wall clock.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -276,3 +292,4 @@ behind a small interface and switch later.
 - 2026-11-05: block validity decodes EIP-8130 transactions.
 - 2026-11-05: protected peers bypass limits and score bans.
 - 2026-11-05: discv5 runs over io UDP (SimIo + kqueue/io_uring).
+- 2026-11-05: validation failure reasons and block versions as labeled metrics.

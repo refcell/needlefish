@@ -88,6 +88,47 @@ pub fn acceptance(result: Error!void) Acceptance {
     return .accept;
 }
 
+/// Failure reasons, labeled like base/base `block_validation_failed`.
+pub const Reason = enum(u8) {
+    timestamp_future,
+    timestamp_past,
+    invalid_hash,
+    invalid_signature,
+    invalid_signer,
+    too_many_blocks,
+    block_seen,
+    invalid_block,
+    invalid_base_time_schedule,
+    parent_beacon_root,
+    blob_gas_used,
+    excess_blob_gas,
+    withdrawals_root,
+};
+
+/// Maps a validation error to its metric reason; `timestamp` splits future from past.
+pub fn reason_of(err: Error, timestamp: u64, now_seconds: u64) Reason {
+    const reason: Reason = switch (err) {
+        error.Timestamp => if (timestamp > now_seconds +| timestamp_future_max_seconds)
+            .timestamp_future
+        else
+            .timestamp_past,
+        error.Signature => .invalid_signature,
+        error.Signer => .invalid_signer,
+        error.ExtraData, error.BaseFeeOverflow, error.Transaction => .invalid_block,
+        error.BlockHash => .invalid_hash,
+        error.Withdrawals => .withdrawals_root,
+        error.BlobGasUsed => .blob_gas_used,
+        error.ExcessBlobGas => .excess_blob_gas,
+        error.ParentBeaconRoot => .parent_beacon_root,
+        error.BaseTimeSchedule => .invalid_base_time_schedule,
+        error.TooManyBlocks => .too_many_blocks,
+        error.BlockSeen => .block_seen,
+    };
+    assert((err == error.Timestamp) ==
+        (reason == .timestamp_future or reason == .timestamp_past));
+    return reason;
+}
+
 /// The timestamp window check alone.
 pub fn check_timestamp(timestamp: u64, now_seconds: u64) Error!void {
     const is_future = timestamp > now_seconds +| timestamp_future_max_seconds;
@@ -765,4 +806,18 @@ test "validity: fuzz validation of mutated envelopes" {
     defer testing.allocator.destroy(context);
     try context.init(&.{.ecotone});
     try fuzz.run(context, fuzz_validate, .{ .iterations = 64 });
+}
+
+test "validity: reason_of follows base/base labels" {
+    const now = 1_000_000;
+    try testing.expectEqual(Reason.timestamp_future, reason_of(error.Timestamp, now + 6, now));
+    try testing.expectEqual(Reason.timestamp_past, reason_of(error.Timestamp, now - 61, now));
+    try testing.expectEqual(Reason.invalid_hash, reason_of(error.BlockHash, now, now));
+    try testing.expectEqual(Reason.invalid_block, reason_of(error.Transaction, now, now));
+    try testing.expectEqual(Reason.withdrawals_root, reason_of(error.Withdrawals, now, now));
+    try testing.expectEqual(Reason.block_seen, reason_of(error.BlockSeen, now, now));
+    try testing.expectEqual(
+        Reason.invalid_base_time_schedule,
+        reason_of(error.BaseTimeSchedule, now, now),
+    );
 }

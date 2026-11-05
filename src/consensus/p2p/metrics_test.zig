@@ -5,6 +5,7 @@ const std = @import("std");
 const metrics = @import("../../utilities/metrics/root.zig");
 const p2p_metrics = @import("metrics.zig");
 const Fixture = @import("rpc_test.zig").Fixture;
+const validity = @import("gossip/validity.zig");
 
 const testing = std.testing;
 
@@ -28,6 +29,8 @@ test "p2p metrics: register, update, and render" {
     cells.update(fixture.service, .{ .accepted = 1, .dialed = 1, .bytes_received = 99 });
     fixture.service.gossip.stats.accepted = 3;
     fixture.service.gossip.stats.rejected = 1;
+    fixture.service.gossip.stats.failed[@backingInt(validity.Reason.invalid_signer)] = 1;
+    fixture.service.gossip.stats.versions[2] = 4;
     cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
 
     var buffer: [16 * 1024]u8 = undefined;
@@ -37,7 +40,9 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_gossip_peer_count 2\n");
     try expect_contains(text, "base_node_gossipsub_connection{type=\"connected\"} 3\n");
     try expect_contains(text, "base_node_block_validation_total 4\n");
-    try expect_contains(text, "base_node_block_validation_failed 1\n");
+    try expect_contains(text, "base_node_block_validation_failed{reason=\"invalid_signer\"} 1\n");
+    try expect_contains(text, "base_node_block_validation_failed{reason=\"block_seen\"} 0\n");
+    try expect_contains(text, "base_node_block_version{version=\"v3\"} 4\n");
     try expect_contains(text, "base_node_p2p_bytes_received 120\n");
     try expect_contains(text, "base_node_block_topic_subscribed{version=\"v1\"} 1\n");
     try expect_contains(text, "# TYPE base_node_block_topic_peers gauge\n");

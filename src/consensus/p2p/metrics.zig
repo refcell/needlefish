@@ -4,14 +4,16 @@
 //! The p2p state machines keep plain `Stats` counters; `Metrics.update` copies them (and
 //! derived gauges such as per-topic peer counts) into registry cells, so the hot paths never
 //! touch atomics. Call `update` before serving a scrape, or on every service tick.
-//! Label sets follow base/base where this node has the matching counter; failure reasons
-//! are not broken out.
+//! Label sets follow base/base. `block_validation_*` count decoded envelopes only (decode
+//! failures are rejected before validation, as in base/base); validation duration is not
+//! exported because the state machines have no wall clock.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const metrics = @import("../../utilities/metrics/root.zig");
 const service_module = @import("service.zig");
 const router_module = @import("gossip/router.zig");
+const validity = @import("gossip/validity.zig");
 
 const Service = service_module.Service;
 const Counter = metrics.Counter;
@@ -30,6 +32,13 @@ const connection_labels = [connection_types.len][1]metrics.Label{
     .{.{ .name = "type", .value = connection_types[1] }},
     .{.{ .name = "type", .value = connection_types[2] }},
     .{.{ .name = "type", .value = connection_types[3] }},
+};
+
+const reasons = std.meta.fieldNames(validity.Reason);
+const reason_labels = labels: {
+    var labels: [reasons.len][1]metrics.Label = undefined;
+    for (reasons, &labels) |name, *label| label.* = .{.{ .name = "reason", .value = name }};
+    break :labels labels;
 };
 
 /// Transport counters `update` reads (a copy of `Transport(IO).Stats`).
@@ -54,11 +63,12 @@ pub const Metrics = struct {
     gossipsub_connection: [connection_types.len]Gauge = @splat(.{}),
     block_validation_total: Counter = .{},
     block_validation_success: Counter = .{},
-    block_validation_failed: Counter = .{},
+    block_validation_failed: [reasons.len]Counter = @splat(.{}),
+    block_version: [versions.len]Counter = @splat(.{}),
     p2p_bytes_received: Counter = .{},
     p2p_bytes_sent: Counter = .{},
 
-    pub const entries_count = 10 + 3 * versions.len + connection_types.len;
+    pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -107,8 +117,22 @@ pub const Metrics = struct {
             "Gossiped blocks accepted",
             &self.block_validation_success,
         );
-        try registry.counter("base_node_block_validation_failed", "Gossiped blocks rejected " ++
-            "or ignored", &self.block_validation_failed);
+        for (&self.block_validation_failed, &reason_labels) |*counter, *labels| {
+            try registry.register(.{
+                .name = "base_node_block_validation_failed",
+                .help = "Number of failed block validations by reason",
+                .labels = labels,
+                .metric = .{ .counter = counter },
+            });
+        }
+        for (&self.block_version, &version_labels) |*counter, *labels| {
+            try registry.register(.{
+                .name = "base_node_block_version",
+                .help = "Distribution of block versions",
+                .labels = labels,
+                .metric = .{ .counter = counter },
+            });
+        }
         try registry.counter("base_node_p2p_bytes_received", "Bytes received on p2p " ++
             "TCP connections", &self.p2p_bytes_received);
         try registry.counter(
@@ -137,10 +161,14 @@ pub const Metrics = struct {
         self.gossipsub_connection[1].set(@intCast(transport.dial_failures));
         self.gossipsub_connection[2].set(@intCast(service.stats.inbound_refused));
         self.gossipsub_connection[3].set(@intCast(transport.closed));
-        const validated = gossip.stats.accepted + gossip.stats.rejected + gossip.stats.ignored;
-        store(&self.block_validation_total, validated);
+        var failed: u64 = 0;
+        for (&self.block_validation_failed, gossip.stats.failed) |*counter, count| {
+            store(counter, count);
+            failed += count;
+        }
+        for (&self.block_version, gossip.stats.versions) |*counter, count| store(counter, count);
+        store(&self.block_validation_total, gossip.stats.accepted + failed);
         store(&self.block_validation_success, gossip.stats.accepted);
-        store(&self.block_validation_failed, gossip.stats.rejected + gossip.stats.ignored);
         store(&self.p2p_bytes_received, transport.bytes_received);
         store(&self.p2p_bytes_sent, transport.bytes_sent);
         assert(self.block_validation_total.get() >= self.block_validation_success.get());

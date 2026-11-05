@@ -131,6 +131,7 @@ test "block gossip: a signed block reaches every node and is delivered once" {
     defer std.testing.allocator.free(scratch);
     for (net.gossips[1..]) |gossip| {
         try std.testing.expectEqual(@as(u64, 1), gossip.stats.accepted);
+        try std.testing.expectEqual(@as(u64, 1), gossip.stats.versions[2]); // Ecotone: v3.
         const envelope = gossip.pop_block(scratch).?;
         try std.testing.expectEqual(@as(u64, 7), envelope.payload.block_number);
         try std.testing.expect(envelope.payload.block_hash.eql(value.block_hash));
@@ -152,6 +153,9 @@ test "block gossip: wrong signer is rejected, not forwarded, and penalized" {
     for (net.gossips[1..], 1..) |gossip, index| {
         try std.testing.expectEqual(@as(u64, 0), gossip.stats.accepted);
         try std.testing.expectEqual(@as(u64, 1), gossip.stats.rejected);
+        const signer = @backingInt(validity.Reason.invalid_signer);
+        try std.testing.expectEqual(@as(u64, 1), gossip.stats.failed[signer]);
+        try std.testing.expectEqual(@as(u64, 0), gossip.stats.decode_failed);
         _ = index;
     }
     try net.heartbeat();

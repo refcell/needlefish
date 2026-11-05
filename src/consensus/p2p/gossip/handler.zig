@@ -54,6 +54,12 @@ pub const Stats = struct {
     ignored: u64 = 0,
     accepted_dropped: u64 = 0,
     published: u64 = 0,
+    /// Messages that did not decode as a payload envelope (rejected before validation).
+    decode_failed: u64 = 0,
+    /// Validation attempts per block version (base/base `block_version`).
+    versions: [versions.len]u64 = @splat(0),
+    /// Validation failures per reason (base/base `block_validation_failed`).
+    failed: [std.meta.fieldNames(validity.Reason).len]u64 = @splat(0),
 };
 
 pub const BlockGossip = struct {
@@ -185,8 +191,18 @@ pub const BlockGossip = struct {
     ) validity.Acceptance {
         const data = gossip.router.message_data(&event.id) orelse return .ignore;
         const version = gossip.version_of(event.topic);
-        const envelope = block.decode(version, data, gossip.scratch) catch return .reject;
-        return validity.acceptance(gossip.validator.validate(&envelope, now_ns / ns_per_s));
+        const envelope = block.decode(version, data, gossip.scratch) catch {
+            gossip.stats.decode_failed += 1;
+            return .reject;
+        };
+        gossip.stats.versions[@backingInt(version) - 1] += 1;
+        const now_seconds = now_ns / ns_per_s;
+        const result = gossip.validator.validate(&envelope, now_seconds);
+        result catch |err| {
+            const timestamp = envelope.payload.timestamp;
+            gossip.stats.failed[@backingInt(validity.reason_of(err, timestamp, now_seconds))] += 1;
+        };
+        return validity.acceptance(result);
     }
 
     fn queue_accepted(gossip: *BlockGossip, id: *const Id) void {
