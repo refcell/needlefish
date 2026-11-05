@@ -33,6 +33,10 @@ const port = 9222;
 const frame_size_max = 256 * 1024;
 const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
 
+const Chain = enum { ecotone, denim };
+const world_realtime_start_s = 1_700_000_000; // `SimWorld` realtime at world time zero.
+const slot_ms = rollup_config.DenimTimestampSchedule.denim_block_interval_ms;
+
 const Node = struct {
     io: SimIo,
     secret: secp256k1.SecretKey,
@@ -51,7 +55,7 @@ const Cluster = struct {
     tx_storage: [512]u8 = undefined,
 
     fn init(cluster: *Cluster, seed: u64) !void {
-        return cluster.init_options(seed, nodes, 0, 0);
+        return cluster.init_options(seed, nodes, 0, 0, .ecotone);
     }
 
     fn all(cluster: *Cluster) []Node {
@@ -64,12 +68,27 @@ const Cluster = struct {
         count: usize,
         reset_ppm: u32,
         datagram_loss_ppm: u32,
+        chain: Chain,
     ) !void {
         assert(count >= 2 and count <= nodes_max);
         cluster.count = count;
         const allocator = std.testing.allocator;
         cluster.rollup = .{ .l2_chain_id = chain_id };
-        cluster.rollup.upgrades.set(.ecotone, 0);
+        switch (chain) {
+            .ecotone => cluster.rollup.upgrades.set(.ecotone, 0),
+            .denim => {
+                // 200 ms blocks from genesis, which sits at the simulated clock's zero.
+                const genesis_s = world_realtime_start_s;
+                cluster.rollup.block_time = 2;
+                cluster.rollup.genesis.l2_time = genesis_s;
+                // Every upgrade through Denim is active, as on a real chain at Denim (Base's
+                // own forks do not cascade to the OP ones).
+                for (std.enums.values(rollup_config.Upgrade)) |upgrade| {
+                    if (@backingInt(upgrade) > @backingInt(rollup_config.Upgrade.denim)) break;
+                    if (upgrade != .bedrock) cluster.rollup.upgrades.set(upgrade, genesis_s);
+                }
+            },
+        }
         cluster.sequencer_secret = @splat(0);
         cluster.sequencer_secret[31] = 5;
         cluster.world = try World.init(allocator, .{
@@ -301,7 +320,7 @@ test "p2p transport: a partitioned node gets the block after the partition heals
 test "p2p transport: blocks keep flowing through random connection resets" {
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
-    try cluster.init_options(5, nodes, 5_000, 0);
+    try cluster.init_options(5, nodes, 5_000, 0, .ecotone);
     defer cluster.deinit();
     const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
     defer std.testing.allocator.free(scratch);
@@ -387,7 +406,7 @@ test "p2p transport: eight nodes with resets gossip every block (slow)" {
     if (!build_options.slow_tests) return error.SkipZigTest;
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
-    try cluster.init_options(8, 8, 2_000, 0);
+    try cluster.init_options(8, 8, 2_000, 0, .ecotone);
     defer cluster.deinit();
     const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
     defer std.testing.allocator.free(scratch);
@@ -428,7 +447,7 @@ test "p2p transport: seed sweep, every node gets every block (slow)" {
 test "p2p transport: discovery fills tables and connects through 10% datagram loss" {
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
-    try cluster.init_options(21, nodes, 0, 100_000);
+    try cluster.init_options(21, nodes, 0, 100_000, .ecotone);
     defer cluster.deinit();
     cluster.run(10 * ns_per_s);
     for (cluster.all()) |*node| {
@@ -449,7 +468,7 @@ test "p2p transport: sixteen-node discovery swarm heals a partition and gossips 
     if (!build_options.slow_tests) return error.SkipZigTest;
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
-    try cluster.init_options(31, nodes_max, 0, 50_000);
+    try cluster.init_options(31, nodes_max, 0, 50_000, .ecotone);
     defer cluster.deinit();
     // Nodes 12..15 start cut off from everyone else, including the bootnode.
     for (12..nodes_max) |cut| {
@@ -487,7 +506,7 @@ test "p2p transport: chaos seed sweep with loss, resets, and a partition (slow)"
     for (40..48) |seed| {
         const cluster = try std.testing.allocator.create(Cluster);
         defer std.testing.allocator.destroy(cluster);
-        try cluster.init_options(seed, 5, 2_000, 50_000);
+        try cluster.init_options(seed, 5, 2_000, 50_000, .ecotone);
         defer cluster.deinit();
         cluster.run(10 * ns_per_s);
         // Cut one node off for a while, then heal and let it rejoin.
@@ -615,4 +634,82 @@ test "p2p transport: stop cancels the UDP completions, then closes the socket" {
     const received = cluster.storage[2].transport.stats.datagrams_received;
     cluster.run(2 * ns_per_s);
     try std.testing.expect(cluster.storage[2].transport.stats.datagrams_received > received);
+}
+
+/// A Denim block at `number`: [L1 info stand-in, BaseTime deposit with its millis part],
+/// timestamped by the 200 ms schedule, on the topic version its time selects.
+fn denim_payload(cluster: *Cluster, number: u64) !ssz.ExecutionPayload {
+    const base_time = consensus_types.base_time;
+    const block = @import("gossip/block.zig");
+    const timestamp_ms = cluster.rollup.l2_block_timestamp_ms(number);
+    const info: consensus_types.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(@truncate(number)) },
+        .from = .zero,
+        .to = .create,
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = "l1info",
+    } };
+    var calldata = base_time.encode_calldata(@intCast(timestamp_ms % 1_000));
+    const time: consensus_types.Envelope = .{ .deposit = base_time.deposit(number, &calldata) };
+    const items = [2][]const u8{
+        info.encode_to(cluster.tx_storage[256..384]),
+        time.encode_to(cluster.tx_storage[384..]),
+    };
+    var result: ssz.ExecutionPayload = .{
+        .version = block.version_at(&cluster.rollup, timestamp_ms / 1_000),
+        .block_number = number,
+        .timestamp = timestamp_ms / 1_000,
+        .gas_limit = 30_000_000,
+        .base_fee_per_gas = 1,
+        .extra_data = "base",
+        .transactions = ssz.Transactions.encode(cluster.tx_storage[0..256], &items),
+    };
+    result.block_hash = try validity.block_hash(&cluster.rollup, &result, beacon_root);
+    return result;
+}
+
+test "p2p transport: Denim 200 ms blocks reach every node within their slot" {
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init_options(0x200, nodes, 0, 0, .denim);
+    defer cluster.deinit();
+    cluster.run(8 * ns_per_s);
+    // The next slot after now; blocks are sealed 150 ms into their slot, as base/base.
+    const first = cluster.world.now_ns / (slot_ms * ns_per_ms) + 1;
+    const blocks = 50; // 10 s at 5 blocks per second.
+    for (0..blocks) |offset| {
+        const number = first + offset;
+        const seal_ns = (number * slot_ms + 150) * ns_per_ms;
+        if (cluster.world.now_ns < seal_ns) cluster.run(seal_ns - cluster.world.now_ns);
+        const value = try denim_payload(cluster, number);
+        const sequencer = &cluster.storage[0];
+        _ = try sequencer.service.publish_block(
+            cluster.sequencer_secret,
+            beacon_root,
+            value,
+            sequencer.io.now_realtime_ns(),
+        );
+        sequencer.transport.execute_commands();
+        sequencer.transport.pump_all();
+        // By the next block's seal (200 ms later) every node has this one, in order.
+        cluster.run(slot_ms * ns_per_ms - 10 * ns_per_ms);
+        for (cluster.all()[1..], 1..) |*node, index| {
+            const envelope = node.service.pop_block(scratch) orelse {
+                std.debug.print("denim: node {d} late for block {d}\n", .{ index, number });
+                return error.BlockLate;
+            };
+            try std.testing.expectEqual(number, envelope.payload.block_number);
+        }
+    }
+    for (cluster.all()[1..]) |*node| {
+        const stats = &node.service.gossip.stats;
+        try std.testing.expectEqual(@as(u64, 0), stats.accepted_dropped);
+        try std.testing.expectEqual(@as(u64, blocks), stats.accepted);
+        try std.testing.expectEqual(@as(u64, 0), stats.rejected);
+    }
 }

@@ -70,6 +70,17 @@ behind a small interface and switch later.
   gossips a block each way and drains the UDP completions on stop. Negative control:
   dropping received datagrams in the transport fails it with `NotConnected`. Decision:
   this replaces the devnet recheck of completion UDP, whose p2p ports are fixed.
+- [x] Native 200 ms blocks (AGENTS.md rule 10, no flashblocks): p2p has no flashblocks
+  topics or handling (only a comment naming a public base/base fixture path). Gossip
+  validation already runs base/base's Denim schedule check (`check_base_time`, after the
+  version checks, before the seen-hash check, as `validate_block_internal`). New DST
+  (`transport_test`): a 4-node SimIo cluster with every upgrade through Denim active from
+  genesis publishes 50 schedule-valid blocks sealed 150 ms into each 200 ms slot; every
+  node pops each block, in order, before the next seal; nothing rejected or dropped.
+  Negative control: a wrong millis part fails it. Decisions: topic score params keep
+  base/base's `rollup.block_time` (seconds) input; at 5 blocks/s the delivery thresholds
+  are met with margin. Per-block CPU (0.83 ms/hop at 128 KiB, `docs/PERF.md`) is ~0.4% of
+  a core at 5 blocks/s.
 - [x] Fuzz: hostile discv5 messages inside an established session (`disc/service_test`).
   Node 0 completes a real handshake with node 1, then seals hostile plaintext with its
   session keys: junk with random type bytes, PING with huge seq, PONG with spoofed
@@ -449,3 +460,4 @@ behind a small interface and switch later.
 - 2026-11-05: gossip validation reuses the message-id decompression.
 - 2026-11-05: real-socket loopback interop (IPv4+IPv6, kqueue+io_uring); fixed republish crash.
 - 2026-11-05: hostile in-session discv5 fuzz (seeded + run_bytes).
+- 2026-11-05: direction change (no flashblocks, 200 ms blocks): Denim gossip DST added; nothing to remove.
