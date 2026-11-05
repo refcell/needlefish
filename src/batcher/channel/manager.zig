@@ -48,6 +48,9 @@ pub const Manager = struct {
     tx_data_buffer: []u8,
     next_channel_id: u64,
     channel_id_seed: [16]u8,
+    /// First and last L2 block numbers of each channel buffer's contents.
+    first_block: [2]u64 = .{ 0, 0 },
+    last_block_of: [2]u64 = .{ 0, 0 },
 
     /// `channel_id_seed` (from the injected randomness) keeps channel ids unique
     /// across restarts; ids are the seed with a counter mixed into the low bytes.
@@ -133,6 +136,8 @@ pub const Manager = struct {
             }
         };
         if (manager.open_since_l1 == null) manager.open_since_l1 = l1_head;
+        if (manager.open().batch_count == 1) manager.first_block[manager.open_index] = block.number;
+        manager.last_block_of[manager.open_index] = block.number;
         manager.last_block = .{ .number = block.number, .hash = block.hash };
         assert(manager.open().batch_count > 0);
     }
@@ -165,6 +170,18 @@ pub const Manager = struct {
         if (frame.is_last) manager.draining = false;
         const frames = [_]frame_module.Frame{frame};
         return frame_module.encode_tx_data(&frames, manager.tx_data_buffer);
+    }
+
+    /// First L2 block of the channel whose frames `next_tx_data` hands out, if any.
+    pub fn draining_first_block(manager: *const Manager) ?u64 {
+        if (!manager.draining) return null;
+        return manager.first_block[manager.open_index +% 1];
+    }
+
+    /// Last L2 block of the channel whose frames `next_tx_data` hands out, if any.
+    pub fn draining_last_block(manager: *const Manager) ?u64 {
+        if (!manager.draining) return null;
+        return manager.last_block_of[manager.open_index +% 1];
     }
 
     pub fn has_pending_frames(manager: *const Manager) bool {

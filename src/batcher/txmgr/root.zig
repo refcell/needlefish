@@ -92,9 +92,20 @@ pub const Slot = struct {
     proofs: [blobs_per_tx_max]kzg.Proof = @splat(@splat(0)),
     blob_count: u8 = 0,
     blob_fee: u128 = 0,
+    /// Caller's tag for the data this tx carries (the service: the first L2 block of its
+    /// channel), reported back if a reorg un-mines the tx after its slot was freed.
+    tag: u64 = 0,
     /// Sidecar version 1 only: 128 cell proofs per blob, computed once at submit.
     cell_proofs: ?*[blobs_per_tx_max]kzg.CellProofs = null,
 };
+
+/// Confirmed txs remembered for reorg detection (well past any realistic L1 reorg depth
+/// at one batch tx per L1 block).
+pub const recent_max = 128;
+
+/// `mined`: seen below the account's mined nonce. Slots dropped by `reset` start
+/// unmined (they may still be mined later); only a mined record can be lost.
+pub const Recent = struct { live: bool = false, mined: bool = false, nonce: u64 = 0, tag: u64 = 0 };
 
 pub const Error = rpc.Error || rpc.DecodeError || txdata.SignError || kzg.Error || kzg.CellError ||
     blobs.EncodeError || error{NoFreeSlot};
@@ -112,6 +123,15 @@ pub const TxManager = struct {
     /// When a nonce gap (no slot holds the account's `latest` nonce while later slots
     /// wait) was first seen; `needs_reset` reports it once it outlives a resubmit period.
     gap_since_ms: ?u64 = null,
+    /// Tag stored in the next submitted tx's slot.
+    submit_tag: u64 = 0,
+    /// Recently confirmed txs (ring, newest overwrite oldest). A `latest` account nonce at
+    /// or below one of them means an L1 reorg un-mined it after its slot was freed; a
+    /// lossy reorg or a replacement at the same nonce would lose its data for good, so its
+    /// tag is reported (`take_lost_floor`) and the caller re-posts from there.
+    recent: [recent_max]Recent = @splat(.{}),
+    recent_next: u32 = 0,
+    lost_floor: ?u64 = null,
     raw_buffer: []u8,
     params_buffer: []u8,
     prover: ?*kzg.Prover,
@@ -282,16 +302,23 @@ pub const TxManager = struct {
         slot.sent_at_ms = 0;
         slot.attempts = 0;
         slot.retries_left = manager.config.publish_max_retries;
+        slot.tag = manager.submit_tag;
+        manager.supersede(nonce);
         manager.next_nonce = nonce + 1;
         try manager.send(client, slot, now_ms);
-        assert(slot.state == .pending);
+        // Pending, or freed at once as lost (its nonce was taken): frames were consumed.
+        assert(slot.state == .pending or manager.lost_floor != null);
         return true;
     }
 
     /// Frees slots whose nonce was mined and resubmits stale ones. Returns the number
     /// of transactions confirmed by this poll.
     pub fn poll(manager: *TxManager, client: *rpc.Client, now_ms: u64) Error!u32 {
-        if (manager.pending_count() == 0) return 0;
+        // Idle with remembered txs: still read the nonce, which detects reorg losses.
+        if (manager.pending_count() == 0) {
+            if (manager.recent_live_count() > 0) _ = try manager.account_nonce(client, "latest");
+            return 0;
+        }
         const mined_nonce = try manager.account_nonce(client, "latest");
         const confirmed_nonce = try manager.nonce_buried(client, mined_nonce);
         assert(confirmed_nonce <= mined_nonce or manager.config.confirmations > 1);
@@ -300,6 +327,7 @@ pub const TxManager = struct {
         for (manager.slots) |*slot| {
             if (slot.state != .pending) continue;
             if (slot.nonce < confirmed_nonce) {
+                manager.remember(slot, true);
                 slot.state = .free;
                 confirmed += 1;
                 continue;
@@ -349,6 +377,8 @@ pub const TxManager = struct {
         for (manager.slots) |*slot| {
             if (slot.state != .pending) continue;
             slot.state = .free;
+            // Its tx may still be mined (and then lost to a reorg): keep watching it.
+            manager.remember(slot, false);
             var replaced: Replaced = manager.replaced orelse
                 .{ .nonce_max = slot.nonce, .fees = slot.fees, .blob_fee = slot.blob_fee };
             replaced.nonce_max = @max(replaced.nonce_max, slot.nonce);
@@ -455,6 +485,14 @@ pub const TxManager = struct {
                     slot.retry_at_ms = now_ms + manager.config.publish_retry_delay_ms;
                     return;
                 }
+                if (slot.attempts == 1 and contains_ignore_case(message, "nonce too low")) {
+                    // Another tx (an orphaned one re-mined, or one from before a reset)
+                    // took the nonce before our first attempt: this data is not on L1.
+                    slot.state = .free;
+                    manager.next_nonce = null;
+                    manager.lost_floor = @min(manager.lost_floor orelse slot.tag, slot.tag);
+                    return;
+                }
                 if (!benign_send_error(message)) return err;
                 slot.replace_now = contains_ignore_case(message, "underpriced");
             },
@@ -481,7 +519,59 @@ pub const TxManager = struct {
             &manager.config.from.bytes,
             tag,
         }) catch unreachable; // Fixed-size content.
-        return rpc.quantity(u64, try client.call("eth_getTransactionCount", params));
+        const nonce = try rpc.quantity(u64, try client.call("eth_getTransactionCount", params));
+        if (std.mem.eql(u8, tag, "latest")) manager.observe_mined(nonce);
+        return nonce;
+    }
+
+    /// Every remembered tx at or above the account's mined nonce is no longer mined.
+    fn observe_mined(manager: *TxManager, mined_nonce: u64) void {
+        for (&manager.recent) |*recent| {
+            if (!recent.live) continue;
+            if (recent.nonce < mined_nonce) {
+                recent.mined = true;
+            } else if (recent.mined) {
+                recent.live = false;
+                manager.lost_floor = @min(manager.lost_floor orelse recent.tag, recent.tag);
+            }
+        }
+        for (manager.recent) |recent| {
+            assert(!recent.live or !recent.mined or recent.nonce < mined_nonce);
+        }
+    }
+
+    /// A new tx at `nonce`: a dropped, never-mined tx at the same nonce can no longer be
+    /// mined, so its data is lost (it may already count as safe from an orphaned block).
+    fn supersede(manager: *TxManager, nonce: u64) void {
+        for (&manager.recent) |*recent| {
+            if (!recent.live or recent.mined or recent.nonce != nonce) continue;
+            recent.live = false;
+            manager.lost_floor = @min(manager.lost_floor orelse recent.tag, recent.tag);
+        }
+        for (manager.recent) |recent| assert(!recent.live or recent.mined or recent.nonce != nonce);
+    }
+
+    fn remember(manager: *TxManager, slot: *const Slot, mined: bool) void {
+        manager.recent[manager.recent_next % recent_max] = .{
+            .live = true,
+            .mined = mined,
+            .nonce = slot.nonce,
+            .tag = slot.tag,
+        };
+        manager.recent_next +%= 1;
+    }
+
+    pub fn recent_live_count(manager: *const TxManager) u32 {
+        var count: u32 = 0;
+        for (manager.recent) |recent| count += @intFromBool(recent.live);
+        assert(count <= recent_max);
+        return count;
+    }
+
+    /// The lowest tag of txs a reorg un-mined since the last call, if any.
+    pub fn take_lost_floor(manager: *TxManager) ?u64 {
+        defer manager.lost_floor = null;
+        return manager.lost_floor;
     }
 
     fn suggested_fees(manager: *TxManager, client: *rpc.Client) Error!txdata.Fees {
@@ -600,6 +690,124 @@ const FakeL1 = struct {
         return text.len;
     }
 };
+
+fn reorg_test_manager(l1: *FakeL1) !struct { rpc.Client, TxManager } {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    const client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 8192,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    const manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 2,
+        .tx_data_bytes_max = 1024,
+    });
+    return .{ client, manager };
+}
+
+test "txmgr: a reorg that un-mines a confirmed tx reports its tag" {
+    var l1: FakeL1 = .{ .mined_nonce = 5 };
+    var client, var manager = try reorg_test_manager(&l1);
+    defer client.deinit(testing.allocator);
+    defer manager.deinit(testing.allocator);
+    manager.submit_tag = 40;
+    try manager.submit(&client, "\x00frame-a", 0);
+    manager.submit_tag = 52;
+    try manager.submit(&client, "\x00frame-b", 0);
+    l1.mined_nonce = 7;
+    try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 1));
+    try testing.expectEqual(@as(u32, 2), manager.recent_live_count());
+    try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
+    // Idle: the nonce is still read; the reorg drops nonce 6 (tag 52) only.
+    l1.mined_nonce = 6;
+    try testing.expectEqual(@as(u32, 0), try manager.poll(&client, 2));
+    try testing.expectEqual(@as(?u64, 52), manager.take_lost_floor());
+    try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
+    // Deeper: nonce 5 (tag 40) too; reported once.
+    l1.mined_nonce = 5;
+    _ = try manager.poll(&client, 3);
+    try testing.expectEqual(@as(?u64, 40), manager.take_lost_floor());
+    try testing.expectEqual(@as(u32, 0), manager.recent_live_count());
+}
+
+test "txmgr: a dropped tx replaced at its nonce, or a taken nonce, reports the tag" {
+    var l1: FakeL1 = .{ .mined_nonce = 5 };
+    var client, var manager = try reorg_test_manager(&l1);
+    defer client.deinit(testing.allocator);
+    defer manager.deinit(testing.allocator);
+    manager.submit_tag = 30;
+    try manager.submit(&client, "\x00frame-a", 0);
+    manager.reset();
+    try testing.expectEqual(@as(u32, 1), manager.recent_live_count());
+    // Not mined yet, so a lower nonce is no loss; a new tx at nonce 5 supersedes it.
+    _ = try manager.poll(&client, 1);
+    try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
+    manager.submit_tag = 31;
+    try manager.submit(&client, "\x00frame-b", 2);
+    try testing.expectEqual(@as(?u64, 30), manager.take_lost_floor());
+    // A first send rejected as "nonce too low": someone else's tx holds the nonce.
+    manager.reset();
+    l1.reject_with = "nonce too low";
+    manager.submit_tag = 32;
+    try manager.submit(&client, "\x00frame-c", 3);
+    try testing.expectEqual(@as(?u64, 31), manager.take_lost_floor());
+    try testing.expectEqual(@as(u32, 0), manager.pending_count());
+    try testing.expectEqual(@as(?u64, null), manager.next_nonce);
+}
+
+fn fuzz_reorg_tracking(prng: *Prng, l1: *FakeL1, manager: *TxManager, client: *rpc.Client) !void {
+    for (0..64) |step| {
+        const now_ms: u64 = step;
+        switch (prng.below(4)) {
+            0 => if (manager.has_capacity()) {
+                manager.submit_tag = prng.below(1000);
+                try manager.submit(client, "\x00frame", now_ms);
+            },
+            1 => {
+                // Reorgs and progress anywhere between the start and the next nonce.
+                const highest = manager.next_nonce orelse l1.mined_nonce;
+                l1.mined_nonce = 5 + prng.below(@max(highest, 5) - 5 + 1);
+            },
+            2 => manager.reset(),
+            else => {},
+        }
+        _ = try manager.poll(client, now_ms);
+        if (manager.take_lost_floor()) |floor| try testing.expect(floor < 1000);
+        try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
+        try testing.expect(manager.recent_live_count() <= recent_max);
+        for (manager.recent) |recent| {
+            try testing.expect(!recent.live or !recent.mined or recent.nonce < l1.mined_nonce);
+        }
+    }
+}
+
+test "txmgr: seeded fuzz of reorg loss tracking" {
+    for (0..32) |seed| {
+        var prng = Prng.init(seed);
+        var l1: FakeL1 = .{ .mined_nonce = 5 };
+        var client, var manager = try reorg_test_manager(&l1);
+        defer client.deinit(testing.allocator);
+        defer manager.deinit(testing.allocator);
+        try fuzz_reorg_tracking(&prng, &l1, &manager, &client);
+    }
+}
+
+fn fuzz_reorg_tracking_target(_: void, smith: *std.testing.Smith) anyerror!void {
+    var prng = Prng.init(smith.value(u64));
+    var l1: FakeL1 = .{ .mined_nonce = 5 };
+    var client, var manager = try reorg_test_manager(&l1);
+    defer client.deinit(testing.allocator);
+    defer manager.deinit(testing.allocator);
+    try fuzz_reorg_tracking(&prng, &l1, &manager, &client);
+}
+
+test "txmgr: fuzz reorg loss tracking" {
+    try std.testing.fuzz({}, fuzz_reorg_tracking_target, .{});
+}
 
 test "txmgr: nonce too high retries the same tx after the delay, then surfaces" {
     const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));

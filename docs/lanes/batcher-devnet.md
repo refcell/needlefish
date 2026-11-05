@@ -228,3 +228,15 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   builds `blobs.kzg.CellProver` (FK20 tables) at startup and sends 128 cell proofs per blob
   with the wrapper version byte. Heavy tests run in ReleaseSafe only (setup takes minutes
   in Debug); a u8 `count * 128` overflow was caught there.
+- 2026-11-05: Reorg loss re-posting (dst-fuzz BUG(batcher), seeds 2562/2856/850). The rollup
+  node can keep a safe head derived from an orphaned L1 block, so the batcher can no longer
+  trust it alone. Each batch tx is tagged with its channel's first L2 block; confirmed and
+  reset-dropped txs go to a 128-entry ring. A `latest` nonce at/below a mined record, a new
+  tx superseding a dropped one at its nonce, or "nonce too low" on a first send marks the
+  data lost; the service then loads from that floor even below the safe head, until a
+  channel reaching every safe head seen since is handed out. Sweep with the gate removed
+  except for crashes/byzantine posts: 1/3000 left (329: a re-posted tx at a reused nonce
+  loses to the older tx; the nonce-only confirmation cannot tell). Gate kept until fixed.
+- [ ] Narrow the sim BUG(batcher) gate: mark txs at contested (reused) nonces and re-post on
+  confirmation; stop resetting txs on a repost; then ask dst-fuzz to drop the gate.
+

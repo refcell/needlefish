@@ -59,6 +59,8 @@ pub const Heads = struct {
 pub const Report = struct {
     heads: Heads = .{ .l1 = 0, .safe_l2 = 0, .unsafe_l2 = 0 },
     blocks_loaded: u32 = 0,
+    /// Re-posts after a reorg un-mined confirmed batch txs.
+    reposts: u32 = 0,
     txs_submitted: u32 = 0,
     txs_confirmed: u32 = 0,
     resets: u32 = 0,
@@ -88,6 +90,13 @@ pub const Service = struct {
     stopped: bool,
     last_da_backlog_bytes: u64,
     force_blobs_when_throttling: bool,
+    /// After a reorg un-mined confirmed batch txs: load from this L2 block even though the
+    /// rollup node may still count it as safe (it can keep a safe head derived from the
+    /// orphaned L1 block), until a channel reaching every safe head seen since is handed
+    /// to the tx manager in full.
+    repost_floor: ?u64 = null,
+    /// Highest safe head seen while re-posting.
+    repost_through: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, channel_id_seed: [16]u8) !Service {
         assert(config.blocks_per_step_max > 0);
@@ -142,6 +151,7 @@ pub const Service = struct {
             try service.submit_frames(clients.l1, now_ms, &report);
         }
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
+        if (service.txs.take_lost_floor()) |floor| service.repost_from(floor, &report);
         if (service.txs.needs_reset(now_ms)) {
             // A lost nonce: drop the waiting txs and reload from safe + 1, which requeues
             // the lost frames' blocks (base/base resets its nonce and requeues frames).
@@ -151,6 +161,17 @@ pub const Service = struct {
         }
         assert(report.txs_submitted <= service.txs.slots.len);
         return report;
+    }
+
+    /// Re-posts from `floor`: the in-flight state is dropped (its data is reloaded too).
+    fn repost_from(service: *Service, floor: u64, report: *Report) void {
+        service.channels.reset();
+        service.txs.reset();
+        service.repost_floor = @min(service.repost_floor orelse floor, floor);
+        service.repost_through = @max(service.repost_through, report.heads.safe_l2, floor);
+        report.resets += 1;
+        report.reposts += 1;
+        assert(service.channels.next_block_number() == null);
     }
 
     /// DA throttling is in effect: enabled, the builder supports it, and the backlog is
@@ -213,13 +234,24 @@ pub const Service = struct {
     }
 
     fn load_blocks(service: *Service, clients: Clients, heads: Heads, report: *Report) Error!void {
+        // The safe head can jump while re-posting (derived from orphaned data, or read
+        // as 0 while unknown): the re-post must cover every safe head seen since.
+        if (service.repost_floor != null) {
+            service.repost_through = @max(service.repost_through, heads.safe_l2);
+        }
         if (service.channels.next_block_number()) |next| {
-            if (next <= heads.safe_l2) {
+            if (next <= heads.safe_l2 and service.repost_floor == null) {
                 service.channels.reset();
                 report.resets += 1;
             }
         }
-        var next = service.channels.next_block_number() orelse heads.safe_l2 + 1;
+        // An unknown safe head reads as 0: re-post from the floor itself then.
+        const safe_next = heads.safe_l2 + 1;
+        const first = if (service.repost_floor) |floor|
+            (if (heads.safe_known) @min(floor, safe_next) else floor)
+        else
+            safe_next;
+        var next = service.channels.next_block_number() orelse first;
         while (next <= heads.unsafe_l2 and report.blocks_loaded < service.blocks_per_step_max) {
             var params: [48]u8 = undefined;
             const text = std.fmt.bufPrint(&params, "[\"0x{x}\",true]", .{next}) catch
@@ -249,7 +281,14 @@ pub const Service = struct {
         while (service.txs.has_capacity() and service.channels.has_pending_frames()) {
             // Nonce and fees are read before frames are pulled, so an error here leaves
             // the frames in the channel manager; a slot that exists is resent by poll.
+            service.txs.submit_tag = service.channels.draining_first_block().?;
+            const channel_last = service.channels.draining_last_block().?;
             if (!try service.txs.submit_from(l1, frames, now_ms)) return;
+            const channel_done = !service.channels.has_pending_frames();
+            if (channel_done and channel_last >= service.repost_through) {
+                service.repost_floor = null;
+                service.repost_through = 0;
+            }
             report.txs_submitted += 1;
         }
     }
@@ -672,6 +711,73 @@ test "service: a stalled safe head triggers resubmission from safe + 1" {
     for (12..30) |round| {
         const report = try service.step(clients, round * 2000);
         try testing.expectEqual(@as(u32, 0), report.resets);
+        chains.l1_head += 1;
+    }
+}
+
+test "service: a reorg that un-mines confirmed batch txs re-posts below the safe head" {
+    var chains: FakeChains = .{ .l2_head = 6 };
+    const info: l1_info.L1BlockInfo = .{ .format = .jovian, .number = 90, .sequence_number = 0 };
+    var calldata: [l1_info.calldata_length_max]u8 = undefined;
+    const hex = std.fmt.bufPrint(&chains.info_hex, "{x}", .{info.encode_calldata(&calldata)}) catch
+        unreachable;
+    chains.info_hex_length = hex.len;
+    var l1_role: FakeChains.Role = .{ .chains = &chains, .is_l1 = true };
+    var l2_role: FakeChains.Role = .{ .chains = &chains, .is_l1 = false };
+    const limits: rpc.Limits = .{ .response_bytes_max = 16384, .parse_bytes_max = 256 * 1024 };
+    const l1_transport: rpc.Transport = .{ .context = &l1_role, .send_fn = FakeChains.send };
+    const l2_transport: rpc.Transport = .{ .context = &l2_role, .send_fn = FakeChains.send };
+    var l1 = try rpc.Client.init(testing.allocator, l1_transport, limits);
+    defer l1.deinit(testing.allocator);
+    var l2 = try rpc.Client.init(testing.allocator, l2_transport, limits);
+    defer l2.deinit(testing.allocator);
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var service = try Service.init(testing.allocator, .{
+        .channels = .{
+            .channel = .{ .frame_size_max = 1000, .input_bytes_max = 64 * 1024 },
+            .max_channel_duration_l1_blocks = 1,
+            .batch_bytes_max = 4096,
+        },
+        .txs = .{
+            .chain_id = 900,
+            .private_key = batcher.private_key,
+            .from = batcher.address,
+            .to = .{ .bytes = @splat(0xff) },
+            .tx_data_bytes_max = 1024,
+        },
+        .source = .{ .tx_count_max = 8, .tx_bytes_max = 4096, .input_bytes_max = 1024 },
+    }, @splat(5));
+    defer service.deinit(testing.allocator);
+    const clients: Clients = .{ .l1 = &l1, .l2 = &l2, .rollup = &l2 };
+    // Blocks 1..6 go out in one channel and are mined (FakeChains mines on send).
+    for (0..4) |round| {
+        _ = try service.step(clients, round * 2000);
+        chains.l1_head += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), service.txs.pending_count());
+    const sent_before = chains.sent_count;
+    try testing.expect(sent_before > 0);
+    // The rollup node derived them, then an L1 reorg lost the txs. It keeps safe = 6.
+    chains.safe_l2 = 6;
+    chains.mined_nonce = 0;
+    var reposts: u32 = 0;
+    var loaded: u32 = 0;
+    for (4..10) |round| {
+        const report = try service.step(clients, round * 2000);
+        reposts += report.reposts;
+        loaded += report.blocks_loaded;
+        chains.l1_head += 1;
+    }
+    // Re-posted from block 1 though 1..6 count as safe; the floor is consumed.
+    try testing.expectEqual(@as(u32, 1), reposts);
+    try testing.expectEqual(@as(u32, 6), loaded);
+    try testing.expect(chains.sent_count > sent_before);
+    try testing.expectEqual(@as(?u64, null), service.repost_floor);
+    // Without a loss nothing is re-posted again.
+    for (10..20) |round| {
+        const report = try service.step(clients, round * 2000);
+        try testing.expectEqual(@as(u32, 0), report.reposts);
+        try testing.expectEqual(@as(u32, 0), report.blocks_loaded);
         chains.l1_head += 1;
     }
 }
