@@ -84,11 +84,22 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
   injected vtables; seeded simulation against an in-memory world.
-- [ ] `proof/challenger` network adapters: `ChainView`/`Prover` over `src/proof/rpc`
-  (factory, AggregateVerifier, AnchorStateRegistry, DelayedWETH reads; L2 raw headers;
-  prover RPC with the `base/challenger/proof-session/v2` session ids).
-- [ ] `proof/challenger` submission: `Submitter` over the batcher's txmgr (signing, fee
-  bumping, receipt polling, revert data mapped through `aggregate_verifier.classify_revert`).
+- [x] `proof/challenger` network adapters: `ChainView` over `src/proof/rpc`
+  (`challenger/rpc_chain.zig`: factory `gameCount`/`gameAtIndex`/`games`/`gameImpls`,
+  AggregateVerifier getters with per-proxy version-gated intervals, `getAnchorRoot` +
+  `anchorGame` pinned to one L1 block, registry preflight/finality, DelayedWETH
+  `delay`/`withdrawals`, L1 block number from a hash-checked raw header, L2 raw headers).
+- [ ] `proof/challenger` prover client: `Prover` over the prover-service JSON-RPC with the
+  `base/challenger/proof-session/v2` session ids, once `proof/prover-service` defines the
+  protocol on main.
+- [x] `proof/challenger` submission: shared `src/proof/submission/` (`Sender`: estimate,
+  EIP-1559 signing with value via `batcher/txdata`, broadcast, receipt polling, failed
+  receipt replay, revert data from `Endpoint.last_error`; `classify` through
+  `aggregate_verifier.classify_revert`, selector text and error names). The proposer's
+  `TxSubmitter` and the challenger's `challenger/tx_submitter.zig` sit on it.
+- [ ] `proof/submission` fee bumping: resubmit a stuck transaction at the same nonce with
+  bumped fees (base/base `TxManager`); today a dropped transaction is retried by the
+  caller with a fresh nonce.
 - [ ] `bin/base challenger`: CLI/config wiring, real IO loop calling `Driver.tick`.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
   holds exactly the preimages the client read; `native.run(.., witness)`; `proof run
@@ -238,6 +249,19 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
+- Challenger network adapters: every failed read (transport, JSON-RPC error, revert,
+  decode) maps to `ChainUnavailable`; only `debug_getRawHeader` by number answering
+  `NotFound` (null or an RPC error) maps to `BlockNotAvailable`. `l1_block_number` reads
+  `debug_getRawHeader` by hash and checks keccak(raw) against the hash before decoding.
+  Interval pairs are returned unchecked (callers already validate them). The challenger
+  `Prover` adapter waits for the prover-service protocol (not invented here).
+- `src/proof/submission/` holds the generic `Sender` (failures carry the JSON-RPC phase:
+  estimate, broadcast, replay) and one classifier for both tools. The proposer maps
+  `AlreadyProven`/`InvalidProof` to a plain revert (it never sees them); the challenger
+  maps an unknown revert to `execution_reverted` at estimation, `tx_reverted` on replay,
+  `other` at broadcast; dropped and transport failures are `other`. Challenger
+  transactions carry no value. The classifier keeps the whole-name match for every error
+  (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
 - 2026-11-05: `base proposer` (native prover, dry-run, JSON-RPC submitter).
@@ -291,3 +315,6 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - 2026-11-05: `proof/challenger` core landed (AggregateVerifier codecs, scanner,
   validator, dispute attempts with ZK fallback, bonds, anchor updater, driver, seeded
   simulation). Network adapters, txmgr submission and `bin/base challenger` remain.
+- 2026-11-05: `proof/challenger` network adapters and submission landed (`rpc_chain.zig`
+  ChainView, shared `src/proof/submission/` sender + classifier under the proposer and
+  challenger submitters). Prover client and fee bumping remain.
