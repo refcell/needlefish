@@ -32,6 +32,7 @@ fn bench_field_mul(comptime F: type) fn (u32) u64 {
 }
 const sha256 = @import("sha256.zig");
 const ripemd160 = @import("ripemd160.zig");
+const blake2f = @import("blake2f.zig");
 
 pub const Case = struct {
     name: []const u8,
@@ -205,6 +206,29 @@ fn bench_modexp(
     }.run;
 }
 
+fn bench_blake2f_12(iterations: u32) u64 {
+    var h = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var m: [16]u64 = @splat(0x0123456789abcdef);
+    for (0..iterations) |index| {
+        blake2f.blake2f(12, &h, &m, .{ index, 0 }, false);
+        m[0] = h[0];
+    }
+    return h[7];
+}
+
+/// std baseline: one 128-byte message is a single BLAKE2b-512 compression (12 rounds).
+fn bench_blake2b_128_std(iterations: u32) u64 {
+    var data: [128]u8 = @splat(0x33);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        var digest: [64]u8 = undefined;
+        std.crypto.hash.blake2.Blake2b512.hash(&data, &digest, .{});
+        data[0..64].* = digest;
+        accumulator +%= digest[63];
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
@@ -225,6 +249,8 @@ pub const cases = [_]Case{
     .{ .name = "sha256/4KiB (std)", .iterations = 100_000, .run = bench_sha256_4k_std },
     .{ .name = "ripemd160/32B", .iterations = 1_000_000, .run = bench_ripemd160_32 },
     .{ .name = "ripemd160/4KiB", .iterations = 50_000, .run = bench_ripemd160_4k },
+    .{ .name = "blake2f/12 rounds", .iterations = 1_000_000, .run = bench_blake2f_12 },
+    .{ .name = "blake2b/128B (std)", .iterations = 1_000_000, .run = bench_blake2b_128_std },
 };
 
 /// Runs every case whose name contains `filter` (all when null).
