@@ -19,6 +19,7 @@ const usage =
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
+    \\         [--checkpoint.path FILE]
     \\
 ;
 
@@ -39,6 +40,9 @@ pub const Flags = struct {
     /// The L1 `ProtocolVersions` contract; defaults to the chain's public one.
     upgrade_signal_contract: ?[20]u8 = null,
     upgrade_signal_block_tag: base.utilities.upgrade_signal.BlockTag = .finalized,
+    /// Durable safe/finalized checkpoints; base/base defaults to a file under its data dir,
+    /// here they are off unless a path is given.
+    checkpoint_path: ?[]const u8 = null,
 };
 
 const p2p_args_max = 2 * p2p.options.bootnodes_max + 64;
@@ -108,6 +112,9 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.rpc_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(u8, arg, "--sequencer.key-index")) {
         flags.sequencer_key_index = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, arg, "--checkpoint.path")) {
+        if (value.len == 0) return error.InvalidValue;
+        flags.checkpoint_path = value;
     } else if (eql(u8, arg, "--upgrade-signal.contract")) {
         flags.upgrade_signal_contract = try parse_address(value);
     } else if (eql(u8, arg, "--upgrade-signal.l1-block-tag")) {
@@ -196,6 +203,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .version = base.build_options.version,
         .p2p = p2p_config,
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
+        .checkpoint_path = flags.checkpoint_path,
     });
     defer node.deinit();
     _ = try node.start();
@@ -291,6 +299,10 @@ test "consensus: flags" {
     }));
     try std.testing.expectEqual(@as(u8, 0x74), upgrade.upgrade_signal_contract.?[0]);
     try std.testing.expectEqual(.safe, upgrade.upgrade_signal_block_tag);
+    try std.testing.expect(upgrade.checkpoint_path == null);
+    const with_checkpoint = required ++ [_][]const u8{ "--checkpoint.path", "ckpt.bin" };
+    const checkpointed = try parse_flags(&with_checkpoint);
+    try std.testing.expectEqualStrings("ckpt.bin", checkpointed.checkpoint_path.?);
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
     try std.testing.expect(upgrade_settings(&disabled, 8453) != null);

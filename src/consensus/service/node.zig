@@ -44,6 +44,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const gossip_bridge = @import("gossip_bridge.zig");
 const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
+const checkpoint = @import("checkpoint.zig");
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -84,6 +85,8 @@ const gossip_blocks_per_tick: u32 = 8;
 pub const Options = struct {
     p2p: ?P2p = null,
     upgrade_signal: ?UpgradeSignal = null,
+    /// Durable safe/finalized checkpoints (`--checkpoint.path`); none when null.
+    checkpoint_path: ?[]const u8 = null,
     l1: Address,
     /// Beacon API for blobs; without it blob batches are unavailable.
     l1_beacon: ?Address = null,
@@ -287,7 +290,11 @@ pub fn Node(comptime IO: type) type {
         signer_version: u64 = 0,
         /// Observes the L1 upgrade-signal schedule when configured.
         upgrade: ?*Upgrade = null,
+        /// Persists the safe and finalized heads when `checkpoint_path` is set.
+        checkpoints: ?*Checkpoints = null,
+        checkpoints_logged: bool = false,
 
+        pub const Checkpoints = checkpoint.CheckpointStore(IO);
         pub const Network = p2p_network.Network(IO);
         pub const Signer = signer_watcher.SignerWatcher(IO);
         pub const Upgrade = upgrade_signal.Observer(IO, *Self);
@@ -350,7 +357,47 @@ pub fn Node(comptime IO: type) type {
             errdefer node.rpc_server.deinit();
             if (options.upgrade_signal) |config| try node.init_upgrade(&config);
             errdefer node.deinit_upgrade();
+            if (options.checkpoint_path) |path| try node.init_checkpoints(path);
+            errdefer node.deinit_checkpoints();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_checkpoints(node: *Self, path: []const u8) !void {
+            assert(node.checkpoints == null);
+            assert(path.len > 0);
+            const store = try node.allocator.create(Checkpoints);
+            errdefer node.allocator.destroy(store);
+            try store.init(node.allocator, node.io, path);
+            node.checkpoints = store;
+        }
+
+        fn deinit_checkpoints(node: *Self) void {
+            const store = node.checkpoints orelse return;
+            store.stop();
+            var rounds: u32 = 0;
+            while (store.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
+            store.deinit(node.allocator);
+            node.allocator.destroy(store);
+            node.checkpoints = null;
+        }
+
+        /// Records the engine's safe and finalized heads; logs the stored ones once loaded.
+        fn tick_checkpoints(node: *Self) void {
+            const store = node.checkpoints orelse return;
+            const loaded = store.loaded orelse return;
+            if (!node.checkpoints_logged) {
+                node.checkpoints_logged = true;
+                const none: protocol.block.L2BlockInfo = .{};
+                node.logger.log(.info, "consensus", "checkpoints loaded", .{
+                    .safe = (loaded.safe orelse none).block_info.number,
+                    .finalized = (loaded.finalized orelse none).block_info.number,
+                    .invalid_images = store.invalid_images,
+                });
+            }
+            const sync = node.driver.sync_state();
+            store.update(sync.safe_head, sync.finalized_head);
         }
 
         fn init_upgrade(node: *Self, config: *const UpgradeSignal) !void {
@@ -517,6 +564,7 @@ pub fn Node(comptime IO: type) type {
         pub fn deinit(node: *Self) void {
             node.deinit_p2p();
             node.deinit_upgrade();
+            node.deinit_checkpoints();
             node.gossip_arena.deinit();
             node.rpc_server.deinit();
             node.driver.deinit();
@@ -532,6 +580,7 @@ pub fn Node(comptime IO: type) type {
             assert(address.family == node.options.rpc_address.family);
             if (node.network) |network| try node.start_p2p(network);
             if (node.upgrade) |observer| observer.start();
+            if (node.checkpoints) |store| store.start();
             return address;
         }
 
@@ -582,6 +631,7 @@ pub fn Node(comptime IO: type) type {
                 node.tick_signer(network);
                 node.tick_gossip(network);
             }
+            node.tick_checkpoints();
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
         }
@@ -888,13 +938,23 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         .jwt_secret = .{ .bytes = @splat(7) },
         .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
         .http_client = harness_module.client_options,
+        .checkpoint_path = "checkpoint.bin",
     });
     defer node.deinit();
+    node.checkpoints.?.start(); // `start` would also bind the RPC port.
     for (0..40) |_| {
         node.tick();
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
     const status = node.sync_status();
+    // The discovered safe head is checkpointed (written on change, fsynced).
+    const store = node.checkpoints.?;
+    try testing.expect(std.meta.eql(checkpoint.Checkpoints{}, store.loaded.?));
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "checkpoints loaded") != null);
+    if (status.safe_l2.block_info.number != 0) {
+        try testing.expect(std.meta.eql(status.safe_l2, store.checkpoints.safe.?));
+        try testing.expect(store.file.stats.saves >= 1);
+    }
     try testing.expectEqual(@as(u64, 7), status.head_l1.number);
     try testing.expectEqualSlices(u8, &hash, &status.head_l1.hash.bytes);
     // The fake chain's L1 origin (507) does not exist, so the node never starts running.

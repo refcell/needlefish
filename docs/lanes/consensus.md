@@ -37,7 +37,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] EL sync mode: derivation and sequencing wait for `el_sync_finished`; the driver
     re-sends the forkchoice state every 2 s while the engine answers SYNCING (base/base
     `AwaitingELSyncCompletion` + `probe_el_sync`)
-  - [ ] checkpoint reader / pruned-block recovery
+  - [x] checkpoint store (`service/checkpoint.zig`, `--checkpoint.path`): safe/finalized
+    heads in base/base's 128-byte record layout, one crc-checked image via `StoreFile`
+  - [ ] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
+    the start finder then uses a matching checkpoint, else binary-searches the earliest
+    unpruned block (base/base `find_earliest_unpruned_block`)
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
@@ -74,6 +78,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Checkpoints: base/base stores them in redb under its data dir by default; we write one
+  fixed 269-byte image (magic, mask, two records, crc32) through the io layer and only when
+  `--checkpoint.path` is given. A torn image loads as "no checkpoints".
 - Engine queue: an empty `synchronize` update is always a forced forkchoice update (startup
   sync and EL sync probes); unforced it was a no-op once the heads were known, so
   `el_sync_finished` could stay false.
@@ -189,6 +196,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: durable safe/finalized checkpoints behind `--checkpoint.path`.
 - 2026-11-05: service: derivation and sequencing wait for EL sync, probing the engine every 2 s.
 - 2026-11-05: rpc: pre-Isthmus optimism_outputAtBlock from cached eth_getProof storage roots.
 - 2026-11-05: protocol: span batches carry EIP-8130 transactions (base/base `SpanBatchEip8130TransactionData`).
