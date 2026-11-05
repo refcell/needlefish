@@ -207,6 +207,10 @@ pub const Evm = struct {
         assert(evm.frames_len == 0);
         evm.return_len = 0;
         evm.fatal_error = null;
+        errdefer {
+            evm.frames_len = 0;
+            evm.arena.release(0);
+        }
         var step: Step = switch (message.kind) {
             .call => try evm.start_call(fork, .{
                 .kind = if (message.is_static) .staticcall else .call,

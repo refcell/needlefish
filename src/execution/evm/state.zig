@@ -117,7 +117,8 @@ pub const Limits = struct {
     transient_slots_max: u32 = 1 << 14,
     journal_entries_max: u32 = 1 << 18,
     logs_max: u32 = 1 << 14,
-    log_data_bytes_max: u32 = 1 << 22,
+    /// Log data per transaction; LOG costs 8 gas per byte, so this bounds gas / 8.
+    log_data_bytes_max: u32 = 64 << 20,
     /// Bytes of contract code deployed within one block.
     code_bytes_max: u32 = 1 << 24,
 };
