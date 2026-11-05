@@ -45,6 +45,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   static checks (EIP-2 low s, chain 1, EIP-2681 nonce) vs ethereum/tests. Prague: 47 valid ok,
   150 invalid rejected, 0 failures, 3 u128-fee divergences, 12 execution-level skips.
   Seven curated vectors are committed for `zig build test`.
+- [x] ethereum/tests `GenesisTests/basic_genesis_tests.json` committed: genesis JSON to full
+  block RLP matches (2 cases; the legacy `wei`-alloc case is skipped like alloy).
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -141,3 +143,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: EIP-7594 v1 sidecar cell-proof verification (`CellVerifier`).
 - 2026-11-05: `genesischeck` tool; base/base mainnet/sepolia/zeronet genesis hashes match.
 - 2026-11-05: `txtest` TransactionTests runner, 0 failures.
+- 2026-11-05: ethereum/tests GenesisTests vectors (genesis block RLP parity).

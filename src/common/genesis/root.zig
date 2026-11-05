@@ -189,4 +189,5 @@ pub const Parsed = json.Parsed;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("vectors_test.zig");
 }
