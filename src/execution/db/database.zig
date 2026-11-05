@@ -589,6 +589,50 @@ pub fn DatabaseType(comptime Storage: type) type {
             return .{ .sequence = sequence, .state_root = self.head_info.state_root };
         }
 
+        /// Commits a block the caller executed on this very state and already applied
+        /// (`input.changeset` is the changeset it applied on top of the head): inserts the
+        /// block and moves the head without touching state, as one `block_and_head` entry.
+        /// Replay applies the changeset through the usual path and ends in the same state.
+        /// A block already stored only moves the head (re-applying its changeset is
+        /// idempotent: changesets carry absolute values).
+        pub fn commit_applied(self: *Self, input: *const BlockInput) OperationError!Commit {
+            if (!self.head_info.present) return error.ParentNotHead;
+            if (!std.mem.eql(u8, &self.head_info.hash, &input.parent_hash)) {
+                return error.ParentNotHead;
+            }
+            const size = block_entry_size(input);
+            if (size > self.config.engine.entry_body_size_max) return error.BlockTooLarge;
+            try self.check_accepting(1, journal_module.entry_size_bytes(size));
+            if (self.chain.meta(input.hash) != null) {
+                const sequence = try self.set_head(input.hash);
+                return .{ .sequence = sequence, .state_root = self.head_info.state_root };
+            }
+            try self.insert_check(input);
+            try self.chain_insert(input);
+            self.chain.plan_reorg(input.hash, &self.plan) catch |err| {
+                // Stored in memory: journal it alone so replay stays in step.
+                const body = encode_block(input, self.queue_slot());
+                _ = self.queue_push(@intCast(body.len));
+                return err;
+            };
+            assert(self.plan.unwind_hashes().len == 0 and self.plan.apply_hashes().len == 1);
+            self.chain.set_head(&self.plan);
+            self.state.set_block_hash(input.number, input.hash);
+            const state_root = self.state.state_root() catch |err| {
+                self.phase = .failed;
+                return err;
+            };
+            self.head_info = .{
+                .present = true,
+                .number = input.number,
+                .hash = input.hash,
+                .state_root = state_root,
+            };
+            const body = encode_block_and_head(input, self.queue_slot());
+            const sequence = self.queue_push(@intCast(body.len));
+            return .{ .sequence = sequence, .state_root = state_root };
+        }
+
         /// The block `input` with the changeset built from `overlay` (in `changeset_buffer`).
         fn build_block(
             self: *Self,

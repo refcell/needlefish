@@ -49,7 +49,9 @@ pub const Error = db_module.overlay.Error || error{ CodeStoreFull, UndoUnavailab
 const UndoRecord = struct { offset: u32, len: u32 };
 
 pub const StateDb = struct {
-    state: State,
+    /// Heap-pinned: owned (`init`) or borrowed from a durable database (`init_shared`).
+    state: *State,
+    owns_state: bool,
     overlay: Overlay,
     changeset: Changeset,
     undo_bytes: []u8,
@@ -61,18 +63,32 @@ pub const StateDb = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateDb {
         assert(config.codes_max > 0 and config.code_bytes_max > 0);
-        assert(config.undo_blocks_max > 0 and config.undo_bytes_max > 0);
-        var state = try State.init(allocator, .{
+        const state = try allocator.create(State);
+        errdefer allocator.destroy(state);
+        state.* = try State.init(allocator, state_config(config));
+        errdefer state.deinit(allocator);
+        var db = try init_shared(allocator, config, state);
+        db.owns_state = true;
+        return db;
+    }
+
+    /// The `db.State` layout this config describes.
+    pub fn state_config(config: Config) db_module.state.Config {
+        return .{
             .accounts_max = config.trie.accounts_max,
             .storage_slots_max = config.storage_slots_max,
             .codes_max = config.codes_max,
             .code_bytes_max = config.code_bytes_max,
             .account_nodes_max = config.trie.account_nodes_max,
             .storage_nodes_max = config.trie.storage_nodes_max,
-        });
-        errdefer state.deinit(allocator);
-        // The base pointer is re-aimed at every commit: a StateDb may move until then.
-        var overlay = try Overlay.init(allocator, undefined, .{
+        };
+    }
+
+    /// Execution over a state owned elsewhere (the durable database); `state` outlives
+    /// the StateDb.
+    pub fn init_shared(allocator: std.mem.Allocator, config: Config, state: *State) !StateDb {
+        assert(config.undo_blocks_max > 0 and config.undo_bytes_max > 0);
+        var overlay = try Overlay.init(allocator, state, .{
             .accounts_max = config.block_accounts_max,
             .slots_max = config.block_slots_max,
             .codes_max = config.block_codes_max,
@@ -90,6 +106,7 @@ pub const StateDb = struct {
         const undo_records = try allocator.alloc(UndoRecord, config.undo_blocks_max);
         return .{
             .state = state,
+            .owns_state = false,
             .overlay = overlay,
             .changeset = changeset,
             .undo_bytes = undo_bytes,
@@ -102,13 +119,16 @@ pub const StateDb = struct {
         allocator.free(db.undo_bytes);
         db.changeset.deinit(allocator);
         db.overlay.deinit(allocator);
-        db.state.deinit(allocator);
+        if (db.owns_state) {
+            db.state.deinit(allocator);
+            allocator.destroy(db.state);
+        }
         db.* = undefined;
     }
 
-    /// The evm `Database` over committed state. The StateDb must not move while in use.
+    /// The evm `Database` over committed state.
     pub fn database(db: *StateDb) evm.state.Database {
-        return db_module.evm_backend.database(&db.state);
+        return db_module.evm_backend.database(db.state);
     }
 
     /// The state trie, for proofs and storage roots.
@@ -183,7 +203,7 @@ pub const StateDb = struct {
 
     /// Applies every change cached in `state` during a block, then empties the cache.
     pub fn commit(db: *StateDb, evm_state: *evm.State) Error!void {
-        db.overlay.base = &db.state;
+        assert(db.overlay.base == db.state);
         assert(db.overlay.accounts.count() == 0);
         errdefer db.overlay.discard();
         try db_module.evm_backend.commit_evm(evm_state, &db.overlay);
@@ -230,6 +250,14 @@ pub const StateDb = struct {
             if (record.offset < offset + len and offset < record.offset + record.len) return true;
         }
         return false;
+    }
+
+    /// Forgets every saved changeset (the state moved by other means, e.g. the durable
+    /// database's head move).
+    pub fn clear_undo(db: *StateDb) void {
+        db.undo_count = 0;
+        db.undo_write = 0;
+        assert(db.undo_depth() == 0);
     }
 
     /// How many of the most recent commits `rollback` can revert.

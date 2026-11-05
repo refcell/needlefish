@@ -11,7 +11,9 @@ const txpool = @import("../txpool/root.zig");
 const engine_module = @import("../engine/root.zig");
 const chain_module = @import("chain.zig");
 const Executor = @import("executor.zig").Executor;
-const StateDb = @import("state_db.zig").StateDb;
+const state_db_module = @import("state_db.zig");
+const StateDb = state_db_module.StateDb;
+const db_module = @import("../db/root.zig");
 
 pub const Chain = chain_module.Chain;
 pub const Engine = engine_module.Engine(Chain);
@@ -46,17 +48,40 @@ pub const Node = struct {
     }
 
     pub fn create_for(chain_spec: *const chainspec.ChainSpec) !*Node {
+        return create_with(chain_spec, null);
+    }
+
+    /// A node executing on a state owned elsewhere (a durable database) that already
+    /// holds the genesis allocation, or a restored head when `restoring`.
+    pub const Shared = struct {
+        state: *db_module.State,
+        genesis: consensus.Header,
+        restoring: bool = false,
+    };
+
+    pub const state_config: state_db_module.Config = .{
+        .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
+        .storage_slots_max = 4096,
+        .code_bytes_max = 1 << 16,
+        .codes_max = 64,
+        .block_accounts_max = 256,
+        .block_slots_max = 1024,
+        .block_codes_max = 64,
+        .block_code_bytes_max = 1 << 16,
+        .undo_bytes_max = 1 << 20,
+    };
+
+    pub fn create_with(chain_spec: *const chainspec.ChainSpec, shared: ?Shared) !*Node {
         const node = try testing.allocator.create(Node);
         errdefer testing.allocator.destroy(node);
         node.spec = chain_spec;
-        node.db = try StateDb.init(testing.allocator, .{
-            .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
-            .code_bytes_max = 1 << 16,
-            .codes_max = 64,
-            .undo_bytes_max = 1 << 20,
-        });
-        for (0..senders) |i| {
-            try node.db.put_account(address_of(@intCast(i + 1)).bytes, eth, 0, &.{});
+        if (shared) |s| {
+            node.db = try StateDb.init_shared(testing.allocator, state_config, s.state);
+        } else {
+            node.db = try StateDb.init(testing.allocator, state_config);
+            for (0..senders) |i| {
+                try node.db.put_account(address_of(@intCast(i + 1)).bytes, eth, 0, &.{});
+            }
         }
         node.executor = try Executor.init(testing.allocator, chain_spec, &node.db, .{
             .scratch_bytes = 1 << 20,
@@ -73,10 +98,11 @@ pub const Node = struct {
             },
         });
         node.pool = try txpool.Pool.init(testing.allocator, .{});
-        var genesis = genesis_header(try node.db.root());
+        var genesis = if (shared) |s| s.genesis else genesis_header(try node.db.root());
         if (chain_spec.mode == .l2) genesis.extra_data = &l2_genesis_extra_data;
         const allocator = testing.allocator;
         node.chain = try Chain.init(allocator, chain_spec, &node.db, &node.executor, &genesis, .{
+            .restoring = if (shared) |s| s.restoring else false,
             .store = .{ .blocks_max = 256, .bytes_max = 1 << 20 },
             .staging_bytes = 1 << 18,
             .select_max = 64,

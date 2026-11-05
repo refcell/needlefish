@@ -34,6 +34,9 @@ const l2_to_l1_message_passer: [20]u8 =
     primitives.hex.decode_array(20, "4200000000000000000000000000000000000016") catch unreachable;
 
 pub const Config = struct {
+    /// The state db holds a restored head's state, not genesis (durable restart): skip
+    /// the genesis root check; `restore` re-adds the retained blocks.
+    restoring: bool = false,
     store: block_store.Config = .{},
     staging_bytes: u32 = 32 << 20,
     select_max: u32 = 4096,
@@ -94,6 +97,30 @@ pub const Record = struct {
 
 pub const TxLocation = struct { block_hash: Hash, index: u32 };
 
+/// A stored block as the durable journal records it: the record bytes (header, body,
+/// receipts, requests) and the changeset `StateDb` just applied for it.
+pub const JournalBlock = struct {
+    hash: Hash,
+    parent_hash: Hash,
+    number: u64,
+    timestamp: u64,
+    header: []const u8,
+    record: []const u8,
+    changeset: []const u8,
+};
+
+pub const JournalError = error{ JournalBusy, JournalFailed };
+
+/// Durable journal of executed blocks (`durable.zig`). Every stored block is committed
+/// right after execution (state already applied, journal head moves to it), and every
+/// other state move is a journal head move that unwinds/applies stored changesets on the
+/// shared state instead of re-executing.
+pub const Journal = struct {
+    context: *anyopaque,
+    commit_block: *const fn (context: *anyopaque, block: *const JournalBlock) JournalError!void,
+    move_head: *const fn (context: *anyopaque, hash: Hash) JournalError!void,
+};
+
 /// Builder DA limits set by the batcher (`miner_setMaxDASize`); 0 means no limit. Sizes
 /// are FastLZ-estimated compressed bytes of the EIP-2718 encoding (base/base
 /// `estimated_da_size`). Applied to pool transactions on L2 only.
@@ -117,6 +144,7 @@ pub const Chain = struct {
     executor: *Executor,
     store: block_store.BlockStore,
     pool: ?*txpool.Pool = null,
+    journal: ?Journal = null,
     da_limits: DaLimits = .{},
     staging: []u8,
     select_buffer: []*const txpool.Tx,
@@ -145,7 +173,9 @@ pub const Chain = struct {
         config: Config,
     ) !Chain {
         assert(genesis.number == 0);
-        assert(std.mem.eql(u8, &genesis.state_root.bytes, &(try db.root())));
+        if (!config.restoring) {
+            assert(std.mem.eql(u8, &genesis.state_root.bytes, &(try db.root())));
+        }
         var store = try block_store.BlockStore.init(allocator, config.store);
         errdefer store.deinit(allocator);
         const staging = try allocator.alloc(u8, config.staging_bytes);
@@ -404,9 +434,52 @@ pub const Chain = struct {
         const bytes =
             try chain.encode_record(child, transactions, withdrawals, receipts, executed.requests);
         try chain.store.put(ref_of(child, hash), bytes);
+        if (chain.journal) |journal| {
+            // A failure leaves the record stored but unexecuted; the caller rolls back.
+            const entry = journal_block(child, hash, chain.store.record(hash).?, chain.db);
+            journal.commit_block(journal.context, &entry) catch return error.StateUnavailable;
+        }
         for (transactions, 0..) |raw, index| chain.index_transaction(raw, hash, @intCast(index));
         chain.state_hash = hash;
         chain.db.set_block_hash(child.number, hash);
+    }
+
+    fn journal_block(
+        child: *const Header,
+        hash: Hash,
+        record_bytes: []const u8,
+        db: *StateDb,
+    ) JournalBlock {
+        var outer = rlp.Decoder.init(record_bytes);
+        var items = outer.list() catch unreachable; // Encoded by this chain.
+        return .{
+            .hash = hash,
+            .parent_hash = child.parent_hash.bytes,
+            .number = child.number,
+            .timestamp = child.timestamp,
+            .header = items.raw() catch unreachable,
+            .record = record_bytes,
+            .changeset = db.last_changeset().?, // The commit of this very block.
+        };
+    }
+
+    /// Re-adds a block retained by the durable journal (oldest first, after `init` with
+    /// `restoring`); the last one restored is the head and the state's block.
+    pub fn restore(chain: *Chain, record_bytes: []const u8) Error!void {
+        const stored = Record.decode(record_bytes) catch return error.StateUnavailable;
+        const hash = stored.header.hash().bytes;
+        if (chain.store.ref(hash) == null) {
+            try chain.store.put(ref_of(&stored.header, hash), record_bytes);
+        }
+        var transactions = stored.transactions;
+        var index: u32 = 0;
+        while (!transactions.is_empty()) : (index += 1) {
+            chain.index_transaction(transactions.bytes() catch unreachable, hash, index);
+        }
+        chain.store.set_canonical(stored.header.number, hash);
+        chain.state_hash = hash;
+        chain.forkchoice.head_block_hash = .{ .bytes = hash };
+        assert(std.mem.eql(u8, &chain.head_hash(), &hash));
     }
 
     fn index_transaction(chain: *Chain, raw: []const u8, block_hash: Hash, index: u32) void {
@@ -446,6 +519,13 @@ pub const Chain = struct {
     /// a failure leaves the state where it was.
     fn move_state(chain: *Chain, target: Hash) Error!void {
         if (std.mem.eql(u8, &target, &chain.state_hash)) return;
+        if (chain.journal) |journal| {
+            // The journal unwinds/applies stored changesets on the shared state.
+            journal.move_head(journal.context, target) catch return error.StateUnavailable;
+            chain.db.clear_undo();
+            chain.state_hash = target;
+            return;
+        }
         var path: [reexecute_max]Hash = undefined;
         var path_len: u32 = 0;
         var rollbacks: u32 = 0;
