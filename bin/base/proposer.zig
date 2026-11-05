@@ -21,6 +21,8 @@ const Source = host.rpc_source.RpcSource(io.IO);
 const Endpoint = proof.rpc.Endpoint(io.IO);
 const Chain = proposer.rpc_chain.RpcChain(Endpoint);
 const Submitter = proposer.tx_submitter.TxSubmitter(Endpoint);
+const Exporter = proposer.exporter.Exporter;
+const Server = http.Server(io.IO, *Exporter, Exporter.handle);
 
 const usage =
     \\usage: base proposer --prover-rpc <url|native> --l1-eth-rpc <url> --l2-eth-rpc <url>
@@ -28,6 +30,8 @@ const usage =
     \\         --dispute-game-factory-addr <addr> --game-type <n>
     \\         (--private-key <hex> | --dry-run) [--poll-interval 12s] [--rpc-timeout 30s]
     \\         [--rollup-config <file>] [--l1-genesis <file>] [--ticks-max <n>]
+    \\         [--health.addr 0.0.0.0] [--health.port 8080 (0: off)]
+    \\         [--metrics.enabled] [--metrics.addr 0.0.0.0] [--metrics.port 7300]
     \\
 ;
 
@@ -133,8 +137,75 @@ fn run(init: std.process.Init, service: *Service, config: *const proposer.config
         .anchor_state_registry = config.anchor_state_registry,
         .poll_interval_ns = config.poll_interval_ms * std.time.ns_per_ms,
     }, service.chain.chain(), prover, submit);
-    return tick_loop(service, config, &dry_run);
+    const endpoints = try allocator.create(Endpoints);
+    defer allocator.destroy(endpoints);
+    try endpoints.open(allocator, &service.os_io, config);
+    defer endpoints.close(allocator, &service.os_io);
+    return tick_loop(service, config, &dry_run, &endpoints.exporter);
 }
+
+/// The health/readiness/metrics servers (`proposer.exporter`): the health port, and the
+/// metrics port when `--metrics.enabled` and different.
+const Endpoints = struct {
+    exporter: Exporter,
+    servers: [2]?*Server = .{ null, null },
+
+    fn now_ns(context: *anyopaque) u64 {
+        const os_io: *io.IO = @ptrCast(@alignCast(context));
+        return os_io.now_monotonic_ns();
+    }
+
+    fn open(
+        endpoints: *Endpoints,
+        allocator: std.mem.Allocator,
+        os_io: *io.IO,
+        config: *const proposer.config.Config,
+    ) !void {
+        endpoints.servers = .{ null, null };
+        try endpoints.exporter.init(.{ .context = os_io, .now_ns = now_ns }, .{
+            .version = "needlefish",
+            .poll_interval_ns = config.poll_interval_ms * std.time.ns_per_ms,
+        });
+        errdefer endpoints.close(allocator, os_io);
+        const health = io.Address.ip4(config.health_addr, config.health_port);
+        const metrics = io.Address.ip4(config.metrics_addr, config.metrics_port);
+        const same = config.health_port == config.metrics_port and
+            std.mem.eql(u8, &config.health_addr, &config.metrics_addr);
+        const wanted = [2]bool{ config.health_port != 0, config.metrics_enabled and !same };
+        for (wanted, [2]io.Address{ health, metrics }, &endpoints.servers) |on, at, *slot| {
+            if (!on) continue;
+            const server = try allocator.create(Server);
+            errdefer allocator.destroy(server);
+            try server.init(allocator, os_io, &endpoints.exporter, .{
+                .connections_max = 8,
+                .recv_buffer_size = 16 * 1024,
+                .send_buffer_size = 16 * 1024,
+                .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
+            });
+            slot.* = server;
+            const bound = try server.listen(at);
+            std.debug.print("proposer: serving health and metrics on port {d}\n", .{bound.port});
+        }
+    }
+
+    fn close(endpoints: *Endpoints, allocator: std.mem.Allocator, os_io: *io.IO) void {
+        for (endpoints.servers) |slot| if (slot) |server| server.stop();
+        var rounds: u32 = 0;
+        while (rounds < 1000) : (rounds += 1) {
+            var stopped = true;
+            for (endpoints.servers) |slot| {
+                if (slot) |server| stopped = stopped and server.stopped();
+            }
+            if (stopped) break;
+            os_io.run_for_ns(std.time.ns_per_ms) catch break;
+        }
+        for (&endpoints.servers) |*slot| if (slot.*) |server| {
+            server.deinit();
+            allocator.destroy(server);
+            slot.* = null;
+        };
+    }
+};
 
 const RemoteClient = proof.prover_service.client.Client(io.IO);
 const RemoteProver = proof.prover_service.client.ProposerProver(io.IO);
@@ -276,6 +347,7 @@ fn tick_loop(
     service: *Service,
     config: *const proposer.config.Config,
     dry_run: *const proposer.dry_run.DryRun,
+    exporter: *Exporter,
 ) !u8 {
     const interval_ns = config.poll_interval_ms * std.time.ns_per_ms;
     const start_ns = service.os_io.now_monotonic_ns();
@@ -283,6 +355,7 @@ fn tick_loop(
     while (config.ticks_max == null or ticks < config.ticks_max.?) : (ticks += 1) {
         service.pipeline.tick(service.os_io.now_monotonic_ns() - start_ns);
         const stats = service.pipeline.stats;
+        exporter.observe(stats, service.pipeline.collector.stats);
         std.debug.print("proposer: tick {d}: {d} skipped, {d} restarts, {d} dry-run sends\n", .{
             stats.ticks,
             stats.skipped,

@@ -81,7 +81,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proposer` provers: `--prover-rpc <url>` through the prover-service
   `ProposerProver`, `--l1-beacon` blob reads for the native prover (shared with
   `proof run` in `bin/base/beacon.zig`).
-- [ ] `proposer` health/metrics/admin endpoints (base/base `health_addr`, `admin_addr`).
+- [x] `proposer` health/metrics endpoints: `proposer/exporter.zig` (`/`, `/healthz`,
+  `/readyz` = a tick made progress within 5 poll intervals, `/metrics` with pipeline and
+  collector counters); `--health.addr/--health.port` (8080, 0 off), `--metrics.enabled`,
+  `--metrics.addr/--metrics.port` (7300), all serving the same handler.
+- [ ] `proposer` admin JSON-RPC (base/base `admin_addr`: start/stop proposing, status).
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
@@ -290,6 +294,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: proposer health/readiness/metrics endpoints.
 - 2026-11-05: submission fee bumping at the same nonce; on in proposer and challenger.
 - 2026-11-05: native backend e2e (compressed range proven, archive replayed).
 - 2026-11-05: proposer compressed mode through native workers; initData cap fix.
