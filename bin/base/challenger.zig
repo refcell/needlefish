@@ -151,6 +151,7 @@ fn connect(
         .chain_id = chain_id,
         .private_key = key,
         .from = try secp256k1.address(key),
+        .resubmit_polls = 12,
     });
 }
 

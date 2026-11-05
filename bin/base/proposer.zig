@@ -267,6 +267,8 @@ fn open_submitter(
         .game_type = config.game_type.?,
         // The native prover's initData is a witness archive (hundreds of KiB).
         .calldata_bytes_max = proposer.collector.calldata_bytes_max,
+        // One poll per pipeline tick: bump after 12 ticks without a receipt.
+        .resubmit_polls = 12,
     });
 }
 

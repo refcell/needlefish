@@ -100,9 +100,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   receipt replay, revert data from `Endpoint.last_error`; `classify` through
   `aggregate_verifier.classify_revert`, selector text and error names). The proposer's
   `TxSubmitter` and the challenger's `challenger/tx_submitter.zig` sit on it.
-- [ ] `proof/submission` fee bumping: resubmit a stuck transaction at the same nonce with
-  bumped fees (base/base `TxManager`); today a dropped transaction is retried by the
-  caller with a fresh nonce.
+- [x] `proof/submission` fee bumping: after `resubmit_polls` receipt polls the sender
+  re-signs at the same nonce with fees +15% (+1 wei, never below today's suggestion), up to
+  `bumps_max`, and settles on any hash's receipt; `base proposer`/`base challenger` bump
+  after 12 polls.
 - [x] `bin/base challenger`: `challenger/flags.zig` (base/base `cli.rs` names, defaults,
   comma-separated bond claim addresses, `from_cli` checks; fuzzed), JSON-RPC chain view and
   submitter, `Driver.tick` on the IO clock. Disputes wait for the prover client below
@@ -247,8 +248,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
   batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
   estimation, no revert data), while a game creation needs the bond as value and the
-  revert selector. No fee bumping: a dropped creation fails, and the pipeline's restart
-  re-proposes at a fresh nonce (base/base's `TxManager` resubmits in place).
+  revert selector. Fee bumping now lives in the shared `submission` sender (same nonce,
+  raised fees); a creation still dropped after `receipt_polls_max` fails and the pipeline
+  re-proposes at a fresh nonce.
 - Challenger (port of `crates/proof/challenge/src`): pure state machines over three
   injected vtables (`chain.ChainView` reads, `Prover` request/poll, `Submitter`
   send/status); `Driver.tick(now_ns)` is the only entry point. Ported: `scanner.rs`
@@ -288,6 +290,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: submission fee bumping at the same nonce; on in proposer and challenger.
 - 2026-11-05: native backend e2e (compressed range proven, archive replayed).
 - 2026-11-05: proposer compressed mode through native workers; initData cap fix.
 - 2026-11-05: challenger prover-service client, `base challenger --zk-rpc-url`.
