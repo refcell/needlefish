@@ -92,6 +92,51 @@ pub const Account = struct {
 
 pub const StorageKey = struct { address: Address, slot: u256 };
 
+/// Storage-slot map context. `AutoContext` streams the key's fields through wyhash and
+/// compares bytes element-wise; together that was ~40% of an SSTORE/SLOAD loop. This
+/// folds the key's 64-bit limbs and finishes with the murmur3 `fmix64` avalanche, and
+/// compares the key as two wide integers. Like the unseeded wyhash it replaces, it is not
+/// keyed: probe lengths stay bounded by the gas needed to create each slot.
+pub const StorageKeyContext = struct {
+    const multiplier: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    pub fn hash(_: StorageKeyContext, key: StorageKey) u64 {
+        const address: u160 = @bitCast(key.address);
+        var folded: u64 = @truncate(address);
+        folded = (folded ^ @as(u64, @truncate(address >> 64))) *% multiplier;
+        folded = (folded ^ @as(u64, @truncate(address >> 128))) *% multiplier;
+        var limb: u32 = 0;
+        while (limb < 4) : (limb += 1) {
+            folded = (folded ^ @as(u64, @truncate(key.slot >> @intCast(limb * 64)))) *% multiplier;
+        }
+        return fmix64(folded);
+    }
+
+    pub fn eql(_: StorageKeyContext, a: StorageKey, b: StorageKey) bool {
+        const same_address = @as(u160, @bitCast(a.address)) == @as(u160, @bitCast(b.address));
+        return same_address and a.slot == b.slot;
+    }
+
+    fn fmix64(value: u64) u64 {
+        var x = value;
+        x ^= x >> 33;
+        x *%= 0xff51_afd7_ed55_8ccd;
+        x ^= x >> 33;
+        x *%= 0xc4ce_b9fe_1a85_ec53;
+        x ^= x >> 33;
+        return x;
+    }
+};
+
+pub fn StorageKeyMap(comptime V: type) type {
+    return std.HashMapUnmanaged(
+        StorageKey,
+        V,
+        StorageKeyContext,
+        std.hash_map.default_max_load_percentage,
+    );
+}
+
 pub const Slot = struct {
     present: u256,
     /// Value at the start of the transaction `original_tx` (EIP-2200 "original").
@@ -170,8 +215,8 @@ pub const State = struct {
     database: Database,
     limits: Limits,
     accounts: std.AutoHashMapUnmanaged(Address, Account) = .empty,
-    slots: std.AutoHashMapUnmanaged(StorageKey, Slot) = .empty,
-    transient: std.AutoHashMapUnmanaged(StorageKey, u256) = .empty,
+    slots: StorageKeyMap(Slot) = .empty,
+    transient: StorageKeyMap(u256) = .empty,
     journal: []Entry,
     journal_len: u32 = 0,
     logs: []Log,
@@ -667,4 +712,29 @@ pub const State = struct {
 
 test "state: entry is compact" {
     try std.testing.expect(@sizeOf(Entry) <= 64);
+}
+
+test "state: storage key context agrees with byte equality and spreads keys" {
+    var prng = std.Random.DefaultPrng.init(0x5107);
+    const context = StorageKeyContext{};
+    var buckets: [64]u32 = @splat(0);
+    var iteration: u32 = 0;
+    while (iteration < 4096) : (iteration += 1) {
+        var address: Address = undefined;
+        prng.random().bytes(&address);
+        const key = StorageKey{ .address = address, .slot = prng.random().int(u256) };
+        var other = key;
+        switch (prng.random().uintLessThan(u8, 3)) {
+            0 => {},
+            1 => other.address[prng.random().uintLessThan(usize, 20)] +%= 1,
+            else => other.slot +%= @as(u256, 1) << prng.random().int(u8),
+        }
+        const same = std.mem.eql(u8, &key.address, &other.address) and key.slot == other.slot;
+        try std.testing.expectEqual(same, context.eql(key, other));
+        if (same) try std.testing.expectEqual(context.hash(key), context.hash(other));
+        // Sequential slots of one contract (the common layout) must not cluster.
+        const sequential = StorageKey{ .address = address, .slot = iteration };
+        buckets[context.hash(sequential) >> 58] += 1;
+    }
+    for (buckets) |count| try std.testing.expect(count > 16 and count < 128);
 }

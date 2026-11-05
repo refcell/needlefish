@@ -111,8 +111,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `evm: snailtracer` in `zig build bench`, ~50 ms / 166M gas, docs/PERF.md).
 - [x] Performance: profile snailtracer (interpreter loop ~80%, memory ops ~15%, keccak ~2%;
   docs/PERF.md).
-- [ ] Performance: erc20/storage path — the state slot map (`State.slot_for`, wyhash) and
-  overlay lookups dominate after the interpreter; try a flat open-addressed slot table.
+- [x] Performance: erc20/storage path — `StorageKeyContext` (limb fold + fmix64 hash,
+  wide-integer compare) for `State.slots`/`transient`: storage loop 12.7 -> 11.0 us, erc20
+  1.44 -> 1.41 us (same-load A/B). Kept `std.HashMapUnmanaged` (not a custom flat table) so
+  other lanes' `iterator`/`count`/`clearRetainingCapacity` uses are unchanged. The db
+  lane's overlay `SlotKey` map still uses `AutoContext` and could adopt the same context.
 - [ ] Performance: frame entry copies `Frame` by value (`run` local); measure the call loop
   with a pointer-based frame and keep it if `evm: call loop` improves. Call-loop profile:
   interpreter 35%, account-map lookup + key compare ~25%, start_call/push_frame/resume ~20%,
