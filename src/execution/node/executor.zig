@@ -342,6 +342,22 @@ pub const Executor = struct {
         executed: struct { success: bool, gas_used: u64, output: []const u8 },
     };
 
+    /// `simulate` against another state (an older block's, see `HistoryDatabase`); the
+    /// executor's own database is restored afterwards and no cached state crosses over.
+    pub fn simulate_on(
+        executor: *Executor,
+        block: *const BlockEnv,
+        call: Call,
+        database: evm.state.Database,
+    ) Error!Simulated {
+        executor.abort_block();
+        const saved = executor.state.database;
+        executor.state.database = database;
+        defer executor.state.database = saved;
+        defer assert(executor.state.accounts.count() == 0);
+        return executor.simulate(block, call);
+    }
+
     /// Runs `call` on top of the committed state in `block`'s context, with no fee
     /// (base fee zero, gas price zero), then discards every change. The output borrows
     /// the scratch arena until the next call.

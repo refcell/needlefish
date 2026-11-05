@@ -16,6 +16,8 @@ const Prng = @import("../../testing/prng.zig").Prng;
 const B256 = primitives.B256;
 const Node = fixture.Node;
 const AccountProof = @import("../trie/state_trie.zig").StateTrie.AccountProof;
+const StorageProof = @import("../trie/state_trie.zig").StateTrie.StorageProof;
+const HistoryDatabase = @import("history_database.zig").HistoryDatabase;
 
 const blocks_max = 128;
 
@@ -31,6 +33,7 @@ const Harness = struct {
     snapshots: [blocks_max]Snapshot = undefined,
     snapshots_len: u32 = 0,
     proof: AccountProof = .{},
+    storage_proof: StorageProof = .{},
     buffers: [blocks_max][256]u8 = undefined,
     timestamp: u64 = 0,
 
@@ -127,9 +130,30 @@ const Harness = struct {
             );
             const balance = if (receiver) |r| r.balance else 0;
             try testing.expectEqual(expected.receiver_balance, balance);
+            try h.check_database(hash, number, expected);
             checked += 1;
         }
         return checked;
+    }
+
+    /// The evm-facing reads (`HistoryDatabase`) agree with the snapshot too.
+    fn check_database(h: *Harness, hash: [32]u8, number: u64, expected: Snapshot) !void {
+        var history: HistoryDatabase = .{
+            .chain = &h.node.chain,
+            .hash = hash,
+            .number = number,
+            .account_proof = &h.proof,
+            .storage_proof = &h.storage_proof,
+        };
+        const database = history.database();
+        const sender = (try database.basic(fixture.address_of(1).bytes)).?;
+        try testing.expectEqual(expected.sender_nonce, sender.nonce);
+        try testing.expect(!sender.has_storage);
+        const receiver = try database.basic(fixture.address_of(9).bytes);
+        try testing.expectEqual(expected.receiver_balance, if (receiver) |r| r.balance else 0);
+        try testing.expectEqual(@as(u256, 0), try database.storage(fixture.address_of(9).bytes, 1));
+        try testing.expectEqual(@as(usize, 0), (try database.code_by_hash(sender.code_hash)).len);
+        try testing.expect(history.failure == null);
     }
 };
 

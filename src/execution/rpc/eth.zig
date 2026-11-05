@@ -44,6 +44,7 @@ pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_m
     @import("txpool.zig").methods;
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
+const eth_proof = @import("eth_proof.zig");
 
 const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
@@ -509,7 +510,7 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Calls ------------------------------------------------------------------------
 
-fn parse_call(api: *Api, raw: []const u8) HandlerError!node.executor.Executor.Call {
+fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.Call {
     var result: node.executor.Executor.Call = .{};
     var scanner = json.Scanner.init(raw);
     if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
@@ -528,7 +529,7 @@ fn parse_call(api: *Api, raw: []const u8) HandlerError!node.executor.Executor.Ca
         } else if (std.mem.eql(u8, name.bytes, "value")) {
             result.value = json.parse_quantity(u256, text) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "data") or std.mem.eql(u8, name.bytes, "input")) {
-            result.data = json.parse_data(text, api.scratch) catch return error.InvalidParams;
+            result.data = json.parse_data(text, space) catch return error.InvalidParams;
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
@@ -536,28 +537,84 @@ fn parse_call(api: *Api, raw: []const u8) HandlerError!node.executor.Executor.Ca
     return result;
 }
 
+/// A call request with the state it runs against. The block is resolved before the
+/// call object is parsed, so call data of a historical call stays clear of the proof
+/// buffers at the scratch tail.
+const CallRequest = struct {
+    message: node.executor.Executor.Call,
+    view: state_view.View,
+};
+
+fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
+    const call_raw = try call.params.raw();
+    const view = try state_view.resolve(api, call, try call.params.optional_raw());
+    const space = switch (view) {
+        .head => api.scratch,
+        .historical => api.scratch[0 .. proof_tail_offset(api) orelse {
+            return call.fail(rpc.code.internal_error, "proof scratch too small");
+        }],
+    };
+    return .{ .message = try parse_call(space, call_raw), .view = view };
+}
+
+/// Where the proof buffers of a historical call start (aligned, at the scratch tail).
+fn proof_tail_offset(api: *Api) ?usize {
+    const size = @sizeOf(eth_proof.Scratch);
+    if (api.scratch.len < size + @alignOf(eth_proof.Scratch)) return null;
+    const base = @intFromPtr(api.scratch.ptr);
+    const alignment = @alignOf(eth_proof.Scratch);
+    const start = std.mem.alignBackward(usize, base + api.scratch.len - size, alignment);
+    assert(start >= base);
+    return start - base;
+}
+
+fn view_header(api: *Api, view: state_view.View) consensus.Header {
+    return switch (view) {
+        .head => head_header(api),
+        .historical => |block| api.chain.header(block.hash).?, // Resolved, so stored.
+    };
+}
+
 fn simulate(
     api: *Api,
     call: *Call,
-    message: node.executor.Executor.Call,
+    request: CallRequest,
 ) HandlerError!node.executor.Executor.Simulated {
-    api.chain.ensure_head_state() catch {
-        return call.fail(rpc.code.internal_error, "head state unavailable");
-    };
-    const head = head_header(api);
-    var env = node.chain.env_of(&head);
+    const header = view_header(api, request.view);
+    var env = node.chain.env_of(&header);
     env.number += 1;
     env.timestamp += 1;
-    env.parent_hash = api.chain.head_hash();
-    return api.chain.executor.simulate(&env, message) catch |err| {
+    env.parent_hash = header.hash().bytes;
+    const executor = api.chain.executor;
+    const block = switch (request.view) {
+        .head => {
+            api.chain.ensure_head_state() catch {
+                return call.fail(rpc.code.internal_error, "head state unavailable");
+            };
+            return executor.simulate(&env, request.message) catch |err| {
+                return call.fail(rpc.code.internal_error, @errorName(err));
+            };
+        },
+        .historical => |block| block,
+    };
+    const offset = proof_tail_offset(api).?; // Checked when the request was parsed.
+    const proofs: *eth_proof.Scratch = @ptrCast(@alignCast(api.scratch[offset..].ptr));
+    var history: node.HistoryDatabase = .{
+        .chain = api.chain,
+        .hash = block.hash,
+        .number = block.number,
+        .account_proof = &proofs.account,
+        .storage_proof = &proofs.storage,
+    };
+    return executor.simulate_on(&env, request.message, history.database()) catch |err| {
+        if (history.failure) |failure| return eth_proof.fail_history(call, failure);
         return call.fail(rpc.code.internal_error, @errorName(err));
     };
 }
 
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
-    const message = try parse_call(api, try call.params.raw());
-    try require_head_state(api, call, try call.params.optional_raw());
-    switch (try simulate(api, call, message)) {
+    const request = try parse_call_request(api, call);
+    switch (try simulate(api, call, request)) {
         .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
         .executed => |executed| {
             if (!executed.success) return call.fail(3, "execution reverted");
@@ -568,11 +625,10 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
 
 /// Binary search for the smallest gas limit that succeeds, bounded by the block limit.
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
-    var message = try parse_call(api, try call.params.raw());
-    try require_head_state(api, call, try call.params.optional_raw());
-    var high = message.gas orelse head_header(api).gas_limit;
-    message.gas = high;
-    const first = try simulate(api, call, message);
+    var request = try parse_call_request(api, call);
+    var high = request.message.gas orelse view_header(api, request.view).gas_limit;
+    request.message.gas = high;
+    const first = try simulate(api, call, request);
     switch (first) {
         .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
         .executed => |e| if (!e.success) return call.fail(3, "execution reverted"),
@@ -581,8 +637,8 @@ fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     var iterations: u32 = 0;
     while (low + 1 < high and iterations < estimate_iterations_max) : (iterations += 1) {
         const middle = low + (high - low) / 2;
-        message.gas = middle;
-        const ok = switch (try simulate(api, call, message)) {
+        request.message.gas = middle;
+        const ok = switch (try simulate(api, call, request)) {
             .invalid => false,
             .executed => |e| e.success,
         };

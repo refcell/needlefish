@@ -173,6 +173,12 @@ test "eth: state reads and getProof at an older block from the history window" {
     one[19] = 1;
     try h.node.db.put_account(one, 5, 0, &.{});
     try h.node.db.put_storage(one, 7, 0x2a);
+    // Returns SLOAD(0): PUSH0 SLOAD PUSH0 MSTORE PUSH1 32 PUSH0 RETURN.
+    const reader = [_]u8{ 0x5f, 0x54, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3 };
+    var two: [20]u8 = @splat(0);
+    two[19] = 0x22;
+    try h.node.db.put_account(two, 0, 1, &reader);
+    try h.node.db.put_storage(two, 0, 0x11);
     var store = try history_module.Store.init(testing.allocator, .{
         .window_blocks = 8,
         .paths_max = 1 << 12,
@@ -186,7 +192,16 @@ test "eth: state reads and getProof at an older block from the history window" {
     const first = try h.mine(12);
     try h.node.db.put_account(one, 6, 0, &.{});
     try h.node.db.put_storage(one, 7, 0x2b);
+    try h.node.db.put_storage(two, 0, 0x33);
     _ = try h.mine(24);
+    const reader_address = "\"0x0000000000000000000000000000000000000022\"";
+    const call_old = "[{\"to\":" ++ reader_address ++ "},\"0x1\"]";
+    try expect_contains(try h.request("eth_call", call_old), "0011\"");
+    const call_new = "[{\"to\":" ++ reader_address ++ "},\"latest\"]";
+    try expect_contains(try h.request("eth_call", call_new), "0033\"");
+    try expect_contains(try h.request("eth_estimateGas", call_old), "\"result\":\"0x");
+    const call_genesis = "[{\"to\":" ++ reader_address ++ "},\"0x0\"]";
+    try expect_contains(try h.request("eth_call", call_genesis), "historical state");
     const at_one = "[" ++ address_one ++ ",\"0x1\"]";
     try testing.expectEqualStrings("\"result\":\"0x5\"", try h.request("eth_getBalance", at_one));
     const latest = "[" ++ address_one ++ ",\"latest\"]";
