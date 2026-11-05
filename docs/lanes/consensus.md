@@ -42,13 +42,14 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
     the start finder then uses a matching checkpoint, else binary-searches the earliest
     unpruned block (base/base `find_earliest_unpruned_block`)
-- [ ] Native 200 ms blocks (AGENTS.md rule 10), consensus side done:
+- [x] Native 200 ms blocks (AGENTS.md rule 10):
   - [x] driver ticks in ms; subsecond slots build at the parent timestamp and seal 150 ms in
   - [x] BaseTimeUpdateTx deposit in sequenced and derived attributes; singular-only and
     same-second batch rules; pipeline test of 200 ms derivation
   - [x] devnet smoke at 200 ms (nf-builder, 2026-11-05): devnet genesis activates Denim at
     genesis, EL serves `engine_getPayloadV5` (Azul/Osaka); `just devnet smoke` passes with
     ~5 L2 blocks/s.
+  - [x] devnet smoke at 200 ms passes (25 blocks per 5 s; verifier derives; metrics check)
 - [x] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
@@ -230,6 +231,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: devnet smoke passes at native 200 ms blocks on main (Denim at genesis from batcher-devnet, EL fixes from node): 25 blocks/5 s, verifier derives, load test 99/99.
 - 2026-11-05: confs: `service/conf_depth.zig` hides L1 blocks within N of the head from derivation (`--l1.verifier-confs`, no head: no gate) and from sequencer origin selection (`--sequencer.l1-confs`, default 4, no head: nothing); `--sequencer.recover`.
 - 2026-11-05: 200 ms devnet trial (local, uncommitted Denim genesis): EL rejects same-second FCU attrs and lacks Base upgrades from genesis; handed to the node and batcher-devnet lanes.
 - 2026-11-05: derive: end-to-end pipeline test of native 200 ms Denim blocks (singular batches sharing a second, BaseTimeUpdateTx millis).
