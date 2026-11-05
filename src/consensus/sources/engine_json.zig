@@ -349,7 +349,11 @@ fn decode_data_list(
     return items;
 }
 
-fn decode_withdrawals(allocator: Allocator, raw: []const u8, limits: Limits) Error![]Withdrawal {
+pub fn decode_withdrawals(
+    allocator: Allocator,
+    raw: []const u8,
+    limits: Limits,
+) Error![]Withdrawal {
     const count = try object.array_count(raw, limits.withdrawals_max);
     const withdrawals = try allocator.alloc(Withdrawal, count);
     var iterator = try object.ArrayIterator.init(raw);

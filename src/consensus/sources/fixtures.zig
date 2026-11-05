@@ -269,3 +269,93 @@ pub fn l2_block_json(buffer: []u8, number: u64, header_hash: *[32]u8) ![]const u
     try writer.end_object();
     return out.buffered();
 }
+
+pub const l2_full_transactions_max = 16;
+pub const l2_full_withdrawals_max = 4;
+
+/// A full L2 block for `l2_block_full`: an Ecotone L1 info deposit first, then the extra
+/// transactions, with a matching transactions root. Deposit inputs borrow `calldata`, so
+/// the block must not move after `init`.
+pub const L2FullBlock = struct {
+    calldata: [protocol.l1_info.calldata_length_max]u8,
+    envelopes: [l2_full_transactions_max]Envelope,
+    count: u32,
+    withdrawals: [l2_full_withdrawals_max]consensus.block.Withdrawal,
+    withdrawal_count: u32,
+    header: Header,
+    l1_info: protocol.l1_info.L1BlockInfo,
+
+    pub fn init(
+        block: *L2FullBlock,
+        number: u64,
+        parent: B256,
+        sequence_number: u64,
+        extra: []const Envelope,
+    ) void {
+        assert(extra.len < l2_full_transactions_max);
+        block.l1_info = .{
+            .format = .ecotone,
+            .number = 500 + number,
+            .block_hash = .init(@splat(0x55)),
+            .sequence_number = sequence_number,
+            .batcher_address = .init(@splat(0xba)),
+            .blob_base_fee_scalar = 2,
+            .base_fee_scalar = 3,
+        };
+        const rollup: protocol.rollup_config.RollupConfig = .{};
+        const deposit = block.l1_info.deposit_tx(&rollup, 0, &block.calldata);
+        block.envelopes[0] = .{ .deposit = .{
+            .source_hash = deposit.source_hash,
+            .from = deposit.from,
+            .to = .{ .call = deposit.to.? },
+            .mint = 0,
+            .value = 0,
+            .gas_limit = deposit.gas_limit,
+            .is_system_transaction = deposit.is_system_transaction,
+            .input = deposit.input,
+        } };
+        @memcpy(block.envelopes[1 .. 1 + extra.len], extra);
+        block.count = @intCast(1 + extra.len);
+        block.withdrawal_count = 0;
+        block.header = header_for(block.envelopes[0..block.count], number, parent);
+        block.header.mix_hash = .init(@splat(0x3d));
+        block.header.beneficiary = .init(@splat(0xfe));
+        assert(block.envelopes[0].is_deposit());
+    }
+
+    pub fn transactions(block: *const L2FullBlock) []const Envelope {
+        return block.envelopes[0..block.count];
+    }
+
+    pub fn hash(block: *const L2FullBlock) B256 {
+        return block.header.hash();
+    }
+
+    /// Renders the block as `eth_getBlockByNumber(n, true)` returns it.
+    pub fn json_text(block: *const L2FullBlock, buffer: []u8) ![]const u8 {
+        var out: std.Io.Writer = .fixed(buffer);
+        var writer = json.Writer.init(&out);
+        try writer.begin_object();
+        try format.header_fields(&writer, &block.header, block.hash().bytes, 1000);
+        try writer.key("transactions");
+        try writer.begin_array();
+        for (block.transactions()) |envelope| try write_transaction(&writer, envelope);
+        try writer.end_array();
+        try writer.key("withdrawals");
+        try writer.begin_array();
+        for (block.withdrawals[0..block.withdrawal_count]) |item| {
+            try writer.begin_object();
+            try format.field_quantity(&writer, "index", item.index);
+            try format.field_quantity(&writer, "validatorIndex", item.validator_index);
+            try format.field_data(&writer, "address", &item.address.bytes);
+            try format.field_quantity(&writer, "amount", item.amount);
+            try writer.end_object();
+        }
+        try writer.end_array();
+        try writer.key("uncles");
+        try writer.begin_array();
+        try writer.end_array();
+        try writer.end_object();
+        return out.buffered();
+    }
+};

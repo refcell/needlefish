@@ -17,9 +17,12 @@ pub const finalize_task = @import("finalize_task.zig");
 pub const task_queue = @import("task_queue.zig");
 pub const EngineTaskQueue = task_queue.EngineTaskQueue;
 pub const mock_engine = @import("mock_engine.zig");
+pub const polling_client = @import("polling_client.zig");
+pub const PollingClient = polling_client.PollingClient;
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("attributes_match_test.zig");
     _ = @import("task_queue_test.zig");
+    _ = @import("polling_client_test.zig");
 }

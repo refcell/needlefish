@@ -1,8 +1,9 @@
 //! L2 Engine API client: `engine_forkchoiceUpdatedV2/V3`, `engine_newPayloadV2/V3/V4`,
 //! `engine_getPayloadV2..V5` (the versions base/base selects per fork in
 //! `crates/consensus/engine/src/versions.rs`), and `eth_getBlockByNumber` on the same
-//! authenticated endpoint to build `L2BlockInfo`s. Every request carries a fresh
-//! `Authorization: Bearer <jwt>` with `iat` from the injected IO's wall clock.
+//! authenticated endpoint to build `L2BlockInfo`s or full, verified `L2Block`s. Every
+//! request carries a fresh `Authorization: Bearer <jwt>` with `iat` from the injected IO's
+//! wall clock.
 //!
 //! One request in flight. Results are delivered to the caller's callback as a `Response`
 //! whose slices stay valid until the next response arrives. Engine API error codes map to
@@ -21,6 +22,7 @@ const http_client = @import("../../utilities/http/client.zig");
 const protocol = @import("../protocol/root.zig");
 const engine_json = @import("engine_json.zig");
 const l2_block = @import("l2_block.zig");
+const l2_block_full = @import("l2_block_full.zig");
 
 const L2BlockInfo = protocol.block.L2BlockInfo;
 const ChainGenesis = protocol.rollup_config.ChainGenesis;
@@ -42,9 +44,11 @@ pub const Response = union(enum) {
     payload_status: PayloadStatus,
     payload: PayloadEnvelope,
     l2_block: L2BlockInfo,
+    /// Borrows the client's arena until the next response.
+    l2_block_full: l2_block_full.L2Block,
 };
 
-pub const Error = rpc.client.Error || l2_block.Error || error{
+pub const Error = rpc.client.Error || l2_block_full.Error || error{
     UnknownPayload,
     InvalidForkchoiceState,
     InvalidPayloadAttributes,
@@ -59,12 +63,13 @@ pub const Options = struct {
     /// Anchors `L2BlockInfo` for the genesis block, which has no L1 info deposit.
     genesis: ChainGenesis,
     limits: engine_json.Limits = .{},
+    block_limits: l2_block_full.Limits = .{},
     /// Largest request body (a `newPayload` with every transaction).
     request_size_max: u32 = 8 * 1024 * 1024,
     retain_bytes: usize = 4 * 1024 * 1024,
 };
 
-const Method = enum { forkchoice_updated, new_payload, get_payload, block };
+const Method = enum { forkchoice_updated, new_payload, get_payload, block, block_full };
 
 /// Maps an Engine API error code (execution-apis `common.md`).
 pub fn error_from_code(code: i64) Error {
@@ -205,6 +210,20 @@ pub fn EngineClient(comptime IO: type) type {
             try engine.client.call(*Self, engine, on_result, method, &tag, write_block_tag);
         }
 
+        /// `eth_getBlockByNumber(tag, true)` decoded into a full, verified `L2Block`.
+        pub fn l2_full_block(
+            engine: *Self,
+            tag: BlockTag,
+            comptime Context: type,
+            context: Context,
+            comptime callback: fn (Context, *Self, Error!Response) void,
+        ) !void {
+            const method = "eth_getBlockByNumber";
+            try engine.start(.block_full, Context, context, callback);
+            errdefer engine.pending = null;
+            try engine.client.call(*Self, engine, on_result, method, &tag, write_block_tag);
+        }
+
         fn start(
             engine: *Self,
             method: Method,
@@ -265,6 +284,13 @@ pub fn EngineClient(comptime IO: type) type {
                 .block => {
                     if (std.mem.eql(u8, raw, "null")) return error.BlockNotFound;
                     return .{ .l2_block = try l2_block.decode(raw, &engine.options.genesis) };
+                },
+                .block_full => {
+                    if (std.mem.eql(u8, raw, "null")) return error.BlockNotFound;
+                    const genesis = &engine.options.genesis;
+                    const block_limits = engine.options.block_limits;
+                    const block = try l2_block_full.decode(allocator, raw, genesis, block_limits);
+                    return .{ .l2_block_full = block };
                 },
             };
         }

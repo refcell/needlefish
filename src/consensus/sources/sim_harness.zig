@@ -30,8 +30,14 @@ pub fn Harness(comptime Context: type, comptime handler: http.server.Handler(Con
 
         /// `harness` must not move afterwards.
         pub fn init(harness: *Self, context: Context, seed: u64) !void {
+            try harness.init_world(context, .{ .seed = seed });
+            assert(harness.world.options.seed == seed);
+        }
+
+        /// Like `init` with explicit world options (latency range, resets, refusals).
+        pub fn init_world(harness: *Self, context: Context, options: io.sim.Options) !void {
             const allocator = std.testing.allocator;
-            harness.world = try io.SimWorld.init(allocator, .{ .seed = seed });
+            harness.world = try io.SimWorld.init(allocator, options);
             errdefer harness.world.deinit();
             const server_host = io.Address.ip4(.{ 10, 0, 0, 1 }, 0);
             try io.SimIo.init(&harness.server_io, allocator, &harness.world, .{

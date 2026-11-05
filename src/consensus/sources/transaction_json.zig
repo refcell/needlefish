@@ -8,8 +8,10 @@
 //! Mirrors base/base `AlloyChainProvider::block_info_and_transactions_by_hash`, which
 //! decodes `TxEnvelope`s and recovers senders in the data sources.
 //!
-//! Types 0-4 are rebuilt. Other types are kept with the RPC `from` (the data sources
-//! ignore them) and make root verification impossible, so strict mode rejects them.
+//! Types 0-4 and the OP deposit (0x7e: `sourceHash`, `from`, `to`, `mint`, `value`, `gas`,
+//! `isSystemTx`, `input`) are rebuilt; a deposit's `from` is bound by its hash instead of a
+//! signature. Other types are kept with the RPC `from` (the data sources ignore them) and
+//! make root verification impossible, so strict mode rejects them.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -56,6 +58,9 @@ pub const Options = struct {
     recover_to: ?Address = null,
     /// Verify the transactions root against the header (rejects unknown types).
     verify_root: bool = true,
+    /// Recover senders at all. Off for L2 blocks, whose hash and root checks already bind
+    /// every transaction and whose senders consolidation never reads.
+    recover_senders: bool = true,
 };
 
 const Key = enum(u5) {
@@ -79,6 +84,9 @@ const Key = enum(u5) {
     y_parity,
     from,
     hash,
+    source_hash,
+    mint,
+    is_system_tx,
 };
 
 const keys = std.StaticStringMap(Key).initComptime(.{
@@ -102,6 +110,9 @@ const keys = std.StaticStringMap(Key).initComptime(.{
     .{ "yParity", .y_parity },
     .{ "from", .from },
     .{ "hash", .hash },
+    .{ "sourceHash", .source_hash },
+    .{ "mint", .mint },
+    .{ "isSystemTx", .is_system_tx },
 });
 
 const Seen = object.Seen(@typeInfo(Key).@"enum".field_names.len);
@@ -119,6 +130,8 @@ const mask_eip1559 = mask_common |
     mask(&.{ .max_fee_per_gas, .max_priority_fee_per_gas, .chain_id, .access_list });
 const mask_eip4844 = mask_eip1559 | mask(&.{ .max_fee_per_blob_gas, .blob_versioned_hashes });
 const mask_eip7702 = mask_eip1559 | mask(&.{.authorization_list});
+/// `to` (absent for creations), `mint`, and `isSystemTx` default like op-alloy's serde.
+const mask_deposit = mask(&.{ .source_hash, .from, .gas, .value, .input, .hash });
 
 /// The decoded fields of one transaction object. Lists stay raw until the type is known.
 const Fields = struct {
@@ -143,6 +156,9 @@ const Fields = struct {
     y_parity: u64 = 0,
     from: Address = .zero,
     hash: B256 = .zero,
+    source_hash: B256 = .zero,
+    mint: u128 = 0,
+    is_system_tx: bool = false,
 };
 
 pub const Decoded = struct {
@@ -178,10 +194,11 @@ pub fn decode(
     };
     if (envelope) |built| {
         if (!built.hash().eql(fields.hash)) return error.HashMismatch;
-        const recover = if (options.recover_to) |target|
+        const recover_selected = if (options.recover_to) |target|
             fields.to != null and fields.to.?.eql(target)
         else
             true;
+        const recover = options.recover_senders and recover_selected and !built.is_deposit();
         if (recover) transaction.from = try recover_sender(built, fields.from);
     } else {
         try fields.seen.require(mask(&.{ .from, .input }));
@@ -231,6 +248,9 @@ fn apply(
         .y_parity => fields.y_parity = try object.quantity(u64, value),
         .from => fields.from = try object.address(value),
         .hash => fields.hash = try object.hash(value),
+        .source_hash => fields.source_hash = try object.hash(value),
+        .mint => fields.mint = try object.quantity(u128, value),
+        .is_system_tx => fields.is_system_tx = try object.boolean(value),
     }
 }
 
@@ -288,6 +308,10 @@ fn build_envelope(scratch: Allocator, fields: *const Fields, limits: Limits) Err
             try seen.require(mask_eip7702);
             return try build_eip7702(scratch, fields, limits);
         },
+        deposit_tx_type => {
+            try seen.require(mask_deposit);
+            return build_deposit(fields);
+        },
         else => null,
     };
 }
@@ -295,6 +319,23 @@ fn build_envelope(scratch: Allocator, fields: *const Fields, limits: Limits) Err
 fn kind(to: ?Address) consensus.TxKind {
     if (to) |address| return .{ .call = address };
     return .create;
+}
+
+pub const deposit_tx_type: u8 = 0x7e;
+
+fn build_deposit(fields: *const Fields) Envelope {
+    assert(fields.tx_type == deposit_tx_type);
+    assert(fields.seen.has(@backingInt(Key.source_hash)));
+    return .{ .deposit = .{
+        .source_hash = fields.source_hash,
+        .from = fields.from,
+        .to = kind(fields.to),
+        .mint = fields.mint,
+        .value = fields.value,
+        .gas_limit = fields.gas,
+        .is_system_transaction = fields.is_system_tx,
+        .input = fields.input,
+    } };
 }
 
 fn build_legacy(fields: *const Fields) Error!Envelope {

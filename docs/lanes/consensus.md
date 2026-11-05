@@ -29,7 +29,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [x] engine task queue: insert unsafe, consolidate (AttributesMatch), build/seal (Holocene
     deposits-only fallback), finalize, synchronize; deterministic mock engine, fuzzed
-  - [ ] polling adapter over `sources.EngineClient` (callback-based) implementing the task
+  - [x] polling adapter over `sources.EngineClient` (callback-based) implementing the task
     client contract in `engine/task.zig`, plus a full L2 block fetch (header fields + raw
     EIP-2718 txs incl. deposits + withdrawals) for consolidation
   - [x] starting forkchoice discovery (resumable find_starting_forkchoice)
@@ -141,10 +141,26 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   `eip1559Params` resolve to `Context.fee_params_canyon` (default 250/6, base/base
   `post_canyon_params`) because `RollupConfig` has no chain op config. Deposits-only
   fallback builds with the leading-deposits prefix of the attributes' transactions.
+- Polling engine client (`engine/polling_client.zig`): each call names its request with a
+  key (method, version, 64-bit Wyhash digest of the identifying arguments: forkchoice state
+  + attributes, payload block hash + side-car, payload id, block number). A stored result is
+  handed out once to the matching call; a different call discards it and starts its own
+  request, so an abandoned task cannot leak its result into another. Errors: -38002 ->
+  `InvalidForkchoiceState`; block decode/verify/genesis failures -> `InvalidBlock`;
+  transport and other RPC errors (and arena OOM) -> `RpcFailed`; null block -> null; a block
+  whose number differs from the requested one -> `InvalidBlock`.
+- Full L2 blocks (`sources/l2_block_full.zig`): transactions are rebuilt from the JSON
+  objects (types 0-4 and deposits 0x7e), each must hash to its `hash` and the list must
+  match `transactionsRoot`; senders are not recovered (hash + root already bind them).
+  Deposit `to` (absent = create), `mint`, and `isSystemTx` default like op-alloy serde.
+  Withdrawals are decoded but not checked against `withdrawalsRoot` (post-Isthmus that root
+  is the message passer storage root).
 
 ## Log
 - 2026-11-05: service: driver (startup, derivation, finalization, sequencing), fuzzed.
 - 2026-11-05: sequencer: next-block attributes (build_on, pool gating), fuzzed.
+- 2026-11-05: engine: polling client over `sources.EngineClient` (keyed results, error
+  mapping), full L2 block fetch with deposits; e2e insert + consolidate over SimIo, fuzzed.
 - 2026-11-05: service: node stage 1 (heads + RPC); bin: `base consensus` subcommand.
 - 2026-11-05: sources: L2 provider label queries; service: L1 head watcher.
 - 2026-11-05: sources: L2 chain provider; protocol: system config from L2 blocks.
