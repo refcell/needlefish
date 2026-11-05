@@ -15,7 +15,7 @@ const scalar_module = @import("scalar.zig");
 const table = @import("table.zig");
 const Fe = field.Fe;
 const Scalar = scalar_module.Scalar;
-const FieldInverse = @import("modinv.zig").Modulus(field.p_int);
+const FieldInverse = @import("../safegcd.zig").Modulus(u256, field.p_int);
 
 pub const Affine = table.Affine;
 

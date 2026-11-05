@@ -37,8 +37,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] bls: GLV-split scalars inside large G1 MSM (halves windows).
 - [x] fuzz coverage audit: every precompile/decoder file has a std.testing.fuzz target; added
   safegcd (BLS + secp moduli) and lazy-reduction checks to the montgomery target.
-- [ ] safegcd codegen: generic `safegcd.Modulus(u256, ..)` is ~10% slower in ecrecover than the
-  identical specialized secp256k1/modinv.zig; find the cause (would speed every Fp inverse).
+- [x] safegcd codegen: the generic copy's i318 accumulator was the 10% gap; rounded to whole
+  words, secp256k1 now uses `safegcd.zig` and modinv.zig is deleted.
 - [ ] p256: wider static generator table (window 8, 64 affine entries) for verify.
 - [ ] fuzz campaigns: 30-minute `zig build test --fuzz -Doptimize=ReleaseSafe` runs per crypto
   target when host load allows; commit any reproducer as a regression test.
@@ -259,3 +259,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: bls SSWU (Fp) single exponentiation via sqrt(-Z) trick: map_fp_to_g1 41->34us. Closed keccak single-message item (see backlog).
 - 2026-11-05: modexp large-modulus Montgomery rows unrolled 4-way (small comptime lengths keep fused loops): 2048b full exp 2.60->1.87ms, 4096b 22.3->15.8ms, 256b unchanged.
 - 2026-11-05: p256 verify: safegcd s^-1 (was Fermat), affine Q table via one shared inversion + mixed adds: 50.7->47.7us.
+- 2026-11-05: safegcd Wide rounded to whole words (i318 -> i320); secp256k1 switched to the generic safegcd (ecrecover 28.5us, unchanged) and modinv.zig removed.

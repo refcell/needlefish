@@ -1,5 +1,5 @@
 //! Variable-time modular inversion by the Bernstein-Yang "safegcd" divstep method,
-//! generic over the modulus width (generalized from `secp256k1/modinv.zig`).
+//! generic over the modulus width (used by secp256k1 and `montgomery.Field.inverse`).
 //!
 //! Only for public inputs: the number of outer iterations depends on the value.
 //! Batches of 62 divsteps run on the low 64 bits of (f, g) with a branch-free
@@ -25,7 +25,8 @@ pub fn Modulus(comptime Int: type, comptime modulus: Int) type {
         /// Divsteps are bounded by (49 bits + 57) / 17 (Bernstein-Yang theorem 11.2).
         const batch_count_max = ((49 * bits + 57) / 17 + limb_bits - 1) / limb_bits + 1;
         const Signed62 = [limb_count]i64;
-        const Wide = @Int(.signed, limb_bits * limb_count + 8);
+        // Rounded up to whole words: odd widths (i318) generate much slower code.
+        const Wide = @Int(.signed, (limb_bits * limb_count + 8 + 63) / 64 * 64);
         const m_limbs = to_signed62(modulus);
         /// m^-1 mod 2^62 by Newton iteration.
         const m_inverse_62: u64 = blk: {

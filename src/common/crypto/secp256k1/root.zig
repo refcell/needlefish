@@ -13,13 +13,12 @@ const keccak = @import("../keccak.zig");
 pub const field = @import("field.zig");
 pub const scalar = @import("scalar.zig");
 pub const table = @import("table.zig");
-pub const modinv = @import("modinv.zig");
 pub const point = @import("point.zig");
 
 const Fe = field.Fe;
 const Scalar = scalar.Scalar;
 const Affine = point.Affine;
-const ScalarInverse = modinv.Modulus(scalar.n_int);
+const ScalarInverse = @import("../safegcd.zig").Modulus(u256, scalar.n_int);
 
 /// Uncompressed public key without the 0x04 prefix: x || y, big-endian.
 pub const PublicKey = [64]u8;
