@@ -10,7 +10,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
 - [x] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
-- [ ] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
+- [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [ ] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [ ] Linux CI coverage for io_uring (`just test-linux`).
 - [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
@@ -39,6 +39,11 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   `call.params` (positional cursor: quantity/data/fixed/string/boolean/raw) and
   `call.writer`; `call.fail(code, message)` for typed errors. Batches capped at 100.
   `rpc.Client(IO)` sends one call at a time with optional bearer auth (JWT).
+- CLI: a spec struct is the flag table (`field_name` -> `--field-name`, env
+  `<PREFIX>FIELD_NAME`); precedence flag > env > default; no default and not optional means
+  required. Environment is injected (`cli.Env.from_map(init.environ_map)`).
+- Logging: fixed messages + typed fields, logfmt or JSON, one sink call per line,
+  timestamps from an injected clock (simulated time under DST).
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -55,3 +60,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: rpc: JSON-RPC 2.0 Router (batches, notifications, typed params, error rewind) and Client; fuzzed.
 - 2026-11-05: jwt: HS256 create/verify, +-60s iat window, alg-none rejection, hex secret; fuzzed.
 - 2026-11-05: metrics: atomic Counter/Gauge/Histogram, static Registry, Prometheus text. log: leveled logfmt/JSON Logger with fixed messages, typed fields, injected sink and clock.
+- 2026-11-05: cli: spec-struct flags with env fallback, required/optional, help text; fuzzed.

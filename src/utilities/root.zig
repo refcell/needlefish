@@ -11,6 +11,7 @@ pub const rpc = @import("rpc/root.zig");
 pub const jwt = @import("jwt/root.zig");
 pub const metrics = @import("metrics/root.zig");
 pub const log = @import("log/root.zig");
+pub const cli = @import("cli/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
