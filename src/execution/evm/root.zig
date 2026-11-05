@@ -20,6 +20,7 @@ pub const transaction = @import("transaction.zig");
 pub const op = @import("op.zig");
 pub const native = @import("native.zig");
 pub const eip8130_config = @import("eip8130_config.zig");
+pub const eip8130_auth = @import("eip8130_auth.zig");
 pub const bench = @import("bench.zig");
 pub const state_test = @import("state_test.zig");
 
