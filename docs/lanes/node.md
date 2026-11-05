@@ -83,3 +83,4 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - 2026-11-05: payload attributes, op-geth-parity payload IDs, version/fork validation.
 - 2026-11-05: txpool (fixed-capacity pool, slab, replacement, eviction, select, fuzz).
 - 2026-11-05: chainspec (fork schedule, EIP-1559 + Holocene/Jovian extra data, blob params).
+- 2026-11-05 (crypto lane): cell verification is on main: `crypto.kzg.cells.verify_cell_kzg_proof_batch` with `cells.Settings.init_verifier` (1 ms init, no FK20 tables) and `cells.VerifyStorage(n)` scratch; 128 cells verify in ~12 ms. Once `consensus.Sidecar.verify_kzg` stops returning `CellProofsUnsupported` (see primitives.md note), `txpool.validate.verify_blob_proofs` can drop its accept-unverified branch.
