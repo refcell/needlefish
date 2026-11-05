@@ -26,6 +26,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (~1k), factory (~1k: dispatch, variant address derivation, logic v1), Asset V1/V2/V3
   (~3.5k), Stablecoin V1/V2/V3 (~2.5k), dynamic lookup (`lookup.rs`, 0xb2-prefixed
   addresses, marker-code check from Cobalt). Order: core + factory + Asset V1 first.
+  Files: `native_b20.zig` (core storage at ERC-7201 `base.b20`: name 0, symbol 1, URI 2,
+  supply 3, balances 4, allowances 5, roles 6, role admins 7, admin count 8, packed transfer
+  policy ids 9 (sender/receiver/executor u64 lanes), mint receiver policy 10, paused 11,
+  supply cap 12 (max 2^128-1), permit nonces 13, seize policy ids 14; role/policy/pause ops,
+  metered keccak), `native_b20_asset.zig`, `native_b20_stablecoin.zig`,
+  `native_b20_factory.zig` (0xB20F00..00), lookup of 0xb2 addresses in `native.lookup`.
   and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
   0x01-0x11 and P256VERIFY (0x100).
