@@ -222,10 +222,13 @@ pub const Service = struct {
 
     // ---------------------------------------------------------------- connections
 
-    /// Reserves a pending inbound slot before the handshake; false means refuse.
-    pub fn reserve_inbound(service: *Service, address: ip.Address) bool {
-        for (service.gater.blocked_addresses.slice()) |blocked| {
-            if (std.meta.eql(blocked, address)) return false;
+    /// Reserves a pending inbound slot before the handshake; false means refuse. The
+    /// address is null when the transport does not know it.
+    pub fn reserve_inbound(service: *Service, address: ?ip.Address) bool {
+        if (address) |value| {
+            for (service.gater.blocked_addresses.slice()) |blocked| {
+                if (std.meta.eql(blocked, value)) return false;
+            }
         }
         service.limits.begin(.inbound) catch {
             service.stats.inbound_refused += 1;

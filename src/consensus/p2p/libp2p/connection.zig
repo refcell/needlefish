@@ -1024,6 +1024,12 @@ pub const Connection = struct {
         assert(connection.gossip_tx_length <= capacity);
     }
 
+    /// Free bytes in the outbound gossip queue: `send_gossip` accepts any frame this large.
+    pub fn gossip_send_room(connection: *const Connection) u32 {
+        assert(connection.gossip_tx_length <= connection.gossip_tx.len);
+        return @intCast(connection.gossip_tx.len - connection.gossip_tx_length);
+    }
+
     /// Writes outbound bytes into `output` and returns them. Call until it returns empty.
     pub fn flush(connection: *Connection, output: []u8) []const u8 {
         assert(output.len >= flush_length_min);

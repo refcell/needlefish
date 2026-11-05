@@ -9,6 +9,7 @@ pub const disc = @import("disc/root.zig");
 pub const libp2p = @import("libp2p/root.zig");
 pub const bench = @import("bench.zig");
 pub const service = @import("service.zig");
+pub const transport = @import("transport.zig");
 
 test {
     std.testing.refAllDecls(@This());
