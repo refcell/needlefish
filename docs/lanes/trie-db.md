@@ -72,6 +72,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   FIFO overflow; short transfers resubmitted; read errors retried then zero-filled (checksums
   catch it); write errors retried then panic; fsync failure panics (no retry after fsync
   error); full fsync (F_FULLFSYNC on Darwin); callbacks only from `tick`.
+- Publishing under contention: after a green `zig build test` on base B, a rejected push is
+  retried without re-testing only when B..origin/main touches none of trie/db/evm/common/
+  build.zig/base.zig (tidy still runs); anything else re-tests.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
