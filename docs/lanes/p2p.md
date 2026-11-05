@@ -57,8 +57,10 @@ behind a small interface and switch later.
   latency, loss, and partitions (seeded, `-Dslow-tests` for the big one).
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
-- [ ] Perf: noise transport at 338 MB/s seal+open is std ChaCha20-Poly1305; profile and
-  consider a vectorized ChaCha20 if transport throughput matters at block sizes.
+- [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
+  (8 blocks per pass in column layout, keystream 599 -> 2260 MB/s; std Poly1305).
+- [ ] Perf: Poly1305 (~2 GB/s) now dominates half the AEAD; consider a 2^26-limb NEON
+  Poly1305 or interleaving MAC with keystream generation.
 
 ## Decisions
 - Lives under `src/consensus/p2p/` (matches base/base `crates/consensus/*`), owned by this
@@ -178,3 +180,4 @@ behind a small interface and switch later.
 - 2026-11-05: `gossip` block handler (validate before forward, publish, topic retirement).
 - 2026-11-05: `gossip` v1.2 IDONTWANT.
 - 2026-11-05: `Service` orchestrator with score bans and end-to-end block test.
+- 2026-11-05: vectorized ChaCha20 for noise (2.1x transport throughput).

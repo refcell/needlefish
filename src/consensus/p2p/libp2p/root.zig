@@ -7,6 +7,7 @@ const std = @import("std");
 pub const multistream = @import("multistream.zig");
 pub const protobuf = @import("protobuf.zig");
 pub const identity = @import("identity.zig");
+pub const chacha_poly = @import("chacha_poly.zig");
 pub const noise = @import("noise.zig");
 pub const yamux = @import("yamux.zig");
 pub const identify = @import("identify.zig");

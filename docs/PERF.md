@@ -38,7 +38,7 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | Case | ns/op | MB/s | Notes |
 | --- | ---: | ---: | --- |
 | p2p/noise XX handshake | 757 468 | | ~1 300 handshakes/s per core; secp256k1 sign+verify dominate |
-| p2p/noise transport seal+open 64 KiB | 193 878 | 338 | std ChaCha20-Poly1305 |
+| p2p/noise transport seal+open 64 KiB | 92 351 | 710 | 8-block column ChaCha20 + std Poly1305 (std AEAD: 338 MB/s) |
 | p2p/snappy compress 128 KiB | 77 974 | 1 681 | semi-compressible payload |
 | p2p/snappy decompress 128 KiB | 20 618 | 6 357 | |
 | p2p/gossip rpc decode 128 KiB publish | 21 | | zero-copy: cost is independent of payload size |
