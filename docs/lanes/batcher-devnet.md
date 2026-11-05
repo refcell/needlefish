@@ -72,7 +72,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   the target, keeping the batch that reached it).
 - [x] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
-- [ ] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
+- [x] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
 - [x] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
 - [ ] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
 - [ ] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
@@ -190,3 +190,6 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `--compressed-size-target B`: replaces `target_frames` full frames as the
   channel's compressed target; met through the ratio estimate (we compress once at close),
   so a channel rejects the batch that would cross it instead of keeping it like base/base.
+- 2026-11-05: `--brotli-quality 0-11` (default 9 like base/base). Quality buys match search:
+  1/2/4/8/16-way hash buckets, lazy matching from 5, all covered positions inserted from 10.
+  Text sample: q0 16599 B, q9 12248 B, q11 10262 B. Smoke and sim seed 42 pass.

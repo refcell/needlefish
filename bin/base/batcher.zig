@@ -20,6 +20,7 @@ const usage =
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
     \\         --network-timeout S (0 disables) --compressed-size-target B
+    \\         --brotli-quality 0-11
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
@@ -80,6 +81,7 @@ const Flags = struct {
     network_timeout_ms: u64 = 10 * std.time.ms_per_s,
     /// Compressed bytes a channel aims for before it closes; 0 = one full frame.
     compressed_size_target: u32 = 0,
+    brotli_quality: u4 = batcher.comp.brotli.quality_default,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -191,6 +193,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
                 .input_bytes_max = 4 << 20,
                 .algorithm = flags.compression,
                 .compressed_bytes_target = flags.compressed_size_target,
+                .brotli_quality = flags.brotli_quality,
             },
             .max_channel_duration_l1_blocks = flags.max_channel_duration - flags.sub_safety_margin,
         },
@@ -388,6 +391,10 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
         const seconds = try parse(u64, value, 10);
         if (seconds == 0 or seconds > 3600) return error.InvalidResubmissionTimeout;
         flags.resubmit_after_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--brotli-quality")) {
+        const quality = try parse(u8, value, 10);
+        if (quality > batcher.comp.brotli.quality_max) return error.InvalidBrotliQuality;
+        flags.brotli_quality = @intCast(quality);
     } else if (eql(u8, arg, "--compressed-size-target")) {
         flags.compressed_size_target = try parse(u32, value, 10);
         if (flags.compressed_size_target == 0) return error.InvalidCompressedSizeTarget;
@@ -628,6 +635,11 @@ test "batcher: flags" {
     const size_target = [_][]const u8{ "--compressed-size-target", "4096" };
     const sized = try parse_flags(&size_target);
     try std.testing.expectEqual(@as(u32, 4096), sized.compressed_size_target);
+    const quality = [_][]const u8{ "--brotli-quality", "11" };
+    try std.testing.expectEqual(@as(u4, 11), (try parse_flags(&quality)).brotli_quality);
+    try std.testing.expectEqual(@as(u4, 9), (try parse_flags(&.{})).brotli_quality);
+    const quality_big = [_][]const u8{ "--brotli-quality", "12" };
+    try std.testing.expectError(error.InvalidBrotliQuality, parse_flags(&quality_big));
     const size_zero = [_][]const u8{ "--compressed-size-target", "0" };
     try std.testing.expectError(error.InvalidCompressedSizeTarget, parse_flags(&size_zero));
     const timeout_off = [_][]const u8{ "--network-timeout", "0" };
@@ -668,6 +680,7 @@ const fuzz_flag_names = [_][]const u8{
     "--no-force-blobs-when-throttling",
     "--network-timeout",
     "--compressed-size-target",
+    "--brotli-quality",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 
@@ -675,6 +688,7 @@ const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "call
 fn check_flag_invariants(flags: Flags) !void {
     try std.testing.expect(flags.blobs_per_tx >= 1 and flags.blobs_per_tx <= 6);
     try std.testing.expect(flags.poll_interval_ms > 0);
+    try std.testing.expect(flags.brotli_quality <= batcher.comp.brotli.quality_max);
     try std.testing.expect(flags.network_timeout_ms <= 3600 * std.time.ms_per_s);
     try std.testing.expect(flags.resubmit_after_ms > 0);
     try std.testing.expect(flags.calldata_bytes_max >= 64);

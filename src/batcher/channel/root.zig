@@ -31,6 +31,8 @@ pub const Config = struct {
     /// `target_frames` full frames. Like the frame target it is met through the ratio
     /// estimate, since the channel compresses once at close.
     compressed_bytes_target: u32 = 0,
+    /// Brotli match search effort, 0..=11 (base/base `--brotli-quality`).
+    brotli_quality: u4 = comp.brotli.quality_default,
 
     pub fn validate(config: Config) void {
         assert(config.frame_size_max > Frame.encoded_overhead);
@@ -39,6 +41,7 @@ pub const Config = struct {
         assert(config.compression_ratio_percent >= 1);
         assert(config.compression_ratio_percent <= 100);
         assert(config.input_bytes_max >= 1);
+        assert(config.brotli_quality <= comp.brotli.quality_max);
     }
 
     /// Uncompressed bytes at which the ratio estimate fills `target_frames` frames.
@@ -121,7 +124,7 @@ pub const ChannelOut = struct {
     fn create_brotli(allocator: std.mem.Allocator, config: Config) !*comp.brotli.Encoder {
         const brotli = try allocator.create(comp.brotli.Encoder);
         errdefer allocator.destroy(brotli);
-        brotli.* = try .init(allocator, config.input_bytes_max);
+        brotli.* = try .init_quality(allocator, config.input_bytes_max, config.brotli_quality);
         return brotli;
     }
 
@@ -325,6 +328,7 @@ test "channel: seeded fuzz round trip through consensus channel" {
             .input_bytes_max = 64 * 1024,
             .algorithm = if (round % 2 == 0) .zlib else .brotli,
             .compressed_bytes_target = if (prng.chance(1, 2)) 0 else @intCast(prng.range(1, 8192)),
+            .brotli_quality = @intCast(prng.below(comp.brotli.quality_max + 1)),
         };
         var channel = try ChannelOut.init(testing.allocator, config, @splat(@truncate(round)));
         defer channel.deinit(testing.allocator);

@@ -386,21 +386,67 @@ fn emit_code_length(
     try writer.write(extra, extra_bits);
 }
 
+/// base/base `--brotli-quality` scale (0..=11, default 9). Quality buys match search
+/// effort: candidates kept per hash bucket, lazy matching, and inserting every position
+/// a copy covers. Every quality produces a valid stream; higher ones are just smaller.
+pub const quality_default = 9;
+pub const quality_max = 11;
+const lazy_quality_min = 5;
+const insert_all_quality_min = 10;
+const ways_max = 16;
+
+/// Candidates kept per hash bucket at `quality`.
+pub fn ways_of(quality: u4) u32 {
+    assert(quality <= quality_max);
+    const ways: u32 = switch (quality) {
+        0, 1 => 1,
+        2...4 => 2,
+        5...7 => 4,
+        8, 9 => 8,
+        else => ways_max,
+    };
+    assert(ways >= 1 and ways <= ways_max);
+    return ways;
+}
+
+const Match = struct { length: usize, distance: usize };
+
 pub const Encoder = struct {
+    /// `1 << hash_bits` buckets of `ways` most recent positions each.
     table: []u32,
+    /// Per bucket: insertions so far (wrapping), selecting the slot to overwrite.
+    heads: []u8,
     commands: []Command,
     input_bytes_max: u32,
+    quality: u4,
+    ways: u32,
 
     pub fn init(allocator: std.mem.Allocator, input_bytes_max: u32) !Encoder {
+        return init_quality(allocator, input_bytes_max, quality_default);
+    }
+
+    pub fn init_quality(allocator: std.mem.Allocator, input_bytes_max: u32, quality: u4) !Encoder {
         assert(input_bytes_max <= meta_block_length_max);
-        const table = try allocator.alloc(u32, 1 << hash_bits);
+        assert(quality <= quality_max);
+        const ways = ways_of(quality);
+        const table = try allocator.alloc(u32, (@as(usize, 1) << hash_bits) * ways);
         errdefer allocator.free(table);
+        const heads = try allocator.alloc(u8, @as(usize, 1) << hash_bits);
+        errdefer allocator.free(heads);
         const commands = try allocator.alloc(Command, input_bytes_max / match_length_min + 2);
-        return .{ .table = table, .commands = commands, .input_bytes_max = input_bytes_max };
+        return .{
+            .table = table,
+            .heads = heads,
+            .commands = commands,
+            .input_bytes_max = input_bytes_max,
+            .quality = quality,
+            .ways = ways,
+        };
     }
 
     pub fn deinit(encoder: *Encoder, allocator: std.mem.Allocator) void {
         allocator.free(encoder.table);
+        allocator.free(encoder.heads);
         allocator.free(encoder.commands);
         encoder.* = undefined;
     }
@@ -423,29 +469,46 @@ pub const Encoder = struct {
         return (std.mem.readInt(u32, bytes, .little) *% 0x1e35a7bd) >> (32 - hash_bits);
     }
 
-    /// Greedy LZ77. Every command has a copy except an optional last one carrying the
-    /// trailing literals (its copy is never executed: the meta-block ends first).
+    /// LZ77 over hash buckets: the longest candidate wins (ties: the nearest), and from
+    /// `lazy_quality_min` a match yields to a longer one starting a byte later. Every
+    /// command has a copy except an optional last one carrying the trailing literals (its
+    /// copy is never executed: the meta-block ends first).
     fn find_matches(encoder: *Encoder, input: []const u8) []Command {
         @memset(encoder.table, std.math.maxInt(u32));
+        @memset(encoder.heads, 0);
         var count: usize = 0;
         var literal_start: usize = 0;
         var position: usize = 0;
         while (position + match_length_min <= input.len) {
-            const key = hash(input[position..][0..4]);
-            const candidate = encoder.table[key];
-            encoder.table[key] = @intCast(position);
-            const length = match_length(input, candidate, position);
-            if (length < match_length_min) {
+            const best = encoder.best_match(input, position);
+            encoder.insert(input, position);
+            if (best.length < match_length_min) {
                 position += 1;
                 continue;
             }
+            if (encoder.quality >= lazy_quality_min and
+                position + 1 + match_length_min <= input.len)
+            {
+                const next = encoder.best_match(input, position + 1);
+                if (next.length > best.length + 1) {
+                    position += 1; // Literal now; the longer match is found next round.
+                    continue;
+                }
+            }
             encoder.commands[count] = .{
                 .insert = @intCast(position - literal_start),
-                .copy = @intCast(length),
-                .distance = @intCast(position - candidate),
+                .copy = @intCast(best.length),
+                .distance = @intCast(best.distance),
             };
             count += 1;
-            position += length;
+            const end = position + best.length;
+            if (encoder.quality >= insert_all_quality_min) {
+                var covered = position + 1;
+                while (covered < end and covered + match_length_min <= input.len) : (covered += 1) {
+                    encoder.insert(input, covered);
+                }
+            }
+            position = end;
             literal_start = position;
         }
         // The decoder stops as soon as MLEN bytes are out, so a trailing command exists
@@ -460,6 +523,32 @@ pub const Encoder = struct {
         }
         assert(count <= encoder.commands.len);
         return encoder.commands[0..count];
+    }
+
+    fn insert(encoder: *Encoder, input: []const u8, position: usize) void {
+        assert(position + match_length_min <= input.len);
+        const key = hash(input[position..][0..4]);
+        const slot = encoder.heads[key] % encoder.ways;
+        encoder.table[key * encoder.ways + slot] = @intCast(position);
+        encoder.heads[key] +%= 1;
+    }
+
+    fn best_match(encoder: *const Encoder, input: []const u8, position: usize) Match {
+        assert(position + match_length_min <= input.len);
+        const key = hash(input[position..][0..4]);
+        const bucket = encoder.table[key * encoder.ways ..][0..encoder.ways];
+        var best: Match = .{ .length = 0, .distance = 0 };
+        for (bucket) |candidate| {
+            if (candidate != std.math.maxInt(u32) and candidate >= position) continue;
+            const length = match_length(input, candidate, position);
+            if (length == 0) continue;
+            const distance = position - candidate;
+            if (length > best.length or (length == best.length and distance < best.distance)) {
+                best = .{ .length = length, .distance = distance };
+            }
+        }
+        assert(best.length == 0 or best.distance >= 1);
+        return best;
     }
 
     fn match_length(input: []const u8, candidate: u32, position: usize) usize {
@@ -615,6 +704,44 @@ test "brotli encoder: seeded fuzz over mixed literal and repeat inputs" {
     }
 }
 
+test "brotli encoder: every quality round trips; higher quality is never worse here" {
+    const input = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(input);
+    var prng = Prng.init(0x9a11);
+    // Text with rare edits and back-references at varied distances.
+    for (input, 0..) |*byte, index| {
+        byte.* = "lorem ipsum dolor sit amet, consectetur "[index % 40];
+        if (prng.chance(1, 30)) byte.* = prng.int(u8);
+    }
+    var sizes: [quality_max + 1]usize = undefined;
+    for (0..quality_max + 1) |quality| {
+        var encoder = try Encoder.init_quality(testing.allocator, 1 << 17, @intCast(quality));
+        defer encoder.deinit(testing.allocator);
+        sizes[quality] = try expect_round_trip(&encoder, input);
+    }
+    try testing.expect(sizes[quality_default] <= sizes[0]);
+    try testing.expect(sizes[quality_max] <= sizes[0]);
+    try testing.expectEqual(@as(u32, 8), ways_of(quality_default));
+}
+
+test "brotli encoder: seeded fuzz across qualities" {
+    var prng = Prng.init(0x9a12);
+    var input: [8192]u8 = undefined;
+    for (0..48) |_| {
+        const quality: u4 = @intCast(prng.below(quality_max + 1));
+        var encoder = try Encoder.init_quality(testing.allocator, input.len, quality);
+        defer encoder.deinit(testing.allocator);
+        const length = prng.below(input.len + 1);
+        const alphabet = prng.range(1, 256);
+        for (input[0..length], 0..) |*byte, index| {
+            const repeat = index >= 64 and prng.chance(3, 4);
+            const fresh: u8 = @intCast(prng.below(alphabet));
+            byte.* = if (repeat) input[index - prng.range(1, 64)] else fresh;
+        }
+        _ = try expect_round_trip(&encoder, input[0..length]);
+    }
+}
+
 test "brotli encoder: fuzz" {
     try testing.fuzz({}, fuzz_round_trip, .{});
 }
@@ -622,7 +749,8 @@ test "brotli encoder: fuzz" {
 fn fuzz_round_trip(_: void, smith: *testing.Smith) anyerror!void {
     var buffer: [4096]u8 = undefined;
     const input = buffer[0..smith.slice(&buffer)];
-    var encoder = try Encoder.init(testing.allocator, buffer.len);
+    const quality: u4 = if (input.len > 0) @intCast(input[0] % (quality_max + 1)) else 0;
+    var encoder = try Encoder.init_quality(testing.allocator, buffer.len, quality);
     defer encoder.deinit(testing.allocator);
     _ = try expect_round_trip(&encoder, input);
 }
