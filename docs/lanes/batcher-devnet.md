@@ -239,4 +239,12 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   loses to the older tx; the nonce-only confirmation cannot tell). Gate kept until fixed.
 - [ ] Narrow the sim BUG(batcher) gate: mark txs at contested (reused) nonces and re-post on
   confirmation; stop resetting txs on a repost; then ask dst-fuzz to drop the gate.
+- 2026-11-05: Devnet at native 200 ms blocks (AGENTS.md rule 10, no flashblocks). rollup.json
+  and the L2 genesis activate the Base upgrades through Denim at genesis (`"base"` objects),
+  `block_time`/`blockTime` is the legacy 2 s, and the L2 genesis allocates the BaseTime proxy
+  (code and admin slot from the public base/base dev genesis). devnet.env adds
+  `L2_BLOCK_TIME_MS=200`; smoke polls liveness every 200 ms. Integration fix in the node
+  lane: the EL engine API now serves `engine_getPayloadV5` (Azul/Osaka; the CL calls it).
+  Live: 50 blocks per 10 s, five blocks share each timestamp second, smoke passes, and the
+  batcher keeps safe within ~20 blocks (about 4 s) of unsafe with singular batches.
 

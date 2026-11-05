@@ -19,7 +19,9 @@ pub const Config = struct {
     l1_chain_id: u64 = 900,
     l2_chain_id: u64 = 901,
     l1_block_time_s: u64 = 2,
-    l2_block_time_s: u64 = 1,
+    /// Legacy (pre-Denim) L2 block time, the rollup config's `block_time`. Denim is active
+    /// at genesis, so every devnet L2 block uses the native 200 ms cadence instead.
+    l2_block_time_s: u64 = 2,
     /// Genesis timestamp shared by L1 and L2 (seconds since the Unix epoch).
     genesis_timestamp: u64,
     l1_gas_limit: u64 = 60_000_000,
@@ -59,6 +61,31 @@ fn write_address(w: *Writer, address: Address) Writer.Error!void {
 
 fn write_hash(w: *Writer, hash: [32]u8) Writer.Error!void {
     try w.print("\"0x{x}\"", .{&hash});
+}
+
+/// The BaseTime proxy predeploy (base/base dev genesis, public): Denim blocks need it with
+/// code and the canonical proxy admin; the node installs and links the implementation in
+/// the first Denim block (`ensure_predeploy`), so the implementation slot stays unset.
+pub const base_time_proxy_address = "0x4200000000000000000000000000000000000030";
+const base_time_proxy_hex = @embedFile("base_time_proxy.hex");
+const base_time_admin_slot =
+    "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+const base_time_proxy_admin =
+    "0x0000000000000000000000004200000000000000000000000000000000000018";
+
+comptime {
+    assert(base_time_proxy_hex.len > 0 and base_time_proxy_hex.len % 2 == 0);
+}
+
+fn write_base_time_proxy(w: *Writer) Writer.Error!void {
+    try w.print(",\n    \"{s}\": {{ \"balance\": \"0x0\", \"code\": \"0x{s}\",", .{
+        base_time_proxy_address,
+        std.mem.trimEnd(u8, base_time_proxy_hex, "\n"),
+    });
+    try w.print(" \"storage\": {{ \"{s}\": \"{s}\" }} }}", .{
+        base_time_admin_slot,
+        base_time_proxy_admin,
+    });
 }
 
 fn write_funded_alloc(w: *Writer, config: *const Config) Writer.Error!void {
@@ -137,6 +164,23 @@ const l2_upgrade_keys = [_][]const u8{
     "isthmus",  "jovian",
 };
 
+/// Base upgrades activated at L2 genesis (Denim brings native 200 ms subsecond blocks;
+/// base/base `BaseFeature::SubsecondBlocks`), with each predecessor.
+const base_upgrade_keys = [_][]const u8{ "azul", "beryl", "cobalt", "denim" };
+
+/// Native subsecond L2 block interval once Denim is active (base/base
+/// `NATIVE_SUBSECOND_BLOCK_INTERVAL_MILLIS`).
+pub const l2_block_interval_ms: u64 = 200;
+
+fn write_base_upgrades(w: *Writer, indent: []const u8) Writer.Error!void {
+    try w.print("{s}\"base\": {{ ", .{indent});
+    for (base_upgrade_keys, 0..) |key, index| {
+        const separator = if (index + 1 == base_upgrade_keys.len) " " else ", ";
+        try w.print("\"{s}\": 0{s}", .{ key, separator });
+    }
+    try w.writeAll("},\n");
+}
+
 /// Jovian extraData: version 1 ++ denominator u32 ++ elasticity u32 ++ min base fee u64.
 pub fn l2_extra_data(config: *const Config) [17]u8 {
     var out: [17]u8 = undefined;
@@ -155,6 +199,9 @@ pub fn write_l2_genesis(w: *Writer, config: *const Config) Writer.Error!void {
     try w.writeAll("    \"bedrockBlock\": 0,\n");
     try w.writeAll("    \"shanghaiTime\": 0,\n    \"cancunTime\": 0,\n    \"pragueTime\": 0,\n");
     for (l2_upgrade_keys) |key| try w.print("    \"{s}Time\": 0,\n", .{key});
+    try write_base_upgrades(w, "    ");
+    // Anchors the Denim timestamp schedule on the EL (base/base `blockTime`).
+    try w.print("    \"blockTime\": {d},\n", .{config.l2_block_time_s});
     try w.print(
         \\    "optimism": {{
         \\      "eip1559Elasticity": {d},
@@ -172,6 +219,7 @@ pub fn write_l2_genesis(w: *Writer, config: *const Config) Writer.Error!void {
     try write_header_fields(w, config.genesis_timestamp, config.l2_gas_limit, &extra);
     try w.writeAll("  \"alloc\": {\n");
     try write_funded_alloc(w, config);
+    try write_base_time_proxy(w);
     try w.writeAll("\n  }\n}\n");
 }
 
@@ -205,6 +253,7 @@ pub fn write_rollup_config(
         config.channel_timeout, config.l1_chain_id,         config.l2_chain_id,
     });
     for (l2_upgrade_keys) |key| try w.print("  \"{s}_time\": 0,\n", .{key});
+    try write_base_upgrades(w, "  ");
     try w.writeAll("  \"pectra_blob_schedule_time\": 0,\n");
     try w.writeAll("  \"batch_inbox_address\": ");
     try write_address(w, config.batch_inbox());
@@ -318,10 +367,10 @@ test "genesis: batch inbox follows the 0xff00..chain id convention" {
 
 test "genesis: L1 and L2 genesis are valid JSON with funded accounts" {
     const config: Config = .{ .genesis_timestamp = 1_700_000_000 };
-    var buffer: [16 * 1024]u8 = undefined;
+    var buffer: [32 * 1024]u8 = undefined;
     const cases = .{
         .{ write_l1_genesis, 900, accounts.funded_count + 1 }, // + portal
-        .{ write_l2_genesis, 901, accounts.funded_count },
+        .{ write_l2_genesis, 901, accounts.funded_count + 1 }, // + BaseTime proxy
     };
     inline for (cases) |case| {
         var w: Writer = .fixed(&buffer);
@@ -349,8 +398,69 @@ test "genesis: rollup config is valid JSON with the expected anchors" {
     const l2 = genesis.get("l2").?.object.get("hash").?.string;
     try testing.expect(std.mem.startsWith(u8, l2, "0x2222"));
     try testing.expectEqual(@as(i64, 0), root.get("jovian_time").?.integer);
+    try testing.expectEqual(@as(i64, 0), root.get("base").?.object.get("denim").?.integer);
+    try testing.expectEqual(@as(i64, 2), root.get("block_time").?.integer);
     try testing.expectEqualStrings(
         "0x976ea74026e726554db657fa54763abd0c3a0aa9",
         genesis.get("system_config").?.object.get("batcherAddr").?.string,
     );
+}
+
+const base_time_proxy_bytes: [20]u8 = .{0x42} ++ @as([18]u8, @splat(0)) ++ .{0x30};
+
+fn check_subsecond_schedule(genesis_timestamp: u64, block_number: u64) !void {
+    const rollup_json = @import("../../consensus/protocol/rollup_json.zig");
+    const config: Config = .{ .genesis_timestamp = genesis_timestamp };
+    var buffer: [32 * 1024]u8 = undefined;
+    var rollup_writer: Writer = .fixed(&buffer);
+    const anchor: GenesisAnchor = .{ .l1_hash = @splat(1), .l2_hash = @splat(2) };
+    try write_rollup_config(&rollup_writer, &config, anchor);
+    const rollup = try rollup_json.parse(rollup_writer.buffered());
+    // Denim from genesis: every block, the first included, is 200 ms after its parent.
+    try testing.expectEqual(@as(?u64, 0), rollup.upgrades.get(.denim));
+    const start_ms = genesis_timestamp * 1000;
+    try testing.expectEqual(start_ms, rollup.l2_block_timestamp_ms(0));
+    const expected_ms = start_ms + block_number * l2_block_interval_ms;
+    try testing.expectEqual(expected_ms, rollup.l2_block_timestamp_ms(block_number));
+    // The EL reads the same activation and legacy block time from the L2 genesis.
+    var genesis_writer: Writer = .fixed(&buffer);
+    try write_l2_genesis(&genesis_writer, &config);
+    const parsed = try common_genesis.parse(testing.allocator, genesis_writer.buffered());
+    defer parsed.deinit();
+    const el = parsed.value.config;
+    try testing.expectEqual(@as(?u64, 0), el.base_upgrade_time(.denim));
+    try testing.expectEqual(@as(?u64, 0), el.base_upgrade_time(.azul));
+    try testing.expectEqual(@as(?u64, config.l2_block_time_s), el.block_time);
+    // The BaseTime proxy: code plus the canonical admin, implementation not yet linked.
+    var proxy_found = false;
+    for (parsed.value.accounts) |account| {
+        if (!std.mem.eql(u8, &account.address.bytes, &base_time_proxy_bytes)) continue;
+        proxy_found = true;
+        try testing.expectEqual(base_time_proxy_hex.len / 2, account.code.len);
+        try testing.expectEqual(@as(usize, 1), account.storage.len);
+    }
+    try testing.expect(proxy_found);
+}
+
+test "genesis: Denim at genesis gives 200 ms L2 blocks on both layers" {
+    try check_subsecond_schedule(1_700_000_000, 0);
+    try check_subsecond_schedule(1_700_000_000, 1);
+    try check_subsecond_schedule(1_700_000_000, 5);
+}
+
+test "genesis: seeded fuzz of the subsecond schedule" {
+    var prng = @import("../../testing/prng.zig").Prng.init(0xde1);
+    for (0..16) |_| {
+        const timestamp = prng.range(1, 4_000_000_000);
+        try check_subsecond_schedule(timestamp, prng.below(1_000_000));
+    }
+}
+
+fn fuzz_subsecond_schedule(_: void, smith: *testing.Smith) anyerror!void {
+    const timestamp = smith.valueRangeAtMost(u64, 1, 4_000_000_000);
+    try check_subsecond_schedule(timestamp, smith.valueRangeAtMost(u64, 0, 1_000_000));
+}
+
+test "genesis: fuzz the subsecond schedule" {
+    try testing.fuzz({}, fuzz_subsecond_schedule, .{});
 }

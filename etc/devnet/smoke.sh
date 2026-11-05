@@ -42,8 +42,12 @@ done
 l2_head() { echo $(($(rpc "$SEQ" eth_blockNumber '[]' | field result))); }
 first_l2=$(l2_head)
 l2_advances() { [ "$(l2_head)" -gt "$first_l2" ]; }
-for _ in $(seq 1 $((L2_BLOCK_TIME * 10))); do l2_advances && break; sleep 1; done
-l2_advances || fail "sequencer L2 head stuck at $first_l2 for $((L2_BLOCK_TIME * 10))s: seq-cl" \
+# Denim at genesis: a block every L2_BLOCK_TIME_MS (200 ms). Poll every 200 ms for up to
+# 50 block intervals (10 s), in whole polls so bash needs no fractional arithmetic.
+interval_ms="${L2_BLOCK_TIME_MS:-$((L2_BLOCK_TIME * 1000))}"
+polls=$((interval_ms * 50 / 200))
+for _ in $(seq 1 "$polls"); do l2_advances && break; sleep 0.2; done
+l2_advances || fail "sequencer L2 head stuck at $first_l2 for $((polls / 5))s: seq-cl" \
   "is not building blocks through the engine API (see $DIR/logs/seq-cl.log)"
 ok "sequencer L2 head advancing (block $(l2_head))"
 

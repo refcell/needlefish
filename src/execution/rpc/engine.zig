@@ -89,6 +89,8 @@ const engine_methods = [_]rpc.Method(*EngineApi){
     .{ .name = "engine_getPayloadV2", .handler = get_payload(.v2) },
     .{ .name = "engine_getPayloadV3", .handler = get_payload(.v3) },
     .{ .name = "engine_getPayloadV4", .handler = get_payload(.v4) },
+    // Osaka (L2: Azul); for blob-free L2 payloads the envelope matches V4.
+    .{ .name = "engine_getPayloadV5", .handler = get_payload(.v5) },
 };
 
 fn wrap_eth(comptime handler: *const fn (*eth.Api, *Call) HandlerError!void) fn (

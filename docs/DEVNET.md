@@ -53,7 +53,10 @@ pids to `.devnet/pids/<process>.pid`.
 | L1 chain id | 900 | OP Stack devnet convention |
 | L2 chain id | 901 | OP Stack devnet convention |
 | L1 block time | 2 s | fast feedback, still exercises epochs |
-| L2 block time | 1 s | Base mainnet block time |
+| L2 block time | 200 ms | Base native subsecond blocks: Denim (`SubsecondBlocks`) is active at genesis |
+| Legacy block time | 2 s | rollup `block_time` / genesis `blockTime`; anchors the Denim schedule only |
+| Base upgrades | Azul, Beryl, Cobalt, Denim at 0 | rollup.json and L2 genesis `"base"` objects |
+| BaseTime proxy | `0x4200…0030` in the L2 genesis | Denim blocks need it (base/base dev genesis); the node links the implementation |
 | Batch inbox | `0xff00000000000000000000000000000000000385` | `0xff` ++ zeros ++ L2 chain id (901 = 0x385) |
 | Sequencer window | 3600 L1 blocks | rollup default |
 | Channel timeout | 300 L1 blocks | Granite value |
@@ -129,7 +132,8 @@ Each binary must accept at least the flags below. Lanes may add more.
 
 `just devnet smoke` passes when, within 120 s of `up`:
 
-0. **Liveness.** The sequencer EL head advances within 10 L2 block times; otherwise the
+0. **Liveness.** The sequencer EL head advances within 50 L2 block intervals (10 s at
+   200 ms, polled every 200 ms via `L2_BLOCK_TIME_MS` in `devnet.env`); otherwise the
    smoke fails at once and names the sequencer CL.
 
 1. **Sequencing.** The smoke user sends an L2 transfer to the sequencer EL; it is in
