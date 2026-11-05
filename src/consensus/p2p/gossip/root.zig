@@ -11,6 +11,7 @@ pub const peer_score = @import("peer_score.zig");
 pub const router = @import("router.zig");
 pub const ssz_payload = @import("ssz_payload.zig");
 pub const block = @import("block.zig");
+pub const validity = @import("validity.zig");
 
 test {
     _ = @import("router_test.zig");
