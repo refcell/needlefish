@@ -28,6 +28,7 @@ fn bench_field_mul(comptime F: type) fn (u32) u64 {
         }
     }.run;
 }
+const sha256 = @import("sha256.zig");
 
 pub const Case = struct {
     name: []const u8,
@@ -96,6 +97,52 @@ fn bench_keccak_4k_std(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_sha256_32(iterations: u32) u64 {
+    var data: [32]u8 = @splat(0x5a);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const digest = sha256.sha256(&data);
+        data[0] = digest[0];
+        accumulator +%= digest[31];
+    }
+    return accumulator;
+}
+
+fn bench_sha256_32_std(iterations: u32) u64 {
+    var data: [32]u8 = @splat(0x5a);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&data, &digest, .{});
+        data[0] = digest[0];
+        accumulator +%= digest[31];
+    }
+    return accumulator;
+}
+
+fn bench_sha256_4k(iterations: u32) u64 {
+    var data: [4096]u8 = @splat(0x33);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const digest = sha256.sha256(&data);
+        data[0] = digest[0];
+        accumulator +%= digest[31];
+    }
+    return accumulator;
+}
+
+fn bench_sha256_4k_std(iterations: u32) u64 {
+    var data: [4096]u8 = @splat(0x33);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&data, &digest, .{});
+        data[0] = digest[0];
+        accumulator +%= digest[31];
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
@@ -104,6 +151,10 @@ pub const cases = [_]Case{
     .{ .name = "keccak256/32B batch", .iterations = 2_000_000, .run = bench_keccak_32_batch },
     .{ .name = "keccak256/4KiB", .iterations = 50_000, .run = bench_keccak_4k },
     .{ .name = "keccak256/4KiB (std)", .iterations = 50_000, .run = bench_keccak_4k_std },
+    .{ .name = "sha256/32B", .iterations = 2_000_000, .run = bench_sha256_32 },
+    .{ .name = "sha256/32B (std)", .iterations = 2_000_000, .run = bench_sha256_32_std },
+    .{ .name = "sha256/4KiB", .iterations = 100_000, .run = bench_sha256_4k },
+    .{ .name = "sha256/4KiB (std)", .iterations = 100_000, .run = bench_sha256_4k_std },
 };
 
 /// Runs every case whose name contains `filter` (all when null).
