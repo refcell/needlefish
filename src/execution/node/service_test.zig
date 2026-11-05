@@ -24,7 +24,7 @@ const test_limits: service_module.Limits = .{
         .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
         .code_bytes_max = 1 << 16,
         .codes_max = 64,
-        .undo_entries_max = 1 << 12,
+        .undo_bytes_max = 1 << 20,
     },
     .executor = .{
         .scratch_bytes = 1 << 20,

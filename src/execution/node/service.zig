@@ -84,7 +84,7 @@ pub const Limits = struct {
         },
         .code_bytes_max = 32 << 20,
         .codes_max = 1 << 13,
-        .undo_entries_max = 1 << 17,
+        .undo_bytes_max = 16 << 20,
     },
     /// Devnet-sized EVM bounds (a transaction exceeding one fails like out-of-gas).
     executor: executor_module.Config = .{

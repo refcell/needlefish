@@ -5,7 +5,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
 - [x] `node/chain`: Engine backend (import, forkchoice, reorg via rollback, builder, pool).
-- [x] `node/executor`: L1 block execution over evm + StateDb (deposit txs/L1 fees: pending).
+- [x] `node/executor`: L1 + L2 block execution over evm + StateDb (deposits, L1 fees, DA footprint).
   (evm lane, 2026-11-05: OP support is on main. Set `BlockEnv.op = .{ .upgrade = ... }`, pass
   `TxEnv{ .tx_type = .deposit, .mint, .is_system_transaction }` for 0x7e and
   `TxEnv.envelope` (EIP-2718 bytes) for L1 fees; run `evm.op.apply_transition` for the Canyon
@@ -55,6 +55,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: StateDb now wraps the trie-db lane's `db.State` (flat tables for EVM reads + StateTrie for roots/proofs); commits go through `db.Overlay` into a `db.Changeset`, and the last blocks' encoded changesets sit in a bounded byte ring for rollback (replaces the bespoke undo journal). Step 1 of persistence: the same changesets are what `db.database` journals.
 - 2026-11-05: debug_getRawHeader/Block/Receipts/Transaction; block params accept a bare 32-byte hash (geth BlockNumberOrHash). Decision: the rpc item is complete; every `optimism_*` method op tooling calls (syncStatus, outputAtBlock, rollupConfig, safeHeadAtL1Block, version) is served by the rollup node (consensus lane), and the only EL-side OP method in use, miner_setMaxDASize, is implemented.
 - 2026-11-05: eth_getProof (EIP-1186) from the trie lane's prove_account/prove_storage, head state only (same rule as other state calls), proof buffers carved from the bounded RPC scratch, storage keys capped at 256 per request; keys accepted as up-to-32-byte hex or minimal quantities like geth.
 - 2026-11-05: miner_setMaxDASize (batcher DA throttle) on the HTTP RPC; the L2 builder skips pool txs whose FastLZ-estimated size (base/base estimated_da_size) exceeds the per-tx limit or the cumulative per-block limit; deposits/forced txs are never limited. L2 build+import through the engine covered by a chain test (fixture now takes a spec).

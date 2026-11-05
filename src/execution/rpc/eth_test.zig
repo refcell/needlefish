@@ -139,7 +139,7 @@ test "eth: getProof account and storage proofs verify against the state root" {
     const address_hash = primitives.keccak256(&one).bytes;
     const proven = try trie_proof.verify(head.state_root.bytes, &address_hash, nodes[0..count]);
     try testing.expect(proven != null);
-    const storage_root = h.node.db.trie.storage_root(address_hash);
+    const storage_root = h.node.db.trie().storage_root(address_hash);
     try expect_contains(text, "\"storageHash\"");
     var slot: [32]u8 = @splat(0);
     slot[31] = 7;

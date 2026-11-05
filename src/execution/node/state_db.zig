@@ -1,24 +1,28 @@
-//! In-memory world state for the node: the evm `Database` backend over the trie lane's
-//! `StateTrie`, a fixed-size code store and a 256-entry block hash ring. `commit` folds
-//! one block's journaled evm `State` (dirty accounts, wiped storage, dirty slots, new
-//! code) into the trie and resets the cache for the next block.
+//! World state for the node: the trie-db lane's `db.State` (flat account/storage/code
+//! tables for EVM reads, mirrored into a `StateTrie` for roots and proofs) behind the evm
+//! `Database` interface, plus a 256-entry block hash ring.
 //!
-//! Persistence arrives with the trie-db storage engine; until then the node keeps state
-//! in memory (enough for the devnet).
+//! `commit` folds one block's journaled evm `State` into an `Overlay`, which turns it into
+//! a canonical `Changeset` and applies it. The encoded changesets of the last blocks stay
+//! in a bounded byte ring, so `rollback` can unwind them: a block whose roots do not
+//! match, or a reorg to a recent ancestor. The same changesets are what the durable
+//! database journals.
 //!
-//! Every commit also records an undo journal (previous account and slot values) in a
-//! bounded ring, so the last blocks can be rolled back: a block whose roots do not
-//! match, or a reorg to a recent ancestor.
+//! `put_account`/`put_storage` (genesis and tests) write the tables directly, outside any
+//! block, and are not undoable.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const evm = @import("../evm/root.zig");
 const state_trie = @import("../trie/state_trie.zig");
+const db_module = @import("../db/root.zig");
 
 const Address = evm.primitives.Address;
 const Hash = [32]u8;
 const keccak256 = evm.primitives.keccak256;
-const AccountInfo = evm.state.AccountInfo;
+const State = db_module.State;
+const Overlay = db_module.Overlay;
+const Changeset = db_module.Changeset;
 
 pub const Config = struct {
     trie: state_trie.Config = .{
@@ -26,126 +30,108 @@ pub const Config = struct {
         .account_nodes_max = 1 << 18,
         .storage_nodes_max = 1 << 19,
     },
+    /// Nonzero storage slots held in the flat table.
+    storage_slots_max: u32 = 1 << 18,
     code_bytes_max: u32 = 64 << 20,
     codes_max: u32 = 1 << 14,
-    undo_entries_max: u32 = 1 << 18,
+    /// Accounts, slots and new codes one block may change.
+    block_accounts_max: u32 = 1 << 14,
+    block_slots_max: u32 = 1 << 16,
+    block_codes_max: u32 = 1 << 10,
+    block_code_bytes_max: u32 = 4 << 20,
+    /// Encoded changesets kept for rollback, by bytes and by blocks.
+    undo_bytes_max: u32 = 32 << 20,
+    undo_blocks_max: u32 = 1024,
 };
 
-pub const Error = state_trie.Error || error{ CodeStoreFull, UndoUnavailable };
+pub const Error = db_module.overlay.Error || error{ CodeStoreFull, UndoUnavailable };
 
-const CodeRef = struct { offset: u32, len: u32 };
-
-const Undo = union(enum) {
-    /// First entry of every committed block.
-    block,
-    account: struct { key: Hash, previous: ?state_trie.Account },
-    slot: struct { key: Hash, slot_hash: Hash, previous: u256 },
-};
-const block_hash_window = 256;
+const UndoRecord = struct { offset: u32, len: u32 };
 
 pub const StateDb = struct {
-    trie: state_trie.StateTrie,
-    codes: std.AutoHashMapUnmanaged(Hash, CodeRef),
-    codes_max: u32,
-    code_bytes: []u8,
-    code_len: u32 = 0,
-    block_hashes: [block_hash_window]Hash = undefined,
-    block_numbers: [block_hash_window]?u64 = @splat(null),
-    undo: []Undo,
-    /// Monotonic ring positions: entries `[undo_tail, undo_head)` are live.
-    undo_head: u64 = 0,
-    undo_tail: u64 = 0,
-    /// Committed blocks whose undo entries are complete and still in the ring.
-    undo_blocks: u32 = 0,
-    /// The block being committed lost undo entries (ring overflow or a storage wipe).
-    undo_lost: bool = false,
+    state: State,
+    overlay: Overlay,
+    changeset: Changeset,
+    undo_bytes: []u8,
+    undo_records: []UndoRecord,
+    /// Ring of the newest records: `[undo_tail, undo_tail + undo_count)`.
+    undo_tail: u32 = 0,
+    undo_count: u32 = 0,
+    undo_write: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateDb {
-        assert(config.codes_max > 0);
-        assert(config.code_bytes_max > 0);
-        var trie = try state_trie.StateTrie.init(allocator, config.trie);
-        errdefer trie.deinit(allocator);
-        var codes: std.AutoHashMapUnmanaged(Hash, CodeRef) = .empty;
-        try codes.ensureTotalCapacity(allocator, config.codes_max);
-        errdefer codes.deinit(allocator);
-        const code_bytes = try allocator.alloc(u8, config.code_bytes_max);
-        errdefer allocator.free(code_bytes);
-        assert(config.undo_entries_max > 1);
-        const undo = try allocator.alloc(Undo, config.undo_entries_max);
-        return .{
-            .undo = undo,
-            .trie = trie,
-            .codes = codes,
+        assert(config.codes_max > 0 and config.code_bytes_max > 0);
+        assert(config.undo_blocks_max > 0 and config.undo_bytes_max > 0);
+        var state = try State.init(allocator, .{
+            .accounts_max = config.trie.accounts_max,
+            .storage_slots_max = config.storage_slots_max,
             .codes_max = config.codes_max,
-            .code_bytes = code_bytes,
+            .code_bytes_max = config.code_bytes_max,
+            .account_nodes_max = config.trie.account_nodes_max,
+            .storage_nodes_max = config.trie.storage_nodes_max,
+        });
+        errdefer state.deinit(allocator);
+        // The base pointer is re-aimed at every commit: a StateDb may move until then.
+        var overlay = try Overlay.init(allocator, undefined, .{
+            .accounts_max = config.block_accounts_max,
+            .slots_max = config.block_slots_max,
+            .codes_max = config.block_codes_max,
+        });
+        errdefer overlay.deinit(allocator);
+        var changeset = try Changeset.init(allocator, .{
+            .accounts_max = config.block_accounts_max,
+            .storage_max = config.block_slots_max,
+            .codes_max = config.block_codes_max,
+            .code_bytes_max = config.block_code_bytes_max,
+        });
+        errdefer changeset.deinit(allocator);
+        const undo_bytes = try allocator.alloc(u8, config.undo_bytes_max);
+        errdefer allocator.free(undo_bytes);
+        const undo_records = try allocator.alloc(UndoRecord, config.undo_blocks_max);
+        return .{
+            .state = state,
+            .overlay = overlay,
+            .changeset = changeset,
+            .undo_bytes = undo_bytes,
+            .undo_records = undo_records,
         };
     }
 
     pub fn deinit(db: *StateDb, allocator: std.mem.Allocator) void {
-        allocator.free(db.undo);
-        allocator.free(db.code_bytes);
-        db.codes.deinit(allocator);
-        db.trie.deinit(allocator);
+        allocator.free(db.undo_records);
+        allocator.free(db.undo_bytes);
+        db.changeset.deinit(allocator);
+        db.overlay.deinit(allocator);
+        db.state.deinit(allocator);
         db.* = undefined;
     }
 
+    /// The evm `Database` over committed state. The StateDb must not move while in use.
     pub fn database(db: *StateDb) evm.state.Database {
-        return .{ .context = db, .vtable = &vtable };
+        return db_module.evm_backend.database(&db.state);
     }
 
-    const vtable: evm.state.Database.VTable = .{
-        .basic = basic,
-        .code_by_hash = code_by_hash,
-        .storage = storage,
-        .block_hash = block_hash,
-    };
-
-    fn from(context: *anyopaque) *StateDb {
-        return @ptrCast(@alignCast(context));
-    }
-
-    fn basic(context: *anyopaque, address: Address) evm.state.Error!?AccountInfo {
-        const account = from(context).trie.get_account(keccak256(&address)) orelse return null;
-        return .{
-            .balance = account.balance,
-            .nonce = account.nonce,
-            .code_hash = account.code_hash,
-        };
-    }
-
-    fn code_by_hash(context: *anyopaque, code_hash: Hash) evm.state.Error![]const u8 {
-        return from(context).code(code_hash) orelse error.DatabaseFailure;
-    }
-
-    fn storage(context: *anyopaque, address: Address, slot: u256) evm.state.Error!u256 {
-        return from(context).get_storage(address, slot);
-    }
-
-    fn block_hash(context: *anyopaque, number: u64) evm.state.Error!Hash {
-        const db = from(context);
-        const index = number % block_hash_window;
-        if (db.block_numbers[index] != number) return @splat(0);
-        return db.block_hashes[index];
+    /// The state trie, for proofs and storage roots.
+    pub fn trie(db: *StateDb) *state_trie.StateTrie {
+        return &db.state.state_trie;
     }
 
     pub fn code(db: *const StateDb, code_hash: Hash) ?[]const u8 {
-        if (std.mem.eql(u8, &code_hash, &evm.primitives.keccak_empty)) return &.{};
-        const ref = db.codes.get(code_hash) orelse return null;
-        return db.code_bytes[ref.offset..][0..ref.len];
+        return db.state.code_by_hash(code_hash);
     }
 
     pub fn get_storage(db: *const StateDb, address: Address, slot: u256) u256 {
-        return db.trie.get_storage(keccak256(&address), slot_key(slot));
+        return db.state.storage(address, slot);
     }
 
     pub fn get_account(db: *const StateDb, address: Address) ?state_trie.Account {
-        return db.trie.get_account(keccak256(&address));
+        const info = db.state.basic(address) orelse return null;
+        return .{ .nonce = info.nonce, .balance = info.balance, .code_hash = info.code_hash };
     }
 
     /// Records a canonical block hash for BLOCKHASH (last 256 blocks).
     pub fn set_block_hash(db: *StateDb, number: u64, hash: Hash) void {
-        db.block_numbers[number % block_hash_window] = number;
-        db.block_hashes[number % block_hash_window] = hash;
+        db.state.set_block_hash(number, hash);
     }
 
     /// Genesis allocation: create or replace an account, storing its code.
@@ -156,154 +142,124 @@ pub const StateDb = struct {
         nonce: u64,
         bytes: []const u8,
     ) Error!void {
-        const code_hash = try db.store_code(bytes);
-        try db.trie.set_account(keccak256(&address), .{
+        const stored = db.state.insert_code(bytes) catch return error.CodeStoreFull;
+        const code_hash = if (bytes.len == 0) evm.primitives.keccak_empty else stored.hash;
+        const info: db_module.AccountInfo = .{
+            .nonce = nonce,
+            .balance = balance,
+            .code_hash = code_hash,
+        };
+        const table = &db.state.account_table;
+        if (!table.contains(address) and table.count() == db.state.config.accounts_max) {
+            return error.StateFull;
+        }
+        table.putAssumeCapacity(address, info);
+        try db.state.state_trie.set_account(keccak256(&address), .{
             .nonce = nonce,
             .balance = balance,
             .code_hash = code_hash,
         });
     }
 
+    /// Genesis storage of an existing account.
     pub fn put_storage(db: *StateDb, address: Address, slot: u256, value: u256) Error!void {
-        try db.trie.set_storage(keccak256(&address), slot_key(slot), value);
+        assert(db.state.account_table.contains(address));
+        const key: db_module.state.SlotKey = .{ .address = address, .slot = slot };
+        const table = &db.state.storage_table;
+        if (value == 0) {
+            _ = table.remove(key);
+        } else {
+            if (!table.contains(key) and table.count() == db.state.config.storage_slots_max) {
+                return error.StateFull;
+            }
+            table.putAssumeCapacity(key, value);
+        }
+        try db.state.state_trie.set_storage(keccak256(&address), slot_key(slot), value);
     }
 
     pub fn root(db: *StateDb) Error!Hash {
-        return db.trie.root();
-    }
-
-    fn store_code(db: *StateDb, bytes: []const u8) Error!Hash {
-        if (bytes.len == 0) return evm.primitives.keccak_empty;
-        const code_hash = keccak256(bytes);
-        if (db.codes.contains(code_hash)) return code_hash;
-        if (db.codes.count() == db.codes_max) return error.CodeStoreFull;
-        if (bytes.len > db.code_bytes.len - db.code_len) return error.CodeStoreFull;
-        @memcpy(db.code_bytes[db.code_len..][0..bytes.len], bytes);
-        const ref: CodeRef = .{ .offset = db.code_len, .len = @intCast(bytes.len) };
-        db.codes.putAssumeCapacityNoClobber(code_hash, ref);
-        db.code_len += @intCast(bytes.len);
-        return code_hash;
+        return db.state.state_root();
     }
 
     /// Applies every change cached in `state` during a block, then empties the cache.
-    pub fn commit(db: *StateDb, state: *evm.State) Error!void {
-        db.undo_begin_block();
-        var accounts = state.accounts.valueIterator();
-        while (accounts.next()) |account| {
-            if (!account.dirty) continue;
-            const key = keccak256(&account.address);
-            db.undo_push(.{ .account = .{ .key = key, .previous = db.trie.get_account(key) } });
-            if (!account.in_database) {
-                try db.trie.delete_account(key);
-                continue;
-            }
-            if (account.info.has_code() and !db.codes.contains(account.info.code_hash)) {
-                // New code is always cached on the account (set during this block).
-                const stored = try db.store_code(account.info.code.?);
-                assert(std.mem.eql(u8, &stored, &account.info.code_hash));
-            }
-            try db.trie.set_account(key, .{
-                .nonce = account.info.nonce,
-                .balance = account.info.balance,
-                .code_hash = account.info.code_hash,
-            });
-            if (account.storage_cleared) {
-                const had_storage = !std.mem.eql(u8, &db.trie.storage_root(key), &empty_root);
-                if (had_storage) db.undo_lost = true;
-                try db.trie.wipe_storage(key);
-            }
-        }
-        try db.commit_slots(state);
-        db.undo_end_block();
-        state.accounts.clearRetainingCapacity();
-        state.slots.clearRetainingCapacity();
-        state.code_store_len = 0;
+    pub fn commit(db: *StateDb, evm_state: *evm.State) Error!void {
+        db.overlay.base = &db.state;
+        assert(db.overlay.accounts.count() == 0);
+        errdefer db.overlay.discard();
+        try db_module.evm_backend.commit_evm(evm_state, &db.overlay);
+        _ = try db.overlay.commit(&db.changeset);
+        db.undo_push();
+        evm_state.accounts.clearRetainingCapacity();
+        evm_state.slots.clearRetainingCapacity();
+        evm_state.code_store_len = 0;
     }
 
-    fn undo_begin_block(db: *StateDb) void {
-        db.undo_lost = false;
-        db.undo_push(.block);
-    }
-
-    fn undo_end_block(db: *StateDb) void {
-        if (db.undo_lost) {
-            // A block without full undo cannot be reverted, nor can anything before it.
-            db.undo_tail = db.undo_head;
-            db.undo_blocks = 0;
-        } else {
-            db.undo_blocks += 1;
-        }
-        assert(db.undo_head - db.undo_tail <= db.undo.len);
-    }
-
-    fn undo_push(db: *StateDb, entry: Undo) void {
-        if (db.undo_lost) return;
-        if (db.undo_head - db.undo_tail == db.undo.len) db.undo_evict_oldest();
-        if (db.undo_lost) return;
-        db.undo[db.undo_head % db.undo.len] = entry;
-        db.undo_head += 1;
-    }
-
-    /// Drops the oldest committed block's entries; marks loss if only the current is left.
-    fn undo_evict_oldest(db: *StateDb) void {
-        if (db.undo_blocks == 0) {
-            db.undo_lost = true;
+    /// Saves the encoded changeset just applied; evicts the oldest records for room. A
+    /// changeset larger than the ring drops all undo history.
+    fn undo_push(db: *StateDb) void {
+        const size = db.changeset.encoded_length();
+        const capacity: u32 = @intCast(db.undo_bytes.len);
+        if (size > capacity) {
+            db.undo_count = 0;
+            db.undo_write = 0;
             return;
         }
-        assert(db.undo[db.undo_tail % db.undo.len] == .block);
-        db.undo_tail += 1;
-        while (db.undo[db.undo_tail % db.undo.len] != .block) db.undo_tail += 1;
-        db.undo_blocks -= 1;
-        assert(db.undo_tail < db.undo_head);
+        const len: u32 = @intCast(size);
+        if (db.undo_write + len > capacity) db.undo_write = 0;
+        // FIFO eviction until no live record overlaps the target range (bounded by the
+        // record count).
+        while (db.undo_count > 0) {
+            const full = db.undo_count == db.undo_records.len;
+            if (!full and !db.undo_overlaps(db.undo_write, len)) break;
+            db.undo_tail = (db.undo_tail + 1) % @as(u32, @intCast(db.undo_records.len));
+            db.undo_count -= 1;
+        }
+        const encoded = db.changeset.encode(db.undo_bytes[db.undo_write..][0..len]);
+        assert(encoded.len == len);
+        const slot = (db.undo_tail + db.undo_count) % @as(u32, @intCast(db.undo_records.len));
+        db.undo_records[slot] = .{ .offset = db.undo_write, .len = len };
+        db.undo_count += 1;
+        db.undo_write += len;
+        assert(db.undo_count <= db.undo_records.len);
+    }
+
+    fn undo_overlaps(db: *const StateDb, offset: u32, len: u32) bool {
+        const records: u32 = @intCast(db.undo_records.len);
+        for (0..db.undo_count) |index| {
+            const record = db.undo_records[(db.undo_tail + @as(u32, @intCast(index))) % records];
+            if (record.offset < offset + len and offset < record.offset + record.len) return true;
+        }
+        return false;
     }
 
     /// How many of the most recent commits `rollback` can revert.
     pub fn undo_depth(db: *const StateDb) u32 {
-        return db.undo_blocks;
+        return db.undo_count;
+    }
+
+    /// The changeset of the most recent commit `rollback` can revert (for the journal).
+    pub fn last_changeset(db: *const StateDb) ?[]const u8 {
+        if (db.undo_count == 0) return null;
+        const record = db.undo_records[db.newest_index()];
+        return db.undo_bytes[record.offset..][0..record.len];
+    }
+
+    fn newest_index(db: *const StateDb) u32 {
+        assert(db.undo_count > 0);
+        const records: u32 = @intCast(db.undo_records.len);
+        return (db.undo_tail + db.undo_count - 1) % records;
     }
 
     /// Reverts the most recent committed block.
     pub fn rollback(db: *StateDb) Error!void {
-        if (db.undo_blocks == 0) return error.UndoUnavailable;
-        assert(db.undo_head > db.undo_tail);
-        while (true) {
-            db.undo_head -= 1;
-            switch (db.undo[db.undo_head % db.undo.len]) {
-                .block => break,
-                .slot => |slot| try db.trie.set_storage(slot.key, slot.slot_hash, slot.previous),
-                .account => |account| if (account.previous) |previous| {
-                    try db.trie.set_account(account.key, previous);
-                } else {
-                    try db.trie.delete_account(account.key);
-                },
-            }
-            assert(db.undo_head > db.undo_tail);
-        }
-        db.undo_blocks -= 1;
-    }
-
-    fn commit_slots(db: *StateDb, state: *evm.State) Error!void {
-        var slots = state.slots.iterator();
-        while (slots.next()) |kv| {
-            if (!kv.value_ptr.dirty) continue;
-            const account = state.accounts.getPtr(kv.key_ptr.address) orelse continue;
-            if (!account.in_database) continue;
-            // Writes from before a storage wipe belong to a dead incarnation.
-            if (kv.value_ptr.epoch != account.storage_epoch) continue;
-            const key = keccak256(&kv.key_ptr.address);
-            const slot_hash = slot_key(kv.key_ptr.slot);
-            const previous = db.trie.get_storage(key, slot_hash);
-            db.undo_push(.{ .slot = .{
-                .key = key,
-                .slot_hash = slot_hash,
-                .previous = previous,
-            } });
-            try db.trie.set_storage(key, slot_hash, kv.value_ptr.present);
-        }
+        if (db.undo_count == 0) return error.UndoUnavailable;
+        const record = db.undo_records[db.newest_index()];
+        db.changeset.decode(db.undo_bytes[record.offset..][0..record.len]) catch unreachable;
+        try db.state.unwind(&db.changeset);
+        db.undo_count -= 1;
+        db.undo_write = record.offset;
     }
 };
-
-const empty_root = @import("../trie/node.zig").empty_root;
 
 fn slot_key(slot: u256) Hash {
     var bytes: [32]u8 = undefined;
@@ -316,8 +272,15 @@ const testing = std.testing;
 fn small_config() Config {
     return .{
         .trie = .{ .accounts_max = 64, .account_nodes_max = 512, .storage_nodes_max = 512 },
+        .storage_slots_max = 256,
         .code_bytes_max = 4096,
         .codes_max = 16,
+        .block_accounts_max = 64,
+        .block_slots_max = 256,
+        .block_codes_max = 16,
+        .block_code_bytes_max = 4096,
+        .undo_bytes_max = 1 << 16,
+        .undo_blocks_max = 64,
     };
 }
 
@@ -409,7 +372,8 @@ fn random_block(prng: *Prng, db: *StateDb, state: *evm.State) !void {
 
 fn rollback_scenario(prng: *Prng) !void {
     var config = small_config();
-    config.undo_entries_max = 64;
+    config.undo_bytes_max = 2048;
+    config.undo_blocks_max = 8;
     var db = try StateDb.init(testing.allocator, config);
     defer db.deinit(testing.allocator);
     var state = try evm.State.init(testing.allocator, db.database(), small_limits);

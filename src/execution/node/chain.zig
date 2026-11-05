@@ -384,7 +384,7 @@ pub const Chain = struct {
             }
         } else if (chain.spec.is_upgrade_active(.isthmus, child.timestamp)) {
             const key = primitives.keccak256(&l2_to_l1_message_passer).bytes;
-            const root = chain.db.trie.storage_root(key);
+            const root = chain.db.trie().storage_root(key);
             if (!std.mem.eql(u8, &child.withdrawals_root.?.bytes, &root)) {
                 return "withdrawals root mismatch";
             }
@@ -668,7 +668,7 @@ pub const Chain = struct {
             } else {
                 child.requests_hash = consensus.block.empty_requests_hash;
                 const key = primitives.keccak256(&l2_to_l1_message_passer).bytes;
-                child.withdrawals_root = .{ .bytes = chain.db.trie.storage_root(key) };
+                child.withdrawals_root = .{ .bytes = chain.db.trie().storage_root(key) };
             }
         }
         assert(child.optionals_contiguous());

@@ -53,7 +53,7 @@ pub const Node = struct {
             .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
             .code_bytes_max = 1 << 16,
             .codes_max = 64,
-            .undo_entries_max = 1 << 12,
+            .undo_bytes_max = 1 << 20,
         });
         for (0..senders) |i| {
             try node.db.put_account(address_of(@intCast(i + 1)).bytes, eth, 0, &.{});

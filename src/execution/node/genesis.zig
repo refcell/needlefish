@@ -18,7 +18,7 @@ pub fn load(
     db: *StateDb,
     parsed: *const genesis.Genesis,
 ) Error!consensus.Header {
-    assert(db.trie.account_count() == 0);
+    assert(db.trie().account_count() == 0);
     for (parsed.accounts) |*account| {
         try db.put_account(account.address.bytes, account.balance, account.nonce, account.code);
         for (account.storage) |slot| {
@@ -50,7 +50,7 @@ fn load_and_hash(text: []const u8) ![32]u8 {
         },
         .code_bytes_max = 1 << 18,
         .codes_max = 64,
-        .undo_entries_max = 16,
+        .undo_bytes_max = 1 << 16,
     });
     defer db.deinit(testing.allocator);
     const header = try load(testing.allocator, &db, &parsed.value);

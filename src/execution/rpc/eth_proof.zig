@@ -36,7 +36,7 @@ pub fn get_proof(api: *eth.Api, call: *Call) HandlerError!void {
     };
     const db = api.chain.db;
     const address_hash = primitives.keccak256(&address).bytes;
-    db.trie.prove_account(address_hash, &scratch.account) catch {
+    db.trie().prove_account(address_hash, &scratch.account) catch {
         return call.fail(rpc.code.internal_error, "state unavailable");
     };
     const account = db.get_account(address) orelse state_trie.Account{};
@@ -53,11 +53,11 @@ pub fn get_proof(api: *eth.Api, call: *Call) HandlerError!void {
     try w.key("nonce");
     try w.quantity(account.nonce);
     try w.key("storageHash");
-    try w.data(&db.trie.storage_root(address_hash));
+    try w.data(&db.trie().storage_root(address_hash));
     try w.key("storageProof");
     try w.begin_array();
     for (keys[0..keys_count]) |slot| {
-        db.trie.prove_storage(address_hash, primitives.keccak256(&slot).bytes, &scratch.storage);
+        db.trie().prove_storage(address_hash, primitives.keccak256(&slot).bytes, &scratch.storage);
         try w.begin_object();
         try w.key("key");
         try w.data(&slot);
