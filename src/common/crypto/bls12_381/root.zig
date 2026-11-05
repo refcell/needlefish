@@ -18,6 +18,8 @@ pub const G2 = g2.G2;
 pub const G2Affine = g2.Affine;
 pub const pairing = @import("pairing.zig");
 pub const map = @import("map.zig");
+pub const msm = @import("msm.zig");
+pub const precompile = @import("precompile.zig");
 
 test {
     std.testing.refAllDecls(@This());

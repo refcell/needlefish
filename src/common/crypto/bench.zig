@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 const keccak = @import("keccak.zig");
 const secp256k1 = @import("secp256k1/root.zig");
 const montgomery = @import("montgomery.zig");
+const bls_bench = @import("bls12_381/bench.zig");
 const modexp = @import("modexp.zig");
 const p256 = @import("p256.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
@@ -373,6 +374,12 @@ fn bench_verify_std(iterations: u32) u64 {
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
+    .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },
+    .{ .name = "bls12-381/g1 mul", .iterations = 5_000, .run = bls_bench.g1_mul },
+    .{ .name = "bls12-381/g2 mul", .iterations = 2_000, .run = bls_bench.g2_mul },
+    .{ .name = "bls12-381/pairing-2", .iterations = 500, .run = bls_bench.pairing_2 },
+    .{ .name = "bls12-381/map_fp_to_g1", .iterations = 5_000, .run = bls_bench.map_fp_to_g1 },
+    .{ .name = "bls12-381/g1 msm-64", .iterations = 200, .run = bls_bench.g1_msm_64 },
     .{ .name = "modexp/256b full exp", .iterations = 20_000, .run = bench_modexp(32, 32, false) },
     .{ .name = "modexp/2048b e=65537", .iterations = 2_000, .run = bench_modexp(256, 3, false) },
     .{ .name = "modexp/2048b full exp", .iterations = 20, .run = bench_modexp(256, 256, false) },
