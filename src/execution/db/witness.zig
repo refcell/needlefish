@@ -5,7 +5,9 @@
 //! - `state`: deduplicated RLP preimages of the pre-state trie nodes the block needs,
 //! - `codes`: bytecodes read,
 //! - `keys`: preimages of touched keys (20-byte addresses, 32-byte slot keys),
-//! - `headers`: RLP headers of ancestors read by BLOCKHASH (opaque bytes from the caller).
+//! - `headers`: RLP headers of ancestors read by BLOCKHASH, oldest first, ending at the
+//!   parent. A verifier links them to the parent it trusts (`SparseState.reset`): each is
+//!   the child of the previous one and the last is the parent (reth stateless validation).
 //!
 //! Flow: execute the block over `Recorder` (wraps the evm `Database`, records every account,
 //! slot, code hash, and block number read), build the block's `Changeset`, then
@@ -41,7 +43,7 @@ pub const Address = state_module.Address;
 pub const Hash = state_module.Hash;
 pub const AccountInfo = state_module.AccountInfo;
 
-pub const Error = error{ WitnessFull, KeysFull, UnknownCode } || sparse.Error;
+pub const Error = error{ WitnessFull, KeysFull, UnknownCode, InvalidHeaderChain } || sparse.Error;
 
 /// A bounded list of byte strings in one arena. The arena and ends are reserved at init and
 /// committed on first touch (`lazy_alloc`), so an idle list costs no resident memory.
@@ -378,19 +380,61 @@ pub const NodeStore = struct {
     }
 };
 
-/// The block number of an RLP header (field 8 of the header list).
-pub fn header_number(header: []const u8) error{InvalidWitness}!u64 {
+/// The fields of an RLP header a stateless verifier links ancestors by.
+pub const HeaderLink = struct { parent_hash: Hash, state_root: Hash, number: u64 };
+
+const header_items_max = 32;
+
+/// Decodes the header list strictly: one list spanning all of `header`, at least 9 fields.
+fn header_items(
+    header: []const u8,
+    items: *[header_items_max]rlp.Item,
+) error{InvalidWitness}!u32 {
     const outer = rlp.decode_item(header) catch return error.InvalidWitness;
     if (outer.kind != .list or outer.encoded_length != header.len) return error.InvalidWitness;
-    var items: [32]rlp.Item = undefined;
-    const count = rlp.decode_list(outer.payload, &items) catch return error.InvalidWitness;
+    const count = rlp.decode_list(outer.payload, items) catch return error.InvalidWitness;
     if (count < 9) return error.InvalidWitness;
-    const item = items[8];
+    assert(count <= header_items_max);
+    return count;
+}
+
+/// A canonical RLP integer of at most 8 bytes (no leading zero).
+fn header_integer(item: rlp.Item) error{InvalidWitness}!u64 {
     if (item.kind != .string or item.payload.len > 8) return error.InvalidWitness;
     if (item.payload.len > 0 and item.payload[0] == 0) return error.InvalidWitness;
     var number: u64 = 0;
     for (item.payload) |byte| number = (number << 8) | byte;
     return number;
+}
+
+fn header_hash(item: rlp.Item) error{InvalidWitness}!Hash {
+    if (item.kind != .string or item.payload.len != 32) return error.InvalidWitness;
+    return item.payload[0..32].*;
+}
+
+/// The block number of an RLP header (field 8 of the header list).
+pub fn header_number(header: []const u8) error{InvalidWitness}!u64 {
+    var items: [header_items_max]rlp.Item = undefined;
+    _ = try header_items(header, &items);
+    return header_integer(items[8]);
+}
+
+/// Parent hash (field 0), state root (field 3), and number (field 8) of an RLP header.
+/// Strict: both hashes are 32-byte strings, the number a canonical integer.
+pub fn header_link(header: []const u8) error{InvalidWitness}!HeaderLink {
+    var items: [header_items_max]rlp.Item = undefined;
+    const count = try header_items(header, &items);
+    assert(count >= 9);
+    return .{
+        .parent_hash = try header_hash(items[0]),
+        .state_root = try header_hash(items[3]),
+        .number = try header_integer(items[8]),
+    };
+}
+
+/// The parent hash of an RLP header (field 0 of the header list), decoded strictly.
+pub fn header_parent_hash(header: []const u8) error{InvalidWitness}!Hash {
+    return (try header_link(header)).parent_hash;
 }
 
 fn slot_hash_of(slot: u256) Hash {
@@ -405,8 +449,12 @@ fn address_order(a: *const Address, b: *const Address) std.math.Order {
 
 const HeaderEntry = struct { number: u64, hash: Hash };
 
-/// A stateless state provider backed only by a witness.
+/// A stateless state provider backed only by a witness, bound to the parent of the block it
+/// verifies: BLOCKHASH is served only from a header chain that ends at that parent.
 pub const SparseState = struct {
+    /// The parent of the block being verified, trusted by the caller.
+    pub const Parent = struct { number: u64, hash: Hash };
+
     pub const Config = struct {
         nodes_max: u32,
         node_bytes_max: u32,
@@ -422,8 +470,16 @@ pub const SparseState = struct {
     /// Heap-allocated: the trie's resolver points at it.
     nodes: *NodeStore,
     codes: NodeStore,
+    /// Ancestors, oldest first, each the child of the previous one.
     headers: []HeaderEntry,
     headers_len: u32 = 0,
+    /// The state root in the last header added (the parent's, once verified).
+    headers_tail_state_root: Hash = @splat(0),
+    /// Set by `verify_headers`; `block_hash` serves nothing before.
+    headers_verified: bool = false,
+    /// Null only for the builder's scratch, which never serves BLOCKHASH.
+    parent: ?Parent = null,
+    pre_state_root: Hash = @splat(0),
     trie: sparse.SparseTrie,
     account_root: sparse.NodeIndex = sparse.none,
     /// Storage trie roots by address hash, opened on first use from the account leaf.
@@ -480,11 +536,23 @@ pub const SparseState = struct {
         self.* = undefined;
     }
 
-    /// Forgets the witness and every update; the state is `pre_state_root`, all unknown.
-    pub fn reset(self: *SparseState, pre_state_root: Hash) void {
+    /// Forgets the witness and every update; the state is `pre_state_root`, all unknown, and
+    /// headers must end at `parent` (whose state root must be `pre_state_root`).
+    pub fn reset(self: *SparseState, pre_state_root: Hash, parent: Parent) void {
+        self.clear(pre_state_root);
+        self.parent = parent;
+        assert(self.parent != null and !self.headers_verified);
+    }
+
+    /// As `reset`, unbound: no header chain verifies (the builder's scratch).
+    fn clear(self: *SparseState, pre_state_root: Hash) void {
         self.nodes.clear();
         self.codes.clear();
         self.headers_len = 0;
+        self.headers_tail_state_root = @splat(0);
+        self.headers_verified = false;
+        self.parent = null;
+        self.pre_state_root = pre_state_root;
         self.trie.clear();
         self.storage_roots.clearRetainingCapacity();
         self.incomplete = false;
@@ -513,22 +581,56 @@ pub const SparseState = struct {
         _ = try self.codes.add(code);
     }
 
+    /// Appends the next ancestor header, oldest first: it must be the child of the previous
+    /// one (number + 1, parent hash = keccak256 of the previous header). Nothing is served
+    /// until `verify_headers` links the last one to the parent.
     pub fn add_header(self: *SparseState, header: []const u8) Error!void {
+        if (self.headers_verified) return error.InvalidHeaderChain;
+        const link = try header_link(header);
+        if (self.headers_len > 0) {
+            const previous = &self.headers[self.headers_len - 1];
+            if (previous.number == std.math.maxInt(u64)) return error.InvalidHeaderChain;
+            if (link.number != previous.number + 1) return error.InvalidHeaderChain;
+            if (!std.mem.eql(u8, &link.parent_hash, &previous.hash)) {
+                return error.InvalidHeaderChain;
+            }
+        }
         if (self.headers_len == self.headers.len) return error.WitnessFull;
-        self.headers[self.headers_len] = .{
-            .number = try header_number(header),
-            .hash = node.keccak256(header),
-        };
+        const hash = node.keccak256(header);
+        self.headers[self.headers_len] = .{ .number = link.number, .hash = hash };
         self.headers_len += 1;
+        self.headers_tail_state_root = link.state_root;
+        assert(self.headers[self.headers_len - 1].number == link.number);
     }
 
-    /// Loads every part of `witness`. `keys` are not needed: reads come with their keys.
+    /// Links the header chain to the bound parent: the last header is the parent (number and
+    /// hash) and holds the pre-state root. An empty chain verifies and serves no BLOCKHASH.
+    pub fn verify_headers(self: *SparseState) error{InvalidHeaderChain}!void {
+        if (self.headers_verified) return;
+        const parent = self.parent orelse return error.InvalidHeaderChain;
+        if (self.headers_len > 0) {
+            const tail = &self.headers[self.headers_len - 1];
+            if (tail.number != parent.number) return error.InvalidHeaderChain;
+            if (!std.mem.eql(u8, &tail.hash, &parent.hash)) return error.InvalidHeaderChain;
+            if (!std.mem.eql(u8, &self.headers_tail_state_root, &self.pre_state_root)) {
+                return error.InvalidHeaderChain;
+            }
+            // Contiguous numbers ending at the parent: the first is at least 0.
+            assert(self.headers[0].number == parent.number - (self.headers_len - 1));
+        }
+        self.headers_verified = true;
+    }
+
+    /// Loads every part of `witness` and verifies its headers against the bound parent.
+    /// `keys` are not needed: reads come with their keys.
     pub fn load(self: *SparseState, witness: *const Witness) Error!void {
         for (0..witness.state.count) |index| try self.add_node(witness.state.get(@intCast(index)));
         for (0..witness.codes.count) |index| try self.add_code(witness.codes.get(@intCast(index)));
         for (0..witness.headers.count) |index| {
             try self.add_header(witness.headers.get(@intCast(index)));
         }
+        try self.verify_headers();
+        assert(self.headers_len == witness.headers.count);
     }
 
     fn account_state(self: *SparseState, address_hash: *const Hash) Error!?history.AccountState {
@@ -569,10 +671,18 @@ pub const SparseState = struct {
         return fallback.code(fallback.context, &hash) orelse error.WitnessIncomplete;
     }
 
+    /// The hash of ancestor `number` from a verified chain that covers it, else the trusted
+    /// fallback (never unverified witness headers).
     pub fn block_hash(self: *const SparseState, number: u64) ?Hash {
-        for (self.headers[0..self.headers_len]) |entry| {
-            if (entry.number == number) return entry.hash;
+        if (self.headers_verified and self.headers_len > 0) {
+            const first = self.headers[0].number;
+            if (number >= first and number - first < self.headers_len) {
+                const entry = &self.headers[@intCast(number - first)];
+                assert(entry.number == number);
+                return entry.hash;
+            }
         }
+        // A caller-installed fallback is trusted (it is the node's own chain, not witness data).
         const fallback = self.fallback orelse return null;
         return fallback.block_hash(fallback.context, number);
     }
@@ -910,7 +1020,7 @@ pub const Builder = struct {
         for (changeset.storage_changes()) |*change| {
             try self.touched.add_slot(change.address, change.slot);
         }
-        self.scratch.reset(pre_root);
+        self.scratch.clear(pre_root);
         try self.collect_proofs(source);
         try self.collect_siblings(source, changeset);
         try replay(&self.scratch, reads, changeset);

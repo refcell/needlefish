@@ -25,6 +25,7 @@ const changeset_module = @import("changeset.zig");
 const evm_backend = @import("evm_backend.zig");
 const witness = @import("witness.zig");
 const witness_block = @import("witness_block.zig");
+const header_chain = @import("witness_header_chain.zig");
 const evm_test = @import("witness_evm_test.zig");
 const witness_codec = @import("witness_codec.zig");
 const history = @import("history.zig");
@@ -146,14 +147,6 @@ fn address_of(index: u8) Address {
     return address;
 }
 
-/// `rlp([salt, 1, 1, 1, 1, 1, 1, 1, number])`: header-shaped, number at field 8 (< 128);
-/// `salt` tells sibling blocks of one number apart.
-fn header_of(number: u8, salt: u8) [10]u8 {
-    assert(number < 0x80);
-    assert(salt > 0 and salt < 0x80);
-    return .{ 0xc9, salt, 1, 1, 1, 1, 1, 1, 1, if (number == 0) 0x80 else number };
-}
-
 fn write_word(buffer: []u8, word_index: u32, value: u256) void {
     std.mem.writeInt(u256, buffer[word_index * 32 ..][0..32], value, .big);
 }
@@ -175,7 +168,7 @@ const Harness = struct {
     sparse_changeset: Changeset,
     /// Per canonical block number (a reorg overwrites the replaced branch).
     blocks: [numbers_max]Block,
-    headers: [numbers_max][10]u8,
+    headers: [numbers_max][header_chain.header_bytes_max]u8,
     hashes: [numbers_max]Hash,
     roots: [numbers_max]Hash,
     nonces_at: [numbers_max][senders_total]u64,
@@ -248,17 +241,28 @@ const Harness = struct {
         try self.overlay.set_account(address_of(index), .{ .nonce = 1, .code_hash = code_hash });
     }
 
-    /// Commits the overlay as block `number` (header-shaped bytes, hash = keccak).
+    /// Commits the overlay as block `number`: a header-shaped list holding the parent hash,
+    /// the post-state root (previewed by applying then unwinding the changeset), and number.
     fn commit(self: *Harness, number: u8, parent_hash: Hash) !void {
         assert(number < numbers_max);
-        self.headers[number] = header_of(number, self.salt);
-        const hash = trie.node.keccak256(&self.headers[number]);
+        try self.overlay.build_changeset(&self.sparse_changeset);
+        try self.db.state.apply(&self.sparse_changeset);
+        const root = try self.db.state.state_root();
+        try self.db.state.unwind(&self.sparse_changeset);
+        const header = header_chain.encode_salted(
+            &self.headers[number],
+            &parent_hash,
+            &root,
+            number,
+            self.salt,
+        );
+        const hash = trie.node.keccak256(header);
         const input: database.BlockInput = .{
             .hash = hash,
             .parent_hash = parent_hash,
             .number = number,
             .timestamp = number,
-            .header = &self.headers[number],
+            .header = header,
             .body = "body",
             .receipts = &.{},
             .transaction_hashes = &.{},
@@ -266,6 +270,7 @@ const Harness = struct {
         };
         const result = try self.db.execute_and_commit(&self.overlay, &input);
         self.hashes[number] = hash;
+        try testing.expectEqual(root, result.state_root);
         self.roots[number] = result.state_root;
         self.nonces_at[number] = self.nonces;
         try self.tick_until_idle();
@@ -369,7 +374,11 @@ fn witness_of(harness: *Harness, number: u8, hash: Hash) witness_block.Error!Has
 /// Stateless re-execution of block `number` from the generated witness alone.
 fn check_stateless(harness: *Harness, number: u8) !void {
     const sparse = &harness.sparse;
-    sparse.reset(harness.roots[number - 1]);
+    const parent: witness.SparseState.Parent = .{
+        .number = number - 1,
+        .hash = harness.hashes[number - 1],
+    };
+    sparse.reset(harness.roots[number - 1], parent);
     try sparse.load(&harness.generator.witness);
     try harness.execute(number, sparse.database());
     try testing.expect(!sparse.incomplete);

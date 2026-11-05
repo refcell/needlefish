@@ -22,6 +22,7 @@ const changeset_module = @import("changeset.zig");
 const evm_backend = @import("evm_backend.zig");
 const evm = @import("../evm/root.zig");
 const trie = @import("../trie/root.zig");
+const HeaderChain = @import("witness_header_chain.zig").HeaderChain;
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const op = evm.opcode;
@@ -186,12 +187,6 @@ fn address_of(index: u64) Address {
     return address;
 }
 
-/// `rlp([1, 1, 1, 1, 1, 1, 1, 1, number])`, a minimal header-shaped list (number < 128).
-fn header_of(number: u8) [10]u8 {
-    assert(number > 0 and number < 0x80);
-    return .{ 0xc9, 1, 1, 1, 1, 1, 1, 1, 1, number };
-}
-
 /// One transaction's observable result, digested so it outlives the evm's buffers.
 const Observed = struct {
     invalid: ?evm.transaction.Invalid = null,
@@ -344,7 +339,7 @@ fn genesis_contract(overlay: *Overlay, index: u64, code: []const u8, balance: u2
     });
 }
 
-fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset) !void {
+fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
     for (0..senders_total) |index| {
         try overlay.set_account(address_of(index), .{ .balance = sender_balance });
     }
@@ -367,10 +362,6 @@ fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset)
     }
     try overlay.set_storage(address_of(contract_forwarder), 1, prng.range(1, 100));
     _ = try overlay.commit(changeset);
-    for (1..headers_total + 1) |number| {
-        const header = header_of(@intCast(number));
-        state.set_block_hash(number, trie.node.keccak256(&header));
-    }
 }
 
 const Fixture = struct {
@@ -381,6 +372,7 @@ const Fixture = struct {
     builder: witness.Builder,
     built: witness.Witness,
     sparse: witness.SparseState,
+    chain: HeaderChain,
     sparse_changeset: Changeset,
     evm_state: evm.State,
     machine: evm.Evm,
@@ -402,6 +394,7 @@ const Fixture = struct {
         });
         fixture.built = try witness.Witness.init(allocator, witness_config);
         fixture.sparse = try witness.SparseState.init(allocator, sparse_config);
+        fixture.chain = .{};
         fixture.sparse_changeset = try Changeset.init(allocator, changeset_config);
         fixture.evm_state = try evm.State.init(allocator, inner, evm_limits);
         fixture.machine = try evm.Evm.init(allocator, evm_config, &fixture.evm_state);
@@ -446,17 +439,11 @@ fn run_full(fixture: *Fixture) !Hash {
     }
     try evm_backend.commit_evm(&fixture.evm_state, &fixture.overlay);
     try fixture.overlay.build_changeset(&fixture.changeset);
-    var headers_buffer: [headers_total][10]u8 = undefined;
-    var headers: [headers_total][]const u8 = undefined;
-    for (keys.block_numbers.slice(), 0..) |number, index| {
-        headers_buffer[index] = header_of(@intCast(number));
-        headers[index] = &headers_buffer[index];
-    }
     const witness_root = try fixture.builder.build(
         &fixture.state,
         keys,
         &fixture.changeset,
-        headers[0..keys.block_numbers.len],
+        fixture.chain.headers(),
         &fixture.built,
     );
     const post_root = try fixture.overlay.commit(&fixture.changeset);
@@ -468,7 +455,7 @@ fn run_full(fixture: *Fixture) !Hash {
 fn load_witness(fixture: *Fixture, pre_root: Hash, skip: ?u32) !void {
     const sparse = &fixture.sparse;
     const built = &fixture.built;
-    sparse.reset(pre_root);
+    sparse.reset(pre_root, fixture.chain.parent());
     var index: u32 = 0;
     while (index < built.state.count) : (index += 1) {
         if (skip != index) try sparse.add_node(built.state.get(index));
@@ -479,6 +466,7 @@ fn load_witness(fixture: *Fixture, pre_root: Hash, skip: ?u32) !void {
     while (index < built.headers.count) : (index += 1) {
         try sparse.add_header(built.headers.get(index));
     }
+    try sparse.verify_headers();
 }
 
 /// Stateless run with the whole witness: same results, same root, nothing missing.
@@ -522,11 +510,17 @@ test "witness evm: stateless re-execution over the witness matches the full stat
         defer testing.allocator.destroy(fixture);
         try fixture.init();
         defer fixture.deinit();
-        try genesis(&prng, &fixture.state, &fixture.overlay, &fixture.changeset);
+        try genesis(&prng, &fixture.overlay, &fixture.changeset);
         var block_index: u64 = 0;
         while (block_index < 3) : (block_index += 1) {
-            generate_block(&prng, &fixture.state, &fixture.block, headers_total + 1 + block_index);
+            const number = headers_total + 1 + block_index;
+            generate_block(&prng, &fixture.state, &fixture.block, number);
             const pre_root = try fixture.state.state_root();
+            // Headers 1..parent; the parent holds the pre-state root.
+            fixture.chain.build(number - 1, pre_root);
+            for (1..number) |ancestor| {
+                fixture.state.set_block_hash(ancestor, fixture.chain.hash(ancestor));
+            }
             const post_root = try run_full(fixture);
             try testing.expect(fixture.built.state.count > 0);
             try run_stateless(fixture, pre_root, post_root);

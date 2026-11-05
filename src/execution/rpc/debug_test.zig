@@ -184,10 +184,15 @@ test "debug_executionWitness: stateless re-execution of each block matches its r
     inline for (.{ "0x1", "0x2", "0x3" }, 1..) |param, number| {
         const text = try harness.request("[\"" ++ param ++ "\"]");
         const parent = chain.header(hashes[number - 1]).?;
-        harness.sparse.reset(parent.state_root.bytes);
+        const bound: db_module.witness.SparseState.Parent = .{
+            .number = number - 1,
+            .hash = hashes[number - 1],
+        };
+        harness.sparse.reset(parent.state_root.bytes, bound);
         try testing.expect(try harness.load(text, "state") > 0);
         _ = try harness.load(text, "codes");
         try testing.expect(try harness.load(text, "headers") >= 1);
+        try harness.sparse.verify_headers();
         try testing.expect((try json.find_path(text, &.{ "result", "keys" })) != null);
         const root = try harness.reexecute(hashes[number]);
         try testing.expectEqual(chain.header(hashes[number]).?.state_root.bytes, root);
@@ -204,10 +209,12 @@ test "debug_executionWitness: stateless re-execution of each block matches its r
 
     // The head's own witness still works after the refusals (state intact).
     const text = try harness.request("[\"latest\"]");
-    harness.sparse.reset(chain.header(hashes[2]).?.state_root.bytes);
+    const head_parent: db_module.witness.SparseState.Parent = .{ .number = 2, .hash = hashes[2] };
+    harness.sparse.reset(chain.header(hashes[2]).?.state_root.bytes, head_parent);
     _ = try harness.load(text, "state");
     _ = try harness.load(text, "codes");
     _ = try harness.load(text, "headers");
+    try harness.sparse.verify_headers();
     const head_header = chain.header(hashes[3]).?;
     try testing.expectEqual(head_header.state_root.bytes, try harness.reexecute(hashes[3]));
 }

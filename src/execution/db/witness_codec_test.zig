@@ -14,6 +14,7 @@ const overlay_module = @import("overlay.zig");
 const changeset_module = @import("changeset.zig");
 const evm_backend = @import("evm_backend.zig");
 const trie = @import("../trie/root.zig");
+const HeaderChain = @import("witness_header_chain.zig").HeaderChain;
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const State = state_module.State;
@@ -113,7 +114,7 @@ fn random_info(prng: *Prng, overlay: *Overlay) !AccountInfo {
     return info;
 }
 
-fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset) !void {
+fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
     for (0..genesis_accounts) |index| {
         const address = address_of(index);
         try overlay.set_account(address, try random_info(prng, overlay));
@@ -122,10 +123,6 @@ fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset)
         }
     }
     _ = try overlay.commit(changeset);
-    for (1..headers_total + 1) |number| {
-        const header = header_of(@intCast(number));
-        state.set_block_hash(number, keccak256(&header));
-    }
 }
 
 fn random_reads(prng: *Prng, state: *State, recorder: *witness.Recorder) !void {
@@ -168,6 +165,7 @@ const Fixture = struct {
     built: Witness,
     decoded: Witness,
     sparse: witness.SparseState,
+    chain: HeaderChain,
     encoder: codec.Encoder,
     buffer: []u8,
     again: []u8,
@@ -186,6 +184,7 @@ const Fixture = struct {
         fixture.built = try Witness.init(allocator, witness_config);
         fixture.decoded = try Witness.init(allocator, witness_config);
         fixture.sparse = try witness.SparseState.init(allocator, sparse_config);
+        fixture.chain = .{};
         fixture.encoder = try codec.Encoder.init(allocator, witness_config);
         fixture.buffer = try allocator.alloc(u8, 1 << 22);
         fixture.again = try allocator.alloc(u8, 1 << 22);
@@ -207,24 +206,23 @@ const Fixture = struct {
     }
 };
 
-/// Builds one block's witness; returns the witness-only post-state root.
-fn build_block(prng: *Prng, fixture: *Fixture) !Hash {
+/// Builds one block's witness on headers ending at a parent holding `pre_root`; returns the
+/// witness-only post-state root.
+fn build_block(prng: *Prng, fixture: *Fixture, pre_root: Hash) !Hash {
     const keys = &fixture.recorder.keys;
     keys.clear();
+    fixture.chain.build(headers_total, pre_root);
+    for (1..headers_total + 1) |number| {
+        fixture.state.set_block_hash(number, fixture.chain.hash(number));
+    }
     try random_reads(prng, &fixture.state, &fixture.recorder);
     try random_writes(prng, &fixture.overlay);
     try fixture.overlay.build_changeset(&fixture.changeset);
-    var headers_buffer: [headers_total][10]u8 = undefined;
-    var headers: [headers_total][]const u8 = undefined;
-    for (keys.block_numbers.slice(), 0..) |number, index| {
-        headers_buffer[index] = header_of(@intCast(number));
-        headers[index] = &headers_buffer[index];
-    }
     return fixture.builder.build(
         &fixture.state,
         keys,
         &fixture.changeset,
-        headers[0..keys.block_numbers.len],
+        fixture.chain.headers(),
         &fixture.built,
     );
 }
@@ -259,7 +257,7 @@ fn check_lookup(prng: *Prng, built: *const Witness, decoded: *const Witness) !vo
 
 fn round_trip_block(prng: *Prng, fixture: *Fixture) !void {
     const pre_root = try fixture.state.state_root();
-    const sparse_root = try build_block(prng, fixture);
+    const sparse_root = try build_block(prng, fixture, pre_root);
     const built = &fixture.built;
     const decoded = &fixture.decoded;
     const size = try fixture.encoder.encoded_size(built);
@@ -276,7 +274,7 @@ fn round_trip_block(prng: *Prng, fixture: *Fixture) !void {
     try testing.expectEqualSlices(u8, fixture.buffer[0..written], fixture.again[0..again]);
     try check_lookup(prng, built, decoded);
     const sparse = &fixture.sparse;
-    sparse.reset(pre_root);
+    sparse.reset(pre_root, fixture.chain.parent());
     try sparse.load(decoded);
     try witness.replay(sparse, &fixture.recorder.keys, &fixture.changeset);
     try testing.expectEqual(sparse_root, sparse.state_root());
@@ -291,7 +289,7 @@ test "witness codec: builder witnesses round-trip and replay to the same root" {
         var fixture: Fixture = undefined;
         try fixture.init();
         defer fixture.deinit();
-        try genesis(&prng, &fixture.state, &fixture.overlay, &fixture.changeset);
+        try genesis(&prng, &fixture.overlay, &fixture.changeset);
         for (0..3) |_| try round_trip_block(&prng, &fixture);
     }
 }

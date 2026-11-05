@@ -76,6 +76,9 @@ const Metric = enum(u8) {
 };
 const metrics_count = std.enums.values(Metric).len;
 
+/// Bench witnesses carry no headers (no BLOCKHASH), so the bound parent is never linked.
+const no_headers_parent: witness.SparseState.Parent = .{ .number = 0, .hash = @splat(0) };
+
 /// One block's witness shape and per-sample durations.
 const Report = struct {
     nodes: u32 = 0,
@@ -374,13 +377,13 @@ fn measure_sample(
     clock = lap(io, report, .build, sample, clock);
     report.builder_trie_used = trie_used(&fixture.builder.scratch);
     // `build` starts with this reset; timed alone to show its share (O(pool capacity)).
-    fixture.builder.scratch.reset(fixture.pre_root);
+    fixture.builder.scratch.reset(fixture.pre_root, no_headers_parent);
     clock = lap(io, report, .builder_reset, sample, clock);
     const size = try fixture.encoder.encode(&fixture.built, fixture.encoded);
     clock = lap(io, report, .encode, sample, clock);
     try witness_codec.decode(fixture.encoded[0..size], &fixture.decoded);
     clock = lap(io, report, .decode, sample, clock);
-    fixture.sparse.reset(fixture.pre_root);
+    fixture.sparse.reset(fixture.pre_root, no_headers_parent);
     clock = lap(io, report, .reset, sample, clock);
     try fixture.sparse.load(&fixture.decoded);
     clock = lap(io, report, .load, sample, clock);
@@ -390,7 +393,7 @@ fn measure_sample(
     report.trie_capacity = @intCast(fixture.sparse.trie.nodes.len);
     if (!std.mem.eql(u8, &fixture.sparse.state_root(), &post_root)) return error.RootMismatch;
     if (kind == .calls) {
-        fixture.sparse.reset(fixture.pre_root);
+        fixture.sparse.reset(fixture.pre_root, no_headers_parent);
         try fixture.sparse.load(&fixture.decoded);
         clock = bench.now_ns(io);
         try fixture.execute(fixture.sparse.database());

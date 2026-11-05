@@ -3,6 +3,11 @@
 Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execution/trie`.
 
 ## Backlog
+- [x] Witness header ancestry verification (DST-found soundness gap): `SparseState` trusted
+  each witness header's number, so a hostile witness could forge BLOCKHASH. Now bound to the
+  verified block's parent (`reset(pre_root, parent)`): headers strictly decoded, contiguous
+  and ascending, parent-hash linked, ending at the parent with the pre-state root.
+  (`db/witness.zig` `header_link` / `verify_headers`, `db/witness_header_test.zig`)
 - [x] Merkle Patricia Trie: node encoding (RLP), in-memory trie, root computation, proofs (eth_getProof), ordered-trie root for tx/receipt/withdrawal roots. No recursion. Vectors from ethereum/tests TrieTests.
 - [x] Fast incremental state root: sorted batch updates, parallel hashing of subtries, cached branch nodes.
 - [x] Storage engine (own design, TigerBeetle-inspired): append-only data file + fixed-size block grid or LSM, checksummed blocks, crash-safe superblock, all disk I/O through `utilities.io` (io_uring on Linux), static memory budget. Flat account/storage tables + history for reorgs.
@@ -337,6 +342,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   window match the chain. Storage proofs are fetched one slot per call into the existing
   scratch (no scratch growth); the account proof is recomputed per slot (a few lookups).
 
+- Witness header ancestry (reth stateless validation): `SparseState.reset(pre_state_root,
+  parent)` binds the verifier to the parent of the block it checks (number + hash, trusted by
+  the caller). `add_header` decodes each header strictly (`header_link`: 32-byte parent hash
+  and state root, canonical number) and requires it to be the child of the previous one
+  (number + 1, parent hash = keccak256 of the previous header); `verify_headers` (called by
+  `load`) requires the last header to be the parent (number and hash) and to hold the
+  pre-state root. `block_hash` serves nothing before verification and only numbers the chain
+  covers (O(1) by offset). An empty header list is allowed (a block that reads no BLOCKHASH);
+  every BLOCKHASH read is then `WitnessIncomplete`, and the pre-state root is the caller's
+  claim alone, as before. A chain may start anywhere below the parent (a suffix: fewer
+  ancestors is not a forgery). Failures are `error.InvalidHeaderChain` (`witness.Error`). The
+  builder's scratch is unbound (private `clear`), since it never serves BLOCKHASH.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -489,3 +507,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   encodes (`witness_codec`) to the unwind witness's bytes, head witness re-executes
   statelessly to the stored root; blocks below the window fall back to the unwind; durable
   node test checks the source per block across a new head.
+- 2026-11-05: witness header ancestry verification (DST-found soundness gap: forged BLOCKHASH
+  from unlinked witness headers). `SparseState` is bound to the parent; gap, duplicate,
+  unsorted, broken middle link, wrong tail hash/number, missing parent, and pre-root mismatch
+  are rejected; seeded + `std.testing.fuzz` chain mutations verify only suffixes of the valid
+  chain. Witness tests now use real linked headers (`db/witness_header_chain.zig`).

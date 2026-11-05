@@ -12,6 +12,7 @@ const overlay_module = @import("overlay.zig");
 const changeset_module = @import("changeset.zig");
 const evm_backend = @import("evm_backend.zig");
 const trie = @import("../trie/root.zig");
+const HeaderChain = @import("witness_header_chain.zig").HeaderChain;
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const State = state_module.State;
@@ -98,7 +99,7 @@ fn random_info(prng: *Prng, overlay: *Overlay) !AccountInfo {
     return info;
 }
 
-fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset) !void {
+fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
     for (0..genesis_accounts) |index| {
         const address = address_of(index);
         try overlay.set_account(address, try random_info(prng, overlay));
@@ -107,10 +108,12 @@ fn genesis(prng: *Prng, state: *State, overlay: *Overlay, changeset: *Changeset)
         }
     }
     _ = try overlay.commit(changeset);
-    for (1..headers_total + 1) |number| {
-        const header = header_of(@intCast(number));
-        state.set_block_hash(number, trie.node.keccak256(&header));
-    }
+}
+
+/// Headers 1..`headers_total` ending at a parent holding `pre_root`, hashes into `state`.
+fn set_headers(chain: *HeaderChain, state: *State, pre_root: Hash) void {
+    chain.build(headers_total, pre_root);
+    for (1..headers_total + 1) |number| state.set_block_hash(number, chain.hash(number));
 }
 
 fn random_reads(prng: *Prng, state: *State, recorder: *witness.Recorder) !void {
@@ -178,9 +181,10 @@ fn check_minimal(
     keys: *const witness.KeySet,
     changeset: *const Changeset,
     pre_root: Hash,
+    parent: witness.SparseState.Parent,
 ) !void {
     for (0..built.state.count) |skip| {
-        sparse.reset(pre_root);
+        sparse.reset(pre_root, parent);
         for (0..built.state.count) |index| {
             if (index != skip) try sparse.add_node(built.state.get(@intCast(index)));
         }
@@ -196,6 +200,7 @@ const Fixture = struct {
     builder: witness.Builder,
     built: witness.Witness,
     sparse: witness.SparseState,
+    chain: HeaderChain,
 
     fn init(fixture: *Fixture) !void {
         const allocator = testing.allocator;
@@ -210,6 +215,7 @@ const Fixture = struct {
         });
         fixture.built = try witness.Witness.init(allocator, witness_config);
         fixture.sparse = try witness.SparseState.init(allocator, sparse_config);
+        fixture.chain = .{};
     }
 
     fn deinit(fixture: *Fixture) void {
@@ -228,35 +234,30 @@ fn run_block(prng: *Prng, fixture: *Fixture) !void {
     const state = &fixture.state;
     const keys = &fixture.recorder.keys;
     keys.clear();
+    const pre_root = try state.state_root();
+    set_headers(&fixture.chain, state, pre_root);
     try random_reads(prng, state, &fixture.recorder);
     try random_writes(prng, &fixture.overlay);
     try fixture.overlay.build_changeset(&fixture.changeset);
-    var headers_buffer: [headers_total][10]u8 = undefined;
-    var headers: [headers_total][]const u8 = undefined;
-    for (keys.block_numbers.slice(), 0..) |number, index| {
-        headers_buffer[index] = header_of(@intCast(number));
-        headers[index] = &headers_buffer[index];
-    }
-    const header_count = keys.block_numbers.len;
-    const pre_root = try state.state_root();
     const built = &fixture.built;
     const sparse_root = try fixture.builder.build(
         state,
         keys,
         &fixture.changeset,
-        headers[0..header_count],
+        fixture.chain.headers(),
         built,
     );
     try testing.expectEqual(keys.codes.len, built.codes.count + empty_codes(keys));
     const sparse = &fixture.sparse;
-    sparse.reset(pre_root);
+    sparse.reset(pre_root, fixture.chain.parent());
     try sparse.load(built);
     try check_reads(state, sparse, keys);
     try witness.replay(sparse, keys, &fixture.changeset);
     const post_root = try fixture.overlay.commit(&fixture.changeset);
     try testing.expectEqual(post_root, sparse_root);
     try testing.expectEqual(post_root, sparse.state_root());
-    try check_minimal(sparse, built, keys, &fixture.changeset, pre_root);
+    const parent = fixture.chain.parent();
+    try check_minimal(sparse, built, keys, &fixture.changeset, pre_root, parent);
 }
 
 fn empty_codes(keys: *const witness.KeySet) u32 {
@@ -274,7 +275,7 @@ test "witness: stateless replay matches the full state and every node is needed"
         var fixture: Fixture = undefined;
         try fixture.init();
         defer fixture.deinit();
-        try genesis(&prng, &fixture.state, &fixture.overlay, &fixture.changeset);
+        try genesis(&prng, &fixture.overlay, &fixture.changeset);
         for (0..4) |_| try run_block(&prng, &fixture);
     }
 }
@@ -282,7 +283,9 @@ test "witness: stateless replay matches the full state and every node is needed"
 test "witness: missing code and header fail the evm read and flag the witness" {
     var sparse = try witness.SparseState.init(testing.allocator, sparse_config);
     defer sparse.deinit(testing.allocator);
-    sparse.reset(trie.node.empty_root);
+    var chain: HeaderChain = .{};
+    chain.build(3, trie.node.empty_root);
+    sparse.reset(trie.node.empty_root, chain.parent());
     const database = sparse.database();
     const empty_code = try database.code_by_hash(trie.node.empty_code_hash);
     try testing.expectEqual(@as(usize, 0), empty_code.len);
@@ -292,9 +295,14 @@ test "witness: missing code and header fail the evm read and flag the witness" {
     sparse.incomplete = false;
     try testing.expectError(error.DatabaseFailure, database.block_hash(3));
     try testing.expect(sparse.incomplete);
-    const header = header_of(3);
-    try sparse.add_header(&header);
-    try testing.expectEqual(trie.node.keccak256(&header), try database.block_hash(3));
+    for (chain.headers()) |header| try sparse.add_header(header);
+    // Not served before the chain is linked to the parent.
+    try testing.expectError(error.DatabaseFailure, database.block_hash(3));
+    try sparse.verify_headers();
+    for (1..4) |number| {
+        try testing.expectEqual(chain.hash(number), try database.block_hash(number));
+    }
+    try testing.expectError(error.DatabaseFailure, database.block_hash(4));
 }
 
 test "witness: header number decoding is strict" {

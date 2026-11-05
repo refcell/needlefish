@@ -41,6 +41,7 @@ test {
     _ = @import("witness_evm_test.zig");
     _ = @import("witness_block_test.zig");
     _ = @import("witness_codec_test.zig");
+    _ = @import("witness_header_test.zig");
     _ = @import("database_test.zig");
     _ = @import("database_history_test.zig");
 }
