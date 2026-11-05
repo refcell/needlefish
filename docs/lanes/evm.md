@@ -109,8 +109,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   wire RPC estimation to `eip8130_simulate.simulate`.
 - [x] Performance: snailtracer contract workload (`just vectors` fetches revm's public fixture;
   `evm: snailtracer` in `zig build bench`, ~50 ms / 166M gas, docs/PERF.md).
-- [ ] Performance: compare with revm on the same machine; profile call-frame and keccak
-  paths.
+- [x] Performance: profile snailtracer (interpreter loop ~80%, memory ops ~15%, keccak ~2%;
+  docs/PERF.md).
+- [ ] Performance: compare with revm on the same machine (needs a Rust toolchain build).
 
 ## Decisions
 - EIP-8130 pre-call reads warm the accounts and slots they touch (base's gas-free journal

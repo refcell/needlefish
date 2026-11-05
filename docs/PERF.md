@@ -416,6 +416,13 @@ the shared machine at load average ~35, so treat it as a ceiling:
 |---|---|---|
 | evm: snailtracer | 50 479 625 | ~3.3 Ggas/s; arithmetic, memory, and jump heavy |
 
+Profile (macOS `sample`, 5 s of snailtracer, top of stack): the threaded interpreter loop
+~80% (dispatch plus inlined arithmetic/stack ops), `memory_op` MLOAD/MSTORE ~15% (mostly the
+u256 byte swap; an in-bounds fast path that skips expansion pricing measured ~1%, within
+noise, so it was not kept), Keccak-f ~2%, memmove/memset ~1%. No call-frame cost shows up:
+snailtracer makes almost no calls. The call-frame path is covered by `evm: call loop`
+(~117 ns per frame push/pop).
+
 Not yet compared with revm on the same machine: building revm needs a Rust toolchain build
 the shared disk cannot spare right now.
 
