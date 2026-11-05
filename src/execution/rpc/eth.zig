@@ -36,7 +36,9 @@ pub const Api = struct {
     scratch: []u8,
 };
 
-pub const methods = [_]rpc.Method(*Api){
+pub const methods = core_methods ++ @import("eth_more.zig").methods;
+
+const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
     .{ .name = "net_version", .handler = net_version },
     .{ .name = "net_listening", .handler = net_listening },

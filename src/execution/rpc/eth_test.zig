@@ -199,6 +199,51 @@ test "eth: debug raw header, block, receipts and transaction" {
     try expect_contains(out.buffered(), "\"result\":\"0x");
 }
 
+test "eth: block transaction counts, by-index lookups, uncles, sha3, txpool_status" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var tx_buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 5, &tx_buffer);
+    const status = try h.request("txpool_status", "[]");
+    try testing.expectEqualStrings("\"result\":{\"pending\":\"0x1\",\"queued\":\"0x0\"}", status);
+    const hash = try h.mine(12);
+    const count = try h.request("eth_getBlockTransactionCountByNumber", "[\"latest\"]");
+    try testing.expectEqualStrings("\"result\":\"0x1\"", count);
+    const genesis_count = try h.request("eth_getBlockTransactionCountByNumber", "[\"0x0\"]");
+    try testing.expectEqualStrings("\"result\":\"0x0\"", genesis_count);
+    const missing = try h.request("eth_getBlockTransactionCountByNumber", "[\"0x9\"]");
+    try testing.expectEqualStrings("\"result\":null", missing);
+    const uncles = try h.request("eth_getUncleCountByBlockNumber", "[\"0x1\"]");
+    try testing.expectEqualStrings("\"result\":\"0x0\"", uncles);
+    const uncle = try h.request("eth_getUncleByBlockNumberAndIndex", "[\"0x1\",\"0x0\"]");
+    try testing.expectEqualStrings("\"result\":null", uncle);
+    const tx = try h.request("eth_getTransactionByBlockNumberAndIndex", "[\"0x1\",\"0x0\"]");
+    try expect_contains(tx, "\"transactionIndex\":\"0x0\"");
+    try expect_contains(tx, "\"blockNumber\":\"0x1\"");
+    const past_end = try h.request("eth_getTransactionByBlockNumberAndIndex", "[\"0x1\",\"0x1\"]");
+    try testing.expectEqualStrings("\"result\":null", past_end);
+    var request_buffer: [256]u8 = undefined;
+    const by_hash = try std.fmt.bufPrint(
+        &request_buffer,
+        request_prefix_format ++
+            "eth_getTransactionByBlockHashAndIndex\",\"params\":[\"0x{x}\",\"0x0\"]}}",
+        .{&hash.bytes},
+    );
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, by_hash, &out);
+    try expect_contains(out.buffered(), "\"transactionIndex\":\"0x0\"");
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_accounts", "[]"));
+    // keccak256("") and keccak256(0x68656c6c6f20776f726c64) ("hello world").
+    try expect_contains(
+        try h.request("web3_sha3", "[\"0x\"]"),
+        "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+    );
+    try expect_contains(
+        try h.request("web3_sha3", "[\"0x68656c6c6f20776f726c64\"]"),
+        "0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad",
+    );
+}
+
 test "eth: send raw transaction, mine, receipt, logs and nonce" {
     const h = try Harness.create();
     defer h.destroy();
@@ -283,6 +328,11 @@ const method_names = [_][]const u8{
     "debug_getRawBlock",
     "debug_getRawReceipts",
     "debug_getRawTransaction",
+    "eth_getBlockTransactionCountByNumber",
+    "eth_getTransactionByBlockNumberAndIndex",
+    "eth_getUncleByBlockHashAndIndex",
+    "web3_sha3",
+    "txpool_status",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",
