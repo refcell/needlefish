@@ -126,10 +126,28 @@ patch_rollup() {
 start_consensus() {
   local common=(--rollup-config "$DIR/rollup.json" --l1 "http://127.0.0.1:$PORT_L1_HTTP"
     --l1-beacon "http://127.0.0.1:$PORT_L1_BEACON" --l2-jwt "$DIR/jwt.hex")
+  # Unsafe-block gossip: the verifier dials the sequencer's enode (logged at startup).
+  local p2p=(--p2p.listen.ip 127.0.0.1 --p2p.no-discovery --p2p.no-bootstore)
   start seq-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_SEQUENCER_ENGINE" \
-    --rpc.port "$PORT_SEQUENCER_RPC" --sequencer --sequencer.key-index "$SEQUENCER_INDEX"
+    --rpc.port "$PORT_SEQUENCER_RPC" --sequencer --sequencer.key-index "$SEQUENCER_INDEX" \
+    "${p2p[@]}" --p2p.listen.tcp 9222 --p2p.listen.udp 9223
+  local enode="" tries=0
+  while [ -z "$enode" ] && [ "$tries" -lt 50 ]; do
+    enode=$(grep -o 'enode=enode://[^ ]*' "$DIR/logs/seq-cl.log" 2>/dev/null | head -n1 |
+      sed 's/^enode=//') || true
+    [ -n "$enode" ] || sleep 0.2
+    tries=$((tries + 1))
+  done
+  local gossip=()
+  if [ -n "$enode" ]; then
+    gossip=(--p2p.bootnodes "$enode")
+  else
+    log "ver-cl: sequencer enode not found, starting without a gossip peer"
+  fi
+  local signer; signer=$("$BASE" devnet account "$SEQUENCER_INDEX")
   start ver-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_VERIFIER_ENGINE" \
-    --rpc.port "$PORT_VERIFIER_RPC"
+    --rpc.port "$PORT_VERIFIER_RPC" "${p2p[@]}" --p2p.listen.tcp 9232 --p2p.listen.udp 9233 \
+    --p2p.unsafe.block.signer "$signer" ${gossip[@]+"${gossip[@]}"}
 }
 
 down() {

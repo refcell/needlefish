@@ -30,6 +30,13 @@ const polling_client = @import("../engine/polling_client.zig");
 const kzg = @import("../../common/crypto/kzg/root.zig");
 const derive_errors = @import("../derive/errors.zig");
 const blob_module = @import("../derive/blob.zig");
+const p2p_network = @import("../p2p/network.zig");
+const p2p_options = @import("../p2p/options.zig");
+const secp256k1 = @import("../p2p/peers/secp256k1.zig");
+const enr = @import("../p2p/peers/enr.zig");
+const snappy = @import("../p2p/gossip/snappy.zig");
+const primitives = @import("../../common/primitives/root.zig");
+const gossip_bridge = @import("gossip_bridge.zig");
 
 const ProviderError = derive_errors.ProviderError;
 const BlockInfo = protocol.block.BlockInfo;
@@ -43,7 +50,23 @@ const L2BlockInfo = protocol.block.L2BlockInfo;
 const SystemConfig = protocol.system_config.SystemConfig;
 const SafeBlock = protocol.span_batch.SafeBlock;
 
+/// Unsafe-block gossip (base/base `NetworkActor`): received blocks go to the driver, and a
+/// sequencer publishes every block it seals.
+pub const P2p = struct {
+    options: p2p_options.Options,
+    node_secret: secp256k1.SecretKey,
+    unsafe_block_signer: primitives.Address,
+    /// Signs published blocks; null on verifiers.
+    sequencer_key: ?[32]u8 = null,
+    /// Seeds connection keys and the service's randomness; from OS entropy in production.
+    seed: u64,
+};
+
+/// Gossiped blocks handed to the driver per tick.
+const gossip_blocks_per_tick: u32 = 8;
+
 pub const Options = struct {
+    p2p: ?P2p = null,
     l1: Address,
     /// Beacon API for blobs; without it blob batches are unavailable.
     l1_beacon: ?Address = null,
@@ -146,6 +169,25 @@ pub fn output_of(
     return result;
 }
 
+/// `enode://<public key>@<ip>:<tcp>` for the advertised (else listen) address.
+pub fn enode_of(output: []u8, p2p: *const P2p) ![]const u8 {
+    const public = try secp256k1.public_key(p2p.node_secret);
+    const uncompressed = try secp256k1.decompress(public);
+    const hex = std.fmt.bytesToHex(uncompressed[1..], .lower);
+    const tcp = p2p.options.advertise_tcp orelse p2p.options.listen_tcp;
+    const address = p2p.options.advertise_ip orelse p2p.options.listen_ip;
+    const ip4 = switch (address) {
+        .ip4 => |bytes| bytes,
+        .ip6 => return error.Ip6Unsupported,
+    };
+    const ip = if (std.mem.allEqual(u8, &ip4, 0)) [4]u8{ 127, 0, 0, 1 } else ip4;
+    const text = try std.fmt.bufPrint(output, "enode://{s}@{d}.{d}.{d}.{d}:{d}", .{
+        &hex, ip[0], ip[1], ip[2], ip[3], tcp,
+    });
+    assert(text.len > "enode://".len + 128);
+    return text;
+}
+
 pub fn Node(comptime IO: type) type {
     return struct {
         const Self = @This();
@@ -202,6 +244,21 @@ pub fn Node(comptime IO: type) type {
         logged_unsafe_number: u64 = 0,
         logged_error: ?anyerror = null,
         status_logged_ns: u64 = 0,
+        network: ?*Network = null,
+        p2p_random: std.Random.DefaultPrng = .init(0),
+        /// Gossip decode scratch and publish encoding storage (p2p only).
+        gossip_scratch: []u8 = &.{},
+        publish_storage: []u8 = &.{},
+        gossip_arena: std.heap.ArenaAllocator,
+        gossip: GossipStats = .{},
+
+        pub const Network = p2p_network.Network(IO);
+        pub const GossipStats = struct {
+            received: u64 = 0,
+            undecodable: u64 = 0,
+            published: u64 = 0,
+            publish_failures: u64 = 0,
+        };
 
         /// Builds the node in place; `node` must not move afterwards.
         pub fn init(
@@ -237,6 +294,7 @@ pub fn Node(comptime IO: type) type {
                     .admin = &admin_vtable,
                 },
                 .safe_db = try safedb.SafeDB.init(allocator, options.safedb_entries),
+                .gossip_arena = .init(allocator),
             };
             errdefer node.safe_db.deinit(allocator);
             try node.init_sources();
@@ -250,6 +308,41 @@ pub fn Node(comptime IO: type) type {
             );
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
+            errdefer node.rpc_server.deinit();
+            if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_p2p(node: *Self, p2p: *const P2p) !void {
+            const allocator = node.allocator;
+            node.gossip_scratch = try allocator.alloc(u8, snappy.gossip_size_max);
+            errdefer allocator.free(node.gossip_scratch);
+            node.publish_storage = try allocator.alloc(u8, snappy.gossip_size_max);
+            errdefer allocator.free(node.publish_storage);
+            const network = try allocator.create(Network);
+            errdefer allocator.destroy(network);
+            node.p2p_random = .init(p2p.seed);
+            try network.init(
+                allocator,
+                node.io,
+                node.rollup,
+                p2p.options,
+                p2p.node_secret,
+                p2p.unsafe_block_signer,
+                node.p2p_random.random(),
+                p2p.seed,
+            );
+            node.network = network;
+            assert(node.gossip_scratch.len >= snappy.gossip_size_max);
+        }
+
+        fn deinit_p2p(node: *Self) void {
+            const network = node.network orelse return;
+            network.stop();
+            network.deinit(node.allocator);
+            node.allocator.destroy(network);
+            node.allocator.free(node.gossip_scratch);
+            node.allocator.free(node.publish_storage);
+            node.network = null;
         }
 
         fn init_sources(node: *Self) !void {
@@ -319,6 +412,8 @@ pub fn Node(comptime IO: type) type {
         /// Frees everything. The IO must not run afterwards (in-flight operations would
         /// complete into freed memory); the binary tears both down together.
         pub fn deinit(node: *Self) void {
+            node.deinit_p2p();
+            node.gossip_arena.deinit();
             node.rpc_server.deinit();
             node.driver.deinit();
             node.deinit_sources();
@@ -331,7 +426,22 @@ pub fn Node(comptime IO: type) type {
             const address = try node.rpc_server.listen(node.options.rpc_address);
             node.logger.log(.info, "consensus", "rpc listening", .{ .port = address.port });
             assert(address.family == node.options.rpc_address.family);
+            if (node.network) |network| try node.start_p2p(network);
             return address;
+        }
+
+        fn start_p2p(node: *Self, network: *Network) !void {
+            const invalid = try network.start();
+            var record_text: [enr.text_length_max]u8 = undefined;
+            var enode_text: [256]u8 = undefined;
+            const p2p = &node.options.p2p.?;
+            node.logger.log(.info, "consensus", "p2p listening", .{
+                .tcp = p2p.options.listen_tcp,
+                .udp = p2p.options.listen_udp,
+                .enode = enode_of(&enode_text, p2p) catch "unavailable",
+                .enr = enr.encode_text(&record_text, &network.record),
+                .invalid_bootnodes = invalid,
+            });
         }
 
         pub fn providers(node: *Self) Providers {
@@ -361,8 +471,50 @@ pub fn Node(comptime IO: type) type {
             if (node.blobs) |blobs| blobs.tick();
             const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
             node.driver.tick(node.providers(), now_s);
+            if (node.network) |network| node.tick_gossip(network);
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
+        }
+
+        /// Hands received blocks to the driver and publishes the block just sealed.
+        fn tick_gossip(node: *Self, network: *Network) void {
+            for (0..gossip_blocks_per_tick) |_| {
+                const envelope = network.pop_block(node.gossip_scratch) orelse break;
+                node.gossip.received += 1;
+                defer _ = node.gossip_arena.reset(.{ .retain_with_limit = 1 << 20 });
+                const allocator = node.gossip_arena.allocator();
+                const decoded = gossip_bridge.decode_gossip(allocator, &envelope) catch {
+                    node.gossip.undecodable += 1;
+                    continue;
+                };
+                _ = node.driver.insert_unsafe(&decoded);
+            }
+            const sealed = node.driver.queue.take_sealed() orelse return;
+            const key = node.options.p2p.?.sequencer_key orelse return;
+            node.publish(network, key, sealed);
+        }
+
+        fn publish(
+            node: *Self,
+            network: *Network,
+            key: [32]u8,
+            sealed: *const gossip_bridge.Envelope,
+        ) void {
+            assert(node.publish_storage.len > 0);
+            const storage = node.publish_storage;
+            const result = if (gossip_bridge.encode_gossip(node.rollup, sealed, storage)) |payload|
+                network.publish_block(key, sealed.parent_beacon_block_root, payload)
+            else |err|
+                err;
+            if (result) |_| {
+                node.gossip.published += 1;
+            } else |err| {
+                node.gossip.publish_failures += 1;
+                node.logger.log(.warn, "consensus", "block publish failed", .{
+                    .number = sealed.payload.block_number,
+                    .err = @errorName(err),
+                });
+            }
         }
 
         /// Every 10 s while not running: where startup waits.
@@ -626,4 +778,149 @@ test "node: output roots seeded fuzz, available iff Isthmus and a storage root" 
             try testing.expect(output.output.bridge_storage_root.eql(.init(@splat(3))));
         } else |_| try testing.expect(!available);
     }
+}
+
+test "node: enode text parses back as a bootnode" {
+    var secret: secp256k1.SecretKey = @splat(0);
+    secret[31] = 3;
+    var p2p: P2p = .{
+        .options = try p2p_options.parse(&.{"--p2p.listen.tcp=9300"}),
+        .node_secret = secret,
+        .unsafe_block_signer = .zero,
+        .seed = 1,
+    };
+    var text: [256]u8 = undefined;
+    const enode = try enode_of(&text, &p2p);
+    try testing.expect(std.mem.endsWith(u8, enode, "@127.0.0.1:9300"));
+    const boot = @import("../p2p/peers/boot.zig");
+    const parsed = try boot.parse(enode);
+    try testing.expect(parsed == .enode);
+    p2p.options.advertise_ip = .{ .ip6 = @splat(1) };
+    try testing.expectError(error.Ip6Unsupported, enode_of(&text, &p2p));
+}
+
+/// A signed block with a valid hash for `rollup`, timestamped `now_s`.
+fn gossip_payload(
+    rollup: *const RollupConfig,
+    now_s: u64,
+    storage: []u8,
+    beacon_root: primitives.B256,
+) !@import("../p2p/gossip/block.zig").ExecutionPayload {
+    const ssz = @import("../p2p/gossip/ssz_payload.zig");
+    const validity = @import("../p2p/gossip/validity.zig");
+    const consensus_types = @import("../../common/consensus/root.zig");
+    const deposit: consensus_types.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(1) },
+        .from = .zero,
+        .to = .create,
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = "needlefish",
+    } };
+    const transaction = deposit.encode_to(storage[128..]);
+    var payload: ssz.ExecutionPayload = .{
+        .version = @import("../p2p/gossip/block.zig").version_at(rollup, now_s),
+        .block_number = 1,
+        .timestamp = now_s,
+        .gas_limit = 30_000_000,
+        .base_fee_per_gas = 1,
+        .transactions = ssz.Transactions.encode(storage[0..128], &.{transaction}),
+    };
+    payload.block_hash = try validity.block_hash(rollup, &payload, beacon_root);
+    return payload;
+}
+
+test "node: receives gossiped unsafe blocks from a p2p peer" {
+    const common_secp256k1 = @import("../../common/crypto/secp256k1/root.zig");
+    var fake: FakeRpc = .{};
+    var harness: Harness = undefined;
+    try harness.init(&fake, 0x9e);
+    defer harness.deinit();
+    var rollup: RollupConfig = .{ .block_time = 2, .l2_chain_id = 901 };
+    rollup.upgrades.set(.ecotone, 0);
+    var sequencer_key: [32]u8 = @splat(0);
+    sequencer_key[31] = 5;
+    const signer: primitives.Address = .{ .bytes = try common_secp256k1.address(sequencer_key) };
+    // The peer: a bare network on its own host that publishes as the sequencer.
+    var peer_io: sim.SimIo = undefined;
+    try sim.SimIo.init(&peer_io, testing.allocator, &harness.world, .{
+        .host = sim.Address.ip4(.{ 10, 0, 0, 9 }, 0),
+    });
+    defer peer_io.deinit();
+    var peer_secret: secp256k1.SecretKey = @splat(0);
+    peer_secret[31] = 4;
+    var peer_prng = std.Random.DefaultPrng.init(4);
+    const peer = try testing.allocator.create(TestNode.Network);
+    defer testing.allocator.destroy(peer);
+    const peer_options = try p2p_options.parse(&.{
+        "--p2p.listen.ip=10.0.0.9",
+        "--p2p.no-discovery",
+    });
+    const peer_random = peer_prng.random();
+    const allocator = testing.allocator;
+    try peer.init(allocator, &peer_io, &rollup, peer_options, peer_secret, signer, peer_random, 4);
+    defer peer.deinit(testing.allocator);
+    _ = try peer.start();
+    const peer_p2p: P2p = .{
+        .options = peer_options,
+        .node_secret = peer_secret,
+        .unsafe_block_signer = signer,
+        .seed = 0,
+    };
+    var enode_text: [256]u8 = undefined;
+    var boot_flag: [300]u8 = undefined;
+    const peer_enode = try enode_of(&enode_text, &peer_p2p);
+    const bootnode = try std.fmt.bufPrint(&boot_flag, "--p2p.bootnodes={s}", .{peer_enode});
+
+    var log_buffer: [8192]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    var node_secret: secp256k1.SecretKey = @splat(0);
+    node_secret[31] = 3;
+    const node = try testing.allocator.create(TestNode);
+    defer testing.allocator.destroy(node);
+    try node.init(testing.allocator, &harness.client_io, &logger, &rollup, .{
+        .l1 = harness.address,
+        .l2 = harness.address,
+        .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
+        .http_client = harness_module.client_options,
+        .p2p = .{
+            .options = try p2p_options.parse(&.{
+                "--p2p.listen.ip=10.0.0.2",
+                "--p2p.no-discovery",
+                bootnode,
+            }),
+            .node_secret = node_secret,
+            .unsafe_block_signer = signer,
+            .seed = 3,
+        },
+    });
+    defer node.deinit();
+    _ = try node.start();
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "enode=") != null);
+    for (0..300) |_| {
+        node.tick();
+        peer.transport.execute_commands();
+        harness.world.run_for_ns(10 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 1), node.network.?.peer_count());
+    var storage: [512]u8 = undefined;
+    const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
+    const now_s = peer_io.now_realtime_ns() / std.time.ns_per_s;
+    const payload = try gossip_payload(&rollup, now_s, &storage, beacon_root);
+    _ = try peer.publish_block(sequencer_key, beacon_root, payload);
+    for (0..100) |_| {
+        node.tick();
+        peer.transport.execute_commands();
+        harness.world.run_for_ns(10 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u64, 1), node.gossip.received);
+    try testing.expectEqual(@as(u64, 0), node.gossip.undecodable);
+    // Startup has not finished (no L1), so the driver does not take the block yet.
+    try testing.expectEqual(@as(u64, 1), node.driver.stats.unsafe_ignored);
+    peer.stop();
+    while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
 }

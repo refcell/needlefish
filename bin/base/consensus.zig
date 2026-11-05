@@ -10,11 +10,14 @@ const io = base.utilities.io;
 const log = base.utilities.log;
 const consensus = base.consensus;
 const Node = consensus.service.Node(io.IO);
+const p2p = consensus.p2p;
+const accounts = base.batcher.devnet.accounts;
 
 const usage =
     \\usage: base consensus --rollup-config ROLLUP.json --l1 URL --l2 URL --l2-jwt FILE
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
+    \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\
 ;
 
@@ -29,7 +32,21 @@ pub const Flags = struct {
     sequencer: bool = false,
     sequencer_key_index: u32 = 0,
     log_level: log.Level = .info,
+    /// Unsafe-block gossip, on unless `--p2p.disabled` (base/base default).
+    p2p_disabled: bool = false,
+    p2p: p2p.options.Options = .{},
 };
+
+const p2p_args_max = 2 * p2p.options.bootnodes_max + 64;
+
+/// How many arguments the `--p2p.*` flag at `args[index]` spans.
+fn p2p_flag_span(args: []const []const u8, index: usize) !usize {
+    const name = args[index]["--p2p.".len..];
+    if (std.mem.indexOfScalar(u8, name, '=') != null) return 1;
+    if (p2p.options.is_bool(name) or std.mem.eql(u8, name, "disabled")) return 1;
+    if (index + 1 == args.len) return error.MissingValue;
+    return 2;
+}
 
 /// Parses `http://a.b.c.d:port` (IPv4 literal only; no DNS).
 pub fn parse_url(text: []const u8) !io.Address {
@@ -87,8 +104,22 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
 
 pub fn parse_flags(args: []const []const u8) !Flags {
     var flags: Flags = .{};
+    var p2p_args: [p2p_args_max][]const u8 = undefined;
+    var p2p_count: usize = 0;
     var index: usize = 0;
     while (index < args.len) {
+        if (std.mem.startsWith(u8, args[index], "--p2p.")) {
+            const span = try p2p_flag_span(args, index);
+            if (std.mem.eql(u8, args[index], "--p2p.disabled")) {
+                flags.p2p_disabled = true;
+            } else {
+                if (p2p_count + span > p2p_args.len) return error.TooManyP2pFlags;
+                @memcpy(p2p_args[p2p_count..][0..span], args[index..][0..span]);
+                p2p_count += span;
+            }
+            index += span;
+            continue;
+        }
         if (apply_switch(&flags, args[index])) {
             index += 1;
             continue;
@@ -100,6 +131,7 @@ pub fn parse_flags(args: []const []const u8) !Flags {
     if (flags.rollup_config == null) return error.MissingRollupConfig;
     if (flags.l1 == null or flags.l2 == null) return error.MissingEndpoint;
     if (flags.l2_jwt == null) return error.MissingJwt;
+    flags.p2p = try p2p.options.parse(p2p_args[0..p2p_count]);
     return flags;
 }
 
@@ -132,6 +164,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .sink = log.stderr_sink(),
         .time = .{ .context = &os_io, .now_ns = now_ns },
     };
+    const p2p_config = try p2p_settings(init, &flags, &logger);
     const node = try init.gpa.create(Node);
     defer init.gpa.destroy(node);
     try node.init(init.gpa, &os_io, &logger, &rollup, .{
@@ -143,6 +176,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .sequencer = flags.sequencer,
         .driver = .{ .sequencer = flags.sequencer },
         .version = base.build_options.version,
+        .p2p = p2p_config,
     });
     defer node.deinit();
     _ = try node.start();
@@ -154,6 +188,41 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         node.tick();
         try os_io.run_for_ns(10 * std.time.ns_per_ms);
     }
+}
+
+/// The gossip setup, or null when disabled or no unsafe block signer is known (verifiers
+/// need `--p2p.unsafe.block.signer`; a sequencer signs with its own key).
+fn p2p_settings(
+    init: std.process.Init,
+    flags: *const Flags,
+    logger: *log.Logger,
+) !?consensus.service.node.P2p {
+    if (flags.p2p_disabled) return null;
+    const sequencer_key: ?[32]u8 = if (flags.sequencer)
+        accounts.derive_dev(flags.sequencer_key_index).private_key
+    else
+        null;
+    const own_signer = if (sequencer_key) |key| accounts.address_of(key) else null;
+    const signer = flags.p2p.unsafe_block_signer orelse own_signer orelse {
+        logger.log(.warn, "consensus", "p2p disabled: no --p2p.unsafe.block.signer", .{});
+        return null;
+    };
+    var key_buffer: [256]u8 = undefined;
+    const key_file = if (flags.p2p.priv_path) |path|
+        try Io.Dir.cwd().readFile(init.io, path, &key_buffer)
+    else
+        null;
+    var seed_bytes: [8]u8 = undefined;
+    init.io.random(&seed_bytes);
+    const seed = std.mem.readInt(u64, &seed_bytes, .little);
+    var prng = std.Random.DefaultPrng.init(seed);
+    return .{
+        .options = flags.p2p,
+        .node_secret = try p2p.network.node_secret(&flags.p2p, key_file, prng.random()),
+        .unsafe_block_signer = signer,
+        .sequencer_key = sequencer_key,
+        .seed = seed,
+    };
 }
 
 test "consensus: flags" {
@@ -168,6 +237,23 @@ test "consensus: flags" {
     try std.testing.expectEqual(@as(u16, 9551), flags.l2.?.port);
     try std.testing.expectEqual(@as(u16, 7545), flags.rpc_port);
     try std.testing.expectError(error.MissingRollupConfig, parse_flags(&.{}));
+    const required = [_][]const u8{
+        "--rollup-config", "r.json", "--l1", "http://127.0.0.1:1", "--l2", "http://127.0.0.1:2",
+        "--l2-jwt",        "j",
+    };
+    const with_p2p = try parse_flags(&(required ++ [_][]const u8{
+        "--p2p.listen.tcp", "9300", "--p2p.no-discovery", "--p2p.listen.udp=9301",
+    }));
+    try std.testing.expect(!with_p2p.p2p_disabled);
+    try std.testing.expectEqual(@as(u16, 9300), with_p2p.p2p.listen_tcp);
+    try std.testing.expectEqual(@as(u16, 9301), with_p2p.p2p.listen_udp);
+    try std.testing.expect(with_p2p.p2p.no_discovery);
+    const disabled = try parse_flags(&(required ++ [_][]const u8{"--p2p.disabled"}));
+    try std.testing.expect(disabled.p2p_disabled);
+    try std.testing.expectError(
+        error.MissingValue,
+        parse_flags(&(required ++ [_][]const u8{"--p2p.listen.tcp"})),
+    );
     try std.testing.expectError(error.UnknownFlag, parse_flags(&.{ "--nope", "1" }));
     try std.testing.expectError(error.UnsupportedUrl, parse_url("https://127.0.0.1:1"));
     try std.testing.expectError(error.MissingPort, parse_url("http://127.0.0.1"));

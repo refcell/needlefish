@@ -82,7 +82,7 @@ const bool_flags = [_][]const u8{
     "no-discovery", "scoring.topics", "topic-scoring", "ban.peers", "no-bootstore",
 };
 
-fn is_bool(name: []const u8) bool {
+pub fn is_bool(name: []const u8) bool {
     for (bool_flags) |flag| if (std.mem.eql(u8, flag, name)) return true;
     return false;
 }
