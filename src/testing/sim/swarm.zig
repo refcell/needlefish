@@ -12,15 +12,143 @@ const Prng = @import("../prng.zig").Prng;
 const cluster_module = @import("cluster.zig");
 const Config = cluster_module.Config;
 const Cluster = cluster_module.Cluster;
+const network_module = @import("network.zig");
 
-/// Seeds that once failed, kept forever as regression tests. Append on every fix.
-/// They are tied to `Config.random`: when config generation changes, a seed maps to a
-/// new config and only keeps value as extra coverage.
-pub const regression_seeds = [_]u64{
-    56, // Checkpoint restored safe head without the matching L1 block hash.
-    1275, 2506, // Rewind restored a safe head above the post-restart unsafe head.
-    3426, 4530, // Clamping that safe head instead left a derivation gap.
+pub const Regression = struct { seed: u64, config: Config };
+
+/// Seeds that once failed, kept forever as regression tests. Append on every fix:
+/// `just sim-minimize SEED` prints a ready-to-paste entry. Pinning the config keeps the
+/// failing scenario even when `Config.random` changes.
+pub const regressions = [_]Regression{
+    // Checkpoint restored safe head without the matching L1 block hash.
+    .{ .seed = 56, .config = .{
+        .verifier_count = 5,
+        .network = .{
+            .latency_ns_min = 13000000,
+            .latency_ns_max = 296000000,
+            .drop_ppm = 116261,
+            .duplicate_ppm = 104417,
+            .capacity = 4096,
+        },
+        .l2_block_time_ns = 2000000000,
+        .l1_block_time_ns = 12000000000,
+        .fault_end_ns = 600000000000,
+        .production_end_ns = 660000000000,
+        .settle_end_ns = 960000000000,
+        .crashes_per_minute = 2,
+        .partitions_per_minute = 3,
+        .disk_fault_ppm = 313460,
+        .downtime_ns_max = 116000000000,
+        .l1_reorgs_per_minute = 2,
+        .clock_skew_ns_max = 0,
+    } },
+    // Rewind restored a safe head above the post-restart unsafe head.
+    .{ .seed = 1275, .config = .{
+        .verifier_count = 1,
+        .network = .{
+            .latency_ns_min = 35000000,
+            .latency_ns_max = 281000000,
+            .drop_ppm = 0,
+            .duplicate_ppm = 191331,
+            .capacity = 4096,
+        },
+        .l2_block_time_ns = 2000000000,
+        .l1_block_time_ns = 12000000000,
+        .fault_end_ns = 600000000000,
+        .production_end_ns = 660000000000,
+        .settle_end_ns = 960000000000,
+        .crashes_per_minute = 6,
+        .partitions_per_minute = 3,
+        .disk_fault_ppm = 469070,
+        .downtime_ns_max = 67000000000,
+        .l1_reorgs_per_minute = 3,
+        .clock_skew_ns_max = 21000000000,
+    } },
+    // Same as 1275.
+    .{ .seed = 2506, .config = .{
+        .verifier_count = 4,
+        .network = .{
+            .latency_ns_min = 43000000,
+            .latency_ns_max = 246000000,
+            .drop_ppm = 137563,
+            .duplicate_ppm = 188440,
+            .capacity = 4096,
+        },
+        .l2_block_time_ns = 2000000000,
+        .l1_block_time_ns = 12000000000,
+        .fault_end_ns = 600000000000,
+        .production_end_ns = 660000000000,
+        .settle_end_ns = 960000000000,
+        .crashes_per_minute = 6,
+        .partitions_per_minute = 4,
+        .disk_fault_ppm = 56631,
+        .downtime_ns_max = 8000000000,
+        .l1_reorgs_per_minute = 2,
+        .clock_skew_ns_max = 17000000000,
+    } },
+    // Clamping that safe head instead left a derivation gap.
+    .{ .seed = 3426, .config = .{
+        .verifier_count = 5,
+        .network = .{
+            .latency_ns_min = 10000000,
+            .latency_ns_max = 403000000,
+            .drop_ppm = 277617,
+            .duplicate_ppm = 0,
+            .capacity = 4096,
+        },
+        .l2_block_time_ns = 2000000000,
+        .l1_block_time_ns = 12000000000,
+        .fault_end_ns = 600000000000,
+        .production_end_ns = 660000000000,
+        .settle_end_ns = 960000000000,
+        .crashes_per_minute = 6,
+        .partitions_per_minute = 0,
+        .disk_fault_ppm = 459539,
+        .downtime_ns_max = 71000000000,
+        .l1_reorgs_per_minute = 2,
+        .clock_skew_ns_max = 20000000000,
+    } },
+    // Same as 3426.
+    .{ .seed = 4530, .config = .{
+        .verifier_count = 2,
+        .network = .{
+            .latency_ns_min = 25000000,
+            .latency_ns_max = 255000000,
+            .drop_ppm = 178525,
+            .duplicate_ppm = 19170,
+            .capacity = 4096,
+        },
+        .l2_block_time_ns = 2000000000,
+        .l1_block_time_ns = 12000000000,
+        .fault_end_ns = 600000000000,
+        .production_end_ns = 660000000000,
+        .settle_end_ns = 960000000000,
+        .crashes_per_minute = 4,
+        .partitions_per_minute = 0,
+        .disk_fault_ppm = 455717,
+        .downtime_ns_max = 28000000000,
+        .l1_reorgs_per_minute = 2,
+        .clock_skew_ns_max = 0,
+    } },
 };
+
+/// Print `config` as a Zig `Regression` literal for `regressions`.
+pub fn print_regression(seed: u64, config: Config) void {
+    std.debug.print("    .{{ .seed = {d}, .config = .{{\n", .{seed});
+    inline for (@typeInfo(Config).@"struct".field_names) |name| {
+        const value = @field(config, name);
+        if (@TypeOf(value) == network_module.Config) {
+            std.debug.print("        .network = .{{\n", .{});
+            inline for (@typeInfo(network_module.Config).@"struct".field_names) |inner| {
+                std.debug.print("            .{s} = {d},\n", .{ inner, @field(value, inner) });
+            }
+            std.debug.print("        }},\n", .{});
+        } else {
+            std.debug.print("        .{s} = {d},\n", .{ name, value });
+        }
+    }
+    std.debug.print("    }} }},\n", .{});
+}
 
 pub const Outcome = enum { ok, safety, liveness };
 
@@ -114,10 +242,9 @@ pub fn minimize(allocator: std.mem.Allocator, seed: u64, config: Config) !Config
     return best;
 }
 
-test "swarm: regression seeds" {
-    for (regression_seeds) |seed| {
-        const outcome = try run_config(std.testing.allocator, seed, config_for_seed(seed));
-        if (outcome != .ok) std.debug.print("swarm: regression seed {d} failed\n", .{seed});
+test "swarm: pinned regressions" {
+    for (regressions) |regression| {
+        const outcome = try run_config(std.testing.allocator, regression.seed, regression.config);
         try std.testing.expectEqual(Outcome.ok, outcome);
     }
 }

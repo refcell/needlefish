@@ -12,13 +12,21 @@ provably robust.
 - [x] Bench harness in `bench_main.zig` (filterable, ns/op, throughput) and perf tracking file `docs/PERF.md`.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
+## Notes for other lanes (from simulator findings)
+- consensus (derivation): a durable checkpoint of (safe head, L1 cursor) must also name the
+  hash of the L1 block it reflects, and per-L1-block records written later can be newer than
+  the checkpoint after a lost write. Restore both from the checkpoint on restart.
+- After restart, a rewind on an L1 reorg can land on a record whose safe head is above the
+  restored unsafe head; take those blocks back from disk instead of clamping (clamping
+  leaves a gap that derivation never fills).
+
 ## Decisions
 - Cross-lane fuzz targets live in `src/testing/fuzz_targets.zig` (our lane) so we never
   edit other lanes' files to add them. They test properties (canonical round trip,
   model equivalence, tamper resistance), not just "does not crash".
 - Swarm runs in-process (`simulator swarm FIRST COUNT`), ~1 ms/seed in ReleaseSafe.
-  Failing seeds: `just sim-minimize SEED`, fix, then append to
-  `sim/swarm.zig:regression_seeds`.
+  Failing seeds: `just sim-minimize SEED`, fix, then paste the printed entry into
+  `sim/swarm.zig:regressions` (seed + full config, so it survives `Config.random` changes).
 - `tidy` enforces fn length ≤ 70 via `etc/scripts/fn-length.awk` (relies on zig fmt
   indentation). Generic type constructors (`fn X(...) type {`) are exempt: they are struct
   definitions. Assert density is a report only (`just assert-density`), never a gate.

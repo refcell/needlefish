@@ -4,6 +4,7 @@
 //!   zig build sim -- [seed]              run one seed (random seed if omitted)
 //!   zig build sim -- swarm FIRST COUNT   run seeds FIRST..FIRST+COUNT-1 in-process
 //!   zig build sim -- minimize SEED       shrink a failing seed's config
+//!   zig build sim -- regression SEED     print SEED's config as a regression entry
 //!
 //! Runs the cluster (L1, sequencer, batcher, verifiers) on simulated time and network
 //! with fault injection, driven by one seed. Same seed, same run. Exits non-zero on
@@ -25,6 +26,11 @@ pub fn main(init: std.process.Init) !void {
         if (result.failed > 0) std.process.exit(1);
         return;
     }
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "regression")) {
+        const seed = try std.fmt.parseInt(u64, args[2], 10);
+        sim.swarm.print_regression(seed, sim.swarm.config_for_seed(seed));
+        return;
+    }
     if (args.len >= 3 and std.mem.eql(u8, args[1], "minimize")) {
         const seed = try std.fmt.parseInt(u64, args[2], 10);
         const config = sim.swarm.config_for_seed(seed);
@@ -35,6 +41,8 @@ pub fn main(init: std.process.Init) !void {
         const minimized = try sim.swarm.minimize(init.gpa, seed, config);
         std.debug.print("minimize: seed={d}\n", .{seed});
         print_config(minimized);
+        std.debug.print("regression entry for src/testing/sim/swarm.zig:\n", .{});
+        sim.swarm.print_regression(seed, minimized);
         return;
     }
     const seed: u64 = if (args.len > 1)
