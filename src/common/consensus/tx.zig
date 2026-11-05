@@ -10,7 +10,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const primitives = @import("../primitives/root.zig");
 const rlp = @import("../rlp/root.zig");
-const keccak = @import("../crypto/keccak.zig");
 const fields = @import("tx_fields.zig");
 const signature_module = @import("signature.zig");
 const Address = primitives.Address;
@@ -237,23 +236,7 @@ fn decode_legacy(input: []const u8) DecodeError!Signed(Legacy) {
     };
 }
 
-/// Feeds encoded bytes into a keccak hasher.
-pub const KeccakSink = struct {
-    hasher: keccak.Hasher = .{},
-
-    fn write(context: *anyopaque, data: []const u8) void {
-        const sink: *KeccakSink = @ptrCast(@alignCast(context));
-        sink.hasher.update(data);
-    }
-
-    pub fn encoder(sink: *KeccakSink) Encoder {
-        return Encoder.init_sink(.{ .context = sink, .write = write });
-    }
-
-    pub fn final(sink: *KeccakSink) B256 {
-        return .{ .bytes = sink.hasher.final() };
-    }
-};
+pub const KeccakSink = @import("hashing.zig").KeccakSink;
 
 /// A signed transaction (or deposit) in any supported EIP-2718 type.
 pub const Envelope = union(TxType) {

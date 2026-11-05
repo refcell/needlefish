@@ -10,7 +10,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [ ] EIP-4844 pooled/network form with sidecar (blobs, commitments, proofs; EIP-7594 wrapper version), EIP-2718 pooled tx decoding for txpool/RPC.
 - [ ] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
 - [ ] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
-- [ ] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
+- [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
 - [ ] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
 - [ ] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
 - [ ] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
@@ -28,9 +28,13 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   as a fallback until the crypto lane ships ecrecover; hot paths take a `Recoverer` fn pointer.
 - EIP-1559 base fee and blob gas math live in `execution/chainspec` (node lane landed them
   first); this lane does not duplicate them.
+- Receipts support EIP-658 status only (no pre-Byzantium state root): every chain we run is
+  post-merge.
+- Tx/receipt/withdrawal roots call the trie lane's `ordered_trie_root` with caller scratch.
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
 - 2026-11-05: consensus tx types + envelope, signatures, recovery; EIP-155 and Base deposit vectors.
+- 2026-11-05: header/receipts/logs/withdrawals/block/body, roots, EIP-7685; mainnet genesis + Cancun/Prague block vectors.

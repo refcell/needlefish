@@ -6,6 +6,10 @@ const std = @import("std");
 pub const signature = @import("signature.zig");
 pub const tx_fields = @import("tx_fields.zig");
 pub const tx = @import("tx.zig");
+pub const hashing = @import("hashing.zig");
+pub const header = @import("header.zig");
+pub const receipt = @import("receipt.zig");
+pub const block = @import("block.zig");
 
 pub const Signature = signature.Signature;
 pub const Recoverer = signature.Recoverer;
@@ -24,6 +28,13 @@ pub const Eip7702 = tx.Eip7702;
 pub const Deposit = tx.Deposit;
 pub const Envelope = tx.Envelope;
 pub const Signed = tx.Signed;
+pub const Header = header.Header;
+pub const Receipt = receipt.Receipt;
+pub const Log = receipt.Log;
+pub const Logs = receipt.Logs;
+pub const Block = block.Block;
+pub const Body = block.Body;
+pub const Withdrawal = block.Withdrawal;
 
 test {
     std.testing.refAllDecls(@This());
