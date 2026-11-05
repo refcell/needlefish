@@ -40,6 +40,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   witness-only re-execution root == stored root (base/base `witness_differential`).
   (historical half done in `db/history_test.zig`; witness-only changeset replay root == full
   root in `db/witness_test.zig`; EVM re-execution over `SparseState` pending a block executor)
+- [ ] Witness entry point for the node: move the durable database to the block's parent
+  (`set_head`, no re-journal), wrap the evm Database with `witness.Recorder`, run the caller's
+  executor (`node.Executor.execute_block` over the recorded database), build the witness,
+  restore the head. Bounded scratch; refuses blocks outside retention.
+- [ ] `debug_executionWitness(block)` handler in `rpc/debug.zig` (small additive integration
+  edit in the rpc lane) returning `{state, codes, keys, headers}` as hex arrays.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
