@@ -19,7 +19,7 @@ behind a small interface and switch later.
   (libp2p multihash of secp256k1 pubkey, base58), multiaddr encode/decode, boot node
   lists for Base mainnet/sepolia (public, from base/base `boot.rs`), node key load/gen.
   Vectors from EIP-778 + fuzz all decoders.
-- [ ] `peers`: bounded peer store, peer scoring params (port `score.rs`: topic params
+- [x] `peers`: bounded peer store, peer scoring params (port `score.rs`: topic params
   from block time, thresholds, decay), connection gater (ip/subnet bans, dial limits;
   port `gater.rs`/`gate.rs`).
 - [x] `disc`: discv5 wire protocol: packet masking (AES-CTR), header, ordinary /
@@ -32,9 +32,12 @@ behind a small interface and switch later.
   SHA256, libp2p signed static key payload), yamux framing + flow control (bounded
   streams/windows), TCP transport over utilities/io. Interop vectors; fuzz each codec.
 - [ ] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
-- [ ] `gossip`: gossipsub v1.1 (protobuf RPC codec written by hand [done: `gossip/rpc.zig`], mesh maintenance,
+- [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
-  OP Stack message id (sha256 of domain + snappy-decoded payload).
+  OP Stack message id (sha256 of domain + snappy-decoded payload) [id: block worker].
+- [ ] `gossip`: router follow-ups: score retention across reconnects (`retain_score`),
+  outbound mesh quota (D_out), IWANT retransmission limit, IDONTWANT (v1.2), peer
+  exchange on PRUNE (disabled in base/base, so low priority).
 - [ ] `gossip`: snappy block-format codec (own implementation, fuzzed round trip) [done],
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
@@ -75,6 +78,30 @@ behind a small interface and switch later.
 - Snappy/protobuf varints accept non-minimal encodings like reference decoders;
   multiaddr/ENR varints stay strict.
 
+- Peer scoring params mirror base/base `score.rs` exactly, including its decay formula
+  `(1 - 0.01)^(1/n)`, which shrinks counters to 99% (not 1%) per decay period; op-node
+  uses `0.01^(1/n)`. We follow base/base (rule 7); revisit if base/base changes.
+- Boot store: FIFO-evicting ring of ENRs (2048), JSON array of `enr:` strings like
+  base/base; undecodable entries skipped on load. Library code never opens files.
+- Gater: fixed-capacity sets; `peer_redialing = null` means any redial within the dial
+  period (1 h) is refused (base/base default); protected peers bypass the redial limit.
+  DNS multiaddrs are allowed outbound unresolved, inbound needs an IP.
+- `PeerId` zero-fills bytes past `length` so struct equality agrees with `eql`.
+- Gossip router: IO-free; peers are slots 0..63 with `u64` bitset peer sets; transport
+  pulls framed RPCs via `drain(slot, buffer)` (backpressure for free). Config matches
+  base/base (D 8/6/12, Dlazy 6, 500 ms heartbeat, mcache 12/3, seen TTL 65 s, flood
+  publish off, anonymous messages). Messages are forwarded only after the app's
+  `validate` (accept/reject/ignore). Without a mesh, publish goes to up to D topic
+  peers above the publish threshold (no persistent fanout map). One IWANT promise per
+  IHAVE (random id), like libp2p. Graylisted peers' RPCs are dropped. Slow peers drop
+  their oldest queued message (queue 256, base/base `MAX_OUTBOUND_QUEUE`).
+- Seen cache: open addressing + backward-shift deletion + insertion FIFO; when full it
+  evicts the oldest early (costs a re-validation, never correctness).
+- Message cache: FIFO byte arena allocated once (64 MiB default); arena pressure evicts
+  the oldest message. Lookup is linear (1024 entries); index it if profiling says so.
+- Test time: the 16-node discv5 sim takes ~70 s in Debug, so `zig build test` runs a
+  6-node variant (<2 s) and the large one needs `-Dslow-tests` (build option added).
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -84,3 +111,8 @@ behind a small interface and switch later.
 - 2026-11-05: `gossip` snappy block codec and gossipsub protobuf RPC codec (worker).
 - 2026-11-05: `disc` routing table, session cache, lookups, discovery service; 16-node
   seeded simulation converges through one boot node.
+- 2026-11-05: `peers` scoring params, boot store, connection gater.
+- 2026-11-05: `gossip` seen cache, message cache, peer-score counters, and gossipsub
+  router; 20-node seeded cluster delivers every message deterministically, attacker
+  publishing invalid blocks is scored negative and pruned, IHAVE/IWANT path tested.
+- 2026-11-05: shrank discv5 cluster test (73 s -> <2 s); large run behind -Dslow-tests.
