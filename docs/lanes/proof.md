@@ -37,13 +37,14 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   frames signed to the inbox on L1, everything served through the host handler from an
   empty store; the client derives + executes to the claim and matches the node's output
   root (`client/e2e_test.zig`).
-- [ ] `proof/e2e-2`: extend the e2e: epoch change across L1 blocks, span batches, blob
+- [x] `proof/e2e-2`: extend the e2e: epoch change across L1 blocks, span batches, blob
   batches (l1-blob through the host), a Holocene deposit-only retry (invalid user tx in a
-  batch), and intermediate output roots (boot key 9).
+  batch).
+- [ ] `proof/e2e-3`: e2e intermediate output roots (boot key 9); a host witness for the
+  attempted payload, so a deposit-only retry can follow valid user txs that read state.
 - [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
-  canonical archive, offline replay. Left: the RPC-backed `Source` (L1/L2 execution
-  RPC + beacon blobs + `debug_executePayload` witness) and a server loop over fds for a
-  separate client process.
+  canonical archive, offline replay, JSON-RPC source. Left: beacon blobs in the RPC
+  source and a server loop over fds for a separate client process.
 - [ ] `bin/base proof`: `replay <archive>` done. Left: `run` (native mode against
   devnet RPCs for an L2 block) that records the archive.
 - [ ] `proof/rpc` + `proof/contracts`: typed L1/L2/rollup clients with caching, ABI
@@ -120,6 +121,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - 2026-11-05: host: RPC-backed source over the node's debug endpoints (SimIo HTTP test).
 - 2026-11-05: `base proof replay <archive>`: offline client run over a recorded archive.
 - 2026-11-05: host: canonical preimage archive for record/replay (strict decoder, fuzz).
+- 2026-11-05: `proof/e2e-2` landed: e2e scenarios for an epoch change, span batches
+  (also across the epoch change), blob-carried frames (real KZG commitment, host
+  `l1-blob`), and a Holocene deposit-only retry (fee cap below base fee, rejected
+  before state reads; the fixture serves one witness per parent, the node's
+  deposit-only block's, so the invalid tx goes first in its batch).
 - 2026-11-05: `proof/e2e` landed: real derive + execute of 3 L2 blocks through the host.
 - 2026-11-05: host: hint handler over a chain `Source` (headers, list tries, blobs,
   code/state nodes, payload witness); providers served from an empty store in tests.
