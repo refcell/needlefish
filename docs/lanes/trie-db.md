@@ -25,9 +25,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
   (vs 2 ms for 1k accounts alone). Profile storage trie rehash/creation and fix.
   (10.3 -> 7.9 ms; the rest is real trie work, docs/PERF.md)
-- [ ] Parallel storage-trie rehash: in a storage-heavy block, hashing dirty storage tries
+- [x] Parallel storage-trie rehash: in a storage-heavy block, hashing dirty storage tries
   (~2.4 ms) and the account trie (~1.8 ms) is now over half the block. Split the dirty storage
   roots across worker threads (one pool, disjoint subtries).
+  (`rehash_threads`, default 0; db/block 8.05 -> 6.87 ms at 4 threads, docs/PERF.md)
 - [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
 - [x] Compact node layout (packed paths, per-kind body, cached refs out of line).
@@ -136,6 +137,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   writes); record results.
 - [ ] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
   hit/miss latency on 100k accounts and the overlay read path; compare with trie `get`.
+- [ ] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
+  sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -149,8 +152,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - Public TrieTests JSON vectors committed under `trie/testdata/` (small, public).
 - One trie pool hosts many roots (`*_in` APIs): all storage tries share a pool sized at init.
 - `StateTrie` takes hashed keys; writes mark accounts dirty, `root()` rehashes dirty storage
-  tries and applies dirty accounts sorted. Single-threaded for now; parallel subtrie hashing
-  only once benchmarks show hashing dominates block time.
+  tries and applies dirty accounts sorted.
+- Parallel storage rehash (`StateTrie.Config.rehash_threads`, `db.state.Config`): default 0,
+  so DST, the simulator and tests not asking for it stay single-threaded. With N > 0 a static
+  pool (`trie/rehash_pool.zig`) is spawned at init and sleeps on a futex (`std.Io.Threaded`'s
+  OS futex, synchronization rather than I/O). `flush` collects dirty nodes serially (per-trie
+  end offsets, change marks), splits them at trie boundaries into <= 4 chunks per thread
+  (cap 64, the bounded queue), and caller + workers claim chunks from a
+  `generation << 32 | index` counter, then join before applying accounts and hashing the
+  account trie. A chunk holds whole storage tries, so a worker writes only its chunk's
+  `order` slice and its nodes' caches, with batch buffers on its own stack; results are
+  bit-identical for any split. Fewer than 1024 dirty nodes hash on the caller. Claimed
+  chunks, not one static range per thread: on a loaded machine workers lagged 3-4x behind
+  the caller's share. The account trie and the collect walk stay serial.
 - State provider (`db/state.zig`, `db/overlay.zig`): committed state is flat hash tables
   (EVM reads) mirrored into `StateTrie` (roots). Reads follow revm `Database`: `basic`,
   `storage`, `code_by_hash`, `block_hash` (256-entry ring). The EVM lane can adapt its Host
@@ -680,3 +694,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   the window reaches `max(head - window + 1, retention floor)`, proofs at every block of it
   verify against the stored roots and equal the pre-crash proofs; rebuild off restarts at the
   head; history off serves only the head. ~0.9 s Debug for the history test group.
+- 2026-11-05: parallel storage-trie rehash: `rehash_threads` (default 0) static pool, chunks
+  of whole tries claimed by caller + workers, joined before the account trie. trie/storage 4k
+  slots 3.40 -> 2.37 ms (4 threads), db/block 8.05 -> 6.87 ms, db/commit sim cpu p50
+  ~8.2 -> ~6.9 ms (medians, load 25-60 on 14 cores). Seeded differential (caches, roots,
+  change marks; threads 3-4 vs 0, incl. deletions, wipes, early flushes) and a fuzz.

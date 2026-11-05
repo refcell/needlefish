@@ -5,6 +5,8 @@
 //! Writes only mark accounts dirty. `root` then rehashes the storage tries of dirty accounts,
 //! re-encodes those accounts, applies them to the account trie in sorted key order (adjacent
 //! paths share cached nodes and cache lines), and rehashes only the dirty paths.
+//! With `Config.rehash_threads` > 0 the dirty storage tries are hashed on a static thread
+//! pool (`rehash_pool.zig`), bit-identical to the serial path; zero (DST) stays serial.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -12,12 +14,23 @@ const assert = std.debug.assert;
 const rlp = @import("../../common/rlp/root.zig");
 const node = @import("node.zig");
 const trie_module = @import("trie.zig");
+const rehash_pool = @import("rehash_pool.zig");
 const Hash = node.Hash;
 
 /// Longest account encoding: list header, nonce, balance, storage root, code hash.
 pub const account_rlp_bytes_max = 2 + 9 + 33 + 33 + 33;
 const AccountTrie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 112 });
 const StorageTrie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 33 });
+const RehashPool = rehash_pool.RehashPoolType(StorageTrie);
+
+/// Upper bound on `Config.rehash_threads`.
+pub const rehash_threads_max = rehash_pool.threads_max;
+/// Chunks per thread (caller included) in a parallel rehash: enough that a late or slow
+/// thread takes fewer, few enough that each chunk still fills hash batches.
+const rehash_chunks_per_thread = 4;
+/// Flushes with fewer dirty storage nodes rehash on the calling thread: waking the workers
+/// costs more than it saves. Results do not depend on it.
+pub const rehash_parallel_nodes_min_default = 1024;
 
 comptime {
     assert(account_rlp_bytes_max <= 112);
@@ -35,6 +48,12 @@ pub const Config = struct {
     storage_nodes_max: u32,
     /// Accounts touched between flushes. A full list flushes early; it never fails.
     dirty_accounts_max: u32 = 4096,
+    /// Worker threads that rehash dirty storage tries in `flush`, besides the caller. Zero
+    /// (DST, the simulator) keeps everything on the calling thread. Roots are identical for
+    /// any count.
+    rehash_threads: u32 = 0,
+    /// Fewer dirty storage nodes than this rehash serially even with workers (tests set 0).
+    rehash_parallel_nodes_min: u32 = rehash_parallel_nodes_min_default,
 };
 
 pub const Error = error{ TrieFull, AccountsFull, UnknownAccount };
@@ -76,10 +95,16 @@ pub const StateTrie = struct {
     dirty_len: u32 = 0,
     /// Storage roots of dirty accounts, rehashed together so their nodes share hash batches.
     storage_roots: []StorageTrie.NodeIndex,
+    /// End offset of each storage root's dirty nodes in `storage.order` (parallel rehash).
+    storage_root_ends: []u32,
+    /// Workers for the parallel storage rehash; null when `rehash_threads` is zero.
+    rehash_pool: ?*RehashPool,
+    rehash_parallel_nodes_min: u32,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateTrie {
         assert(config.accounts_max > 0);
         assert(config.dirty_accounts_max > 0);
+        assert(config.rehash_threads <= rehash_threads_max);
         var accounts = try AccountTrie.init(allocator, config.account_nodes_max);
         errdefer accounts.deinit(allocator);
         var storage = try StorageTrie.init(allocator, config.storage_nodes_max);
@@ -90,6 +115,16 @@ pub const StateTrie = struct {
         const dirty = try allocator.alloc(Hash, config.dirty_accounts_max);
         errdefer allocator.free(dirty);
         const storage_roots = try allocator.alloc(StorageTrie.NodeIndex, config.dirty_accounts_max);
+        errdefer allocator.free(storage_roots);
+        const storage_root_ends = try allocator.alloc(u32, config.dirty_accounts_max);
+        errdefer allocator.free(storage_root_ends);
+        var pool: ?*RehashPool = null;
+        if (config.rehash_threads > 0) {
+            const created = try allocator.create(RehashPool);
+            errdefer allocator.destroy(created);
+            try created.init(config.rehash_threads);
+            pool = created;
+        }
         return .{
             .accounts = accounts,
             .storage = storage,
@@ -97,10 +132,18 @@ pub const StateTrie = struct {
             .accounts_max = config.accounts_max,
             .dirty = dirty,
             .storage_roots = storage_roots,
+            .storage_root_ends = storage_root_ends,
+            .rehash_pool = pool,
+            .rehash_parallel_nodes_min = config.rehash_parallel_nodes_min,
         };
     }
 
     pub fn deinit(self: *StateTrie, allocator: std.mem.Allocator) void {
+        if (self.rehash_pool) |pool| {
+            pool.deinit();
+            allocator.destroy(pool);
+        }
+        allocator.free(self.storage_root_ends);
         allocator.free(self.storage_roots);
         allocator.free(self.dirty);
         self.entries.deinit(allocator);
@@ -244,7 +287,57 @@ pub const StateTrie = struct {
             count += 1;
         }
         assert(count <= dirty.len);
-        self.storage.update_caches(self.storage_roots[0..count]);
+        const roots = self.storage_roots[0..count];
+        if (self.rehash_pool) |pool| {
+            self.update_storage_caches_parallel(pool, roots);
+        } else {
+            self.storage.update_caches(roots);
+        }
+        for (roots) |index| assert(self.storage.cache[index].len > 0);
+    }
+
+    /// Collects the dirty storage nodes once, splits them at trie boundaries into chunks of
+    /// about equal node count, and hashes the chunks on the pool.
+    fn update_storage_caches_parallel(
+        self: *StateTrie,
+        pool: *RehashPool,
+        roots: []const StorageTrie.NodeIndex,
+    ) void {
+        assert(roots.len <= self.storage_root_ends.len);
+        const ends = self.storage_root_ends[0..roots.len];
+        const total = self.storage.collect_dirty_split(roots, ends);
+        const order = self.storage.order[0..total];
+        if (total == 0 or total < self.rehash_parallel_nodes_min) {
+            if (total > 0) self.storage.hash_collected(order);
+            return;
+        }
+        var ranges: [rehash_pool.chunks_max][]u64 = undefined;
+        const chunks = (pool.thread_count + 1) * rehash_chunks_per_thread;
+        const parts = @min(chunks, rehash_pool.chunks_max);
+        split_ranges(order, ends, ranges[0..parts]);
+        pool.run(&self.storage, ranges[0..parts]);
+    }
+
+    /// Splits `order` into `ranges.len` contiguous ranges of about `order.len / ranges.len`
+    /// nodes each, cut only at the trie boundaries `ends` (sorted end offsets).
+    fn split_ranges(order: []u64, ends: []const u32, ranges: [][]u64) void {
+        assert(ranges.len > 0);
+        assert(ends.len == 0 or ends[ends.len - 1] == order.len);
+        const total: u64 = order.len;
+        var root_index: usize = 0;
+        var start: u32 = 0;
+        for (ranges, 0..) |*range, part| {
+            var end: u32 = @intCast(order.len);
+            if (part + 1 < ranges.len) {
+                const target = total * (part + 1) / ranges.len;
+                while (root_index < ends.len and ends[root_index] < target) root_index += 1;
+                end = if (root_index < ends.len) ends[root_index] else end;
+                end = @max(end, start);
+            }
+            range.* = order[start..end];
+            start = end;
+        }
+        assert(start == order.len);
     }
 
     /// Applies every dirty account to the account trie without hashing the account trie.

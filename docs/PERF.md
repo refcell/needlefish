@@ -272,6 +272,35 @@ up to ±15%).
 | trie/ordered root 200x200B | 73 308 | 73 874 | noise |
 | trie/state block 1k accounts | 1 653 791 | 1 627 583 | noise |
 
+## 2026-11-05 trie parallel storage rehash (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
+
+`StateTrie.Config.rehash_threads` (also `db.state.Config.rehash_threads`; default 0) starts
+a static pool at init. `flush` collects the dirty storage nodes serially (per-trie offsets,
+change marks), splits them at trie boundaries into up to 4 chunks per thread (cap 64), and
+the caller and workers claim chunks from one generation-tagged counter. Workers write only the
+caches of their chunk's nodes; roots, caches and change marks are bit-identical to serial
+(seeded differential threads 3-4 vs 0, plus a fuzz). The account trie still hashes serially
+after the join.
+
+Load average 25-60 on 14 cores during every run, so medians of interleaved runs:
+
+| Case (threads) | 0 | 2 | 4 | 8 | Runs |
+| --- | ---: | ---: | ---: | ---: | --- |
+| trie/storage 4k slots (new case) | 3.40 ms | 2.57 ms | 2.37 ms | 2.28 ms | 9 (0: 3.19-3.74, 4: 1.91-2.98) |
+| db/block 1k acct+4k slot apply+root | 8.05 ms | 7.05 ms | 6.87 ms | 6.89 ms | 7 (0: 7.92-8.50, 4: 6.74-7.19) |
+| db/commit sim cpu p50 | 8.08-8.27 ms | | 6.68-7.21 ms | | 3 each |
+
+`trie/storage` = 1k contracts x 64 slots, a block writes 4k random slots (precomputed key
+hashes) then takes the root: ~9.8k dirty storage nodes per block, about 0.9 ms of writes,
+2.3 ms of storage rehash (0.27 ms of it the serial collect) and 0.24 ms of account root at 0
+threads. The other `trie/` cases (threads 0) are unchanged: get 164 ns, block 1.38 ms,
+hash_builder 3.08 ms, ordered 84 us, state block 1.64 ms.
+
+Tried first: one static range per thread. With 8 threads the caller hashed its 1/9 in
+~210 us and then waited 550-850 us for the workers (late wakeups, descheduling and E-cores
+on the loaded machine), so 8 threads gained little over 2. Claimed chunks fixed that.
+Not parallel: the dirty-node collect (one walk, ~28 ns per node, ~12% of the rehash).
+
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 | Case | ns/op | MB/s | Notes |

@@ -760,10 +760,33 @@ pub fn TrieType(comptime config: Config) type {
         /// Rehashes every dirty node below `roots`, deepest level first: a node depends only
         /// on its children, which sit one level deeper, so a level's nodes are independent.
         fn update_caches_batched(self: *Self, roots: []const NodeIndex) void {
-            const count = self.collect_dirty(roots);
-            const order = self.order[0..count];
+            const count = self.collect_dirty(roots, null);
+            self.hash_collected(self.order[0..count]);
+        }
+
+        /// Phase one of a split rehash (`update_caches` = `collect_dirty_split` then
+        /// `hash_collected` over the whole range): writes the dirty nodes below `roots`, root
+        /// after root, into `order` and returns their count. `ends[i]` is the end offset of
+        /// root `i`'s nodes, so any run of whole roots is a contiguous `order` range. Also
+        /// sets the `changed` marks, so the hashing phase writes nothing but caches.
+        pub fn collect_dirty_split(self: *Self, roots: []const NodeIndex, ends: []u32) u32 {
+            assert(config.hash_batched);
+            assert(ends.len == roots.len);
+            const count = self.collect_dirty(roots, ends);
+            assert(roots.len == 0 or ends[roots.len - 1] == count);
+            return count;
+        }
+
+        /// Phase two: rehashes the collected nodes in `range`, a slice of `order` holding the
+        /// nodes of whole tries (every dirty child of a node in `range` is in `range`). It
+        /// reads `nodes` and `cache` and writes only `range` and the caches of its nodes, so
+        /// threads may hash disjoint ranges of distinct tries of the same pool at once.
+        pub fn hash_collected(self: *Self, range: []u64) void {
+            assert(config.hash_batched);
+            assert(range.len <= self.order.len);
+            const order = range;
             std.sort.pdq(u64, order, {}, std.sort.asc(u64));
-            var end: usize = count;
+            var end: usize = order.len;
             var levels: u32 = 0;
             while (end > 0) : (levels += 1) {
                 assert(levels <= depth_max);
@@ -776,10 +799,14 @@ pub fn TrieType(comptime config: Config) type {
         }
 
         /// Writes `depth << 32 | index` into `order` for every dirty node below `roots`.
-        fn collect_dirty(self: *Self, roots: []const NodeIndex) u32 {
+        /// With `ends`, `ends[i]` gets the end offset of root `i`'s nodes.
+        fn collect_dirty(self: *Self, roots: []const NodeIndex, ends: ?[]u32) u32 {
             var stack: [depth_max * 16]u64 = undefined;
             var count: u32 = 0;
-            for (roots) |root| {
+            for (roots, 0..) |root, root_index| {
+                defer if (ends) |e| {
+                    e[root_index] = count;
+                };
                 if (root == none or self.cache[root].len > 0) continue;
                 stack[0] = root;
                 var stack_len: u32 = 1;

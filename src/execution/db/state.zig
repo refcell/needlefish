@@ -33,6 +33,8 @@ pub const Config = struct {
     code_bytes_max: u32,
     account_nodes_max: u32,
     storage_nodes_max: u32,
+    /// Storage-rehash worker threads (`StateTrie.Config.rehash_threads`); zero for DST.
+    rehash_threads: u32 = 0,
 };
 
 pub const Error = error{ StateFull, CodeFull } || trie.state_trie.Error;
@@ -116,6 +118,7 @@ pub const State = struct {
             .accounts_max = config.accounts_max,
             .account_nodes_max = config.account_nodes_max,
             .storage_nodes_max = config.storage_nodes_max,
+            .rehash_threads = config.rehash_threads,
         });
         return .{
             .account_table = account_table,

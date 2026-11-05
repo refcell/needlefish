@@ -237,3 +237,93 @@ test "state trie: set_storage_slots matches per-slot writes" {
     }
     try testing.expectEqual(try single.root(), try batched.root());
 }
+
+/// Serial (`rehash_threads = 0`) and parallel tries fed the same random blocks.
+const RehashPair = struct {
+    serial: state.StateTrie,
+    parallel: state.StateTrie,
+    models: [2][accounts_max]ModelAccount = @splat(@splat(.{})),
+
+    fn init(pair: *RehashPair, threads: u32, nodes_min: u32, dirty_max: u32) !void {
+        var config: state.Config = .{
+            .accounts_max = accounts_max,
+            .account_nodes_max = accounts_max * 4,
+            .storage_nodes_max = accounts_max * slots_max * 3,
+            .dirty_accounts_max = dirty_max,
+        };
+        pair.* = .{ .serial = undefined, .parallel = undefined };
+        pair.serial = try state.StateTrie.init(testing.allocator, config);
+        errdefer pair.serial.deinit(testing.allocator);
+        config.rehash_threads = threads;
+        config.rehash_parallel_nodes_min = nodes_min;
+        pair.parallel = try state.StateTrie.init(testing.allocator, config);
+        errdefer pair.parallel.deinit(testing.allocator);
+        try pair.serial.track_changes(testing.allocator);
+        try pair.parallel.track_changes(testing.allocator);
+    }
+
+    fn deinit(pair: *RehashPair) void {
+        pair.parallel.deinit(testing.allocator);
+        pair.serial.deinit(testing.allocator);
+    }
+
+    /// One block of `operations` random writes (deletions and wipes included) on both
+    /// tries, then both roots, every cached node reference, and the change marks agree.
+    fn block(pair: *RehashPair, seed: u64, operations: u32) !void {
+        var prng_serial = Prng.init(seed);
+        var prng_parallel = Prng.init(seed);
+        for (0..operations) |_| {
+            try random_operation(&prng_serial, &pair.serial, &pair.models[0]);
+            try random_operation(&prng_parallel, &pair.parallel, &pair.models[1]);
+        }
+        const root = try pair.serial.root();
+        try testing.expectEqual(root, try pair.parallel.root());
+        const serial = &pair.serial.storage;
+        const parallel = &pair.parallel.storage;
+        try testing.expectEqual(serial.free_count, parallel.free_count);
+        for (serial.nodes, parallel.nodes, 0..) |*a, *b, index| {
+            try testing.expectEqual(a.kind, b.kind);
+            if (a.kind == .free) continue;
+            const want = &serial.cache[index];
+            const got = &parallel.cache[index];
+            try testing.expectEqual(want.len, got.len);
+            if (want.len > 0) try testing.expectEqualSlices(u8, want.slice(), got.slice());
+        }
+        try testing.expectEqualSlices(u64, serial.changed, parallel.changed);
+    }
+};
+
+test "state trie: parallel storage rehash matches serial (seeded differential)" {
+    var prng = Prng.init(0x9a4a11e1);
+    // Forced parallel on every flush (also the early flushes of a small dirty list), and
+    // the default threshold with blocks big enough to cross it now and then.
+    const setups = [_][3]u32{ .{ 4, 0, 4096 }, .{ 4, 0, 5 }, .{ 3, 0, 64 }, .{ 4, 64, 4096 } };
+    for (setups) |setup| {
+        const pair = try testing.allocator.create(RehashPair);
+        defer testing.allocator.destroy(pair);
+        try pair.init(setup[0], setup[1], setup[2]);
+        defer pair.deinit();
+        for (0..60) |_| try pair.block(prng.int(u64), @intCast(1 + prng.below(400)));
+        try testing.expectEqual(model_root(&pair.models[1]), try pair.parallel.root());
+    }
+}
+
+fn fuzz_parallel_rehash(_: void, smith: *testing.Smith) anyerror!void {
+    var input: [64]u8 = undefined;
+    const length = smith.slice(&input);
+    if (length < 9) return;
+    const pair = try testing.allocator.create(RehashPair);
+    defer testing.allocator.destroy(pair);
+    const threads: u32 = 1 + input[0] % 4;
+    try pair.init(threads, 0, 2 + input[0] / 4 % 16);
+    defer pair.deinit();
+    var at: usize = 1;
+    while (at + 8 <= length) : (at += 8) {
+        const seed = std.mem.readInt(u64, input[at..][0..8], .little);
+        try pair.block(seed, @intCast(1 + seed % 300));
+    }
+}
+
+test "state trie: fuzz parallel storage rehash against serial" {
+    try testing.fuzz({}, fuzz_parallel_rehash, .{});
+}
