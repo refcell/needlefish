@@ -7,7 +7,7 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] keccak256: fast single + batch (SIMD multi-lane) implementation, vectors, bench vs std.
 - [ ] keccak256: dedicated NEON-SHA3 / AVX2 single-message path to beat std by >20%.
 - [x] sha256 (use/beat std), ripemd160, blake2f (EIP-152 compression), identity.
-- [ ] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
+- [x] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
 - [ ] montgomery: no-carry CIOS for moduli with spare top bits, dedicated squaring, faster inversion (bernstein-yang / binary gcd).
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
@@ -83,6 +83,32 @@ fallback but hot paths should be our own, optimized implementations.
   24 rounds unrolled): ~101 ops/round vs ~125 but 245ns vs 147ns per 32B hash on Apple M4
   (shifted-operand logic ops are slower there). Reverted; generic permutation stays.
 
+- secp256k1 field: 4x64 limbs, weakly reduced (< 2^256), overflow folded with
+  2^256 = 0x1000003D1 (mod p); branch-free add/sub/mul/sqr/half. Measured against
+  libsecp256k1's 5x52 multiply ported to Zig on Apple M4: 4x64 mul 14ns latency / 5ns
+  throughput vs 5x52 11.5ns / 9ns, so 4x64 stays (and add/sub need no magnitude tracking).
+  Scalars mod n: 4x64, 512 -> 385 -> 258 -> 256-bit folding with 2^256 - n.
+- secp256k1 recovery (variable time, public data): GLV split of both scalars, wNAF w=10 for
+  G and lambda*G (comptime tables of 256 affine points each, computed with exact
+  `comptime_int` arithmetic, independent of the runtime field code), w=5 Jacobian table
+  for R; Strauss-Shamir joint loop. Jacobian formulas with explicit infinity and h = 0
+  cases; libsecp256k1's 3M+4S doubling with `half`. r^-1 and the final Z^-1 use a
+  variable-time safegcd (Bernstein-Yang, signed 62-bit limbs, branch-free 62-divstep
+  batches) in `modinv.zig`. g_window 12 measured within noise of 10, so 10 (32 KiB tables).
+- secp256k1 API: `ecrecover(hash, v_parity: u1, r, s) ?[64]u8`, `ecrecover_address`,
+  `recover_point` (u2 recovery id, bit 1 = r + n with r + n < p), `recover_tx_address`
+  (rejects s > n/2, EIP-2), `precompile_ecrecover(input) ?[32]u8` (input right-padded to
+  128 bytes, v word exactly 27/28, r,s in [1, n-1], high s allowed, null = empty output).
+  `sign`, `public_key`, `address` return `error.InvalidPrivateKey` for 0 or >= n.
+- secp256k1 signing: RFC 6979 HMAC-SHA256 nonce (std hmac), constant-time k*G with a
+  65x8 comptime table of signed 4-bit windows, masked full-row scans and complete
+  projective mixed addition (RCB15 alg. 8); s normalized low, recovery id adjusted.
+  The two inversions (k^-1 and Z^-1) use blinding: invert k*b / Z*b with the variable-time
+  safegcd and multiply by b, where b comes from HMAC over the RFC 6979 state (without
+  advancing it) or HMAC(private key) for `public_key`; this halved sign time (19 -> 11us).
+  std's ECDSA adds 32 zero "noise" bytes to its RFC 6979 input, so it is not an RFC 6979
+  oracle; vectors (EIP-155 example, key 1 / "Satoshi Nakamoto") cover the nonce instead.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
@@ -90,3 +116,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: sha256 (ARMv8 SHA2 path, 32B: 26ns vs std 33ns; 4KiB: 1455ns vs std 1643ns), ripemd160 (32B: 131ns; 4KiB: 8.6us), blake2f (12 rounds: 87ns, std compression 85ns); official/EIP-152 vectors 0-8, seeded + coverage fuzz.
 - 2026-11-05: modexp (EIP-198/2565/7883/7823) + bigint: public geth vectors (22 incl. even moduli, gas for 3 rule sets), seeded differential fuzz vs std big ints, coverage fuzz; bench (ReleaseFast, M-series): 256-bit full exp 5.6us, 2048-bit e=65537 23.6us, 2048-bit full exp 2.52ms, 4096-bit e=65537 101us, 4096-bit full exp 21.9ms, 8192-bit e=65537 428us, even 2048-bit e=65537 24.4us.
 - 2026-11-05: secp256r1 P256VERIFY (EIP-7951) on montgomery.Field; vectors, differential fuzz vs std ecdsa, coverage fuzz; bench (ReleaseFast: verify 51-71us depending on machine load vs std 108us).
+- 2026-11-05: secp256k1: ecrecover/precompile 0x01, tx recovery (low s), RFC 6979 signing, public key/address; vectors, seeded differential fuzz vs std (mul, recovery, ecdsa verify), coverage fuzz of precompile vs std reference; bench (ReleaseFast, Apple M4, loaded host): ecrecover 28.8us (std verify 62us), sign 10.7us (std 75us), public_key 8.9us (std 65us).
