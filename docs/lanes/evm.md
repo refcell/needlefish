@@ -39,6 +39,18 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   at 0xB20F00..00, warmed from Beryl: createB20 for both variants, getB20Address, isB20,
   isB20Initialized). Next: common/Asset/Stablecoin V2 (Cobalt: seize, UI multiplier,
   metered permit, ...) and V3 (Denim); until then the V1 surface serves every fork.
+  V2 (Cobalt) delta, from base logic/v2.rs: common adds SEIZE_ROLE, SEIZE_EXEMPT_POLICY,
+  SEIZE_RECEIVER_POLICY, seizeWithMemo (pause feature SEIZE=3, enum max 3; ensure seizable =
+  fails seize-exempt policy; seize-receiver policy on `to`; from==to InvalidReceiver; Memo
+  then Seized(caller,from,to,amount)), AccountNotSeizable; policyId/updatePolicy accept seize
+  scopes; transfer/transferFrom check zero addresses first then read the packed transfer
+  policy ids once (one SLOAD of slot 9); permit/domainSeparator use metered keccak (30+6/word
+  each) plus 3000 recovery gas. Asset adds pending UI multiplier (slot 4: u128 multiplier,
+  u64 effective-at at byte 16), MAX_UI_MULTIPLIER 2^128-1, uiMultiplier/newUIMultiplier/
+  effectiveAt/balanceOfUI/totalSupplyUI/toUIAmount/fromUIAmount, updateUIMultiplier,
+  cancelUIMultiplierUpdate, supportsInterface (ERC-165 + ERC-8056 ids), effective
+  multiplier (matured pending wins) in scaling, updateMultiplier clears pending and emits
+  UIMultiplierUpdateCancelled (if live) + MultiplierUpdated + UIMultiplierUpdated.
   Decisions: token init checks and factory account reads are metered like base
   `with_account_info` (100, +2500 cold); an unset multiplier reads as WAD; permit V1 uses
   unmetered hashing and no 3000-gas recovery charge, rejects high s (k256); factory init
