@@ -474,8 +474,6 @@ test "service: a stalled safe head triggers resubmission from safe + 1" {
     }
     // Safe head never moved: one reset after 10 L1 blocks, and blocks 1..4 reloaded.
     try testing.expectEqual(@as(u32, 1), resets);
-    // The reset also reset txmgr: the next nonce comes from `latest`, filling any gap.
-    try testing.expectEqualStrings("latest", service.txs.nonce_tag);
     try testing.expectEqual(@as(u32, 8), loaded);
     // Once the safe head advances there is no further reset.
     chains.safe_l2 = 4;

@@ -59,6 +59,9 @@ pub const Slot = struct {
     data_length: u32 = 0,
     sent_at_ms: u64 = 0,
     attempts: u32 = 0,
+    /// The pool kept another tx at this nonce (ours from before a restart or reset, or
+    /// a dropped one): bump and resend on the next poll instead of after a full period.
+    replace_now: bool = false,
     hash: primitives.B256 = .zero,
     /// Blob mode only: the encoded blob, its commitment and proof (computed once at
     /// submit; resubmissions only re-sign), and the current max blob fee.
@@ -79,9 +82,6 @@ pub const TxManager = struct {
     config: Config,
     slots: []Slot,
     next_nonce: ?u64,
-    /// Account nonce tag read when `next_nonce` is unknown: "pending" at startup (keep a
-    /// previous run's pooled txs), "latest" after a reset (refill nonces that were lost).
-    nonce_tag: []const u8 = "pending",
     /// After a reset: the highest dropped nonce and the fees it carried. A new tx at a
     /// nonce up to this one bumps those fees, so it replaces a dropped copy still pooled.
     replaced: ?Replaced = null,
@@ -188,8 +188,10 @@ pub const TxManager = struct {
         const slot = for (manager.slots) |*slot| {
             if (slot.state == .free) break slot;
         } else return error.NoFreeSlot;
-        const nonce = manager.next_nonce orelse
-            try manager.account_nonce(client, manager.nonce_tag);
+        // `latest`, like base/base: pooled txs we do not track (a previous run's, or ones
+        // dropped by a reset) are replaced at their nonces, never adopted. An adopted tx
+        // that L1 evicts would leave a nonce gap nothing re-sends.
+        const nonce = manager.next_nonce orelse try manager.account_nonce(client, "latest");
         var fees = try manager.suggested_fees(client);
         var blob_fee = if (manager.prover != null) try manager.suggested_blob_fee(client) else 0;
         if (manager.replaced) |replaced| {
@@ -241,7 +243,7 @@ pub const TxManager = struct {
                 confirmed += 1;
                 continue;
             }
-            if (now_ms >= slot.sent_at_ms + manager.config.resubmit_after_ms) {
+            if (slot.replace_now or now_ms >= slot.sent_at_ms + manager.config.resubmit_after_ms) {
                 try manager.bump(client, slot);
                 try manager.send(client, slot, now_ms);
             }
@@ -295,7 +297,6 @@ pub const TxManager = struct {
             manager.replaced = replaced;
         }
         manager.next_nonce = null;
-        manager.nonce_tag = "latest";
         manager.gap_since_ms = null;
         assert(manager.pending_count() == 0);
     }
@@ -364,10 +365,15 @@ pub const TxManager = struct {
         slot.sent_at_ms = now_ms;
         slot.attempts += 1;
         slot.hash = hash;
+        slot.replace_now = false;
         _ = client.call("eth_sendRawTransaction", params) catch |err| switch (err) {
             // Known benign answers: already mined, already pooled, or the previous
             // attempt still wins; `poll` decides what happens next.
-            error.RpcError => if (!benign_send_error(client.last_error())) return err,
+            error.RpcError => {
+                const message = client.last_error();
+                if (!benign_send_error(message)) return err;
+                slot.replace_now = contains_ignore_case(message, "underpriced");
+            },
             else => return err,
         };
     }
@@ -421,6 +427,12 @@ const SingleFrame = struct {
         return single.frame;
     }
 };
+
+fn contains_ignore_case(message: []const u8, needle: []const u8) bool {
+    var lower_buffer: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(&lower_buffer, message[0..@min(message.len, 256)]);
+    return std.mem.indexOf(u8, lower, needle) != null;
+}
 
 fn benign_send_error(message: []const u8) bool {
     const benign = [_][]const u8{
@@ -644,11 +656,13 @@ test "txmgr: blob mode packs up to blobs_per_tx frames per transaction" {
     try testing.expectEqual(@as(u32, 2), l1.sends);
 }
 
-/// An L1 with a nonce-indexed pool, reorgs, and tx loss: `mined` advances over contiguous
-/// pooled nonces; a reorg returns mined txs to the pool; a loss drops pooled txs.
+/// An L1 with a nonce-indexed pool, reorgs, and tx loss. `fees[n]` is the max fee of the
+/// tx known at nonce n (0: none); those at n >= `mined` are pooled. Mining advances over
+/// contiguous pooled nonces; a reorg returns mined txs to the pool; a loss evicts pooled
+/// txs. A same-nonce send must outbid the pooled tx by 10% (geth's replacement rule).
 const LossyL1 = struct {
     mined: u64 = 0,
-    pool: [pool_size]bool = @splat(false),
+    fees: [pool_size]u128 = @splat(0),
     sends: u32 = 0,
 
     const pool_size = 512;
@@ -659,26 +673,24 @@ const LossyL1 = struct {
 
     fn mine(l1: *LossyL1, count_max: u64) void {
         var count: u64 = 0;
-        while (count < count_max and l1.mined < pool_size and l1.pool[l1.mined]) : (count += 1) {
-            l1.pool[l1.mined] = false;
+        while (count < count_max and l1.mined < pool_size and l1.fees[l1.mined] > 0) {
             l1.mined += 1;
+            count += 1;
         }
     }
 
-    /// Unmines the top `depth` txs back into the pool, then drops each pooled tx whose
-    /// nonce is at least `mined` with probability `loss_percent`.
+    /// Unmines the top `depth` txs back into the pool, then evicts each pooled tx with
+    /// probability `loss_percent`.
     fn reorg_and_lose(l1: *LossyL1, prng: *Prng, depth: u64, loss_percent: u64) void {
-        const back = @min(depth, l1.mined);
-        for (l1.mined - back..l1.mined) |nonce| l1.pool[nonce] = true;
-        l1.mined -= back;
-        for (l1.pool[@intCast(l1.mined)..]) |*pooled| {
-            if (pooled.* and prng.chance(loss_percent, 100)) pooled.* = false;
+        l1.mined -= @min(depth, l1.mined);
+        for (l1.fees[@intCast(l1.mined)..]) |*fee| {
+            if (fee.* > 0 and prng.chance(loss_percent, 100)) fee.* = 0;
         }
     }
 
     fn pending_nonce(l1: *const LossyL1) u64 {
         var nonce = l1.mined;
-        while (nonce < pool_size and l1.pool[nonce]) nonce += 1;
+        while (nonce < pool_size and l1.fees[nonce] > 0) nonce += 1;
         return nonce;
     }
 
@@ -698,10 +710,13 @@ const LossyL1 = struct {
             "\"0x2\""
         else blk: {
             l1.sends += 1;
-            const nonce = sent_nonce(body) catch return error.TransportFailed;
-            if (nonce >= pool_size) return error.TransportFailed;
-            if (nonce >= l1.mined) l1.pool[@intCast(nonce)] = true;
-            break :blk "\"0x00\"";
+            const tx = sent_tx(body) catch return error.TransportFailed;
+            if (tx.nonce >= pool_size) return error.TransportFailed;
+            const error_message = l1.accept(tx.nonce, tx.fee) orelse break :blk "\"0x00\"";
+            const text = std.fmt.bufPrint(response, "{{\"jsonrpc\":\"2.0\",\"id\":{s}," ++
+                "\"error\":{{\"code\":-32000,\"message\":\"{s}\"}}}}", .{ id, error_message }) catch
+                return error.ResponseTooLarge;
+            return text.len;
         };
         const envelope = "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}";
         const text = std.fmt.bufPrint(response, envelope, .{ id, result }) catch
@@ -709,13 +724,22 @@ const LossyL1 = struct {
         return text.len;
     }
 
-    fn sent_nonce(body: []const u8) !u64 {
+    /// Pools the tx, or returns geth's error message.
+    fn accept(l1: *LossyL1, nonce: u64, fee: u128) ?[]const u8 {
+        if (nonce < l1.mined) return "nonce too low";
+        const pooled = l1.fees[@intCast(nonce)];
+        if (pooled > 0 and fee * 100 < pooled * 110) return "replacement transaction underpriced";
+        l1.fees[@intCast(nonce)] = fee;
+        return null;
+    }
+
+    fn sent_tx(body: []const u8) !struct { nonce: u64, fee: u128 } {
         const hex_start = std.mem.indexOf(u8, body, "[\"0x").? + 4;
         const hex_end = std.mem.indexOfScalarPos(u8, body, hex_start, '"').?;
         var raw: [2048]u8 = undefined;
         const bytes = try std.fmt.hexToBytes(&raw, body[hex_start..hex_end]);
-        const envelope = try consensus.Envelope.decode(bytes);
-        return envelope.eip1559.tx.nonce;
+        const tx = (try consensus.Envelope.decode(bytes)).eip1559.tx;
+        return .{ .nonce = tx.nonce, .fee = tx.max_fee_per_gas };
     }
 };
 
@@ -841,4 +865,41 @@ fn fuzz_lossy(_: void, smith: *testing.Smith) anyerror!void {
         if (manager.needs_reset(now_ms)) manager.reset();
     }
     try testing.expect(l1.mined >= mined_before + 20);
+}
+
+test "txmgr: a restart replaces untracked pooled txs; an eviction cannot stall it" {
+    var l1: LossyL1 = .{};
+    // A previous run left txs at nonces 0 and 1 in the pool, with high fees.
+    l1.fees[0] = 1_000;
+    l1.fees[1] = 1_000;
+    var client: rpc.Client = undefined;
+    var manager = try lossy_manager(&l1, &client);
+    defer manager.deinit(testing.allocator);
+    defer client.deinit(testing.allocator);
+    try manager.submit(&client, "\x00a", 0);
+    try manager.submit(&client, "\x00b", 0);
+    // Starting at `latest` (0), not `pending` (2): the old txs are not adopted.
+    try testing.expectEqual(@as(u64, 0), manager.slots[0].nonce);
+    try testing.expectEqual(@as(u64, 1), manager.slots[1].nonce);
+    try testing.expect(manager.slots[0].replace_now); // Underpriced against the old tx.
+    // Each poll bumps and resends at once until ours outbids the old tx at nonce 0.
+    var now_ms: u64 = 10;
+    for (0..40) |_| {
+        _ = try manager.poll(&client, now_ms);
+        now_ms += 10;
+        if (!manager.slots[0].replace_now) break;
+    }
+    try testing.expect(l1.fees[0] > 1_000);
+    // L1 evicts the old tx at nonce 1 before ours replaced it: nothing adopted it, so our
+    // slot is resent there after its resubmit period, and the stream does not stall.
+    l1.fees[1] = 0;
+    for (0..40) |_| {
+        l1.mine(2);
+        _ = try manager.poll(&client, now_ms);
+        now_ms += 500;
+        if (manager.pending_count() == 0) break;
+    }
+    try testing.expectEqual(@as(u64, 2), l1.mined);
+    try testing.expectEqual(@as(u32, 0), manager.pending_count());
+    try testing.expect(l1.fees[1] != 1_000);
 }

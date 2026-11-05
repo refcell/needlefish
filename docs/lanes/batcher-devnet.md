@@ -121,3 +121,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   txmgr; the stall watchdog resets txmgr too. After a reset the nonce comes from `latest` and
   dropped nonces are refilled with fees bumped over the dropped txs (replace pooled copies).
   Frames are requeued by reloading blocks from safe + 1.
+- 2026-11-05: txmgr takes its first nonce from `latest` (was `pending`), like base/base: a
+  restarted batcher replaces untracked pooled txs instead of adopting them (an adopted tx that
+  L1 evicts left a gap nothing re-sent). An underpriced same-nonce send bumps and resends on
+  the next poll. Test: restart with pooled txs, then eviction (mutation-checked).
