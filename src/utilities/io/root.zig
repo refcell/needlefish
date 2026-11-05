@@ -61,4 +61,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("sim_test.zig");
     _ = @import("os_test.zig");
+    _ = @import("shutdown_test.zig");
 }

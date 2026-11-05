@@ -137,6 +137,13 @@ const KqueueImpl = struct {
         return os.open_file(path, mode);
     }
 
+    /// Shuts down both directions; pending recvs complete with 0. Close with `close_now`
+    /// once in-flight operations on `fd` have completed.
+    pub fn shutdown_now(io: *KqueueImpl, fd: Fd) void {
+        _ = io;
+        os.shutdown(fd);
+    }
+
     pub fn close_now(io: *KqueueImpl, fd: Fd) void {
         _ = io;
         os.close(fd);

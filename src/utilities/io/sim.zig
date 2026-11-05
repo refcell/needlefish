@@ -183,6 +183,8 @@ const Side = struct {
     node: u32 = 0,
     fd: FdSim = 0,
     open: bool = false,
+    /// `shutdown_now` was called: recv returns 0, send fails, and the peer has seen FIN.
+    shut: bool = false,
     /// Bytes flowing to this side.
     inbound: Pipe,
 };
@@ -374,6 +376,7 @@ pub const World = struct {
             connection.pending_accept = false;
             for (&connection.sides) |*side| {
                 side.open = false;
+                side.shut = false;
                 side.inbound.reset();
             }
             return @intCast(index);
@@ -388,7 +391,8 @@ pub const World = struct {
         connection.sides[side].open = false;
         const peer = &connection.sides[side ^ 1];
         const peer_alive = peer.open or connection.pending_accept;
-        if (peer_alive and !connection.reset) {
+        const fin_sent = connection.sides[side].shut;
+        if (peer_alive and !connection.reset and !fin_sent) {
             peer.inbound.close_write(world.now_ns + world.latency_ns());
         }
         connection_release_if_unused(connection);
@@ -592,6 +596,24 @@ pub const SimIo = struct {
     }
 
     /// Resets the connection behind `fd`; both sides observe ConnectionResetByPeer.
+    /// Shuts down both directions of a stream: pending and future recvs on `fd` return 0,
+    /// sends fail with `BrokenPipe`, and the peer sees end of stream. The descriptor stays
+    /// allocated until `close_now`, so in-flight operations complete before it is reused.
+    pub fn shutdown_now(io: *SimIo, fd: Fd) void {
+        const descriptor = io.descriptors[fd];
+        if (descriptor != .stream) return;
+        const connection = &io.world.connections[descriptor.stream.connection];
+        const side = &connection.sides[descriptor.stream.side];
+        assert(side.open);
+        if (side.shut) return;
+        side.shut = true;
+        const peer = &connection.sides[descriptor.stream.side ^ 1];
+        if ((peer.open or connection.pending_accept) and !connection.reset) {
+            const world = io.world;
+            peer.inbound.close_write(world.now_ns + world.latency_ns());
+        }
+    }
+
     pub fn reset_connection(io: *SimIo, fd: Fd) void {
         const descriptor = io.descriptors[fd];
         assert(descriptor == .stream);
@@ -682,6 +704,7 @@ pub const SimIo = struct {
         const descriptor = io.descriptors[fd];
         if (descriptor != .stream) return null;
         const connection = &io.world.connections[descriptor.stream.connection];
+        if (connection.sides[descriptor.stream.side].shut) return io.world.now_ns;
         if (connection.hosts_partitioned(io.world)) return null;
         return connection.sides[descriptor.stream.side].inbound.next_arrival_ns(io.world.now_ns);
     }
@@ -784,6 +807,10 @@ pub const SimIo = struct {
             completion.result = .{ .recv = error.ConnectionResetByPeer };
             return true;
         }
+        if (connection.sides[descriptor.stream.side].shut) {
+            completion.result = .{ .recv = 0 };
+            return true;
+        }
         if (connection.hosts_partitioned(io.world)) return false;
         const pipe = &connection.sides[descriptor.stream.side].inbound;
         const now_ns = io.world.now_ns;
@@ -813,7 +840,8 @@ pub const SimIo = struct {
         }
         const peer_side: u1 = descriptor.stream.side ^ 1;
         const peer = &connection.sides[peer_side];
-        if (!peer.open and !connection.pending_accept) {
+        const own_shut = connection.sides[descriptor.stream.side].shut;
+        if (own_shut or (!peer.open and !connection.pending_accept)) {
             completion.result = .{ .send = error.BrokenPipe };
             return true;
         }

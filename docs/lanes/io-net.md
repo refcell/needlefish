@@ -63,3 +63,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: cli: spec-struct flags with env fallback, required/optional, help text; fuzzed.
 - 2026-11-05: ring_buffer (comptime capacity, asserted ordering, binary-search first_after), retry (base/base defaults, seeded SplitMix64 jitter), health (GET / liveness, GET /healthz version).
 - 2026-11-05: ws: RFC 6455 frame codec (in-place unmask, minimal-length/control/mask checks), accept key, close parsing; fuzzed. Next: ws client/server on IO.
+- 2026-11-05: io: `shutdown_now(fd)` on all backends: wakes pending recvs with 0 and sends FIN, so components with concurrent recv+send can tear down before `close_now` without fd reuse races.

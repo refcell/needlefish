@@ -184,6 +184,12 @@ pub fn close(fd: fd_t) void {
     _ = system.close(fd);
 }
 
+/// shutdown(2) both directions. Errors (ENOTCONN after a peer reset) are ignored: the
+/// socket is being torn down either way.
+pub fn shutdown(fd: fd_t) void {
+    _ = system.shutdown(fd, system.SHUT.RDWR);
+}
+
 pub fn clock_ns(clock: std.posix.clockid_t) u64 {
     var ts: std.posix.timespec = undefined;
     const rc = system.clock_gettime(clock, &ts);
