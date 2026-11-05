@@ -45,7 +45,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] admin_postUnsafePayload (payload envelope decode → insert task), base_*
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [x] `p2p`: `Node` embeds `p2p.Network(IO)` (`--p2p.*` flags, on by default, `--p2p.disabled`): gossiped blocks go to `Driver.insert_unsafe`, the sequencer publishes each sealed block; devnet verifier follows the sequencer's unsafe head over gossip.
-  - [ ] unsafe payload buffer (out-of-order / gap blocks) and EL sync from gossip
+  - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
+  - [ ] EL sync from gossip (forkchoice to the gossiped tip when the gap exceeds the buffer; needs EL-side p2p sync)
   - [ ] unsafe block signer from the L1 SystemConfig instead of `--p2p.unsafe.block.signer`
   - [ ] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
@@ -67,7 +68,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 
 ## Decisions
 - p2p in `base consensus` is on by default (base/base); without `--p2p.unsafe.block.signer` a verifier runs with p2p off and warns, a sequencer signs with its own key. The node key is random unless `--p2p.priv.*`. The devnet verifier dials the sequencer's enode, scraped from its startup log.
-- Gossiped unsafe blocks: only the block right after the unsafe head is queued; stale and gapped blocks are dropped (no unsafe payload buffer or EL sync yet; derivation fills gaps). An active sequencer ignores gossip.
+- Gossiped unsafe blocks: the block right after the unsafe head is queued, later ones wait in a 64-slot buffer (evicting the highest number when full), stale ones are dropped. Gaps the buffer cannot bridge are filled by derivation until EL sync exists. An active sequencer ignores gossip.
 - Devnet: the dev L1 JSON-RPC server allowed only 4 connections; each consensus node holds
   two (watcher + provider) and the batcher more, so the verifier's L1 provider was reset
   forever (RecvFailed). Raised to 16 (beacon 8) in `execution/node/service.zig`.
@@ -172,6 +173,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: `UnsafeBuffer` keeps out-of-order gossiped blocks until their parent is inserted; driver drains it every tick. Devnet verifier unsafe head equals the sequencer's.
 - 2026-11-05: service: unsafe-block gossip wired into `base consensus` (p2p.Network in Node, publish on seal, insert on receive); devnet smoke green with the verifier's unsafe head tracking the sequencer over gossip.
 - 2026-11-05: engine/service: seal tasks own their fetched payload once the insert starts (the polling client reuses result memory); queue keeps the last unsafe sealed payload (`take_sealed`); `Driver.insert_unsafe` queues the gossiped payload right after the unsafe head; `service/gossip_bridge.zig` converts engine <-> gossip payloads.
 - 2026-11-05: rpc: admin_* sequencer control, recover mode, pipeline reset, healthz.

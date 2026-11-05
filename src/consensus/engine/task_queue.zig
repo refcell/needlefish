@@ -431,7 +431,7 @@ fn copy_attributes(
     return result;
 }
 
-fn copy_envelope(allocator: Allocator, source: *const Envelope) Allocator.Error!Envelope {
+pub fn copy_envelope(allocator: Allocator, source: *const Envelope) Allocator.Error!Envelope {
     assert(source.payload.transactions.len <= std.math.maxInt(u32));
     var result = source.*;
     const payload = &source.payload;

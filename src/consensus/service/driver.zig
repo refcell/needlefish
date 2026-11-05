@@ -39,6 +39,7 @@ const Pipeline = pipeline_module.Pipeline;
 const EngineTaskQueue = task_queue.EngineTaskQueue;
 const SyncState = @import("../engine/state.zig").SyncState;
 const InsertEnvelope = @import("../engine/insert_task.zig").Envelope;
+const UnsafeBuffer = @import("unsafe_buffer.zig").UnsafeBuffer;
 
 pub const Options = struct {
     sequencer: bool = false,
@@ -48,6 +49,8 @@ pub const Options = struct {
     finalizer_capacity: u32 = 1024,
     /// Upper bound on engine queue steps and pipeline steps per tick.
     steps_per_tick_max: u32 = 64,
+    /// Gossiped blocks ahead of the unsafe head kept until their parent is inserted.
+    unsafe_buffer_capacity: u32 = 64,
 };
 
 pub const Phase = enum { starting, resetting, running };
@@ -56,8 +59,10 @@ pub const Stats = struct {
     resets: u64 = 0,
     consolidated: u64 = 0,
     sealed: u64 = 0,
-    /// Gossiped unsafe payloads queued for insertion / ignored (stale, gap, not running).
+    /// Gossiped unsafe payloads queued for insertion / buffered ahead of the head / ignored
+    /// (stale, not running, sequencing, buffer full).
     unsafe_queued: u64 = 0,
+    unsafe_buffered: u64 = 0,
     unsafe_ignored: u64 = 0,
     finalized: u64 = 0,
     engine_failures: u64 = 0,
@@ -115,6 +120,7 @@ pub const Driver = struct {
     finalizer: Finalizer,
     selector: OriginSelector,
     builder: attributes_module.AttributesBuilder,
+    unsafe_buffer: UnsafeBuffer,
     /// A consolidate task is queued; holds the L1 block its attributes derive from.
     consolidating: ?BlockInfo = null,
     /// Sequencer attributes waiting for their payload id (build) or seal.
@@ -146,6 +152,10 @@ pub const Driver = struct {
         errdefer queue.deinit(allocator);
         var finalizer = try Finalizer.init(allocator, options.finalizer_capacity);
         errdefer finalizer.deinit(allocator);
+        const retain_bytes = options.queue.retain_bytes;
+        var unsafe_buffer =
+            try UnsafeBuffer.init(allocator, options.unsafe_buffer_capacity, retain_bytes);
+        errdefer unsafe_buffer.deinit(allocator);
         driver.* = .{
             .allocator = allocator,
             .rollup = rollup,
@@ -157,6 +167,7 @@ pub const Driver = struct {
             .finalizer = finalizer,
             .selector = .init(rollup),
             .builder = .init(allocator, rollup, blob_schedule),
+            .unsafe_buffer = unsafe_buffer,
             .sequencer_active = options.sequencer,
         };
         assert(driver.phase == .starting);
@@ -166,6 +177,7 @@ pub const Driver = struct {
         driver.drop_sealing();
         driver.pipeline.deinit();
         driver.finalizer.deinit(driver.allocator);
+        driver.unsafe_buffer.deinit(driver.allocator);
         driver.queue.deinit(driver.allocator);
         driver.* = undefined;
     }
@@ -182,6 +194,7 @@ pub const Driver = struct {
             .running => {
                 driver.step_engine(providers);
                 if (driver.phase != .running) return;
+                driver.drain_unsafe();
                 driver.derive(providers);
                 if (driver.phase != .running) return;
                 driver.finalize(providers.l1_finalized);
@@ -253,27 +266,56 @@ pub const Driver = struct {
         return driver.queue.state.sync_state.unsafe_head.block_info.hash;
     }
 
-    /// Queues a gossiped unsafe payload for insertion (base/base `UnsafePayload` handling).
-    /// Only the payload right after the unsafe head is taken; older ones are stale and later
-    /// ones leave a gap that derivation fills. An active sequencer ignores gossip. Returns
-    /// whether the payload was queued; the queue copies it.
+    /// Takes a gossiped unsafe payload (base/base `UnsafePayload` handling): the block right
+    /// after the unsafe head is queued for insertion, later blocks wait in the unsafe buffer
+    /// until their parent is inserted, older ones are stale. An active sequencer ignores
+    /// gossip. Returns whether the payload was kept; both paths copy it.
     pub fn insert_unsafe(driver: *Driver, envelope: *const InsertEnvelope) bool {
         const unsafe_number = driver.queue.state.sync_state.unsafe_head.block_info.number;
         const number = envelope.payload.block_number;
         const wanted = driver.phase == .running and !driver.sequencer_active and
-            number == unsafe_number + 1;
-        if (wanted) {
-            if (driver.queue.enqueue(.{ .insert = .{
-                .envelope = envelope,
-                .drop_invalid = true,
-            } })) {
-                driver.stats.unsafe_queued += 1;
-                return true;
-            } else |err| driver.note(err);
+            number > unsafe_number;
+        if (wanted and number == unsafe_number + 1 and driver.enqueue_unsafe(envelope)) {
+            return true;
+        }
+        if (wanted and number > unsafe_number + 1) {
+            switch (driver.unsafe_buffer.put(envelope)) {
+                .stored, .replaced, .evicted_other => {
+                    driver.stats.unsafe_buffered += 1;
+                    return true;
+                },
+                .dropped, .out_of_memory => {},
+            }
         }
         driver.stats.unsafe_ignored += 1;
         assert(driver.stats.unsafe_ignored > 0);
         return false;
+    }
+
+    fn enqueue_unsafe(driver: *Driver, envelope: *const InsertEnvelope) bool {
+        const request: task_queue.Request = .{ .insert = .{
+            .envelope = envelope,
+            .drop_invalid = true,
+        } };
+        driver.queue.enqueue(request) catch |err| {
+            driver.note(err);
+            return false;
+        };
+        driver.stats.unsafe_queued += 1;
+        assert(driver.queue.len() > 0);
+        return true;
+    }
+
+    /// Drops buffered blocks the chain already has and queues the next one, if buffered.
+    fn drain_unsafe(driver: *Driver) void {
+        const buffer = &driver.unsafe_buffer;
+        if (buffer.count == 0) return;
+        if (driver.sequencer_active) return buffer.clear();
+        const unsafe_number = driver.queue.state.sync_state.unsafe_head.block_info.number;
+        buffer.prune_through(unsafe_number);
+        const index = buffer.find(unsafe_number + 1) orelse return;
+        if (driver.enqueue_unsafe(buffer.get(index))) buffer.remove(index);
+        assert(buffer.count <= buffer.slots.len);
     }
 
     /// Starts over from startup discovery (engine reset, base/base `ResetRequest`).
@@ -548,6 +590,7 @@ const Scenario = struct {
         scenario.transactions[0] = scenario.deposit[0..deposit.len];
         var hash: Hash = .zero;
         hash.bytes[0] = 0x43;
+        hash.bytes[1] = @truncate(attributes.parent.block_info.number + 1);
         scenario.mock.payload = .{ .block_value = 0, .payload = .{
             .parent_hash = attributes.parent.block_info.hash,
             .fee_recipient = .zero,
@@ -639,15 +682,66 @@ test "driver: a sealed payload inserts into a verifier as its unsafe head" {
     try testing.expect(!verifier.driver.insert_unsafe(sealed)); // Not running yet.
     for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 1);
     try testing.expectEqual(Phase.running, verifier.driver.phase);
-    var gap = sealed.*;
-    gap.payload.block_number = 3;
-    try testing.expect(!verifier.driver.insert_unsafe(&gap));
+    var stale = sealed.*;
+    stale.payload.block_number = 0;
+    try testing.expect(!verifier.driver.insert_unsafe(&stale));
     try testing.expect(verifier.driver.insert_unsafe(sealed));
     for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 2);
     const head = verifier.driver.sync_state().unsafe_head;
     try testing.expect(head.block_info.hash.eql(sealed.payload.block_hash));
     try testing.expectEqual(@as(u64, 1), verifier.driver.stats.unsafe_queued);
     try testing.expectEqual(@as(u64, 2), verifier.driver.stats.unsafe_ignored);
+}
+
+/// Seals blocks 1 and 2 on a sequencer and keeps copies of their payloads in `arena`.
+fn seal_two(arena: Allocator) ![2]InsertEnvelope {
+    var sequencer: Scenario = undefined;
+    try sequencer.init(.{ .sequencer = true });
+    defer sequencer.deinit();
+    sequencer.chain.unavailable_from = 3;
+    const driver = &sequencer.driver;
+    for (0..8) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 1);
+    var sealed: [2]InsertEnvelope = undefined;
+    for (&sealed, 0..) |*envelope, index| {
+        const now_s = Scenario.genesis_time + 2 * (index + 1);
+        driver.tick(sequencer.providers(), now_s);
+        sequencer.arm_payload(&driver.sealing.?);
+        for (0..16) |_| driver.tick(sequencer.providers(), now_s);
+        envelope.* = try task_queue.copy_envelope(arena, driver.queue.take_sealed().?);
+        // The next build reads its parent's block and system config from the chain.
+        const head = driver.sync_state().unsafe_head;
+        sequencer.chain.add_l2_block(head);
+        const config = sequencer.rollup.genesis.system_config.?;
+        sequencer.chain.add_system_config(head.block_info.hash, config);
+    }
+    try testing.expectEqual(@as(u64, 2), sealed[1].payload.block_number);
+    try testing.expect(sealed[1].payload.parent_hash.eql(sealed[0].payload.block_hash));
+    return sealed;
+}
+
+test "driver: out-of-order gossip waits in the unsafe buffer for its parent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const sealed = try seal_two(arena.allocator());
+    var verifier: Scenario = undefined;
+    try verifier.init(.{});
+    defer verifier.deinit();
+    verifier.chain.unavailable_from = 3;
+    const driver = &verifier.driver;
+    for (0..8) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 1);
+    try testing.expectEqual(Phase.running, driver.phase);
+    try testing.expect(driver.insert_unsafe(&sealed[1]));
+    try testing.expectEqual(@as(u64, 1), driver.stats.unsafe_buffered);
+    for (0..4) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 4);
+    try testing.expectEqual(@as(u64, 0), driver.sync_state().unsafe_head.block_info.number);
+    try testing.expect(driver.insert_unsafe(&sealed[0]));
+    for (0..16) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 4);
+    const head = driver.sync_state().unsafe_head;
+    try testing.expect(head.block_info.hash.eql(sealed[1].payload.block_hash));
+    try testing.expectEqual(@as(u32, 0), driver.unsafe_buffer.count);
+    try testing.expectEqual(@as(u64, 2), driver.stats.unsafe_queued);
+    // A late duplicate of block 1 is stale now.
+    try testing.expect(!driver.insert_unsafe(&sealed[0]));
 }
 
 test "driver: admin sequencer stop and start" {
