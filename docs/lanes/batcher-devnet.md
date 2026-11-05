@@ -58,7 +58,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
   the channel time out on L1 (base/base `sub_safety_margin`).
 - [x] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
-- [ ] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
+- [x] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
   (base/base `sequencers.rs`).
 - [x] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
   already on L1 after a restart (base/base `recent_txs.rs`).
@@ -150,3 +150,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   run the driver yet (consensus lane "service node stage 2"). Devnet side: cold `up` now writes
   a fresh genesis (stale genesis made dev L1 backfill hours); smoke step 0 fails fast on a stuck
   sequencer.
+- 2026-11-05: `just devnet smoke` passes end to end (after consensus d2a7b30).
+- 2026-11-05: `--sequencer-urls` (entries `URL` or `L2_URL=ROLLUP_URL`, because our EL and CL are
+  separate processes); leader = first `admin_sequencerActive` true, kept when none is active;
+  a new leader gets DA limits re-pushed. The devnet batcher uses it.

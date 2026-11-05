@@ -17,6 +17,7 @@ pub const metrics = @import("metrics/root.zig");
 pub const throttle = @import("throttle/root.zig");
 pub const admin = @import("admin/root.zig");
 pub const sync = @import("sync/root.zig");
+pub const sequencers = @import("sequencers/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

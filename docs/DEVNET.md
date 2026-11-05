@@ -108,6 +108,8 @@ Each binary must accept at least the flags below. Lanes may add more.
   `--admin-port P [--admin-addr IP]` serves base/base's admin JSON-RPC (`admin_startBatcher`,
   `admin_stopBatcher`, `admin_flushBatcher`, `admin_getBatcherStatus`,
   `admin_getThrottleController`, `admin_setThrottleController`); `--stopped` starts with ingestion stopped.
+  `--sequencer-urls URL|L2_URL=ROLLUP_URL,...` replaces `--l2`/`--rollup-rpc`; the leader is
+  the first endpoint whose rollup node answers `admin_sequencerActive` with true.
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 

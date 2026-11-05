@@ -79,8 +79,8 @@ up() {
   start_l2_el ver-el "$PORT_VERIFIER_HTTP" "$PORT_VERIFIER_ENGINE"
   patch_rollup "$l1" "$seq_el" "$ver_el"
   start_consensus
-  start batcher batcher --rollup-config "$DIR/rollup.json" --l1 "$l1" --l2 "$seq_el" \
-    --rollup-rpc "http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
+  start batcher batcher --rollup-config "$DIR/rollup.json" --l1 "$l1" \
+    --sequencer-urls "$seq_el=http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
     --metrics.port "$PORT_BATCHER_METRICS"
   log "up; 'just devnet status' to inspect, 'just devnet smoke' to verify"
 }

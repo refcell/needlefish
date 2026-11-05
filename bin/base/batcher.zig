@@ -4,6 +4,7 @@ const std = @import("std");
 const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
 const Servers = @import("batcher_servers.zig").Servers;
+const sequencer_clients = @import("batcher_sequencers.zig");
 
 const Io = std.Io;
 const batcher = base.batcher;
@@ -16,6 +17,7 @@ const usage =
     \\         [--throttle-strategy off|step|linear|quadratic]
     \\         [--admin-port P [--admin-addr IP]] [--stopped] [--num-confirmations N]
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
+    \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
     \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
     \\         [--wait-node-sync-timeout SECONDS]]
     \\
@@ -26,6 +28,9 @@ const Flags = struct {
     l1: ?[]const u8 = null,
     l2: ?[]const u8 = null,
     rollup_rpc: ?[]const u8 = null,
+    /// Comma-separated sequencer endpoints (`URL` or `L2_URL=ROLLUP_URL`); replaces
+    /// `--l2`/`--rollup-rpc` (base/base `--sequencer-urls`).
+    sequencer_urls: ?[]const u8 = null,
     key_index: u32 = @backingInt(batcher.devnet.accounts.Role.batcher),
     private_key: ?[32]u8 = null,
     max_channel_duration: u64 = 2,
@@ -81,6 +86,8 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.l2 = value;
         } else if (eql(u8, arg, "--rollup-rpc")) {
             flags.rollup_rpc = value;
+        } else if (eql(u8, arg, "--sequencer-urls")) {
+            flags.sequencer_urls = value;
         } else if (eql(u8, arg, "--key-index")) {
             flags.key_index = try std.fmt.parseInt(u32, value, 10);
         } else if (eql(u8, arg, "--private-key")) {
@@ -137,7 +144,13 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     };
     const rollup_path = flags.rollup_config orelse return usage_error();
     const l1_url = flags.l1 orelse return usage_error();
-    const l2_url = flags.l2 orelse return usage_error();
+    var entries: [batcher.sequencers.sequencers_max]sequencer_clients.Entry = undefined;
+    const entry_count = if (flags.sequencer_urls) |text|
+        try sequencer_clients.parse_entries(text, &entries)
+    else blk: {
+        entries[0] = .{ .l2 = flags.l2 orelse return usage_error(), .rollup = flags.rollup_rpc };
+        break :blk 1;
+    };
     const rollup_text = try Io.Dir.cwd().readFileAlloc(
         init.io,
         rollup_path,
@@ -184,7 +197,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .stopped = flags.stopped,
     }, seed);
     defer service.deinit(init.gpa);
-    return run(init, flags, &service, l1_url, l2_url);
+    return run(init, flags, &service, l1_url, entries[0..entry_count]);
 }
 
 fn run(
@@ -192,28 +205,22 @@ fn run(
     flags: Flags,
     service: *batcher.service.Service,
     l1_url: []const u8,
-    l2_url: []const u8,
+    entries: []const sequencer_clients.Entry,
 ) !u8 {
     const limits: batcher.rpc.Limits = .{};
     var l1_http = HttpTransport.init(init.gpa, init.io, l1_url);
     defer l1_http.deinit();
     var l1 = try batcher.rpc.Client.init(init.gpa, l1_http.transport(), limits);
     defer l1.deinit(init.gpa);
-    var l2_http = HttpTransport.init(init.gpa, init.io, l2_url);
-    defer l2_http.deinit();
-    var l2 = try batcher.rpc.Client.init(init.gpa, l2_http.transport(), limits);
-    defer l2.deinit(init.gpa);
-    var rollup_http = HttpTransport.init(init.gpa, init.io, flags.rollup_rpc orelse l2_url);
-    defer rollup_http.deinit();
-    var rollup = try batcher.rpc.Client.init(init.gpa, rollup_http.transport(), .{});
-    defer rollup.deinit(init.gpa);
-    const clients: batcher.service.Clients = .{
-        .l1 = &l1,
-        .l2 = &l2,
-        .rollup = if (flags.rollup_rpc != null) &rollup else null,
-    };
+    const endpoints = try init.gpa.create(sequencer_clients.SequencerClients);
+    defer init.gpa.destroy(endpoints);
+    try endpoints.init(init.gpa, init.io, entries);
+    defer endpoints.deinit(init.gpa);
+    var leader = endpoints.tracker();
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
-    if (flags.wait_node_sync) try wait_for_node_sync(init, flags, &l1, &rollup, service);
+    if (flags.wait_node_sync) {
+        try wait_for_node_sync(init, flags, &l1, leader.current().rollup, service);
+    }
     var metrics: batcher.metrics.Metrics = .{};
     try metrics.register();
     var admin: batcher.admin.Admin = .{ .service = service };
@@ -222,6 +229,7 @@ fn run(
     var throttle_logged: batcher.throttle.Outcome = .idle;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
+        const clients = follow_leader(&leader, &l1, endpoints.has_rollup, service);
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
             metrics.record(report, service.txs.pending_count());
@@ -236,6 +244,28 @@ fn run(
             try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
         }
     }
+}
+
+/// Re-checks which sequencer is active and returns the clients for this step. A new
+/// leader gets the DA limits pushed again; with no active sequencer the leader is kept.
+fn follow_leader(
+    leader: *batcher.sequencers.Sequencers,
+    l1: *batcher.rpc.Client,
+    has_rollup: bool,
+    service: *batcher.service.Service,
+) batcher.service.Clients {
+    const refresh = leader.refresh();
+    if (refresh.leader_changed) {
+        std.debug.print("batcher: sequencer leader is now #{d}\n", .{leader.leader});
+        service.throttle.pushed = null;
+    }
+    if (refresh.active_count == 0) {
+        std.debug.print("batcher: no sequencer is active; keeping #{d}\n", .{leader.leader});
+    } else if (refresh.active_count > 1) {
+        std.debug.print("batcher: {d} sequencers are active\n", .{refresh.active_count});
+    }
+    const endpoint = leader.current();
+    return .{ .l1 = l1, .l2 = endpoint.l2, .rollup = if (has_rollup) endpoint.rollup else null };
 }
 
 /// Logs throttle outcomes when they change (pushes repeat every refresh).
@@ -276,7 +306,9 @@ fn validate_flags(flags: Flags) !void {
     if (flags.check_recent_txs_depth > 0 and !flags.wait_node_sync)
         return error.RecentTxsDepthRequiresWaitNodeSync;
     // Node sync is read from the rollup node: required, not optional, with the flag.
-    if (flags.wait_node_sync and flags.rollup_rpc == null)
+    if (flags.sequencer_urls != null and (flags.l2 != null or flags.rollup_rpc != null))
+        return error.SequencerUrlsReplaceL2;
+    if (flags.wait_node_sync and flags.rollup_rpc == null and flags.sequencer_urls == null)
         return error.WaitNodeSyncRequiresRollupRpc;
 }
 
@@ -438,9 +470,17 @@ test "batcher: flags" {
     try std.testing.expectError(error.RecentTxsDepthRequiresWaitNodeSync, parse_flags(&no_wait));
     const no_rollup = [_][]const u8{"--wait-node-sync"};
     try std.testing.expectError(error.WaitNodeSyncRequiresRollupRpc, parse_flags(&no_rollup));
+    const both = [_][]const u8{ "--l2", "http://a:1", "--sequencer-urls", "http://b:2" };
+    try std.testing.expectError(error.SequencerUrlsReplaceL2, parse_flags(&both));
+    const urls = [_][]const u8{ "--sequencer-urls", "http://b:2", "--wait-node-sync" };
+    try std.testing.expect((try parse_flags(&urls)).wait_node_sync);
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
     try std.testing.expectError(error.UnknownDataAvailability, parse_flags(&bad));
     try std.testing.expectError(error.MissingValue, parse_flags(&.{"--l1"}));
+}
+
+test {
+    _ = sequencer_clients;
 }
