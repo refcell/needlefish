@@ -4,6 +4,7 @@ Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
 Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
+- [x] `node/executor`: L1 block execution over evm + StateDb (deposit txs/L1 fees: pending).
 - [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
@@ -43,6 +44,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: L1 block executor (system calls, withdrawals, Prague requests, receipts, bloom, state root); OP deposits pending evm OP support.
 - 2026-11-05: node state db (evm backend, block commit to state trie).
 - 2026-11-05: engine payload well-formedness (block hash verification).
 - 2026-11-05: txpool stateless validation over common/consensus envelopes.
