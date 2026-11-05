@@ -13,5 +13,14 @@ provably robust.
 - [ ] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Decisions
+- Simulator v1 runs *model* nodes (`src/testing/sim/nodes.zig`) that follow the Base data
+  flow (L1, sequencer gossip, batcher → L1, verifier derivation). Real components replace
+  them as lanes land behind `utilities.io`; network, fault injector, and checkers stay.
+- Fixed 10 ms simulator step; three PRNG streams (network, nodes, faults) derived from the
+  seed so fault schedule changes do not perturb node randomness.
+- Safety is checked on heads only: chains are hash-linked, so a head match implies the
+  prefix matches.
+- Fuzz bodies take `*std.testing.Smith`; `testing.fuzz.run` drives them both coverage-guided
+  and from seeded `Prng` bytes on every `zig build test` (failure prints seed + iteration).
 
 ## Log

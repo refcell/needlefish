@@ -1,0 +1,386 @@
+//! Deterministic cluster simulation: model nodes on a simulated network with fault
+//! injection and invariant checks. One seed fixes the swarm config, the fault
+//! schedule, and every network decision, so a failing seed is a complete bug report.
+//!
+//! Phases:
+//!   1. faults:  [0, fault_end)          crashes, partitions, drops, disk faults
+//!   2. heal:    fault_end               restart everything, heal partitions, stop drops
+//!   3. drain:   [fault_end, settle_end) sequencer stops at production_end; then
+//!               liveness requires every verifier to reach the sequencer head, safe and
+//!               unsafe, and the batcher to confirm it on L1.
+//!
+//! Safety invariants are checked after every step:
+//!   - every verifier block at or below its unsafe head matches the sequencer chain
+//!   - safe head <= unsafe head <= sequencer head
+//!   - safe head never decreases within one incarnation of a verifier
+//!   - no reorgs and no equivocations (the model is honest)
+//!   - batcher confirmed <= L1-included <= sequencer head
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Prng = @import("../prng.zig").Prng;
+const network_module = @import("network.zig");
+const nodes = @import("nodes.zig");
+const NodeId = network_module.NodeId;
+
+pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
+pub const step_ns: u64 = 10 * std.time.ns_per_ms;
+const ns_per_s = std.time.ns_per_s;
+
+pub const Config = struct {
+    verifier_count: u8 = 2,
+    network: network_module.Config = .{},
+    l2_block_time_ns: u64 = 2 * ns_per_s,
+    l1_block_time_ns: u64 = 12 * ns_per_s,
+    fault_end_ns: u64 = 600 * ns_per_s,
+    production_end_ns: u64 = 660 * ns_per_s,
+    settle_end_ns: u64 = 960 * ns_per_s,
+    /// Expected faults per simulated minute during the fault phase.
+    crashes_per_minute: u32 = 1,
+    partitions_per_minute: u32 = 1,
+    /// Probability a restart loses the latest durable write, in parts per million.
+    disk_fault_ppm: u32 = 100_000,
+    downtime_ns_max: u64 = 60 * ns_per_s,
+
+    /// Swarm testing: a random but valid configuration per seed. Different seeds explore
+    /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
+    pub fn random(prng: *Prng) Config {
+        const latency_ns_min = prng.range(1, 50) * std.time.ns_per_ms;
+        const config: Config = .{
+            .verifier_count = @intCast(prng.range(1, verifier_count_max)),
+            .network = .{
+                .latency_ns_min = latency_ns_min,
+                .latency_ns_max = latency_ns_min + prng.range(0, 500) * std.time.ns_per_ms,
+                .drop_ppm = @intCast(swarm_level(prng, 300_000)),
+                .duplicate_ppm = @intCast(swarm_level(prng, 200_000)),
+                .capacity = 4096,
+            },
+            .crashes_per_minute = @intCast(swarm_level(prng, 6)),
+            .partitions_per_minute = @intCast(swarm_level(prng, 4)),
+            .disk_fault_ppm = @intCast(swarm_level(prng, 500_000)),
+            .downtime_ns_max = prng.range(1, 120) * ns_per_s,
+        };
+        config.validate();
+        return config;
+    }
+
+    pub fn validate(config: Config) void {
+        assert(config.verifier_count >= 1 and config.verifier_count <= verifier_count_max);
+        assert(config.l2_block_time_ns >= step_ns);
+        assert(config.l1_block_time_ns >= step_ns);
+        assert(config.fault_end_ns <= config.production_end_ns);
+        assert(config.production_end_ns < config.settle_end_ns);
+        assert(config.disk_fault_ppm <= 1_000_000);
+        assert(config.downtime_ns_max > 0);
+    }
+
+    pub fn block_count_max(config: Config) u64 {
+        return config.production_end_ns / config.l2_block_time_ns + 1;
+    }
+
+    pub fn l1_block_count_max(config: Config) u64 {
+        return config.settle_end_ns / config.l1_block_time_ns + 1;
+    }
+};
+
+/// Off a quarter of the time, otherwise uniform up to `max`: swarm testing disables
+/// whole fault classes on some seeds so the remaining ones get room to bite.
+fn swarm_level(prng: *Prng, max: u64) u64 {
+    if (prng.chance(1, 4)) return 0;
+    return prng.range(0, max);
+}
+
+pub const Failure = error{ SafetyViolation, LivenessViolation };
+
+pub const Report = struct {
+    steps: u64 = 0,
+    crashes: u64 = 0,
+    partitions: u64 = 0,
+    disk_faults: u64 = 0,
+    sequencer_head: u64 = 0,
+    l1_head: u64 = 0,
+    network: network_module.Stats = .{},
+};
+
+pub const Cluster = struct {
+    config: Config,
+    now_ns: u64 = 0,
+    prng_network: Prng,
+    prng_nodes: Prng,
+    prng_faults: Prng,
+    network: nodes.Net,
+    l1: nodes.L1,
+    sequencer: nodes.Sequencer,
+    batcher: nodes.Batcher = .{},
+    verifiers: [verifier_count_max]nodes.Verifier,
+    /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
+    restart_ns: [network_module.node_count_max]?u64 = @splat(null),
+    heal_ns: ?u64 = null,
+    safe_floor: [verifier_count_max]u64 = @splat(0),
+    report: Report = .{},
+
+    pub fn init(allocator: std.mem.Allocator, seed: u64, config: Config) !Cluster {
+        config.validate();
+        var network = try nodes.Net.init(allocator, config.network);
+        errdefer network.deinit(allocator);
+        var l1 = try nodes.L1.init(allocator, config.l1_block_count_max(), config.l1_block_time_ns);
+        errdefer l1.deinit(allocator);
+        var sequencer_chain = try nodes.Chain.init(allocator, config.block_count_max());
+        errdefer sequencer_chain.deinit(allocator);
+        var verifiers: [verifier_count_max]nodes.Verifier = undefined;
+        var initialized: u8 = 0;
+        errdefer for (verifiers[0..initialized]) |*v| v.chain.deinit(allocator);
+        while (initialized < config.verifier_count) : (initialized += 1) {
+            verifiers[initialized] = .{
+                .id = nodes.node_verifier_first + initialized,
+                .chain = try nodes.Chain.init(allocator, config.block_count_max()),
+            };
+        }
+        return .{
+            .config = config,
+            .prng_network = Prng.init(seed ^ 0x6e65_7477_6f72_6b00),
+            .prng_nodes = Prng.init(seed ^ 0x6e6f_6465_7300_0000),
+            .prng_faults = Prng.init(seed ^ 0x6661_756c_7473_0000),
+            .network = network,
+            .l1 = l1,
+            .sequencer = .{
+                .chain = sequencer_chain,
+                .block_time_ns = config.l2_block_time_ns,
+                .next_block_ns = config.l2_block_time_ns,
+            },
+            .verifiers = verifiers,
+        };
+    }
+
+    pub fn deinit(cluster: *Cluster, allocator: std.mem.Allocator) void {
+        for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| v.chain.deinit(allocator);
+        cluster.sequencer.chain.deinit(allocator);
+        cluster.l1.deinit(allocator);
+        cluster.network.deinit(allocator);
+        cluster.* = undefined;
+    }
+
+    fn env(cluster: *Cluster) nodes.Env {
+        return .{
+            .now_ns = cluster.now_ns,
+            .prng = &cluster.prng_network,
+            .network = &cluster.network,
+            .verifier_count = cluster.config.verifier_count,
+        };
+    }
+
+    fn up(cluster: *const Cluster, node: NodeId) bool {
+        return cluster.restart_ns[node] == null;
+    }
+
+    /// Run all phases. Returns the report, or a Failure after printing a diagnosis.
+    pub fn run(cluster: *Cluster) Failure!Report {
+        const steps_max = cluster.config.settle_end_ns / step_ns;
+        var step: u64 = 0;
+        while (step < steps_max) : (step += 1) {
+            cluster.now_ns += step_ns;
+            if (cluster.now_ns < cluster.config.fault_end_ns) cluster.inject_faults();
+            if (cluster.now_ns >= cluster.config.fault_end_ns) cluster.heal_all();
+            if (cluster.now_ns >= cluster.config.production_end_ns) {
+                cluster.sequencer.producing = false;
+            }
+            cluster.restart_due();
+            cluster.deliver();
+            cluster.tick();
+            try cluster.check_safety();
+        }
+        cluster.report.steps = steps_max;
+        try cluster.check_liveness();
+        cluster.report.sequencer_head = cluster.sequencer.head;
+        cluster.report.l1_head = cluster.l1.head;
+        cluster.report.network = cluster.network.stats;
+        return cluster.report;
+    }
+
+    fn deliver(cluster: *Cluster) void {
+        const e = cluster.env();
+        while (cluster.network.pop_due(cluster.now_ns)) |packet| {
+            if (!cluster.up(packet.to)) continue;
+            switch (packet.to) {
+                nodes.node_l1 => cluster.l1.on_message(&e, packet.from, packet.message),
+                nodes.node_sequencer => {
+                    cluster.sequencer.on_message(&e, packet.from, packet.message);
+                },
+                nodes.node_batcher => cluster.batcher.on_message(&e, packet.from, packet.message),
+                else => {
+                    const index = packet.to - nodes.node_verifier_first;
+                    assert(index < cluster.config.verifier_count);
+                    cluster.verifiers[index].on_message(&e, packet.from, packet.message);
+                },
+            }
+        }
+    }
+
+    fn tick(cluster: *Cluster) void {
+        const e = cluster.env();
+        cluster.l1.tick(&e);
+        if (cluster.up(nodes.node_sequencer)) cluster.sequencer.tick(&e);
+        if (cluster.up(nodes.node_batcher)) cluster.batcher.tick(&e, &cluster.sequencer);
+        for (cluster.verifiers[0..cluster.config.verifier_count]) |*verifier| {
+            if (cluster.up(verifier.id)) verifier.tick(&e);
+        }
+    }
+
+    fn inject_faults(cluster: *Cluster) void {
+        const steps_per_minute = 60 * ns_per_s / step_ns;
+        const prng = &cluster.prng_faults;
+        if (prng.chance(cluster.config.crashes_per_minute, steps_per_minute)) {
+            // Any node but L1. Crashing an already-down node extends nothing.
+            const node: NodeId = @intCast(prng.range(1, 2 + cluster.config.verifier_count));
+            if (cluster.up(node)) {
+                cluster.restart_ns[node] = cluster.now_ns +
+                    prng.range(step_ns, cluster.config.downtime_ns_max);
+                cluster.report.crashes += 1;
+            }
+        }
+        if (cluster.heal_ns) |heal_ns| {
+            if (cluster.now_ns >= heal_ns) {
+                cluster.network.heal();
+                cluster.heal_ns = null;
+            }
+        } else if (prng.chance(cluster.config.partitions_per_minute, steps_per_minute)) {
+            var group: [network_module.node_count_max]u8 = @splat(0);
+            for (&group) |*g| g.* = @intFromBool(prng.chance(1, 2));
+            cluster.network.partition(group);
+            cluster.heal_ns = cluster.now_ns + prng.range(step_ns, cluster.config.downtime_ns_max);
+            cluster.report.partitions += 1;
+        }
+    }
+
+    fn heal_all(cluster: *Cluster) void {
+        cluster.network.heal();
+        cluster.heal_ns = null;
+        cluster.network.config.drop_ppm = 0;
+        cluster.network.config.duplicate_ppm = 0;
+        for (&cluster.restart_ns) |*restart_ns| {
+            if (restart_ns.*) |*ns| ns.* = @min(ns.*, cluster.now_ns);
+        }
+    }
+
+    fn restart_due(cluster: *Cluster) void {
+        const e = cluster.env();
+        for (&cluster.restart_ns, 0..) |*restart_ns, node_index| {
+            const ns = restart_ns.* orelse continue;
+            if (cluster.now_ns < ns) continue;
+            restart_ns.* = null;
+            const node: NodeId = @intCast(node_index);
+            assert(node != nodes.node_l1);
+            switch (node) {
+                nodes.node_sequencer => cluster.sequencer.restart(&e),
+                nodes.node_batcher => cluster.batcher.restart(&e),
+                else => {
+                    const index = node - nodes.node_verifier_first;
+                    const disk_fault = cluster.prng_faults.chance(
+                        cluster.config.disk_fault_ppm,
+                        1_000_000,
+                    );
+                    cluster.report.disk_faults += @intFromBool(disk_fault);
+                    cluster.verifiers[index].restart(disk_fault);
+                    cluster.safe_floor[index] = cluster.verifiers[index].safe_head;
+                },
+            }
+        }
+    }
+
+    fn check_safety(cluster: *Cluster) Failure!void {
+        const sequencer = &cluster.sequencer;
+        if (cluster.batcher.confirmed > sequencer.head) {
+            return cluster.fail("batcher confirmed beyond sequencer head", 0);
+        }
+        for (cluster.verifiers[0..cluster.config.verifier_count], 0..) |*v, index| {
+            if (v.safe_head > v.unsafe_head) return cluster.fail("safe > unsafe", v.id);
+            if (v.unsafe_head > sequencer.head) return cluster.fail("unsafe > sequencer", v.id);
+            if (v.safe_head < cluster.safe_floor[index]) {
+                return cluster.fail("safe head decreased", v.id);
+            }
+            cluster.safe_floor[index] = v.safe_head;
+            if (v.reorgs != 0) return cluster.fail("unexpected reorg", v.id);
+            if (v.equivocations != 0) return cluster.fail("equivocation", v.id);
+            // Heads only: earlier blocks were checked when they were heads, and parent
+            // hashes chain them, so a head match implies the whole prefix matches.
+            if (v.chain.hashes[v.unsafe_head] != sequencer.chain.hashes[v.unsafe_head]) {
+                return cluster.fail("unsafe head diverged", v.id);
+            }
+            if (v.chain.hashes[v.safe_head] != sequencer.chain.hashes[v.safe_head]) {
+                return cluster.fail("safe head diverged", v.id);
+            }
+        }
+    }
+
+    fn check_liveness(cluster: *Cluster) Failure!void {
+        const head = cluster.sequencer.head;
+        if (cluster.batcher.confirmed != head) {
+            return cluster.fail("batcher did not confirm sequencer head", nodes.node_batcher);
+        }
+        for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| {
+            if (v.unsafe_head != head) return cluster.fail("verifier unsafe head lags", v.id);
+            if (v.safe_head != head) return cluster.fail("verifier safe head lags", v.id);
+        }
+    }
+
+    fn fail(cluster: *const Cluster, reason: []const u8, node: NodeId) Failure {
+        std.debug.print(
+            "simulator: violation at t={d}ms node={d}: {s} (sequencer={d} confirmed={d})\n",
+            .{
+                cluster.now_ns / std.time.ns_per_ms, node,                      reason,
+                cluster.sequencer.head,              cluster.batcher.confirmed,
+            },
+        );
+        for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| {
+            std.debug.print("  verifier {d}: safe={d} unsafe={d} l1_cursor={d}\n", .{
+                v.id, v.safe_head, v.unsafe_head, v.follower.cursor,
+            });
+        }
+        return if (std.mem.indexOf(u8, reason, "lags") != null or
+            std.mem.indexOf(u8, reason, "did not") != null)
+            error.LivenessViolation
+        else
+            error.SafetyViolation;
+    }
+};
+
+/// Run one seed with its swarm config. Used by the simulator binary and the test suite.
+pub fn run_seed(allocator: std.mem.Allocator, seed: u64) !Report {
+    var prng = Prng.init(seed);
+    const config = Config.random(&prng);
+    var cluster = try Cluster.init(allocator, seed, config);
+    defer cluster.deinit(allocator);
+    return cluster.run();
+}
+
+test "cluster: fault-free run reaches liveness" {
+    var cluster = try Cluster.init(std.testing.allocator, 1, .{
+        .crashes_per_minute = 0,
+        .partitions_per_minute = 0,
+        .fault_end_ns = 60 * ns_per_s,
+        .production_end_ns = 120 * ns_per_s,
+        .settle_end_ns = 300 * ns_per_s,
+    });
+    defer cluster.deinit(std.testing.allocator);
+    const report = try cluster.run();
+    try std.testing.expectEqual(@as(u64, 59), report.sequencer_head);
+}
+
+test "cluster: same seed, same run" {
+    const a = try run_seed(std.testing.allocator, 42);
+    const b = try run_seed(std.testing.allocator, 42);
+    try std.testing.expectEqual(a.network.sent, b.network.sent);
+    try std.testing.expectEqual(a.network.delivered, b.network.delivered);
+    try std.testing.expectEqual(a.crashes, b.crashes);
+    try std.testing.expectEqual(a.sequencer_head, b.sequencer_head);
+}
+
+test "cluster: seeded swarm" {
+    var seed: u64 = 0;
+    while (seed < 8) : (seed += 1) {
+        _ = run_seed(std.testing.allocator, seed) catch |err| {
+            std.debug.print("cluster: swarm seed {d} failed\n", .{seed});
+            return err;
+        };
+    }
+}

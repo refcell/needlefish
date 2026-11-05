@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "base", .module = base }},
         }),
     });
+    b.installArtifact(sim);
     const run_sim = b.addRunArtifact(sim);
     run_sim.addPassthruArgs();
     const sim_step = b.step("sim", "Run the deterministic simulator: zig build sim -- [seed]");
