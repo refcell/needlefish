@@ -9,6 +9,8 @@ pub const json = @import("json/root.zig");
 pub const http = @import("http/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const jwt = @import("jwt/root.zig");
+pub const metrics = @import("metrics/root.zig");
+pub const log = @import("log/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

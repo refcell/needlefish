@@ -54,3 +54,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: http: Server(IO, Ctx, handler) and Client(IO) with keep-alive and pipelining; SimIo + kqueue + io_uring tests.
 - 2026-11-05: rpc: JSON-RPC 2.0 Router (batches, notifications, typed params, error rewind) and Client; fuzzed.
 - 2026-11-05: jwt: HS256 create/verify, +-60s iat window, alg-none rejection, hex secret; fuzzed.
+- 2026-11-05: metrics: atomic Counter/Gauge/Histogram, static Registry, Prometheus text. log: leveled logfmt/JSON Logger with fixed messages, typed fields, injected sink and clock.
