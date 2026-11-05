@@ -127,3 +127,8 @@ provably robust.
   AuthorizationList: canonical re-encode, iterators walk the counted items) and legacy
   `v` decoding (inverts EIP-155 encoding). Seeded words now 3/4 of inputs with a wider
   small-value spread. Note: `-Dtest-filter` takes one substring; `a|b` matches nothing.
+- 2026-11-05: model-based fuzz of the batcher channel manager (`fuzz_targets_batcher.zig`):
+  random configs (zlib/brotli, frame sizes, target frames) under interleaved adds,
+  reorged parents, L1 heads, closes, drains, and resets; every channel must decode
+  to exactly the next accepted blocks, and a final drain must deliver them all.
+  Mutation-checked; 200 ms Debug.
