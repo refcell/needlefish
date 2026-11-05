@@ -75,6 +75,9 @@ fallback but hot paths should be our own, optimized implementations.
   ~4 ns/gas, well under ecrecover's ~9.5 ns/gas, so it is not a gas-DoS bottleneck.
 - [x] BLS pairing perf: closed by the same analysis (pairing-2 588us / 102,900 gas =
   ~5.7 ns/gas).
+- [x] x86_64 test coverage from the arm64 host: `zig build test -Dtarget=x86_64-macos
+  -Dcpu=x86_64_v3 -frosetta -Dtest-filter=crypto` runs the suite under Rosetta (scalar
+  sha256, AVX2 keccak lanes, x86 `ct.barrier`). 255 pass, 3 heavy KZG tests skipped in Debug.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -359,3 +362,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: KZG `evaluate_blob` (fraction-sum barycentric, 4 lanes): batch verify (6) 3.95 -> 3.25ms.
 - 2026-11-05: bn254 G2 subgroup check [x+1]Q + psi([x]Q) + psi^2([x]Q) = psi^3([2x]Q) (one 63-bit mul instead of 127-bit [6x^2]Q; old test kept as oracle): pairing-2 502 -> ~460us. Split: Miller loop (2 pairs) 247us, final exponentiation 166us (new benches).
 - 2026-11-05: fuzz campaign: p256 precompile 300K runs clean.
+- 2026-11-05: crypto suite passes on x86_64 (baseline and x86_64_v3) under Rosetta.
