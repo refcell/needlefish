@@ -17,6 +17,8 @@ const json = @import("../../utilities/json/root.zig");
 const keccak256 = @import("../../common/primitives/root.zig").keccak256;
 const block = @import("../protocol/block.zig");
 const safedb = @import("../safedb/root.zig");
+const rollup_json = @import("../protocol/rollup_json.zig");
+const RollupConfig = @import("../protocol/rollup_config.zig").RollupConfig;
 
 const Call = rpc.Call;
 const HandlerError = rpc.HandlerError;
@@ -73,6 +75,7 @@ pub const Backend = struct {
     context: *anyopaque,
     vtable: *const VTable,
     version: []const u8,
+    rollup: *const RollupConfig,
 
     pub const VTable = struct {
         sync_status: *const fn (context: *anyopaque) SyncStatus,
@@ -89,6 +92,7 @@ pub const methods = [_]rpc.Method(*const Backend){
     .{ .name = "optimism_outputAtBlock", .handler = output_at_block },
     .{ .name = "optimism_safeHeadAtL1Block", .handler = safe_head_at_l1_block },
     .{ .name = "optimism_syncStatus", .handler = sync_status },
+    .{ .name = "optimism_rollupConfig", .handler = rollup_config },
     .{ .name = "optimism_version", .handler = version },
 };
 
@@ -171,6 +175,12 @@ fn sync_status(backend: *const Backend, call: *Call) HandlerError!void {
     try write_sync_status(call.writer, status);
 }
 
+fn rollup_config(backend: *const Backend, call: *Call) HandlerError!void {
+    try call.params.finish();
+    assert(backend.rollup.block_time > 0 or backend.rollup.l2_chain_id == 0);
+    try rollup_json.write(call.writer, backend.rollup);
+}
+
 fn version(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
     assert(backend.version.len > 0);
@@ -236,6 +246,7 @@ const TestNode = struct {
     output: ?OutputAtBlock = null,
     db: ?*const safedb.SafeDB = null,
     last_tag: ?BlockTag = null,
+    rollup: RollupConfig = .{ .block_time = 2, .l2_chain_id = 8453 },
 
     const vtable: Backend.VTable = .{
         .sync_status = status_of,
@@ -258,7 +269,12 @@ const TestNode = struct {
     }
 
     fn call(test_node: *TestNode, body: []const u8, buffer: []u8) []const u8 {
-        const backend: Backend = .{ .context = test_node, .vtable = &vtable, .version = "v0.1.0" };
+        const backend: Backend = .{
+            .context = test_node,
+            .vtable = &vtable,
+            .version = "v0.1.0",
+            .rollup = &test_node.rollup,
+        };
         var out: std.Io.Writer = .fixed(buffer);
         _ = Router.handle(&backend, body, &out);
         return out.buffered();
@@ -306,6 +322,12 @@ test "rollup rpc: syncStatus and version JSON" {
     try testing.expectEqualStrings(
         \\{"jsonrpc":"2.0","id":2,"result":"v0.1.0"}
     , version_reply);
+    const config_reply = test_node.call(
+        \\{"jsonrpc":"2.0","id":3,"method":"optimism_rollupConfig"}
+    , &buffer);
+    const start = std.mem.indexOf(u8, config_reply, "\"result\":").? + 9;
+    const config = try rollup_json.parse(config_reply[start .. config_reply.len - 1]);
+    try testing.expectEqualDeep(test_node.rollup, config);
 }
 
 test "rollup rpc: outputAtBlock tags, availability, and response" {
@@ -374,7 +396,9 @@ fn fuzz_body(test_node: *TestNode, body: []const u8) !void {
 test "rollup rpc: seeded fuzz, replies are always valid JSON" {
     var prng = Prng.init(0x524f4c4c);
     var test_node: TestNode = .{};
-    const names = [_][]const u8{ "outputAtBlock", "safeHeadAtL1Block", "syncStatus", "version" };
+    const names = [_][]const u8{
+        "outputAtBlock", "safeHeadAtL1Block", "syncStatus", "version", "rollupConfig",
+    };
     const params = [_][]const u8{ "[]", "[\"0x1\"]", "[\"safe\"]", "[1]", "{}", "[\"0x\"]", "x" };
     var body: [256]u8 = undefined;
     for (0..2000) |_| {
