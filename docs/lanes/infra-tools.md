@@ -50,6 +50,15 @@ allocation after startup.
   rule 10).
 - [ ] Devnet smoke: withdrawer step once the devnet deploys a proving portal (the stand-in
   portal in `batcher/devnet/portal.zig` only emits deposits).
+- [x] `infra/sidecrush`: block-production health sidecar (port `sidecrush`): poll the EL
+  head, flag stalls and slow blocks against the 200 ms cadence, metrics + health endpoints,
+  `base sidecrush`. SimIo tests for stall, recovery, and RPC failure.
+- [ ] `infra/load_test` key stream + chain prep: derive N sender keys from a seed, fund them
+  in batches from a funder account through the tx manager, deploy workload contracts
+  (ERC-20, storage, looper) from hand-assembled bytecode (port `workload/{key_stream,
+  chain_prep,accounts}.rs`). Lets the devnet load test exceed 10 dev accounts.
+- [ ] `infra/load_test` payloads: `storage`, `precompile`, `looper` (gas-heavy), and a real
+  ERC-20 transfer against the deployed token (port `payloads/*`); `--json` report.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -76,6 +85,11 @@ allocation after startup.
   content address (reuse without comparing against the previous manifest); no compression
   yet. Restore verifies every chunk and renames a temp file into place. A consistent copy
   needs the node stopped; an online engine checkpoint export (trie-db) is future work.
+- sidecrush polls `latest` over HTTP (one poll per 200 ms slot by default) and measures age
+  as local time since the head number advanced (base/base's `newHeads` semantics), because
+  whole-second header timestamps cannot resolve 200 ms blocks. Thresholds keep base/base's
+  defaults (2 s grace, 3 s unhealthy). The StatsD heartbeat becomes per-state Prometheus
+  tick counters.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
   address; deploying a token is future work), open-loop pacer with 2x catch-up, one
   tx_manager driver per sender, latency via reservoir sampling. Default senders are dev
@@ -150,3 +164,6 @@ allocation after startup.
 - 2026-11-05: smoke step 5 (`base load-test` 20 tx/s for 5 s from dev accounts 2-4 against the
   sequencer); full `just devnet smoke` passes, 99/99 confirmed, p50 690 ms. load-test gains
   `--receipt-poll-ms` (default 200, matching 200 ms L2 blocks).
+- 2026-11-05: sidecrush (`HeadState` classifier + fuzz, `Checker(IO)` with metrics/readiness,
+  SimIo tests at 200 ms slots) and `base sidecrush`; on the devnet: healthy/200, then error/503
+  after the sequencer EL was killed.
