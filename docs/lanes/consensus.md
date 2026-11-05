@@ -19,8 +19,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
   - [x] channel bank / assembler / provider (Holocene switch)
-  - [ ] channel reader (decode owned batches)
-  - [ ] batch stream, batch queue, batch validator
+  - [x] channel reader (decode owned batches)
+  - [x] batch stream, batch queue, batch validator, batch provider
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
   - [ ] attributes queue, pipeline core (step, reset, signals)
 - [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
@@ -66,7 +66,12 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - Decoded batches own an arena (`OwnedBatch`) holding a copy of their bytes, so they outlive
   the channel's decompressed buffer.
 
+- Batch stages do not own their upstream: the pipeline resets each stage upstream-first.
+  L2 fetch errors during span checks make the span undecided (as base/base). `l1_blocks`
+  and the queue's batch list are allocator-bounded only, as in base/base.
+
 ## Log
+- 2026-11-05: derive: channel reader, batch stream/queue/validator/provider (ported tests, fuzz).
 - 2026-11-05: engine: sync state + forkchoice state, L2 finalizer (bounded, fuzzed).
 - 2026-11-05: safedb: safe head updates, reset semantics, lookup, record codec, fuzz.
 - 2026-11-05: derive: channel bank (Granite ready selection, size prune), assembler, provider.
