@@ -32,6 +32,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   (salts + init code hashes verified by derivation), ERC-1167 proxy helpers, `coinbase_tip`.
 - [x] `consensus/eip8130_gas.zig`: base/base `base-common-eip8130` gas schedule and intrinsic
   gas (nonce key, bytecode, account changes, sender/payer auth, EIP-7623 payload floor).
+- [x] `rpc_types/transaction.zig`: parse RPC transaction objects (types 0-4, 0x79, deposit) back
+  into envelopes; the rebuilt envelope must hash to the reported `hash`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -88,6 +90,12 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   tests check it against `encode_without_payer_auth`. Nonce-manager slots stay in
   `execution/evm/native.zig`.
 
+- `parse_transaction` checks the reported `hash` but not `from` (recovery needs the crypto
+  recoverer; callers that need it recover from the envelope). Legacy `v` must agree with
+  `chainId`. The remaining base/base common crates (`network`, `rpc-types-engine`,
+  `observability-events`, `evm*`, `precompile*`) are trait glue, engine API (node lane) or
+  execution, so they are not ported here.
+
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
@@ -112,3 +120,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: EIP-8130 account flags, unsequenced sentinel, delegation indicator.
 - 2026-11-05: CREATE/CREATE2 addresses, EIP-8130 deployment table, coinbase tip.
 - 2026-11-05: EIP-8130 intrinsic gas (`eip8130_gas`).
+- 2026-11-05: RPC transaction JSON parsing with hash check.

@@ -247,12 +247,70 @@ test "rpc types: EIP-8130 transaction and receipt" {
 fn write_any(input: []const u8, buffer: []u8) !void {
     const envelope = Envelope.decode(input) catch return;
     var w: Writer = .fixed(buffer);
-    rpc.write_transaction(&w, envelope, .{ .hash = .zero, .from = .zero }) catch |err| {
+    const context: rpc.TransactionContext = .{ .hash = envelope.hash(), .from = .zero };
+    rpc.write_transaction(&w, envelope, context) catch |err| {
         // Only an undersized buffer may fail; the writer itself never errors.
         try testing.expectEqual(error.WriteFailed, err);
         return;
     };
     try testing.expect(try std.json.validate(testing.allocator, w.buffered()));
+    try expect_round_trip(w.buffered(), input);
+}
+
+/// parse_transaction(write_transaction(envelope)) re-encodes to the same bytes.
+fn expect_round_trip(text: []const u8, encoded: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(Value, arena.allocator(), text, .{});
+    const parsed = try rpc.transaction.parse_transaction(arena.allocator(), value);
+    var buffer: [1024]u8 = undefined;
+    var encoder = @import("../rlp/root.zig").Encoder.init(&buffer);
+    parsed.envelope.encode(&encoder);
+    try testing.expectEqualSlices(u8, encoded, encoder.written());
+}
+
+fn parse_error(text: []const u8) !rpc.transaction.Transaction {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(Value, arena.allocator(), text, .{});
+    return rpc.transaction.parse_transaction(arena.allocator(), value);
+}
+
+fn legacy_json(buffer: []u8, hash: B256, v: []const u8, type_text: []const u8) ![]const u8 {
+    var hash_text: [66]u8 = undefined;
+    hex.encode_prefixed(&hash_text, &hash.bytes);
+    return std.fmt.bufPrint(buffer,
+        \\{{"type":"{s}","hash":"{s}","chainId":"0x1","nonce":"0x9","gasPrice":"0x4a817c800",
+        \\"gas":"0x5208","to":"0x3535353535353535353535353535353535353535",
+        \\"value":"0xde0b6b3a7640000","input":"0x",
+        \\"r":"0x28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276",
+        \\"s":"0x67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83","v":"{s}"}}
+    , .{ type_text, &hash_text, v });
+}
+
+test "rpc types: transaction parse checks hash, v and type" {
+    var encoded: [128]u8 = undefined;
+    const envelope = try Envelope.decode(try hex.decode_into(&encoded, eip155_example_hex));
+    const hash = envelope.hash();
+    var buffer: [1024]u8 = undefined;
+    const parsed = try parse_error(try legacy_json(&buffer, hash, "0x25", "0x0"));
+    try testing.expect(parsed.envelope.legacy.tx.chain_id.? == 1);
+    try testing.expect(parsed.hash.eql(hash));
+    const cases = [_]struct { v: []const u8, type_text: []const u8, err: anyerror }{
+        .{ .v = "0x26", .type_text = "0x0", .err = error.HashMismatch },
+        .{ .v = "0x27", .type_text = "0x0", .err = error.InvalidSignature },
+        .{ .v = "0x1c", .type_text = "0x0", .err = error.InvalidSignature },
+        .{ .v = "0x1", .type_text = "0x0", .err = error.InvalidSignature },
+        .{ .v = "0x25", .type_text = "0x5", .err = error.UnknownType },
+        .{ .v = "0x25", .type_text = "0x2", .err = error.InvalidSignature },
+        .{ .v = "0x1", .type_text = "0x2", .err = error.MissingField },
+    };
+    for (cases) |case| {
+        const text = try legacy_json(&buffer, hash, case.v, case.type_text);
+        try testing.expectError(case.err, parse_error(text));
+    }
+    const wrong_hash = try legacy_json(&buffer, .zero, "0x25", "0x0");
+    try testing.expectError(error.HashMismatch, parse_error(wrong_hash));
 }
 
 test "rpc types: seeded fuzz decoded envelopes serialize to valid JSON" {
@@ -282,6 +340,142 @@ test "rpc types: fuzz" {
             var buffer: [16 * 1024]u8 = undefined;
             const length = smith.slice(&input);
             try write_any(input[0..length], &buffer);
+        }
+    }.run, .{});
+}
+
+fn round_trip_envelope(envelope: Envelope) !void {
+    var encoded: [2048]u8 = undefined;
+    var encoder = @import("../rlp/root.zig").Encoder.init(&encoded);
+    envelope.encode(&encoder);
+    _ = try Envelope.decode(encoder.written()); // write_any skips undecodable input.
+    var buffer: [16 * 1024]u8 = undefined;
+    try write_any(encoder.written(), &buffer);
+}
+
+test "rpc types: transaction parse round-trips every type" {
+    const fields = consensus.tx_fields;
+    const aa = consensus.eip8130;
+    const target = Address.comptime_hex("4200000000000000000000000000000000000007");
+    const key = B256{ .bytes = @splat(0x11) };
+    var access_buffer: [256]u8 = undefined;
+    const access = fields.AccessList.build(&access_buffer, &.{
+        .{ .address = target, .storage_keys = &.{ key, .zero } },
+        .{ .address = .zero },
+    });
+    var hashes_buffer: [128]u8 = undefined;
+    const hashes = fields.HashList.build(&hashes_buffer, &.{ key, key });
+    var auth_buffer: [256]u8 = undefined;
+    const auths = fields.AuthorizationList.build(&auth_buffer, &.{
+        .{ .chain_id = 8453, .address = target, .nonce = 3, .y_parity = 1, .r = 7, .s = 9 },
+    });
+    const signature: consensus.signature.Signature = .{ .y_parity = true, .r = 1 << 200, .s = 5 };
+    const common = .{
+        .chain_id = 8453,
+        .nonce = 4,
+        .gas_limit = 21_000,
+        .value = 10,
+        .input = "hi",
+    };
+    try round_trip_envelope(.{ .eip2930 = .{ .signature = signature, .tx = .{
+        .chain_id = common.chain_id,
+        .nonce = common.nonce,
+        .gas_price = 7,
+        .gas_limit = common.gas_limit,
+        .to = .create,
+        .value = common.value,
+        .input = common.input,
+        .access_list = access,
+    } } });
+    try round_trip_envelope(.{ .eip1559 = .{ .signature = signature, .tx = .{
+        .chain_id = common.chain_id,
+        .nonce = common.nonce,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 2,
+        .gas_limit = common.gas_limit,
+        .to = .{ .call = target },
+        .value = common.value,
+        .input = common.input,
+        .access_list = .empty,
+    } } });
+    try round_trip_envelope(.{ .eip4844 = .{ .signature = signature, .tx = .{
+        .chain_id = common.chain_id,
+        .nonce = common.nonce,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 2,
+        .gas_limit = common.gas_limit,
+        .to = target,
+        .value = common.value,
+        .input = common.input,
+        .access_list = access,
+        .max_fee_per_blob_gas = 3,
+        .blob_versioned_hashes = hashes,
+    } } });
+    try round_trip_envelope(.{ .eip7702 = .{ .signature = signature, .tx = .{
+        .chain_id = common.chain_id,
+        .nonce = common.nonce,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 2,
+        .gas_limit = common.gas_limit,
+        .to = target,
+        .value = common.value,
+        .input = common.input,
+        .access_list = .empty,
+        .authorization_list = auths,
+    } } });
+    var phase_buffer: [256]u8 = undefined;
+    var calls_buffer: [256]u8 = undefined;
+    var changes_buffer: [512]u8 = undefined;
+    var ops_buffer: [256]u8 = undefined;
+    var actors_buffer: [256]u8 = undefined;
+    const phase = aa.Phase.build(&phase_buffer, &.{.{ .to = target, .value = 5, .data = "x" }});
+    const ops = aa.SignedChanges.build(&ops_buffer, &.{
+        .{ .change_type = .revoke_actor, .payload = &.{ 1, 2 } },
+    });
+    const actors = aa.InitialActors.build(&actors_buffer, &.{.{
+        .actor_id = key,
+        .authenticator = aa.k1_authenticator,
+        .scope = 1,
+        .policy_data = &.{},
+    }});
+    const changes = aa.AccountChanges.build(&changes_buffer, &.{
+        .{ .delegation = target },
+        .{ .create = .{ .user_salt = key, .code = &.{0x60}, .initial_actors = actors } },
+        .{ .config = .{ .channel = .local, .sequence = 2, .changes = ops, .signature = "sig" } },
+    });
+    try round_trip_envelope(.{ .eip8130 = .{
+        .tx = .{
+            .chain_id = 8453,
+            .sender = target,
+            .nonce_key = 1 << 100,
+            .nonce_sequence = 7,
+            .valid_after = 1,
+            .valid_before = 2,
+            .max_priority_fee_per_gas = 1,
+            .max_fee_per_gas = 2,
+            .gas_limit = 100_000,
+            .account_changes = changes,
+            .calls = aa.Calls.build(&calls_buffer, &.{ phase, phase }),
+            .metadata = "memo",
+            .payer = target,
+        },
+        .sender_auth = "sender",
+        .payer_auth = "payer",
+    } });
+}
+
+test "rpc types: fuzz transaction parse" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
+            var input: [1024]u8 = undefined;
+            const length = smith.slice(&input);
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const text = input[0..length];
+            const value = std.json.parseFromSliceLeaky(Value, allocator, text, .{}) catch return;
+            const parsed = rpc.transaction.parse_transaction(allocator, value) catch return;
+            try testing.expect(parsed.envelope.hash().eql(parsed.hash));
         }
     }.run, .{});
 }

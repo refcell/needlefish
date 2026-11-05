@@ -10,6 +10,7 @@ const consensus = @import("../consensus/root.zig");
 pub const json = @import("json.zig");
 pub const eip8130 = @import("eip8130.zig");
 pub const request = @import("request.zig");
+pub const transaction = @import("transaction.zig");
 
 const Writer = std.Io.Writer;
 const Object = json.Object;
@@ -391,5 +392,6 @@ test {
     _ = json;
     _ = eip8130;
     _ = request;
+    _ = transaction;
     _ = @import("root_test.zig");
 }
