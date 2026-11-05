@@ -3,6 +3,7 @@
 const std = @import("std");
 const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
+const MetricsServer = @import("batcher_metrics.zig").MetricsServer;
 
 const Io = std.Io;
 const batcher = base.batcher;
@@ -27,6 +28,8 @@ const Flags = struct {
     data_availability: batcher.txmgr.DataAvailability = .calldata,
     /// base/base batches with brotli (Fjord is active from genesis on the devnet).
     compression: batcher.comp.Algorithm = .brotli,
+    /// Serve Prometheus metrics on this port (op-batcher `--metrics.port`).
+    metrics_port: ?u16 = null,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -56,7 +59,7 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (eql(u8, arg, "--poll-interval-ms")) {
             flags.poll_interval_ms = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, arg, "--metrics.port")) {
-            // Metrics land with utilities/metrics; accepted for the process contract.
+            flags.metrics_port = try std.fmt.parseInt(u16, value, 10);
         } else if (eql(u8, arg, "--data-availability")) {
             flags.data_availability = std.meta.stringToEnum(
                 batcher.txmgr.DataAvailability,
@@ -148,15 +151,43 @@ fn run(
         .rollup = if (flags.rollup_rpc != null) &rollup else null,
     };
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
+    var metrics: batcher.metrics.Metrics = .{};
+    try metrics.register();
+    var metrics_server: MetricsServer = undefined;
+    const serving = if (flags.metrics_port) |port|
+        start_metrics(&metrics_server, init.gpa, &metrics, port)
+    else
+        false;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
+            metrics.record(report, service.txs.pending_count());
         } else |err| {
+            metrics.step_failures.increment();
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
         }
-        try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
+        if (serving) {
+            try metrics_server.serve_for(flags.poll_interval_ms);
+        } else {
+            try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
+        }
     }
+}
+
+/// Metrics are optional: a bind failure is logged and batching continues without them.
+fn start_metrics(
+    server: *MetricsServer,
+    allocator: std.mem.Allocator,
+    metrics: *batcher.metrics.Metrics,
+    port: u16,
+) bool {
+    server.start(allocator, metrics, port) catch |err| {
+        std.debug.print("batcher: metrics disabled, port {d}: {t}\n", .{ port, err });
+        return false;
+    };
+    std.debug.print("batcher: metrics on :{d}/metrics\n", .{port});
+    return true;
 }
 
 fn log_report(report: batcher.service.Report) void {
@@ -184,6 +215,9 @@ test "batcher: flags" {
     const args = [_][]const u8{ "--l1", "http://x", "--key-index", "3", "--metrics.port", "7300" };
     const flags = try parse_flags(&args);
     try std.testing.expectEqual(@as(u32, 3), flags.key_index);
+    try std.testing.expectEqual(@as(?u16, 7300), flags.metrics_port);
+    const bad_port = [_][]const u8{ "--metrics.port", "70000" };
+    try std.testing.expectError(error.Overflow, parse_flags(&bad_port));
     const blobs = [_][]const u8{ "--data-availability", "blobs" };
     try std.testing.expectEqual(.blobs, (try parse_flags(&blobs)).data_availability);
     try std.testing.expectEqual(.brotli, (try parse_flags(&blobs)).compression);

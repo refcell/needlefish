@@ -41,7 +41,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/source`: EIP-7702 (type 4) transactions.
 - [x] `batcher/service` + `base batcher`: step loop (heads, load, frames, txmgr), calldata DA.
 - [x] `batcher/service`: safe-head stall watchdog (resubmit from safe+1; covers timed-out channels).
-- [ ] `base batcher`: metrics endpoint (blocked: utilities/http has only a parser, no server).
+- [x] `base batcher`: metrics endpoint (`batcher/metrics`, utilities http server + metrics
+  registry; served while waiting between steps; bind failure only disables metrics).
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
@@ -109,3 +110,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `base devnet batches` inspector; live: 20 batches decoded from an anvil L1.
 - 2026-11-05: multi-blob transactions (default 6 per tx in blob mode).
 - 2026-11-05: brotli compressor; text compresses to ~31% (reference q5: ~23%).
+- 2026-11-05: batcher Prometheus metrics on `--metrics.port`; verified with curl live.
