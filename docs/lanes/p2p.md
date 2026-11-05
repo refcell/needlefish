@@ -65,8 +65,11 @@ behind a small interface and switch later.
   1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
 - [x] `Service` DST: sequencer publishing every 2 s through random TCP resets
   (`reset_ppm` 5000): every node gets every block and reconnects.
-- [ ] `Service` DST: 8 nodes (slow tests), node crash/restart (`SimIo.crash`), and
-  peer bans propagating under an invalid-block attacker.
+- [x] `Service` DST: invalid-block attacker banned by every honest peer (discv5 ban +
+  disconnect) while honest gossip continues; crash/restart reconnects and receives
+  blocks; 8 nodes with resets behind `-Dslow-tests`.
+- [ ] Node integration: expose `Service` + `Transport` to the consensus node binary
+  (config from CLI flags mirroring base/base `--p2p.*`), keys from the node key file.
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
@@ -223,3 +226,4 @@ behind a small interface and switch later.
 - 2026-11-05: libp2p connection pipeline (worker, 1624507).
 - 2026-11-05: TCP transport over utilities/io; SimIo cluster gossips blocks end to end.
 - 2026-11-05: redial from lookups; gossip survives random connection resets in DST.
+- 2026-11-05: DST attacker/crash/8-node scenarios.
