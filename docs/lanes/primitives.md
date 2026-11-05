@@ -27,6 +27,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `signer`: `eth_signTransaction` request body, response parse, content + signer checks.
 - [x] genesis `config.base` (azul..zenith, v1/v2/v3/future aliases, strict like base/base) and
   `activationAdminAddress`; `Config.is_base_upgrade_active`.
+- [x] EIP-8130 account-state constants (flags, `unsequenced`) and the delegation indicator.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -93,3 +94,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: 0x79 accountChanges/calls request parsing.
 - 2026-11-05: remote signer codecs (`common/signer`).
 - 2026-11-05: genesis Base upgrade times and activation admin address.
+- 2026-11-05: EIP-8130 account flags, unsequenced sentinel, delegation indicator.

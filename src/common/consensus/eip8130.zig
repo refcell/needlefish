@@ -53,6 +53,52 @@ pub const scope_sponsor_payer: u16 = 0x0004;
 pub const scope_policy: u16 = 0x0008;
 pub const scope_nonce: u16 = 0x0010;
 
+/// Local-channel sequence low-half sentinel (`maxInt(u32)`): an unsequenced (JIT) batch
+/// consumes no sequence. Sequenced batches run up to `unsequenced - 2`.
+pub const unsequenced: u32 = std.math.maxInt(u32);
+
+/// `AccountState.flags` bits.
+pub const flag_default_eoa_revoked: u8 = 0x01;
+/// Actor configuration frozen; only the unlock op is accepted.
+pub const flag_locked: u8 = 0x02;
+/// While set, `lock_union` holds `unlocks_at` instead of `unlock_delay`.
+pub const flag_unlock_initiated: u8 = 0x04;
+
+/// EIP-7702-style delegation indicator: account code `0xef0100 || target`.
+pub const delegation_indicator_prefix = [3]u8{ 0xef, 0x01, 0x00 };
+pub const delegation_indicator_size = delegation_indicator_prefix.len + 20;
+
+comptime {
+    assert(delegation_indicator_size == 23);
+    assert(flag_default_eoa_revoked & flag_locked & flag_unlock_initiated == 0);
+}
+
+pub fn delegation_indicator(target: Address) [delegation_indicator_size]u8 {
+    return delegation_indicator_prefix ++ target.bytes;
+}
+
+/// The delegation target when `code` is exactly a delegation indicator.
+pub fn delegation_target(code: []const u8) ?Address {
+    if (code.len != delegation_indicator_size) return null;
+    if (!std.mem.eql(u8, code[0..3], &delegation_indicator_prefix)) return null;
+    return .{ .bytes = code[3..23].* };
+}
+
+test "eip8130: delegation indicator" {
+    const target = Address.comptime_hex("4200000000000000000000000000000000000007");
+    const code = delegation_indicator(target);
+    try std.testing.expectEqualSlices(u8, &.{ 0xef, 0x01, 0x00, 0x42 }, code[0..4]);
+    try std.testing.expect(delegation_target(&code).?.eql(target));
+    try std.testing.expect(delegation_target(code[0..22]) == null);
+    var bad = code;
+    bad[1] = 0x02;
+    try std.testing.expect(delegation_target(&bad) == null);
+    var long: [24]u8 = undefined;
+    long[0..23].* = code;
+    long[23] = 0;
+    try std.testing.expect(delegation_target(&long) == null);
+}
+
 /// Canonical CREATE2-deployed EIP-8130 contracts (identical on every Base chain).
 pub const contracts = struct {
     pub const account_config = Address.comptime_hex("813012Bd8D971928475235BBac6F0488c4A100AC");
