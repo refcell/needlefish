@@ -64,6 +64,7 @@ fn flag_name(comptime field: []const u8) []const u8 {
 
 fn env_name(comptime prefix: []const u8, comptime field: []const u8) []const u8 {
     comptime {
+        @setEvalBranchQuota(100 * (prefix.len + field.len) + 1000);
         var name: [prefix.len + field.len]u8 = undefined;
         @memcpy(name[0..prefix.len], prefix);
         for (field, 0..) |byte, index| name[prefix.len + index] = std.ascii.toUpper(byte);
