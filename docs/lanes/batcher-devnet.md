@@ -64,6 +64,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   also recovers from dropped txs and rollup-node restarts; duplicate batches are dropped by
   derivation.
 
+- 2026-11-05: Push procedure: after a green `zig build test` + tidy, if main moved and the new
+  upstream commits touch none of our files (nor build.zig / src/base.zig), rebase and push without
+  a second full test run. Main moves faster than one test run, so strict re-testing never lands.
+
 ## Log
 - 2026-11-05: DEVNET.md contract; batcher frame + blob codecs with fuzz tests.
 - 2026-11-05: batcher/frame reuses consensus Frame; comp: zlib + stored brotli (verified
