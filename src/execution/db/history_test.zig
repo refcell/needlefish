@@ -22,7 +22,7 @@ const StateTrie = trie.StateTrie;
 
 const addresses_max = 24;
 const slots_max = 12;
-const blocks_total = 48;
+const blocks_total = 32;
 const window_blocks = 10;
 
 const state_config: state_module.Config = .{
@@ -247,7 +247,8 @@ fn run_seed(seed: u64) !void {
 }
 
 test "history: proofs at every block of the window match an unwound state" {
-    for (0..6) |seed| try run_seed(0x415700 + seed);
+    // Two seeds keep Debug runtime low; the long fuzz run covers more.
+    for (0..2) |seed| try run_seed(0x415700 + seed);
 }
 
 test "history: window edges and errors" {
