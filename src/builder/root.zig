@@ -6,6 +6,7 @@ const std = @import("std");
 pub const core = @import("core/root.zig");
 pub const publish = @import("publish/root.zig");
 pub const multiplex = @import("multiplex/root.zig");
+pub const metering = @import("metering/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

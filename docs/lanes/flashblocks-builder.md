@@ -42,7 +42,7 @@ can drive the builder and the flashblocks consumer.
 - [ ] `builder/core` service: Engine API integration (`forkchoiceUpdated` with
   attributes starts a job, `getPayload` returns the best sealed payload), resting /
   cancellation on new FCU (port `service.rs`, `resting.rs`).
-- [ ] `builder/metering`: per-tx execution metering store and extension hooks
+- [x] `builder/metering`: per-tx execution metering store and extension hooks
   (port `crates/builder/metering`, `execution_metering_mode.rs`).
 - [x] `builder/multiplex`: router between the canonical EL and the builder for Engine
   API calls (port `crates/builder/multiplex`).
@@ -60,6 +60,9 @@ can drive the builder and the flashblocks consumer.
   sequence for a block replays to exactly the sealed block.
 
 ## Decisions
+- Metering store keeps base/base semantics (LRU + TTL from insert, late-arrival
+  accounting) with injected time; moka's background expiry is an explicit `expire(now)`
+  tick. The `base_setMeteringInformation` RPC wiring lands with the builder binary.
 - Multiplex is a synchronous router over a comptime `Builder` interface (both builders
   in-process); it ports routing, shadow `no_tx_pool` builds, 128-id route memory, health,
   and the event filter. Wiring it to the Engine API service comes with `builder/core`
@@ -109,3 +112,4 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: `builder/multiplex` router (Denim one-shot selection, shadow builds, health).
 - 2026-11-05: builder/core flashblock generator (index 0 + cumulative-budget deltas with
   per-delta roots and block hash; final block equals a `Chain` build), seeded + fuzz tests.
+- 2026-11-05: `builder/metering` store (LRU/TTL, late arrivals) and execution metering mode.
