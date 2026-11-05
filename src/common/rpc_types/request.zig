@@ -13,6 +13,8 @@ const Address = primitives.Address;
 const B256 = primitives.B256;
 const Value = std.json.Value;
 const fields = consensus.tx_fields;
+const aa = consensus.eip8130;
+const nested = @import("request_eip8130.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ParseError = error{
@@ -20,8 +22,6 @@ pub const ParseError = error{
     InvalidField,
     /// `input` and `data` were both given with different contents.
     ConflictingInput,
-    /// EIP-8130 `accountChanges`/`calls` in a request (not supported yet).
-    UnsupportedField,
     OutOfMemory,
 };
 
@@ -57,12 +57,15 @@ pub const TransactionRequest = struct {
     payer: ?Address = null,
     sender_auth: ?[]const u8 = null,
     payer_auth: ?[]const u8 = null,
+    account_changes: ?aa.AccountChanges = null,
+    calls: ?aa.Calls = null,
 
     pub fn has_eip8130_fields(request: TransactionRequest) bool {
         return request.nonce_key != null or request.valid_after != null or
             request.valid_before != null or request.metadata != null or
             request.sender != null or request.payer != null or
-            request.sender_auth != null or request.payer_auth != null;
+            request.sender_auth != null or request.payer_auth != null or
+            request.account_changes != null or request.calls != null;
     }
 
     /// The type a node would build from these fields (alloy `preferred_type`, plus 0x79).
@@ -85,9 +88,6 @@ pub const TransactionRequest = struct {
 pub fn parse_transaction_request(arena: Allocator, value: Value) ParseError!TransactionRequest {
     if (value != .object) return error.NotAnObject;
     const object = value.object;
-    if (object.get("accountChanges") != null or object.get("calls") != null) {
-        return error.UnsupportedField;
-    }
     var request: TransactionRequest = .{
         .from = try optional_address(object, "from"),
         .to = try optional_address(object, "to"),
@@ -115,6 +115,10 @@ pub fn parse_transaction_request(arena: Allocator, value: Value) ParseError!Tran
     if (object.get("blobVersionedHashes")) |list| {
         request.blob_versioned_hashes = try parse_hash_list(arena, list, blob_hashes_max);
     }
+    if (field(object, "accountChanges")) |list| {
+        request.account_changes = try nested.parse_account_changes(arena, list);
+    }
+    if (field(object, "calls")) |list| request.calls = try nested.parse_calls(arena, list);
     if (object.get("authorizationList")) |list| {
         request.authorization_list = try parse_authorizations(arena, list);
     }
@@ -131,17 +135,25 @@ fn parse_input(arena: Allocator, object: std.json.ObjectMap) ParseError!?[]const
     return input orelse data;
 }
 
-fn field(object: std.json.ObjectMap, name: []const u8) ?Value {
+pub fn field(object: std.json.ObjectMap, name: []const u8) ?Value {
     const value = object.get(name) orelse return null;
     return if (value == .null) null else value;
 }
 
-fn required(object: std.json.ObjectMap, name: []const u8) ParseError!Value {
+pub fn required(object: std.json.ObjectMap, name: []const u8) ParseError!Value {
     return field(object, name) orelse error.InvalidField;
 }
 
-fn string_of(value: Value) ParseError![]const u8 {
+pub fn string_of(value: Value) ParseError![]const u8 {
     return if (value == .string) value.string else error.InvalidField;
+}
+
+pub fn address_of(value: Value) ParseError!Address {
+    return .{ .bytes = try fixed(20, value) };
+}
+
+pub fn hash_of(value: Value) ParseError!B256 {
+    return .{ .bytes = try fixed(32, value) };
 }
 
 pub fn quantity(comptime T: type, value: Value) ParseError!T {
@@ -170,7 +182,7 @@ fn optional_address(object: std.json.ObjectMap, name: []const u8) ParseError!?Ad
     return .{ .bytes = try fixed(20, value) };
 }
 
-fn data_of(arena: Allocator, value: Value) ParseError![]const u8 {
+pub fn data_of(arena: Allocator, value: Value) ParseError![]const u8 {
     const text = try string_of(value);
     if (!std.mem.startsWith(u8, text, "0x")) return error.InvalidField;
     const length = hex.decoded_length(text) catch return error.InvalidField;
@@ -188,7 +200,7 @@ fn optional_data(
     return try data_of(arena, value);
 }
 
-fn array_of(value: Value, limit: usize) ParseError![]const Value {
+pub fn array_of(value: Value, limit: usize) ParseError![]const Value {
     if (value != .array) return error.InvalidField;
     if (value.array.items.len > limit) return error.InvalidField;
     return value.array.items;
@@ -293,6 +305,10 @@ fn parse_text(arena: Allocator, text: []const u8) !TransactionRequest {
     return parse_transaction_request(arena, value);
 }
 
+test {
+    _ = nested;
+}
+
 test "rpc request: dynamic fee call" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -334,7 +350,10 @@ test "rpc request: types, conflicts, and failures" {
     try testing.expectError(error.InvalidField, parse_text(arena, "{\"gas\":\"0x01\"}"));
     try testing.expectError(error.InvalidField, parse_text(arena, "{\"to\":\"0x42\"}"));
     try testing.expectError(error.InvalidField, parse_text(arena, "{\"value\":1}"));
-    try testing.expectError(error.UnsupportedField, parse_text(arena, "{\"calls\":[]}"));
+    try testing.expectEqual(
+        consensus.tx.TxType.eip8130,
+        (try parse_text(arena, "{\"calls\":[]}")).preferred_type(),
+    );
     try testing.expectError(error.NotAnObject, parse_text(arena, "[]"));
     const authorization = try parse_text(arena,
         \\{"authorizationList":[{"chainId":"0x2105",
