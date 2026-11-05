@@ -8,7 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const hex = @import("hex.zig");
-const Keccak256 = std.crypto.hash.sha3.Keccak256;
+const crypto_keccak = @import("../crypto/keccak.zig");
 
 /// A fixed-size byte string of `size` bytes with hex helpers.
 pub fn FixedBytes(comptime size: usize) type {
@@ -70,9 +70,7 @@ pub const Address = FixedBytes(20);
 
 /// Keccak-256 of `data`.
 pub fn keccak256(data: []const u8) B256 {
-    var out: B256 = undefined;
-    Keccak256.hash(data, &out.bytes, .{});
-    return out;
+    return .{ .bytes = crypto_keccak.keccak256(data) };
 }
 
 /// Keccak-256 of the empty string.
@@ -135,15 +133,14 @@ pub fn address_to_word(address: Address) B256 {
 pub fn checksum(address: Address, chain_id: ?u64) [42]u8 {
     var lower: [40]u8 = undefined;
     hex.encode(&lower, &address.bytes);
-    var hasher = Keccak256.init(.{});
+    var hasher = crypto_keccak.Hasher.init();
     var prefix_buffer: [24]u8 = undefined;
     if (chain_id) |id| {
         const prefix = std.fmt.bufPrint(&prefix_buffer, "{d}0x", .{id}) catch unreachable;
         hasher.update(prefix);
     }
     hasher.update(&lower);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
+    const digest = hasher.final();
     var out: [42]u8 = undefined;
     out[0] = '0';
     out[1] = 'x';

@@ -36,8 +36,8 @@ fn has_custom(comptime T: type) bool {
     };
 }
 
-/// Payload length of a struct encoded as a list.
-fn fields_length(value: anytype) usize {
+/// Payload length of a struct encoded as a list (sum of its encoded fields).
+pub fn fields_length(value: anytype) usize {
     var total: usize = 0;
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
         total += length(@field(value, name));
@@ -100,6 +100,25 @@ pub fn encode(encoder: *Encoder, value: anytype) void {
     assert(encoder.position - start == length(value));
 }
 
+/// Encodes each field of struct `value` in order, without a list header.
+pub fn encode_fields(encoder: *Encoder, value: anytype) void {
+    const start = encoder.position;
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        encode(encoder, @field(value, name));
+    }
+    assert(encoder.position - start == fields_length(value));
+}
+
+/// Decodes the fields of struct `T` in order from a list decoder (no finish check).
+pub fn decode_fields(comptime T: type, items: *Decoder) Error!T {
+    const info = @typeInfo(T).@"struct";
+    var value: T = undefined;
+    inline for (info.field_names, info.field_types) |name, Field| {
+        @field(value, name) = try decode(Field, items);
+    }
+    return value;
+}
+
 /// Encodes `value` into `buffer` and returns the written prefix.
 pub fn encode_to(buffer: []u8, value: anytype) []u8 {
     assert(buffer.len >= length(value));
@@ -123,12 +142,9 @@ pub fn decode(comptime T: type, decoder: *Decoder) Error!T {
             comptime assert(pointer.child == u8);
             return decoder.bytes();
         },
-        .@"struct" => |info| {
+        .@"struct" => {
             var items = try decoder.list();
-            var value: T = undefined;
-            inline for (info.field_names, info.field_types) |name, Field| {
-                @field(value, name) = try decode(Field, &items);
-            }
+            const value = try decode_fields(T, &items);
             try items.finish();
             return value;
         },

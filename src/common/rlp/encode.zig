@@ -45,36 +45,54 @@ pub fn list_length(payload_length: usize) usize {
     return header_length(payload_length) + payload_length;
 }
 
+/// A streaming destination (e.g. a keccak hasher) that receives encoded bytes in
+/// order, so hashing an encoding needs no buffer sized for the whole item.
+pub const Sink = struct {
+    context: *anyopaque,
+    write: *const fn (context: *anyopaque, data: []const u8) void,
+};
+
 pub const Encoder = struct {
     buffer: []u8,
+    /// Bytes written so far (into `buffer`, or streamed to `sink`).
     position: usize,
+    sink: ?Sink = null,
 
     pub fn init(buffer: []u8) Encoder {
         return .{ .buffer = buffer, .position = 0 };
     }
 
-    /// The bytes written so far.
+    /// An encoder that streams every byte to `sink` instead of a buffer.
+    pub fn init_sink(sink: Sink) Encoder {
+        return .{ .buffer = &.{}, .position = 0, .sink = sink };
+    }
+
+    /// The bytes written so far. Buffer mode only.
     pub fn written(encoder: *const Encoder) []u8 {
+        assert(encoder.sink == null);
         assert(encoder.position <= encoder.buffer.len);
         return encoder.buffer[0..encoder.position];
     }
 
     pub fn remaining(encoder: *const Encoder) usize {
+        if (encoder.sink != null) return std.math.maxInt(usize);
         assert(encoder.position <= encoder.buffer.len);
         return encoder.buffer.len - encoder.position;
     }
 
     /// Appends already-encoded bytes verbatim.
     pub fn raw(encoder: *Encoder, data: []const u8) void {
-        assert(data.len <= encoder.remaining());
-        @memcpy(encoder.buffer[encoder.position..][0..data.len], data);
+        if (encoder.sink) |sink| {
+            sink.write(sink.context, data);
+        } else {
+            assert(data.len <= encoder.remaining());
+            @memcpy(encoder.buffer[encoder.position..][0..data.len], data);
+        }
         encoder.position += data.len;
     }
 
     fn byte(encoder: *Encoder, value: u8) void {
-        assert(encoder.remaining() >= 1);
-        encoder.buffer[encoder.position] = value;
-        encoder.position += 1;
+        encoder.raw(&.{value});
     }
 
     /// Writes `value` big-endian in exactly `size` bytes.
@@ -153,6 +171,24 @@ test "encode: lengths" {
     try testing.expectEqual(@as(usize, 2), int_length(@as(u64, 128)));
     try testing.expectEqual(@as(usize, 1), bytes_length(&.{0x7f}));
     try testing.expectEqual(@as(usize, 2), bytes_length(&.{0x80}));
+}
+
+test "encode: sink mode streams the same bytes" {
+    const Collect = struct {
+        data: [64]u8 = undefined,
+        len: usize = 0,
+        fn write(context: *anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            @memcpy(self.data[self.len..][0..data.len], data);
+            self.len += data.len;
+        }
+    };
+    var collect: Collect = .{};
+    var encoder = Encoder.init_sink(.{ .context = &collect, .write = Collect.write });
+    encoder.list_header(4);
+    encoder.bytes("cat");
+    try testing.expectEqual(@as(usize, 5), encoder.position);
+    try testing.expectEqualSlices(u8, "\xc4\x83cat", collect.data[0..collect.len]);
 }
 
 test "encode: known encodings" {
