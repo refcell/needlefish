@@ -794,7 +794,9 @@ fn fuzz_validate(context: *TestContext, smith: *std.testing.Smith) anyerror!void
     var envelope = try context.valid(version, prng.below(16));
     const raw = std.mem.asBytes(&envelope.payload.gas_used);
     if (prng.chance(1, 2)) raw[@intCast(prng.below(8))] ^= prng.int(u8) | 1;
-    if (prng.chance(1, 4)) envelope.signature[@intCast(prng.below(65))] ^= 0x10;
+    // Only r and s: decoding derives `y_parity` from byte 64, so flipping it alone builds
+    // an envelope no decoder produces (and trips `recover_signer`'s assert).
+    if (prng.chance(1, 4)) envelope.signature[@intCast(prng.below(64))] ^= 0x10;
     var validator = context.validator();
     const now = now_test - 70 + prng.below(140);
     const result = validator.validate(&envelope, now);

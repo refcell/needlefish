@@ -18,6 +18,17 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Smith = std.testing.Smith;
 const Prng = @import("prng.zig").Prng;
+const build_options = @import("build_options");
+
+/// `-Dfuzz-soak=N` multiplies every seeded run's iterations and `-Dfuzz-seed=S` moves it
+/// to fresh inputs: `just fuzz-soak` explores far past the per-commit budget. The
+/// defaults (1, 0) leave ordinary `zig build test` runs unchanged.
+pub const soak_factor: u32 = build_options.fuzz_soak;
+pub const soak_seed: u64 = build_options.fuzz_seed;
+
+comptime {
+    assert(soak_factor >= 1);
+}
 
 /// Largest input the seeded driver generates. Inputs live on the stack.
 pub const input_size_limit: u32 = 16 * 1024;
@@ -69,16 +80,20 @@ pub fn run_seeded(
     }
 
     var buffer: [input_size_limit]u8 = undefined;
+    const iterations = std.math.mul(u32, options.iterations, soak_factor) catch
+        std.math.maxInt(u32);
+    const base_seed = options.seed ^ soak_seed;
+    assert(iterations >= options.iterations);
     var iteration: u32 = 0;
-    while (iteration < options.iterations) : (iteration += 1) {
-        const seed = iteration_seed(options.seed, iteration);
+    while (iteration < iterations) : (iteration += 1) {
+        const seed = iteration_seed(base_seed, iteration);
         const input = generate(&buffer, seed, options.input_size_max);
         assert(input.len <= options.input_size_max);
         var smith: Smith = .{ .in = input };
         test_one(context, &smith) catch |err| {
             std.debug.print(
                 "fuzz: failure seed=0x{x} iteration={d} input_len={d} error={s}\n",
-                .{ options.seed, iteration, input.len, @errorName(err) },
+                .{ base_seed, iteration, input.len, @errorName(err) },
             );
             return err;
         };
@@ -221,7 +236,7 @@ test "fuzz: seeded driver is deterministic" {
     const options: Options = .{ .iterations = 64, .coverage = false, .corpus = &.{"abc"} };
     try run_bytes(&a, count_bytes, options);
     try run_bytes(&b, count_bytes, options);
-    try std.testing.expectEqual(@as(u32, 65), a.calls);
+    try std.testing.expectEqual(1 + 64 * soak_factor, a.calls);
     try std.testing.expectEqual(a.bytes, b.bytes);
 }
 

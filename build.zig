@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
         "Fail (instead of skip) OS IO tests when io_uring is unavailable",
     ) orelse false;
     options.addOption(bool, "require_io_uring", require_io_uring);
+    const fuzz_soak = b.option(u32, "fuzz-soak", "Multiply seeded fuzz iterations") orelse 1;
+    options.addOption(u32, "fuzz_soak", fuzz_soak);
+    const fuzz_seed = b.option(u64, "fuzz-seed", "Mixed into every seeded fuzz seed") orelse 0;
+    options.addOption(u64, "fuzz_seed", fuzz_seed);
 
     const base = b.addModule("base", .{
         .root_source_file = b.path("src/base.zig"),

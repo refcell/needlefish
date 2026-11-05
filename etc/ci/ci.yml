@@ -54,3 +54,7 @@ jobs:
           echo "$HOME/zig" >> "$GITHUB_PATH"
       - name: fuzz
         run: zig build test --fuzz=200000 -Doptimize=ReleaseSafe
+      - name: seeded fuzz soak (fresh seed per run, replay with -Dfuzz-seed)
+        run: >-
+          zig build test -Doptimize=ReleaseSafe -Dtest-filter=fuzz -Dfuzz-soak=50
+          -Dfuzz-seed=$GITHUB_RUN_NUMBER

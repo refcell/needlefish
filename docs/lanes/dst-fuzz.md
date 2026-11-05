@@ -263,3 +263,9 @@ provably robust.
   restart recovers unsafe := safe with a non-truncating EL (equivocated), disk fault loses 5
   blocks (head went back), sealed gossip drops the user tx (gossip differs), production
   stalls at 40 (did not produce), sequencer skips derivation (safe head lags): 12/12 caught.
+- 2026-11-05: seeded fuzz soak: `-Dfuzz-soak=N` multiplies every seeded fuzz run and
+  `-Dfuzz-seed=S` moves it to fresh inputs (`just fuzz-soak`; CI fuzz job runs x50 with
+  the run number as seed). First x20 soak found a harness bug in consensus p2p
+  `validity: fuzz validation of mutated envelopes` (flipped signature byte 64 without
+  `y_parity`, tripping `recover_signer`'s assert; no decoder builds that state): fixed to
+  flip r/s only, reported to the consensus lane.

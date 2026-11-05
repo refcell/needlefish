@@ -35,6 +35,10 @@ test-linux:
 fuzz:
     zig build test --fuzz -Doptimize=ReleaseSafe
 
+# Seeded fuzz soak: every seeded fuzz test, `factor` times the iterations, fresh seed
+fuzz-soak factor='100' seed='1':
+    zig build test -Doptimize=ReleaseSafe -Dtest-filter=fuzz -Dfuzz-soak={{ factor }} -Dfuzz-seed={{ seed }}
+
 # Deterministic simulation: just sim [seed]
 sim seed='':
     zig build sim -Doptimize=ReleaseSafe -- {{ seed }}
