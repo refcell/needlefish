@@ -11,7 +11,7 @@ const native = @import("native.zig");
 const abi = @import("native_abi.zig");
 const activation = @import("native_activation.zig");
 const b20 = @import("native_b20.zig");
-const asset = @import("native_b20_asset.zig");
+const asset = @import("native_b20_token.zig");
 const storage = @import("native_storage.zig");
 const primitives = @import("primitives.zig");
 const Address = primitives.Address;
@@ -143,20 +143,32 @@ pub fn token_address(variant: native.B20Variant, creator: Address, salt: *const 
     return token;
 }
 
-const AssetParams = struct {
+const Params = struct {
+    variant: native.B20Variant,
     version: u8,
     name: []const u8,
     symbol: []const u8,
     initial_admin: Address,
+    /// Asset decimals (stablecoins are fixed at 6).
     decimals: u8,
+    /// Stablecoin currency code.
+    currency: []const u8,
 };
 
-/// abi_decode_validate of `B20AssetCreateParams` (a dynamic struct behind one offset word);
-/// failures report the createB20 selector.
-fn decode_asset_params(context: *Context, params: []const u8) Error!AssetParams {
+/// abi_decode_validate of `B20AssetCreateParams` / `B20StablecoinCreateParams` (a dynamic
+/// struct behind one offset word); failures report the createB20 selector.
+fn decode_params(
+    context: *Context,
+    variant: native.B20Variant,
+    params: []const u8,
+) Error!Params {
     const selector = selector_of(.create_b20);
-    const name = "B20AssetCreateParams";
-    const kinds = [_]abi.Kind{ .uint8, .string, .string, .address, .uint8 };
+    const name = switch (variant) {
+        .asset => "B20AssetCreateParams",
+        .stablecoin => "B20StablecoinCreateParams",
+    };
+    const last: abi.Kind = if (variant == .asset) .uint8 else .string;
+    const kinds = [_]abi.Kind{ .uint8, .string, .string, .address, last };
     var failure: native.DecodeFailure = .overrun;
     if (params.len < 32) return context.revert_decode(selector, name, failure);
     const head = params[0..32];
@@ -167,12 +179,15 @@ fn decode_asset_params(context: *Context, params: []const u8) Error!AssetParams 
     const tuple = params[@intCast(offset)..];
     const arguments = abi.decode_arguments(tuple, &kinds, 0, &failure) orelse
         return context.revert_decode(selector, name, failure);
+    const is_asset = variant == .asset;
     return .{
+        .variant = variant,
         .version = arguments.small(0),
         .name = arguments.bytes(1),
         .symbol = arguments.bytes(2),
         .initial_admin = arguments.address(3),
-        .decimals = arguments.small(4),
+        .decimals = if (is_asset) arguments.small(4) else asset.decimals_min,
+        .currency = if (is_asset) &.{} else arguments.bytes(4),
     };
 }
 
@@ -190,9 +205,7 @@ fn create(context: *Context, arguments: *const Arguments) Error!Address {
         .stablecoin => activation.feature_b20_stablecoin,
     };
     try ensure_activated(context, feature);
-    // The stablecoin token is not implemented yet; its creation reverts empty.
-    if (variant == .stablecoin) return context.revert(&.{});
-    const params = try decode_asset_params(context, arguments.bytes(2));
+    const params = try decode_params(context, variant, arguments.bytes(2));
     if (params.version != params_version) {
         return b20.revert_words(context, error_unsupported_version, &.{
             word(params.version),
@@ -207,7 +220,7 @@ fn create(context: *Context, arguments: *const Arguments) Error!Address {
         return context.revert_word(error_token_already_exists, address_word(token));
     }
     try context.install_marker_at(token);
-    try initialize_asset(context, token, &params);
+    try initialize(context, token, &params);
     try emit_created(context, token, variant, &params);
     try run_init_calls(context, token, &params, arguments);
     return token;
@@ -231,45 +244,97 @@ const TokenScope = struct {
     }
 };
 
-fn initialize_asset(context: *Context, token: Address, params: *const AssetParams) Error!void {
+fn initialize(context: *Context, token: Address, params: *const Params) Error!void {
     const scope = TokenScope.enter(context, token);
     defer scope.leave(context);
+    if (params.variant == .stablecoin) try validate_currency(context, params.currency);
     try storage.store(context, b20.slot_name, params.name);
     try storage.store(context, b20.slot_symbol, params.symbol);
     try context.sstore(b20.slot_supply_cap, b20.supply_cap_max);
+    if (params.variant == .stablecoin) {
+        try storage.store(context, asset.stablecoin_root, params.currency);
+        return;
+    }
     const decimals_word = try context.sload(asset.asset_root);
     try context.sstore(asset.asset_root, (decimals_word & ~@as(u256, 0xff)) | params.decimals);
     try context.sstore(asset.asset_root + 1, 0); // Initial multiplier 0 (reads as WAD).
 }
 
-/// B20Created(token indexed, variant indexed, name, symbol, decimals, variantParams).
+const error_missing_required_field = [4]u8{ 0x4a, 0x43, 0xae, 0x87 };
+const error_invalid_currency = [4]u8{ 0x99, 0x7c, 0x1d, 0xe8 };
+
+/// Non-empty, uppercase ASCII letters only.
+fn validate_currency(context: *Context, currency: []const u8) Error!void {
+    if (currency.len == 0) {
+        return revert_string(context, error_missing_required_field, "currency");
+    }
+    for (currency) |byte| {
+        if (byte < 'A' or byte > 'Z') {
+            return revert_string(context, error_invalid_currency, currency);
+        }
+    }
+}
+
+fn revert_string(context: *Context, selector: [4]u8, text: []const u8) error{Revert} {
+    const out = context.out;
+    out[0..4].* = selector;
+    out[4..36].* = word(0x20);
+    out[36..68].* = word(text.len);
+    const padded = std.mem.alignForward(usize, text.len, 32);
+    @memset(out[68..][0..padded], 0);
+    @memcpy(out[68..][0..text.len], text);
+    return context.revert(out[0 .. 68 + padded]);
+}
+
+/// B20Created(token indexed, variant indexed, name, symbol, decimals, variantParams);
+/// stablecoin variantParams = abi.encode(B20StablecoinEventParams{version: 1, currency}).
 fn emit_created(
     context: *Context,
     token: Address,
     variant: native.B20Variant,
-    params: *const AssetParams,
+    params: *const Params,
 ) Error!void {
     const out = context.out;
-    var length: usize = 4 * 32;
-    const tails = [3][]const u8{ params.name, params.symbol, &.{} };
-    const heads = [3]usize{ 0, 1, 3 };
     out[64..96].* = word(params.decimals);
-    for (tails, heads) |tail, head| {
-        out[32 * head ..][0..32].* = word(length);
-        out[length..][0..32].* = word(tail.len);
-        const padded = std.mem.alignForward(usize, tail.len, 32);
-        @memset(out[length + 32 ..][0..padded], 0);
-        @memcpy(out[length + 32 ..][0..tail.len], tail);
-        length += 32 + padded;
+    var length: usize = 4 * 32;
+    length = append_bytes(out, 0, length, params.name);
+    length = append_bytes(out, 1, length, params.symbol);
+    out[96..128].* = word(length);
+    if (variant == .asset) {
+        out[length..][0..32].* = word(0);
+        length += 32;
+    } else {
+        const currency = params.currency;
+        const padded = std.mem.alignForward(usize, currency.len, 32);
+        out[length..][0..32].* = word(4 * 32 + padded);
+        out[length + 32 ..][0..32].* = word(0x20);
+        out[length + 64 ..][0..32].* = word(1);
+        out[length + 96 ..][0..32].* = word(0x40);
+        length = append_tail(out, length + 128, currency);
     }
     const topics = [3]B256{ event_b20_created, address_word(token), word(@backingInt(variant)) };
     try context.emit(&topics, out[0..length]);
 }
 
+/// Write head `head` as an offset to a length-prefixed tail at `length`.
+fn append_bytes(out: []u8, head: usize, length: usize, bytes: []const u8) usize {
+    out[32 * head ..][0..32].* = word(length);
+    return append_tail(out, length, bytes);
+}
+
+fn append_tail(out: []u8, length: usize, bytes: []const u8) usize {
+    out[length..][0..32].* = word(bytes.len);
+    const padded = std.mem.alignForward(usize, bytes.len, 32);
+    @memset(out[length + 32 ..][0..padded], 0);
+    @memcpy(out[length + 32 ..][0..bytes.len], bytes);
+    assert(padded % 32 == 0);
+    return length + 32 + padded;
+}
+
 fn run_init_calls(
     context: *Context,
     token: Address,
-    params: *const AssetParams,
+    params: *const Params,
     arguments: *const Arguments,
 ) Error!void {
     const scope = TokenScope.enter(context, token);

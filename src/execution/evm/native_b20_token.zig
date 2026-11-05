@@ -1,6 +1,10 @@
-//! B-20 Asset token (Beryl V1): ERC-20 with memos, roles, pause flags, supply cap, transfer
-//! policies, metadata, and the asset extension (multiplier, extra metadata, batch mint).
-//! base/base `crates/common/precompiles/src/b20_asset` (dispatch.rs, logic/v1.rs).
+//! B-20 tokens (Beryl V1), Asset and Stablecoin variants: ERC-20 with memos, roles, pause
+//! flags, supply cap, transfer policies, metadata, permit; the asset extension (multiplier,
+//! extra metadata, batch mint, announce) and the stablecoin `currency()`. The variant comes
+//! from the token address. base/base `crates/common/precompiles/src/b20_{asset,stablecoin}`.
+//!
+//! Stablecoin extension storage (ERC-7201 `base.b20.stablecoin`): currency string 0;
+//! decimals are fixed at 6.
 //!
 //! Extension storage (ERC-7201 `base.b20.asset`): decimals 0 (low byte; 0 reads as 6),
 //! multiplier 1, used announcement ids 2, extra metadata 3, pending multiplier 4.
@@ -28,6 +32,9 @@ const slot_decimals: u256 = asset_root;
 const slot_multiplier: u256 = asset_root + 1;
 const base_announcement_ids: u256 = asset_root + 2;
 const base_extra_metadata: u256 = asset_root + 3;
+
+pub const stablecoin_root: u256 =
+    0x35827975a06ca0e9367ea3129b19441d45d0ca58e30b7693f09e73d0943d6200;
 
 pub const role_operator: u256 =
     0x97667070c54ef182b0f5858b034beac1b6f3089aa2d3188bb1e8929f4fa9b929;
@@ -102,11 +109,37 @@ pub fn selector_of(tag: Tag) [4]u8 {
     unreachable; // Every tag has a table entry.
 }
 
-fn find(selector: [4]u8) ?*const Function {
+fn find(selector: [4]u8, variant: native.B20Variant) ?*const Function {
     for (&functions) |*function| {
+        if (!available(function.tag, variant)) continue;
         if (std.mem.eql(u8, &function.selector, &selector)) return function;
     }
     return null;
+}
+
+fn variant_of(context: *const Context) native.B20Variant {
+    return native.b20_variant(context.address).?;
+}
+
+/// The asset extension exists only on assets, `currency()` only on stablecoins.
+fn available(tag: Tag, variant: native.B20Variant) bool {
+    return switch (tag) {
+        .operator_role,
+        .wad_precision,
+        .is_announcement_id_used,
+        .multiplier,
+        .to_scaled_balance,
+        .to_raw_balance,
+        .scaled_balance_of,
+        .update_multiplier,
+        .batch_mint,
+        .extra_metadata,
+        .update_extra_metadata,
+        .announce,
+        => variant == .asset,
+        .currency => variant == .stablecoin,
+        else => true,
+    };
 }
 
 /// Entry point for a token address; `privileged` is false for external calls.
@@ -120,7 +153,8 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
 /// Decode and run one call; factory init calls use `privileged = true`.
 pub fn route(context: *Context, input: []const u8, privileged: bool) Error![]const u8 {
     const selector = native.selector_of(input);
-    const function = find(selector) orelse return context.revert_unknown(selector);
+    const function = find(selector, variant_of(context)) orelse
+        return context.revert_unknown(selector);
     if (function.tag != .announce) return execute(context, function, input, privileged);
     const arguments = try decode(context, function, input);
     try announce(context, &arguments, privileged);
@@ -177,7 +211,7 @@ fn announce(context: *Context, arguments: *const Arguments, privileged: bool) Er
 
 fn internal_call(context: *Context, call: []const u8, privileged: bool) Error!void {
     if (call.len < 4) return revert_with_bytes(context, error_internal_call_malformed, call);
-    const function = find(call[0..4].*) orelse
+    const function = find(call[0..4].*, .asset) orelse
         return revert_with_bytes(context, error_internal_call_failed, call);
     if (function.tag == .announce) return context.revert_selector(error_announcement_in_progress);
     _ = execute(context, function, call, privileged) catch |err| switch (err) {
@@ -227,8 +261,10 @@ fn write_string(context: *Context, value: []const u8) []const u8 {
 }
 
 fn load_string(context: *Context, slot: u256) Error![]const u8 {
-    assert(context.out.len >= 3 * storage.bytes_length_max);
-    const buffer = context.out[context.out.len - storage.bytes_length_max ..];
+    // The upper half of the return buffer (the EVM memory cap) holds the loaded value; the
+    // ABI encoding goes to the lower half, so strings up to half the cap round-trip.
+    assert(context.out.len >= 4 * storage.bytes_length_max);
+    const buffer = context.out[context.out.len / 2 ..];
     return storage.load(context, slot, buffer);
 }
 
@@ -302,6 +338,7 @@ fn view_extension(context: *Context, tag: Tag, arguments: *const Arguments) Erro
             return write_u256(context, try b20.policy_id(context, scope));
         },
         .multiplier => return write_u256(context, try multiplier(context)),
+        .currency => return write_string(context, try load_string(context, stablecoin_root)),
         .domain_separator => return native.write_word(context, try domain_separator(context)),
         .eip712_domain => return try eip712_domain(context),
         .to_scaled_balance => {
@@ -339,6 +376,7 @@ fn string_slot(key: []const u8, base: u256) u256 {
 }
 
 fn decimals(context: *Context) Error!u8 {
+    if (variant_of(context) == .stablecoin) return decimals_min;
     const value: u8 = @truncate(try context.sload(slot_decimals));
     return if (value == 0) decimals_min else value;
 }
@@ -651,10 +689,13 @@ fn update_policy(context: *Context, scope_id: u256, id: u64, privileged: bool) E
     if (!privileged) try b20.ensure_role(context, context.caller, b20.role_default_admin);
     const scope = try supported_scope(context, scope_id);
     const version = policy.version_of(context);
+    // Stablecoins read the old id before the existence check (gas on the revert path).
+    const stablecoin = variant_of(context) == .stablecoin;
+    const old_first = if (stablecoin) try b20.policy_id(context, scope) else 0;
     if (!try policy.policy_exists(context, version, id)) {
         return context.revert_word(error_policy_not_found, word(id));
     }
-    const old = try b20.policy_id(context, scope);
+    const old = if (stablecoin) old_first else try b20.policy_id(context, scope);
     try b20.set_policy_id(context, scope, id);
     var data: [64]u8 = undefined;
     data[0..32].* = word(old);
@@ -841,6 +882,7 @@ pub const Tag = enum {
     extra_metadata,
     update_extra_metadata,
     announce,
+    currency,
 };
 
 pub const functions = [_]Function{
@@ -1215,5 +1257,11 @@ pub const functions = [_]Function{
         .selector = .{ 0x59, 0x51, 0x35, 0xdd },
         .parameters = "(bytes[],string,string,string)",
         .kinds = &.{ .bytes_array, .string, .string, .string },
+    },
+    .{
+        .tag = .currency,
+        .selector = .{ 0xe5, 0xa6, 0xb1, 0x0f },
+        .parameters = "()",
+        .kinds = &.{},
     },
 };

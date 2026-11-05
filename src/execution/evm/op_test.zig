@@ -626,8 +626,11 @@ test "op: native string storage round-trips and cleans tails from Cobalt" {
 }
 
 const b20 = @import("native_b20.zig");
-const b20_asset = @import("native_b20_asset.zig");
+const b20_asset = @import("native_b20_token.zig");
 const token_address: Address = .{ 0xb2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+const stablecoin_address: Address = .{
+    0xb2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+};
 const holder = primitives.address_from_int(0x401de2);
 
 fn short_string(comptime text: []const u8) u256 {
@@ -654,6 +657,10 @@ fn token_setup(h: *Harness) !void {
     try h.database.put_storage(token_address, role_slot(0, sender_address), 1);
     try h.database.put_storage(token_address, b20.root + 8, 1);
     try h.database.put_storage(token_address, role_slot(b20.role_mint, sender_address), 1);
+    try h.database.put_account(stablecoin_address, 0, 0, &native.marker_code);
+    try h.database.put_storage(stablecoin_address, b20.slot_supply_cap, 1_000_000);
+    try h.database.put_storage(stablecoin_address, role_slot(b20.role_mint, sender_address), 1);
+    try h.database.put_storage(stablecoin_address, b20_asset.stablecoin_root, short_string("USD"));
     h.state.reset(h.database.interface());
 }
 
@@ -813,15 +820,16 @@ fn fuzz_token(h: *Harness, smith: *testing.Smith) anyerror!void {
     const floor = 21_000 + calldata_gas(input) * 10 / 4;
     const gas_limit = floor + prng.below(120_000);
     const value: u256 = if (prng.chance(1, 16)) 1 else 0;
-    const executed = try native_call_gas(h, token_address, input, value, gas_limit);
+    const token = if (prng.chance(1, 2)) token_address else stablecoin_address;
+    const executed = try native_call_gas(h, token, input, value, gas_limit);
     try testing.expect(executed.gas_used <= gas_limit);
     switch (executed.status) {
         .success => try testing.expect(executed.output.len % 32 == 0),
         .revert => try testing.expect(executed.output.len == 0 or executed.output.len >= 4),
         .halt => try testing.expectEqual(gas_limit, executed.gas_used),
     }
-    const supply = try h.state.storage_value(token_address, b20.slot_total_supply);
-    const cap = try h.state.storage_value(token_address, b20.slot_supply_cap);
+    const supply = try h.state.storage_value(token, b20.slot_total_supply);
+    const cap = try h.state.storage_value(token, b20.slot_supply_cap);
     try testing.expect(supply <= cap);
 }
 
@@ -995,4 +1003,60 @@ test "op: B-20 factory creates activated asset tokens with init calls" {
     try testing.expectEqual(@as(usize, 36), unknown.output.len);
     const fresh = try create_call(&h, create_input(&buffer, 8, 1, 6, null));
     try testing.expect(fresh.status == .success);
+}
+
+/// createB20(STABLECOIN, salt, abi.encode(B20StablecoinCreateParams), []).
+fn create_stablecoin_input(buffer: []u8, salt: u256, currency: []const u8) []const u8 {
+    var writer = Writer{ .buffer = buffer };
+    writer.buffer[0..4].* = b20_factory.selector_of(.create_b20);
+    writer.length = 4;
+    writer.int(1); // STABLECOIN
+    writer.int(salt);
+    writer.int(4 * 32);
+    writer.int(4 * 32 + 32 + 384);
+    writer.int(384);
+    writer.int(0x20);
+    writer.int(1);
+    writer.int(0xa0);
+    writer.int(0xe0);
+    writer.int(address_int(sender_address));
+    writer.int(0x120);
+    writer.int(4);
+    writer.padded("Cash");
+    writer.int(4);
+    writer.padded("CASH");
+    writer.int(currency.len);
+    writer.padded(currency);
+    writer.int(0);
+    return buffer[0..writer.length];
+}
+
+test "op: B-20 factory creates stablecoins with a currency and fixed decimals" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    const feature = activation.feature_b20_stablecoin;
+    const activate = activation_input(activation.selector_activate, feature);
+    try testing.expect((try native_call(&h, activation.address, &activate, 0)).status == .success);
+    var buffer: [1024]u8 = undefined;
+    const lower = try create_call(&h, create_stablecoin_input(&buffer, 1, "usd"));
+    try testing.expect(lower.status == .revert);
+    try testing.expectEqual(@as(usize, 4 + 96), lower.output.len);
+    const empty = try create_call(&h, create_stablecoin_input(&buffer, 1, ""));
+    try testing.expect(empty.status == .revert);
+    const created = try create_call(&h, create_stablecoin_input(&buffer, 1, "USD"));
+    try testing.expect(created.status == .success);
+    try testing.expectEqual(@as(usize, 2), created.logs.len);
+    const token = created.output[12..32].*;
+    try testing.expectEqual(native.B20Variant.stablecoin, native.b20_variant(token).?);
+
+    var input: [4]u8 = b20_asset.selector_of(.currency);
+    const currency = try native_call(&h, token, &input, 0);
+    try testing.expectEqualStrings("USD", currency.output[64..67]);
+    input = b20_asset.selector_of(.decimals);
+    try testing.expectEqual(@as(u256, 6), output_int(try native_call(&h, token, &input, 0)));
+    input = b20_asset.selector_of(.multiplier);
+    const asset_only = try native_call(&h, token, &input, 0);
+    try testing.expectEqualSlices(u8, &input, asset_only.output);
 }

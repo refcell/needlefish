@@ -22,7 +22,7 @@ const op = @import("op.zig");
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const activation = @import("native_activation.zig");
 const policy = @import("native_policy.zig");
-const b20_asset = @import("native_b20_asset.zig");
+const b20_token = @import("native_b20_token.zig");
 const b20_factory = @import("native_b20_factory.zig");
 const native_abi = @import("native_abi.zig");
 pub const Address = primitives.Address;
@@ -254,9 +254,8 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     if (std.mem.eql(u8, &address, &policy.address)) return policy.dispatch;
     if (std.mem.eql(u8, &address, &b20_factory.address)) return b20_factory.dispatch;
     if (b20_variant(address)) |variant| switch (variant) {
-        // Asset V2/V3 (Cobalt/Denim) surfaces are pending; V1 serves every fork for now.
-        .asset => return b20_asset.dispatch,
-        .stablecoin => return null,
+        // V2/V3 (Cobalt/Denim) surfaces are pending; V1 serves every fork for now.
+        .asset, .stablecoin => return b20_token.dispatch,
     };
     if (!active.at_least(.cobalt)) return null;
     if (std.mem.eql(u8, &address, &tx_context_address)) return tx_context;
@@ -451,7 +450,7 @@ test {
     _ = native_abi;
     _ = @import("native_storage.zig");
     _ = @import("native_b20.zig");
-    _ = @import("native_b20_asset.zig");
+    _ = @import("native_b20_token.zig");
     _ = @import("native_b20_factory.zig");
 }
 
