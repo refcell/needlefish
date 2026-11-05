@@ -23,6 +23,7 @@ const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const activation = @import("native_activation.zig");
 const policy = @import("native_policy.zig");
 const b20_asset = @import("native_b20_asset.zig");
+const b20_factory = @import("native_b20_factory.zig");
 const native_abi = @import("native_abi.zig");
 pub const Address = primitives.Address;
 const B256 = primitives.B256;
@@ -251,6 +252,7 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     if (!active.at_least(.beryl)) return null;
     if (std.mem.eql(u8, &address, &activation.address)) return activation.dispatch;
     if (std.mem.eql(u8, &address, &policy.address)) return policy.dispatch;
+    if (std.mem.eql(u8, &address, &b20_factory.address)) return b20_factory.dispatch;
     if (b20_variant(address)) |variant| switch (variant) {
         // Asset V2/V3 (Cobalt/Denim) surfaces are pending; V1 serves every fork for now.
         .asset => return b20_asset.dispatch,
@@ -266,8 +268,16 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
 pub fn warm_addresses(upgrade: ?op.Upgrade) []const Address {
     const active = upgrade orelse return &.{};
     if (!active.at_least(.beryl)) return &.{};
-    if (!active.at_least(.cobalt)) return &.{ activation.address, policy.address };
-    return &.{ activation.address, policy.address, nonce_manager_address, tx_context_address };
+    if (!active.at_least(.cobalt)) {
+        return &.{ activation.address, policy.address, b20_factory.address };
+    }
+    return &.{
+        activation.address,
+        policy.address,
+        b20_factory.address,
+        nonce_manager_address,
+        tx_context_address,
+    };
 }
 
 /// Run `native` and map its result. `is_direct` is false for DELEGATECALL / CALLCODE.
@@ -442,6 +452,7 @@ test {
     _ = @import("native_storage.zig");
     _ = @import("native_b20.zig");
     _ = @import("native_b20_asset.zig");
+    _ = @import("native_b20_factory.zig");
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {

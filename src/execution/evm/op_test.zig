@@ -888,3 +888,111 @@ test "op: B-20 asset announce runs internal calls atomically" {
     try testing.expect(failed.status == .revert);
     try testing.expectEqual(@as(usize, 4 + 64 + 96), failed.output.len);
 }
+
+const b20_factory = @import("native_b20_factory.zig");
+
+const Writer = struct {
+    buffer: []u8,
+    length: usize = 0,
+
+    fn int(writer: *Writer, value: u256) void {
+        std.mem.writeInt(u256, writer.buffer[writer.length..][0..32], value, .big);
+        writer.length += 32;
+    }
+
+    fn padded(writer: *Writer, bytes: []const u8) void {
+        const size = std.mem.alignForward(usize, bytes.len, 32);
+        @memset(writer.buffer[writer.length..][0..size], 0);
+        @memcpy(writer.buffer[writer.length..][0..bytes.len], bytes);
+        writer.length += size;
+    }
+};
+
+/// createB20(ASSET, salt, abi.encode(B20AssetCreateParams), [init_call]) with 4-byte names.
+fn create_input(
+    buffer: []u8,
+    salt: u256,
+    version: u8,
+    decimals: u8,
+    init_call: ?[]const u8,
+) []const u8 {
+    var writer = Writer{ .buffer = buffer };
+    writer.buffer[0..4].* = b20_factory.selector_of(.create_b20);
+    writer.length = 4;
+    writer.int(0); // ASSET
+    writer.int(salt);
+    writer.int(4 * 32); // params offset
+    writer.int(4 * 32 + 32 + 320); // initCalls offset
+    writer.int(320); // params length
+    writer.int(0x20);
+    writer.int(version);
+    writer.int(0xa0);
+    writer.int(0xe0);
+    writer.int(address_int(sender_address));
+    writer.int(decimals);
+    writer.int(4);
+    writer.padded("Gold");
+    writer.int(3);
+    writer.padded("GLD");
+    const call = init_call orelse {
+        writer.int(0);
+        return buffer[0..writer.length];
+    };
+    writer.int(1);
+    writer.int(32);
+    writer.int(call.len);
+    writer.padded(call);
+    return buffer[0..writer.length];
+}
+
+fn create_call(h: *Harness, input: []const u8) !transaction.Executed {
+    return native_call_gas(h, b20_factory.address, input, 0, 1_000_000);
+}
+
+test "op: B-20 factory creates activated asset tokens with init calls" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    var call_buffer: [4 + 64]u8 = undefined;
+    const mint_call = token_input(&call_buffer, .mint, &.{ address_int(holder), 100 });
+    var buffer: [1024]u8 = undefined;
+    const inactive = try create_call(&h, create_input(&buffer, 7, 1, 18, mint_call));
+    const not_activated = &activation.error_feature_not_activated;
+    try testing.expectEqualSlices(u8, not_activated, inactive.output[0..4]);
+    const activate = activation_input(activation.selector_activate, activation.feature_b20_asset);
+    try testing.expect((try native_call(&h, activation.address, &activate, 0)).status == .success);
+
+    const created = try create_call(&h, create_input(&buffer, 7, 1, 18, mint_call));
+    try testing.expect(created.status == .success);
+    try testing.expectEqual(@as(usize, 3), created.logs.len);
+    const salt = native.u256_word(7);
+    const token = b20_factory.token_address(.asset, sender_address, &salt);
+    try testing.expectEqualSlices(u8, &native.address_word(token), created.output);
+
+    var query: [4 + 32]u8 = undefined;
+    query[0..4].* = b20_factory.selector_of(.is_b20_initialized);
+    query[4..36].* = native.address_word(token);
+    const initialized = try native_call(&h, b20_factory.address, &query, 0);
+    try testing.expectEqual(@as(u256, 1), output_int(initialized));
+    var input_buffer: [4 + 32]u8 = undefined;
+    input_buffer[0..4].* = b20_asset.selector_of(.balance_of);
+    input_buffer[4..36].* = native.address_word(holder);
+    const balance_held = try native_call(&h, token, &input_buffer, 0);
+    try testing.expectEqual(@as(u256, 100), output_int(balance_held));
+    input_buffer[0..4].* = b20_asset.selector_of(.decimals);
+    const decimals = try native_call(&h, token, input_buffer[0..4], 0);
+    try testing.expectEqual(@as(u256, 18), output_int(decimals));
+
+    const again = try create_call(&h, create_input(&buffer, 7, 1, 18, null));
+    try testing.expectEqual(@as(usize, 36), again.output.len);
+    const low = try create_call(&h, create_input(&buffer, 8, 1, 5, null));
+    try testing.expectEqual(@as(usize, 36), low.output.len);
+    const version = try create_call(&h, create_input(&buffer, 8, 2, 6, null));
+    try testing.expectEqual(@as(usize, 68), version.output.len);
+    const unknown = try create_call(&h, create_input(&buffer, 8, 1, 6, &.{ 1, 2, 3, 4 }));
+    try testing.expect(unknown.status == .revert);
+    try testing.expectEqual(@as(usize, 36), unknown.output.len);
+    const fresh = try create_call(&h, create_input(&buffer, 8, 1, 6, null));
+    try testing.expect(fresh.status == .success);
+}
