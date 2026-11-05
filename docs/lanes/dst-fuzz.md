@@ -186,3 +186,6 @@ provably robust.
   origin, safe head monotonic except restarts/L1 reorgs, liveness to the confirmed head.
   2000 seeds green (ReleaseSafe); mutants caught: dropped user tx (104/200 seeds, all
   real-verifier ones), stored tx differs from the hashed one (per-block check).
+- 2026-11-05: beacon API decoder fuzz (`fuzz_targets_sources.zig`): integers (decimal and
+  QUANTITY among noise fields), blobs and sidecars (any field order, extra and missing
+  fields), arbitrary bytes. Sidecar field-swap mutant caught.

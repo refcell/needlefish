@@ -13,6 +13,7 @@ pub const fuzz_targets_net = @import("fuzz_targets_net.zig");
 pub const fuzz_targets_batcher = @import("fuzz_targets_batcher.zig");
 pub const fuzz_targets_derive = @import("fuzz_targets_derive.zig");
 pub const fuzz_targets_engine = @import("fuzz_targets_engine.zig");
+pub const fuzz_targets_sources = @import("fuzz_targets_sources.zig");
 
 test {
     std.testing.refAllDecls(@This());
