@@ -31,8 +31,12 @@ behind a small interface and switch later.
 - [x] `libp2p`: multistream-select 1.0, noise XX handshake (X25519, ChaCha20-Poly1305,
   SHA256, libp2p signed static key payload), yamux framing + flow control (bounded
   streams/windows). Interop vectors; fuzz each codec.
-- [ ] `libp2p`: TCP transport over utilities/io chaining multistream -> noise ->
-  multistream -> yamux; interop test against a real go/rust libp2p peer.
+- [x] `libp2p`: IO-free connection pipeline (`connection.zig`): multistream -> noise ->
+  multistream -> yamux, per-stream meshsub/identify/ping, fuzzed.
+- [ ] `libp2p`: TCP transport over utilities/io (`transport.zig`, `Transport(IO)`) feeding
+  `p2p.Service`; SimIo DST; interop test against a real go/rust libp2p peer.
+- [ ] `libp2p`: yamux go-away handling; backpressure instead of `buffer_overflow` when a
+  caller never flushes.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
@@ -164,6 +168,13 @@ behind a small interface and switch later.
   `Service.on_datagram`/`pop_datagram` until the io lane adds UDP; DST delivers them
   in-process meanwhile.
 
+- Connection (worker): yamux Session(16) (4 MiB windows), <= 12 inbound streams, 64
+  events (gossip stops at 60), ~24 MiB per connection at 10 MiB frames (one init
+  allocation). Handshake timeout 10 s. Ping both ways 15 s; 20 s unanswered closes
+  (rust-libp2p only reports). Listener tolerates lazy multistream dialers. One inbound
+  meshsub stream per peer (second reset). Identify key mismatch closes. Gossip frame
+  slices live until the next receive/tick after all gossip events are popped.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -189,3 +200,4 @@ behind a small interface and switch later.
 - 2026-11-05: `gossip` v1.2 IDONTWANT.
 - 2026-11-05: `Service` orchestrator with score bans and end-to-end block test.
 - 2026-11-05: vectorized ChaCha20 for noise (2.1x transport throughput).
+- 2026-11-05: libp2p connection pipeline (worker, 1624507).
