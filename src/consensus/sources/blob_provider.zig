@@ -60,6 +60,15 @@ pub const KzgVerifier = struct {
     settings: *const kzg.blob.Settings,
     workspace: *kzg.blob.Workspace,
 
+    /// `blob_to_kzg_commitment(blob)`; null for invalid blobs.
+    pub fn blob_commitment(verifier: KzgVerifier, blob: *const Blob) ?[kzg.bytes_per_commitment]u8 {
+        return kzg.blob.blob_to_kzg_commitment(
+            verifier.settings,
+            verifier.workspace,
+            blob,
+        ) catch null;
+    }
+
     /// `kzg_to_versioned_hash(blob_to_kzg_commitment(blob))`; null for invalid blobs.
     pub fn blob_versioned_hash(verifier: KzgVerifier, blob: *const Blob) ?B256 {
         const commitment = kzg.blob.blob_to_kzg_commitment(
