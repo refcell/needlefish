@@ -39,8 +39,9 @@ behind a small interface and switch later.
   OP Stack message id (sha256 of domain + snappy-decoded payload) [id: block worker].
 - [x] `gossip`: router follow-ups: score retention across reconnects (`retain_score`),
   outbound mesh quota (D_out = 2), IWANT retransmission limit.
-- [ ] `gossip`: IDONTWANT (v1.2) and peer exchange on PRUNE (both off in base/base's
-  libp2p config; low priority).
+- [x] `gossip`: IDONTWANT (v1.2): sent to v1.2-capable mesh peers for messages over
+  1000 B; received ids are skipped when forwarding (32-id ring per peer).
+- [ ] `gossip`: peer exchange on PRUNE (disabled in base/base; low priority).
 - [x] `gossip`: snappy block-format codec (own implementation, fuzzed round trip),
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
@@ -168,3 +169,4 @@ behind a small interface and switch later.
   06d1ae2..8e11d37).
 - 2026-11-05: `disc` node bans.
 - 2026-11-05: `gossip` block handler (validate before forward, publish, topic retirement).
+- 2026-11-05: `gossip` v1.2 IDONTWANT.
