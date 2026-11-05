@@ -134,6 +134,33 @@ pub fn Recorder(comptime samples_max: u32) type {
     };
 }
 
+/// Writes the summary as JSON object members (no surrounding braces), for embedding.
+pub fn write_json_members(
+    s: Summary,
+    failures: []const u64,
+    out: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    assert(failures.len == failure_count);
+    try out.print("\"submitted\":{d},\"confirmed\":{d},\"failed\":{d},", .{
+        s.submitted, s.confirmed, s.failed,
+    });
+    try out.print("\"send_errors\":{d},\"fee_bumps\":{d},\"throughput_milli_tps\":{d},", .{
+        s.send_errors, s.bumps, s.throughput_milli_tps,
+    });
+    try out.print("\"latency_ms\":{{\"p50\":{d},\"p90\":{d},\"p99\":{d},\"max\":{d}}},", .{
+        s.latency_p50_ms, s.latency_p90_ms, s.latency_p99_ms, s.latency_max_ms,
+    });
+    try out.writeAll("\"failures\":{");
+    var first = true;
+    for (failures, 0..) |count, index| {
+        if (count == 0) continue;
+        const failure: manager.Failure = @fromBackingInt(@intCast(index));
+        try out.print("{s}\"{t}\":{d}", .{ if (first) "" else ",", failure, count });
+        first = false;
+    }
+    try out.writeAll("}");
+}
+
 /// Nearest-rank percentile of an ascending slice; 0 when empty.
 fn percentile(sorted: []const u32, rank: u32) u64 {
     assert(rank > 0 and rank <= 100);

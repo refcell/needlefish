@@ -8,6 +8,9 @@ pub const pacing = @import("pacing.zig");
 pub const workload = @import("workload.zig");
 pub const metrics = @import("metrics.zig");
 pub const runner = @import("runner.zig");
+pub const key_stream = @import("key_stream.zig");
+pub const contracts = @import("contracts.zig");
+pub const chain_prep = @import("chain_prep.zig");
 
 pub const Runner = runner.Runner;
 pub const Config = runner.Config;
