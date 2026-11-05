@@ -6,6 +6,7 @@ const std = @import("std");
 pub const network = @import("network.zig");
 pub const nodes = @import("nodes.zig");
 pub const cluster = @import("cluster.zig");
+pub const swarm = @import("swarm.zig");
 pub const Cluster = cluster.Cluster;
 
 test {

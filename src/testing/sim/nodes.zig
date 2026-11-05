@@ -275,7 +275,8 @@ pub const Batcher = struct {
     progress_ns: u64 = 0,
     next_submit_ns: u64 = 0,
 
-    pub const submit_interval_ns: u64 = 2 * std.time.ns_per_s;
+    // Several blocks per batch, at most two batches per L1 block: L1 includes four.
+    pub const submit_interval_ns: u64 = 6 * std.time.ns_per_s;
     pub const resubmit_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
     pub fn tick(batcher: *Batcher, env: *const Env, sequencer: *const Sequencer) void {

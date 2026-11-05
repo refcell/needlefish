@@ -39,16 +39,16 @@ fuzz:
 sim seed='':
     zig build sim -Doptimize=ReleaseSafe -- {{ seed }}
 
-# Run many simulator seeds: just sim-swarm 100
-sim-swarm count='50':
+# Run many simulator seeds in-process: just sim-swarm 1000 [first-seed]
+sim-swarm count='200' first='':
     #!/usr/bin/env bash
     set -euo pipefail
-    zig build -Doptimize=ReleaseSafe
-    for i in $(seq 1 {{ count }}); do
-      seed=$RANDOM$RANDOM
-      zig build sim -Doptimize=ReleaseSafe -- "$seed" >/dev/null 2>&1 || { echo "FAIL seed=$seed"; exit 1; }
-    done
-    echo "sim-swarm: {{ count }} seeds ok"
+    first="{{ first }}"; [ -n "$first" ] || first=$RANDOM$RANDOM
+    zig build sim -Doptimize=ReleaseSafe -- swarm "$first" {{ count }}
+
+# Shrink a failing simulator seed's config: just sim-minimize 1234
+sim-minimize seed:
+    zig build sim -Doptimize=ReleaseSafe -- minimize {{ seed }}
 
 # Micro benchmarks
 bench *args:

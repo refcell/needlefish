@@ -374,13 +374,3 @@ test "cluster: same seed, same run" {
     try std.testing.expectEqual(a.crashes, b.crashes);
     try std.testing.expectEqual(a.sequencer_head, b.sequencer_head);
 }
-
-test "cluster: seeded swarm" {
-    var seed: u64 = 0;
-    while (seed < 8) : (seed += 1) {
-        _ = run_seed(std.testing.allocator, seed) catch |err| {
-            std.debug.print("cluster: swarm seed {d} failed\n", .{seed});
-            return err;
-        };
-    }
-}

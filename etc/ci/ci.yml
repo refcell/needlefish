@@ -28,6 +28,29 @@ jobs:
         run: zig build test --summary all
       - name: test release-safe
         run: zig build test -Doptimize=ReleaseSafe
-      - name: simulator seeds
+      - name: simulator swarm (fixed seeds)
+        run: zig build sim -Doptimize=ReleaseSafe -- swarm 1 500
+
+  swarm:
+    # Longer swarm on every push to main: fresh seeds per run, reproducible from the log.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
         run: |
-          for seed in 1 2 3 4 5 6 7 8 9 10; do zig build sim -Doptimize=ReleaseSafe -- $seed; done
+          sh etc/scripts/install-zig.sh "$HOME/zig"
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: swarm
+        run: zig build sim -Doptimize=ReleaseSafe -- swarm $((GITHUB_RUN_NUMBER * 100000)) 20000
+
+  fuzz:
+    # Coverage-guided fuzz smoke: every std.testing.fuzz target for a bounded run count.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
+        run: |
+          sh etc/scripts/install-zig.sh "$HOME/zig"
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: fuzz
+        run: zig build test --fuzz=200000 -Doptimize=ReleaseSafe
