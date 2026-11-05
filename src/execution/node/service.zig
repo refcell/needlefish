@@ -133,8 +133,19 @@ pub const Limits = struct {
         .staging_bytes = 8 << 20,
     },
     beacon: beacon_module.Config = .{ .slots_max = 256, .bytes_max = 32 << 20 },
-    /// `debug_executionWitness` buffers (null disables it); `overlay` and `changeset` are
-    /// derived from the `state` block limits.
+    /// `debug_executionWitness` buffers (null disables it); see `witness_config` for the
+    /// derived fields. Every large buffer is reserved at init and committed on first touch
+    /// (`lazy_alloc`); only the hash-map indexes are written at init (their metadata in
+    /// ReleaseFast, all of them in safe builds, where `Allocator.alloc` fills memory).
+    /// - keys: 4096 accounts + 16384 slots. Each witness key is at least 20 bytes, at least
+    ///   45 JSON bytes, so the default response carries at most ~23k keys; more could never
+    ///   be served. Below the executor's per-block bounds: heavier blocks fail `KeysFull`.
+    /// - sparse.nodes_max 16384: candidate proof nodes (a superset of the witness nodes),
+    ///   ~5 per touched key below a 64k-account trie, shared near the root. Bytes: 4 MiB
+    ///   (256 B average; a full branch is 532 B). trie_nodes_max: 4 sparse nodes per
+    ///   candidate (decoded branches materialize unresolved children).
+    /// - codes: 512 contracts read; 8 MiB is 512 x 16 KiB average (EIP-170 max is 24 KiB).
+    /// - depth_max 1024: `state.undo_blocks_max`, the deepest in-memory unwind.
     witness: ?db_module.witness_block.Config = .{
         .builder = .{
             .sparse = .{
@@ -153,19 +164,16 @@ pub const Limits = struct {
                 .block_numbers_max = db_module.witness_block.headers_max,
             },
         },
-        .witness = .{
-            .state_nodes_max = 1 << 14,
-            .state_bytes_max = 4 << 20,
-            .codes_max = 512,
-            .code_bytes_max = 8 << 20,
-            .keys_max = (1 << 12) + (1 << 14),
-            .headers_max = db_module.witness_block.headers_max,
-            .header_bytes_max = 512 << 10,
-        },
+        .witness = undefined,
         .overlay = undefined,
         .changeset = undefined,
         .depth_max = 1024,
     },
+    /// Bound on a `debug_executionWitness` result's JSON: the HTTP send buffer (1 MiB) less
+    /// the head reserve (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB). Larger
+    /// witnesses fail with "witness too large" instead of an overflowing response. Raising
+    /// it needs a larger `http.send_buffer_size` too.
+    witness_response_bytes_max: u32 = (1 << 20) - (2 << 10),
     http: http.server.Options = .{
         // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
         .connections_max = 16,
@@ -208,6 +216,41 @@ pub const Limits = struct {
         .send_buffer_size = 4 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
     },
+
+    /// The witness generator's config, null when the method is disabled. `overlay` and
+    /// `changeset` hold one block's writes (the `state` block limits). The output `witness`
+    /// follows the response bound: hex doubles every byte, so no list can usefully hold
+    /// more than half of it, and its counts are the builder's.
+    pub fn witness_config(limits: *const Limits) ?db_module.witness_block.Config {
+        var config = limits.witness orelse return null;
+        const response_bytes_max = limits.witness_response_bytes_max;
+        assert(response_bytes_max > 0);
+        const keys = &config.builder.keys;
+        config.response_bytes_max = response_bytes_max;
+        config.witness = .{
+            .state_nodes_max = config.builder.sparse.nodes_max,
+            .state_bytes_max = @min(config.builder.sparse.node_bytes_max, response_bytes_max / 2),
+            .codes_max = keys.codes_max,
+            .code_bytes_max = @min(config.builder.sparse.code_bytes_max, response_bytes_max / 2),
+            .keys_max = keys.accounts_max + keys.slots_max,
+            .headers_max = db_module.witness_block.headers_max,
+            .header_bytes_max = response_bytes_max / 2,
+        };
+        config.overlay = .{
+            .accounts_max = limits.state.block_accounts_max,
+            .slots_max = limits.state.block_slots_max,
+            .codes_max = limits.state.block_codes_max,
+        };
+        config.changeset = .{
+            .accounts_max = limits.state.block_accounts_max,
+            .storage_max = limits.state.block_slots_max,
+            .codes_max = limits.state.block_codes_max,
+            .code_bytes_max = limits.state.block_code_bytes_max,
+        };
+        assert(config.depth_max > 0);
+        assert(config.builder.keys.accounts_max > 0);
+        return config;
+    }
 };
 
 pub fn Service(comptime IO: type) type {
@@ -472,19 +515,7 @@ pub fn Service(comptime IO: type) type {
 
         /// The execution witness generator, bound to the node's state.
         fn init_witness(service: *Self) !void {
-            const limits = &service.options.limits;
-            var config = limits.witness orelse return;
-            config.overlay = .{
-                .accounts_max = limits.state.block_accounts_max,
-                .slots_max = limits.state.block_slots_max,
-                .codes_max = limits.state.block_codes_max,
-            };
-            config.changeset = .{
-                .accounts_max = limits.state.block_accounts_max,
-                .storage_max = limits.state.block_slots_max,
-                .codes_max = limits.state.block_codes_max,
-                .code_bytes_max = limits.state.block_code_bytes_max,
-            };
+            const config = service.options.limits.witness_config() orelse return;
             const allocator = service.allocator;
             const generator = try allocator.create(db_module.witness_block.Generator);
             errdefer allocator.destroy(generator);

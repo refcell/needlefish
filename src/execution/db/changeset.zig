@@ -14,6 +14,7 @@
 //!   codes: length u32, bytes (their hashes are recomputed on decode).
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 
 const keccak256 = @import("../trie/node.zig").keccak256;
@@ -91,16 +92,18 @@ pub const Changeset = struct {
     /// Sort scratch: one index per entry of the larger of `accounts` and `storage`.
     order: []u64,
 
+    /// Buffers are reserved here and committed on first touch (`lazy_alloc`).
     pub fn init(allocator: std.mem.Allocator, config: Config) !Changeset {
-        const accounts = try allocator.alloc(AccountChange, config.accounts_max);
-        errdefer allocator.free(accounts);
-        const storage = try allocator.alloc(StorageChange, config.storage_max);
-        errdefer allocator.free(storage);
-        const code_bytes = try allocator.alloc(u8, config.code_bytes_max);
-        errdefer allocator.free(code_bytes);
-        const code_ends = try allocator.alloc(u32, config.codes_max);
-        errdefer allocator.free(code_ends);
-        const order = try allocator.alloc(u64, @max(config.accounts_max, config.storage_max));
+        const accounts = try lazy.alloc(allocator, AccountChange, config.accounts_max);
+        errdefer lazy.free(allocator, accounts);
+        const storage = try lazy.alloc(allocator, StorageChange, config.storage_max);
+        errdefer lazy.free(allocator, storage);
+        const code_bytes = try lazy.alloc(allocator, u8, config.code_bytes_max);
+        errdefer lazy.free(allocator, code_bytes);
+        const code_ends = try lazy.alloc(allocator, u32, config.codes_max);
+        errdefer lazy.free(allocator, code_ends);
+        const order_len = @max(config.accounts_max, config.storage_max);
+        const order = try lazy.alloc(allocator, u64, order_len);
         return .{
             .accounts = accounts,
             .storage = storage,
@@ -111,11 +114,11 @@ pub const Changeset = struct {
     }
 
     pub fn deinit(self: *Changeset, allocator: std.mem.Allocator) void {
-        allocator.free(self.order);
-        allocator.free(self.code_ends);
-        allocator.free(self.code_bytes);
-        allocator.free(self.storage);
-        allocator.free(self.accounts);
+        lazy.free(allocator, self.order);
+        lazy.free(allocator, self.code_ends);
+        lazy.free(allocator, self.code_bytes);
+        lazy.free(allocator, self.storage);
+        lazy.free(allocator, self.accounts);
         self.* = undefined;
     }
 

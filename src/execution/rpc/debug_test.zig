@@ -12,6 +12,7 @@ const node_module = @import("../node/root.zig");
 const db_module = @import("../db/root.zig");
 const payload = @import("../payload/root.zig");
 const eth = @import("eth.zig");
+const debug = @import("debug.zig");
 const engine_types = @import("../engine/root.zig").types;
 
 const chain_module = node_module.chain;
@@ -97,8 +98,13 @@ const Harness = struct {
     }
 
     fn request(harness: *Harness, comptime params: []const u8) ![]const u8 {
+        return harness.request_into(params, &harness.out);
+    }
+
+    /// As `request`, with the response limited to `buffer` (an HTTP send buffer).
+    fn request_into(harness: *Harness, comptime params: []const u8, buffer: []u8) ![]const u8 {
         const body = request_prefix ++ "debug_executionWitness\",\"params\":" ++ params ++ "}";
-        var out: std.Io.Writer = .fixed(&harness.out);
+        var out: std.Io.Writer = .fixed(buffer);
         _ = eth.Router.handle(&harness.api, body, &out);
         const text = out.buffered();
         try json.validate(text);
@@ -204,4 +210,37 @@ test "debug_executionWitness: stateless re-execution of each block matches its r
     _ = try harness.load(text, "headers");
     const head_header = chain.header(hashes[3]).?;
     try testing.expectEqual(head_header.state_root.bytes, try harness.reexecute(hashes[3]));
+}
+
+test "debug_executionWitness: a witness over the response bound fails cleanly" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    _ = try harness.mine(0, 12);
+    const head_root = try harness.node.db.root();
+    const text = try harness.request("[\"0x1\"]");
+    const result = (try json.find_path(text, &.{"result"})).?;
+    const length = debug.witness_json_length(&harness.generator.witness);
+    try testing.expectEqual(@as(u64, result.len), length);
+
+    // The configured bound: one byte short fails, the exact length passes.
+    harness.generator.response_bytes_max = @intCast(length - 1);
+    const refused = try harness.request("[\"0x1\"]");
+    try testing.expect(std.mem.indexOf(u8, refused, "\"code\":-32000") != null);
+    try testing.expect(std.mem.indexOf(u8, refused, debug.witness_too_large) != null);
+    try testing.expectEqual(head_root, try harness.node.db.root());
+    harness.generator.response_bytes_max = @intCast(length);
+    try testing.expectEqualStrings(text, try harness.request("[\"0x1\"]"));
+
+    // The response buffer: the full response must fit with one byte to spare.
+    const fitting = try harness.request_into("[\"0x1\"]", harness.out[0 .. text.len + 1]);
+    try testing.expectEqualStrings(text, fitting);
+    const small = try harness.request_into("[\"0x1\"]", harness.out[0..text.len]);
+    try testing.expect(std.mem.indexOf(u8, small, debug.witness_too_large) != null);
+
+    // Output buffers too small for the witness report the same error.
+    harness.generator.witness.state.bytes.len = 1;
+    const full = harness.request("[\"0x1\"]");
+    harness.generator.witness.state.bytes.len = generator_config.witness.state_bytes_max;
+    try testing.expect(std.mem.indexOf(u8, try full, debug.witness_too_large) != null);
+    try testing.expectEqual(head_root, try harness.node.db.root());
 }

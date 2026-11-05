@@ -6,7 +6,10 @@
 //!
 //! `debug_executionWitness(block)` (base/base, alloy `ExecutionWitness`): the pre-state trie
 //! nodes, codes, touched keys, and ancestor headers a stateless client needs to re-execute
-//! the block, as `{state, codes, keys, headers}` hex arrays (`node/witness.zig`).
+//! the block, as `{state, codes, keys, headers}` hex arrays (`node/witness.zig`). A witness
+//! whose JSON exceeds the generator's `response_bytes_max` or the space left in the response
+//! buffer fails with -32000 "witness too large" (as does one that overflowed the generator's
+//! output buffers) instead of an overflowing response.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -15,7 +18,8 @@ const rpc = @import("../../utilities/rpc/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
 const json = @import("../../utilities/json/root.zig");
-const ByteList = @import("../db/witness.zig").ByteList;
+const witness_module = @import("../db/witness.zig");
+const ByteList = witness_module.ByteList;
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -103,17 +107,50 @@ pub fn execution_witness(api: *eth.Api, call: *Call) HandlerError!void {
     try call.params.finish();
     const generator = api.witness orelse
         return call.fail(rpc.code.server_error, "execution witness unavailable");
-    node.witness.execution_witness(api.chain, generator, hash) catch |err| {
-        return call.fail(rpc.code.server_error, @errorName(err));
+    node.witness.execution_witness(api.chain, generator, hash) catch |err| switch (err) {
+        error.WitnessFull => return call.fail(rpc.code.server_error, witness_too_large),
+        else => return call.fail(rpc.code.server_error, @errorName(err)),
     };
     const built = &generator.witness;
     const w = call.writer;
+    // The response's closing `}` follows, and a full buffer reads as overflow: keep one more.
+    const space_bytes = w.out.buffer.len - w.out.end;
+    const length = witness_json_length(built);
+    if (length > generator.response_bytes_max or length + 2 > space_bytes) {
+        return call.fail(rpc.code.server_error, witness_too_large);
+    }
+    const start = w.out.end;
     try w.begin_object();
     try write_list(w, "state", &built.state);
     try write_list(w, "codes", &built.codes);
     try write_list(w, "keys", &built.keys);
     try write_list(w, "headers", &built.headers);
     try w.end_object();
+    assert(w.out.end - start == length);
+}
+
+pub const witness_too_large = "witness too large";
+
+/// Exact length of the `{state, codes, keys, headers}` object `execution_witness` writes.
+pub fn witness_json_length(built: *const witness_module.Witness) u64 {
+    const lists = [_]struct { []const u8, *const ByteList }{
+        .{ "state", &built.state },
+        .{ "codes", &built.codes },
+        .{ "keys", &built.keys },
+        .{ "headers", &built.headers },
+    };
+    var length: u64 = 2 + (lists.len - 1); // Braces and the commas between members.
+    for (lists) |entry| {
+        const name, const list = entry;
+        length += name.len + 3 + 2; // `"name":` and the brackets.
+        if (list.count > 0) length += list.count - 1; // Commas.
+        var index: u32 = 0;
+        while (index < list.count) : (index += 1) {
+            length += 4 + 2 * @as(u64, list.get(index).len); // `"0x` + hex + `"`.
+        }
+    }
+    assert(length >= 2 + 4 * 5 + 3);
+    return length;
 }
 
 fn write_list(w: *json.Writer, name: []const u8, list: *const ByteList) HandlerError!void {

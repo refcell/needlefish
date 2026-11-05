@@ -23,6 +23,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const evm = @import("../evm/root.zig");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const trie = @import("../trie/root.zig");
 const state_module = @import("state.zig");
 const changeset_module = @import("changeset.zig");
@@ -42,7 +43,8 @@ pub const AccountInfo = state_module.AccountInfo;
 
 pub const Error = error{ WitnessFull, KeysFull, UnknownCode } || sparse.Error;
 
-/// A bounded list of byte strings in one arena.
+/// A bounded list of byte strings in one arena. The arena and ends are reserved at init and
+/// committed on first touch (`lazy_alloc`), so an idle list costs no resident memory.
 pub const ByteList = struct {
     bytes: []u8,
     ends: []u32,
@@ -50,15 +52,15 @@ pub const ByteList = struct {
 
     pub fn init(allocator: std.mem.Allocator, items_max: u32, bytes_max: u32) !ByteList {
         assert(items_max > 0);
-        const bytes = try allocator.alloc(u8, bytes_max);
-        errdefer allocator.free(bytes);
-        const ends = try allocator.alloc(u32, items_max);
+        const bytes = try lazy.alloc(allocator, u8, bytes_max);
+        errdefer lazy.free(allocator, bytes);
+        const ends = try lazy.alloc(allocator, u32, items_max);
         return .{ .bytes = bytes, .ends = ends };
     }
 
     pub fn deinit(self: *ByteList, allocator: std.mem.Allocator) void {
-        allocator.free(self.ends);
-        allocator.free(self.bytes);
+        lazy.free(allocator, self.ends);
+        lazy.free(allocator, self.bytes);
         self.* = undefined;
     }
 
@@ -141,8 +143,8 @@ fn SetList(comptime T: type) type {
 
         fn init(allocator: std.mem.Allocator, items_max: u32) !Self {
             assert(items_max > 0);
-            const items = try allocator.alloc(T, items_max);
-            errdefer allocator.free(items);
+            const items = try lazy.alloc(allocator, T, items_max);
+            errdefer lazy.free(allocator, items);
             var result: Self = .{ .items = items };
             try result.index.ensureTotalCapacity(allocator, items_max);
             return result;
@@ -150,7 +152,7 @@ fn SetList(comptime T: type) type {
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.index.deinit(allocator);
-            allocator.free(self.items);
+            lazy.free(allocator, self.items);
             self.* = undefined;
         }
 
@@ -310,10 +312,10 @@ pub const NodeStore = struct {
 
     pub fn init(allocator: std.mem.Allocator, items_max: u32, bytes_max: u32) !NodeStore {
         assert(items_max > 0);
-        const entries = try allocator.alloc(Entry, items_max);
-        errdefer allocator.free(entries);
-        const arena = try allocator.alloc(u8, bytes_max);
-        errdefer allocator.free(arena);
+        const entries = try lazy.alloc(allocator, Entry, items_max);
+        errdefer lazy.free(allocator, entries);
+        const arena = try lazy.alloc(allocator, u8, bytes_max);
+        errdefer lazy.free(allocator, arena);
         var result: NodeStore = .{ .entries = entries, .arena = arena };
         try result.index.ensureTotalCapacity(allocator, items_max);
         return result;
@@ -321,8 +323,8 @@ pub const NodeStore = struct {
 
     pub fn deinit(self: *NodeStore, allocator: std.mem.Allocator) void {
         self.index.deinit(allocator);
-        allocator.free(self.arena);
-        allocator.free(self.entries);
+        lazy.free(allocator, self.arena);
+        lazy.free(allocator, self.entries);
         self.* = undefined;
     }
 
@@ -812,9 +814,9 @@ pub const Builder = struct {
         errdefer scratch.deinit(allocator);
         var touched = try KeySet.init(allocator, config.keys);
         errdefer touched.deinit(allocator);
-        const account_proof = try allocator.create(trie.StateTrie.AccountProof);
-        errdefer allocator.destroy(account_proof);
-        const storage_proof = try allocator.create(trie.StateTrie.StorageProof);
+        const account_proof = try lazy.create(allocator, trie.StateTrie.AccountProof);
+        errdefer lazy.destroy(allocator, account_proof);
+        const storage_proof = try lazy.create(allocator, trie.StateTrie.StorageProof);
         return .{
             .scratch = scratch,
             .touched = touched,
@@ -824,8 +826,8 @@ pub const Builder = struct {
     }
 
     pub fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
-        allocator.destroy(self.storage_proof);
-        allocator.destroy(self.account_proof);
+        lazy.destroy(allocator, self.storage_proof);
+        lazy.destroy(allocator, self.account_proof);
         self.touched.deinit(allocator);
         self.scratch.deinit(allocator);
         self.* = undefined;

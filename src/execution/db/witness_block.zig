@@ -91,6 +91,9 @@ pub const Config = struct {
     changeset: changeset_module.Config,
     /// Blocks from the state's block down to the witnessed one, inclusive.
     depth_max: u32,
+    /// Bound on the witness's JSON encoding (`debug_executionWitness` result); the RPC
+    /// replies "witness too large" above it. Not used by `generate`.
+    response_bytes_max: u32 = std.math.maxInt(u32),
 };
 
 pub const Generator = struct {
@@ -107,6 +110,7 @@ pub const Generator = struct {
     changesets: [][]const u8,
     headers: [][]const u8,
     blocks: ?Blocks = null,
+    response_bytes_max: u32,
 
     pub fn init(allocator: std.mem.Allocator, state: *State, config: Config) !Generator {
         assert(config.depth_max > 0);
@@ -139,6 +143,7 @@ pub const Generator = struct {
             .changeset_built = changeset_built,
             .changesets = changesets,
             .headers = headers,
+            .response_bytes_max = config.response_bytes_max,
         };
     }
 

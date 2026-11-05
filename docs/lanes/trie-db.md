@@ -67,9 +67,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   storage-heavy blocks; record in docs/PERF.md.
 - [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
   blocks (committed small vectors); document any intended differences.
-- [ ] Witness generator memory: default limits allocate ~40-60 MB at node start even if
+- [x] Witness generator memory: default limits allocate ~40-60 MB at node start even if
   `debug_executionWitness` is never called; size from limits more tightly or allocate through
   `utilities.lazy_alloc` (node lane pattern). Large witnesses can exceed the 1 MiB HTTP buffer.
+  (lazy buffers in `db/witness.zig`, `db/changeset.zig`, `trie/sparse.zig`; derived config in
+  `Limits.witness_config`; "witness too large" in `rpc/debug.zig`; measured by
+  `node/witness_memory_test.zig`)
 - [ ] Witness generation blocks the state for one unwind + re-apply per block between target
   and head; consider generating from the history store instead (no state disturbance).
 
@@ -261,6 +264,24 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `PreimageIterator` yields that same set (digest, bytes) and `preimage_key` renders the oracle
   key; keys are searched linearly since they sort by bytes, not digest. No lookup by oracle
   key: it drops the digest's high byte, so hosts load their key-value store from the iterator.
+- Witness generator memory: every large generator buffer (byte lists, key-set items, node
+  stores, the sparse node pool, changesets, proof buffers) is reserved at init through
+  `utilities.lazy_alloc` and committed on first touch, so static allocation holds (nothing
+  allocates per call) while an idle node pays only for hash-map indexes, which std writes at
+  init (metadata always; keys and values too in safe builds, where `Allocator.alloc` fills
+  with 0xAA). `SparseTrie` hands out nodes from a high-water mark plus a LIFO free list, so
+  `clear` is O(1) instead of rewriting the whole pool on every witness (same allocation order
+  as the old fully threaded free list). The output `Witness` byte lists are derived from
+  `Limits.witness_response_bytes_max` (default 1 MiB - 2 KiB: the HTTP send buffer less the
+  head reserve and the JSON-RPC envelope): hex doubles every byte, so no list can usefully
+  hold more than half of it. Key bounds stay 4096 accounts + 16384 slots: each key is at least
+  45 JSON bytes, so the default response cannot carry more than ~23k keys anyway. The RPC
+  computes the exact JSON length first and replies -32000 "witness too large" when it exceeds
+  the configured bound or the space left in the response buffer, or when the build overflowed
+  the output lists (`WitnessFull`); before, the router's generic -32603 "response too large".
+  The bound rides on `witness_block.Config.response_bytes_max` (default unbounded) so
+  `eth.Api` stays unchanged. Not done: the generator's `Overlay` (18 MiB of hash maps for one
+  block's writes) could borrow the `StateDb` overlay, idle between blocks.
 
 - Database-owned history (`DatabaseType`, `Config.history`, null = off): the database owns a
   `history.Store` and enables `StateTrie.track_changes` only when it is configured. Live head
@@ -414,3 +435,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   drops and rebuilds history with the database healthy; history-off serves the head live.
   `eth_getProof` at older blocks of a durable node's window returns the bytes it returned as
   the head (by number and hash, after a reorg back too); out-of-window and side blocks refused.
+- 2026-11-05: witness generator memory, default node limits, measured by
+  `node/witness_memory_test.zig` (bump allocator over a sentinel-filled region; a written
+  4 KiB page counts as resident). Before: reserved 99.4 MiB, resident 99.4 MiB (Debug/
+  ReleaseSafe) and 14.8 MiB (ReleaseFast: the sparse pool clear). After: reserved 88.4 MiB,
+  resident 332 KiB (ReleaseFast) and 24.2 MiB (safe builds: overlay maps 18.3, key-set maps
+  2.3, node-store maps 1.3). Per part (Debug before -> after, reserved/resident MiB): sparse
+  29.0/29.0 -> 29.0/1.3, keys x2 3.3/3.3 -> 3.3/2.3, witness 13.3/13.3 -> 2.3/0, overlay
+  18.3/18.3 unchanged, changesets x2 16.0/16.0 -> 16.0/0, proofs 0.15/0.15 -> 0.15/0.
+  `debug_executionWitness` over the configured bound or the response buffer: -32000
+  "witness too large", exact JSON length checked against the written response.

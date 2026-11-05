@@ -25,6 +25,7 @@ pub const Service = service.Service;
 test {
     _ = @import("service_test.zig");
     _ = @import("durable_test.zig");
+    _ = @import("witness_memory_test.zig");
 }
 
 test {

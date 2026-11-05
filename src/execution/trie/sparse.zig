@@ -14,6 +14,7 @@
 //! preimage, so an untouched branch costs one pool node, not seventeen. No recursion.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 
 const rlp = @import("rlp.zig");
@@ -124,10 +125,15 @@ const Node = struct {
     body: Body = .{ .children = undefined },
 };
 
+/// Node pool: freed nodes form a LIFO list, and `nodes[fresh..]` were never handed out since
+/// the last `clear`. So `clear` is O(1) and the pool (reserved at init, committed on first
+/// touch through `lazy_alloc`) only becomes resident as far as a block actually used it.
 pub const SparseTrie = struct {
     nodes: []Node,
     free_head: NodeIndex = none,
     free_count: u32 = 0,
+    /// Nodes at and above this index are untouched since `clear`.
+    fresh: u32 = 0,
     resolver: Resolver,
 
     pub fn init(
@@ -136,43 +142,48 @@ pub const SparseTrie = struct {
         resolver: Resolver,
     ) !SparseTrie {
         assert(nodes_max > 0 and nodes_max < unloaded);
-        const nodes = try allocator.alloc(Node, nodes_max);
+        const nodes = try lazy.alloc(allocator, Node, nodes_max);
         var result: SparseTrie = .{ .nodes = nodes, .resolver = resolver };
         result.clear();
         return result;
     }
 
     pub fn deinit(self: *SparseTrie, allocator: std.mem.Allocator) void {
-        allocator.free(self.nodes);
+        lazy.free(allocator, self.nodes);
         self.* = undefined;
     }
 
     /// Frees every node of every trie.
     pub fn clear(self: *SparseTrie) void {
         self.free_head = none;
-        var index: usize = self.nodes.len;
-        while (index > 0) {
-            index -= 1;
-            self.nodes[index] = .{ .kind = .free };
-            self.nodes[index].body = .{ .children = @splat(self.free_head) };
-            self.free_head = @intCast(index);
-        }
+        self.fresh = 0;
         self.free_count = @intCast(self.nodes.len);
-        assert(self.free_head == 0);
+        assert(self.free_count > 0);
     }
 
+    /// Reuses the newest freed node first, then the lowest untouched one: the same order
+    /// as a free list threaded through the whole pool.
     fn alloc(self: *SparseTrie, kind: Kind) Error!NodeIndex {
         if (self.free_count == 0) return error.SparseFull;
-        const index = self.free_head;
-        assert(index < self.nodes.len);
-        assert(self.nodes[index].kind == .free);
-        self.free_head = self.nodes[index].body.children[0];
+        const index = if (self.free_head != none) blk: {
+            const head = self.free_head;
+            assert(head < self.fresh);
+            assert(self.nodes[head].kind == .free);
+            self.free_head = self.nodes[head].body.children[0];
+            break :blk head;
+        } else blk: {
+            assert(self.fresh < self.nodes.len);
+            self.fresh += 1;
+            break :blk self.fresh - 1;
+        };
         self.free_count -= 1;
+        assert(self.free_count >= self.nodes.len - self.fresh);
         self.nodes[index] = .{ .kind = kind };
-        return index;
+        return @intCast(index);
     }
 
     fn free(self: *SparseTrie, index: NodeIndex) void {
+        assert(index < self.fresh);
         assert(self.nodes[index].kind != .free);
         self.nodes[index] = .{ .kind = .free };
         self.nodes[index].body = .{ .children = @splat(self.free_head) };
