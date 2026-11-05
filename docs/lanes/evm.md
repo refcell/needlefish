@@ -19,8 +19,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Beryl ActivationRegistry 0x8453..01 (Cobalt value gate and state-backed admin).
 - [x] Beryl PolicyRegistry V1 0x8453..02 (`native_policy.zig`, alloy-compatible decoder in
   `native_abi.zig`).
-- [ ] PolicyRegistry V2 (Cobalt: composite policies, children arrays with tail cleanup) and
-  V3 (Denim: inverted policy ids); until then the registry is only installed before Cobalt.
+- [x] PolicyRegistry V2 (Cobalt: composite policies, children arrays with tail cleanup) and
+  V3 (Denim: inverted policy ids).
 - [ ] Base native precompiles (Beryl+: B20 factory, B20 tokens)
   and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
@@ -78,8 +78,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   tuple type-check texts reproduced). Only implemented singletons are warmed; PolicyRegistry
   and B20Factory join the warm set when they land. The activation admin comes from
   `op.Context.activation_admin` (chain config). `__initialize` keeps existing code.
+- PolicyRegistry composite evaluation is iterative: write-time validation keeps children to
+  (possibly inverted) plain lists, so a child that is itself composite is never recursed
+  into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: PolicyRegistry V2/V3 (composite and inverted policies).
 - 2026-11-05: Beryl PolicyRegistry V1 and the native ABI decoder.
 - 2026-11-05: Beryl ActivationRegistry native precompile.
 - 2026-11-05: native precompile framework; Cobalt TxContext and NonceManager getters.

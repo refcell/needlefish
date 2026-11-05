@@ -8,28 +8,42 @@ const std = @import("std");
 const assert = std.debug.assert;
 const native = @import("native.zig");
 
-pub const Kind = enum { address, uint64, bool, policy_type, address_array, bytes32, uint256 };
+pub const Kind = enum {
+    address,
+    uint64,
+    bool,
+    /// A Solidity enum (uint8) with values up to the caller's `enumeration_max`.
+    enumeration,
+    address_array,
+    uint64_array,
+    bytes32,
+    uint256,
+};
 
 pub const arguments_max = 4;
 
-/// A decoded `address[]`: `count` validated-later 32-byte words.
-pub const AddressArray = struct {
+/// A decoded dynamic array of one-word elements (`address[]`, `uint64[]`).
+pub const Array = struct {
     words: []const u8,
 
-    pub fn count(array: AddressArray) u32 {
+    pub fn count(array: Array) u32 {
         assert(array.words.len % 32 == 0);
         return @intCast(array.words.len / 32);
     }
 
-    pub fn word(array: AddressArray, index: u32) *const [32]u8 {
+    pub fn word(array: Array, index: u32) *const [32]u8 {
         assert(index < array.count());
         return array.words[@as(usize, index) * 32 ..][0..32];
+    }
+
+    pub fn uint64(array: Array, index: u32) u64 {
+        return std.mem.readInt(u64, array.word(index)[24..32], .big);
     }
 };
 
 pub const Arguments = struct {
     words: [arguments_max]*const [32]u8 = undefined,
-    array: AddressArray = .{ .words = &.{} },
+    array: Array = .{ .words = &.{} },
 
     pub fn address(arguments: *const Arguments, index: usize) native.Address {
         return arguments.words[index][12..32].*;
@@ -52,6 +66,7 @@ pub const Arguments = struct {
 pub fn decode_arguments(
     data: []const u8,
     kinds: []const Kind,
+    enumeration_max: u8,
     failure: *native.DecodeFailure,
 ) ?Arguments {
     assert(kinds.len <= arguments_max);
@@ -63,13 +78,13 @@ pub fn decode_arguments(
             return null;
         };
         arguments.words[index] = head;
-        if (kind != .address_array) continue;
+        if (kind != .address_array and kind != .uint64_array) continue;
         assert(array_count == 0);
         array_count += 1;
-        arguments.array = address_array(data, head, failure) orelse return null;
+        arguments.array = decode_array(data, head, failure) orelse return null;
     }
     for (kinds, 0..) |kind, index| {
-        if (!valid(kind, arguments.words[index], arguments.array)) {
+        if (!valid(kind, arguments.words[index], arguments.array, enumeration_max)) {
             failure.* = .type_check;
             return null;
         }
@@ -89,11 +104,11 @@ fn as_offset(word: *const [32]u8) ?u64 {
     return std.mem.readInt(u64, word[24..32], .big);
 }
 
-fn address_array(
+fn decode_array(
     data: []const u8,
     head: *const [32]u8,
     failure: *native.DecodeFailure,
-) ?AddressArray {
+) ?Array {
     const offset = as_offset(head) orelse {
         failure.* = .{ .offset = head.* };
         return null;
@@ -122,15 +137,18 @@ fn zero(bytes: []const u8) bool {
     return true;
 }
 
-fn valid(kind: Kind, word: *const [32]u8, array: AddressArray) bool {
+fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) bool {
     return switch (kind) {
         .address => zero(word[0..12]),
         .uint64 => zero(word[0..24]),
         .bool => zero(word[0..31]) and word[31] <= 1,
-        .policy_type => zero(word[0..31]) and word[31] <= 1,
+        .enumeration => zero(word[0..31]) and word[31] <= enumeration_max,
         .bytes32, .uint256 => true,
-        .address_array => for (0..array.count()) |index| {
-            if (!zero(array.word(@intCast(index))[0..12])) break false;
+        .address_array => for (0..elements.count()) |index| {
+            if (!zero(elements.word(@intCast(index))[0..12])) break false;
+        } else true,
+        .uint64_array => for (0..elements.count()) |index| {
+            if (!zero(elements.word(@intCast(index))[0..24])) break false;
         } else true,
     };
 }
@@ -147,24 +165,24 @@ test "native abi: dynamic address arrays follow alloy's decoder" {
     data[159] = 0xaa;
     data[191] = 0xbb;
     var failure: native.DecodeFailure = .overrun;
-    const arguments = decode_arguments(&data, &kinds, &failure).?;
+    const arguments = decode_arguments(&data, &kinds, 1, &failure).?;
     try testing.expectEqual(@as(u64, 7), arguments.uint64(0));
     try testing.expectEqual(@as(u32, 2), arguments.array.count());
     try testing.expectEqual(@as(u8, 0xbb), arguments.array.word(1)[31]);
 
     data[127] = 3; // Length beyond the buffer.
-    try testing.expectEqual(null, decode_arguments(&data, &kinds, &failure));
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.overrun, failure);
     data[127] = 2;
     data[64] = 1; // Dirty offset.
-    try testing.expectEqual(null, decode_arguments(&data, &kinds, &failure));
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expect(failure == .offset);
     data[64] = 0;
     data[160] = 1; // Dirty address element: a tuple type-check failure.
-    try testing.expectEqual(null, decode_arguments(&data, &kinds, &failure));
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
     data[160] = 0;
     data[63] = 2; // Bool above 1.
-    try testing.expectEqual(null, decode_arguments(&data, &kinds, &failure));
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
 }

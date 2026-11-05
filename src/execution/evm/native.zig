@@ -201,10 +201,7 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     const active = upgrade orelse return null;
     if (!active.at_least(.beryl)) return null;
     if (std.mem.eql(u8, &address, &activation.address)) return activation.dispatch;
-    // PolicyRegistry V2 (Cobalt) and V3 (Denim) are not implemented yet.
-    if (!active.at_least(.cobalt) and std.mem.eql(u8, &address, &policy.address)) {
-        return policy.dispatch;
-    }
+    if (std.mem.eql(u8, &address, &policy.address)) return policy.dispatch;
     if (!active.at_least(.cobalt)) return null;
     if (std.mem.eql(u8, &address, &tx_context_address)) return tx_context;
     if (std.mem.eql(u8, &address, &nonce_manager_address)) return nonce_manager;
@@ -216,7 +213,7 @@ pub fn warm_addresses(upgrade: ?op.Upgrade) []const Address {
     const active = upgrade orelse return &.{};
     if (!active.at_least(.beryl)) return &.{};
     if (!active.at_least(.cobalt)) return &.{ activation.address, policy.address };
-    return &.{ activation.address, nonce_manager_address, tx_context_address };
+    return &.{ activation.address, policy.address, nonce_manager_address, tx_context_address };
 }
 
 /// Run `native` and map its result. `is_direct` is false for DELEGATECALL / CALLCODE.

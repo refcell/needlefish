@@ -311,6 +311,9 @@ const native_selectors = [_][4]u8{
     policy.functions[1].selector,
     policy.functions[5].selector,
     policy.functions[7].selector,
+    policy.functions[11].selector,
+    policy.functions[12].selector,
+    policy.functions[16].selector,
 };
 
 const native_targets = [_]Address{
@@ -322,7 +325,8 @@ const native_targets = [_]Address{
 
 fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
     var prng = Prng.init(smith.value(u64));
-    const upgrade: op_stack.Upgrade = if (prng.chance(1, 2)) .beryl else .cobalt;
+    const upgrades = [_]op_stack.Upgrade{ .beryl, .cobalt, .denim };
+    const upgrade = upgrades[prng.below(upgrades.len)];
     const admin = if (prng.chance(1, 2)) sender_address else target;
     h.evm.block.op = .{ .upgrade = upgrade, .activation_admin = admin };
     const to = native_targets[prng.below(native_targets.len)];
@@ -430,12 +434,12 @@ fn policy_selector(tag: policy.Tag) [4]u8 {
     return policy.functions[@backingInt(tag)].selector;
 }
 
-/// selector ++ words ++ (offset-referenced address array when `accounts` is non-null).
+/// selector ++ words ++ (offset-referenced one-word array when `elements` is non-null).
 fn policy_input(
     buffer: []u8,
     tag: policy.Tag,
     words: []const u256,
-    accounts: ?[]const Address,
+    elements: ?[]const u256,
 ) []const u8 {
     buffer[0..4].* = policy_selector(tag);
     var length: usize = 4;
@@ -443,14 +447,13 @@ fn policy_input(
         std.mem.writeInt(u256, buffer[length..][0..32], word, .big);
         length += 32;
     }
-    const list = accounts orelse return buffer[0..length];
+    const list = elements orelse return buffer[0..length];
     const head = 32 * (words.len + 1);
     std.mem.writeInt(u256, buffer[length..][0..32], head, .big);
     std.mem.writeInt(u256, buffer[length + 32 ..][0..32], list.len, .big);
     length += 64;
-    for (list) |account| {
-        @memset(buffer[length..][0..12], 0);
-        buffer[length + 12 ..][0..20].* = account;
+    for (list) |element| {
+        std.mem.writeInt(u256, buffer[length..][0..32], element, .big);
         length += 32;
     }
     return buffer[0..length];
@@ -483,7 +486,8 @@ test "op: PolicyRegistry creates allowlists behind the activation gate" {
     try testing.expectEqual(@as(usize, 2), created.logs.len);
 
     const member = primitives.address_from_int(0xa11ce);
-    const update = policy_input(&buffer, .update_allowlist, &.{ id, 1 }, &.{member});
+    const update =
+        policy_input(&buffer, .update_allowlist, &.{ id, 1 }, &.{address_int(member)});
     const updated = try native_call(&h, policy.address, update, 0);
     try testing.expectEqual(evm_module.Status.success, updated.status);
     const check = policy_input(&buffer, .is_authorized, &.{ id, address_int(member) }, null);
@@ -494,7 +498,7 @@ test "op: PolicyRegistry creates allowlists behind the activation gate" {
     const builtin = try native_call(&h, policy.address, exists, 0);
     try testing.expectEqual(@as(u8, 1), builtin.output[31]);
 
-    var many: [65]Address = @splat(member);
+    var many: [65]u256 = @splat(address_int(member));
     const big = policy_input(&buffer, .update_allowlist, &.{ id, 1 }, &many);
     const too_large = try native_call_gas(&h, policy.address, big, 0, 1_000_000);
     try testing.expectEqualSlices(u8, &policy.error_batch_size_too_large, too_large.output[0..4]);
@@ -515,4 +519,69 @@ test "op: PolicyRegistry rejects value and reports Beryl decode failures" {
     try testing.expectEqualSlices(u8, &expected, failed.output);
     const paid = try native_call(&h, policy.address, bad_type, 1);
     try testing.expectEqualSlices(u8, &native.selector_non_payable, paid.output);
+}
+
+fn policy_call(h: *Harness, input: []const u8) !transaction.Executed {
+    return native_call_gas(h, policy.address, input, 0, 1_000_000);
+}
+
+fn output_word(executed: transaction.Executed) u256 {
+    return std.mem.readInt(u256, executed.output[0..32], .big);
+}
+
+test "op: PolicyRegistry composite and inverted policies (Denim)" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .denim, .activation_admin = sender_address };
+    const feature = activation.feature_policy_registry;
+    const activate = activation_input(activation.selector_activate, feature);
+    _ = try native_call(&h, activation.address, &activate, 0);
+    var buffer: [4 + 32 * 10]u8 = undefined;
+    const admin = address_int(sender_address);
+    const member: u256 = 0xa11ce;
+    const allow_create =
+        policy_input(&buffer, .create_policy_with_accounts, &.{ admin, 1 }, &.{member});
+    const allow: u64 = @intCast(output_word(try policy_call(&h, allow_create)));
+    const block_create = policy_input(&buffer, .create_policy, &.{ admin, 0 }, null);
+    const block = output_word(try policy_call(&h, block_create));
+    try testing.expectEqual(@as(u64, (1 << 56) | 2), allow);
+    try testing.expectEqual(@as(u256, 3), block);
+
+    const one_child = policy_input(&buffer, .create_composite_policy, &.{ admin, 3 }, &.{allow});
+    const range = try policy_call(&h, one_child);
+    try testing.expectEqualSlices(u8, &policy.error_child_policies_outside_of_range, range.output);
+    const builtin =
+        policy_input(&buffer, .create_composite_policy, &.{ admin, 3 }, &.{ allow, 0 });
+    const invalid = try policy_call(&h, builtin);
+    try testing.expectEqualSlices(u8, &policy.error_invalid_child_policy, invalid.output[0..4]);
+    const as_list = policy_input(&buffer, .create_policy, &.{ admin, 2 }, null);
+    const incompatible = try policy_call(&h, as_list);
+    try testing.expectEqualSlices(u8, &policy.error_incompatible_policy_type, incompatible.output);
+
+    const create =
+        policy_input(&buffer, .create_composite_policy, &.{ admin, 3 }, &.{ allow, block });
+    const composite = output_word(try policy_call(&h, create));
+    try testing.expectEqual(@as(u256, (3 << 56) | 4), composite);
+    const member_check = policy_input(&buffer, .is_authorized, &.{ composite, member }, null);
+    try testing.expectEqual(@as(u256, 1), output_word(try policy_call(&h, member_check)));
+    const stranger = policy_input(&buffer, .is_authorized, &.{ composite, 0xb0b }, null);
+    try testing.expectEqual(@as(u256, 0), output_word(try policy_call(&h, stranger)));
+    const children = policy_input(&buffer, .composite_policy_child_ids, &.{composite}, null);
+    const ids = try policy_call(&h, children);
+    try testing.expectEqual(@as(usize, 128), ids.output.len);
+    try testing.expectEqual(@as(u8, 3), ids.output[127]);
+
+    const invert = policy_input(&buffer, .inverted_policy_id, &.{allow}, null);
+    const inverted = output_word(try policy_call(&h, invert));
+    try testing.expectEqual(@as(u256, allow | (1 << 63)), inverted);
+    const negated = policy_input(&buffer, .is_authorized, &.{ inverted, member }, null);
+    try testing.expectEqual(@as(u256, 0), output_word(try policy_call(&h, negated)));
+    const negated_stranger = policy_input(&buffer, .is_authorized, &.{ inverted, 0xb0b }, null);
+    try testing.expectEqual(@as(u256, 1), output_word(try policy_call(&h, negated_stranger)));
+
+    h.evm.block.op = .{ .upgrade = .cobalt, .activation_admin = sender_address };
+    const again = policy_input(&buffer, .inverted_policy_id, &.{allow}, null);
+    const unknown = try policy_call(&h, again);
+    try testing.expectEqualSlices(u8, &policy_selector(.inverted_policy_id), unknown.output);
 }
