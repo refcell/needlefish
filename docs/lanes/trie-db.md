@@ -63,8 +63,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Witness codec for the proof lane: canonical binary encoding of a `Witness` (strict
   decoder, encode(decode(x)) == x) plus a keccak256 preimage view (iterator + lookup by digest).
   (`db/witness_codec.zig`)
-- [ ] Witness size + build-time benchmarks (nodes, bytes, us per block) for 1k-account and
-  storage-heavy blocks; record in docs/PERF.md.
+- [x] Witness size + build-time benchmarks (nodes, bytes, us per block) for 1k-account and
+  storage-heavy blocks; record in docs/PERF.md. (`db/witness_bench.zig`, `-- db/witness`;
+  plus a 200-call evm block; docs/PERF.md "db witness")
+- [ ] `SparseState.reset` / `SparseTrie.clear` is O(pool capacity): ~370 us per reset for a
+  104k-node pool, paid by every `Builder.build` and verifier load. Clear only used nodes
+  (or track a high-water mark).
+- [ ] `Builder.build` is 4-5x a full-state block apply (30.7 vs 8.2 ms storage-heavy): proves
+  every key separately, then replays on a sparse trie. Share proof walks (sorted keys, one
+  descent) or build the witness from the full trie's dirty-path walk.
 - [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
   blocks (committed small vectors); document any intended differences.
 - [x] Witness generator memory: default limits allocate ~40-60 MB at node start even if
@@ -75,6 +82,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `node/witness_memory_test.zig`)
 - [ ] Witness generation blocks the state for one unwind + re-apply per block between target
   and head; consider generating from the history store instead (no state disturbance).
+- [ ] Faster `witness.Builder.build`: 4-5x the cost of applying the block (30.7 vs 8.2 ms on
+  the storage-heavy block); collect proof nodes in one sorted multi-key trie walk instead of
+  one proof per key, and skip the sparse replay when the caller does not need the root.
+- [ ] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
+  size the rpc response buffer for witnesses or stream the JSON.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -445,3 +457,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   18.3/18.3 unchanged, changesets x2 16.0/16.0 -> 16.0/0, proofs 0.15/0.15 -> 0.15/0.
   `debug_executionWitness` over the configured bound or the response buffer: -32000
   "witness too large", exact JSON length checked against the written response.
+- 2026-11-05: witness benchmarks (`db/witness_bench.zig`, 100k-account state, 11 samples, median):
+  1k account writes 3 004 nodes / 751 KB / build 7.1 ms; 1k acct + 4k slots 5 613 nodes /
+  1.28 MB / build 30.7 ms / verifier replay 12.7 ms; 200 evm SLOAD+SSTORE calls 1 484 nodes /
+  392 KB / build 4.4 ms / stateless re-exec 1.67 ms. Recorder ~30 ns per key, codec 0.45-0.75
+  GB/s. Every sample checks the verifier's root against the builder's.

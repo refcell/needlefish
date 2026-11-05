@@ -134,6 +134,53 @@ Storage writes in `apply` are ~420 ns per slot (two hash-table updates plus a tr
 cache-miss bound). Next step if this matters: hash dirty storage tries on worker threads
 (lane backlog).
 
+### 2026-11-05 db witness (aarch64-macos, Apple M4 Pro, 48 GB, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/witness` (`db/witness_bench.zig`, ~2 s; whole
+`db/` run ~7.5 s). State = the db bench state (100k accounts, 1k contracts x 64 slots), every
+contract running `old = SLOAD(cd[0]); SSTORE(cd[0], cd[32]); LOG1`. Each block is built once,
+never committed, and measured 11 times (median). The write blocks' "execution" reads every
+written key's old value once; the evm block runs 200 calls (distinct senders, distinct
+contracts, one SLOAD + SSTORE each) through the real evm. Bytes = canonical
+`witness_codec` encoding; keys = 20-byte addresses + 32-byte slot keys.
+
+| Block | state nodes | bytes | codes | keys | build | load + replay |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k account writes | 3 004 | 751 314 | 0 | 1 000 | 7.1 ms | 0.37 + 1.0 + 1.36 ms |
+| 1k acct + 4k slot writes | 5 613 | 1 276 542 | 0 | 5 989 | 30.7 ms | 0.38 + 1.7 + 12.7 ms |
+| 200 evm SLOAD+SSTORE calls | 1 484 | 391 701 | 1 | 611 | 4.4 ms | 0.38 + 0.51 + 1.25 ms |
+
+"build" = `Builder.build` (proofs of every touched key, deleted keys' siblings, replay on
+its scratch sparse state, witness copy-out). "load + replay" = `SparseState.reset` +
+`load` (decoded witness) + `witness.replay` (reads + changeset, root checked against the
+builder's).
+
+| Block | recorder overhead | encode | decode | stateless evm |
+| --- | ---: | ---: | ---: | ---: |
+| 1k account writes | 4 us (200 -> 204 us of reads) | 1.21 ms, 619 MB/s | 1.00 ms, 752 MB/s | |
+| 1k acct + 4k slot writes | 177 us (326 -> 503 us) | 2.80 ms, 455 MB/s | 1.73 ms, 740 MB/s | |
+| 200 evm calls | 34 us (200 -> 235 us of execution) | 0.67 ms, 589 MB/s | 0.52 ms, 751 MB/s | 1.67 ms |
+
+"stateless evm" = the 200 calls re-executed over `SparseState.database()` + `apply_evm`
+(after load), vs 0.20 ms for the same calls over the full state. Two runs agreed within ~5%
+(the storage-heavy build 29.5-30.7 ms, replay 11.4-12.7 ms).
+
+Takeaways:
+- Size: ~750 B per touched account for 1k scattered accounts (3 nodes per account; the top
+  two account-trie levels are shared), ~1.3 MB for the storage-heavy block. A 1 MiB HTTP
+  buffer is already too small for it (hex doubles it).
+- `Builder.build` is 4-5x the cost of applying the same block to the full state (30.7 vs
+  8.2 ms for the storage-heavy block): it proves each key separately (no shared path walk),
+  then replays the block on a sparse trie that decodes every node from RLP. The replay half
+  is what `load + replay` shows for the verifier (12.7 ms).
+- `SparseState.reset` is O(pool capacity), not O(witness): ~370 us here for a 104 600-node
+  pool (5x witness nodes estimated from the block shape), and it runs inside every
+  `build` too. Size the pool from limits tightly or clear only used nodes.
+- The Recorder costs ~30 ns per recorded key (bounded hash-set insert); noise for the
+  account-only block.
+- Codec: encode sorts by keccak256 of every item (~400 ns per node), decode re-hashes every
+  item for the strict order check; both ~0.5-0.75 GB/s, small next to build.
+
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `TrieType` nodes keep only what their kind needs: a packed path (2 nibbles per byte, stored in

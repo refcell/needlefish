@@ -30,6 +30,9 @@ const IoStorageType = @import("storage/io_storage.zig").IoStorageType;
 const io_root = @import("../../utilities/io/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
+/// Witness size and build-time benchmarks (`witness_bench.zig`), run by `bench_main.zig`.
+pub const witness = @import("witness_bench.zig");
+
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
 const Changeset = changeset_module.Changeset;
@@ -78,15 +81,15 @@ pub const Shape = struct {
     rounds: u32,
     round_blocks: u32,
 
-    fn slots(shape: Shape) u32 {
+    pub fn slots(shape: Shape) u32 {
         return shape.contracts * shape.slots_per_contract;
     }
 
-    fn fill_blocks(shape: Shape) u32 {
+    pub fn fill_blocks(shape: Shape) u32 {
         return shape.accounts / shape.fill_accounts;
     }
 
-    fn fill_slots(shape: Shape) u32 {
+    pub fn fill_slots(shape: Shape) u32 {
         return shape.slots() / shape.fill_blocks();
     }
 
@@ -102,7 +105,7 @@ pub const Shape = struct {
         return shape.rounds * shape.round_blocks;
     }
 
-    fn check(shape: Shape) void {
+    pub fn check(shape: Shape) void {
         assert(shape.accounts % shape.fill_accounts == 0);
         assert(shape.contracts % shape.fill_blocks() == 0);
         assert(shape.slots() % shape.fill_blocks() == 0);
@@ -127,7 +130,7 @@ pub const shape_bench: Shape = .{
     .round_blocks = 32,
 };
 
-const shape_test: Shape = .{
+pub const shape_test: Shape = .{
     .accounts = 400,
     .contracts = 8,
     .slots_per_contract = 16,
@@ -139,7 +142,7 @@ const shape_test: Shape = .{
 };
 
 /// Walk step for distinct accounts and slots; coprime with the table sizes.
-const stride = 97;
+pub const stride = 97;
 const header_size = 64;
 const account_change_bytes = 20 + 1 + 2 * (8 + 32 + 32);
 const storage_change_bytes = 20 + 3 * 32;
@@ -155,7 +158,7 @@ comptime {
     assert(changeset_bytes(shape_bench) == 629_018);
 }
 
-fn address_of(index: u64) Address {
+pub fn address_of(index: u64) Address {
     assert(index <= std.math.maxInt(u32));
     var address: Address = @splat(0x5a);
     std.mem.writeInt(u32, address[0..4], @intCast(index), .big);
@@ -169,7 +172,7 @@ fn hash_of(number: u64) Hash {
 }
 
 /// Setup block `fill_index`: creates its accounts and every slot of its contracts.
-fn write_fill(overlay: *Overlay, shape: Shape, fill_index: u32) !void {
+pub fn write_fill(overlay: *Overlay, shape: Shape, fill_index: u32) !void {
     assert(fill_index < shape.fill_blocks());
     const first: u64 = @as(u64, fill_index) * shape.fill_accounts;
     for (0..shape.fill_accounts) |offset| {
@@ -190,7 +193,7 @@ fn write_fill(overlay: *Overlay, shape: Shape, fill_index: u32) !void {
 
 /// One measured block: distinct accounts bump nonce and balance, distinct existing slots
 /// increment (never to zero), so the changeset has exactly the block's write counts.
-fn write_block(overlay: *Overlay, shape: Shape, prng: *Prng) !void {
+pub fn write_block(overlay: *Overlay, shape: Shape, prng: *Prng) !void {
     var account = prng.below(shape.accounts);
     for (0..shape.block_accounts) |_| {
         const address = address_of(account);
@@ -211,7 +214,7 @@ fn write_block(overlay: *Overlay, shape: Shape, prng: *Prng) !void {
     assert(overlay.slots.count() == shape.block_slots);
 }
 
-fn state_config(shape: Shape) state_module.Config {
+pub fn state_config(shape: Shape) state_module.Config {
     const accounts = shape.accounts + shape.changed_accounts_max();
     const slots = shape.slots() + shape.changed_slots_max();
     return .{
@@ -225,7 +228,7 @@ fn state_config(shape: Shape) state_module.Config {
     };
 }
 
-fn changeset_config(shape: Shape) changeset_module.Config {
+pub fn changeset_config(shape: Shape) changeset_module.Config {
     return .{
         .accounts_max = shape.changed_accounts_max(),
         .storage_max = shape.changed_slots_max(),
@@ -234,7 +237,7 @@ fn changeset_config(shape: Shape) changeset_module.Config {
     };
 }
 
-fn overlay_config(shape: Shape) overlay_module.Config {
+pub fn overlay_config(shape: Shape) overlay_module.Config {
     return .{
         .accounts_max = shape.changed_accounts_max(),
         .slots_max = shape.changed_slots_max(),
@@ -385,7 +388,7 @@ fn bench_decode(iterations: u32) u64 {
 
 // Commit latency.
 
-fn now_ns(io: std.Io) u64 {
+pub fn now_ns(io: std.Io) u64 {
     const nanoseconds = std.Io.Clock.awake.now(io).nanoseconds;
     assert(nanoseconds >= 0);
     return @intCast(nanoseconds);
@@ -578,7 +581,7 @@ fn print_percentiles(label: []const u8, samples: []u64) void {
     });
 }
 
-fn matches(name: []const u8, filter: ?[]const u8) bool {
+pub fn matches(name: []const u8, filter: ?[]const u8) bool {
     const pattern = filter orelse return true;
     return std.mem.indexOf(u8, name, pattern) != null;
 }
@@ -667,6 +670,10 @@ fn delete_scratch(io: std.Io) void {
             name_os, scratch_path, @errorName(err),
         }),
     };
+}
+
+test {
+    _ = witness;
 }
 
 test "bench: cases are well formed" {
