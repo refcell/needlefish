@@ -53,6 +53,8 @@ pub const Config = struct {
 
 pub const AddError = error{ChannelFull};
 
+pub const manager = @import("manager.zig");
+
 pub const ChannelOut = struct {
     config: Config,
     id: ChannelId,
@@ -280,4 +282,8 @@ test "channel: seeded fuzz round trip through consensus channel" {
             try testing.expectEqualSlices(u8, input, decoded);
         }
     }
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

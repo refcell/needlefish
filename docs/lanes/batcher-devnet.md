@@ -16,7 +16,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `batcher/comp`: real brotli compressor (LZ77 + prefix codes), checked with `brotli -d`.
 - [ ] `batcher/batch`: singular batch RLP, span batch encoding.
 - [x] `batcher/channel`: channel out (ratio estimate, compress on close, frames).
-- [ ] `batcher/channel`: channel manager (block queue, timeouts, tx tracking, reorgs).
+- [x] `batcher/channel`: channel manager (double-buffered channels, backpressure, reorg detect,
+  duration close); batches decode back via consensus SingleBatch.
 - [x] `batcher/txdata`: EIP-1559 calldata tx building + signing, gas, fee bumps.
 - [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
 - [ ] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
@@ -62,3 +63,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: rpc client, `base devnet transfer`; signing + portal deposit log verified
   against a local dev node; portal log decodes with consensus `decode_deposit_log`.
 - 2026-11-05: L2 block source decoding with hash check and mutation fuzz.
+- 2026-11-05: channel manager emitting singular batches; round trip through consensus decode.
