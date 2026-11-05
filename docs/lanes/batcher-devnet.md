@@ -53,7 +53,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
 - [x] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
 - [x] `batcher/rpc`: JSON-RPC client over an injected transport (HTTP in bin, canned in tests).
-- [ ] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
+- [x] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
 - [x] `batcher/admin`: base/base admin JSON-RPC (start/stop/flush/status/throttle info) and
   `--stopped`, `--admin-port`, `--admin-addr`; one event loop serves admin + metrics.
@@ -79,7 +79,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
 - [x] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
 - [x] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
-- [ ] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
+- [x] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
   validator's derived hashes with the leader's.
 - [ ] `batcher`: batcher balance metric (base/base `BalanceMonitorLayer`).
 
@@ -205,3 +205,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   died with AddressInUse, `up` still said "up" and `smoke` passed against the other devnet.
   `up` now refuses a cold start while any devnet port is taken and fails when a component
   exits during startup. Re-ran smoke on our own devnet (a2d588d): all checks pass.
+- 2026-11-05: shadow mode (`--shadow.enabled`, `--shadow.inbox`,
+  `--shadow.validator-rollup-rpc`, `--shadow.validator-l2-rpc`; all four or none, requires
+  `--no-throttle`; the rollup config file's inbox must be the shadow inbox). Safe head from
+  the validator, unsafe from the leader (`Clients.unsafe_from_l2`): reading both from the
+  validator stalled, since it only learns blocks once batched. `batcher.parity.Monitor`
+  compares derived block hashes (<= 25 per step, from validator safe + 1); logs a summary
+  per 100 blocks and every mismatch. Live on the devnet: 101/101 blocks match.

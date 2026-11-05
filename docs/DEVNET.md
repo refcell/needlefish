@@ -120,6 +120,8 @@ Each binary must accept at least the flags below. Lanes may add more.
   (bytes, base/base defaults, validated together).
   In calldata mode new txs switch to blobs while throttling is active
   (`--no-force-blobs-when-throttling` turns that off).
+- Shadow mode posts to `--shadow.inbox` and compares a parity validator's derived blocks
+  with the leader's (see `bin/base/batcher_shadow.zig`).
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 

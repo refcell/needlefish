@@ -5,6 +5,7 @@ const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
 const Servers = @import("batcher_servers.zig").Servers;
 const sequencer_clients = @import("batcher_sequencers.zig");
+const shadow_mode = @import("batcher_shadow.zig");
 
 const Io = std.Io;
 const batcher = base.batcher;
@@ -23,6 +24,8 @@ const usage =
     \\         --brotli-quality 0-11 --publish-max-retries N --publish-retry-delay D
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
+    \\         [--shadow.enabled --shadow.inbox ADDR --shadow.validator-rollup-rpc URL
+    \\          --shadow.validator-l2-rpc URL (requires --no-throttle)]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
     \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
     \\         [--wait-node-sync-timeout SECONDS]]
@@ -82,6 +85,7 @@ const Flags = struct {
     /// Compressed bytes a channel aims for before it closes; 0 = one full frame.
     compressed_size_target: u32 = 0,
     brotli_quality: u4 = batcher.comp.brotli.quality_default,
+    shadow: shadow_mode.Settings = .{},
     publish_max_retries: u8 = 10,
     publish_retry_delay_ms: u64 = 1_000,
 };
@@ -176,6 +180,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     );
     defer init.gpa.free(rollup_text);
     const rollup = try batcher.service.RollupFields.parse(init.gpa, rollup_text);
+    try shadow_mode.check_inbox(flags.shadow, rollup.batch_inbox_address.bytes);
     const accounts = batcher.devnet.accounts;
     const account = flags.private_key orelse accounts.derive_dev(flags.key_index).private_key;
     var seed: [16]u8 = undefined;
@@ -255,9 +260,12 @@ fn run(
     defer endpoints.deinit(init.gpa);
     var leader = endpoints.tracker();
     var active_count: u8 = 1;
+    const shadow = if (flags.shadow.enabled) try start_shadow(init, flags) else null;
+    defer if (shadow) |validator| stop_shadow(init.gpa, validator);
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
     if (flags.wait_node_sync) {
-        try wait_for_node_sync(init, flags, &l1, leader.current().rollup, service);
+        const rollup = if (shadow) |validator| &validator.rollup else leader.current().rollup;
+        try wait_for_node_sync(init, flags, &l1, rollup, service);
     }
     var metrics: batcher.metrics.Metrics = .{};
     try metrics.register();
@@ -268,7 +276,12 @@ fn run(
     var blobs_forced_logged = false;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
-        const clients = follow_leader(&leader, &l1, endpoints.has_rollup, service, &active_count);
+        var clients = follow_leader(&leader, &l1, endpoints.has_rollup, service, &active_count);
+        // A shadow batcher follows the parity validator's derivation, not the leader's.
+        if (shadow) |validator| {
+            clients.rollup = &validator.rollup;
+            clients.unsafe_from_l2 = true;
+        }
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
             metrics.record(report, service.txs.pending_count());
@@ -282,12 +295,27 @@ fn run(
             metrics.step_failures.increment();
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
         }
+        if (shadow) |validator| validator.check(clients.l2);
         if (serving) {
             try servers.serve_for(flags.poll_interval_ms);
         } else {
             try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
         }
     }
+}
+
+fn start_shadow(init: std.process.Init, flags: Flags) !*shadow_mode.Shadow {
+    const shadow = try init.gpa.create(shadow_mode.Shadow);
+    errdefer init.gpa.destroy(shadow);
+    try shadow.init(init.gpa, init.io, flags.shadow, flags.network_timeout_ms);
+    const inbox = &flags.shadow.inbox.?;
+    std.debug.print("batcher: SHADOW MODE: posting to shadow inbox 0x{x}\n", .{inbox});
+    return shadow;
+}
+
+fn stop_shadow(allocator: std.mem.Allocator, shadow: *shadow_mode.Shadow) void {
+    shadow.deinit(allocator);
+    allocator.destroy(shadow);
 }
 
 /// Re-checks which sequencer is active and returns the clients for this step. A new
@@ -336,6 +364,7 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
 /// command lines work unchanged. Returns false for flags it does not know.
 fn apply_alias(flags: *Flags, arg: []const u8, value: []const u8) !bool {
     if (try apply_txmgr_flag(flags, arg, value)) return true;
+    if (try shadow_mode.apply_flag(&flags.shadow, arg, value)) return true;
     if (try apply_throttle_flag(flags, arg, value)) return true;
     return apply_alias_settings(flags, arg, value);
 }
@@ -432,6 +461,8 @@ fn parse_switch(flags: *Flags, arg: []const u8) bool {
         flags.stopped = true;
     } else if (eql(u8, arg, "--wait-node-sync")) {
         flags.wait_node_sync = true;
+    } else if (eql(u8, arg, "--shadow.enabled")) {
+        flags.shadow.enabled = true;
     } else if (eql(u8, arg, "--no-force-blobs-when-throttling")) {
         flags.force_blobs_when_throttling = false;
     } else if (eql(u8, arg, "--no-throttle")) {
@@ -445,6 +476,7 @@ fn validate_flags(flags: Flags) !void {
     // base/base rejects a margin that leaves no channel duration.
     if (flags.sub_safety_margin >= flags.max_channel_duration) return error.SubSafetyMarginTooLarge;
     if (flags.throttle.problem() != null) return error.InvalidThrottleConfig;
+    try shadow_mode.validate(flags.shadow, flags.throttle.strategy == .off);
     const recent_depth_max = batcher.sync.recent_txs_depth_max;
     if (flags.check_recent_txs_depth > recent_depth_max) return error.RecentTxsDepthTooLarge;
     if (flags.check_recent_txs_depth > 0 and !flags.wait_node_sync)
@@ -679,6 +711,7 @@ test "batcher: flags" {
 
 test {
     _ = sequencer_clients;
+    _ = shadow_mode;
     _ = @import("http_transport.zig");
 }
 
@@ -704,6 +737,8 @@ const fuzz_flag_names = [_][]const u8{
     "--brotli-quality",
     "--publish-max-retries",
     "--publish-retry-delay",
+    "--shadow.enabled",
+    "--shadow.inbox",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 

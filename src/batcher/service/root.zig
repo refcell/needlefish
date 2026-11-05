@@ -42,6 +42,10 @@ pub const Clients = struct {
     l2: *rpc.Client,
     /// Rollup node; null runs without safe-head tracking.
     rollup: ?*rpc.Client,
+    /// Shadow mode: `rollup` is the parity validator, which only learns blocks once they
+    /// are batched, so the unsafe head comes from the leader's `l2` (base/base reads the
+    /// leader's unsafe blocks and follows the validator's derivation).
+    unsafe_from_l2: bool = false,
 };
 
 pub const Heads = struct {
@@ -280,13 +284,12 @@ fn read_heads(clients: Clients) Error!Heads {
     if (clients.rollup) |rollup| {
         if (rollup.call("optimism_syncStatus", "[]")) |status| {
             const safe = try rpc.field(status, "safe_l2");
-            const unsafe = try rpc.field(status, "unsafe_l2");
-            return .{
-                .l1 = l1,
-                .safe_l2 = try rpc.number(try rpc.field(safe, "number")),
-                .unsafe_l2 = try rpc.number(try rpc.field(unsafe, "number")),
-                .safe_known = true,
-            };
+            const safe_l2 = try rpc.number(try rpc.field(safe, "number"));
+            const unsafe_l2 = if (clients.unsafe_from_l2) blk: {
+                const leader = try clients.l2.call("eth_blockNumber", "[]");
+                break :blk @max(safe_l2, try rpc.quantity(u64, leader));
+            } else try rpc.number(try rpc.field(try rpc.field(status, "unsafe_l2"), "number"));
+            return .{ .l1 = l1, .safe_l2 = safe_l2, .unsafe_l2 = unsafe_l2, .safe_known = true };
         } else |_| {}
     }
     const unsafe = try rpc.quantity(u64, try clients.l2.call("eth_blockNumber", "[]"));
@@ -530,6 +533,79 @@ fn fuzz_throttling(_: void, smith: *testing.Smith) anyerror!void {
     if (service.throttling(backlog)) {
         try testing.expect(!service.throttle.disabled and backlog >= start);
     }
+}
+
+/// Heads read through canned answers: `l2_head` from the leader, `safe`/`unsafe` from the
+/// rollup node.
+fn heads_for(l2_head: u64, safe: u64, unsafe: u64, unsafe_from_l2: bool) !Heads {
+    var l1_text: [32]u8 = undefined;
+    var l2_text: [32]u8 = undefined;
+    var status_text: [96]u8 = undefined;
+    var l1_canned: rpc.CannedTransport = .{ .answers = &.{.{
+        .method = "eth_blockNumber",
+        .result = try std.fmt.bufPrint(&l1_text, "\"0x{x}\"", .{7}),
+    }} };
+    var l2_canned: rpc.CannedTransport = .{ .answers = &.{.{
+        .method = "eth_blockNumber",
+        .result = try std.fmt.bufPrint(&l2_text, "\"0x{x}\"", .{l2_head}),
+    }} };
+    var rollup_canned: rpc.CannedTransport = .{ .answers = &.{.{
+        .method = "optimism_syncStatus",
+        .result = try std.fmt.bufPrint(&status_text, "{{\"safe_l2\":{{\"number\":{d}}}," ++
+            "\"unsafe_l2\":{{\"number\":{d}}}}}", .{ safe, unsafe }),
+    }} };
+    const limits: rpc.Limits = .{};
+    var l1 = try rpc.Client.init(testing.allocator, l1_canned.transport(), limits);
+    defer l1.deinit(testing.allocator);
+    var l2 = try rpc.Client.init(testing.allocator, l2_canned.transport(), limits);
+    defer l2.deinit(testing.allocator);
+    var rollup = try rpc.Client.init(testing.allocator, rollup_canned.transport(), limits);
+    defer rollup.deinit(testing.allocator);
+    const clients: Clients = .{
+        .l1 = &l1,
+        .l2 = &l2,
+        .rollup = &rollup,
+        .unsafe_from_l2 = unsafe_from_l2,
+    };
+    return read_heads(clients);
+}
+
+test "service: shadow mode reads the unsafe head from the leader" {
+    const canonical = try heads_for(9, 2, 3, false);
+    try testing.expectEqual(@as(u64, 3), canonical.unsafe_l2);
+    try testing.expectEqual(@as(u64, 2), canonical.safe_l2);
+    const shadow = try heads_for(9, 2, 3, true);
+    try testing.expectEqual(@as(u64, 9), shadow.unsafe_l2);
+    try testing.expectEqual(@as(u64, 2), shadow.safe_l2);
+    try testing.expect(shadow.safe_known);
+    // A leader behind the validator's safe head never yields unsafe < safe.
+    try testing.expectEqual(@as(u64, 5), (try heads_for(4, 5, 5, true)).unsafe_l2);
+}
+
+fn check_shadow_heads(l2_head: u64, safe: u64, unsafe: u64) !void {
+    const heads = try heads_for(l2_head, safe, unsafe, true);
+    try testing.expectEqual(safe, heads.safe_l2);
+    try testing.expectEqual(@max(l2_head, safe), heads.unsafe_l2);
+    try testing.expect(heads.unsafe_l2 >= heads.safe_l2);
+}
+
+test "service: seeded fuzz of shadow heads" {
+    var prng = Prng.init(0x5ad1);
+    for (0..200) |_| {
+        try check_shadow_heads(prng.below(1 << 40), prng.below(1 << 40), prng.below(1 << 40));
+    }
+}
+
+test "service: fuzz shadow heads" {
+    try testing.fuzz({}, fuzz_shadow_heads, .{});
+}
+
+fn fuzz_shadow_heads(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [12]u8 = @splat(0);
+    _ = smith.slice(&bytes);
+    const l2_head: u64 = std.mem.readInt(u32, bytes[0..4], .little);
+    const safe: u64 = std.mem.readInt(u32, bytes[4..8], .little);
+    try check_shadow_heads(l2_head, safe, std.mem.readInt(u32, bytes[8..12], .little));
 }
 
 test "service: rollup fields from the devnet rollup.json" {
