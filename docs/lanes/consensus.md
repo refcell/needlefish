@@ -6,7 +6,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 ## Backlog
 - [ ] `protocol`: (split below) rollup config, system config (+ updates from L1 logs), L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian formats), user deposits from TransactionDeposited logs, frames, channels, singular + span batches, batch validity rules (Holocene strict ordering), block info.
   - [x] frames (zero-copy codec, payload parser), channels, `BlockInfo`/`L2BlockInfo`
-  - [ ] local RLP decoder (until primitives lane lands one) + singular batches
+  - [x] singular batches (codec + validity rules), batch drop reasons (uses `common/rlp`)
   - [ ] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
   - [x] rollup config + hardfork activation, system config + L1 log updates
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
@@ -36,6 +36,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - Zig 0.17 has no array `**` operator: use `@splat`.
 
 ## Log
+- 2026-11-05: singular batch codec + validity (Holocene, Denim same-second, Jovian).
 - 2026-11-05: L1 info deposit (4 formats, base/base vectors), fork selection, blob fee.
 - 2026-11-05: user deposits, deposit tx 2718 encoding (base/base vectors), source hashes.
 - 2026-11-05: rollup config (upgrades, features, Denim schedule), system config updates.

@@ -113,6 +113,10 @@ pub const Feature = enum {
     extended_sequencer_drift,
     one_shot_payload_building,
     singular_batches_only,
+    eip8130,
+    eip8430,
+    native_nonce_manager,
+    gas_limit_billing,
 
     pub fn activation_upgrade(feature: Feature) Upgrade {
         const index = @backingInt(feature);
@@ -140,8 +144,10 @@ pub const Feature = enum {
             .jovian
         else if (index <= @backingInt(Feature.engine_api_v5))
             .azul
+        else if (index <= @backingInt(Feature.singular_batches_only))
+            .denim
         else
-            .denim;
+            .everest;
         return result;
     }
 };
@@ -387,6 +393,7 @@ test "rollup config: feature mapping" {
     try testing.expectEqual(Upgrade.jovian, Feature.min_base_fee.activation_upgrade());
     try testing.expectEqual(Upgrade.azul, Feature.engine_api_v5.activation_upgrade());
     try testing.expectEqual(Upgrade.denim, Feature.singular_batches_only.activation_upgrade());
+    try testing.expectEqual(Upgrade.everest, Feature.eip8130.activation_upgrade());
 }
 
 test "rollup config: drift, channel limits, timeouts" {
