@@ -31,7 +31,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
-- [ ] rpc: filters (eth_newFilter/newBlockFilter/newPendingTransactionFilter,
+- [x] rpc: filters (eth_newFilter/newBlockFilter/newPendingTransactionFilter,
   getFilterChanges/getFilterLogs, uninstallFilter) with bounded slots and expiry.
 - [ ] rpc: historical state (balance/code/storage/nonce/getProof/call at older blocks)
   through the trie-db history window (`db.history.Store`).
@@ -63,6 +63,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: polling filters (`rpc/filters.zig`): 64 slots, LRU eviction instead of reth's 5-minute idle expiry (deterministic, no clock in the rpc layer); log/block filters report canonical blocks after the head at creation (geth/reth); pending filters see hashes accepted by eth_sendRawTransaction (1024-entry ring; the node has no tx gossip yet).
 - 2026-11-05: tooling RPC methods (`rpc/eth_more.zig`); backlog extended with filters, historical state, execution witness, txpool content.
 - 2026-11-05: RSS finding: `std.mem.Allocator.alloc` memsets every allocation with `undefined` (0xAA) in Debug/ReleaseSafe, so every configured upper bound is resident at startup (ReleaseSafe dev L1 node 766 MiB vs 55 MiB ReleaseFast; devnet builds ReleaseSafe). Added `utilities/lazy_alloc` (rawAlloc/rawFree, no fill; pages commit on first write) and moved the node lane's large buffers (executor scratch, block stores, chain staging/build, StateDb undo ring, rpc scratch, engine API space, txpool slabs, KZG memory) plus the shared http server buffers onto it (~250 MiB fewer resident bytes). Remaining eager reservations live in trie-db (`db.State` tables, database staging/queue) and evm (`State` caches, frame stacks); those lanes can adopt the same helper. RSS samples on macOS are noisy (0xAA pages compress under pressure); compare allocations, not one `ps` reading.
 - 2026-11-05: perf step 2: recovery threads claim 8-tx batches from an atomic counter (static chunks left the caller waiting on slow cores); evm lane integration fix: `State.begin_transaction` skips clearing an empty transient map (the clear memsets metadata for all 1<<18 slots every tx). 500-transfer block: 4.4-5.3 ms (noisy machine), sequential 16.7 ms. Remaining main-thread cost: state commit + trie root (~60%), EVM transact (~30%). Next idea: pipeline execution behind recovery.

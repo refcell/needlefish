@@ -36,9 +36,12 @@ pub const Api = struct {
     scratch: []u8,
     /// `debug_executionWitness` buffers, bound to the chain's state; null disables it.
     witness: ?*node.witness.Generator = null,
+    /// Polling filters (eth_newFilter and friends); null disables them.
+    filters: ?*filters_module.Filters = null,
 };
 
-pub const methods = core_methods ++ @import("eth_more.zig").methods;
+pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods;
+const filters_module = @import("filters.zig");
 
 const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
@@ -271,7 +274,7 @@ fn get_storage_at(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Blocks -----------------------------------------------------------------------
 
-fn head_header(api: *Api) consensus.Header {
+pub fn head_header(api: *Api) consensus.Header {
     return api.chain.header(api.chain.head_hash()).?;
 }
 
@@ -497,6 +500,7 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
         .nonce = if (account) |a| a.nonce else 0,
         .balance = if (account) |a| a.balance else 0,
     }) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+    if (api.filters) |filters| filters.note_pending(validated.tx.hash.bytes);
     try call.writer.data(&validated.tx.hash.bytes);
 }
 
@@ -586,9 +590,11 @@ fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Logs -------------------------------------------------------------------------
 
-const Filter = struct {
+pub const Filter = struct {
     from: u64,
     to: u64,
+    /// `toBlock` was a concrete number (not omitted or a tag): a polled filter stops there.
+    to_given: bool = false,
     block_hash: ?Hash = null,
     addresses: [16][20]u8 = undefined,
     address_count: u32 = 0,
@@ -596,7 +602,7 @@ const Filter = struct {
     topics: [4][8]Hash = undefined,
     topic_counts: [4]u32 = @splat(0),
 
-    fn matches(filter: *const Filter, item: consensus.Log) bool {
+    pub fn matches(filter: *const Filter, item: consensus.Log) bool {
         if (filter.address_count > 0) {
             const ok = for (filter.addresses[0..filter.address_count]) |a| {
                 if (std.mem.eql(u8, &a, &item.address.bytes)) break true;
@@ -634,7 +640,7 @@ fn parse_hashes(scanner: *json.Scanner, first: json.Token, out: [][32]u8) Handle
     }
 }
 
-fn parse_filter(api: *Api, call: *Call, raw: []const u8) HandlerError!Filter {
+pub fn parse_filter(api: *Api, call: *Call, raw: []const u8) HandlerError!Filter {
     const head = head_header(api).number;
     var filter: Filter = .{ .from = head, .to = head };
     var scanner = json.Scanner.init(raw);
@@ -647,6 +653,7 @@ fn parse_filter(api: *Api, call: *Call, raw: []const u8) HandlerError!Filter {
             if (value.tag != .string) return error.InvalidParams;
             const number = try resolve_number_text(api, call, value.bytes);
             if (name.bytes[0] == 'f') filter.from = number else filter.to = number;
+            if (name.bytes[0] == 't') filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
         } else if (std.mem.eql(u8, name.bytes, "blockHash")) {
             filter.block_hash = json.parse_fixed(32, value.bytes) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "address")) {
@@ -707,7 +714,7 @@ fn get_logs(api: *Api, call: *Call) HandlerError!void {
     try call.writer.end_array();
 }
 
-fn block_logs(
+pub fn block_logs(
     api: *Api,
     call: *Call,
     hash: Hash,

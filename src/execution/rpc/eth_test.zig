@@ -10,6 +10,7 @@ const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const trie_proof = @import("../trie/proof.zig");
 const fixture = @import("../node/test_fixture.zig");
+const filters_module = @import("filters.zig");
 const eth = @import("eth.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -22,6 +23,7 @@ const address_target = "\"0x1111111111111111111111111111111111111111\"";
 const Harness = struct {
     node: *fixture.Node,
     api: eth.Api,
+    filters: filters_module.Filters = .{},
     scratch: [1 << 18]u8 = undefined,
     out: [1 << 16]u8 = undefined,
 
@@ -35,12 +37,22 @@ const Harness = struct {
             .pool = &harness.node.pool,
             .scratch = &harness.scratch,
         };
+        harness.filters = .{};
+        harness.api.filters = &harness.filters;
         return harness;
     }
 
     fn destroy(harness: *Harness) void {
         harness.node.destroy();
         testing.allocator.destroy(harness);
+    }
+
+    /// Routes a request body built at runtime and returns the whole response.
+    fn request_runtime(harness: *Harness, body: []const u8) ![]const u8 {
+        var out: std.Io.Writer = .fixed(&harness.out);
+        _ = eth.Router.handle(&harness.api, body, &out);
+        try json.validate(out.buffered());
+        return out.buffered();
     }
 
     /// Routes one request and returns the `result` (or `error`) JSON text.
@@ -244,6 +256,66 @@ test "eth: block transaction counts, by-index lookups, uncles, sha3, txpool_stat
     );
 }
 
+const log_contract = "\"0x2222222222222222222222222222222222222222\"";
+
+/// Signs a call to the LOG0 contract and submits it through eth_sendRawTransaction.
+fn send_log_call(h: *Harness, nonce: u64) ![32]u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = nonce,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 60_000,
+        .to = .{ .call = .{ .bytes = @splat(0x22) } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    var raw_buffer: [256]u8 = undefined;
+    const raw = envelope.encode_to(&raw_buffer);
+    var body_buffer: [800]u8 = undefined;
+    const send_format = request_prefix_format ++ "eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}";
+    const body = try std.fmt.bufPrint(&body_buffer, send_format, .{raw});
+    try expect_contains(try h.request_runtime(body), "\"result\":\"0x");
+    return envelope.hash().bytes;
+}
+
+test "eth: block, pending and log filters report changes once" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // PUSH1 0 PUSH1 0 LOG0 STOP: one empty log from the contract per call.
+    try h.node.db.put_account(@splat(0x22), 0, 0, &.{ 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00 });
+    try testing.expectEqualStrings("\"result\":\"0x1\"", try h.request("eth_newBlockFilter", "[]"));
+    const pending_id = try h.request("eth_newPendingTransactionFilter", "[]");
+    try testing.expectEqualStrings("\"result\":\"0x2\"", pending_id);
+    const log_id = try h.request("eth_newFilter", "[{\"address\":" ++ log_contract ++ "}]");
+    try testing.expectEqualStrings("\"result\":\"0x3\"", log_id);
+    const tx_hash = try send_log_call(h, 0);
+    var hex: [70]u8 = undefined;
+    const tx_hex = try std.fmt.bufPrint(&hex, "0x{x}", .{&tx_hash});
+    try expect_contains(try h.request("eth_getFilterChanges", "[\"0x2\"]"), tx_hex);
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x2\"]"));
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x1\"]"));
+    const block_hash = try h.mine(12);
+    const block_hex = try std.fmt.bufPrint(&hex, "0x{x}", .{&block_hash.bytes});
+    try expect_contains(try h.request("eth_getFilterChanges", "[\"0x1\"]"), block_hex);
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x1\"]"));
+    const logs = try h.request("eth_getFilterChanges", "[\"0x3\"]");
+    try expect_contains(logs, "\"address\":" ++ log_contract);
+    try expect_contains(logs, "\"blockNumber\":\"0x1\"");
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x3\"]"));
+    try expect_contains(try h.request("eth_getFilterLogs", "[\"0x3\"]"), "\"logIndex\":\"0x0\"");
+    try expect_contains(try h.request("eth_getFilterLogs", "[\"0x1\"]"), "error");
+    // A filter for another address sees nothing.
+    const other = try h.request("eth_newFilter", "[{\"address\":" ++ address_one ++ ",\"fromBlock\":\"0x0\"}]");
+    try testing.expectEqualStrings("\"result\":\"0x4\"", other);
+    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterLogs", "[\"0x4\"]"));
+    try testing.expectEqualStrings("\"result\":true", try h.request("eth_uninstallFilter", "[\"0x3\"]"));
+    try testing.expectEqualStrings("\"result\":false", try h.request("eth_uninstallFilter", "[\"0x3\"]"));
+    try expect_contains(try h.request("eth_getFilterChanges", "[\"0x3\"]"), "filter not found");
+}
+
 test "eth: send raw transaction, mine, receipt, logs and nonce" {
     const h = try Harness.create();
     defer h.destroy();
@@ -333,6 +405,11 @@ const method_names = [_][]const u8{
     "eth_getUncleByBlockHashAndIndex",
     "web3_sha3",
     "txpool_status",
+    "eth_newFilter",
+    "eth_newBlockFilter",
+    "eth_getFilterChanges",
+    "eth_getFilterLogs",
+    "eth_uninstallFilter",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

@@ -16,6 +16,7 @@ const payload = @import("../payload/root.zig");
 const txpool = @import("../txpool/root.zig");
 const engine_module = @import("../engine/root.zig");
 const eth = @import("../rpc/eth.zig");
+const filters_module = @import("../rpc/filters.zig");
 const engine_rpc = @import("../rpc/engine.zig");
 const jwt = @import("../../utilities/jwt/root.zig");
 const http = @import("../../utilities/http/root.zig");
@@ -232,6 +233,7 @@ pub fn Service(comptime IO: type) type {
         http_server: HttpServer,
         engine_api: ?engine_rpc.EngineApi = null,
         kzg: ?*KzgMemory = null,
+        filters: ?*filters_module.Filters = null,
         auth_server: ?AuthServer = null,
         beacon: ?beacon_module.Beacon = null,
         beacon_server: ?BeaconServer = null,
@@ -425,6 +427,11 @@ pub fn Service(comptime IO: type) type {
                 .scratch = try lazy.alloc(allocator, u8, limits.rpc_scratch_bytes),
             };
             errdefer lazy.free(allocator, service.api.scratch);
+            const filters = try allocator.create(filters_module.Filters);
+            filters.* = .{};
+            service.filters = filters;
+            service.api.filters = filters;
+            errdefer allocator.destroy(filters);
             if (service.options.verify_blob_proofs and service.spec.mode == .l1) {
                 service.kzg = try KzgMemory.create(allocator);
                 service.api.kzg = service.kzg.?.verifier();
@@ -505,6 +512,7 @@ pub fn Service(comptime IO: type) type {
             service.http_server.deinit();
             service.deinit_witness();
             lazy.free(service.allocator, service.api.scratch);
+            if (service.filters) |filters| service.allocator.destroy(filters);
             if (service.kzg) |memory| lazy.destroy(service.allocator, memory);
             service.deinit_state();
             service.* = undefined;
