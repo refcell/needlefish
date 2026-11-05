@@ -149,6 +149,10 @@ fallback but hot paths should be our own, optimized implementations.
   checked against the setup in tests. Vectors: all 114 fixed-length c-kzg-4844
   verify_kzg_proof cases (the 8 wrong-length ones cannot occur through the precompile).
 
+- montgomery.mul accumulates each row as two straight carry chains (low halves, then high
+  halves) instead of per-limb u128 multiply-add; the old form made LLVM spill NZCV
+  (mrs/msr) and use adds+cinc pairs on AArch64.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
@@ -160,3 +164,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: modexp: pre-Osaka moduli above 1024 bytes via caller-provided scratch (`precompile_modexp_run_with_scratch`, `scratch_limbs_needed`); 1025-byte Berlin example (5547 gas) and differential fuzz vs std big ints for 1025..3000-byte odd/even moduli.
 - 2026-11-05: BLS12-381 + EIP-2537 precompiles 0x0b-0x11 (official geth vectors incl. fail cases and gas), RFC 9380 hash-to-curve G1/G2 + expand_message_xmd vectors, ZCash compressed G1/G2, seeded + coverage fuzz; bench (ReleaseFast, M-series): g1 add 477ns, g1 mul 87us, g2 mul 233us, pairing-2 0.72ms, map_fp_to_g1 95us, g1 msm-64 1.62ms.
 - 2026-11-05: kzg verify_kzg_proof + 0x0A precompile on BLS12-381; c-kzg + geth vectors; 1.01 ms per call (1.26 ms before the G2-free rearrangement). Fixed kzg tests not running (missing refAllDecls).
+- 2026-11-05: montgomery mul row-wise carry chains: bn254 19.6->18.2ns, bls 31.4->25.8ns; bls g1 mul 89->71us, msm-64 1.78->1.25ms, pairing-2 0.71->0.66ms.

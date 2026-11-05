@@ -184,26 +184,53 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
             return .{ @truncate(wide), @truncate(wide >> 64) };
         }
 
-        /// Montgomery product a * b * R^-1 mod p (CIOS method).
+        /// Adds `addend` into `accumulator[offset..offset + limbs]` with one carry chain and
+        /// ripples the carry into the following words of the window.
+        inline fn accumulate(
+            accumulator: *[limbs + 2]u64,
+            comptime offset: usize,
+            addend: *const [limbs]u64,
+        ) void {
+            comptime assert(offset <= 1);
+            var carry: u1 = 0;
+            inline for (0..limbs) |j| {
+                const step1 = @addWithOverflow(accumulator[offset + j], addend[j]);
+                const step2 = @addWithOverflow(step1[0], carry);
+                accumulator[offset + j] = step2[0];
+                carry = step1[1] | step2[1];
+            }
+            inline for (offset + limbs..limbs + 2) |k| {
+                const step = @addWithOverflow(accumulator[k], carry);
+                accumulator[k] = step[0];
+                carry = step[1];
+            }
+            assert(carry == 0);
+        }
+
+        /// Adds the row x * y[0..limbs] into the window: low halves at offset 0, high
+        /// halves at offset 1, as two straight carry chains (adds/adcs on AArch64).
+        inline fn accumulate_row(accumulator: *[limbs + 2]u64, x: u64, y: *const [limbs]u64) void {
+            var low: [limbs]u64 = undefined;
+            var high: [limbs]u64 = undefined;
+            inline for (0..limbs) |j| {
+                const product = @as(u128, x) * y[j];
+                low[j] = @truncate(product);
+                high[j] = @truncate(product >> 64);
+            }
+            accumulate(accumulator, 0, &low);
+            accumulate(accumulator, 1, &high);
+        }
+
+        /// Montgomery product a * b * R^-1 mod p (CIOS, row-wise carry chains).
         pub fn mul(a: Self, b: Self) Self {
             var t: [limbs + 2]u64 = @splat(0);
             inline for (0..limbs) |i| {
-                var carry: u64 = 0;
-                inline for (0..limbs) |j| {
-                    t[j], carry = multiply_add(a.limbs_value[j], b.limbs_value[i], t[j], carry);
-                }
-                const top = @as(u128, t[limbs]) + carry;
-                t[limbs] = @truncate(top);
-                t[limbs + 1] = @truncate(top >> 64);
-
+                accumulate_row(&t, b.limbs_value[i], &a.limbs_value);
                 const m = t[0] *% inverse_word;
-                _, carry = multiply_add(m, modulus_limbs[0], t[0], 0);
-                inline for (1..limbs) |j| {
-                    t[j - 1], carry = multiply_add(m, modulus_limbs[j], t[j], carry);
-                }
-                const high = @as(u128, t[limbs]) + carry;
-                t[limbs - 1] = @truncate(high);
-                t[limbs] = t[limbs + 1] + @as(u64, @truncate(high >> 64));
+                accumulate_row(&t, m, &modulus_limbs);
+                assert(t[0] == 0);
+                inline for (0..limbs + 1) |k| t[k] = t[k + 1];
+                t[limbs + 1] = 0;
             }
             assert(t[limbs] <= 1);
             const result = reduce_once(t[0..limbs].*, t[limbs]);
