@@ -4,6 +4,7 @@ Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
 Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
+- [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
 - [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
@@ -42,6 +43,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: node state db (evm backend, block commit to state trie).
 - 2026-11-05: engine payload well-formedness (block hash verification).
 - 2026-11-05: txpool stateless validation over common/consensus envelopes.
 - 2026-11-05: engine types, method/fork versioning, Engine(Backend) handlers, fuzz.
