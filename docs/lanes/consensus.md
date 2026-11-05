@@ -18,7 +18,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
   - [ ] channel bank / assembler / reader
   - [ ] batch stream, batch queue, batch validator
-  - [ ] stateful attributes builder + attributes queue, pipeline core (step, reset, signals)
+  - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
+  - [ ] attributes queue, pipeline core (step, reset, signals)
 - [ ] `engine`: engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
@@ -49,8 +50,15 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - Span batches: EIP-8130 txs decode but cannot be expanded yet (`error.Eip8130Unsupported`)
   until `common/consensus` has 8130 decoding. Overflow returns errors where base/base wraps.
 - Brotli: own RFC 7932 decoder, static dictionary committed (CRC checked vs RFC).
+- Attributes builder errors: `BlockMismatch` → `L1OriginMismatch`, `BlockMismatchEpochReset`
+  → `EpochParentMismatch`, `BrokenTimeInvariant` → `BadTimestamp` (all reset); deposit decode
+  failures → `BadEncoding` (critical); BaseTime/overflow → `AttributesBuilder` (critical).
+  Upgrade deployment bytecode is embedded hex copied verbatim from base/base and decoded
+  when an activation block is built. `PayloadAttributes` reuses the execution lane's
+  `Withdrawal` and converts to its engine type with `engine()`.
 
 ## Log
+- 2026-11-05: stateful attributes builder (Denim BaseTime/gas scaling), upgrade txs.
 - 2026-11-05: derive: blob codec, error kinds, provider contracts, L1 traversal.
 - 2026-11-05: span batches (codec, tx data, derive, validity), brotli decoder, batch reader.
 - 2026-11-05: singular batch codec + validity (Holocene, Denim same-second, Jovian).

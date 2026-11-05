@@ -1,7 +1,8 @@
 //! In-memory chain and blob provider for derivation tests. Blocks are indexed by number;
 //! receipts, transactions, and blobs are indexed by block position. Setting
 //! `unavailable_from` makes every query at or above that block number return
-//! `error.NotAvailable`, emulating an in-flight fetch.
+//! `error.NotAvailable`, emulating an in-flight fetch. L1 headers are derived from the
+//! block infos; L2 system configs are registered per L2 block hash.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -14,9 +15,14 @@ const blob = @import("blob.zig");
 const BlockInfo = protocol.block.BlockInfo;
 const Hash = protocol.block.Hash;
 const Receipt = protocol.log.Receipt;
+const L1Header = protocol.l1_info.L1Header;
+const SystemConfig = protocol.SystemConfig;
 const ProviderError = errors.ProviderError;
 
 pub const blocks_max = 64;
+pub const system_configs_max = 16;
+
+pub const SystemConfigEntry = struct { l2_hash: Hash, config: SystemConfig };
 
 pub const TestChain = struct {
     blocks: [blocks_max]BlockInfo = undefined,
@@ -26,6 +32,11 @@ pub const TestChain = struct {
     count: u32 = 0,
     unavailable_from: u64 = std.math.maxInt(u64),
     blobs_missing: bool = false,
+    /// Per-block `mix_hash` (prevrandao) reported by `l1_header_by_hash`.
+    mix_hashes: [blocks_max]Hash = @splat(.zero),
+    base_fees: [blocks_max]?u64 = @splat(null),
+    system_configs: [system_configs_max]SystemConfigEntry = undefined,
+    system_config_count: u32 = 0,
 
     /// Builds `count` linked blocks starting at `first_number` with `block_time` spacing.
     pub fn init(count: u32, first_number: u64, block_time: u64) TestChain {
@@ -80,6 +91,41 @@ pub const TestChain = struct {
         return chain.transactions[try chain.index_of_hash(hash)];
     }
 
+    pub fn l1_header_by_hash(chain: *TestChain, hash: Hash) ProviderError!L1Header {
+        const index = try chain.index_of_hash(hash);
+        const block = chain.blocks[index];
+        assert(block.hash.eql(hash));
+        return .{
+            .number = block.number,
+            .timestamp = block.timestamp,
+            .hash = block.hash,
+            .parent_hash = block.parent_hash,
+            .base_fee = chain.base_fees[index],
+            .excess_blob_gas = null,
+            .mix_hash = chain.mix_hashes[index],
+        };
+    }
+
+    /// Registers (or replaces) the system config of an L2 block.
+    pub fn add_system_config(chain: *TestChain, l2_hash: Hash, config: SystemConfig) void {
+        for (chain.system_configs[0..chain.system_config_count]) |*entry| {
+            if (!entry.l2_hash.eql(l2_hash)) continue;
+            entry.config = config;
+            return;
+        }
+        assert(chain.system_config_count < system_configs_max);
+        chain.system_configs[chain.system_config_count] = .{ .l2_hash = l2_hash, .config = config };
+        chain.system_config_count += 1;
+    }
+
+    pub fn system_config_by_l2_hash(chain: *TestChain, l2_hash: Hash) ProviderError!SystemConfig {
+        assert(chain.system_config_count <= system_configs_max);
+        for (chain.system_configs[0..chain.system_config_count]) |entry| {
+            if (entry.l2_hash.eql(l2_hash)) return entry.config;
+        }
+        return error.NotFound;
+    }
+
     pub fn blobs(
         chain: *TestChain,
         block: BlockInfo,
@@ -100,4 +146,16 @@ test "test chain: lookups" {
     try std.testing.expectError(error.NotFound, chain.l1_block_info_by_number(14));
     chain.unavailable_from = 11;
     try std.testing.expectError(error.NotAvailable, chain.l1_receipts_by_hash(block.hash));
+}
+
+test "test chain: headers and system configs" {
+    var chain = TestChain.init(3, 5, 12);
+    const header = try chain.l1_header_by_hash(chain.blocks[1].hash);
+    try std.testing.expect(header.parent_hash.eql(chain.blocks[0].hash));
+    try std.testing.expectEqual(@as(u64, 6), header.number);
+    try std.testing.expectError(error.NotFound, chain.system_config_by_l2_hash(.zero));
+    chain.add_system_config(.zero, .{ .gas_limit = 7 });
+    chain.add_system_config(.zero, .{ .gas_limit = 8 });
+    try std.testing.expectEqual(@as(u64, 8), (try chain.system_config_by_l2_hash(.zero)).gas_limit);
+    try std.testing.expectEqual(@as(u32, 1), chain.system_config_count);
 }

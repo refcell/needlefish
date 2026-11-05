@@ -32,6 +32,8 @@ pub const Error = ProviderError || error{
     BadParentHash,
     BadTimestamp,
     L1OriginMismatch,
+    /// The new epoch's L1 block does not build on the parent's L1 origin.
+    EpochParentMismatch,
     NextL1BlockHashMismatch,
     BlobsUnderFill,
     BlobsOverFill,
@@ -42,6 +44,8 @@ pub const Error = ProviderError || error{
     InvalidBatchType,
     InvalidBatchValidity,
     AttributesBuilder,
+    /// Malformed L1 data, e.g. an undecodable deposit log.
+    BadEncoding,
 };
 
 pub fn kind(err: Error) Kind {
@@ -57,6 +61,7 @@ pub fn kind(err: Error) Kind {
         error.BadParentHash,
         error.BadTimestamp,
         error.L1OriginMismatch,
+        error.EpochParentMismatch,
         error.NextL1BlockHashMismatch,
         error.BlobsUnavailable,
         error.BlobsUnderFill,
@@ -69,6 +74,7 @@ pub fn kind(err: Error) Kind {
         error.InvalidBatchType,
         error.InvalidBatchValidity,
         error.AttributesBuilder,
+        error.BadEncoding,
         => .critical,
     };
 }

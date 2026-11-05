@@ -181,13 +181,19 @@ pub const L1BlockInfo = struct {
     }
 };
 
-/// The L1 header fields the L1 info deposit needs.
+/// The L1 header fields the L1 info deposit and the attributes builder need.
 pub const L1Header = struct {
     number: u64,
     timestamp: u64,
     hash: B256,
     base_fee: ?u64,
     excess_blob_gas: ?u64,
+    parent_hash: B256 = .zero,
+    /// `prevrandao` post-merge; becomes the L2 `prev_randao`.
+    mix_hash: B256 = .zero,
+    blob_gas_used: ?u64 = null,
+    parent_beacon_block_root: ?B256 = null,
+    requests_hash: ?B256 = null,
 };
 
 /// L1 blob fee schedule (EIP-4844 / EIP-7691 / BPO forks).
