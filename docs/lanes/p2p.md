@@ -28,10 +28,12 @@ behind a small interface and switch later.
 - [x] `disc`: Kademlia routing table (bounded k-buckets, 256 log distances), lookup
   iteration, bootstrap, ENR filter on `opstack` chain id, discovery driver state machine
   (port `driver.rs`), DST test with a simulated network of N nodes.
-- [ ] `libp2p`: multistream-select 1.0, noise XX handshake (X25519, ChaCha20-Poly1305,
+- [x] `libp2p`: multistream-select 1.0, noise XX handshake (X25519, ChaCha20-Poly1305,
   SHA256, libp2p signed static key payload), yamux framing + flow control (bounded
-  streams/windows), TCP transport over utilities/io. Interop vectors; fuzz each codec.
-- [ ] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
+  streams/windows). Interop vectors; fuzz each codec.
+- [ ] `libp2p`: TCP transport over utilities/io chaining multistream -> noise ->
+  multistream -> yamux; interop test against a real go/rust libp2p peer.
+- [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
   OP Stack message id (sha256 of domain + snappy-decoded payload) [id: block worker].
@@ -106,6 +108,20 @@ behind a small interface and switch later.
 - Test time: the 16-node discv5 sim takes ~70 s in Debug, so `zig build test` runs a
   6-node variant (<2 s) and the large one needs `-Dslow-tests` (build option added).
 
+- libp2p (worker): multistream messages <= 1024 B, 16 protocols/role, listener takes
+  <= 32 proposals and answers `ls` with `na`. Noise accepts only secp256k1 identity
+  keys, both s halves, ignores extensions and any message-1 payload; caller compares
+  `Transport.remote_peer` with the expected id. Cacophony XX vector verified locally but
+  not committed (contains test private keys). Yamux: comptime stream count (<= 1024),
+  256 KiB window per stream, update after 128 KiB read; new streams must use the peer's
+  parity and increase; full table or go-away refuses streams with RST; data for unknown
+  streams is dropped; protocol errors send go-away on next flush.
+- Identify: zero-copy decode, 16 listen addrs, 32 protocols, 4 KiB cap; unsupported
+  multiaddrs skipped; protocol version "" (base/base). `check_peer` binds key to the
+  noise peer id. Ping: 32 B, every 15 s, 20 s timeout (libp2p defaults).
+- Connection limits mirror base/base `ConnectionLimitsConfig`: pending in 5 / out 16,
+  established 30, per peer 1.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -121,3 +137,5 @@ behind a small interface and switch later.
   publishing invalid blocks is scored negative and pruned, IHAVE/IWANT path tested.
 - 2026-11-05: shrank discv5 cluster test (73 s -> <2 s); large run behind -Dslow-tests.
 - 2026-11-05: router follow-ups: score retention, outbound quota, IWANT resend limit.
+- 2026-11-05: `libp2p` multistream-select, noise XX, yamux (worker, 736304d..eb8d70c).
+- 2026-11-05: `libp2p` identify, ping, connection limits.
