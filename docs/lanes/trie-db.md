@@ -5,12 +5,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 ## Backlog
 - [x] Merkle Patricia Trie: node encoding (RLP), in-memory trie, root computation, proofs (eth_getProof), ordered-trie root for tx/receipt/withdrawal roots. No recursion. Vectors from ethereum/tests TrieTests.
 - [x] Fast incremental state root: sorted batch updates, parallel hashing of subtries, cached branch nodes.
-- [ ] Storage engine (own design, TigerBeetle-inspired): append-only data file + fixed-size block grid or LSM, checksummed blocks, crash-safe superblock, all disk I/O through `utilities.io` (io_uring on Linux), static memory budget. Flat account/storage tables + history for reorgs.
+- [x] Storage engine (own design, TigerBeetle-inspired): append-only data file + fixed-size block grid or LSM, checksummed blocks, crash-safe superblock, all disk I/O through `utilities.io` (io_uring on Linux), static memory budget. Flat account/storage tables + history for reorgs.
 - [x] State provider implementing the evm `Host` backend: accounts, storage, code-by-hash, block hashes; overlay/journal for pending block execution; commit + state root.
 - [x] Block/receipt/header storage and canonical chain indices; reorg (unwind) support.
-- [ ] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
+- [x] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
 - [ ] Benchmarks: state root of N updates, random reads, commit latency. (trie cases landed in
   `trie/bench.zig`; commit latency waits on the storage engine)
+- [ ] Durable database facade (`db/database.zig`): journal block/head entries, state moves
+  only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
+- [ ] Real storage backend over `utilities.io` (io_uring/kqueue) once io lands.
+- [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
 - [ ] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`; compact node layout (packed paths, out-of-line values).
 
@@ -44,6 +48,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - EVM integration (`db/evm_backend.zig`): `database(&state)` is the evm vtable `Database`;
   `commit_evm` folds the evm's journaled block State into an Overlay with the same rules as
   `node/state_db.zig`, so the node can move to `db.State` and get changesets/unwind/snapshots.
+- Storage engine (`db/storage/`): duck-typed sector Storage (callbacks only from `tick`),
+  deterministic `SimStorage` (latency, reorder, crash with lost/kept/torn sectors, bit rot,
+  read faults). Layout: 4 superblock copies (sectors 0-3, written one at a time with a sync
+  each, highest valid sequence wins, repaired on open), checkpoint zones A/B, journal ring.
+  AEGIS-128L MAC checksums. `format(format_id)` seeds all checksums/chain so stale data from a
+  previous format never validates. Journal: hash-chained entries, logical positions, clean
+  end vs corrupt classification, valid prefix accepted after torn tail. Checkpoints: pulled
+  producer, per-block checksums. Journal space freed only after all superblock copies durable.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -57,4 +69,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   moves State purely from stored changesets.
 - 2026-11-05: State snapshots (stream write/load, trie rebuilt and root-checked on load).
 - 2026-11-05: evm backend adapter (Database vtable + commit_evm fold into Overlay).
+- 2026-11-05: storage engine (superblock, journal, A/B checkpoints, engine) with seeded
+  crash/torn-write/bit-rot fault injection over SimStorage; mutation-checked.
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
