@@ -18,6 +18,7 @@ pub const trie = @import("trie.zig");
 pub const proof = @import("proof.zig");
 pub const ordered = @import("ordered.zig");
 pub const state_trie = @import("state_trie.zig");
+pub const bench = @import("bench.zig");
 
 pub const Nibbles = nibbles.Nibbles;
 pub const Hash = node.Hash;

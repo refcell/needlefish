@@ -23,6 +23,16 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | rlp/reencode 64x32B list | 651.0 | 3249 | |
 | sim/cluster seed | 3881808 | | 16 simulated minutes per seed (3.9 ms) |
 
+## 2026-11-05 trie (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+| Case | ns/op | Notes |
+| --- | ---: | --- |
+| trie/get 100k | 168 | includes ~146 ns keccak of the key |
+| trie/block 1k puts+root on 100k | 1 699 793 | dirty-path rehash, 1.7 µs/update |
+| trie/hash_builder 10k leaves | 3 019 320 | 302 ns/leaf, streaming |
+| trie/ordered root 200x200B | 70 763 | tx/receipt root shape |
+| trie/state block 1k accounts | 2 013 084 | StateTrie, 100k accounts |
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

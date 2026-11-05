@@ -4,12 +4,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 
 ## Backlog
 - [x] Merkle Patricia Trie: node encoding (RLP), in-memory trie, root computation, proofs (eth_getProof), ordered-trie root for tx/receipt/withdrawal roots. No recursion. Vectors from ethereum/tests TrieTests.
-- [ ] Fast incremental state root: sorted batch updates, parallel hashing of subtries, cached branch nodes.
+- [x] Fast incremental state root: sorted batch updates, parallel hashing of subtries, cached branch nodes.
 - [ ] Storage engine (own design, TigerBeetle-inspired): append-only data file + fixed-size block grid or LSM, checksummed blocks, crash-safe superblock, all disk I/O through `utilities.io` (io_uring on Linux), static memory budget. Flat account/storage tables + history for reorgs.
 - [ ] State provider implementing the evm `Host` backend: accounts, storage, code-by-hash, block hashes; overlay/journal for pending block execution; commit + state root.
 - [ ] Block/receipt/header storage and canonical chain indices; reorg (unwind) support.
 - [ ] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
-- [ ] Benchmarks: state root of N updates, random reads, commit latency.
+- [ ] Benchmarks: state root of N updates, random reads, commit latency. (trie cases landed in
+  `trie/bench.zig`; commit latency waits on the storage engine)
+- [ ] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
+  `update_cache`; compact node layout (packed paths, out-of-line values).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -32,3 +35,4 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   all ethereum/tests TrieTests vectors pass.
 - 2026-11-05: StateTrie (account + shared-pool storage tries, dirty-set incremental root,
   account/storage proofs), differential-tested against HashBuilder.
+- 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
