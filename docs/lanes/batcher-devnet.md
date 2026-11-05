@@ -74,7 +74,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
 - [x] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
 - [x] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
-- [ ] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
+- [x] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
 - [ ] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
   validator's derived hashes with the leader's.
 - [ ] `batcher`: batcher balance metric (base/base `BalanceMonitorLayer`).
@@ -193,3 +193,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `--brotli-quality 0-11` (default 9 like base/base). Quality buys match search:
   1/2/4/8/16-way hash buckets, lazy matching from 5, all covered positions inserted from 10.
   Text sample: q0 16599 B, q9 12248 B, q11 10262 B. Smoke and sim seed 42 pass.
+- 2026-11-05: `--publish-max-retries N` (10) / `--publish-retry-delay D` (1s; `500ms`, `2s`,
+  `1m`, bare seconds): "nonce too high" schedules a re-send of the same signed tx from
+  `poll` (step machine, no sleeping); once exhausted the error surfaces and the slot falls
+  back to normal resubmission. Previously such a tx waited a full resubmission period.

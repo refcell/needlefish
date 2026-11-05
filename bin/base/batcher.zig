@@ -20,7 +20,7 @@ const usage =
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
     \\         --network-timeout S (0 disables) --compressed-size-target B
-    \\         --brotli-quality 0-11
+    \\         --brotli-quality 0-11 --publish-max-retries N --publish-retry-delay D
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
@@ -82,6 +82,8 @@ const Flags = struct {
     /// Compressed bytes a channel aims for before it closes; 0 = one full frame.
     compressed_size_target: u32 = 0,
     brotli_quality: u4 = batcher.comp.brotli.quality_default,
+    publish_max_retries: u8 = 10,
+    publish_retry_delay_ms: u64 = 1_000,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -178,6 +180,17 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const account = flags.private_key orelse accounts.derive_dev(flags.key_index).private_key;
     var seed: [16]u8 = undefined;
     init.io.random(&seed);
+    const config = service_config(flags, rollup, account);
+    var service = try batcher.service.Service.init(init.gpa, config, seed);
+    defer service.deinit(init.gpa);
+    return run(init, flags, &service, l1_url, entries[0..entry_count]);
+}
+
+fn service_config(
+    flags: Flags,
+    rollup: batcher.service.RollupFields,
+    account: [32]u8,
+) batcher.service.Config {
     // One frame per transaction payload: the payload is `version byte ++ frame`.
     const payload_max: u32 = switch (flags.data_availability) {
         .calldata => flags.calldata_bytes_max,
@@ -186,7 +199,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     // Forcing blobs needs the KZG prover in calldata mode; skip it when it cannot apply.
     const force_blobs = flags.force_blobs_when_throttling and
         flags.data_availability == .calldata and flags.throttle.strategy != .off;
-    var service = try batcher.service.Service.init(init.gpa, .{
+    return .{
         .channels = .{
             .channel = .{
                 .frame_size_max = payload_max - 1,
@@ -200,13 +213,15 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .txs = .{
             .chain_id = rollup.l1_chain_id,
             .private_key = account,
-            .from = accounts.address_of(account),
+            .from = batcher.devnet.accounts.address_of(account),
             .to = rollup.batch_inbox_address,
             .tx_data_bytes_max = payload_max,
             .data_availability = flags.data_availability,
             // op-batcher's blob default: up to 6 frames (blobs) per transaction.
             .blobs_per_tx = if (flags.data_availability == .blobs) flags.blobs_per_tx else 1,
             .resubmit_after_ms = flags.resubmit_after_ms,
+            .publish_max_retries = flags.publish_max_retries,
+            .publish_retry_delay_ms = flags.publish_retry_delay_ms,
             .blob_override = force_blobs,
             .slots_max = flags.pending_max,
             .confirmations = flags.confirmations,
@@ -218,9 +233,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .throttle = flags.throttle,
         .stopped = flags.stopped,
         .force_blobs_when_throttling = force_blobs,
-    }, seed);
-    defer service.deinit(init.gpa);
-    return run(init, flags, &service, l1_url, entries[0..entry_count]);
+    };
 }
 
 fn run(
@@ -391,6 +404,10 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
         const seconds = try parse(u64, value, 10);
         if (seconds == 0 or seconds > 3600) return error.InvalidResubmissionTimeout;
         flags.resubmit_after_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--publish-max-retries")) {
+        flags.publish_max_retries = try parse(u8, value, 10);
+    } else if (eql(u8, arg, "--publish-retry-delay")) {
+        flags.publish_retry_delay_ms = try parse_duration_ms(value);
     } else if (eql(u8, arg, "--brotli-quality")) {
         const quality = try parse(u8, value, 10);
         if (quality > batcher.comp.brotli.quality_max) return error.InvalidBrotliQuality;
@@ -635,6 +652,10 @@ test "batcher: flags" {
     const size_target = [_][]const u8{ "--compressed-size-target", "4096" };
     const sized = try parse_flags(&size_target);
     try std.testing.expectEqual(@as(u32, 4096), sized.compressed_size_target);
+    const retry = [_][]const u8{ "--publish-max-retries", "3", "--publish-retry-delay", "250ms" };
+    const retry_flags = try parse_flags(&retry);
+    try std.testing.expectEqual(@as(u8, 3), retry_flags.publish_max_retries);
+    try std.testing.expectEqual(@as(u64, 250), retry_flags.publish_retry_delay_ms);
     const quality = [_][]const u8{ "--brotli-quality", "11" };
     try std.testing.expectEqual(@as(u4, 11), (try parse_flags(&quality)).brotli_quality);
     try std.testing.expectEqual(@as(u4, 9), (try parse_flags(&.{})).brotli_quality);
@@ -681,10 +702,64 @@ const fuzz_flag_names = [_][]const u8{
     "--network-timeout",
     "--compressed-size-target",
     "--brotli-quality",
+    "--publish-max-retries",
+    "--publish-retry-delay",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 
 /// Parsed flags always satisfy the bounds the batcher relies on.
+/// humantime-style duration for the forms base/base examples use: `500ms`, `2s`, `1m`,
+/// or bare seconds. At most one hour.
+fn parse_duration_ms(text: []const u8) !u64 {
+    const units = [_]struct { suffix: []const u8, ms: u64 }{
+        .{ .suffix = "ms", .ms = 1 },
+        .{ .suffix = "s", .ms = std.time.ms_per_s },
+        .{ .suffix = "m", .ms = std.time.ms_per_min },
+    };
+    var number = text;
+    var unit_ms: u64 = std.time.ms_per_s;
+    for (units) |unit| {
+        if (std.mem.endsWith(u8, text, unit.suffix)) {
+            number = text[0 .. text.len - unit.suffix.len];
+            unit_ms = unit.ms;
+            break;
+        }
+    }
+    const value = std.fmt.parseInt(u64, number, 10) catch return error.InvalidDuration;
+    const ms = std.math.mul(u64, value, unit_ms) catch return error.InvalidDuration;
+    if (ms > std.time.ms_per_hour) return error.InvalidDuration;
+    return ms;
+}
+
+test "batcher: parse_duration_ms forms and bounds" {
+    try std.testing.expectEqual(@as(u64, 500), try parse_duration_ms("500ms"));
+    try std.testing.expectEqual(@as(u64, 2000), try parse_duration_ms("2s"));
+    try std.testing.expectEqual(@as(u64, 60_000), try parse_duration_ms("1m"));
+    try std.testing.expectEqual(@as(u64, 3000), try parse_duration_ms("3"));
+    for ([_][]const u8{ "", "s", "ms", "-1s", "2h", "61m", "1.5s", "99999999999999999999" }) |bad| {
+        try std.testing.expectError(error.InvalidDuration, parse_duration_ms(bad));
+    }
+    var prng = base.testing.Prng.init(0xd0d0);
+    var buffer: [12]u8 = undefined;
+    const alphabet = "0123456789msh.";
+    for (0..2000) |_| {
+        const length = prng.range(0, buffer.len);
+        for (buffer[0..length]) |*byte| byte.* = alphabet[prng.below(alphabet.len)];
+        const ms = parse_duration_ms(buffer[0..length]) catch continue;
+        try std.testing.expect(ms <= std.time.ms_per_hour);
+    }
+}
+
+test "batcher: fuzz parse_duration_ms" {
+    try std.testing.fuzz({}, fuzz_duration, .{});
+}
+
+fn fuzz_duration(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [32]u8 = undefined;
+    const ms = parse_duration_ms(buffer[0..smith.slice(&buffer)]) catch return;
+    try std.testing.expect(ms <= std.time.ms_per_hour);
+}
+
 fn check_flag_invariants(flags: Flags) !void {
     try std.testing.expect(flags.blobs_per_tx >= 1 and flags.blobs_per_tx <= 6);
     try std.testing.expect(flags.poll_interval_ms > 0);

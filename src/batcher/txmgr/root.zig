@@ -27,6 +27,11 @@ pub const Config = struct {
     slots_max: u8 = 8,
     tx_data_bytes_max: u32 = 128 * 1024,
     resubmit_after_ms: u64 = 12_000,
+    /// "nonce too high" (a lower nonce has not reached this RPC backend yet) re-sends the
+    /// same tx after `publish_retry_delay_ms`, at most this many times per tx, before it
+    /// surfaces as an error (base/base `--publish-max-retries`, `--publish-retry-delay`).
+    publish_max_retries: u8 = 10,
+    publish_retry_delay_ms: u64 = 1_000,
     tip_wei_default: u128 = 1_000_000_000,
     /// Replacement fee bump in percent (geth requires 10 for non-blob transactions).
     bump_percent: u8 = 10,
@@ -72,6 +77,9 @@ pub const Slot = struct {
     /// The pool kept another tx at this nonce (ours from before a restart or reset, or
     /// a dropped one): bump and resend on the next poll instead of after a full period.
     replace_now: bool = false,
+    /// A "nonce too high" retry of the same tx is due at this time.
+    retry_at_ms: ?u64 = null,
+    retries_left: u8 = 0,
     hash: primitives.B256 = .zero,
     /// Blob mode only: the encoded blob, its commitment and proof (computed once at
     /// submit; resubmissions only re-sign), and the current max blob fee.
@@ -239,6 +247,7 @@ pub const TxManager = struct {
         slot.blob_fee = blob_fee;
         slot.sent_at_ms = 0;
         slot.attempts = 0;
+        slot.retries_left = manager.config.publish_max_retries;
         manager.next_nonce = nonce + 1;
         try manager.send(client, slot, now_ms);
         assert(slot.state == .pending);
@@ -262,6 +271,10 @@ pub const TxManager = struct {
                 continue;
             }
             if (slot.nonce < mined_nonce) continue; // Mined; waiting for confirmations.
+            if (slot.retry_at_ms) |retry_at_ms| {
+                if (now_ms >= retry_at_ms) try manager.send(client, slot, now_ms);
+                continue;
+            }
             if (slot.replace_now or now_ms >= slot.sent_at_ms + manager.config.resubmit_after_ms) {
                 try manager.bump(client, slot);
                 try manager.send(client, slot, now_ms);
@@ -391,11 +404,17 @@ pub const TxManager = struct {
         slot.attempts += 1;
         slot.hash = hash;
         slot.replace_now = false;
+        slot.retry_at_ms = null;
         _ = client.call("eth_sendRawTransaction", params) catch |err| switch (err) {
             // Known benign answers: already mined, already pooled, or the previous
             // attempt still wins; `poll` decides what happens next.
             error.RpcError => {
                 const message = client.last_error();
+                if (contains_ignore_case(message, "nonce too high") and slot.retries_left > 0) {
+                    slot.retries_left -= 1;
+                    slot.retry_at_ms = now_ms + manager.config.publish_retry_delay_ms;
+                    return;
+                }
                 if (!benign_send_error(message)) return err;
                 slot.replace_now = contains_ignore_case(message, "underpriced");
             },
@@ -541,6 +560,132 @@ const FakeL1 = struct {
         return text.len;
     }
 };
+
+test "txmgr: nonce too high retries the same tx after the delay, then surfaces" {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var l1: FakeL1 = .{ .reject_with = "nonce too high" };
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 8192,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    var manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 2,
+        .tx_data_bytes_max = 1024,
+        .resubmit_after_ms = 100_000,
+        .publish_max_retries = 2,
+        .publish_retry_delay_ms = 50,
+    });
+    defer manager.deinit(testing.allocator);
+    try manager.submit(&client, "\x00frame-a", 0);
+    const hash = manager.slots[0].hash;
+    const fees = manager.slots[0].fees;
+    try testing.expectEqual(@as(?u64, 50), manager.slots[0].retry_at_ms);
+    // Not due yet: nothing is sent.
+    _ = try manager.poll(&client, 49);
+    try testing.expectEqual(@as(u32, 1), l1.sends);
+    // Due: the same signed tx (same fees, same hash) goes out again.
+    _ = try manager.poll(&client, 50);
+    try testing.expectEqual(@as(u32, 2), l1.sends);
+    try testing.expectEqual(hash, manager.slots[0].hash);
+    try testing.expectEqual(fees, manager.slots[0].fees);
+    // Retries exhausted: the error surfaces and the slot waits for normal resubmission.
+    try testing.expectError(error.RpcError, manager.poll(&client, 100));
+    try testing.expectEqual(@as(?u64, null), manager.slots[0].retry_at_ms);
+    try testing.expectEqual(@as(u32, 3), l1.sends);
+    _ = try manager.poll(&client, 10_000);
+    try testing.expectEqual(@as(u32, 3), l1.sends);
+    // The backend catches up: the next retry would succeed; a new tx gets fresh retries.
+    l1.reject_with = null;
+    try manager.submit(&client, "\x00frame-b", 10_000);
+    try testing.expectEqual(@as(u8, 2), manager.slots[1].retries_left);
+    try testing.expectEqual(@as(?u64, null), manager.slots[1].retry_at_ms);
+}
+
+test "txmgr: seeded fuzz of nonce-too-high retry bounds" {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var prng = Prng.init(0x2a11);
+    var l1: FakeL1 = .{};
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 8192,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    for (0..20) |_| {
+        const retries: u8 = @intCast(prng.below(6));
+        var manager = try TxManager.init(testing.allocator, .{
+            .chain_id = 900,
+            .private_key = batcher.private_key,
+            .from = batcher.address,
+            .to = .{ .bytes = @splat(0xff) },
+            .slots_max = 1,
+            .tx_data_bytes_max = 1024,
+            .resubmit_after_ms = 1_000_000,
+            .publish_max_retries = retries,
+            .publish_retry_delay_ms = prng.range(1, 100),
+        });
+        defer manager.deinit(testing.allocator);
+        l1 = .{ .reject_with = "nonce too high" };
+        manager.submit(&client, "\x00frame", 0) catch {};
+        var now_ms: u64 = 0;
+        for (0..40) |_| {
+            now_ms += prng.range(0, 120);
+            if (prng.chance(1, 8)) l1.reject_with = null;
+            _ = manager.poll(&client, now_ms) catch {};
+        }
+        // The first send, `retries` retries, and the send that surfaces the error; nothing
+        // more before normal resubmission.
+        try testing.expect(l1.sends <= 2 + @as(u32, retries));
+        try testing.expect(manager.slots[0].retries_left <= retries);
+    }
+}
+
+test "txmgr: fuzz nonce-too-high retry bounds" {
+    try testing.fuzz({}, fuzz_publish_retries, .{});
+}
+
+/// Byte 0: retries; byte 1: delay; then per byte, a time step (low 7 bits) and whether
+/// the backend caught up (high bit).
+fn fuzz_publish_retries(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [64]u8 = @splat(0);
+    const length = smith.slice(&bytes);
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var l1: FakeL1 = .{ .reject_with = "nonce too high" };
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 8192,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    const retries: u8 = bytes[0] % 8;
+    var manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 1,
+        .tx_data_bytes_max = 1024,
+        .resubmit_after_ms = 1_000_000,
+        .publish_max_retries = retries,
+        .publish_retry_delay_ms = @as(u64, bytes[1]) + 1,
+    });
+    defer manager.deinit(testing.allocator);
+    manager.submit(&client, "\x00frame", 0) catch {};
+    var now_ms: u64 = 0;
+    for (bytes[2..@max(2, length)]) |byte| {
+        now_ms += byte & 0x7f;
+        if (byte & 0x80 != 0) l1.reject_with = null;
+        _ = manager.poll(&client, now_ms) catch {};
+    }
+    try testing.expect(l1.sends <= 2 + @as(u32, retries));
+    try testing.expect(manager.slots[0].retries_left <= retries);
+}
 
 test "txmgr: nonces, confirmation, resubmission with bumped fees" {
     const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
