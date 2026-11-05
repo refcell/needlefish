@@ -11,6 +11,7 @@ pub const ripemd160 = @import("ripemd160.zig");
 pub const bench = @import("bench.zig");
 pub const montgomery = @import("montgomery.zig");
 pub const kzg = @import("kzg/root.zig");
+pub const bls12_381 = @import("bls12_381/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
