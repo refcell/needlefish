@@ -26,6 +26,7 @@ pub const Error = ProviderError || error{
     Eof,
     NotEnoughData,
     MissingL1Data,
+    ChannelReaderEmpty,
     // Reset.
     ReorgDetected,
     HoloceneActivation,
@@ -43,6 +44,7 @@ pub const Error = ProviderError || error{
     ChannelNotFound,
     InvalidBatchType,
     InvalidBatchValidity,
+    BatchQueueEmpty,
     AttributesBuilder,
     /// Malformed L1 data, e.g. an undecodable deposit log.
     BadEncoding,
@@ -55,6 +57,7 @@ pub fn kind(err: Error) Kind {
         error.Eof,
         error.NotEnoughData,
         error.MissingL1Data,
+        error.ChannelReaderEmpty,
         => .temporary,
         error.ReorgDetected,
         error.HoloceneActivation,
@@ -73,6 +76,7 @@ pub fn kind(err: Error) Kind {
         error.ChannelNotFound,
         error.InvalidBatchType,
         error.InvalidBatchValidity,
+        error.BatchQueueEmpty,
         error.AttributesBuilder,
         error.BadEncoding,
         => .critical,
