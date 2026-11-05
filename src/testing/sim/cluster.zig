@@ -25,6 +25,7 @@ const Prng = @import("../prng.zig").Prng;
 const network_module = @import("network.zig");
 const nodes = @import("nodes.zig");
 const codec = @import("codec.zig");
+const real_batcher = @import("real_batcher.zig");
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
@@ -50,6 +51,9 @@ pub const Config = struct {
     clock_skew_ns_max: u64 = 0,
     /// Forged channels an attacker posts to the batch inbox per minute (fault phase).
     spam_per_minute: u32 = 0,
+    /// Run the batcher lane's real service (JSON-RPC against model state) instead of
+    /// the model batcher's submissions.
+    real_batcher: bool = false,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -71,6 +75,7 @@ pub const Config = struct {
             .clock_skew_ns_max = swarm_level(prng, 30) * ns_per_s,
             .l1_reorgs_per_minute = @intCast(swarm_level(prng, 3)),
             .spam_per_minute = @intCast(swarm_level(prng, 6)),
+            .real_batcher = prng.chance(1, 2),
         };
         config.validate();
         return config;
@@ -97,7 +102,9 @@ pub const Config = struct {
         const batcher = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
         // Chance-per-step injection can exceed the mean; four times it is ample headroom.
         const spam = 4 * config.spam_per_minute * (config.fault_end_ns / (60 * ns_per_s) + 1);
-        return @intCast(batcher + spam);
+        // The real txmgr appends every attempt, including fee-bump resubmissions.
+        const real = if (config.real_batcher) 8 * (config.settle_end_ns / ns_per_s) else 0;
+        return @intCast(batcher + spam + real);
     }
 
     pub fn l1_block_count_max(config: Config) u64 {
@@ -139,6 +146,8 @@ pub const Cluster = struct {
     batcher: nodes.Batcher,
     tx_pool: codec.TxPool,
     attacker: codec.Encoder,
+    real: ?*real_batcher.RealBatcher,
+    allocator: std.mem.Allocator,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
     restart_ns: [network_module.node_count_max]?u64 = @splat(null),
@@ -167,6 +176,10 @@ pub const Cluster = struct {
         errdefer tx_pool.deinit(allocator);
         var attacker = try codec.Encoder.init(allocator, 0x6174_7461_636b_6572);
         errdefer attacker.deinit(allocator);
+        const RealBatcher = real_batcher.RealBatcher;
+        const real = if (config.real_batcher) try RealBatcher.create(allocator) else null;
+        errdefer if (real) |r| r.destroy(allocator);
+        batcher.submitting = real == null;
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
         errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
@@ -193,6 +206,8 @@ pub const Cluster = struct {
             .batcher = batcher,
             .tx_pool = tx_pool,
             .attacker = attacker,
+            .real = real,
+            .allocator = allocator,
             .verifiers = verifiers,
         };
     }
@@ -202,6 +217,7 @@ pub const Cluster = struct {
         cluster.batcher.deinit(allocator);
         cluster.tx_pool.deinit(allocator);
         cluster.attacker.deinit(allocator);
+        if (cluster.real) |real| real.destroy(allocator);
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -286,11 +302,40 @@ pub const Cluster = struct {
             cluster.sequencer.tick(&cluster.env(nodes.node_sequencer));
         }
         if (cluster.up(nodes.node_batcher)) {
-            cluster.batcher.tick(&cluster.env(nodes.node_batcher), &cluster.sequencer);
+            const e = cluster.env(nodes.node_batcher);
+            cluster.batcher.tick(&e, &cluster.sequencer);
+            if (cluster.real) |real| real.tick(e.now_ns, cluster.real_view());
         }
         for (cluster.verifiers[0..cluster.config.verifier_count]) |*verifier| {
             if (cluster.up(verifier.id)) verifier.tick(&cluster.env(verifier.id));
         }
+    }
+
+    fn linked(cluster: *const Cluster, a: NodeId, b: NodeId) bool {
+        const network = &cluster.network;
+        return cluster.up(a) and cluster.up(b) and
+            !network.is_blocked(a, b) and !network.is_blocked(b, a);
+    }
+
+    /// What the real batcher's RPC clients can reach: its L1, the sequencer's EL, and
+    /// the first verifier as its rollup node.
+    fn real_view(cluster: *Cluster) real_batcher.View {
+        const batcher = nodes.node_batcher;
+        const rollup_node = nodes.node_verifier_first;
+        const rollup = &cluster.verifiers[0];
+        return .{
+            .l1 = &cluster.l1,
+            .sequencer = &cluster.sequencer,
+            .pool = &cluster.tx_pool,
+            .prng = &cluster.prng_faults,
+            .l1_reachable = cluster.linked(batcher, nodes.node_l1),
+            .l2_reachable = cluster.linked(batcher, nodes.node_sequencer),
+            .rollup = if (cluster.linked(batcher, rollup_node))
+                .{ .safe = rollup.safe_head, .unsafe = rollup.unsafe_head }
+            else
+                null,
+            .drop_ppm = cluster.network.config.drop_ppm,
+        };
     }
 
     fn inject_faults(cluster: *Cluster) void {
@@ -308,7 +353,7 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.l1_reorgs_per_minute, steps_per_minute)) {
             const depth_max = @min(nodes.l1_reorg_depth_max, cluster.l1.head);
             if (depth_max > 0) {
-                cluster.l1.reorg(prng.range(1, depth_max));
+                cluster.l1.reorg(&cluster.env(nodes.node_l1), prng.range(1, depth_max));
                 cluster.report.l1_reorgs += 1;
             }
         }
@@ -391,7 +436,13 @@ pub const Cluster = struct {
             const e = cluster.env(node);
             switch (node) {
                 nodes.node_sequencer => cluster.sequencer.restart(&e),
-                nodes.node_batcher => cluster.batcher.restart(&e),
+                nodes.node_batcher => {
+                    cluster.batcher.restart(&e);
+                    if (cluster.real) |real| {
+                        // Proof: the service re-allocates what it just freed.
+                        real.restart(cluster.allocator, e.now_ns) catch unreachable;
+                    }
+                },
                 else => {
                     const index = node - nodes.node_verifier_first;
                     const disk_fault = cluster.prng_faults.chance(
@@ -583,6 +634,23 @@ test "cluster: inbox spam from a non-batcher sender is ignored" {
     defer cluster.deinit(std.testing.allocator);
     const report = try cluster.run();
     try std.testing.expect(report.spam > 0);
+}
+
+test "cluster: real batcher service drives the chain to liveness without faults" {
+    var cluster = try Cluster.init(std.testing.allocator, 3, .{
+        .verifier_count = 2,
+        .crashes_per_minute = 0,
+        .partitions_per_minute = 0,
+        .real_batcher = true,
+        .fault_end_ns = 0,
+        .production_end_ns = 120 * ns_per_s,
+        .settle_end_ns = 400 * ns_per_s,
+    });
+    defer cluster.deinit(std.testing.allocator);
+    const report = try cluster.run();
+    const stats = cluster.real.?.stats();
+    try std.testing.expect(stats.submitted > 0);
+    try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
 }
 
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {

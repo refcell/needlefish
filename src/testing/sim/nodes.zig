@@ -18,7 +18,7 @@ const network_module = @import("network.zig");
 const NodeId = network_module.NodeId;
 const codec = @import("codec.zig");
 
-pub const batch_blocks_max = codec.blocks_max;
+pub const batch_blocks_max = 8;
 pub const l1_batches_max = 4;
 pub const sync_blocks_max = 16;
 pub const l1_request_burst = 4;
@@ -34,9 +34,13 @@ pub const genesis_hash: u64 = 0x6765_6e65_7369_7300;
 pub const l1_genesis_hash: u64 = 0x6c31_6765_6e65_7369;
 /// Deepest L1 reorg the fault injector produces. Followers must handle any depth.
 pub const l1_reorg_depth_max = 3;
+/// Mempool storage: the admission limit plus room to re-inject every transaction of a
+/// maximal reorg, as geth does, so a reorg never silently loses an account nonce.
+pub const l1_mempool_capacity = l1_mempool_max + l1_reorg_depth_max * l1_batches_max;
 
 comptime {
     assert(l1_batches_max <= codec.transactions_max);
+    assert(batch_blocks_max <= codec.blocks_max);
 }
 
 pub fn block_hash(parent_hash: u64, number: u64, payload: u64) u64 {
@@ -51,7 +55,12 @@ pub const Batch = struct {
     tx_index: u32,
     /// `codec.sender_batcher`, or `codec.sender_attacker` for forged inbox spam.
     sender: u8 = codec.sender_batcher,
+    /// Account nonce for transactions from the real batcher's account. L1 includes them
+    /// strictly in nonce order; model and attacker transactions carry none.
+    nonce: ?u64 = null,
 };
+
+pub const SubmitResult = enum { accepted, replaced, nonce_too_low, mempool_full };
 
 pub const L1Block = struct {
     number: u64,
@@ -191,13 +200,18 @@ pub const L1 = struct {
     head: u64 = 0,
     block_time_ns: u64,
     next_block_ns: u64,
-    mempool: [l1_mempool_max]Batch = undefined,
+    mempool: [l1_mempool_capacity]Batch = undefined,
     mempool_count: u8 = 0,
     reorgs: u64 = 0,
+    /// Mined nonce of the real batcher's account after each block, index = number.
+    nonce_after: []u64,
 
     pub fn init(allocator: std.mem.Allocator, block_count_max: u64, block_time_ns: u64) !L1 {
         assert(block_time_ns > 0);
         const blocks = try allocator.alloc(L1Block, block_count_max + 1);
+        errdefer allocator.free(blocks);
+        const nonce_after = try allocator.alloc(u64, block_count_max + 1);
+        nonce_after[0] = 0;
         blocks[0] = .{
             .number = 0,
             .hash = l1_genesis_hash,
@@ -205,11 +219,17 @@ pub const L1 = struct {
             .batch_count = 0,
             .batches = undefined,
         };
-        return .{ .blocks = blocks, .block_time_ns = block_time_ns, .next_block_ns = 0 };
+        return .{
+            .blocks = blocks,
+            .nonce_after = nonce_after,
+            .block_time_ns = block_time_ns,
+            .next_block_ns = 0,
+        };
     }
 
     pub fn deinit(l1: *L1, allocator: std.mem.Allocator) void {
         allocator.free(l1.blocks);
+        allocator.free(l1.nonce_after);
         l1.* = undefined;
     }
 
@@ -217,19 +237,18 @@ pub const L1 = struct {
         if (env.now_ns < l1.next_block_ns) return;
         if (l1.head + 1 == l1.blocks.len) return;
         l1.next_block_ns += l1.block_time_ns;
+        l1.mine(env);
+    }
+
+    /// Mines the next block from the mempool and broadcasts it.
+    fn mine(l1: *L1, env: *const Env) void {
+        assert(l1.head + 1 < l1.blocks.len);
         const number = l1.head + 1;
         const block = &l1.blocks[number];
         block.number = number;
         block.parent_hash = l1.blocks[l1.head].hash;
         block.hash = env.prng.int(u64) | 1;
-        block.batch_count = @min(l1.mempool_count, l1_batches_max);
-        @memcpy(block.batches[0..block.batch_count], l1.mempool[0..block.batch_count]);
-        std.mem.copyForwards(
-            Batch,
-            l1.mempool[0 .. l1.mempool_count - block.batch_count],
-            l1.mempool[block.batch_count..l1.mempool_count],
-        );
-        l1.mempool_count -= block.batch_count;
+        l1.nonce_after[number] = l1.include_mempool(block, l1.nonce_after[l1.head]);
         l1.head = number;
         env.send(node_l1, node_batcher, .{ .l1_block = block.* });
         var verifier: u8 = 0;
@@ -238,36 +257,131 @@ pub const L1 = struct {
         }
     }
 
-    /// Orphan the top `depth` blocks. Their batches return to the mempool front when
-    /// there is room (as re-broadcast transactions would); the rest are lost and the
-    /// batcher must resubmit. Replacement blocks follow on the normal schedule.
-    pub fn reorg(l1: *L1, depth: u64) void {
+    /// Moves includable mempool entries into `block`, in order. Nonce-carrying entries go
+    /// in only at the next expected nonce; stale ones (already mined) are dropped and
+    /// future ones wait. Returns the mined nonce after the block.
+    fn include_mempool(l1: *L1, block: *L1Block, nonce_start: u64) u64 {
+        var nonce_next = nonce_start;
+        block.batch_count = 0;
+        var kept: u8 = 0;
+        // Each pass includes at least one entry or stops; nonces can unlock waiting ones.
+        for (0..l1_batches_max + 1) |_| {
+            kept = 0;
+            var included_any = false;
+            for (l1.mempool[0..l1.mempool_count]) |batch| {
+                const stale = if (batch.nonce) |nonce| nonce < nonce_next else false;
+                if (stale) continue;
+                const ready = if (batch.nonce) |nonce| nonce == nonce_next else true;
+                if (ready and block.batch_count < l1_batches_max) {
+                    block.batches[block.batch_count] = batch;
+                    block.batch_count += 1;
+                    if (batch.nonce != null) nonce_next += 1;
+                    included_any = true;
+                } else {
+                    l1.mempool[kept] = batch;
+                    kept += 1;
+                }
+            }
+            l1.mempool_count = kept;
+            if (!included_any or block.batch_count == l1_batches_max) break;
+        }
+        assert(nonce_next >= nonce_start);
+        assert(block.batch_count <= l1_batches_max);
+        return nonce_next;
+    }
+
+    /// The real batcher account's mined nonce at the head.
+    pub fn nonce_mined(l1: *const L1) u64 {
+        return l1.nonce_after[l1.head];
+    }
+
+    /// Mined nonce plus consecutive pending nonces in the mempool (`pending` tag).
+    pub fn nonce_pending(l1: *const L1) u64 {
+        var nonce = l1.nonce_mined();
+        for (0..l1_mempool_capacity + 1) |_| {
+            const found = for (l1.mempool[0..l1.mempool_count]) |batch| {
+                if (batch.nonce == nonce) break true;
+            } else false;
+            if (!found) break;
+            nonce += 1;
+        }
+        return nonce;
+    }
+
+    /// `eth_sendRawTransaction` for the real batcher: replace a pending entry with the
+    /// same nonce (fee bump), otherwise queue it.
+    pub fn submit_nonced(l1: *L1, tx_index: u32, nonce: u64) SubmitResult {
+        if (nonce < l1.nonce_mined()) return .nonce_too_low;
+        for (l1.mempool[0..l1.mempool_count]) |*batch| {
+            if (batch.nonce == nonce) {
+                batch.tx_index = tx_index;
+                return .replaced;
+            }
+        }
+        if (l1.mempool_count >= l1_mempool_max) return .mempool_full;
+        l1.mempool[l1.mempool_count] = .{ .tx_index = tx_index, .nonce = nonce };
+        l1.mempool_count += 1;
+        return .accepted;
+    }
+
+    /// Orphan the top `depth` blocks and immediately mine a replacement branch of the
+    /// same height, as a heavier fork would arrive on L1. Orphaned transactions go back
+    /// to the mempool, so the new branch re-includes them where nonces allow.
+    pub fn reorg(l1: *L1, env: *const Env, depth: u64) void {
+        const height = l1.head;
+        l1.orphan(depth);
+        for (0..depth) |_| l1.mine(env);
+        assert(l1.head == height);
+    }
+
+    /// Drops the top `depth` blocks; their transactions return to the mempool front.
+    fn orphan(l1: *L1, depth: u64) void {
         assert(depth > 0 and depth <= l1_reorg_depth_max);
         assert(depth <= l1.head);
-        var restored: [l1_mempool_max]Batch = undefined;
-        var restored_count: u8 = 0;
+        const restored_max = l1_reorg_depth_max * l1_batches_max;
+        var merged: [restored_max + l1_mempool_capacity]Batch = undefined;
+        var count: usize = 0;
         var number = l1.head + 1 - depth;
         while (number <= l1.head) : (number += 1) {
             const block = &l1.blocks[number];
             for (block.batches[0..block.batch_count]) |batch| {
-                if (restored_count == l1_mempool_max) break;
-                restored[restored_count] = batch;
-                restored_count += 1;
+                // A pending replacement for the same nonce wins over the orphaned one.
+                if (batch.nonce != null and l1.has_nonce(batch.nonce.?)) continue;
+                merged[count] = batch;
+                count += 1;
             }
         }
-        const kept = @min(l1.mempool_count, l1_mempool_max - restored_count);
-        @memcpy(restored[restored_count..][0..kept], l1.mempool[0..kept]);
-        l1.mempool_count = restored_count + kept;
-        @memcpy(l1.mempool[0..l1.mempool_count], restored[0..l1.mempool_count]);
+        assert(count <= restored_max);
+        @memcpy(merged[count..][0..l1.mempool_count], l1.mempool[0..l1.mempool_count]);
+        count += l1.mempool_count;
+        // Overflow drops nonce-less (model) transactions from the back: their senders
+        // retry. Nonce-carrying ones number at most the txmgr window plus one reorg.
+        var index = count;
+        while (count > l1_mempool_capacity and index > 0) {
+            index -= 1;
+            if (merged[index].nonce != null) continue;
+            std.mem.copyForwards(Batch, merged[index .. count - 1], merged[index + 1 .. count]);
+            count -= 1;
+        }
+        assert(count <= l1_mempool_capacity);
+        l1.mempool_count = @intCast(count);
+        @memcpy(l1.mempool[0..count], merged[0..count]);
         l1.head -= depth;
         l1.reorgs += 1;
+    }
+
+    fn has_nonce(l1: *const L1, nonce: u64) bool {
+        for (l1.mempool[0..l1.mempool_count]) |batch| {
+            if (batch.nonce == nonce) return true;
+        }
+        return false;
     }
 
     pub fn on_message(l1: *L1, env: *const Env, from: NodeId, message: Message) void {
         switch (message) {
             .batch_submit => |batch| {
                 assert(batch.tx_index < env.tx_pool.count);
-                if (l1.mempool_count == l1_mempool_max) return; // Full: batcher retries.
+                if (l1.mempool_count >= l1_mempool_max) return; // Full: batcher retries.
                 l1.mempool[l1.mempool_count] = batch;
                 l1.mempool_count += 1;
             },
@@ -370,7 +484,7 @@ pub const L1Follower = struct {
 /// The block numbers `batch` adds on top of `head`, or null when it does not connect
 /// (gap) or is fully known (duplicate). Derivation ignores such batches.
 pub fn batch_extension(head: u64, batch: codec.Blocks) ?struct { first: u64, last: u64 } {
-    assert(batch.count > 0 and batch.count <= batch_blocks_max);
+    assert(batch.count > 0 and batch.count <= codec.blocks_max);
     assert(batch.number_first > 0);
     if (batch.number_first > head + 1) return null;
     const last = batch.number_first + batch.count - 1;
@@ -393,6 +507,8 @@ pub const Batcher = struct {
     /// Byzantine mode for checker tests: corrupt the tx data of this submission. Honest
     /// runs leave it null.
     corrupt_tx: ?u32 = null,
+    /// False when the real batcher service submits; this model then only observes L1.
+    submitting: bool = true,
 
     // Several blocks per batch, at most two batches per L1 block: L1 includes four.
     pub const submit_interval_ns: u64 = 6 * std.time.ns_per_s;
@@ -425,6 +541,7 @@ pub const Batcher = struct {
 
     pub fn tick(batcher: *Batcher, env: *const Env, sequencer: *const Sequencer) void {
         batcher.follower.tick(env, node_batcher);
+        if (!batcher.submitting) return;
         if (env.now_ns < batcher.next_submit_ns) return;
         batcher.next_submit_ns = env.now_ns + submit_interval_ns;
         batcher.submitted = @max(batcher.submitted, batcher.confirmed);
@@ -490,6 +607,7 @@ pub const Batcher = struct {
             .next_submit_ns = env.now_ns,
             .progress_ns = env.now_ns,
             .corrupt_tx = batcher.corrupt_tx,
+            .submitting = batcher.submitting,
         };
     }
 };
@@ -695,3 +813,43 @@ pub const Verifier = struct {
         verifier.sync_ns = 0;
     }
 };
+
+test "nodes: L1 includes nonced transactions in order, replaces, and survives reorgs" {
+    const allocator = std.testing.allocator;
+    var l1 = try L1.init(allocator, 16, std.time.ns_per_s);
+    defer l1.deinit(allocator);
+    var network = try Net.init(allocator, .{});
+    defer network.deinit(allocator);
+    var pool = try codec.TxPool.init(allocator, 8);
+    defer pool.deinit(allocator);
+    var prng = Prng.init(1);
+    const env: Env = .{
+        .now_ns = 0,
+        .global_ns = 0,
+        .prng = &prng,
+        .network = &network,
+        .verifier_count = 0,
+        .tx_pool = &pool,
+    };
+    // Nonce 1 waits for nonce 0; a resubmitted nonce 1 replaces the first.
+    try std.testing.expectEqual(SubmitResult.accepted, l1.submit_nonced(10, 1));
+    l1.mine(&env);
+    try std.testing.expectEqual(@as(u8, 0), l1.blocks[1].batch_count);
+    try std.testing.expectEqual(@as(u64, 0), l1.nonce_pending());
+    try std.testing.expectEqual(SubmitResult.replaced, l1.submit_nonced(11, 1));
+    try std.testing.expectEqual(SubmitResult.accepted, l1.submit_nonced(12, 0));
+    try std.testing.expectEqual(@as(u64, 2), l1.nonce_pending());
+    l1.mine(&env);
+    try std.testing.expectEqual(@as(u8, 2), l1.blocks[2].batch_count);
+    try std.testing.expectEqual(@as(u32, 12), l1.blocks[2].batches[0].tx_index);
+    try std.testing.expectEqual(@as(u32, 11), l1.blocks[2].batches[1].tx_index);
+    try std.testing.expectEqual(@as(u64, 2), l1.nonce_mined());
+    try std.testing.expectEqual(SubmitResult.nonce_too_low, l1.submit_nonced(13, 1));
+    // A reorg re-mines the orphaned transactions on the replacement branch.
+    const orphaned_hash = l1.blocks[2].hash;
+    l1.reorg(&env, 1);
+    try std.testing.expectEqual(@as(u64, 2), l1.head);
+    try std.testing.expect(l1.blocks[2].hash != orphaned_hash);
+    try std.testing.expectEqual(@as(u64, 2), l1.nonce_mined());
+    try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
+}

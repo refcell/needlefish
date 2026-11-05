@@ -77,6 +77,20 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
             n.sent,             n.delivered,       dropped,
         },
     );
+    if (cluster.real) |real| {
+        const stats = real.stats();
+        std.debug.print(
+            "  real batcher: steps={d} step_errors={d} rpc_calls={d} rpc_failures={d} " ++
+                "txs_sent={d}\n",
+            .{
+                stats.steps,
+                stats.step_errors,
+                stats.calls,
+                stats.transport_failures,
+                stats.submitted,
+            },
+        );
+    }
 }
 
 fn print_config(config: Config) void {
@@ -84,7 +98,7 @@ fn print_config(config: Config) void {
     std.debug.print(
         "  verifiers={d} latency={d}..{d}ms drop={d}ppm dup={d}ppm crashes/min={d} " ++
             "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
-            "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d}\n",
+            "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d} real_batcher={}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -99,6 +113,7 @@ fn print_config(config: Config) void {
             config.clock_skew_ns_max / ms,
             config.l1_reorgs_per_minute,
             config.spam_per_minute,
+            config.real_batcher,
         },
     );
 }

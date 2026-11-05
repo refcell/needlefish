@@ -15,6 +15,13 @@ provably robust.
 - [ ] Sim: multi-frame channels spread over L1 blocks via the derive lane's channel bank
   (timeouts, frame loss, reorged frames) once `derive` lands it.
 - [ ] Sim: swap model nodes for real components behind `utilities.io` SimIo as lanes land.
+  - [x] Batcher: the real `batcher/service` (txmgr, channel manager, L2 source) runs
+    against model state through JSON-RPC transports (`sim/real_batcher.zig`).
+  - [ ] Sequencer / verifier derivation once the consensus service is step-driven.
+- [ ] Sim: L1 transaction-loss fault (mempool eviction, a different L1 RPC node). The real
+  batcher's txmgr never refetches its nonce, so one lost tx stalls it forever (see notes).
+- [ ] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
+  minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
 - [ ] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
@@ -23,6 +30,11 @@ provably robust.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Notes for other lanes (from simulator findings)
+- batcher (txmgr): a confirmed tx that a reorg orphans and L1 then drops leaves a nonce gap
+  that nothing fills: `next_nonce` is cached forever and freed slots are never re-sent, so
+  every later tx waits on L1 indefinitely. base/base resets its nonce cache on send timeout
+  and requeues the frames; the service's safe-head stall reset should also reset txmgr
+  (refetch the `latest` nonce, drop slots above it, requeue their frames).
 - consensus (derivation): a durable checkpoint of (safe head, L1 cursor) must also name the
   hash of the L1 block it reflects, and per-L1-block records written later can be newer than
   the checkpoint after a lost write. Restore both from the checkpoint on restart.
@@ -55,6 +67,14 @@ provably robust.
   L1 carries indices into an append-only tx pool (no rewrite, so stale messages stay
   valid). Cost: ~6.5 ms/seed ReleaseSafe (was 1-4 ms).
 
+- Real batcher in the sim: answered synchronously from model state via `rpc.Transport`
+  (no sockets), stepped every 2 s of local time; single-frame channels (input cap 1900
+  bytes) because sim derivation is stateless per L1 tx. The model batcher stays as an L1
+  observer for the confirmation checks. L1 enforces account nonces for its txs.
+- L1 reorgs mine a same-height replacement branch at once and re-inject every orphaned tx
+  (geth behaviour). The old model let L1 shrink and lose txs when the mempool was full,
+  which produced nonce gaps no real L1 node causes; tx loss becomes its own fault class.
+
 - Push loop: main lands ~1 commit/min while a full test run takes 2-3 min under load,
   so strict re-test-on-every-reject never wins. After a green full run, if upstream
   commits since the tested base touch none of our files nor build.zig/src/base.zig,
@@ -86,3 +106,6 @@ provably robust.
   faults are now random directed cuts. 5000 seeds green.
 - 2026-11-05: sim verifiers derive via derive-lane Retrieval/FrameQueue (calldata source,
   sender filter); inbox-spam fault (swarm level); sender-check negative test.
+- 2026-11-05: the real batcher service runs in the sim (`real_batcher=true`, half of
+  swarm seeds); L1 enforces nonces and reorgs re-mine at once. 1000 seeds green. Found:
+  txmgr cannot recover a lost nonce (noted for the batcher lane).

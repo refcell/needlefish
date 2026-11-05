@@ -143,6 +143,8 @@ pub fn print_regression(seed: u64, config: Config) void {
                 std.debug.print("            .{s} = {d},\n", .{ inner, @field(value, inner) });
             }
             std.debug.print("        }},\n", .{});
+        } else if (@TypeOf(value) == bool) {
+            std.debug.print("        .{s} = {},\n", .{ name, value });
         } else {
             std.debug.print("        .{s} = {d},\n", .{ name, value });
         }

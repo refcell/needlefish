@@ -11,8 +11,8 @@
 //! L1 blocks need a channel bank; the simulator adopts the derive lane's once it lands.
 //!
 //! Model block encoding: block `n` is a singular batch with `timestamp = n * 2`,
-//! `parent_hash` / hash carrying the model's 64-bit hashes, and one 8-byte transaction
-//! holding the payload.
+//! `parent_hash` / hash carrying the model's 64-bit hashes, and one EIP-1559
+//! transaction whose 8-byte input is the payload (`payload_tx`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +20,7 @@ const manager_module = @import("../../batcher/channel/manager.zig");
 const source = @import("../../batcher/source/root.zig");
 const protocol = @import("../../consensus/protocol/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
+const tx_module = @import("../../common/consensus/tx.zig");
 
 const derive = @import("../../consensus/derive/root.zig");
 
@@ -31,7 +32,11 @@ const ProviderError = derive.errors.ProviderError;
 const SingleBatch = protocol.batch.SingleBatch;
 const batch_reader = protocol.batch_reader;
 
-pub const blocks_max = 8;
+/// Blocks one decoded channel may carry (the real batcher packs more than the model).
+pub const blocks_max = 16;
+/// Encoded length of `payload_tx`, which holds one L2 block's payload.
+pub const payload_tx_length_max = 128;
+pub const l2_chain_id = 901;
 /// Largest tx data: version byte plus one frame.
 pub const tx_data_max = 2048;
 pub const l2_block_time_s = 2;
@@ -63,7 +68,44 @@ pub const Blocks = struct {
     payloads: [blocks_max]u64,
 };
 
-fn word_hash(word: u64) B256 {
+/// The model's L2 transaction for a block: a fixed EIP-1559 transfer whose input is the
+/// payload. Signature values are placeholders; nothing recovers the sender.
+pub fn payload_envelope(payload: *const [8]u8) tx_module.Envelope {
+    return .{ .eip1559 = .{
+        .tx = .{
+            .chain_id = l2_chain_id,
+            .nonce = 0,
+            .max_priority_fee_per_gas = 1,
+            .max_fee_per_gas = 2,
+            .gas_limit = 21_000,
+            .to = .{ .call = .{ .bytes = @splat(0x11) } },
+            .value = 0,
+            .input = payload,
+            .access_list = .empty,
+        },
+        .signature = .{ .y_parity = false, .r = 1, .s = 1 },
+    } };
+}
+
+pub fn payload_tx(payload: u64, out: *[payload_tx_length_max]u8) []u8 {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, payload, .big);
+    const encoded = payload_envelope(&bytes).encode_to(out);
+    assert(encoded.len <= payload_tx_length_max);
+    return encoded;
+}
+
+fn payload_from_tx(encoded: []const u8) ?u64 {
+    const envelope = tx_module.Envelope.decode(encoded) catch return null;
+    const tx = switch (envelope) {
+        .eip1559 => |signed| signed.tx,
+        else => return null,
+    };
+    if (tx.input.len != 8) return null;
+    return std.mem.readInt(u64, tx.input[0..8], .big);
+}
+
+pub fn word_hash(word: u64) B256 {
     var hash: B256 = .zero;
     std.mem.writeInt(u64, hash.bytes[24..32], word, .big);
     return hash;
@@ -147,9 +189,8 @@ pub const Encoder = struct {
         manager.reset();
         for (payloads, 0..) |payload, offset| {
             const number = first + offset;
-            var transaction: [8]u8 = undefined;
-            std.mem.writeInt(u64, &transaction, payload, .big);
-            const transactions = [_][]const u8{&transaction};
+            var transaction_buffer: [payload_tx_length_max]u8 = undefined;
+            const transactions = [_][]const u8{payload_tx(payload, &transaction_buffer)};
             const block: source.L2Block = .{
                 .number = number,
                 .hash = word_hash(hashes[offset + 1]),
@@ -331,7 +372,8 @@ fn decode_batches(allocator: std.mem.Allocator, decompressed: []const u8) ?Block
         if (raw.batch_type != .single) return null;
         if (blocks.count == blocks_max) return null;
         const batch = SingleBatch.decode(allocator, raw.payload) catch return null;
-        if (batch.transactions.len != 1 or batch.transactions[0].len != 8) return null;
+        if (batch.transactions.len != 1) return null;
+        const payload = payload_from_tx(batch.transactions[0]) orelse return null;
         if (batch.timestamp == 0 or batch.timestamp % l2_block_time_s != 0) return null;
         const number = batch.timestamp / l2_block_time_s;
         if (blocks.count == 0) {
@@ -339,7 +381,7 @@ fn decode_batches(allocator: std.mem.Allocator, decompressed: []const u8) ?Block
         } else if (number != blocks.number_first + blocks.count) {
             return null;
         }
-        blocks.payloads[blocks.count] = std.mem.readInt(u64, batch.transactions[0][0..8], .big);
+        blocks.payloads[blocks.count] = payload;
         blocks.count += 1;
     } else return null; // More than blocks_max batches.
     if (blocks.count == 0) return null;
