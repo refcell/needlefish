@@ -79,6 +79,9 @@ fallback but hot paths should be our own, optimized implementations.
   for G (32 odd multiples) and w=5 runtime table for Q (8 odd multiples).
 - Public vectors: a curated 54-case subset (one per Wycheproof category and outcome) of
   the go-ethereum `p256Verify.json` precompile vectors in `testdata/p256_verify_vectors.txt`.
+- Tried comptime "lazy rotation" scalar Keccak (rho folded into shifted-operand EOR/BIC,
+  24 rounds unrolled): ~101 ops/round vs ~125 but 245ns vs 147ns per 32B hash on Apple M4
+  (shifted-operand logic ops are slower there). Reverted; generic permutation stays.
 
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
