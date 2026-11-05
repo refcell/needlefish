@@ -99,6 +99,8 @@ const KqueueImpl = struct {
     pub const connect = methods.connect;
     pub const recv = methods.recv;
     pub const send = methods.send;
+    pub const recvfrom = methods.recvfrom;
+    pub const sendto = methods.sendto;
     pub const read = methods.read;
     pub const write = methods.write;
     pub const fsync = methods.fsync;
@@ -172,11 +174,11 @@ const KqueueImpl = struct {
         os.shutdown(fd);
     }
 
-    /// The remote address of a connected socket, or null if unavailable.
-    /// Opens a non-blocking UDP socket (polled with `recvfrom_now`/`sendto_now`).
+    /// Opens a UDP socket: use the `recvfrom`/`sendto` completions, or poll with
+    /// `recvfrom_now`/`sendto_now`.
     pub fn open_socket_udp(io: *KqueueImpl, family: Address.Family) common.SetupError!Fd {
         _ = io;
-        return os.socket_udp(family);
+        return os.socket_udp(family, .nonblocking);
     }
 
     pub fn bind_udp(io: *KqueueImpl, fd: Fd, address: Address) common.SetupError!Address {
@@ -196,6 +198,7 @@ const KqueueImpl = struct {
         return os.sendto(fd, buffer, address);
     }
 
+    /// The remote address of a connected socket, or null if unavailable.
     pub fn peer_address(io: *KqueueImpl, fd: Fd) ?Address {
         _ = io;
         return os.peer_address(fd);
@@ -251,6 +254,8 @@ const KqueueImpl = struct {
             .recv => |op| .{ op.socket, read_filter },
             .connect => |op| .{ op.socket, write_filter },
             .send => |op| .{ op.socket, write_filter },
+            .recvfrom => |op| .{ op.socket, read_filter },
+            .sendto => |op| .{ op.socket, write_filter },
             else => unreachable, // Only socket operations can block.
         };
     }
@@ -412,6 +417,15 @@ const KqueueImpl = struct {
                     @intCast(rc)
                 else
                     os.send_error(err) };
+            },
+            .recvfrom => |op| {
+                const result = os.recvfrom_nonblocking(op.socket, op.buffer) orelse return false;
+                completion.result = .{ .recvfrom = result };
+            },
+            .sendto => |op| {
+                const result = os.sendto_nonblocking(op.socket, op.buffer, op.address) orelse
+                    return false;
+                completion.result = .{ .sendto = result };
             },
             .read => |op| completion.result = .{ .read = do_read(op.fd, op.buffer, op.offset) },
             .write => |op| completion.result = .{ .write = do_write(op.fd, op.buffer, op.offset) },

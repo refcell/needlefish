@@ -28,6 +28,9 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   / rollup config) is left to execution/consensus, which own those types.
 - [x] `upgrade_signal` observer: live polling on the tag interval, change detection, metrics
   (`base_upgrade_signal_*`). Startup retry policy is the applying lane's (use `retry`).
+- [x] io UDP completions: `recvfrom` -> `Datagram{length, from}` and `sendto(buffer, address)`
+  ops on io_uring (recvmsg/sendmsg), kqueue (non-blocking retry) and SimIo (over the p2p
+  lane's polled datagram pool, with `World.datagram_stats`); polled `*_now` calls stay.
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -103,3 +106,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: http: close-delimited responses (no length, no chunking) were parsed as empty bodies; now `.incomplete` until EOF, finished by `parse_response_at_eof` from the client (keep_alive=false). optimism-rpc skipped: thin typed wrappers over `rpc.Client`, call sites live in consensus/batcher.
 - 2026-11-05: rpc.ws: WsClient (bounded pending ids, notifications raw, pending fail on close), server adapter over ws.Server + Router; rpc.client gains parse_response_any and module-level build_request.
 - 2026-11-05 (p2p lane, additive): minimal UDP for discv5: `open_socket_udp`, `bind_udp`, non-blocking `recvfrom_now`/`sendto_now` (polled, no completion op) on kqueue, io_uring (plain syscalls), and SimIo (world datagram queue with latency, partitions, `datagram_loss_ppm`, purge on close); `udp_test.zig`. A completion-based `recvfrom` can replace polling later.
+- 2026-11-05: io UDP completions on top of the p2p lane's polled path (kept for its transport). io_uring opens UDP sockets blocking (the polled path passes MSG_DONTWAIT). SimIo sendto: unbound socket SocketNotConnected, oversize MessageTooBig, full in-flight table SystemResources; recvfrom on an unbound socket fails fast with SocketNotConnected (the OS would block forever). Fixed sim `bind_udp` dropping the port of a 0.0.0.0:port bind.

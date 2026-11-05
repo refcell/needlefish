@@ -48,6 +48,17 @@ pub const Options = struct {
     datagram_loss_ppm: u32 = 0,
 };
 
+/// Datagram accounting across the world: every send is received or counted as dropped.
+pub const DatagramStats = struct {
+    sent: u64 = 0,
+    received: u64 = 0,
+    dropped_unbound: u64 = 0,
+    dropped_partition: u64 = 0,
+    dropped_loss: u64 = 0,
+    /// Discarded in flight because the destination socket closed.
+    dropped_closed: u64 = 0,
+};
+
 /// A datagram in flight: delivered to `to` once `arrive_ns` passes.
 const InFlight = struct {
     used: bool = false,
@@ -248,6 +259,7 @@ pub const World = struct {
     pipe_memory: []u8,
     backlog_memory: []u32,
     datagrams: []InFlight,
+    datagram_stats: DatagramStats = .{},
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !World {
         assert(options.latency_min_ns <= options.latency_max_ns);
@@ -435,7 +447,10 @@ pub const World = struct {
 
     fn datagrams_purge(world: *World, address: Address) void {
         for (world.datagrams) |*datagram| {
-            if (datagram.used and datagram.to.eql(address)) datagram.used = false;
+            if (datagram.used and datagram.to.eql(address)) {
+                datagram.used = false;
+                world.datagram_stats.dropped_closed += 1;
+            }
         }
     }
 
@@ -491,6 +506,8 @@ pub const SimIo = struct {
     pub const connect = methods.connect;
     pub const recv = methods.recv;
     pub const send = methods.send;
+    pub const recvfrom = methods.recvfrom;
+    pub const sendto = methods.sendto;
     pub const read = methods.read;
     pub const write = methods.write;
     pub const fsync = methods.fsync;
@@ -616,7 +633,9 @@ pub const SimIo = struct {
     pub fn bind_udp(io: *SimIo, fd: Fd, address: Address) common.SetupError!Address {
         assert(io.descriptors[fd] == .udp_unbound);
         var bound = address;
-        if (bound.same_host(Address.ip4(.{ 0, 0, 0, 0 }, 0))) bound = io.options.host.with_port(0);
+        if (bound.same_host(Address.ip4(.{ 0, 0, 0, 0 }, 0))) {
+            bound = io.options.host.with_port(address.port); // Keep the requested port.
+        }
         if (!bound.same_host(io.options.host)) return error.AddressNotAvailable;
         if (bound.port == 0) bound.port = io.port_ephemeral();
         if (io.world.udp_find(bound) != null) return error.AddressInUse;
@@ -638,26 +657,48 @@ pub const SimIo = struct {
         }
         const datagram = best orelse return null;
         datagram.used = false;
+        world.datagram_stats.received += 1;
         const length = @min(datagram.length, buffer.len);
         @memcpy(buffer[0..length], datagram.bytes[0..length]);
         return .{ .length = @intCast(length), .from = datagram.from };
     }
 
     /// Queues one datagram with latency; dropped when the target is unbound or
-    /// partitioned, the queue is full, or the loss roll fails. Returns false when dropped
-    /// locally (queue full or oversized), like a kernel refusing the send.
+    /// partitioned, or the loss roll fails. Returns false when refused locally (unbound
+    /// socket, oversized, or every in-flight slot used), like a kernel refusing the send.
     pub fn sendto_now(io: *SimIo, fd: Fd, buffer: []const u8, address: Address) bool {
+        io.datagram_send(fd, buffer, address) catch return false;
+        return true;
+    }
+
+    fn datagram_send(
+        io: *SimIo,
+        fd: Fd,
+        buffer: []const u8,
+        address: Address,
+    ) common.SendError!void {
         assert(buffer.len > 0);
         const descriptor = io.descriptors[fd];
-        if (descriptor != .udp) return false;
-        if (buffer.len > common.datagram_size_max) return false;
+        if (descriptor != .udp) return error.SocketNotConnected;
+        if (buffer.len > common.datagram_size_max) return error.MessageTooBig;
         const world = io.world;
         const slot = for (world.datagrams) |*datagram| {
             if (!datagram.used) break datagram;
-        } else return false;
-        const target = world.udp_find(address) orelse return true;
-        if (target.node != io.index and world.partitioned(io.index, target.node)) return true;
-        if (world.roll(world.options.datagram_loss_ppm)) return true;
+        } else return error.SystemResources;
+        const stats = &world.datagram_stats;
+        stats.sent += 1;
+        const target = world.udp_find(address) orelse {
+            stats.dropped_unbound += 1;
+            return;
+        };
+        if (target.node != io.index and world.partitioned(io.index, target.node)) {
+            stats.dropped_partition += 1;
+            return;
+        }
+        if (world.roll(world.options.datagram_loss_ppm)) {
+            stats.dropped_loss += 1;
+            return;
+        }
         slot.* = .{
             .used = true,
             .from = descriptor.udp,
@@ -666,7 +707,6 @@ pub const SimIo = struct {
             .length = @intCast(buffer.len),
         };
         @memcpy(slot.bytes[0..buffer.len], buffer);
-        return true;
     }
 
     pub fn open_file(io: *SimIo, path: []const u8, mode: common.OpenMode) common.SetupError!Fd {
@@ -815,6 +855,7 @@ pub const SimIo = struct {
                 now_ns
             else switch (completion.operation) {
                 .recv => |op| io.recv_next_ns(op.socket),
+                .recvfrom => |op| io.recvfrom_next_ns(op.socket),
                 .accept, .send => null,
                 else => completion.ready_ns,
             };
@@ -850,6 +891,18 @@ pub const SimIo = struct {
             },
             .recv => |op| return io.try_recv(completion, op.socket, op.buffer),
             .send => |op| return io.try_send(completion, op.socket, op.buffer),
+            .recvfrom => |op| {
+                if (io.descriptors[op.socket] != .udp) {
+                    completion.result = .{ .recvfrom = error.SocketNotConnected };
+                } else {
+                    const datagram = io.recvfrom_now(op.socket, op.buffer) orelse return false;
+                    completion.result = .{ .recvfrom = datagram };
+                }
+            },
+            .sendto => |op| {
+                const sent = io.datagram_send(op.socket, op.buffer, op.address);
+                completion.result = .{ .sendto = if (sent) op.buffer.len else |err| err };
+            },
             .read => |op| {
                 if (now_ns < completion.ready_ns) return false;
                 completion.result = .{ .read = io.do_read(op.fd, op.buffer, op.offset) };
@@ -872,6 +925,18 @@ pub const SimIo = struct {
             },
         }
         return true;
+    }
+
+    /// Earliest arrival of a datagram for `fd`; now for a non-UDP descriptor (it fails).
+    fn recvfrom_next_ns(io: *SimIo, fd: Fd) ?u64 {
+        const descriptor = io.descriptors[fd];
+        if (descriptor != .udp) return io.world.now_ns;
+        var next: ?u64 = null;
+        for (io.world.datagrams) |*datagram| {
+            if (!datagram.used or !datagram.to.eql(descriptor.udp)) continue;
+            next = if (next) |n| @min(n, datagram.arrive_ns) else datagram.arrive_ns;
+        }
+        return next;
     }
 
     fn try_accept(io: *SimIo, completion: *Completion, fd: Fd) bool {

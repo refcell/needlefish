@@ -1,7 +1,8 @@
 //! Completion-based IO, TigerBeetle style.
 //!
 //! Every backend has the same API: a caller-owned `Completion`, one operation per completion
-//! (`accept`, `connect`, `recv`, `send`, `read`, `write`, `fsync`, `timeout`, `close`), a
+//! (`accept`, `connect`, `recv`, `send`, `recvfrom`, `sendto`, `read`, `write`, `fsync`,
+//! `timeout`, `close`), a
 //! typed callback with a context pointer, and `tick()` / `run_for_ns()` to drive progress.
 //! Callbacks run only from `tick`/`run_for_ns`, never from the submitting call.
 //!

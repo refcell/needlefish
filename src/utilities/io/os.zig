@@ -155,10 +155,13 @@ pub fn listen(fd: fd_t, address: Address, backlog: u31) common.SetupError!Addres
     return bound.to_address() orelse error.Unexpected;
 }
 
-/// Opens a non-blocking UDP socket with close-on-exec.
-pub fn socket_udp(family: Address.Family) common.SetupError!fd_t {
+/// Opens a UDP socket with close-on-exec.
+pub fn socket_udp(family: Address.Family, blocking: Blocking) common.SetupError!fd_t {
     var socket_type: u32 = std.posix.SOCK.DGRAM;
-    if (is_linux) socket_type |= std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK;
+    if (is_linux) {
+        socket_type |= std.posix.SOCK.CLOEXEC;
+        if (blocking == .nonblocking) socket_type |= std.posix.SOCK.NONBLOCK;
+    }
     const rc = system.socket(family_of(family), socket_type, std.posix.IPPROTO.UDP);
     switch (errno(rc)) {
         .SUCCESS => {},
@@ -172,10 +175,12 @@ pub fn socket_udp(family: Address.Family) common.SetupError!fd_t {
     errdefer close(fd);
     if (is_darwin) {
         try fcntl_set(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
-        const flags = system.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.Unexpected;
-        const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
-        try fcntl_set(fd, std.posix.F.SETFL, flags | nonblock);
+        if (blocking == .nonblocking) {
+            const flags = system.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+            if (flags < 0) return error.Unexpected;
+            const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+            try fcntl_set(fd, std.posix.F.SETFL, flags | nonblock);
+        }
     }
     return fd;
 }
@@ -204,24 +209,52 @@ pub fn bind(fd: fd_t, address: Address) common.SetupError!Address {
 /// One datagram received without blocking, or null when none is queued (or on error;
 /// datagram transports tolerate loss). Longer datagrams are truncated to `buffer`.
 pub fn recvfrom(fd: fd_t, buffer: []u8) ?common.Datagram {
+    const result = recvfrom_nonblocking(fd, buffer) orelse return null;
+    return result catch null;
+}
+
+/// Sends one datagram without blocking. False if the kernel refused it (dropped).
+pub fn sendto(fd: fd_t, buffer: []const u8, address: Address) bool {
+    const result = sendto_nonblocking(fd, buffer, address) orelse return false;
+    _ = result catch return false;
+    return true;
+}
+
+/// One datagram received without blocking: null when none is queued, else the datagram or
+/// the error. Longer datagrams are truncated to `buffer`.
+pub fn recvfrom_nonblocking(fd: fd_t, buffer: []u8) ?common.RecvError!common.Datagram {
     assert(buffer.len > 0);
     var from: SockAddr = undefined;
     var from_len: socklen_t = @sizeOf(SockAddr);
     const flags = std.posix.MSG.DONTWAIT;
     const rc = system.recvfrom(fd, buffer.ptr, buffer.len, flags, &from.any, &from_len);
-    if (errno(rc) != .SUCCESS) return null;
+    const err = errno(rc);
+    if (err == .AGAIN or err == .INTR) return null;
+    if (err != .SUCCESS) return recv_error(err);
     const length: usize = @intCast(rc);
-    const address = from.to_address() orelse return null;
-    return .{ .length = @intCast(@min(length, buffer.len)), .from = address };
+    assert(length <= buffer.len);
+    const address = from.to_address() orelse return error.Unexpected;
+    const datagram: common.Datagram = .{ .length = @intCast(length), .from = address };
+    return datagram;
 }
 
-/// Sends one datagram without blocking. False if the kernel refused it (dropped).
-pub fn sendto(fd: fd_t, buffer: []const u8, address: Address) bool {
+/// Sends one datagram without blocking: null when the socket buffer is full, else the size
+/// sent (always all of `buffer`) or the error.
+pub fn sendto_nonblocking(
+    fd: fd_t,
+    buffer: []const u8,
+    address: Address,
+) ?common.SendError!usize {
     assert(buffer.len > 0);
     var to = SockAddr.from(address);
-    const flags = std.posix.MSG.DONTWAIT;
+    var flags: u32 = std.posix.MSG.DONTWAIT;
+    if (is_linux) flags |= std.posix.MSG.NOSIGNAL;
     const rc = system.sendto(fd, buffer.ptr, buffer.len, flags, &to.any, SockAddr.len(address));
-    return errno(rc) == .SUCCESS;
+    const err = errno(rc);
+    if (err == .AGAIN or err == .INTR) return null;
+    if (err != .SUCCESS) return send_error(err);
+    const size: usize = @intCast(rc);
+    return size;
 }
 
 /// The remote address of a connected socket, or null if unavailable (e.g. reset).

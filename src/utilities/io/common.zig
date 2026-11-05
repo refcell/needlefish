@@ -200,6 +200,8 @@ pub const Tag = enum(u8) {
     connect,
     recv,
     send,
+    recvfrom,
+    sendto,
     read,
     write,
     fsync,
@@ -215,6 +217,8 @@ pub fn Operation(comptime Fd: type) type {
         connect: struct { socket: Fd, address: Address, initiated: bool = false },
         recv: struct { socket: Fd, buffer: []u8 },
         send: struct { socket: Fd, buffer: []const u8 },
+        recvfrom: struct { socket: Fd, buffer: []u8 },
+        sendto: struct { socket: Fd, buffer: []const u8, address: Address },
         read: struct { fd: Fd, buffer: []u8, offset: u64 },
         write: struct { fd: Fd, buffer: []const u8, offset: u64 },
         fsync: struct { fd: Fd },
@@ -231,6 +235,8 @@ pub fn Result(comptime Fd: type) type {
         connect: ConnectError!void,
         recv: RecvError!usize,
         send: SendError!usize,
+        recvfrom: RecvError!Datagram,
+        sendto: SendError!usize,
         read: ReadError!usize,
         write: WriteError!usize,
         fsync: FsyncError!void,
@@ -247,6 +253,8 @@ pub fn canceled_result(comptime Fd: type, operation: Operation(Fd)) Result(Fd) {
         .connect => .{ .connect = error.Canceled },
         .recv => .{ .recv = error.Canceled },
         .send => .{ .send = error.Canceled },
+        .recvfrom => .{ .recvfrom = error.Canceled },
+        .sendto => .{ .sendto = error.Canceled },
         .read => .{ .read = error.Canceled },
         .write => .{ .write = error.Canceled },
         .fsync => .{ .fsync = error.Canceled },
@@ -334,6 +342,40 @@ pub fn Methods(comptime IO: type) type {
             assert(buffer.len > 0);
             submit(io, Context, context, .send, callback, completion, .{
                 .send = .{ .socket = socket, .buffer = buffer },
+            });
+        }
+
+        /// Receives one datagram on a UDP socket (see `Datagram`).
+        pub fn recvfrom(
+            io: *IO,
+            comptime Context: type,
+            context: Context,
+            comptime callback: Callback(IO, Context, .recvfrom),
+            completion: *IO.Completion,
+            socket: Fd,
+            buffer: []u8,
+        ) void {
+            assert(buffer.len > 0);
+            submit(io, Context, context, .recvfrom, callback, completion, .{
+                .recvfrom = .{ .socket = socket, .buffer = buffer },
+            });
+        }
+
+        /// Sends `buffer` as one datagram to `address`; `buffer` and `address` must stay valid
+        /// until the callback. A datagram is sent whole or not at all.
+        pub fn sendto(
+            io: *IO,
+            comptime Context: type,
+            context: Context,
+            comptime callback: Callback(IO, Context, .sendto),
+            completion: *IO.Completion,
+            socket: Fd,
+            buffer: []const u8,
+            address: Address,
+        ) void {
+            assert(buffer.len > 0);
+            submit(io, Context, context, .sendto, callback, completion, .{
+                .sendto = .{ .socket = socket, .buffer = buffer, .address = address },
             });
         }
 

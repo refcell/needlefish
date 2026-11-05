@@ -94,6 +94,9 @@ const LinuxIoUring = struct {
         next: ?*Completion = null,
         timespec: linux.kernel_timespec = undefined,
         sock_addr: os.SockAddr = undefined,
+        /// `recvfrom`/`sendto` state the kernel reads (and writes) until the CQE.
+        message: extern union { recv: linux.msghdr, send: linux.msghdr_const } = undefined,
+        iovec: extern union { recv: std.posix.iovec, send: std.posix.iovec_const } = undefined,
     };
 
     const methods = common.Methods(LinuxIoUring);
@@ -101,6 +104,8 @@ const LinuxIoUring = struct {
     pub const connect = methods.connect;
     pub const recv = methods.recv;
     pub const send = methods.send;
+    pub const recvfrom = methods.recvfrom;
+    pub const sendto = methods.sendto;
     pub const read = methods.read;
     pub const write = methods.write;
     pub const fsync = methods.fsync;
@@ -180,11 +185,12 @@ const LinuxIoUring = struct {
         os.shutdown(fd);
     }
 
-    /// The remote address of a connected socket, or null if unavailable.
-    /// Opens a non-blocking UDP socket (polled with `recvfrom_now`/`sendto_now`).
+    /// Opens a UDP socket: use the `recvfrom`/`sendto` completions, or poll with
+    /// `recvfrom_now`/`sendto_now`.
     pub fn open_socket_udp(io: *LinuxIoUring, family: Address.Family) common.SetupError!Fd {
         _ = io;
-        return os.socket_udp(family);
+        // Blocking for io_uring's recvmsg/sendmsg; the polled path passes MSG_DONTWAIT.
+        return os.socket_udp(family, .blocking);
     }
 
     pub fn bind_udp(io: *LinuxIoUring, fd: Fd, address: Address) common.SetupError!Address {
@@ -204,6 +210,7 @@ const LinuxIoUring = struct {
         return os.sendto(fd, buffer, address);
     }
 
+    /// The remote address of a connected socket, or null if unavailable.
     pub fn peer_address(io: *LinuxIoUring, fd: Fd) ?Address {
         _ = io;
         return os.peer_address(fd);
@@ -329,6 +336,22 @@ const LinuxIoUring = struct {
             },
             .recv => |op| try ring.recv(user_data, op.socket, .{ .buffer = op.buffer }, 0),
             .send => |op| try ring.send(user_data, op.socket, op.buffer, linux.MSG.NOSIGNAL),
+            .recvfrom => |op| try io.prepare_recvfrom(completion, user_data, op.socket, op.buffer),
+            .sendto => |op| blk: {
+                completion.sock_addr = os.SockAddr.from(op.address);
+                completion.iovec = .{ .send = .{ .base = op.buffer.ptr, .len = op.buffer.len } };
+                completion.message = .{ .send = .{
+                    .name = &completion.sock_addr.any,
+                    .namelen = os.SockAddr.len(op.address),
+                    .iov = @ptrCast(&completion.iovec.send),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                } };
+                const flags = linux.MSG.NOSIGNAL;
+                break :blk try ring.sendmsg(user_data, op.socket, &completion.message.send, flags);
+            },
             .read => |op| try ring.read(user_data, op.fd, .{ .buffer = op.buffer }, op.offset),
             .write => |op| try ring.write(user_data, op.fd, op.buffer, op.offset),
             .fsync => |op| try ring.fsync(user_data, op.fd, 0),
@@ -342,6 +365,31 @@ const LinuxIoUring = struct {
             },
             .close => |op| try ring.close(user_data, op.fd),
         };
+    }
+
+    fn received(completion: *const Completion, size: usize) common.RecvError!common.Datagram {
+        const from = completion.sock_addr.to_address() orelse return error.Unexpected;
+        return .{ .length = @intCast(size), .from = from };
+    }
+
+    fn prepare_recvfrom(
+        io: *LinuxIoUring,
+        completion: *Completion,
+        user_data: u64,
+        socket: Fd,
+        buffer: []u8,
+    ) error{SubmissionQueueFull}!*linux.io_uring_sqe {
+        completion.iovec = .{ .recv = .{ .base = buffer.ptr, .len = buffer.len } };
+        completion.message = .{ .recv = .{
+            .name = &completion.sock_addr.any,
+            .namelen = @sizeOf(os.SockAddr),
+            .iov = @ptrCast(&completion.iovec.recv),
+            .iovlen = 1,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        } };
+        return io.ring.recvmsg(user_data, socket, &completion.message.recv, 0);
     }
 
     fn store_result(io: *LinuxIoUring, completion: *Completion, cqe: linux.io_uring_cqe) void {
@@ -358,6 +406,10 @@ const LinuxIoUring = struct {
             .connect => .{ .connect = if (err == .SUCCESS) {} else os.connect_error(err) },
             .recv => .{ .recv = if (err == .SUCCESS) size else os.recv_error(err) },
             .send => .{ .send = if (err == .SUCCESS) size else os.send_error(err) },
+            .recvfrom => .{
+                .recvfrom = if (err == .SUCCESS) received(completion, size) else os.recv_error(err),
+            },
+            .sendto => .{ .sendto = if (err == .SUCCESS) size else os.send_error(err) },
             .read => .{ .read = if (err == .SUCCESS) size else os.read_error(err) },
             .write => .{ .write = if (err == .SUCCESS) size else os.write_error(err) },
             .fsync => .{ .fsync = if (err == .SUCCESS) {} else os.fsync_error(err) },
