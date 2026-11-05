@@ -234,6 +234,7 @@ pub fn Node(comptime IO: type) type {
             .set_recover_mode = admin_set_recover_mode,
             .reset_derivation_pipeline = admin_reset_derivation_pipeline,
             .post_unsafe_payload = admin_post_unsafe_payload,
+            .task_queue_length = admin_task_queue_length,
         };
         const base_vtable: base_rpc.VTable = .{
             .config = base_config,
@@ -859,6 +860,10 @@ pub fn Node(comptime IO: type) type {
             const node = from_context(context);
             node.driver.request_reset();
             node.logger.log(.info, "consensus", "derivation pipeline reset requested", .{});
+        }
+
+        fn admin_task_queue_length(context: *anyopaque) u64 {
+            return from_context(context).driver.queue.len();
         }
 
         fn admin_post_unsafe_payload(

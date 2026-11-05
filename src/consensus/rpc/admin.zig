@@ -6,8 +6,11 @@
 //! `admin_postUnsafePayload` hands the raw `OpExecutionPayloadEnvelope` JSON to the node,
 //! which decodes it and queues it like a gossiped unsafe block.
 //!
-//! Not implemented: `admin_overrideLeader` and conductor methods (no conductor), and
-//! `admin_refreshUpgradeSignal`.
+//! Without a conductor `admin_overrideLeader` fails like base/base's sequencer does with no
+//! conductor configured. `admin_refreshUpgradeSignal` needs the runtime-admin upgrade mode
+//! (only metrics-only exists), so it reports the signal as not configured (-32004).
+//! `dev_taskQueueLength` reports the engine task queue length.
+//! Not implemented: `admin_clearPendingP2pConnections` (needs a p2p dial-abort API).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -41,7 +44,12 @@ pub const VTable = struct {
     reset_derivation_pipeline: *const fn (context: *anyopaque) void,
     /// Queues an unsafe payload from its envelope JSON (`admin_postUnsafePayload`).
     post_unsafe_payload: *const fn (context: *anyopaque, envelope_json: []const u8) PostError!void,
+    /// Tasks waiting in the engine queue (`dev_taskQueueLength`).
+    task_queue_length: *const fn (context: *anyopaque) u64,
 };
+
+/// base/base `UPGRADE_SIGNAL_UNAVAILABLE_CODE`.
+pub const upgrade_signal_unavailable_code: i32 = -32004;
 
 pub const methods = [_]rpc.Method(*const Backend){
     .{ .name = "admin_sequencerActive", .handler = sequencer_active },
@@ -52,6 +60,9 @@ pub const methods = [_]rpc.Method(*const Backend){
     .{ .name = "admin_setRecoverMode", .handler = set_recover_mode },
     .{ .name = "admin_resetDerivationPipeline", .handler = reset_derivation_pipeline },
     .{ .name = "admin_postUnsafePayload", .handler = post_unsafe_payload },
+    .{ .name = "admin_overrideLeader", .handler = override_leader },
+    .{ .name = "admin_refreshUpgradeSignal", .handler = refresh_upgrade_signal },
+    .{ .name = "dev_taskQueueLength", .handler = task_queue_length },
     .{ .name = "healthz", .handler = healthz },
 };
 
@@ -100,6 +111,26 @@ fn conductor_enabled(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
     _ = backend;
     try call.writer.boolean(false); // No conductor: a single sequencer.
+}
+
+fn override_leader(backend: *const Backend, call: *Call) HandlerError!void {
+    try call.params.finish();
+    _ = try admin(backend, call);
+    // base/base: `LeaderOverrideError("No conductor configured")`, mapped to InternalError.
+    return call.fail(rpc.code.internal_error, "Internal error");
+}
+
+fn refresh_upgrade_signal(backend: *const Backend, call: *Call) HandlerError!void {
+    try call.params.finish();
+    assert(backend.version.len > 0);
+    const message = "upgrade signal not configured on this node";
+    return call.fail(upgrade_signal_unavailable_code, message);
+}
+
+fn task_queue_length(backend: *const Backend, call: *Call) HandlerError!void {
+    try call.params.finish();
+    const vtable = try admin(backend, call);
+    try call.writer.integer(vtable.task_queue_length(backend.context));
 }
 
 fn recover_mode(backend: *const Backend, call: *Call) HandlerError!void {
@@ -167,6 +198,7 @@ const StubNode = struct {
         .set_recover_mode = set_recover,
         .reset_derivation_pipeline = reset,
         .post_unsafe_payload = post,
+        .task_queue_length = queue_length,
     };
     const rollup_vtable: Backend.VTable = .{
         .sync_status = status_of,
@@ -204,6 +236,9 @@ const StubNode = struct {
     fn post(context: *anyopaque, envelope_json: []const u8) PostError!void {
         if (envelope_json[0] != '{') return error.InvalidPayload;
         of(context).posts += 1;
+    }
+    fn queue_length(context: *anyopaque) u64 {
+        return of(context).resets + 3;
     }
     fn status_of(_: *anyopaque) rollup.SyncStatus {
         return .{};
@@ -274,6 +309,19 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
         \\{"jsonrpc":"2.0","id":9,"method":"admin_postUnsafePayload","params":["0x00"]}
     , &buffer);
     try testing.expect(contains(invalid, "invalid execution payload envelope"));
+    const queue = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":10,"method":"dev_taskQueueLength"}
+    , &buffer);
+    try testing.expect(contains(queue, "\"result\":4"));
+    const leader = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":11,"method":"admin_overrideLeader"}
+    , &buffer);
+    try testing.expect(contains(leader, "-32603"));
+    const refresh = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":12,"method":"admin_refreshUpgradeSignal"}
+    , &buffer);
+    try testing.expect(contains(refresh, "-32004"));
+    try testing.expect(contains(refresh, "upgrade signal not configured on this node"));
     const health = call_text(&backend,
         \\{"jsonrpc":"2.0","id":6,"method":"healthz"}
     , &buffer);
@@ -304,7 +352,8 @@ test "admin rpc: seeded fuzz over method names and params" {
     const names = [_][]const u8{
         "admin_startSequencer",    "admin_stopSequencer",   "admin_setRecoverMode",
         "admin_recoverMode",       "admin_sequencerActive", "healthz",
-        "admin_postUnsafePayload",
+        "admin_postUnsafePayload", "admin_overrideLeader",  "admin_refreshUpgradeSignal",
+        "dev_taskQueueLength",
     };
     const params = [_][]const u8{
         "",                ",\"params\":[]",   ",\"params\":[true]",

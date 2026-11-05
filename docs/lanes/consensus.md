@@ -52,6 +52,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     conductorEnabled, healthz
   - [x] admin_postUnsafePayload: `engine_json.decode_unsafe_envelope` → `Driver.insert_unsafe` (same rules as gossip); RPC body limit raised to 1 MiB
   - [x] base_* RPC: `base_upgradeReadiness` (`rpc/base.zig`) over an upgrade-signal observer (`--upgrade-signal.contract` / `.l1-block-tag`, default contract per chain); metrics-only mode
+  - [x] admin_overrideLeader (no conductor: InternalError like base/base),
+    admin_refreshUpgradeSignal (-32004 outside runtime-admin mode), dev_taskQueueLength
+  - [ ] admin_clearPendingP2pConnections (needs a dial-abort API in `p2p.Service`)
+  - [ ] `ws_subscribe_{unsafe,safe,finalized}_head` and `dev_subscribe_engine_queue_size`
+    (needs websocket support in the RPC server)
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [x] `p2p`: `Node` embeds `p2p.Network(IO)` (`--p2p.*` flags, on by default, `--p2p.disabled`): gossiped blocks go to `Driver.insert_unsafe`, the sequencer publishes each sealed block; devnet verifier follows the sequencer's unsafe head over gossip.
   - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
@@ -60,6 +65,12 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary (done in `p2p.Network`
     through the io layer; the binary forwards every `--p2p.*` flag)
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
+  - [ ] Prometheus metrics endpoint (`--metrics.enabled/addr/port`) with base/base metric
+    names (heads, derivation, engine queue, sequencer, p2p)
+  - [ ] follow mode (base/base `service/follow`): follow a remote CL's safe/finalized heads
+    over RPC instead of deriving
+  - [ ] op-conductor client (`--conductor.rpc`): leader check before sequencing,
+    commitUnsafePayload, overrideLeader
   - [x] service: L1 head watcher (latest/safe/finalized polling, verified headers)
   - [x] service node stage 1: L1 watcher + engine label heads → optimism_* RPC server;
     `base consensus` subcommand with the docs/DEVNET.md flags
@@ -198,6 +209,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: admin_overrideLeader, admin_refreshUpgradeSignal, dev_taskQueueLength; backlog extended.
 - 2026-11-05: engine: startup recovers pruned safe/finalized heads from checkpoints or the earliest unpruned block.
 - 2026-11-05: service: durable safe/finalized checkpoints behind `--checkpoint.path`.
 - 2026-11-05: service: derivation and sequencing wait for EL sync, probing the engine every 2 s.
