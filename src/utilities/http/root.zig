@@ -17,6 +17,7 @@ pub const client = @import("client.zig");
 pub const Server = server.Server;
 pub const ResponseBuilder = server.ResponseBuilder;
 pub const Grow = server.Grow;
+pub const Deferred = server.Deferred;
 pub const Client = client.Client;
 
 test {
@@ -25,4 +26,5 @@ test {
     _ = @import("timeout_test.zig");
     _ = @import("framing_test.zig");
     _ = @import("large_test.zig");
+    _ = @import("deferred_test.zig");
 }

@@ -16,6 +16,14 @@
 //! so only handlers that size their output up front use the pool. With none free, the
 //! rebase fails like a full buffer.
 //!
+//! Deferred responses: a handler that cannot answer synchronously (a proxy waiting on an
+//! upstream) calls `ResponseBuilder.defer_response()` and keeps the returned `Deferred` token.
+//! The connection is parked with no operation in flight and the request bytes kept in its
+//! receive buffer, so the request's slices stay valid until the response is resumed with
+//! `resume_deferred`. A stale token (the connection timed out or the server stopped) is
+//! rejected. A parked connection that is not resumed within `io_timeout_ns` is answered with
+//! 504 and closed; `stop` answers parked connections with 503.
+//!
 //! Timeouts: the owner calls `tick()` from its event loop (every few hundred milliseconds).
 //! A connection waiting for a new request longer than `idle_timeout_ns`, or making no
 //! progress on a partial request or a response for `io_timeout_ns`, is shut down; its pending
@@ -61,9 +69,12 @@ pub fn reason_phrase(status: u16) []const u8 {
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Content Too Large",
+        429 => "Too Many Requests",
         415 => "Unsupported Media Type",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         else => "Unknown",
     };
 }
@@ -72,6 +83,19 @@ pub fn reason_phrase(status: u16) []const u8 {
 pub const Grow = struct {
     context: *anyopaque,
     acquire: *const fn (context: *anyopaque, size_bytes: usize) ?[]u8,
+};
+
+/// Identifies a parked (deferred) response: connection slot and its generation, so a token
+/// outlives neither a timeout nor a reuse of the slot.
+pub const Deferred = struct {
+    index: u32,
+    generation: u32,
+};
+
+/// Parks the connection that owns a response (set by the server; null outside it).
+pub const Park = struct {
+    context: *anyopaque,
+    park: *const fn (context: *anyopaque) Deferred,
 };
 
 /// Builds one response in the connection's send buffer. The body is written first through
@@ -91,6 +115,10 @@ pub const ResponseBuilder = struct {
     content_type: []const u8 = "application/json",
     extra_headers: [extra_headers_max]parser.Header = undefined,
     extra_headers_count: u32 = 0,
+    /// How to park this response's connection (null: deferral is not supported).
+    park: ?Park = null,
+    /// Set by `defer_response`: the server sends nothing when the handler returns.
+    deferred: ?Deferred = null,
 
     pub fn init(buffer: []u8) ResponseBuilder {
         assert(buffer.len > head_reserve_size);
@@ -128,6 +156,17 @@ pub const ResponseBuilder = struct {
         body.buffer = large[head_reserve_size..];
         assert(body.end == written);
         assert(body.buffer.len - body.end >= capacity);
+    }
+
+    /// Answers later: the server parks the connection when the handler returns, and the
+    /// response is written by `resume_deferred(token, ...)`. Anything written to this builder
+    /// is discarded. The request stays valid until then. May be called once per request.
+    pub fn defer_response(builder: *ResponseBuilder) Deferred {
+        const park = builder.park.?; // Deferral needs a server-provided builder.
+        assert(builder.deferred == null);
+        const token = park.park(park.context);
+        builder.deferred = token;
+        return token;
     }
 
     pub fn writer(builder: *ResponseBuilder) *std.Io.Writer {
@@ -193,7 +232,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         const Self = @This();
         const Fd = IO.Fd;
 
-        const State = enum { free, receiving, sending, closing };
+        /// `deferred`: parked by `defer_response`, no operation in flight.
+        const State = enum { free, receiving, sending, closing, deferred };
 
         const Connection = struct {
             server: *Self,
@@ -212,6 +252,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             last_progress_ns: u64 = 0,
             timed_out: bool = false,
             peer: Address = undefined,
+            /// Bumped whenever a deferred response is resumed or abandoned.
+            generation: u32 = 0,
         };
 
         io: *IO,
@@ -234,6 +276,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         responses_grown: u64 = 0,
         connections_rejected: u64 = 0,
         connections_timed_out: u64 = 0,
+        /// Deferred responses answered by the server (504 timeout or 503 on stop).
+        deferred_abandoned: u64 = 0,
 
         /// `server` must not move after `init`.
         pub fn init(
@@ -310,6 +354,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             for (server.connections) |*connection| {
                 const idle = connection.state == .receiving and connection.recv_size == 0;
                 if (idle) server.io.shutdown_now(connection.fd);
+                if (connection.state == .deferred) connection_abandon(connection, 503);
             }
             if (server.accept_pending) {
                 server.io.cancel(&server.accept_completion);
@@ -347,10 +392,15 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                         server.options.idle_timeout_ns
                     else
                         server.options.io_timeout_ns,
-                    .sending => server.options.io_timeout_ns,
+                    .sending, .deferred => server.options.io_timeout_ns,
                 };
                 if (timeout_ns == 0) continue;
                 if (now_ns -| connection.last_progress_ns < timeout_ns) continue;
+                if (connection.state == .deferred) {
+                    server.connections_timed_out += 1;
+                    connection_abandon(connection, 504);
+                    continue;
+                }
                 connection.timed_out = true;
                 server.connections_timed_out += 1;
                 server.io.shutdown_now(connection.fd);
@@ -461,18 +511,89 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                 },
                 .complete => |complete| {
                     assert(connection.large_index == null);
-                    var builder = ResponseBuilder.init(connection.send_buffer);
-                    builder.peer = connection.peer;
-                    if (server.options.large_send_buffers_max > 0) {
-                        builder.grow = .{ .context = connection, .acquire = large_acquire };
-                    }
+                    var builder = connection_builder(connection);
+                    builder.park = .{ .context = connection, .park = connection_park };
+                    connection.consumed = complete.consumed;
+                    connection.keep_alive = complete.message.keep_alive;
                     handler(server.context, &complete.message, &builder);
                     server.requests_handled += 1;
-                    connection.consumed = complete.consumed;
-                    connection.keep_alive = complete.message.keep_alive and !server.stopping;
+                    // Deferred: parked (or already resumed from inside the handler).
+                    if (builder.deferred != null) return;
+                    connection.keep_alive = connection.keep_alive and !server.stopping;
                     connection_send(connection, builder.finish(connection.keep_alive));
                 },
             }
+        }
+
+        /// A builder over the connection's send buffer, growable if large buffers exist.
+        fn connection_builder(connection: *Connection) ResponseBuilder {
+            assert(connection.large_index == null);
+            assert(connection.state == .receiving or connection.state == .deferred);
+            var builder = ResponseBuilder.init(connection.send_buffer);
+            builder.peer = connection.peer;
+            if (connection.server.options.large_send_buffers_max > 0) {
+                builder.grow = .{ .context = connection, .acquire = large_acquire };
+            }
+            return builder;
+        }
+
+        /// `Park.park`: parks the connection whose handler is running.
+        fn connection_park(context: *anyopaque) Deferred {
+            const connection: *Connection = @ptrCast(@alignCast(context));
+            assert(connection.state == .receiving);
+            assert(connection.consumed > 0);
+            // A body the handler wrote (and maybe grew) before deferring is discarded.
+            connection.large_index = null;
+            connection.state = .deferred;
+            connection.last_progress_ns = connection.server.io.now_monotonic_ns();
+            const first = @intFromPtr(connection.server.connections.ptr);
+            const index = (@intFromPtr(connection) - first) / @sizeOf(Connection);
+            assert(index < connection.server.connections.len);
+            return .{ .index = @intCast(index), .generation = connection.generation };
+        }
+
+        /// The parked connection for `token`, or null if the token is stale.
+        fn deferred_connection(server: *Self, token: Deferred) ?*Connection {
+            if (token.index >= server.connections.len) return null;
+            const connection = &server.connections[token.index];
+            if (connection.state != .deferred) return null;
+            if (connection.generation != token.generation) return null;
+            return connection;
+        }
+
+        /// True while `token` can still be resumed (its request slices are still valid).
+        pub fn deferred_valid(server: *Self, token: Deferred) bool {
+            return server.deferred_connection(token) != null;
+        }
+
+        /// Writes and sends the deferred response for `token` with `write(context, builder)`,
+        /// then serves pipelined requests as usual. Returns false (and calls nothing) if the
+        /// token is stale: the connection timed out or the server stopped.
+        pub fn resume_deferred(
+            server: *Self,
+            token: Deferred,
+            write_context: anytype,
+            comptime write: fn (@TypeOf(write_context), *ResponseBuilder) void,
+        ) bool {
+            const connection = server.deferred_connection(token) orelse return false;
+            assert(connection.large_index == null);
+            connection.generation +%= 1;
+            var builder = connection_builder(connection);
+            write(write_context, &builder);
+            assert(builder.deferred == null);
+            connection.keep_alive = connection.keep_alive and !server.stopping;
+            connection_send(connection, builder.finish(connection.keep_alive));
+            assert(connection.state == .sending);
+            return true;
+        }
+
+        /// Answers a parked connection with `status` and closes it; its token goes stale.
+        fn connection_abandon(connection: *Connection, status: u16) void {
+            assert(connection.state == .deferred);
+            assert(status >= 500);
+            connection.generation +%= 1;
+            connection.server.deferred_abandoned += 1;
+            connection_reply_error(connection, status);
         }
 
         /// `Grow.acquire` for a connection's response: the first large buffer no other
@@ -481,7 +602,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             const connection: *Connection = @ptrCast(@alignCast(context));
             const server = connection.server;
             assert(connection.large_index == null);
-            assert(connection.state == .receiving);
+            assert(connection.state == .receiving or connection.state == .deferred);
             const buffer_size = server.options.large_send_buffer_size;
             if (size_bytes > buffer_size) return null;
             var index: u32 = 0;
@@ -504,7 +625,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
 
         /// The response is sent (or abandoned): its large buffer is free again.
         fn connection_release_large(connection: *Connection) void {
-            assert(connection.state == .sending or connection.state == .receiving);
+            assert(connection.state != .free and connection.state != .closing);
             connection.large_index = null;
         }
 
@@ -546,6 +667,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             std.mem.copyForwards(u8, connection.recv_buffer[0..rest.len], rest);
             connection.recv_size = @intCast(rest.len);
             connection.consumed = 0;
+            connection.state = .receiving;
             connection_process(connection);
         }
 
