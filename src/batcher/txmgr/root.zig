@@ -42,6 +42,10 @@ pub const Config = struct {
     /// Calldata mode: also load the KZG prover and blob buffers so `force_blobs` can switch
     /// new transactions to blobs at runtime (base/base `force_blobs_when_throttling`).
     blob_override: bool = false,
+    /// Blob sidecar form: 0 = EIP-4844 blob proofs, 1 = EIP-7594 cell proofs (Osaka L1s
+    /// accept only version 1; pre-Osaka ones only version 0). Version 1 builds the cell
+    /// prover at startup.
+    sidecar_version: u1 = 0,
     /// L1 blocks a tx must be buried under before its slot is freed (base/base
     /// `--num-confirmations`; 1 = included in the latest block).
     confirmations: u64 = 1,
@@ -88,9 +92,11 @@ pub const Slot = struct {
     proofs: [blobs_per_tx_max]kzg.Proof = @splat(@splat(0)),
     blob_count: u8 = 0,
     blob_fee: u128 = 0,
+    /// Sidecar version 1 only: 128 cell proofs per blob, computed once at submit.
+    cell_proofs: ?*[blobs_per_tx_max]kzg.CellProofs = null,
 };
 
-pub const Error = rpc.Error || rpc.DecodeError || txdata.SignError || kzg.Error ||
+pub const Error = rpc.Error || rpc.DecodeError || txdata.SignError || kzg.Error || kzg.CellError ||
     blobs.EncodeError || error{NoFreeSlot};
 
 /// Upper bound of one blob's share of a blob transaction's network encoding.
@@ -109,6 +115,7 @@ pub const TxManager = struct {
     raw_buffer: []u8,
     params_buffer: []u8,
     prover: ?*kzg.Prover,
+    cell_prover: ?*kzg.CellProver = null,
     /// Send new transactions as blobs even in calldata mode (needs `blob_override`).
     /// Pending ones keep their type: geth never replaces across blob and non-blob txs.
     force_blobs: bool = false,
@@ -131,14 +138,22 @@ pub const TxManager = struct {
             slot.* = .{ .data = try allocator.alloc(u8, config.tx_data_bytes_max) };
             initialized += 1;
             for (slot.blobs[0..blob_count]) |*blob| blob.* = try allocator.create(kzg.Blob);
+            if (blob_count > 0 and config.sidecar_version == 1) {
+                slot.cell_proofs = try allocator.create([blobs_per_tx_max]kzg.CellProofs);
+            }
         }
-        const blob_bytes = @as(usize, blob_count) * blob_network_bytes_per_blob + 1024;
+        const per_blob = blob_network_bytes_per_blob +
+            @as(usize, config.sidecar_version) * kzg.cell_proofs_per_blob * (1 + 48);
+        const blob_bytes = @as(usize, blob_count) * per_blob + 1024;
         const raw_length = @max(config.tx_data_bytes_max + 512, blob_bytes);
         const raw_buffer = try allocator.alloc(u8, raw_length);
         errdefer allocator.free(raw_buffer);
         const params_buffer = try allocator.alloc(u8, 2 * raw_buffer.len + 16);
         errdefer allocator.free(params_buffer);
         const prover = if (use_blobs) try create_prover(allocator) else null;
+        errdefer if (prover) |created| destroy_prover(allocator, created);
+        const cells = use_blobs and config.sidecar_version == 1;
+        const cell_prover = if (cells) try create_cell_prover(allocator) else null;
         return .{
             .config = config,
             .slots = slots,
@@ -146,6 +161,7 @@ pub const TxManager = struct {
             .raw_buffer = raw_buffer,
             .params_buffer = params_buffer,
             .prover = prover,
+            .cell_prover = cell_prover,
         };
     }
 
@@ -154,6 +170,19 @@ pub const TxManager = struct {
         for (slot.blobs) |maybe_blob| {
             if (maybe_blob) |blob| allocator.destroy(blob);
         }
+        if (slot.cell_proofs) |proofs| allocator.destroy(proofs);
+    }
+
+    fn destroy_prover(allocator: std.mem.Allocator, prover: *kzg.Prover) void {
+        prover.deinit(allocator);
+        allocator.destroy(prover);
+    }
+
+    fn create_cell_prover(allocator: std.mem.Allocator) !*kzg.CellProver {
+        const prover = try allocator.create(kzg.CellProver);
+        errdefer allocator.destroy(prover);
+        prover.* = try kzg.CellProver.init(allocator);
+        return prover;
     }
 
     fn create_prover(allocator: std.mem.Allocator) !*kzg.Prover {
@@ -166,7 +195,8 @@ pub const TxManager = struct {
     pub fn deinit(manager: *TxManager, allocator: std.mem.Allocator) void {
         for (manager.slots) |slot| destroy_blobs(allocator, slot);
         allocator.free(manager.slots);
-        if (manager.prover) |prover| {
+        if (manager.prover) |prover| destroy_prover(allocator, prover);
+        if (manager.cell_prover) |prover| {
             prover.deinit(allocator);
             allocator.destroy(prover);
         }
@@ -232,7 +262,11 @@ pub const TxManager = struct {
                 const blob = slot.blobs[index].?;
                 try blobs.encode(tx_data, blob);
                 slot.commitments[index] = try prover.commitment(blob);
-                slot.proofs[index] = try prover.blob_proof(blob, &slot.commitments[index]);
+                if (manager.cell_prover) |cell_prover| {
+                    try cell_prover.cell_proofs(blob, &slot.cell_proofs.?[index]);
+                } else {
+                    slot.proofs[index] = try prover.blob_proof(blob, &slot.commitments[index]);
+                }
             }
             if (slot.blob_count == 0) return false;
         } else {
@@ -388,11 +422,17 @@ pub const TxManager = struct {
             .to = manager.config.to,
             .versioned_hashes = hashes[0..count],
         }, &hash_buffer, manager.config.private_key);
-        const sidecar: blob_tx.Sidecar = .{
+        var sidecar: blob_tx.Sidecar = .{
             .blobs = blob_list[0..count],
             .commitments = slot.commitments[0..count],
             .proofs = slot.proofs[0..count],
         };
+        if (slot.cell_proofs) |cell_proofs| {
+            const flat: *const [blobs_per_tx_max * kzg.cell_proofs_per_blob]kzg.Proof =
+                @ptrCast(cell_proofs);
+            sidecar.version = 1;
+            sidecar.proofs = flat[0 .. @as(usize, count) * kzg.cell_proofs_per_blob];
+        }
         return .{ blob_tx.encode_network(envelope, sidecar, manager.raw_buffer), envelope.hash() };
     }
 
@@ -806,6 +846,51 @@ const ListFrames = struct {
         return list.frames[list.next_index];
     }
 };
+
+test "txmgr: sidecar version 1 sends 128 verified-shape cell proofs per blob" {
+    if (!kzg_cells_heavy) return error.SkipZigTest; // FK20 setup takes minutes in Debug.
+    const rlp = @import("../../common/rlp/root.zig");
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var l1: FakeL1 = .{ .mined_nonce = 0 };
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 1024 * 1024,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    var manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 1,
+        .tx_data_bytes_max = 4096,
+        .data_availability = .blobs,
+        .blobs_per_tx = 2,
+        .sidecar_version = 1,
+    });
+    defer manager.deinit(testing.allocator);
+    var frames: ListFrames = .{ .frames = &.{ "\x00frame-one", "\x00frame-two" } };
+    try testing.expect(try manager.submit_from(&client, frames.source(), 0));
+    const slot = &manager.slots[0];
+    try testing.expectEqual(@as(u8, 2), slot.blob_count);
+    for (slot.cell_proofs.?[0..2]) |*proofs| {
+        for (proofs) |*proof| try testing.expect(proof[0] & 0x80 != 0);
+    }
+    // After the signed body comes the wrapper version byte 0x01.
+    const list_prefix = l1.last_raw_prefix[1];
+    const outer_header_length: usize = 1 + list_prefix - 0xf7;
+    var outer = rlp.Decoder.init(l1.last_raw_prefix[1 + outer_header_length ..]);
+    _ = try outer.raw();
+    try testing.expectEqual(@as(u8, 1), try outer.int(u8));
+    // A resend re-signs only; the cell proofs are reused.
+    const first_proof = slot.cell_proofs.?[1][127];
+    _ = try manager.poll(&client, 100_000);
+    try testing.expectEqual(@as(u32, 2), l1.sends);
+    try testing.expectEqualSlices(u8, &first_proof, &slot.cell_proofs.?[1][127]);
+}
+
+const kzg_cells_heavy = @import("../../common/crypto/kzg/root.zig").cells.heavy_tests;
 
 test "txmgr: blob mode packs up to blobs_per_tx frames per transaction" {
     const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));

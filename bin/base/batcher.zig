@@ -22,6 +22,7 @@ const usage =
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
     \\         --network-timeout S (0 disables) --compressed-size-target B
     \\         --brotli-quality 0-11 --publish-max-retries N --publish-retry-delay D
+    \\         --blob-sidecar-version 0|1 (1: EIP-7594 cell proofs, for Osaka L1s)
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
     \\         [--shadow.enabled --shadow.inbox ADDR --shadow.validator-rollup-rpc URL
@@ -86,6 +87,8 @@ const Flags = struct {
     compressed_size_target: u32 = 0,
     brotli_quality: u4 = batcher.comp.brotli.quality_default,
     shadow: shadow_mode.Settings = .{},
+    /// 1 = EIP-7594 cell-proof sidecars (base/base default, Osaka L1s); 0 = EIP-4844.
+    blob_sidecar_version: u1 = 1,
     publish_max_retries: u8 = 10,
     publish_retry_delay_ms: u64 = 1_000,
 };
@@ -228,6 +231,7 @@ fn service_config(
             .publish_max_retries = flags.publish_max_retries,
             .publish_retry_delay_ms = flags.publish_retry_delay_ms,
             .blob_override = force_blobs,
+            .sidecar_version = flags.blob_sidecar_version,
             .slots_max = flags.pending_max,
             .confirmations = flags.confirmations,
             .min_tip_wei = flags.min_tip_wei,
@@ -438,6 +442,10 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
         flags.publish_max_retries = try parse(u8, value, 10);
     } else if (eql(u8, arg, "--publish-retry-delay")) {
         flags.publish_retry_delay_ms = try parse_duration_ms(value);
+    } else if (eql(u8, arg, "--blob-sidecar-version")) {
+        const version = try parse(u8, value, 10);
+        if (version > 1) return error.InvalidBlobSidecarVersion;
+        flags.blob_sidecar_version = @intCast(version);
     } else if (eql(u8, arg, "--brotli-quality")) {
         const quality = try parse(u8, value, 10);
         if (quality > batcher.comp.brotli.quality_max) return error.InvalidBrotliQuality;
@@ -689,6 +697,11 @@ test "batcher: flags" {
     const retry_flags = try parse_flags(&retry);
     try std.testing.expectEqual(@as(u8, 3), retry_flags.publish_max_retries);
     try std.testing.expectEqual(@as(u64, 250), retry_flags.publish_retry_delay_ms);
+    try std.testing.expectEqual(@as(u1, 1), (try parse_flags(&.{})).blob_sidecar_version);
+    const sidecar = [_][]const u8{ "--blob-sidecar-version", "0" };
+    try std.testing.expectEqual(@as(u1, 0), (try parse_flags(&sidecar)).blob_sidecar_version);
+    const sidecar_bad = [_][]const u8{ "--blob-sidecar-version", "2" };
+    try std.testing.expectError(error.InvalidBlobSidecarVersion, parse_flags(&sidecar_bad));
     const quality = [_][]const u8{ "--brotli-quality", "11" };
     try std.testing.expectEqual(@as(u4, 11), (try parse_flags(&quality)).brotli_quality);
     try std.testing.expectEqual(@as(u4, 9), (try parse_flags(&.{})).brotli_quality);
@@ -740,6 +753,7 @@ const fuzz_flag_names = [_][]const u8{
     "--publish-retry-delay",
     "--shadow.enabled",
     "--shadow.inbox",
+    "--blob-sidecar-version",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 

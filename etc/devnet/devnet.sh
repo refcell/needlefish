@@ -109,7 +109,7 @@ up() {
   start_consensus
   start batcher batcher --rollup-config "$DIR/rollup.json" --l1 "$l1" \
     --sequencer-urls "$seq_el=http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
-    --metrics.port "$PORT_BATCHER_METRICS"
+    --metrics.port "$PORT_BATCHER_METRICS" --blob-sidecar-version 0 # Dev L1: Osaka off.
   sleep 1
   all_alive
   log "up; 'just devnet status' to inspect, 'just devnet smoke' to verify"

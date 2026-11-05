@@ -4,7 +4,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 `just devnet` recipes. Goal: **`just devnet up` brings up a working all-Zig devnet.**
 
 ## Backlog
-- [ ] (from crypto lane) Osaka blob txs carry EIP-7594 cell proofs (sidecar version 1):
+- [x] (from crypto lane) Osaka blob txs carry EIP-7594 cell proofs (sidecar version 1):
   use `common.crypto.kzg.cells.compute_cells_and_kzg_proofs` with `Settings.init` and
   `settings.attach_prover_tables(&tables)` (one static ~25 MiB `fk20.Tables`): 93 ms per blob
   instead of 202 ms; proofs are identical with or without tables.
@@ -223,3 +223,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `base_batcher_balance_gwei` gauge (eth_getBalance every 12 s like base/base;
   gwei because our gauges are integers; a failed read keeps the last value). Live: 10^13
   gwei (the 10,000 ETH dev allocation). Smoke passes.
+- 2026-11-05: EIP-7594 sidecars: `--blob-sidecar-version 0|1` (default 1 like base/base;
+  devnet passes 0 because the dev L1 keeps Osaka off and rejects version 1). Version 1
+  builds `blobs.kzg.CellProver` (FK20 tables) at startup and sends 128 cell proofs per blob
+  with the wrapper version byte. Heavy tests run in ReleaseSafe only (setup takes minutes
+  in Debug); a u8 `count * 128` overflow was caught there.
