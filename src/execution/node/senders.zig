@@ -2,9 +2,10 @@
 //!
 //! Recovering a sender (secp256k1 ecrecover, about 30 us) dominates the cost of executing
 //! simple transactions, and it is a pure function of the raw transaction, so a block's
-//! senders are recovered up front on scoped threads (spawned and joined per call; the
-//! calling thread works too, and every thread claims small batches from a shared atomic
-//! counter so fast and slow cores stay busy until the end). The result is identical
+//! senders are recovered on scoped threads (spawned and joined per block) claiming small
+//! batches in order from a shared atomic counter, while the calling thread executes the
+//! transactions whose batches are done (`Pipeline`), helping with unclaimed batches
+//! whenever it would otherwise wait. The result is identical
 //! for any thread count, so execution stays deterministic. Entries that cannot be
 //! recovered (deposits, undecodable or invalid signatures) are left null and the
 //! executor recovers (and rejects) them inline as before.
@@ -26,12 +27,19 @@ const stack_size_bytes = 256 * 1024;
 
 /// Transactions claimed per grab from the shared counter: small enough to balance
 /// fast and slow cores, large enough that the atomic is noise.
-const batch_size = 8;
+pub const batch_size = 8;
 
-/// Work shared by the calling thread and the workers of one `recover` call.
+/// Done flags `Pipeline` needs for `transactions` transactions (one per batch).
+pub fn batches_for(transactions: usize) usize {
+    return std.math.divCeil(usize, transactions, batch_size) catch unreachable;
+}
+
+/// Work shared by the calling thread and the workers of one pipeline.
 const Job = struct {
     raws: []const []const u8,
     out: []?Address,
+    /// Per batch: 1 once its senders are written (release), read with acquire.
+    done: []std.atomic.Value(u32),
     recoverer: consensus.Recoverer,
     next: std.atomic.Value(u32) = .init(0),
 
@@ -40,11 +48,75 @@ const Job = struct {
         const count: u32 = @intCast(job.raws.len);
         var grabs: u32 = 0;
         while (grabs <= count / batch_size) : (grabs += 1) {
-            const start = job.next.fetchAdd(batch_size, .monotonic);
-            if (start >= count) return;
-            const end = @min(start + batch_size, count);
-            recover_range(job.raws[start..end], job.out[start..end], job.recoverer);
+            if (!job.claim_one()) return;
         }
+    }
+
+    /// Recovers the next unclaimed batch; false when every batch is claimed.
+    fn claim_one(job: *Job) bool {
+        const count: u32 = @intCast(job.raws.len);
+        const start = job.next.fetchAdd(batch_size, .monotonic);
+        if (start >= count) return false;
+        const end = @min(start + batch_size, count);
+        recover_range(job.raws[start..end], job.out[start..end], job.recoverer);
+        job.done[start / batch_size].store(1, .release);
+        return true;
+    }
+};
+
+/// Recovery overlapped with execution: workers recover batches in order while the
+/// caller executes; `wait_for(i)` returns once `out[i]` is written, recovering unclaimed
+/// batches itself instead of idling. `finish` joins the workers and must run (also on
+/// error) before `out`, `done` or the pipeline go out of scope.
+pub const Pipeline = struct {
+    job: Job,
+    handles: [threads_max]?std.Thread = @splat(null),
+    workers: u32 = 0,
+
+    pub fn start(
+        pipeline: *Pipeline,
+        raws: []const []const u8,
+        out: []?Address,
+        done: []std.atomic.Value(u32),
+        recoverer: consensus.Recoverer,
+        threads: u32,
+    ) void {
+        assert(out.len == raws.len);
+        assert(done.len >= batches_for(raws.len));
+        assert(threads <= threads_max);
+        assert(raws.len <= std.math.maxInt(u32) - batch_size);
+        for (done[0..batches_for(raws.len)]) |*flag| flag.store(0, .monotonic);
+        const job: Job = .{ .raws = raws, .out = out, .done = done, .recoverer = recoverer };
+        pipeline.* = .{ .job = job };
+        if (raws.len < parallel_transactions_min or threads == 0) return; // Caller recovers.
+        // No more workers than batches beyond the caller's first.
+        const workers = @min(threads, batches_for(raws.len) - 1);
+        for (pipeline.handles[0..workers]) |*handle| {
+            // A failed spawn only means less parallelism: the caller drains the rest.
+            handle.* = std.Thread.spawn(
+                .{ .stack_size = stack_size_bytes },
+                Job.work,
+                .{&pipeline.job},
+            ) catch null;
+        }
+        pipeline.workers = @intCast(workers);
+    }
+
+    /// Blocks until `out[index]` is written.
+    pub fn wait_for(pipeline: *Pipeline, index: usize) void {
+        assert(index < pipeline.job.raws.len);
+        const flag = &pipeline.job.done[index / batch_size];
+        while (flag.load(.acquire) == 0) {
+            if (!pipeline.job.claim_one()) std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Recovers whatever is left and joins the workers.
+    pub fn finish(pipeline: *Pipeline) void {
+        pipeline.job.work();
+        for (pipeline.handles[0..pipeline.workers]) |handle| if (handle) |thread| thread.join();
+        pipeline.workers = 0;
+        assert(pipeline.job.next.load(.monotonic) >= pipeline.job.raws.len);
     }
 };
 
@@ -56,26 +128,14 @@ pub fn recover(
     recoverer: consensus.Recoverer,
     threads: u32,
 ) void {
-    assert(out.len == raws.len);
-    assert(threads <= threads_max);
-    assert(raws.len <= std.math.maxInt(u32) - batch_size);
-    if (raws.len < parallel_transactions_min or threads == 0) {
+    var done_buffer: [batches_for(4096)]std.atomic.Value(u32) = undefined;
+    if (raws.len > 4096) {
         recover_range(raws, out, recoverer);
         return;
     }
-    var job: Job = .{ .raws = raws, .out = out, .recoverer = recoverer };
-    // No more workers than batches beyond the caller's first.
-    const batches: u32 = @intCast(std.math.divCeil(usize, raws.len, batch_size) catch unreachable);
-    const workers = @min(threads, batches - 1);
-    var handles: [threads_max]?std.Thread = @splat(null);
-    for (handles[0..workers]) |*handle| {
-        // A failed spawn only means less parallelism: the remaining threads drain it.
-        handle.* = std.Thread.spawn(.{ .stack_size = stack_size_bytes }, Job.work, .{&job}) catch
-            null;
-    }
-    job.work();
-    for (handles[0..workers]) |handle| if (handle) |thread| thread.join();
-    assert(job.next.load(.monotonic) >= raws.len);
+    var pipeline: Pipeline = undefined;
+    pipeline.start(raws, out, &done_buffer, recoverer, threads);
+    pipeline.finish();
 }
 
 fn recover_range(raws: []const []const u8, out: []?Address, recoverer: consensus.Recoverer) void {
@@ -127,10 +187,26 @@ fn check_matches_sequential(prng: *Prng, count: usize, threads: u32) !void {
     recover_range(raws[0..count], expected[0..count], consensus.recover_address);
     var actual: [80]?Address = undefined;
     recover(raws[0..count], actual[0..count], consensus.recover_address, threads);
-    for (expected[0..count], actual[0..count]) |want, got| {
-        try testing.expectEqual(want == null, got == null);
-        if (want) |address| try testing.expectEqualSlices(u8, &address.bytes, &got.?.bytes);
+    for (expected[0..count], actual[0..count]) |want, got| try expect_same(want, got);
+    // Pipelined: each entry is final as soon as `wait_for` returns, whatever the order.
+    var piped: [80]?Address = undefined;
+    var done: [batches_for(80)]std.atomic.Value(u32) = undefined;
+    var pipeline: Pipeline = undefined;
+    pipeline.start(raws[0..count], piped[0..count], &done, consensus.recover_address, threads);
+    defer pipeline.finish();
+    const stride = prng.range(1, 9);
+    var visited: usize = 0;
+    var index: usize = if (count > 0) prng.below(count) else 0;
+    while (visited < count) : (visited += 1) {
+        pipeline.wait_for(index);
+        try expect_same(expected[index], piped[index]);
+        index = (index + stride) % count;
     }
+}
+
+fn expect_same(want: ?Address, got: ?Address) !void {
+    try testing.expectEqual(want == null, got == null);
+    if (want) |address| try testing.expectEqualSlices(u8, &address.bytes, &got.?.bytes);
 }
 
 test "senders: parallel recovery matches sequential recovery" {

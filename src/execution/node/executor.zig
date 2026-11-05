@@ -132,6 +132,8 @@ pub const Executor = struct {
     recovery_threads: u32,
     /// Senders recovered up front by `execute_block` (one per transaction).
     senders: []?primitives.Address,
+    /// Per-batch completion flags of the recovery pipeline.
+    recovery_done: []std.atomic.Value(u32),
     /// The sender of the transaction being applied, when already known.
     known_sender: ?primitives.Address = null,
     /// Index of the last transaction rejected by `execute_block`.
@@ -167,6 +169,9 @@ pub const Executor = struct {
         const scratch = try lazy.alloc(allocator, u8, config.scratch_bytes);
         errdefer lazy.free(allocator, scratch);
         const senders = try allocator.alloc(?primitives.Address, config.transactions_max);
+        errdefer allocator.free(senders);
+        const batches = senders_module.batches_for(config.transactions_max);
+        const recovery_done = try allocator.alloc(std.atomic.Value(u32), batches);
         return .{
             .spec = spec,
             .backend = backend,
@@ -178,11 +183,13 @@ pub const Executor = struct {
             .recoverer = consensus.recover_address,
             .recovery_threads = config.recovery_threads,
             .senders = senders,
+            .recovery_done = recovery_done,
         };
     }
 
     pub fn deinit(executor: *Executor, allocator: std.mem.Allocator) void {
         allocator.free(executor.senders);
+        allocator.free(executor.recovery_done);
         lazy.free(allocator, executor.scratch);
         executor.machine.deinit(allocator);
         allocator.destroy(executor.machine);
@@ -201,18 +208,26 @@ pub const Executor = struct {
     ) Error!Executed {
         executor.invalid_index = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        // Senders are recovered on worker threads while earlier transactions execute.
         const recovered = executor.recovery_threads > 0;
+        var pipeline: senders_module.Pipeline = undefined;
         if (recovered) {
             const senders = executor.senders[0..transactions.len];
             const threads = executor.recovery_threads;
-            senders_module.recover(transactions, senders, executor.recoverer, threads);
+            const done = executor.recovery_done;
+            pipeline.start(transactions, senders, done, executor.recoverer, threads);
         }
+        defer if (recovered) pipeline.finish();
         var building = try executor.begin_block(block);
         errdefer executor.abort_block();
         defer executor.known_sender = null;
         for (transactions, 0..) |raw, index| {
             executor.invalid_index = @intCast(index);
-            executor.known_sender = if (recovered) executor.senders[index] else null;
+            executor.known_sender = null;
+            if (recovered) {
+                pipeline.wait_for(index);
+                executor.known_sender = executor.senders[index];
+            }
             try executor.apply(&building, raw);
         }
         executor.known_sender = null;
