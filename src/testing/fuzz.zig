@@ -109,7 +109,7 @@ pub fn run_bytes(
 /// `Smith` replays `.in` bytes literally: a value reads 8 little-endian bytes and
 /// falls back to its minimum when they miss the range, `eos` ends on any nonzero
 /// byte, and a slice reads a u32 length. Uniform random bytes therefore yield
-/// minimums, instant loop ends, and empty slices. Half of the inputs are words
+/// minimums, instant loop ends, and empty slices. Three quarters of the inputs are words
 /// instead: little-endian u64s with skewed-small values, which land in typical ranges
 /// and read as mostly-zero `eos` bytes.
 fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
@@ -122,7 +122,7 @@ fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
     };
     const len: usize = @intCast(prng.range(0, len_max));
     const input = buffer[0..len];
-    if (prng.chance(1, 2)) {
+    if (prng.chance(3, 4)) {
         generate_words(&prng, input);
         return input;
     }
@@ -145,11 +145,15 @@ fn generate(buffer: []u8, seed: u64, input_size_max: u32) []const u8 {
 fn generate_words(prng: *Prng, input: []u8) void {
     var offset: usize = 0;
     while (offset < input.len) : (offset += 8) {
+        // Spread over small ranges: booleans and `u1`s accept only 0 or 1, enum-like
+        // selectors a handful of values.
         const word: u64 = switch (prng.below(8)) {
-            // Booleans and `u1`s accept only 0 or 1.
-            0, 1 => prng.below(2),
-            2, 3 => prng.below(16),
-            4, 5 => prng.below(256),
+            0 => prng.below(2),
+            1 => prng.below(4),
+            2 => prng.below(8),
+            3 => prng.below(16),
+            4 => prng.below(64),
+            5 => prng.below(256),
             6 => prng.below(1 << 16),
             else => prng.int(u64),
         };

@@ -123,3 +123,7 @@ provably robust.
   swarm; 3000 seeds green. Found: a fresh txmgr adopts `pending` nonces and cannot
   recover an evicted one (noted for the batcher lane).
 - 2026-11-05: disc-service fuzz target trimmed to 32 seeded iterations (was 2.7 s).
+- 2026-11-05: fuzz targets for tx field decoders (TxKind, HashList, AccessList,
+  AuthorizationList: canonical re-encode, iterators walk the counted items) and legacy
+  `v` decoding (inverts EIP-155 encoding). Seeded words now 3/4 of inputs with a wider
+  small-value spread. Note: `-Dtest-filter` takes one substring; `a|b` matches nothing.

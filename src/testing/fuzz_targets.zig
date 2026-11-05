@@ -491,3 +491,148 @@ fn fuzz_rlp_codec(_: void, smith: *Smith) anyerror!void {
 test "fuzz_targets: rlp comptime codec is canonical and round trips" {
     try fuzz.run({}, fuzz_rlp_codec, .{ .iterations = 512 });
 }
+
+// ------------------------------------------------------------------ tx fields
+
+const tx_fields = @import("../common/consensus/tx_fields.zig");
+const signature_module = @import("../common/consensus/signature.zig");
+const primitives = @import("../common/primitives/root.zig");
+const field_bytes_max = 1024;
+
+/// Anything a field decoder accepts re-encodes byte-identically, and the list iterators
+/// (which `catch unreachable` on structure decoding validated) walk exactly the counted
+/// items.
+fn check_field_canonical(comptime T: type, input: []const u8) !void {
+    const value = rlp.decode_exact(T, input) catch return;
+    var buffer: [field_bytes_max + 16]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, input, rlp.encode_to(&buffer, value));
+    if (T == tx_fields.AccessList) {
+        var iterator = value.iterator();
+        var addresses: u32 = 0;
+        var keys: u32 = 0;
+        while (iterator.next()) |item| : (addresses += 1) {
+            for (0..item.storage_keys.count()) |index| _ = item.storage_keys.get(index);
+            keys += @intCast(item.storage_keys.count());
+        }
+        try std.testing.expectEqual(value.address_count, addresses);
+        try std.testing.expectEqual(value.storage_key_count, keys);
+    } else if (T == tx_fields.AuthorizationList) {
+        var iterator = value.iterator();
+        var count: u32 = 0;
+        while (iterator.next()) |_| count += 1;
+        try std.testing.expectEqual(value.count, count);
+    } else if (T == tx_fields.HashList) {
+        for (0..value.count()) |index| _ = value.get(index);
+    }
+}
+
+/// A small selector or count. Smith maps an out-of-range word to the range minimum, so
+/// narrow ranges come out almost always 0; a reduced `u8` spreads evenly instead.
+fn draw_below(smith: *Smith, comptime n: u8) u8 {
+    comptime assert(n > 0);
+    return smith.value(u8) % n;
+}
+
+fn draw_hash(smith: *Smith) primitives.B256 {
+    var hash: primitives.B256 = undefined;
+    smith.bytes(&hash.bytes);
+    return hash;
+}
+
+fn draw_address(smith: *Smith) primitives.Address {
+    var address: primitives.Address = undefined;
+    smith.bytes(&address.bytes);
+    return address;
+}
+
+/// Encodes a valid field of kind `which` into `out`.
+fn build_field(smith: *Smith, which: u8, out: []u8) []u8 {
+    assert(out.len >= field_bytes_max);
+    var payload: [field_bytes_max - 16]u8 = undefined;
+    var keys: [3][3]primitives.B256 = undefined;
+    for (&keys) |*row| for (row) |*key| {
+        key.* = draw_hash(smith);
+    };
+    switch (which) {
+        0 => {
+            const kind: tx_fields.TxKind = if (smith.value(bool)) .create else .{
+                .call = draw_address(smith),
+            };
+            return rlp.encode_to(out, kind);
+        },
+        1 => {
+            const count = draw_below(smith, 4);
+            return rlp.encode_to(out, tx_fields.HashList.build(&payload, keys[0][0..count]));
+        },
+        2 => {
+            var items: [3]tx_fields.AccessList.BuildItem = undefined;
+            const count = draw_below(smith, 4);
+            for (items[0..count], keys[0..count]) |*item, *row| item.* = .{
+                .address = draw_address(smith),
+                .storage_keys = row[0..draw_below(smith, 4)],
+            };
+            return rlp.encode_to(out, tx_fields.AccessList.build(&payload, items[0..count]));
+        },
+        else => {
+            var items: [2]tx_fields.Authorization = undefined;
+            const count = draw_below(smith, 3);
+            for (items[0..count]) |*item| item.* = .{
+                .chain_id = smith.value(u64),
+                .address = draw_address(smith),
+                .nonce = smith.value(u64),
+                .y_parity = draw_below(smith, 2),
+                .r = smith.value(u256),
+                .s = smith.value(u256),
+            };
+            const list = tx_fields.AuthorizationList.build(&payload, items[0..count]);
+            return rlp.encode_to(out, list);
+        },
+    }
+}
+
+fn fuzz_tx_fields(_: void, smith: *Smith) anyerror!void {
+    var buffer: [field_bytes_max]u8 = undefined;
+    const which = draw_below(smith, 4);
+    const input: []u8 = if (smith.boolWeighted(3, 1))
+        build_field(smith, which, &buffer)
+    else
+        buffer[0..smith.slice(&buffer)];
+    if (input.len > 0 and smith.boolWeighted(1, 1)) {
+        input[smith.index(input.len)] = smith.value(u8);
+    }
+    switch (which) {
+        0 => try check_field_canonical(tx_fields.TxKind, input),
+        1 => try check_field_canonical(tx_fields.HashList, input),
+        2 => try check_field_canonical(tx_fields.AccessList, input),
+        else => try check_field_canonical(tx_fields.AuthorizationList, input),
+    }
+}
+
+test "fuzz_targets: tx field decoders are canonical and iterate what they count" {
+    try fuzz.run({}, fuzz_tx_fields, .{ .iterations = 2048 });
+}
+
+/// `decode_legacy_v` inverts `legacy_v` and rejects everything that is not of its form.
+fn fuzz_legacy_v(_: void, smith: *Smith) anyerror!void {
+    const parity = smith.value(bool);
+    const chain_id: ?u64 = if (smith.value(bool)) smith.value(u64) else null;
+    const signature: Signature = .{ .y_parity = parity, .r = 1, .s = 1 };
+    const v = signature.legacy_v(chain_id);
+    const decoded = signature_module.decode_legacy_v(v).?;
+    try std.testing.expectEqual(parity, decoded.y_parity);
+    try std.testing.expectEqual(chain_id, decoded.chain_id);
+
+    const near_v: u256 = smith.value(u8);
+    const raw: u256 = if (smith.value(bool)) near_v else smith.value(u256);
+    if (signature_module.decode_legacy_v(raw)) |any| {
+        const again: Signature = .{ .y_parity = any.y_parity, .r = 1, .s = 1 };
+        try std.testing.expectEqual(raw, again.legacy_v(any.chain_id));
+    } else {
+        const max_v = @as(u256, std.math.maxInt(u64)) * 2 + 36;
+        try std.testing.expect(raw < 27 or (raw > 28 and raw < 35) or raw > max_v);
+    }
+}
+
+test "fuzz_targets: legacy v decoding inverts encoding" {
+    try fuzz.run({}, fuzz_legacy_v, .{ .iterations = 2048 });
+}
