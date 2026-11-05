@@ -255,7 +255,7 @@ fn open_submitter(
         .factory = config.dispute_game_factory,
         .game_type = config.game_type.?,
         // The native prover's initData is a witness archive (hundreds of KiB).
-        .calldata_bytes_max = 4 << 20,
+        .calldata_bytes_max = proposer.collector.calldata_bytes_max,
     });
 }
 
