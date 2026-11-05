@@ -403,6 +403,7 @@ fn get_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
             .block_number = record.header.number,
             .index = location.index,
             .base_fee = record.header.base_fee_per_gas,
+            .timestamp_ms = format.timestamp_ms(record),
         }, recoverer);
     }
     const pool = api.pool orelse return call.writer.null_value();
@@ -440,6 +441,7 @@ fn get_block_receipts(api: *Api, call: *Call) HandlerError!void {
 /// Writes the receipt at `only` (or every receipt) of the block `hash`.
 fn block_receipts(api: *Api, w: *json.Writer, hash: Hash, only: ?u32) HandlerError!void {
     const record = api.chain.record(hash).?;
+    const block_ms = format.timestamp_ms(record);
     var transactions = record.transactions;
     var receipts = record.receipts;
     var index: u32 = 0;
@@ -452,10 +454,11 @@ fn block_receipts(api: *Api, w: *json.Writer, hash: Hash, only: ?u32) HandlerErr
         defer previous_gas = value.cumulative_gas_used;
         defer log_index += value.logs.count;
         if (only) |wanted| if (wanted != index) continue;
-        const context = receipt_context(api, &record.header, hash, raw, index, value, .{
+        var context = receipt_context(api, &record.header, hash, raw, index, value, .{
             .previous_gas = previous_gas,
             .log_index = log_index,
         });
+        context.inclusion.timestamp_ms = block_ms;
         try format.receipt(w, value, context);
     }
 }
@@ -811,6 +814,7 @@ pub fn block_logs(
 ) HandlerError!void {
     const record = api.chain.record(hash) orelse return;
     if (record.header.logs_bloom.eql(.zero)) return; // No logs in the block.
+    const block_ms = format.timestamp_ms(record);
     var transactions = record.transactions;
     var receipts = record.receipts;
     var index: u32 = 0;
@@ -824,6 +828,7 @@ pub fn block_logs(
             .block_number = record.header.number,
             .index = index,
             .base_fee = null,
+            .timestamp_ms = block_ms,
         };
         const tx_hash = primitives.keccak256(raw).bytes;
         var it = value.logs.iterator();

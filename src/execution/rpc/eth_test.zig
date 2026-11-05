@@ -942,3 +942,61 @@ test "eth: fuzz" {
     defer h.destroy();
     try testing.fuzz(h, fuzz_eth, .{});
 }
+
+const denim_rpc_spec: chainspec.ChainSpec = blk: {
+    var result = chainspec.ChainSpec.presets.base_devnet;
+    for (0..@backingInt(chainspec.Upgrade.denim) + 1) |index| result.upgrades[index] = 0;
+    break :blk result;
+};
+
+test "eth: Denim blocks, transactions and logs report millisecond timestamps" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    // Block 1 is 200 ms after genesis (time 0): the BaseTime deposit at index 1.
+    var calldata = [2][consensus.base_time.calldata_length]u8{
+        consensus.base_time.encode_calldata(0),
+        consensus.base_time.encode_calldata(200),
+    };
+    var info = consensus.base_time.deposit(1, &calldata[0]);
+    info.source_hash = .{ .bytes = @splat(0x11) };
+    info.to = .{ .call = .{ .bytes = @splat(0x11) } };
+    const deposits = [2]consensus.Envelope{
+        .{ .deposit = info },
+        .{ .deposit = consensus.base_time.deposit(1, &calldata[1]) },
+    };
+    var encoded: [2][256]u8 = undefined;
+    const forced = [2][]const u8{
+        deposits[0].encode_to(&encoded[0]),
+        deposits[1].encode_to(&encoded[1]),
+    };
+    var attrs = fixture.attributes_l2(0, 0xfe);
+    attrs.transactions = &forced;
+    const node = h.node;
+    const genesis: primitives.B256 = .{ .bytes = node.chain.genesis_hash };
+    const version = engine_types.forkchoice_version(&denim_rpc_spec, 0);
+    const choice = fixture.forkchoice(genesis);
+    const updated = try node.engine.forkchoice_updated(version, choice, &attrs);
+    const get_version = engine_types.get_payload_version(&denim_rpc_spec, 0);
+    const built = try node.engine.get_payload(get_version, updated.payload_id.?);
+    _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(built.block_hash), null);
+    const block = try h.request("eth_getBlockByNumber", "[\"0x1\",true]");
+    try expect_contains(block, "\"timestamp\":\"0x0\"");
+    try expect_contains(block, "\"timestampMs\":\"0xc8\"");
+    try expect_contains(block, "\"blockTimestampMs\":\"0xc8\"");
+    const tx_hash = primitives.keccak256(forced[1]).bytes;
+    var body: [256]u8 = undefined;
+    const format = request_prefix_format ++ "eth_getTransactionByHash\",\"params\":[\"0x{x}\"]}}";
+    const tx = try h.request_runtime(try std.fmt.bufPrint(&body, format, .{&tx_hash}));
+    try expect_contains(tx, "\"blockTimestampMs\":\"0xc8\"");
+    // Genesis has no BaseTime deposit: no millisecond fields.
+    const genesis_block = try h.request("eth_getBlockByNumber", "[\"0x0\",false]");
+    try testing.expect(std.mem.indexOf(u8, genesis_block, "timestampMs") == null);
+}
+
+test "eth: pre-Denim blocks carry no millisecond timestamps" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(12);
+    const block = try h.request("eth_getBlockByNumber", "[\"0x1\",true]");
+    try testing.expect(std.mem.indexOf(u8, block, "timestampMs") == null);
+}

@@ -22,7 +22,31 @@ pub const Inclusion = struct {
     block_number: u64,
     index: u32,
     base_fee: ?u64,
+    /// Denim: the block's millisecond timestamp (`blockTimestampMs`), when known.
+    timestamp_ms: ?u64 = null,
 };
+
+/// Denim: a block's timestamp in milliseconds from its BaseTime deposit (index 1), as
+/// base/base's RPC reports it; null for pre-Denim blocks (no valid deposit there).
+pub fn timestamp_ms(record: node.chain.Record) ?u64 {
+    var transactions = record.transactions;
+    if (transactions.is_empty()) return null;
+    _ = transactions.bytes() catch return null;
+    if (transactions.is_empty()) return null;
+    const raw = transactions.bytes() catch return null;
+    return timestamp_ms_of(raw, record.header.number, record.header.timestamp);
+}
+
+/// The millisecond timestamp when `second` (a block's transaction at index 1) is the
+/// valid BaseTime deposit for block `number`.
+pub fn timestamp_ms_of(second: []const u8, number: u64, timestamp: u64) ?u64 {
+    const envelope = Envelope.decode(second) catch return null;
+    const millis_part = consensus.base_time.extract(envelope, number) catch return null;
+    assert(millis_part < 1_000);
+    const result = consensus.base_time.timestamp_ms(timestamp, millis_part);
+    assert(result >= timestamp *| 1_000);
+    return result;
+}
 
 pub fn header_fields(w: *Writer, header: *const Header, hash: Hash, size: usize) WriteError!void {
     try field_data(w, "hash", &hash);
@@ -61,8 +85,10 @@ pub fn block(
     full: bool,
     recoverer: consensus.Recoverer,
 ) WriteError!void {
+    const block_ms = timestamp_ms(record);
     try w.begin_object();
     try header_fields(w, &record.header, hash, size);
+    if (block_ms) |ms| try field_quantity(w, "timestampMs", ms);
     try w.key("uncles");
     try w.begin_array();
     try w.end_array();
@@ -81,6 +107,7 @@ pub fn block(
             .block_number = record.header.number,
             .index = index,
             .base_fee = record.header.base_fee_per_gas,
+            .timestamp_ms = block_ms,
         };
         try transaction(w, raw, inclusion, recoverer);
     }
@@ -130,6 +157,7 @@ pub fn transaction(
     if (envelope.chain_id()) |id| try field_quantity(w, "chainId", id);
     try fee_fields(w, envelope, inclusion);
     try inclusion_fields(w, inclusion);
+    if (inclusion) |at| if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
     try signature_fields(w, envelope);
     if (envelope == .deposit) try deposit_fields(w, envelope.deposit);
     try w.end_object();
@@ -283,6 +311,7 @@ pub fn log(
     try field_data(w, "transactionHash", &tx_hash);
     try field_quantity(w, "transactionIndex", at.index);
     try field_quantity(w, "logIndex", log_index);
+    if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
     try w.key("removed");
     try w.boolean(false);
     try w.end_object();
@@ -381,4 +410,37 @@ test "format: deposit transaction and receipt carry the OP fields" {
     try testing.expect(std.mem.indexOf(u8, receipt_text, "\"depositNonce\":\"0x3\"") != null);
     const version = "\"depositReceiptVersion\":\"0x1\"";
     try testing.expect(std.mem.indexOf(u8, receipt_text, version) != null);
+}
+
+fn timestamp_scenario(seed: u64) !void {
+    var prng = @import("../../testing/prng.zig").Prng.init(seed);
+    const number = prng.below(1 << 40);
+    const timestamp = prng.below(1 << 40);
+    var buffer: [256]u8 = undefined;
+    if (prng.chance(1, 2)) {
+        const millis: u16 = @intCast(prng.below(5) * 200);
+        const calldata = consensus.base_time.encode_calldata(millis);
+        const envelope: Envelope = .{ .deposit = consensus.base_time.deposit(number, &calldata) };
+        const raw = envelope.encode_to(&buffer);
+        const expected = timestamp * 1_000 + millis;
+        try std.testing.expectEqual(@as(?u64, expected), timestamp_ms_of(raw, number, timestamp));
+        // The deposit of another block does not count.
+        try std.testing.expectEqual(@as(?u64, null), timestamp_ms_of(raw, number + 1, timestamp));
+        return;
+    }
+    const length = prng.below(buffer.len);
+    prng.fill(buffer[0..length]);
+    try std.testing.expectEqual(@as(?u64, null), timestamp_ms_of(buffer[0..length], number, 7));
+}
+
+test "format: seeded fuzz of BaseTime millisecond timestamps" {
+    for (0..512) |seed| try timestamp_scenario(seed);
+}
+
+fn fuzz_timestamp(_: void, smith: *std.testing.Smith) anyerror!void {
+    try timestamp_scenario(smith.value(u64));
+}
+
+test "format: fuzz BaseTime millisecond timestamps" {
+    try std.testing.fuzz({}, fuzz_timestamp, .{});
 }

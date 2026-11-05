@@ -105,6 +105,7 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash) HandlerError!void {
         .block_number = record.header.number,
         .index = @intCast(index),
         .base_fee = record.header.base_fee_per_gas,
+        .timestamp_ms = format.timestamp_ms(record),
     }, api.chain.executor.recoverer);
 }
 
