@@ -130,6 +130,11 @@ pub const BatchQueue = struct {
         batch_stage.advance_epoch(&queue.l1_blocks, parent);
         const behind = batch_stage.origin_behind(prev.origin(), parent);
         try queue.update_origin(prev, behind);
+        // Deviation from base/base: advance again after the new origin is appended, as the
+        // Holocene batch validator does. A reset point one L1 block behind the parent's origin
+        // (always the case near genesis) otherwise leaves [reset origin, parent origin] here,
+        // and every step fails L1OriginMismatch, resets, and rebuilds the same state.
+        batch_stage.advance_epoch(&queue.l1_blocks, parent);
 
         var out_of_data = false;
         if (prev.next_batch(parent, queue.l1_blocks.items)) |owned| {

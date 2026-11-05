@@ -344,3 +344,34 @@ test "batch queue: accepted span batch is expanded across calls" {
     try testing.expect(second.parent_hash.eql(parent.block_info.hash));
     try testing.expect(queue.is_last_in_span());
 }
+
+test "batch queue: reset one L1 block behind the parent's origin converges" {
+    // Regression (DST seed 48): a reset point one L1 block behind the safe head's origin
+    // (always the case near genesis) left [reset origin, parent origin] in the epoch list,
+    // so every step failed L1OriginMismatch and reset again.
+    const config: RollupConfig = .{ .block_time = 2 };
+    var l2 = TestChain.init(0, 0, 1);
+    var queue = BatchQueue.init(testing.allocator, &config);
+    defer queue.deinit();
+    const reset_origin: BlockInfo = .{ .number = 5, .hash = .{ .bytes = @splat(5) } };
+    const next_origin: BlockInfo = .{
+        .number = 6,
+        .hash = .{ .bytes = @splat(6) },
+        .parent_hash = reset_origin.hash,
+    };
+    try queue.reset(reset_origin);
+    var stub = TestBatches.init(&.{});
+    stub.block = reset_origin;
+    const parent: L2BlockInfo = .{
+        .block_info = .{ .number = 3, .timestamp = 6 },
+        .l1_origin = next_origin.id(),
+    };
+    // Upstream is still behind the parent's origin.
+    try testing.expectError(error.Eof, queue.next_batch(&stub, &l2, parent));
+    stub.block = next_origin;
+    for (0..4) |_| {
+        const result = queue.next_batch(&stub, &l2, parent);
+        if (result) |_| {} else |err| try testing.expect(err != error.L1OriginMismatch);
+        try testing.expect(queue.l1_blocks.items[0].eql(next_origin));
+    }
+}
