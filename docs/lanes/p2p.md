@@ -40,8 +40,10 @@ behind a small interface and switch later.
 - [ ] io asks (io lane): `shutdown(fd)` so closing never races a pending recv, and UDP
   (`open_socket_udp`, `recvfrom`, `sendto`) so discv5 runs over io; then wire
   `Service.on_datagram`/`pop_datagram` into the transport.
-- [ ] `libp2p`: yamux go-away handling; backpressure instead of `buffer_overflow` when a
-  caller never flushes.
+- [x] `libp2p`: yamux go-away: a received go-away closes the connection
+  (`remote_go_away`); `close()` sends go-away first and the transport closes the socket
+  after it is sent (2 s linger cap). Service disconnects (bans) are graceful.
+- [ ] `libp2p`: backpressure instead of `buffer_overflow` when a caller never flushes.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
@@ -237,3 +239,4 @@ behind a small interface and switch later.
 - 2026-11-05: redial from lookups; gossip survives random connection resets in DST.
 - 2026-11-05: DST attacker/crash/8-node scenarios.
 - 2026-11-05: `--p2p.*` options and embeddable `Network(IO)`.
+- 2026-11-05: yamux go-away handling and graceful disconnects.
