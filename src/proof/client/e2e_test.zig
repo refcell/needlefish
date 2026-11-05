@@ -1241,3 +1241,84 @@ test "e2e: the proposer's native prover proves a request and its archive replays
     try prover.request(&request);
     try testing.expect(try prover.poll(request.session()) == .failed);
 }
+
+/// The fixture as a numbered-header source, for backends that boot from block numbers.
+const FixtureSource = struct {
+    fixture: *Fixture,
+
+    pub fn header_by_number(
+        source: *FixtureSource,
+        chain: Chain,
+        number: ?u64,
+    ) SourceError![]const u8 {
+        const self = source.fixture;
+        const hash = switch (chain) {
+            .l1 => self.l1_hashes[@intCast(number orelse self.l1_count - 1)],
+            .l2 => self.blocks[@intCast(number orelse self.scenario.blocks)].hash,
+        };
+        return self.source.headers.get(hash) orelse error.NotFound;
+    }
+
+    pub fn as_source(source: *FixtureSource) host.handler.Source {
+        return source.fixture.source.as_source();
+    }
+};
+
+test "e2e: the prover service's native backend proves a compressed range" {
+    const prover_service = @import("../prover_service/root.zig");
+    const service_protocol = prover_service.protocol;
+    const self = try Fixture.create(.{ .blocks = 4 });
+    defer self.destroy();
+    try self.put_boot(true);
+    kzg.blob.fill_roots_brp(&kzg_storage.roots_brp);
+    const settings: kzg.blob.Settings = .{
+        .g1_lagrange = &kzg_storage.g1_lagrange,
+        .roots_brp = &kzg_storage.roots_brp,
+    };
+    const options: client.Options = .{
+        .builder = builder_config,
+        .resolver = .{ .bytes_max = 1 << 20, .entries_max = 4096 },
+        .l1 = .{ .items_max = 16, .logs_max = 16, .topics_max = 64, .blob_hashes_max = 16 },
+        .l2 = .{ .items_max = 16 },
+        .blobs = .{ .blobs_max = 2, .verify = false },
+        .kzg_settings = &settings,
+        .kzg_workspace = &kzg_workspace,
+    };
+    var rollup_buffer: [8192]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&rollup_buffer);
+    var writer = json.Writer.init(&out);
+    try protocol.rollup_json.write(&writer, &self.rollup);
+    var source: FixtureSource = .{ .fixture = self };
+    const Native = prover_service.native_backend.NativeOver(FixtureSource);
+    var native: Native = try .init(testing.allocator, &source, .{
+        .rollup_config_json = out.buffered(),
+        .chain_id = chains.devnet.chain_id,
+        .client_options = options,
+        .roots_brp = &host_roots_brp,
+        .proof_bytes_max = 4 << 20,
+    });
+    defer native.deinit();
+    const backend = native.backend();
+    const job: service_protocol.ProofJob = .{
+        .session_id = .from("native-e2e"),
+        .status = .claimed,
+        .request = .{ .session_id = .from("native-e2e"), .request = .{ .compressed = .{
+            .start_block_number = 0,
+            .number_of_blocks_to_prove = 4,
+            .l1_head = self.l1_hashes[self.l1_count - 1],
+            .intermediate_block_interval = 2,
+            .zk_vm = .sp1,
+        } } },
+        .attempt = 1,
+        .created_at = .{ .seconds = 0 },
+        .updated_at = .{ .seconds = 0 },
+    };
+    try backend.start(&job);
+    const result = (try backend.poll()).?;
+    try testing.expectEqual(@as(u64, 1), native.proved);
+    // The proof bytes are an archive anyone can replay to the same claim.
+    const verdict = try host.offline.replay(testing.allocator, result.compressed.proof, options);
+    try testing.expect(verdict.holds);
+    try testing.expectEqual(self.expected, verdict.claimed_output_root);
+    try testing.expectEqual(@as(u64, 4), verdict.outcome.block_number);
+}

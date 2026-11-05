@@ -33,10 +33,17 @@ pub const Config = struct {
     proof_bytes_max: u32,
 };
 
+/// The backend over the node's JSON-RPC (`host.rpc_source`).
 pub fn Native(comptime IO: type) type {
+    return NativeOver(host.rpc_source.RpcSource(IO));
+}
+
+/// The backend over any source with `header_by_number(chain, ?number) ![]const u8` (the
+/// raw header; null is the latest) and `as_source() host.handler.Source`.
+pub fn NativeOver(comptime SourceType: type) type {
     return struct {
         const Self = @This();
-        pub const Source = host.rpc_source.RpcSource(IO);
+        pub const Source = SourceType;
 
         allocator: std.mem.Allocator,
         source: *Source,

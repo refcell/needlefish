@@ -127,8 +127,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   the collector); `base proposer --prover-proof-type compressed`. Found and fixed on the
   way: the collector capped `initData` at 4 KiB, so native archives never reached the
   submitter (now 4 MiB).
-- [ ] `proof/prover-service-native-e2e`: native backend proving a real range end to end
-  (SimIo node RPC + `RpcSource`), proof bytes replayed with `base proof replay`.
+- [x] `proof/prover-service-native-e2e`: `native_backend.NativeOver(Source)` (any
+  numbered-header source); e2e proves a 4-block compressed range from the node fixture and
+  replays the returned archive offline to the node's root.
 
 ## Decisions
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
@@ -287,6 +288,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: native backend e2e (compressed range proven, archive replayed).
 - 2026-11-05: proposer compressed mode through native workers; initData cap fix.
 - 2026-11-05: challenger prover-service client, `base challenger --zk-rpc-url`.
 - 2026-11-05: `base challenger` (flags, JSON-RPC view and submitter, driver loop).
