@@ -8,6 +8,7 @@ pub const cbor = @import("cbor.zig");
 pub const errors = @import("errors.zig");
 pub const types = @import("types.zig");
 pub const attestation = @import("attestation.zig");
+pub const x509 = @import("x509.zig");
 
 test {
     std.testing.refAllDecls(@This());
