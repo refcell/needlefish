@@ -23,6 +23,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
   2026-11-05: 36204 / 37724 (96.0%), Cancun + Prague. All remaining failures involve the
   bn254 precompiles (0x06-0x08), which wait on the crypto lane.
+- [ ] (from crypto lane) Pre-Osaka MODEXP with modulus > 1024 bytes is affordable (Berlin:
+  1025-byte modulus, 1-byte base/exp = 5547 gas) and must compute, but `precompile_modexp_run`
+  returns ModulusTooLarge above 1024 bytes. Route those to
+  `crypto.modexp.precompile_modexp_run_with_scratch(parsed, out, scratch)` with
+  `scratch_limbs_needed(modulus_len)` limbs from an arena sized at startup by the block gas
+  limit. The comment "wider than 8192 bits cost far more gas than any block holds" is wrong.
 - [ ] Differential fuzzing harness (random bytecode, seeded) + `std.testing.fuzz` targets.
 - [ ] Performance: benchmark snailtracer/erc20 style workloads; aim beyond revm.
 
