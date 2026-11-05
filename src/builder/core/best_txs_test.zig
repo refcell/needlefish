@@ -9,7 +9,7 @@ const Tx = best_txs.Tx;
 const B256 = best_txs.B256;
 const Address = best_txs.Address;
 const RejectionCache = best_txs.RejectionCache;
-const BestFlashblocksTxs = best_txs.BestFlashblocksTxs;
+const BestTxs = best_txs.BestTxs;
 
 fn make_tx(sender: u8, nonce: u64, id: u16) Tx {
     var hash: B256 = .zero;
@@ -32,12 +32,12 @@ fn make_tx(sender: u8, nonce: u64, id: u16) Tx {
 
 const Fixture = struct {
     cache: RejectionCache,
-    best: BestFlashblocksTxs,
+    best: BestTxs,
 
     fn init(fixture: *Fixture) !void {
         fixture.cache = try RejectionCache.init(testing.allocator, 8, 1000);
         errdefer fixture.cache.deinit(testing.allocator);
-        fixture.best = try BestFlashblocksTxs.init(testing.allocator, &fixture.cache, .{
+        fixture.best = try BestTxs.init(testing.allocator, &fixture.cache, .{
             .committed_max = 64,
             .invalid_senders_max = 4,
         });
@@ -49,7 +49,7 @@ const Fixture = struct {
     }
 };
 
-test "best txs: committed transactions are skipped by later flashblocks" {
+test "best txs: committed transactions are skipped by later snapshot walks" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -60,11 +60,11 @@ test "best txs: committed transactions are skipped by later flashblocks" {
     try testing.expectEqual(&txs[0], best.next(0).?);
     best.mark_current_committed();
     try testing.expectEqual(&txs[1], best.next(0).?);
-    // Not committed (e.g. did not fit this flashblock's gas): offered again next time.
+    // Not committed (e.g. did not fit the block's gas): offered again next time.
     try testing.expectEqual(&txs[2], best.next(0).?);
     best.mark_current_committed();
     try testing.expectEqual(@as(?*const Tx, null), best.next(0));
-    // Next flashblock: the pool still returns everything.
+    // Next walk: the pool still returns everything.
     best.refresh(&snapshot);
     try testing.expectEqual(&txs[1], best.next(0).?);
     try testing.expectEqual(@as(?*const Tx, null), best.next(0));
@@ -194,7 +194,7 @@ fn run_model(seed: u64) !void {
     var prng = Prng.init(seed);
     var cache = try RejectionCache.init(testing.allocator, 64, std.math.maxInt(u64));
     defer cache.deinit(testing.allocator);
-    var best = try BestFlashblocksTxs.init(testing.allocator, &cache, .{
+    var best = try BestTxs.init(testing.allocator, &cache, .{
         .committed_max = 256,
         .invalid_senders_max = 64,
     });
@@ -237,7 +237,7 @@ fn run_model(seed: u64) !void {
                     best.mark_invalid(tx.sender, tx.nonce);
                     model.mark_invalid(tx.sender, tx.nonce);
                 },
-                else => {}, // Did not fit: left for a later flashblock.
+                else => {}, // Did not fit: left for a later walk.
             }
         }
     }

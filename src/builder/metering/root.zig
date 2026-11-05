@@ -3,7 +3,7 @@
 //!
 //! An external simulator meters pending transactions and pushes the results
 //! (`base_setMeteringInformation`); the builder reads them when deciding whether a
-//! transaction fits a flashblock's execution-time budget. The store is an LRU cache with
+//! transaction fits a block's execution-time budget. The store is an LRU cache with
 //! a time-to-live (base/base: 10k entries, 30 s). When the builder includes a transaction
 //! that had no metering yet, it records when (`needed_at`); metering that arrives later
 //! is a *late arrival*: it is counted (latency, predicted time) and not cached, since the

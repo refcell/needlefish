@@ -1,11 +1,11 @@
-//! The best-transactions view for flashblocks. Mirrors base/base
+//! The best-transactions view of the block builder. Mirrors base/base
 //! `crates/builder/core/src/flashblocks/best_txs.rs` (`BestFlashblocksTxs`) and
 //! `crates/execution/payload/src/rejection_cache.rs` (`RejectionCache`).
 //!
-//! Each flashblock asks the pool for a fresh priority-ordered snapshot (`Pool.select`:
+//! Each build asks the pool for a fresh priority-ordered snapshot (`Pool.select`:
 //! highest effective tip first, nonces ascending per sender) and walks it through this
 //! view, which skips:
-//! - transactions already committed by an earlier flashblock of the same block (the pool
+//! - transactions already committed by an earlier snapshot walk of the same block (the pool
 //!   still holds them until the block is canonical);
 //! - transactions in the rejection cache: hashes that failed execution recently, shared
 //!   across blocks with a capacity and a time-to-live (base/base: 100k entries, 30 min);
@@ -115,15 +115,15 @@ pub const RejectionCache = struct {
 };
 
 pub const Options = struct {
-    /// Most transactions one block can commit across all its flashblocks.
+    /// Most transactions one block can commit.
     committed_max: u32 = 16 * 1024,
     /// Most distinct senders marked invalid within one snapshot walk.
     invalid_senders_max: u32 = 4096,
 };
 
-/// Walks one pool snapshot per flashblock. `refresh` installs the next snapshot; the
+/// Walks one pool snapshot per build. `refresh` installs the next snapshot; the
 /// committed set persists for the whole block and is cleared by `reset_block`.
-pub const BestFlashblocksTxs = struct {
+pub const BestTxs = struct {
     const HashSet = std.AutoHashMapUnmanaged([32]u8, void);
     /// Invalid sender to the lowest invalid nonce.
     const SenderMap = std.AutoHashMapUnmanaged([20]u8, u64);
@@ -142,7 +142,7 @@ pub const BestFlashblocksTxs = struct {
         allocator: std.mem.Allocator,
         rejection_cache: *const RejectionCache,
         options: Options,
-    ) !BestFlashblocksTxs {
+    ) !BestTxs {
         assert(options.committed_max > 0);
         assert(options.invalid_senders_max > 0);
         var committed: HashSet = .empty;
@@ -159,22 +159,22 @@ pub const BestFlashblocksTxs = struct {
         };
     }
 
-    pub fn deinit(best: *BestFlashblocksTxs, allocator: std.mem.Allocator) void {
+    pub fn deinit(best: *BestTxs, allocator: std.mem.Allocator) void {
         best.invalid_senders.deinit(allocator);
         best.committed.deinit(allocator);
         best.* = undefined;
     }
 
     /// Starts a new block: forgets committed transactions and the current snapshot.
-    pub fn reset_block(best: *BestFlashblocksTxs) void {
+    pub fn reset_block(best: *BestTxs) void {
         best.committed.clearRetainingCapacity();
         best.refresh(&.{});
         assert(best.committed.count() == 0);
     }
 
-    /// base/base `refresh_iterator`: installs the next flashblock's pool snapshot. A new
+    /// base/base `refresh_iterator`: installs the next pool snapshot. A new
     /// snapshot reflects the pool's current state, so per-walk invalid senders reset.
-    pub fn refresh(best: *BestFlashblocksTxs, snapshot: []const *const Tx) void {
+    pub fn refresh(best: *BestTxs, snapshot: []const *const Tx) void {
         best.snapshot = snapshot;
         best.cursor = 0;
         best.current = null;
@@ -183,7 +183,7 @@ pub const BestFlashblocksTxs = struct {
     }
 
     /// The next executable candidate, or null when the snapshot is exhausted.
-    pub fn next(best: *BestFlashblocksTxs, now_ns: u64) ?*const Tx {
+    pub fn next(best: *BestTxs, now_ns: u64) ?*const Tx {
         best.current = null;
         while (best.cursor < best.snapshot.len) {
             const tx = best.snapshot[best.cursor];
@@ -206,7 +206,7 @@ pub const BestFlashblocksTxs = struct {
 
     /// base/base `mark_invalid`: the current transaction failed; skip its sender's later
     /// nonces for the rest of this snapshot.
-    pub fn mark_invalid(best: *BestFlashblocksTxs, sender: Address, nonce: u64) void {
+    pub fn mark_invalid(best: *BestTxs, sender: Address, nonce: u64) void {
         const current = best.current orelse return;
         // base/base debug-asserts the caller names the current transaction.
         assert(current.sender.eql(sender) and current.nonce == nonce);
@@ -214,30 +214,30 @@ pub const BestFlashblocksTxs = struct {
         best.current = null;
     }
 
-    /// The current transaction was included: later flashblocks must skip it.
-    pub fn mark_current_committed(best: *BestFlashblocksTxs) void {
+    /// The current transaction was included: later snapshot walks must skip it.
+    pub fn mark_current_committed(best: *BestTxs) void {
         const current = best.current orelse return;
         best.insert_committed(current.hash);
         best.current = null;
     }
 
     /// Marks hashes committed by other means (e.g. the sequencer's forced transactions).
-    pub fn mark_committed(best: *BestFlashblocksTxs, hashes: []const B256) void {
+    pub fn mark_committed(best: *BestTxs, hashes: []const B256) void {
         for (hashes) |hash| best.insert_committed(hash);
     }
 
-    pub fn is_committed(best: *const BestFlashblocksTxs, hash: B256) bool {
+    pub fn is_committed(best: *const BestTxs, hash: B256) bool {
         return best.committed.contains(hash.bytes);
     }
 
-    fn insert_committed(best: *BestFlashblocksTxs, hash: B256) void {
+    fn insert_committed(best: *BestTxs, hash: B256) void {
         // A block cannot hold more than `committed_max` transactions (sized from the gas
         // limit at startup), so the reserved capacity always suffices.
         assert(best.committed.count() < best.committed_max or best.committed.contains(hash.bytes));
         best.committed.putAssumeCapacity(hash.bytes, {});
     }
 
-    fn mark_sender_invalid(best: *BestFlashblocksTxs, sender: Address, nonce: u64) void {
+    fn mark_sender_invalid(best: *BestTxs, sender: Address, nonce: u64) void {
         const entry = best.invalid_senders.getPtr(sender.bytes);
         if (entry) |lowest| {
             lowest.* = @min(lowest.*, nonce);

@@ -17,18 +17,21 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 (only the non-flashblocks parts).
 
 ## Backlog
-- [ ] Remove flashblocks: delete `src/execution/flashblocks`, `src/common/flashblocks`,
+- [x] Remove flashblocks: delete `src/execution/flashblocks`, `src/common/flashblocks`,
   `src/builder/publish`, flashblock fuzz targets, sim wiring, and flashblock gossip/RPC
   hooks elsewhere (small edits in other lanes' files are allowed for this). Keep only code
   that a regular builder uses (best-txs view, rejection cache, timing, metering if used).
   Main must stay green at every push; do it in a few steps.
-- [ ] `builder/core`: turn the flashblock generator into a single-shot block builder:
+- [x] `builder/core`: turn the flashblock generator into a single-shot block builder:
   forced txs (deposits incl. L1 info + `BaseTimeUpdateTx`) then best pool txs until the
   gas/DA budget or the wall-clock tx cutoff (seal offset, default 150 ms into the 200 ms
   slot), seal once. Deterministic over injected time.
-- [ ] `builder/core` service: Engine API `forkchoiceUpdated` (attributes) starts a job,
-  `getPayload` returns the sealed block; one job at a time; cancellation on new FCU.
-  Wired into the node's Engine API handlers (coordinate with nf-node via small edits).
+- [x] `builder/core` service core: `forkchoiceUpdated` (attributes) starts a job,
+  `tick` builds until the cutoff and seals, `resolve` (getPayload) returns the sealed block
+  (sealing at once when early); one job at a time; cancellation on new FCU.
+- [ ] Wire `builder/core` `Service` into the node's Engine API handlers
+  (`engine_forkchoiceUpdated` with attributes, `engine_getPayload`) behind a flag, with the
+  node's IO clock as the builder `Clock` (coordinate with nf-node via small edits).
 - [ ] 200 ms cadence end to end with nf-consensus and nf-batcher-devnet: sequencer
   requests a payload every 200 ms slot, seals at the offset, inserts; devnet genesis
   activates Denim/subsecond blocks at genesis; `just devnet smoke` passes at 200 ms.
@@ -46,6 +49,17 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   decisions are in git history (`git log -- docs/lanes/flashblocks-builder.md`).
 - 2026-11-05: `compact_flashblock_metadata` dropped from both feature enums (genesis and
   rollup config): base/base reads it only in the flashblocks payload path.
+- 2026-11-05: single-shot builder runs in one synchronous `build` call (begin block,
+  attribute txs, pool txs, finish, seal, roll back) instead of holding an open block across
+  ticks, so the chain's executor and state are never left mid-block between IO events (RPC
+  or imports may use them). Time passing during the build comes from an injected `Clock`
+  read between pool transactions; `tick(now_ns)` triggers the build. This matches base/base
+  one-shot building: the pool iterator is walked once and the payload is frozen.
+- 2026-11-05: a job's slot starts at the FCU's time (the last `tick`); cutoff =
+  start + `seal_offset_ms` (150), slot end = start + 200 ms, expiry = end + 500 ms leeway.
+  An early `resolve` seals with the cutoff moved to now and never waits.
+- 2026-11-05: the attribute transactions are copied at `start` so the caller's FCU buffers
+  need not outlive the call; `Service` is no longer generic over a publish sink.
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -76,3 +90,9 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   200 ms blocks).
 - 2026-11-05: removed flashblocks, step 1: `execution/flashblocks` (consumer, RPC, pubsub),
   `builder/publish`, flashblock fuzz targets, and `BaseFeature.compact_flashblock_metadata`.
+- 2026-11-05: removed flashblocks, step 2: `common/flashblocks`, `builder/multiplex`, and the
+  flashblock generator; `BestFlashblocksTxs` renamed `BestTxs`.
+- 2026-11-05: `builder/core` single-shot `BlockBuilder` (attribute txs, then best pool txs
+  until gas/DA budget, pool end, or the injected-clock cutoff; sealed block hash-equals a
+  `Chain` build), `timing` reworked to 200 ms slots + 150 ms seal offset (ports base/base
+  `block_seal_target` tests), `Service` FCU/tick/resolve; seeded + `std.testing.fuzz` tests.

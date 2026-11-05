@@ -1,7 +1,7 @@
-//! Flashblocks payload service tests on an in-memory L2 dev node with a recording sink and an
-//! injected clock: job lifecycle, cancellation by a new FCU, resolve before and after every
-//! flashblock, payload expiry, no-tx-pool jobs, the multiplex `Builder` interface, and a
-//! seeded + `std.testing.fuzz` model check of random FCU / resolve / tick interleavings.
+//! Payload service tests on an in-memory L2 dev node with an injected clock: job lifecycle,
+//! cancellation by a new FCU, the 150 ms cutoff inside the 200 ms slot, an early resolve
+//! sealing immediately, expiry, failures, and a seeded + `std.testing.fuzz` model check of
+//! random FCU / resolve / tick interleavings.
 
 const std = @import("std");
 const testing = std.testing;
@@ -11,79 +11,34 @@ const primitives = @import("../../common/primitives/root.zig");
 const chainspec = @import("../../execution/chainspec/root.zig");
 const payload = @import("../../execution/payload/root.zig");
 const fixture = @import("../../execution/node/test_fixture.zig");
-const multiplex = @import("../multiplex/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 const best_txs = @import("best_txs.zig");
-const generator_module = @import("generator.zig");
+const builder_module = @import("builder.zig");
+const builder_test = @import("builder_test.zig");
 const timing = @import("timing.zig");
 const service_module = @import("service.zig");
 
-const Generator = generator_module.Generator;
-const Flashblock = generator_module.Flashblock;
-const Node = fixture.Node;
-const B256 = primitives.B256;
-const PayloadId = service_module.PayloadId;
+const BlockBuilder = builder_module.BlockBuilder;
+const StepClock = builder_test.StepClock;
+const Service = service_module.Service;
 const Payload = service_module.Payload;
+const PayloadId = service_module.PayloadId;
+const Node = fixture.Node;
 const l2 = &chainspec.ChainSpec.presets.base_devnet;
 const ns_per_ms = timing.ns_per_ms;
 const ns_per_s = timing.ns_per_s;
 
-/// What the sink saw of one published flashblock (flashblock slices borrow the generator).
-const Entry = struct {
-    id: PayloadId,
-    index: u64,
-    block_hash: B256,
-    transactions: u64,
-    has_base: bool,
-};
-
-const Recorder = struct {
-    log: [32]Entry = undefined,
-    len: u32 = 0,
-    total: u64 = 0,
-    last: ?Entry = null,
-
-    pub fn publish(recorder: *Recorder, flashblock: Flashblock) error{}!u32 {
-        const entry: Entry = .{
-            .id = flashblock.payload_id,
-            .index = flashblock.index,
-            .block_hash = flashblock.diff.block_hash,
-            .transactions = flashblock.diff.transactions.len,
-            .has_base = flashblock.base != null,
-        };
-        if (recorder.len < recorder.log.len) {
-            recorder.log[recorder.len] = entry;
-            recorder.len += 1;
-        }
-        recorder.total += 1;
-        recorder.last = entry;
-        return 1;
-    }
-
-    fn entries(recorder: *const Recorder) []const Entry {
-        return recorder.log[0..recorder.len];
-    }
-};
-
-const Service = service_module.Service(Recorder);
-
-/// for_tests timing: 1000 ms blocks, 200 ms interval, 100 ms flashblocks leeway, 500 ms job
-/// leeway. A job for timestamp 2 s started at 1 s has 5 flashblocks closing at
-/// 1.1, 1.3, 1.5, 1.7 and 1.9 s, and expires at 2.5 s.
-const config = timing.Config.for_tests;
+/// Default timing: 200 ms slots, 150 ms seal offset, 500 ms job leeway. A job started at
+/// 1 s cuts off at 1.15 s, ends its slot at 1.2 s and expires at 1.7 s.
 const start_ns: u64 = 1 * ns_per_s;
-const expires_ns: u64 = 2500 * ns_per_ms;
-
-fn deadline_ns(index: u64) u64 {
-    assert(index >= 1 and index <= 5);
-    return 1100 * ns_per_ms + (index - 1) * 200 * ns_per_ms;
-}
+const cutoff_ns: u64 = start_ns + 150 * ns_per_ms;
+const expires_ns: u64 = start_ns + 700 * ns_per_ms;
 
 const Harness = struct {
     node: *Node,
     cache: best_txs.RejectionCache,
-    generator: Generator,
-    recorder: Recorder,
+    builder: BlockBuilder,
+    clock: StepClock,
     service: Service,
 
     fn create() !*Harness {
@@ -93,25 +48,20 @@ const Harness = struct {
         errdefer harness.node.destroy();
         harness.cache = try best_txs.RejectionCache.init(testing.allocator, 64, 1000);
         errdefer harness.cache.deinit(testing.allocator);
-        harness.generator = try Generator.init(testing.allocator, &harness.cache, .{
-            .flashblocks_max = 8,
+        harness.builder = try BlockBuilder.init(testing.allocator, &harness.cache, .{
             .transactions_max = 64,
             .transaction_bytes_max = 1 << 14,
             .select_max = 64,
         });
-        errdefer harness.generator.deinit(testing.allocator);
-        harness.recorder = .{};
-        harness.service = try Service.init(
-            &harness.generator,
-            &harness.node.chain,
-            &harness.recorder,
-            config,
-        );
+        errdefer harness.builder.deinit(testing.allocator);
+        harness.clock = .{};
+        const clock = builder_module.Clock.of(StepClock, &harness.clock);
+        harness.service = try Service.init(&harness.builder, &harness.node.chain, clock, .{});
         return harness;
     }
 
     fn destroy(harness: *Harness) void {
-        harness.generator.deinit(testing.allocator);
+        harness.builder.deinit(testing.allocator);
         harness.cache.deinit(testing.allocator);
         harness.node.destroy();
         testing.allocator.destroy(harness);
@@ -126,56 +76,45 @@ const Harness = struct {
             try fixture.submit(harness.node, @intCast(n % 3 + 1), n / 3, 5, buffer);
         }
     }
+
+    /// Moves both time sources to `now_ns` (each clock read inside a build then advances
+    /// it by `step_ns`) and ticks the service.
+    fn tick(harness: *Harness, now_ns: u64, step_ns: u64) void {
+        assert(now_ns >= harness.service.now_ns);
+        harness.clock = .{ .now = now_ns, .step_ns = step_ns };
+        harness.service.tick(now_ns);
+    }
 };
 
 fn id_of(byte: u8) PayloadId {
     return @splat(byte);
 }
 
-fn expect_resolved(result: ?(service_module.BuilderError!Payload)) !Payload {
+fn expect_resolved(result: ?(service_module.Error!Payload)) !Payload {
     const answer = result orelse return error.TestUnexpectedResult;
     return try answer;
 }
 
-test "service: job lifecycle publishes the deltas and resolves the last sealed block" {
+test "service: FCU starts a job, tick builds and seals, resolve returns the block" {
     const harness = try Harness.create();
     defer harness.destroy();
     var buffers: [6][256]u8 = undefined;
     try harness.submit_pool(&buffers);
-    var attributes = fixture.attributes_l2(2, 0xfe);
-    // Five flashblocks of 42_000 gas: room for two transfers each.
-    attributes.gas_limit = 210_000;
+    const attributes = fixture.attributes_l2(2, 0xfe);
     const service = &harness.service;
-    service.tick(start_ns);
+    harness.tick(start_ns, 0);
     try service.send_new_payload(id_of(1), harness.genesis(), &attributes);
-    try testing.expectEqual(@as(u32, 1), harness.recorder.len);
-    try testing.expect(harness.recorder.log[0].has_base);
-    try testing.expectEqual(@as(?u64, deadline_ns(1)), service.next_deadline_ns());
-    service.tick(deadline_ns(1) - 1);
-    try testing.expectEqual(@as(u32, 1), harness.recorder.len);
-    var index: u64 = 1;
-    while (index <= 5) : (index += 1) {
-        service.tick(deadline_ns(index));
-        try testing.expectEqual(index + 1, harness.recorder.len);
-    }
+    try testing.expectEqual(@as(?u64, start_ns), service.next_deadline_ns());
+    try testing.expectEqual(@as(?u64, 2), service.payload_timestamp(id_of(1)));
+    harness.tick(start_ns + ns_per_ms, ns_per_ms);
+    try testing.expectEqual(@as(u64, 1), service.metrics.blocks_sealed.get());
     try testing.expectEqual(@as(?u64, expires_ns), service.next_deadline_ns());
-    service.tick(expires_ns - 1);
-    try testing.expectEqual(@as(u32, 6), harness.recorder.len);
-    try testing.expectEqual(@as(u64, 2), service.payload_timestamp(id_of(1)).? catch 0);
-    try testing.expectError(error.BuildFailed, service.best_payload(id_of(1)).?);
+    // Later ticks inside the slot do not rebuild.
+    harness.tick(cutoff_ns, 0);
+    try testing.expectEqual(@as(u64, 1), service.metrics.blocks_sealed.get());
     const best = try expect_resolved(service.resolve(id_of(1)));
-    var transactions: u64 = 0;
-    for (harness.recorder.entries(), 0..) |entry, position| {
-        try testing.expectEqual(@as(u64, position), entry.index);
-        try testing.expectEqual(position == 0, entry.has_base);
-        try testing.expectEqualSlices(u8, &id_of(1), &entry.id);
-        transactions += entry.transactions;
-    }
-    try testing.expectEqual(@as(u64, 6), transactions);
-    try testing.expectEqual(transactions, best.transactions.len);
-    try testing.expectEqual(@as(u32, 5), best.flashblock_index);
-    const last = harness.recorder.last.?;
-    try testing.expectEqualSlices(u8, &last.block_hash.bytes, &best.block_hash.bytes);
+    try testing.expectEqual(@as(usize, 6), best.transactions.len);
+    try testing.expectEqual(service_module.Stop.pool_exhausted, best.stop);
     try testing.expectEqualSlices(u8, &best.header.hash().bytes, &best.block_hash.bytes);
     try testing.expect(best.block_value > 0);
     // Resolved jobs are gone.
@@ -183,6 +122,23 @@ test "service: job lifecycle publishes the deltas and resolves the last sealed b
     try testing.expect(service.payload_timestamp(id_of(1)) == null);
     try testing.expect(service.next_deadline_ns() == null);
     try testing.expectEqual(@as(u64, 1), service.metrics.jobs_resolved.get());
+    try testing.expectEqual(@as(u64, 0), service.metrics.blocks_sealed_early.get());
+}
+
+test "service: the build stops at the 150 ms cutoff" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var buffers: [6][256]u8 = undefined;
+    try harness.submit_pool(&buffers);
+    const service = &harness.service;
+    harness.tick(start_ns, 0);
+    try service.send_new_payload(id_of(1), harness.genesis(), &fixture.attributes_l2(2, 1));
+    // Each pool transaction takes 50 ms: reads at 0, 50 and 100 ms pass, 150 ms stops.
+    harness.tick(start_ns, 50 * ns_per_ms);
+    const best = try expect_resolved(service.resolve(id_of(1)));
+    try testing.expectEqual(@as(usize, 3), best.transactions.len);
+    try testing.expectEqual(service_module.Stop.cutoff, best.stop);
+    try testing.expectEqual(@as(u64, 1), service.metrics.builds_cut_off.get());
 }
 
 test "service: a new FCU cancels the previous job" {
@@ -191,180 +147,84 @@ test "service: a new FCU cancels the previous job" {
     var buffers: [3][256]u8 = undefined;
     try harness.submit_pool(&buffers);
     const service = &harness.service;
-    const first = fixture.attributes_l2(2, 0x01);
-    const second = fixture.attributes_l2(2, 0x02);
-    service.tick(start_ns);
-    try service.send_new_payload(id_of(1), harness.genesis(), &first);
-    service.tick(deadline_ns(2));
-    try testing.expectEqual(@as(u32, 3), harness.recorder.len);
-    try service.send_new_payload(id_of(2), harness.genesis(), &second);
+    harness.tick(start_ns, 0);
+    try service.send_new_payload(id_of(1), harness.genesis(), &fixture.attributes_l2(2, 1));
+    harness.tick(start_ns + 10, 0);
+    try service.send_new_payload(id_of(2), harness.genesis(), &fixture.attributes_l2(2, 2));
     try testing.expectEqual(@as(u64, 1), service.metrics.jobs_cancelled.get());
     try testing.expect(service.resolve(id_of(1)) == null);
-    try testing.expect(service.payload_timestamp(id_of(1)) == null);
     try testing.expectEqualSlices(u8, &id_of(2), &service.active_id().?);
-    const restart = harness.recorder.log[3];
-    try testing.expectEqualSlices(u8, &id_of(2), &restart.id);
-    try testing.expectEqual(@as(u64, 0), restart.index);
-    // The second job's schedule starts at its own FCU time (1.3 s): 3 flashblocks.
-    service.tick(expires_ns - 1);
-    for (harness.recorder.entries()[4..]) |entry| {
-        try testing.expectEqualSlices(u8, &id_of(2), &entry.id);
-    }
+    harness.tick(start_ns + 20, 0);
     const best = try expect_resolved(service.resolve(id_of(2)));
-    try testing.expectEqual(@as(u32, 3), best.flashblock_index);
     try testing.expectEqual(@as(usize, 3), best.transactions.len);
     try testing.expectEqual(@as(u8, 0x02), best.header.beneficiary.bytes[0]);
 }
 
-test "service: resolve before every flashblock returns the newest sealed block" {
+test "service: an early resolve seals immediately without waiting" {
     const harness = try Harness.create();
     defer harness.destroy();
-    var buffers: [6][256]u8 = undefined;
+    var buffers: [3][256]u8 = undefined;
     try harness.submit_pool(&buffers);
-    var attributes = fixture.attributes_l2(2, 0xfe);
-    attributes.gas_limit = 210_000;
+    var deposit_buffer: [256]u8 = undefined;
+    const deposits = [_][]const u8{builder_test.deposit(&deposit_buffer, 1)};
+    var attributes = fixture.attributes_l2(2, 1);
+    attributes.transactions = &deposits;
     const service = &harness.service;
-    service.tick(start_ns);
-    try service.send_new_payload(id_of(9), harness.genesis(), &attributes);
-    const zero_hash = harness.recorder.last.?.block_hash;
-    service.tick(deadline_ns(2));
-    const best = try expect_resolved(service.resolve(id_of(9)));
-    try testing.expectEqual(@as(u32, 2), best.flashblock_index);
-    try testing.expectEqual(@as(usize, 4), best.transactions.len);
-    try testing.expect(!std.mem.eql(u8, &zero_hash.bytes, &best.block_hash.bytes));
-    const last_hash = harness.recorder.last.?.block_hash;
-    try testing.expectEqualSlices(u8, &last_hash.bytes, &best.block_hash.bytes);
-    // No more flashblocks after resolve.
-    service.tick(expires_ns);
-    try testing.expectEqual(@as(u32, 3), harness.recorder.len);
-    try testing.expectEqual(@as(u64, 0), service.metrics.jobs_expired.get());
+    harness.tick(start_ns, 0);
+    try service.send_new_payload(id_of(4), harness.genesis(), &attributes);
+    // getPayload before any tick: the cutoff moves to now, so only the deposit is sealed.
+    const best = try expect_resolved(service.resolve(id_of(4)));
+    try testing.expectEqual(@as(usize, 1), best.transactions.len);
+    try testing.expectEqualSlices(u8, deposits[0], best.transactions[0]);
+    try testing.expectEqual(service_module.Stop.cutoff, best.stop);
+    try testing.expectEqual(@as(u64, 1), service.metrics.blocks_sealed_early.get());
 }
 
-test "service: an unresolved job expires at its payload deadline" {
+test "service: an unresolved job expires after its slot plus leeway" {
     const harness = try Harness.create();
     defer harness.destroy();
     const service = &harness.service;
-    service.tick(start_ns);
+    harness.tick(start_ns, 0);
     try service.send_new_payload(id_of(3), harness.genesis(), &fixture.attributes_l2(2, 1));
-    // One late tick bursts every remaining flashblock, then drops the job.
-    service.tick(expires_ns);
-    try testing.expectEqual(@as(u32, 6), harness.recorder.len);
+    harness.tick(expires_ns - 1, 0);
+    try testing.expectEqualSlices(u8, &id_of(3), &service.active_id().?);
+    harness.tick(expires_ns, 0);
     try testing.expect(service.resolve(id_of(3)) == null);
     try testing.expectEqual(@as(u64, 1), service.metrics.jobs_expired.get());
     try testing.expect(service.next_deadline_ns() == null);
 }
 
-test "service: no-tx-pool and late jobs build only the fallback block" {
-    const harness = try Harness.create();
-    defer harness.destroy();
-    var buffers: [3][256]u8 = undefined;
-    try harness.submit_pool(&buffers);
-    const service = &harness.service;
-    var shadow = fixture.attributes_l2(2, 1);
-    shadow.no_tx_pool = true;
-    service.tick(start_ns);
-    try service.send_new_payload(id_of(4), harness.genesis(), &shadow);
-    service.tick(deadline_ns(5));
-    try testing.expectEqual(@as(u32, 0), harness.recorder.len);
-    const quiet = try expect_resolved(service.resolve(id_of(4)));
-    try testing.expectEqual(@as(u32, 0), quiet.flashblock_index);
-    try testing.expectEqual(@as(usize, 0), quiet.transactions.len);
-    // An FCU 50 ms before the flashblocks leeway cut-off gets zero regular flashblocks.
-    service.tick(1950 * ns_per_ms);
-    try service.send_new_payload(id_of(5), harness.genesis(), &fixture.attributes_l2(2, 1));
-    try testing.expectEqual(@as(u32, 1), harness.recorder.len);
-    // The payload deadline counts whole seconds: (2 s - floor(1.95 s)) + 500 ms leeway.
-    try testing.expectEqual(@as(?u64, 3450 * ns_per_ms), service.next_deadline_ns());
-    const late = try expect_resolved(service.resolve(id_of(5)));
-    try testing.expectEqual(@as(u32, 0), late.flashblock_index);
-}
-
-test "service: a failed start leaves no job" {
+test "service: failed starts and failed builds" {
     const harness = try Harness.create();
     defer harness.destroy();
     const service = &harness.service;
-    service.tick(start_ns);
+    harness.tick(start_ns, 0);
     try service.send_new_payload(id_of(1), harness.genesis(), &fixture.attributes_l2(2, 1));
     const unknown: [32]u8 = @splat(0xab);
     const result = service.send_new_payload(id_of(2), unknown, &fixture.attributes_l2(2, 1));
     try testing.expectError(error.BuildFailed, result);
     try testing.expect(service.active_id() == null);
-    try testing.expect(service.resolve(id_of(1)) == null);
     try testing.expectEqual(@as(u64, 1), service.metrics.job_start_failed.get());
+    // An attribute transaction that does not execute fails the build, not the FCU.
+    const garbage = [_][]const u8{&.{ 0x7e, 0x01 }};
+    var attributes = fixture.attributes_l2(2, 1);
+    attributes.transactions = &garbage;
+    try service.send_new_payload(id_of(5), harness.genesis(), &attributes);
+    harness.tick(start_ns + 1, 0);
+    try testing.expectEqual(@as(u64, 1), service.metrics.build_failed.get());
+    try testing.expectError(error.BuildFailed, service.resolve(id_of(5)).?);
+    try testing.expect(service.active_id() == null);
 }
 
-test "service: satisfies the multiplex Builder interface" {
-    const flashblocks = try Harness.create();
-    defer flashblocks.destroy();
-    const basic = try Harness.create();
-    defer basic.destroy();
-    const Router = multiplex.Router(Service, Payload);
-    var router = Router.init(&flashblocks.service, &basic.service, l2);
-    flashblocks.service.tick(start_ns);
-    basic.service.tick(start_ns);
-    const attributes = fixture.attributes_l2(2, 1);
-    try router.build_new_payload(id_of(6), flashblocks.genesis(), &attributes);
-    const selected: multiplex.Kind = if (router.basic_selected_at(2)) .basic else .flashblocks;
-    const shadow = if (selected == .basic) flashblocks else basic;
-    // The shadow builder runs without the pool and publishes nothing.
-    try testing.expectEqual(@as(u32, 0), shadow.recorder.len);
-    try testing.expectEqual(@as(u64, 2), (router.payload_timestamp(id_of(6)).?) catch 0);
-    const best = (router.resolve(id_of(6)).?) catch return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u32, 0), best.flashblock_index);
-}
-
-/// The model of one job, recomputed from the same timing functions.
+/// The model of one job.
 const Model = struct {
     id: PayloadId,
-    schedule: timing.Schedule,
-    count: u64,
     expires_ns: u64,
     no_tx_pool: bool,
-    /// Flashblocks published so far (index 0 counts).
-    published: u64,
-    last_hash: ?B256,
 };
 
-fn model_start(
-    model: *?Model,
-    now_ns: u64,
-    id: PayloadId,
-    attributes: *const payload.PayloadAttributes,
-) void {
-    const schedule = timing.Schedule.init(config, attributes.timestamp, now_ns, 0);
-    const duration_ns = timing.payload_job_duration_ns(config, attributes.timestamp, now_ns);
-    model.* = .{
-        .id = id,
-        .schedule = schedule,
-        .count = @min(schedule.count, 8),
-        .expires_ns = now_ns + duration_ns,
-        .no_tx_pool = attributes.no_tx_pool.?,
-        .published = 0,
-        .last_hash = null,
-    };
-}
-
-/// Checks the sink against the model after an operation and folds in what it published.
-fn check_publications(harness: *Harness, model: *Model, total_before: u64) !void {
-    const new = harness.recorder.total - total_before;
-    if (model.no_tx_pool) {
-        try testing.expectEqual(@as(u64, 0), new);
-        return;
-    }
-    const due = harness.service.now_ns;
-    const ticks = model.schedule.index_due(due) - 1;
-    const expected = 1 + @min(ticks, model.count);
-    try testing.expectEqual(expected, model.published + new);
-    if (new == 0) return;
-    const last = harness.recorder.last.?;
-    // At most one active job: every publication belongs to it, indices increase by one.
-    try testing.expectEqualSlices(u8, &model.id, &last.id);
-    try testing.expectEqual(expected - 1, last.index);
-    model.published = expected;
-    model.last_hash = last.block_hash;
-}
-
-/// Returns how many resolves were checked against a published block hash.
+/// One random interleaving of FCUs, resolves and ticks against the model. Returns how many
+/// resolves returned a block with pool transactions.
 fn random_interleaving(prng: *Prng) !u64 {
     const harness = try Harness.create();
     defer harness.destroy();
@@ -373,44 +233,27 @@ fn random_interleaving(prng: *Prng) !u64 {
     const service = &harness.service;
     var model: ?Model = null;
     var now_ns: u64 = start_ns + prng.below(ns_per_s);
-    service.tick(now_ns);
-    var checked: u64 = 0;
-    var step: u32 = 0;
-    while (step < 48) : (step += 1) {
-        const total_before = harness.recorder.total;
+    harness.tick(now_ns, 0);
+    var with_pool: u64 = 0;
+    for (0..48) |_| {
         switch (prng.below(8)) {
             0, 1 => {
                 const id = id_of(@intCast(prng.below(4)));
-                var attributes = fixture.attributes_l2(now_ns / ns_per_s + prng.range(1, 2), 1);
+                var attributes = fixture.attributes_l2(now_ns / ns_per_s + 1, 1);
                 attributes.no_tx_pool = prng.chance(1, 5);
                 try service.send_new_payload(id, harness.genesis(), &attributes);
-                model_start(&model, now_ns, id, &attributes);
-                const active = &model.?;
-                try check_publications(harness, active, total_before);
+                const slot = timing.Slot.init(.{}, now_ns);
+                model = .{
+                    .id = id,
+                    .expires_ns = slot.expires_ns,
+                    .no_tx_pool = attributes.no_tx_pool.?,
+                };
             },
-            2 => {
-                const id = id_of(@intCast(prng.below(4)));
-                const result = service.resolve(id);
-                const expected = if (model) |m| std.mem.eql(u8, &m.id, &id) else false;
-                try testing.expectEqual(expected, result != null);
-                if (!expected) continue;
-                const best = try (result.?);
-                const active = model.?;
-                if (active.last_hash) |hash| {
-                    try testing.expectEqualSlices(u8, &hash.bytes, &best.block_hash.bytes);
-                    try testing.expectEqual(active.published - 1, best.flashblock_index);
-                    checked += 1;
-                }
-                model = null;
-            },
+            2, 3 => with_pool += try check_resolve(harness, prng, &model),
             else => {
                 now_ns += prng.below(400 * ns_per_ms);
-                service.tick(now_ns);
-                const active = &(model orelse {
-                    try testing.expectEqual(total_before, harness.recorder.total);
-                    continue;
-                });
-                try check_publications(harness, active, total_before);
+                harness.tick(now_ns, prng.below(60 * ns_per_ms));
+                const active = model orelse continue;
                 if (now_ns >= active.expires_ns) model = null;
             },
         }
@@ -419,15 +262,37 @@ fn random_interleaving(prng: *Prng) !u64 {
         try testing.expectEqual(model != null, active_id != null);
         if (model) |m| try testing.expectEqualSlices(u8, &m.id, &active_id.?);
     }
-    return checked;
+    return with_pool;
+}
+
+fn check_resolve(harness: *Harness, prng: *Prng, model: *?Model) !u64 {
+    // Usually ask for the active job; sometimes for an arbitrary (likely unknown) id.
+    var id = id_of(@intCast(prng.below(4)));
+    if (model.*) |m| {
+        if (prng.chance(3, 4)) id = m.id;
+    }
+    const result = harness.service.resolve(id);
+    const expected = if (model.*) |m| std.mem.eql(u8, &m.id, &id) else false;
+    try testing.expectEqual(expected, result != null);
+    if (!expected) return 0;
+    const active = model.*.?;
+    model.* = null;
+    const best = try (result.?);
+    try testing.expectEqualSlices(u8, &id, &best.id);
+    try testing.expectEqualSlices(u8, &best.header.hash().bytes, &best.block_hash.bytes);
+    if (active.no_tx_pool) {
+        try testing.expectEqual(@as(usize, 0), best.transactions.len);
+        try testing.expectEqual(service_module.Stop.no_tx_pool, best.stop);
+    }
+    return @intFromBool(best.transactions.len > 0);
 }
 
 test "service: seeded fuzz of FCU, resolve and tick interleavings" {
     var prng = Prng.init(0x5e41ce);
-    var checked: u64 = 0;
-    for (0..24) |_| checked += try random_interleaving(&prng);
-    // The seeds must reach resolves of published jobs, not only empty or expired ones.
-    try testing.expect(checked >= 8);
+    var with_pool: u64 = 0;
+    for (0..24) |_| with_pool += try random_interleaving(&prng);
+    // The seeds must reach resolves of blocks with pool transactions.
+    try testing.expect(with_pool >= 8);
 }
 
 fn fuzz_service(_: void, smith: *testing.Smith) anyerror!void {
