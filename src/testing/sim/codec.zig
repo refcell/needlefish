@@ -11,8 +11,11 @@
 //! L1 blocks need a channel bank; the simulator adopts the derive lane's once it lands.
 //!
 //! Model block encoding: block `n` is a singular batch with `timestamp = n * 2`,
-//! `parent_hash` / hash carrying the model's 64-bit hashes, and one EIP-1559
-//! transaction whose 8-byte input is the payload (`payload_tx`).
+//! `parent_hash` / hash carrying the model's 64-bit hashes, the block's L1 origin (the
+//! sequencer picks final L1 blocks, see `Origin`), and one EIP-1559 transaction whose
+//! 8-byte input is the payload (`payload_tx`). L1 block `k` has timestamp `k * 12`.
+//! `rollup` is a complete rollup config for the real consensus driver (`real_verifier`):
+//! these batches are valid under the real derivation rules.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -68,9 +71,44 @@ pub fn sender_address(sender: u8) Address {
     return Address.init(@splat(0xb0 | sender));
 }
 
-/// Granite on from genesis: the channel bank reads any ready channel, not just the head.
+/// Model genesis hashes (64-bit model words; `word_hash` widens them).
+pub const l2_genesis_hash: u64 = 0x6765_6e65_7369_7300;
+pub const l1_genesis_hash: u64 = 0x6c31_6765_6e65_7369;
+pub const l1_chain_id = 900;
+pub const gas_limit = 30_000_000;
+/// Longer than any simulated run (`Config.settle_end_ns` is at most a few hundred L1
+/// blocks), so the window never expires: the model sequencer never reorgs its chain, and
+/// real derivation would otherwise legitimately diverge into deposit-only blocks.
+pub const seq_window_blocks = 3600;
+
+/// The L1 origin of an L2 block, as model words. The sequencer only adopts L1 blocks
+/// deeper than the deepest L1 reorg, so an origin hash never changes.
+pub const Origin = struct {
+    number: u64,
+    hash: u64,
+    sequence_number: u64 = 0,
+};
+
+pub const genesis_origin: Origin = .{ .number = 0, .hash = l1_genesis_hash };
+
+/// Granite on from genesis (which implies Regolith through Fjord): the channel bank reads
+/// any ready channel, not just the head. Holocene stays off (pre-Holocene batch queue).
 pub const rollup: protocol.RollupConfig = config: {
     var config: protocol.RollupConfig = .{
+        .genesis = .{
+            .l1 = .{ .number = 0, .hash = word_hash(l1_genesis_hash) },
+            .l2 = .{ .number = 0, .hash = word_hash(l2_genesis_hash) },
+            .l2_time = 0,
+            .system_config = .{
+                .batcher_address = sender_address(sender_batcher),
+                .gas_limit = gas_limit,
+            },
+        },
+        .block_time = l2_block_time_s,
+        .max_sequencer_drift = 1800,
+        .seq_window_size = seq_window_blocks,
+        .l1_chain_id = l1_chain_id,
+        .l2_chain_id = l2_chain_id,
         .batch_inbox_address = batch_inbox,
         .channel_timeout = channel_timeout_blocks,
         .granite_channel_timeout = channel_timeout_blocks,
@@ -113,7 +151,7 @@ pub fn payload_tx(payload: u64, out: *[payload_tx_length_max]u8) []u8 {
     return encoded;
 }
 
-fn payload_from_tx(encoded: []const u8) ?u64 {
+pub fn payload_from_tx(encoded: []const u8) ?u64 {
     const envelope = tx_module.Envelope.decode(encoded) catch return null;
     const tx = switch (envelope) {
         .eip1559 => |signed| signed.tx,
@@ -206,15 +244,18 @@ pub const Encoder = struct {
 
     /// Encodes `payloads.len` blocks starting at `first` as one channel, returning its
     /// tx data (one frame each). `hashes[i]` is the hash of block `first - 1 + i` (so it
-    /// starts at the parent). The result borrows the encoder until the next call.
+    /// starts at the parent); `origins[i]` is the L1 origin of block `first + i`. The
+    /// result borrows the encoder until the next call.
     pub fn encode(
         encoder: *Encoder,
         first: u64,
         hashes: []const u64,
         payloads: []const u64,
+        origins: []const Origin,
     ) []const []const u8 {
         assert(first > 0 and payloads.len > 0 and payloads.len <= blocks_max);
         assert(hashes.len == payloads.len + 1);
+        assert(origins.len == payloads.len);
         const manager = &encoder.manager;
         manager.reset();
         for (payloads, 0..) |payload, offset| {
@@ -226,7 +267,10 @@ pub const Encoder = struct {
                 .hash = word_hash(hashes[offset + 1]),
                 .parent_hash = word_hash(hashes[offset]),
                 .timestamp = number * l2_block_time_s,
-                .l1_origin = .{},
+                .l1_origin = .{
+                    .number = origins[offset].number,
+                    .hash = word_hash(origins[offset].hash),
+                },
                 .sequence_number = 0,
                 .transactions = &transactions,
             };
@@ -511,11 +555,13 @@ const fuzz = @import("../fuzz.zig");
 const Fixture = struct {
     hashes: [blocks_max + 2]u64,
     payloads: [blocks_max + 2]u64,
+    origins: [blocks_max + 2]Origin = @splat(genesis_origin),
     encoder: Encoder,
     decoder: Decoder,
 
     fn init(fixture: *Fixture, seed: u64) !void {
         var prng = @import("../prng.zig").Prng.init(seed);
+        fixture.origins = @splat(genesis_origin);
         for (&fixture.hashes, &fixture.payloads) |*hash, *payload| {
             hash.* = prng.int(u64);
             payload.* = prng.int(u64);
@@ -541,6 +587,7 @@ test "codec: encode then decode round trips every batch size" {
             1,
             fixture.hashes[0 .. count + 1],
             fixture.payloads[1..][0..count],
+            fixture.origins[1..][0..count],
         );
         try testing.expectEqual(@as(usize, 1), frames.len);
         const blocks = fixture.decoder.decode(frames[0]) orelse return error.TestUnexpectedResult;
@@ -558,6 +605,7 @@ fn fuzz_tamper(fixture: *Fixture, smith: *std.testing.Smith) anyerror!void {
         first,
         fixture.hashes[first - 1 ..][0 .. count + 1],
         fixture.payloads[first..][0..count],
+        fixture.origins[first..][0..count],
     )[0];
     var data: [tx_data_max]u8 = undefined;
     @memcpy(data[0..encoded.len], encoded);
@@ -601,11 +649,13 @@ test "codec: derive stages keep the batcher's channel and drop an attacker's" {
     defer fixture.deinit();
     var pool = try TxPool.init(testing.allocator, 4);
     defer pool.deinit(testing.allocator);
-    const honest = fixture.encoder.encode(1, fixture.hashes[0..3], fixture.payloads[1..3])[0];
+    const origins = fixture.origins[1..3];
+    const hashes = fixture.hashes[0..3];
+    const honest = fixture.encoder.encode(1, hashes, fixture.payloads[1..3], origins)[0];
     const honest_index = pool.append(honest).?;
     var forged_payloads = fixture.payloads;
     for (&forged_payloads) |*payload| payload.* +%= 1;
-    const forged = fixture.encoder.encode(1, fixture.hashes[0..3], forged_payloads[1..3])[0];
+    const forged = fixture.encoder.encode(1, hashes, forged_payloads[1..3], origins)[0];
     const forged_index = pool.append(forged).?;
     // Order the attacker first: it must not shadow or displace the batcher's data.
     var block: WindowBlock = .{ .number = 5, .hash = 0xaa, .parent_hash = 0xbb, .count = 2 };
@@ -652,7 +702,8 @@ test "codec: multi-frame channels complete across blocks, not when lost or timed
     var pool = try TxPool.init(testing.allocator, 64);
     defer pool.deinit(testing.allocator);
     const hashes = fixture.hashes[0 .. blocks_max + 1];
-    const frames = encoder.encode(1, hashes, fixture.payloads[1..][0..blocks_max]);
+    const payloads = fixture.payloads[1..][0..blocks_max];
+    const frames = encoder.encode(1, hashes, payloads, fixture.origins[1..][0..blocks_max]);
     try testing.expect(frames.len >= 3);
     var window: [window_blocks_max]WindowBlock = undefined;
     // One frame per block, all inside the channel timeout: decodes in the last block.

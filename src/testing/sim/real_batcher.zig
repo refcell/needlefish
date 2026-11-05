@@ -20,7 +20,7 @@ const Prng = @import("../prng.zig").Prng;
 const codec = @import("codec.zig");
 const nodes = @import("nodes.zig");
 
-pub const l1_chain_id = 900;
+pub const l1_chain_id = codec.l1_chain_id;
 pub const step_interval_ns: u64 = 2 * std.time.ns_per_s;
 const raw_tx_bytes_max = codec.tx_data_max + 256;
 
@@ -56,8 +56,6 @@ const Endpoint = struct {
 const Backend = struct {
     view: ?View = null,
     stats: Stats = .{},
-    info_hex: [2 * l1_info.calldata_length_max]u8 = undefined,
-    info_hex_length: usize = 0,
 
     fn send(context: *anyopaque, body: []const u8, response: []u8) rpc.TransportError!usize {
         const endpoint: *Endpoint = @ptrCast(@alignCast(context));
@@ -182,15 +180,28 @@ const Backend = struct {
         try backend.write_l2_block(view.sequencer, number, out);
     }
 
-    /// The model block as `eth_getBlockByNumber(n, true)`: the L1 info deposit, then one
-    /// EIP-1559 transaction carrying the payload (see `codec.payload_envelope`).
+    /// The model block as `eth_getBlockByNumber(n, true)`: the L1 info deposit naming the
+    /// block's L1 origin, then one EIP-1559 transaction carrying the payload (see
+    /// `codec.payload_envelope`).
     fn write_l2_block(
         backend: *Backend,
         sequencer: *const nodes.Sequencer,
         number: u64,
         out: *std.Io.Writer,
     ) !void {
+        _ = backend;
         const chain = &sequencer.chain;
+        const origin = chain.origins[number];
+        assert(origin.number * codec.l1_block_time_s <= number * codec.l2_block_time_s);
+        const info: l1_info.L1BlockInfo = .{
+            .format = .jovian,
+            .number = origin.number,
+            .time = origin.number * codec.l1_block_time_s,
+            .block_hash = codec.word_hash(origin.hash),
+            .sequence_number = origin.sequence_number,
+        };
+        var calldata: [l1_info.calldata_length_max]u8 = undefined;
+        const encoded = info.encode_calldata(&calldata);
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u64, &payload, chain.payloads[number], .big);
         const envelope = codec.payload_envelope(&payload);
@@ -202,9 +213,7 @@ const Backend = struct {
             &codec.word_hash(chain.hashes[number - 1]).bytes,
             number * codec.l2_block_time_s,
         });
-        try out.print("{{\"type\":\"0x7e\",\"input\":\"0x{s}\"}},", .{
-            backend.info_hex[0..backend.info_hex_length],
-        });
+        try out.print("{{\"type\":\"0x7e\",\"input\":\"0x{x}\"}},", .{encoded});
         try out.print("{{\"type\":\"0x2\",\"chainId\":\"0x{x}\",\"nonce\":\"0x0\"," ++
             "\"gas\":\"0x{x}\",\"value\":\"0x0\",\"to\":\"0x{x}\",\"input\":\"0x{x}\"," ++
             "\"maxPriorityFeePerGas\":\"0x{x}\",\"maxFeePerGas\":\"0x{x}\"," ++
@@ -286,12 +295,6 @@ pub const RealBatcher = struct {
         const batcher = try allocator.create(RealBatcher);
         errdefer allocator.destroy(batcher);
         batcher.backend = .{};
-        const info: l1_info.L1BlockInfo = .{ .format = .jovian };
-        var calldata: [l1_info.calldata_length_max]u8 = undefined;
-        const encoded = info.encode_calldata(&calldata);
-        const written = std.fmt.bufPrint(&batcher.backend.info_hex, "{x}", .{encoded}) catch
-            unreachable; // Twice the calldata bound.
-        batcher.backend.info_hex_length = written.len;
         const limits: rpc.Limits = .{
             .request_bytes_max = 2 * raw_tx_bytes_max + 256,
             .response_bytes_max = 8 * 1024,

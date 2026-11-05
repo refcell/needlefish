@@ -17,7 +17,11 @@ provably robust.
 - [ ] Sim: swap model nodes for real components behind `utilities.io` SimIo as lanes land.
   - [x] Batcher: the real `batcher/service` (txmgr, channel manager, L2 source) runs
     against model state through JSON-RPC transports (`sim/real_batcher.zig`).
-  - [ ] Sequencer / verifier derivation once the consensus service is step-driven.
+  - [x] Verifier derivation: the real consensus `Driver` (pipeline, engine task queue,
+    startup discovery) as the first verifier's consensus client (`sim/real_verifier.zig`).
+  - [ ] Sequencer: the real driver in sequencer mode producing the L2 chain.
+- [ ] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
+  reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
 - [ ] Sim: enable both tx-loss faults for the real batcher (with crashes) once txmgr recovers
   nonce gaps (see notes); today they are drawn only where txmgr can survive them.
@@ -34,6 +38,12 @@ provably robust.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Notes for other lanes (from simulator findings)
+- derive (batch queue): a pipeline reset whose L2 safe head has L1 origin `genesis.l1 + 1`
+  walks back to the L2 genesis (origin `genesis.l1`); the batch queue then holds
+  `[genesis.l1, genesis.l1 + 1]` (the origin change is never "behind"), so
+  `derive_next_batch` fails with `L1OriginMismatch` (reset) forever. base/base
+  `batch_queue.rs` has the same edge. Repro: sim seed 48 with the gate removed; or a
+  driver reset with safe head origin 1 and `genesis.l1.number = 0`.
 - batcher (txmgr): a confirmed tx that a reorg orphans and L1 then drops leaves a nonce gap
   that nothing fills: `next_nonce` is cached forever and freed slots are never re-sent, so
   every later tx waits on L1 indefinitely. base/base resets its nonce cache on send timeout
@@ -165,3 +175,14 @@ provably robust.
   a malformed or over-long chunk-size line now fails as soon as it arrives, and declared
   chunk sizes over `body_size_max` fail at the crossing size line instead of after the
   whole body. Pinned by fuzz properties; both fail on the old parser.
+- 2026-11-05: the real consensus driver runs as a verifier in the sim (`real_verifier`,
+  drawn last in `Config.random`, half of seeds). L1 provider over the model L1, a
+  deterministic engine whose block hash is the model sequencer's hash for the same
+  parent and payload tx, startup discovery on restarts (engine chain durable). The model
+  sequencer now picks real L1 origins (final L1 blocks, one epoch step per block) and
+  the batches carry them; `codec.rollup` is a full config (genesis, block time 2, drift
+  1800, window 3600 > any run, so deposit-only blocks never appear). Invariants: safe
+  head is a sequencer block, every derived block has the sequencer's payload tx and L1
+  origin, safe head monotonic except restarts/L1 reorgs, liveness to the confirmed head.
+  2000 seeds green (ReleaseSafe); mutants caught: dropped user tx (104/200 seeds, all
+  real-verifier ones), stored tx differs from the hashed one (per-block check).

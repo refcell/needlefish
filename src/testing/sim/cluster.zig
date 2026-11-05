@@ -20,6 +20,12 @@
 //!   - no reorgs and no equivocations (the model is honest)
 //!   - every L1 batcher transaction decodes with the real protocol codecs (codec.zig)
 //!   - batcher confirmed <= L1-included <= sequencer head
+//!   - real verifier (`Config.real_verifier`, the consensus lane's driver): its safe head
+//!     is a sequencer block, every derived block carries exactly the sequencer's payload
+//!     transaction and L1 origin (never a deposit-only block: the model sequencer never
+//!     lets the sequencing window expire, see `codec.seq_window_blocks`), its safe head
+//!     never decreases except across restarts and L1 reorgs, and after healing it reaches
+//!     the batcher-confirmed head
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,6 +34,7 @@ const network_module = @import("network.zig");
 const nodes = @import("nodes.zig");
 const codec = @import("codec.zig");
 const real_batcher = @import("real_batcher.zig");
+const real_verifier = @import("real_verifier.zig");
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
@@ -89,6 +96,9 @@ pub const Config = struct {
     /// channels (replays with shuffled and duplicated frames, truncated channels), plus
     /// garbage and oversize frames. Derivation must stay safe and live.
     byzantine_per_minute: u32 = 0,
+    /// Run the consensus lane's real node driver as a verifier (see `real_verifier.zig`),
+    /// as the first verifier's consensus client.
+    real_verifier: bool = false,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -125,6 +135,8 @@ pub const Config = struct {
         const admin_ops_per_minute: u32 = @intCast(swarm_level(prng, 6));
         if (config.real_batcher) config.admin_ops_per_minute = admin_ops_per_minute;
         config.byzantine_per_minute = @intCast(swarm_level(prng, 6));
+        // Drawn last so every other field of existing seeds stays the same.
+        config.real_verifier = prng.chance(1, 2);
         config.validate();
         return config;
     }
@@ -208,6 +220,10 @@ pub const Cluster = struct {
     attacker: codec.Encoder,
     byzantine: codec.Encoder,
     real: ?*real_batcher.RealBatcher,
+    real_verifier: ?*real_verifier.RealVerifier,
+    /// Real verifier safe head floor; reset on its restarts and on L1 reorgs.
+    real_safe_floor: u64 = 0,
+    real_reorgs_seen: u64 = 0,
     allocator: std.mem.Allocator,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
@@ -253,6 +269,11 @@ pub const Cluster = struct {
             null;
         errdefer if (real) |r| r.destroy(allocator);
         batcher.submitting = real == null;
+        const verifier_real = if (config.real_verifier)
+            try real_verifier.RealVerifier.create(allocator, config.block_count_max(), seed)
+        else
+            null;
+        errdefer if (verifier_real) |v| v.destroy();
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
         errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
@@ -281,6 +302,7 @@ pub const Cluster = struct {
             .attacker = attacker,
             .byzantine = byzantine,
             .real = real,
+            .real_verifier = verifier_real,
             .allocator = allocator,
             .verifiers = verifiers,
         };
@@ -293,6 +315,7 @@ pub const Cluster = struct {
         cluster.attacker.deinit(allocator);
         cluster.byzantine.deinit(allocator);
         if (cluster.real) |real| real.destroy(allocator);
+        if (cluster.real_verifier) |v| v.destroy();
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -374,7 +397,7 @@ pub const Cluster = struct {
     fn tick(cluster: *Cluster) void {
         cluster.l1.tick(&cluster.env(nodes.node_l1));
         if (cluster.up(nodes.node_sequencer)) {
-            cluster.sequencer.tick(&cluster.env(nodes.node_sequencer));
+            cluster.sequencer.tick(&cluster.env(nodes.node_sequencer), &cluster.l1);
         }
         if (cluster.up(nodes.node_batcher)) {
             const e = cluster.env(nodes.node_batcher);
@@ -383,6 +406,15 @@ pub const Cluster = struct {
         }
         for (cluster.verifiers[0..cluster.config.verifier_count]) |*verifier| {
             if (cluster.up(verifier.id)) verifier.tick(&cluster.env(verifier.id));
+        }
+        const node = nodes.node_verifier_first;
+        if (cluster.real_verifier) |verifier| {
+            if (cluster.up(node)) verifier.tick(.{
+                .l1 = &cluster.l1,
+                .pool = &cluster.tx_pool,
+                .l1_reachable = cluster.linked(node, nodes.node_l1),
+                .now_ns = cluster.env(node).now_ns,
+            });
         }
     }
 
@@ -419,7 +451,8 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.crashes_per_minute, steps_per_minute)) {
             // Any node but L1. Crashing an already-down node extends nothing.
             const node: NodeId = @intCast(prng.range(1, 2 + cluster.config.verifier_count));
-            if (cluster.up(node)) {
+            const fragile = node == nodes.node_verifier_first and cluster.real_verifier_fragile();
+            if (cluster.up(node) and !fragile) {
                 cluster.restart_ns[node] = cluster.now_ns +
                     prng.range(step_ns, cluster.config.downtime_ns_max);
                 cluster.report.crashes += 1;
@@ -427,7 +460,7 @@ pub const Cluster = struct {
         }
         if (prng.chance(cluster.config.l1_reorgs_per_minute, steps_per_minute)) {
             const depth_max = @min(nodes.l1_reorg_depth_max, cluster.l1.head);
-            if (depth_max > 0) {
+            if (depth_max > 0 and !cluster.real_verifier_fragile()) {
                 const depth = prng.range(1, depth_max);
                 const loss_ppm = cluster.config.reorg_tx_loss_ppm;
                 cluster.l1.reorg(&cluster.env(nodes.node_l1), depth, prng, loss_ppm);
@@ -458,6 +491,21 @@ pub const Cluster = struct {
             cluster.heal_ns = cluster.now_ns + prng.range(step_ns, cluster.config.downtime_ns_max);
             cluster.report.partitions += 1;
         }
+    }
+
+    /// BUG(derive): a pipeline reset whose safe head has L1 origin `genesis.l1 + 1` walks
+    /// back to the L2 genesis, so the batch queue holds `[genesis.l1, origin]` and every
+    /// step fails with `L1OriginMismatch`, which resets again: the driver never recovers.
+    /// base/base's `batch_queue.rs` has the same edge (it mirrors op-node). Until the
+    /// derive lane fixes it, nothing makes the real verifier reset in that window: its
+    /// node does not crash and L1 does not reorg (the random draws still happen).
+    fn real_verifier_fragile(cluster: *const Cluster) bool {
+        const verifier = cluster.real_verifier orelse return false;
+        const engine = &verifier.engine;
+        const labeled = engine.blocks[engine.safe].info.l1_origin.number;
+        const driver = if (verifier.safe_head()) |safe| safe.l1_origin.number else labeled;
+        const fragile = codec.rollup.genesis.l1.number + 1;
+        return labeled == fragile or driver == fragile;
     }
 
     /// Half symmetric group splits, half asymmetric: random one-way link cuts, which
@@ -492,7 +540,8 @@ pub const Cluster = struct {
             payload.* = cluster.sequencer.chain.payloads[number] +% 1;
         }
         const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
-        const frames = cluster.attacker.encode(first, hashes, payloads[0..count]);
+        const origins = cluster.sequencer.chain.origins[first..][0..count];
+        const frames = cluster.attacker.encode(first, hashes, payloads[0..count], origins);
         assert(frames.len == 1); // The attacker writes full-size frames.
         const tx_index = cluster.tx_pool.append(frames[0]) orelse return;
         const e = cluster.env(nodes.node_l1);
@@ -530,7 +579,8 @@ pub const Cluster = struct {
                 const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
                 const payloads = cluster.sequencer.chain.payloads[first..][0..count];
                 var frames_buffer: [codec.frames_max][]const u8 = undefined;
-                const frames = cluster.byzantine.encode(first, hashes, payloads);
+                const origins = cluster.sequencer.chain.origins[first..][0..count];
+                const frames = cluster.byzantine.encode(first, hashes, payloads, origins);
                 assert(frames.len <= byzantine_frames_max);
                 @memcpy(frames_buffer[0..frames.len], frames);
                 // Fisher-Yates: frames arrive in any order.
@@ -609,12 +659,36 @@ pub const Cluster = struct {
                     cluster.report.disk_faults += @intFromBool(disk_fault);
                     cluster.verifiers[index].restart(disk_fault);
                     cluster.safe_floor[index] = cluster.verifiers[index].safe_head;
+                    if (index == 0) cluster.restart_real_verifier();
                 },
             }
         }
     }
 
+    fn restart_real_verifier(cluster: *Cluster) void {
+        const verifier = cluster.real_verifier orelse return;
+        // Proof: the driver re-allocates what it just freed.
+        verifier.restart() catch unreachable;
+        cluster.real_safe_floor = 0;
+    }
+
+    fn check_real_verifier(cluster: *Cluster) Failure!void {
+        const verifier = cluster.real_verifier orelse return;
+        const node = nodes.node_verifier_first;
+        if (verifier.check(&cluster.sequencer)) |reason| return cluster.fail(reason, node);
+        const safe = (verifier.safe_head() orelse return).block_info.number;
+        if (cluster.l1.reorgs != cluster.real_reorgs_seen) {
+            cluster.real_reorgs_seen = cluster.l1.reorgs;
+            cluster.real_safe_floor = safe;
+        }
+        if (safe < cluster.real_safe_floor) {
+            return cluster.fail("real verifier safe head decreased", node);
+        }
+        cluster.real_safe_floor = safe;
+    }
+
     fn check_safety(cluster: *Cluster) Failure!void {
+        try cluster.check_real_verifier();
         const sequencer = &cluster.sequencer;
         if (cluster.batcher.confirmed > sequencer.head) {
             return cluster.fail("batcher confirmed beyond sequencer head", 0);
@@ -657,6 +731,11 @@ pub const Cluster = struct {
             if (v.unsafe_head != head) return cluster.fail("verifier unsafe head lags", v.id);
             if (v.safe_head != head) return cluster.fail("verifier safe head lags", v.id);
         }
+        if (cluster.real_verifier) |verifier| {
+            if (verifier.safe_number() != head) {
+                return cluster.fail("real verifier safe head lags", nodes.node_verifier_first);
+            }
+        }
     }
 
     fn fail(cluster: *const Cluster, reason: []const u8, node: NodeId) Failure {
@@ -680,6 +759,21 @@ pub const Cluster = struct {
             std.debug.print("  verifier {d}: safe={d} unsafe={d} l1_cursor={d}\n", .{
                 v.id, v.safe_head, v.unsafe_head, v.follower.cursor,
             });
+        }
+        if (cluster.real_verifier) |verifier| {
+            const driver = &verifier.driver;
+            std.debug.print(
+                "  real verifier: safe={d} phase={s} resets={d} critical={d} " ++
+                    "last_error={s} l1_origin={d}\n",
+                .{
+                    verifier.safe_number(),
+                    @tagName(driver.phase),
+                    driver.stats.resets,
+                    driver.stats.critical_errors,
+                    if (driver.last_error) |err| @errorName(err) else "none",
+                    if (driver.pipeline.origin()) |origin| origin.number else 0,
+                },
+            );
         }
     }
 };
@@ -871,6 +965,42 @@ test "cluster: multi-frame channels across congested L1 blocks stay live" {
     }
 }
 
+test "cluster: real verifier derives the batcher's chain" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 7, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_batcher = real,
+            .real_verifier = true,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const verifier = cluster.real_verifier.?;
+        try std.testing.expectEqual(report.sequencer_head, verifier.safe_number());
+        try std.testing.expect(verifier.driver.stats.consolidated >= report.sequencer_head);
+    }
+}
+
+test "cluster: real verifier survives crashes, partitions, and L1 reorgs" {
+    var cluster = try Cluster.init(std.testing.allocator, 8, .{
+        .verifier_count = 1,
+        .crashes_per_minute = 4,
+        .partitions_per_minute = 2,
+        .l1_reorgs_per_minute = 2,
+        .real_verifier = true,
+        .fault_end_ns = 240 * ns_per_s,
+        .production_end_ns = 300 * ns_per_s,
+        .settle_end_ns = 700 * ns_per_s,
+    });
+    defer cluster.deinit(std.testing.allocator);
+    const report = try cluster.run();
+    try std.testing.expectEqual(report.sequencer_head, cluster.real_verifier.?.safe_number());
+}
+
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     const fault_end_ns = smith.valueRangeAtMost(u64, 0, 120) * ns_per_s;
     const latency_ns_min = smith.valueRangeAtMost(u64, 1, 100) * std.time.ns_per_ms;
@@ -898,6 +1028,7 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .l1_block_txs_min = smith.valueRangeAtMost(u8, 2, nodes.l1_batches_max),
         .byzantine_per_minute = smith.valueRangeAtMost(u32, 0, 12),
         .real_batcher = smith.value(bool),
+        .real_verifier = smith.value(bool),
     };
     const evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
     if (!config.real_batcher or config.crashes_per_minute == 0) {

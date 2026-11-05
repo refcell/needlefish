@@ -91,6 +91,21 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
             },
         );
     }
+    if (cluster.real_verifier) |verifier| {
+        const driver = &verifier.driver;
+        std.debug.print(
+            "  real verifier: safe={d} consolidated={d} resets={d} restarts={d} " ++
+                "engine_calls={d} derivation_failures={d}\n",
+            .{
+                verifier.safe_number(),
+                driver.stats.consolidated,
+                driver.stats.resets,
+                verifier.restarts,
+                verifier.client.calls,
+                driver.stats.derivation_failures,
+            },
+        );
+    }
 }
 
 fn print_config(config: Config) void {
@@ -100,7 +115,7 @@ fn print_config(config: Config) void {
             "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
             "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d} real_batcher={} " ++
             "evictions/min={d} reorg_tx_loss={d}ppm frame_size={d} " ++
-            "l1_block_txs_min={d} byzantine/min={d}\n",
+            "l1_block_txs_min={d} byzantine/min={d} real_verifier={}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -121,6 +136,7 @@ fn print_config(config: Config) void {
             config.frame_size,
             config.l1_block_txs_min,
             config.byzantine_per_minute,
+            config.real_verifier,
         },
     );
 }

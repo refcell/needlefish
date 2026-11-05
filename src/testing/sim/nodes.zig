@@ -30,8 +30,8 @@ pub const node_sequencer: NodeId = 1;
 pub const node_batcher: NodeId = 2;
 pub const node_verifier_first: NodeId = 3;
 
-pub const genesis_hash: u64 = 0x6765_6e65_7369_7300;
-pub const l1_genesis_hash: u64 = 0x6c31_6765_6e65_7369;
+pub const genesis_hash: u64 = codec.l2_genesis_hash;
+pub const l1_genesis_hash: u64 = codec.l1_genesis_hash;
 /// Deepest L1 reorg the fault injector produces. Followers must handle any depth.
 pub const l1_reorg_depth_max = 3;
 /// Mempool storage: the admission limit plus room to re-inject every transaction of a
@@ -97,25 +97,31 @@ pub const Env = struct {
     }
 };
 
-/// Durable chain of block hashes and payloads, index = block number. Entry 0 is genesis.
+/// Durable chain of block hashes, payloads, and L1 origins, index = block number. Entry 0
+/// is genesis. Only the sequencer fills `origins`; verifiers never read them.
 pub const Chain = struct {
     hashes: []u64,
     payloads: []u64,
+    origins: []codec.Origin,
 
     pub fn init(allocator: std.mem.Allocator, block_count_max: u64) !Chain {
         assert(block_count_max > 0);
         const hashes = try allocator.alloc(u64, block_count_max + 1);
         errdefer allocator.free(hashes);
         const payloads = try allocator.alloc(u64, block_count_max + 1);
+        errdefer allocator.free(payloads);
+        const origins = try allocator.alloc(codec.Origin, block_count_max + 1);
         @memset(hashes, 0);
         @memset(payloads, 0);
+        @memset(origins, codec.genesis_origin);
         hashes[0] = genesis_hash;
-        return .{ .hashes = hashes, .payloads = payloads };
+        return .{ .hashes = hashes, .payloads = payloads, .origins = origins };
     }
 
     pub fn deinit(chain: *Chain, allocator: std.mem.Allocator) void {
         allocator.free(chain.hashes);
         allocator.free(chain.payloads);
+        allocator.free(chain.origins);
         chain.* = undefined;
     }
 
@@ -144,13 +150,16 @@ pub const Sequencer = struct {
     /// the first verifier. Honest runs leave it null.
     equivocate_at: ?u64 = null,
 
-    pub fn tick(sequencer: *Sequencer, env: *const Env) void {
+    /// `l1` is read directly (the model sequencer's L1 client) only to pick L1 origins.
+    pub fn tick(sequencer: *Sequencer, env: *const Env, l1: *const L1) void {
         if (!sequencer.producing) return;
         if (env.now_ns < sequencer.next_block_ns) return;
         if (sequencer.head == sequencer.chain.capacity()) return;
         sequencer.next_block_ns += sequencer.block_time_ns;
         const number = sequencer.head + 1;
         const payload = env.prng.int(u64);
+        const origins = sequencer.chain.origins;
+        origins[number] = next_origin(origins[number - 1], number, l1);
         const hash = sequencer.chain.put(number, payload);
         sequencer.head = number;
         var verifier: u8 = 0;
@@ -187,6 +196,26 @@ pub const Sequencer = struct {
                 .hash = sequencer.chain.hashes[number],
             } });
         }
+    }
+
+    /// The L1 origin of block `number`: the parent's, or the next L1 block once it is final
+    /// (deeper than any L1 reorg) and not newer than the block. One epoch step per block,
+    /// as the derivation rules require; L2 time never runs behind the origin's time.
+    fn next_origin(parent: codec.Origin, number: u64, l1: *const L1) codec.Origin {
+        assert(number > 0);
+        assert(parent.number <= l1.head);
+        const candidate = parent.number + 1;
+        const final = candidate + l1_reorg_depth_max <= l1.head;
+        const due = candidate * codec.l1_block_time_s <= number * codec.l2_block_time_s;
+        if (!final or !due) {
+            return .{
+                .number = parent.number,
+                .hash = parent.hash,
+                .sequence_number = parent.sequence_number + 1,
+            };
+        }
+        assert(l1.blocks[candidate].parent_hash == parent.hash);
+        return .{ .number = candidate, .hash = l1.blocks[candidate].hash };
     }
 
     /// Crash-restart: the sequencer chain is durable; production resumes on schedule.
@@ -640,6 +669,7 @@ pub const Batcher = struct {
             first,
             sequencer.chain.hashes[first - 1 .. first + count],
             sequencer.chain.payloads[first .. first + count],
+            sequencer.chain.origins[first .. first + count],
         );
         batcher.submitted += count;
         for (frames) |data| {
