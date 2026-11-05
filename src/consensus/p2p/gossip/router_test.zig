@@ -14,7 +14,7 @@ const Id = router_module.Id;
 const Slot = router_module.Slot;
 const ns_per_ms = std.time.ns_per_ms;
 
-fn test_message_id(topic: []const u8, data: []const u8) Id {
+fn test_message_id(_: ?*anyopaque, topic: []const u8, data: []const u8) Id {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(topic);
     hasher.update(data);

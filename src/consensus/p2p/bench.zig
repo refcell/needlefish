@@ -192,7 +192,7 @@ fn bench_seen(iterations: u32) u64 {
     return checksum;
 }
 
-fn bench_message_id(topic: []const u8, data: []const u8) seen.Id {
+fn bench_message_id(_: ?*anyopaque, topic: []const u8, data: []const u8) seen.Id {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(topic);
     hasher.update(data);

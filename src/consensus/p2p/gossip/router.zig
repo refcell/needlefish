@@ -30,7 +30,12 @@ pub const Slot = u8;
 const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
 
-pub const MessageIdFn = *const fn (topic: []const u8, data: []const u8) Id;
+/// Computes a message id; `context` is `Config.message_id_context` (e.g. scratch space).
+pub const MessageIdFn = *const fn (
+    context: ?*anyopaque,
+    topic: []const u8,
+    data: []const u8,
+) Id;
 
 pub const Config = struct {
     d: u32 = 8,
@@ -52,6 +57,7 @@ pub const Config = struct {
     opportunistic_graft_peers: u32 = 2,
     message_size_max: u32 = 10 * (1 << 20),
     message_id: MessageIdFn,
+    message_id_context: ?*anyopaque = null,
     thresholds: score.Thresholds = score.thresholds,
     /// Null disables scoring (every peer scores 0).
     peer_params: ?score.PeerParams = null,
@@ -453,7 +459,7 @@ pub const Router = struct {
         if (!router.topics[topic].subscribed) return;
         const data = message.data orelse &.{};
         if (data.len > router.config.message_size_max) return;
-        const id = router.config.message_id(name, data);
+        const id = router.config.message_id(router.config.message_id_context, name, data);
         if (!router.seen.insert(&id, now_ns)) return router.on_duplicate(slot, &id, now_ns);
         router.fulfil_promises(&id);
         _ = router.cache.put(&id, topic, data, false) orelse return;
@@ -636,7 +642,8 @@ pub const Router = struct {
         assert(topic < router.topics_count);
         if (!router.topics[topic].subscribed) return error.NotSubscribed;
         if (data.len > router.config.message_size_max) return error.TooLarge;
-        const id = router.config.message_id(router.topics[topic].slice(), data);
+        const name = router.topics[topic].slice();
+        const id = router.config.message_id(router.config.message_id_context, name, data);
         if (!router.seen.insert(&id, now_ns)) return error.Duplicate;
         _ = router.cache.put(&id, topic, data, true) orelse return error.CacheFull;
         var delivery: Delivery = .{
