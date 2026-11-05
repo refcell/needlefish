@@ -16,6 +16,7 @@ pub const memory_db = @import("memory_db.zig");
 pub const interpreter = @import("interpreter.zig");
 pub const evm = @import("evm.zig");
 pub const precompiles = @import("precompiles.zig");
+pub const transaction = @import("transaction.zig");
 
 test {
     _ = @import("evm_test.zig");

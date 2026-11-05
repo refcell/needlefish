@@ -256,3 +256,75 @@ test "evm: opcodes undefined before their fork halt" {
     const shanghai = try h.call(.shanghai, contract, &.{}, 50_000);
     try std.testing.expectEqual(evm_module.Status.success, shanghai.status);
 }
+
+const transaction = @import("transaction.zig");
+
+const Invalid = transaction.Invalid;
+
+fn transact(h: *Harness, tx: *const transaction.TxEnv) !transaction.Result {
+    return transaction.transact(&h.evm, .cancun, tx);
+}
+
+test "transaction: value transfer pays fees and tip" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const coinbase = primitives.address_from_int(0xc0ffee);
+    h.evm.block.coinbase = coinbase;
+    h.evm.block.base_fee = 7;
+    try h.database.put_account(caller, 1_000_000_000, 0, &.{});
+    const tx = transaction.TxEnv{
+        .tx_type = .eip1559,
+        .caller = caller,
+        .gas_limit = 50_000,
+        .gas_price = 10,
+        .gas_priority_fee = 2,
+        .to = other,
+        .value = 1000,
+    };
+    const result = try transaction.transact(&h.evm, .cancun, &tx);
+    const executed = result.executed;
+    try std.testing.expectEqual(evm_module.Status.success, executed.status);
+    try std.testing.expectEqual(@as(u64, 21_000), executed.gas_used);
+    const sender = try h.state.load(caller);
+    try std.testing.expectEqual(@as(u256, 1_000_000_000 - 1000 - 21_000 * 9), sender.info.balance);
+    try std.testing.expectEqual(@as(u64, 1), sender.info.nonce);
+    try std.testing.expectEqual(@as(u256, 1000), (try h.state.load(other)).info.balance);
+    try std.testing.expectEqual(@as(u256, 21_000 * 2), (try h.state.load(coinbase)).info.balance);
+}
+
+test "transaction: invalid transactions change nothing" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(caller, 100, 3, &.{});
+    var tx = transaction.TxEnv{ .caller = caller, .gas_limit = 21_000, .to = other, .nonce = 3 };
+    tx.gas_price = 1;
+    try std.testing.expectEqual(Invalid.insufficient_funds, (try transact(&h, &tx)).invalid);
+    tx.gas_price = 0;
+    tx.nonce = 2;
+    try std.testing.expectEqual(Invalid.nonce_too_low, (try transact(&h, &tx)).invalid);
+    tx.nonce = 3;
+    tx.gas_limit = 20_000;
+    try std.testing.expectEqual(Invalid.intrinsic_gas_too_low, (try transact(&h, &tx)).invalid);
+    try std.testing.expectEqual(@as(u64, 3), (try h.state.load(caller)).info.nonce);
+}
+
+test "transaction: create transaction deploys at sender nonce address" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(caller, 1 << 60, 5, &.{});
+    const init_code = [_]u8{ 0x60, 0xfe, 0x60, 0, 0x53, 0x60, 1, 0x60, 0, 0xf3 };
+    const tx = transaction.TxEnv{
+        .caller = caller,
+        .gas_limit = 100_000,
+        .nonce = 5,
+        .data = &init_code,
+    };
+    const executed = (try transaction.transact(&h.evm, .cancun, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, executed.status);
+    const expected = evm_module.create_address(caller, 5);
+    try std.testing.expectEqualSlices(u8, &expected, &executed.created.?);
+    try std.testing.expectEqual(@as(u64, 6), (try h.state.load(caller)).info.nonce);
+}
