@@ -64,11 +64,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/proposer`: pure logic + pipeline state machine (intervals, targets, recovery
   walk, dispatcher, collector/submitter) over injected chain/prover/submitter interfaces,
   in-memory fakes, DST with prover faults and L1 reorgs (`src/proof/proposer/`).
-- [ ] `proof/proposer-adapters`: `Chain` over `src/proof/rpc` (rollup `syncStatus` /
-  `outputAtBlock`, `eth_call` of `AnchorStateRegistry.getAnchorRoot`+`anchorGame` at one
+- [x] `proof/proposer-adapters`: `Chain` over `src/proof/rpc` (`proposer/rpc_chain.zig`:
+  rollup `syncStatus` / `outputAtBlock`, `getAnchorRoot`+`anchorGame` pinned to one L1
   block, factory `gameCount`/`games`/`gameImpls`, verifier `version` +
-  `intervalsForStartingBlock` with the legacy getters below 0.3.0); a `Prover` client for
-  the prover service once it exists.
+  `intervalsForStartingBlock` with the legacy getters below 0.3.0). The `Prover` client
+  comes with `proof/prover-service`.
 - [ ] `proof/proposer-txmgr`: `Submitter` over the batcher lane's txmgr (init bond from
   `initBonds`, revert selector mapping incl. `GameAlreadyExists`, receipt polling).
 - [ ] `bin/base proposer`: flags/config validation (base/base `config.rs`/`cli.rs`), dry-run
@@ -192,6 +192,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/proposer-adapters`: RPC `Chain` for the proposer, canned-RPC tests.
 - 2026-11-05: `proof/proposer` first slice: intervals, recovery walk, dispatcher/collector
   pipeline over injected interfaces, fakes, ported recovery tests, DST with L1 reorgs.
 - 2026-11-05: `proof/e2e-fuzz`: e2e block count is per scenario; 12 random seeds pass.

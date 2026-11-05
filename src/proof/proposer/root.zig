@@ -13,6 +13,7 @@ pub const dispatcher = @import("dispatcher.zig");
 pub const collector = @import("collector.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const fakes = @import("fakes.zig");
+pub const rpc_chain = @import("rpc_chain.zig");
 
 pub const Intervals = intervals.Intervals;
 pub const RecoveredState = target.RecoveredState;
@@ -24,4 +25,5 @@ test {
     _ = @import("recovery_test.zig");
     _ = @import("pipeline_test.zig");
     _ = @import("sim_test.zig");
+    _ = @import("rpc_chain_test.zig");
 }
