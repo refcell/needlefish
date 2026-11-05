@@ -8,6 +8,7 @@ pub const gossip_bridge = @import("gossip_bridge.zig");
 pub const unsafe_buffer = @import("unsafe_buffer.zig");
 pub const signer_watcher = @import("signer_watcher.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const safedb_store = @import("safedb_store.zig");
 pub const metrics = @import("metrics.zig");
 pub const follow = @import("follow.zig");
 pub const conductor = @import("conductor.zig");
@@ -23,6 +24,7 @@ test {
     _ = unsafe_buffer;
     _ = signer_watcher;
     _ = checkpoint;
+    _ = safedb_store;
     _ = metrics;
     _ = follow;
     _ = conductor;

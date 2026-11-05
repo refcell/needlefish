@@ -21,7 +21,7 @@ const usage =
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
-    \\         [--checkpoint.path FILE]
+    \\         [--checkpoint.path FILE] [--safedb.path FILE]
     \\         [--metrics.enabled [--metrics.addr IP] [--metrics.port P]]
     \\         [--source-l2-rpc URL]   follow mode: insert blocks from a source node
     \\         [--conductor.rpc URL] [--sequencer.stopped]
@@ -66,6 +66,9 @@ pub const Flags = struct {
     /// Durable safe/finalized checkpoints; base/base defaults to a file under its data dir,
     /// here they are off unless a path is given.
     checkpoint_path: ?[]const u8 = null,
+    /// Durable L1 -> safe head entries for `optimism_safeHeadAtL1Block`; in memory only
+    /// (lost on restart) unless a path is given.
+    safedb_path: ?[]const u8 = null,
 };
 
 const p2p_args_max = 2 * p2p.options.bootnodes_max + 64;
@@ -176,6 +179,9 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
     } else if (eql(u8, arg, "--checkpoint.path")) {
         if (value.len == 0) return error.InvalidValue;
         flags.checkpoint_path = value;
+    } else if (eql(u8, arg, "--safedb.path")) {
+        if (value.len == 0) return error.InvalidValue;
+        flags.safedb_path = value;
     } else if (eql(u8, arg, "--upgrade-signal.contract")) {
         flags.upgrade_signal_contract = try parse_address(value);
     } else if (eql(u8, arg, "--upgrade-signal.l1-block-tag")) {
@@ -273,6 +279,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .p2p = p2p_config,
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
         .checkpoint_path = flags.checkpoint_path,
+        .safedb_path = flags.safedb_path,
         .follow_source = flags.source_l2_rpc,
         .rpc_admin = flags.rpc_admin,
         .rpc_dev = flags.rpc_dev,
@@ -383,6 +390,8 @@ test "consensus: flags" {
     const with_checkpoint = required ++ [_][]const u8{ "--checkpoint.path", "ckpt.bin" };
     const checkpointed = try parse_flags(&with_checkpoint);
     try std.testing.expectEqualStrings("ckpt.bin", checkpointed.checkpoint_path.?);
+    const with_safedb = required ++ [_][]const u8{ "--safedb.path", "safe.bin" };
+    try std.testing.expectEqualStrings("safe.bin", (try parse_flags(&with_safedb)).safedb_path.?);
     try std.testing.expect(!checkpointed.metrics_enabled);
     const with_metrics = required ++ [_][]const u8{
         "--metrics.enabled", "--metrics.addr", "127.0.0.1", "--metrics.port", "9191",

@@ -67,7 +67,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     pick origins at the L1 head minus confirmations
   - [x] `--sequencer.recover` (initial recover mode)
   - [ ] `--rpc.disabled`
-  - [ ] `--safedb.path` persistence of the L1→safe-head mapping
+  - [x] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
   - [x] `ws_subscribe_{unsafe,safe,finalized}_head` and `dev_subscribe_engine_queue_size`
@@ -104,6 +104,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- safedb persistence: one rewritten image (like checkpoints) instead of redb; the in-memory safedb stays on without a path (base/base disables tracking), since the RPC is useful anyway.
 - Subsecond (Denim) blocks follow base/base timing: build at the parent's timestamp, `getPayload` at T - 50 ms. Pre-Denim blocks keep build-at-T, seal-on-payload-id (base/base builds one slot early); the devnet runs Denim from genesis so this only affects legacy chains.
 - Admin and dev RPC are off by default like base/base (unmerged modules answer -32601). The devnet sequencer passes `--rpc.enable-admin` because the batcher finds the leader with `admin_sequencerActive`.
 - Admin errors follow base/base exactly (codes and redacted messages) even where ours were more descriptive; reasons go to the log instead.
@@ -231,6 +232,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: safedb: `service/safedb_store.zig` persists the L1->safe-head entries (`--safedb.path`) as one crc-checked image (`magic | count | 80-byte records | crc32`) through `store_file`; `SafeDB.version` drives writes; the driver waits for the load.
 - 2026-11-05: devnet smoke passes at native 200 ms blocks on main (Denim at genesis from batcher-devnet, EL fixes from node): 25 blocks/5 s, verifier derives, load test 99/99.
 - 2026-11-05: confs: `service/conf_depth.zig` hides L1 blocks within N of the head from derivation (`--l1.verifier-confs`, no head: no gate) and from sequencer origin selection (`--sequencer.l1-confs`, default 4, no head: nothing); `--sequencer.recover`.
 - 2026-11-05: 200 ms devnet trial (local, uncommitted Denim genesis): EL rejects same-second FCU attrs and lacks Base upgrades from genesis; handed to the node and batcher-devnet lanes.

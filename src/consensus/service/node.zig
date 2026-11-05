@@ -45,6 +45,7 @@ const gossip_bridge = @import("gossip_bridge.zig");
 const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
 const checkpoint = @import("checkpoint.zig");
+const safedb_store = @import("safedb_store.zig");
 const metrics_module = @import("metrics.zig");
 const follow = @import("follow.zig");
 const conductor_module = @import("conductor.zig");
@@ -91,6 +92,8 @@ pub const Options = struct {
     upgrade_signal: ?UpgradeSignal = null,
     /// Durable safe/finalized checkpoints (`--checkpoint.path`); none when null.
     checkpoint_path: ?[]const u8 = null,
+    /// Durable L1 -> safe head entries (`--safedb.path`); in memory only when null.
+    safedb_path: ?[]const u8 = null,
     l1: Address,
     /// Beacon API for blobs; without it blob batches are unavailable.
     l1_beacon: ?Address = null,
@@ -328,6 +331,9 @@ pub fn Node(comptime IO: type) type {
         /// Persists the safe and finalized heads when `checkpoint_path` is set.
         checkpoints: ?*Checkpoints = null,
         checkpoints_logged: bool = false,
+        /// Persists `safe_db` when `safedb_path` is set.
+        safedb_store: ?*SafeDbStore = null,
+        safedb_logged: bool = false,
         metrics: metrics_module.Metrics = .{},
         metrics_server: ?MetricsServer = null,
         follower: ?*Follower = null,
@@ -337,6 +343,7 @@ pub fn Node(comptime IO: type) type {
         follow_labels: ?follow.Labels = null,
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
+        pub const SafeDbStore = safedb_store.SafeDbStore(IO);
         pub const Follower = follow.Follower(IO);
         pub const Conductor = conductor_module.Conductor(IO);
         pub const WsRpc = ws_rpc_module.WsRpc(IO);
@@ -411,6 +418,8 @@ pub fn Node(comptime IO: type) type {
             errdefer node.deinit_upgrade();
             if (options.checkpoint_path) |path| try node.init_checkpoints(path);
             errdefer node.deinit_checkpoints();
+            if (options.safedb_path) |path| try node.init_safedb_store(path);
+            errdefer node.deinit_safedb_store();
             if (options.follow_source) |source| try node.init_follower(source);
             errdefer node.deinit_follower();
             if (options.conductor) |address| try node.init_conductor(address);
@@ -611,6 +620,41 @@ pub fn Node(comptime IO: type) type {
             node.checkpoints = null;
         }
 
+        fn init_safedb_store(node: *Self, path: []const u8) !void {
+            assert(node.safedb_store == null);
+            assert(path.len > 0);
+            const store = try node.allocator.create(SafeDbStore);
+            errdefer node.allocator.destroy(store);
+            try store.init(node.allocator, node.io, &node.safe_db, path);
+            node.safedb_store = store;
+        }
+
+        fn deinit_safedb_store(node: *Self) void {
+            const store = node.safedb_store orelse return;
+            store.stop();
+            var rounds: u32 = 0;
+            while (store.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
+            store.deinit(node.allocator);
+            node.allocator.destroy(store);
+            node.safedb_store = null;
+        }
+
+        /// Writes the safedb after changes; logs the loaded entries once.
+        fn tick_safedb_store(node: *Self) void {
+            const store = node.safedb_store orelse return;
+            if (!store.loaded) return;
+            if (!node.safedb_logged) {
+                node.safedb_logged = true;
+                node.logger.log(.info, "consensus", "safedb loaded", .{
+                    .entries = node.safe_db.count,
+                    .invalid_images = store.invalid_images,
+                });
+            }
+            store.update();
+        }
+
         /// Records the engine's safe and finalized heads; logs the stored ones once loaded.
         fn tick_checkpoints(node: *Self) void {
             const store = node.checkpoints orelse return;
@@ -793,6 +837,7 @@ pub fn Node(comptime IO: type) type {
             node.deinit_p2p();
             node.deinit_upgrade();
             node.deinit_checkpoints();
+            node.deinit_safedb_store();
             node.deinit_follower();
             node.deinit_conductor();
             node.deinit_ws_rpc();
@@ -821,6 +866,7 @@ pub fn Node(comptime IO: type) type {
             if (node.network) |network| try node.start_p2p(network);
             if (node.upgrade) |observer| observer.start();
             if (node.checkpoints) |store| store.start();
+            if (node.safedb_store) |store| store.start();
             return address;
         }
 
@@ -872,12 +918,15 @@ pub fn Node(comptime IO: type) type {
             const now_ms = node.io.now_realtime_ns() / std.time.ns_per_ms;
             // Startup may need the checkpoints, so the driver waits until they are read.
             const checkpoints_ready = if (node.checkpoints) |store| store.loaded != null else true;
-            if (checkpoints_ready) node.driver.tick(node.providers(), now_ms);
+            // Derivation must not change the safedb before its old image is read.
+            const safedb_ready = if (node.safedb_store) |store| store.loaded else true;
+            if (checkpoints_ready and safedb_ready) node.driver.tick(node.providers(), now_ms);
             if (node.network) |network| {
                 node.tick_signer(network);
                 node.tick_gossip(network);
             }
             node.tick_checkpoints();
+            node.tick_safedb_store();
             node.tick_follow();
             if (node.conductor) |conductor| conductor.tick();
             if (node.ws_rpc) |ws_rpc| ws_rpc.publish(.{
@@ -1228,9 +1277,11 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
         .http_client = harness_module.client_options,
         .checkpoint_path = "checkpoint.bin",
+        .safedb_path = "safedb.bin",
     });
     defer node.deinit();
     node.checkpoints.?.start(); // `start` would also bind the RPC port.
+    node.safedb_store.?.start();
     for (0..40) |_| {
         node.tick();
         harness.world.run_for_ns(std.time.ns_per_s / 10);
@@ -1240,6 +1291,8 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     const store = node.checkpoints.?;
     try testing.expect(std.meta.eql(checkpoint.Checkpoints{}, store.loaded.?));
     try testing.expect(std.mem.indexOf(u8, memory.text(), "checkpoints loaded") != null);
+    try testing.expect(node.safedb_store.?.loaded);
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "safedb loaded") != null);
     if (status.safe_l2.block_info.number != 0) {
         try testing.expect(std.meta.eql(status.safe_l2, store.checkpoints.safe.?));
         try testing.expect(store.file.stats.saves >= 1);

@@ -55,6 +55,8 @@ pub const SafeDB = struct {
     /// Sorted by `l1_block.number`, unique keys.
     entries: []Entry,
     count: u32 = 0,
+    /// Bumped on every change, so a persister can tell whether to write.
+    version: u64 = 0,
 
     pub fn init(allocator: Allocator, capacity: u32) Allocator.Error!SafeDB {
         assert(capacity > 0);
@@ -84,6 +86,7 @@ pub const SafeDB = struct {
 
     /// Inserts or replaces the entry for `entry.l1_block.number`.
     pub fn insert(db: *SafeDB, entry: Entry) void {
+        db.version +%= 1;
         const index = db.lower_bound(entry.l1_block.number);
         if (index < db.count and db.entries[index].l1_block.number == entry.l1_block.number) {
             db.entries[index] = entry;
@@ -124,6 +127,7 @@ pub const SafeDB = struct {
         }
         if (index == db.count) return;
         db.count = index;
+        db.version +%= 1;
         db.insert(.{
             .l1_block = reset_safe_head.l1_origin,
             .safe_head = reset_safe_head.block_info.id(),
