@@ -21,7 +21,7 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets, sqrt_ratio SSWU,
   dedicated Fp squaring and lazy reduction in Fp2/Fp6 (G1 mul and map are ~2-3x blst).
 - [x] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
-- [ ] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
+- [x] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
 - [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
@@ -196,6 +196,29 @@ fallback but hot paths should be our own, optimized implementations.
   bn256 vectors in `bn254/vectors.zig`: all add/mul cases, 9 of 14 pairing cases (all 49
   were checked locally before curating).
 
+- KZG blob API (`kzg/blob.zig`, consensus-specs deneb polynomial-commitments): `Settings.init(storage)`
+  decodes the 4096 Lagrange G1 points (unchecked: public setup, hash asserted) into
+  caller-provided `Settings.Storage` (about 560 KiB) and builds the bit-reversed roots of unity
+  (omega = 7^((r-1)/4096)). The setup file holds the Lagrange points in natural order; they are
+  stored bit-reversed at init, as the spec applies `bit_reversal_permutation` to the setup.
+  Operations take a caller-provided `Workspace` (about 512 KiB) and never allocate. Evaluation and
+  proofs share one batch inversion (Montgomery trick, zeros skipped) of z - w_i; for z in the
+  domain y = p[m] and the quotient entry m uses `compute_quotient_eval_within_domain`. The
+  quotient divides by (w_i - z) as in the spec (a sign slip here was caught by the vectors).
+  `compute_challenge` and the batch r hash follow the spec byte for byte. The batch check folds
+  the y terms into one generator multiple (as c-kzg does): two MSMs of sizes n and 2n+1 plus one
+  two-pair pairing check via `verify.pairing_check_fixed_g2`; scratch is caller-provided
+  (`BatchStorage(n)`), blobs are passed as `[]const *const Blob`. Empty batch is valid.
+- Blob MSM: `bls.msm.msm` over all 4096 points (the bls lane's single-pass Booth Pippenger, c = 10). A
+  dedicated blob-only variant with a carry array measured the same as main's batch-affine msm (34 ms before it, 26 ms now), so it was dropped.
+- Blob vectors: 105 c-kzg-4844 mainnet cases (9 blob_to_kzg_commitment, 48 compute_kzg_proof, 11
+  compute_blob_kzg_proof, 23 verify_blob_kzg_proof, 14 batch) in `kzg/blob_vectors.txt`, with the
+  7 distinct valid blobs (896 KiB) in `blob_vectors.bin`; the two non-canonical blobs are
+  synthesised in the test and wrong-length cases (not expressible with typed arrays) are dropped.
+  In Debug (MSM and subgroup checks take seconds) the vector test runs all error cases, one
+  in-domain proof, one verify and one batch (about 8 s incl. a 2 s setup decode); all other
+  modes run every vector plus seeded round trips, a batch test, and a batch test.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
@@ -214,3 +237,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: bls g2.mul_gls (psi = [x], four 64-bit digits, width-5 NAF, affine tables): 198->80us; single-point MSM (G1MSM/G2MSM with k=1) now uses GLV/GLS. Review of bn254 + BLS precompiles: no defects.
 - 2026-11-05: bls msm: stateless Booth digits, one pass over all points (no 256-point chunks), window up to 10 (G1) / 9 (G2): msm-4096 / blob_to_kzg_commitment 56.8->44.0ms.
 - 2026-11-05: bls G1 msm >= 256 points: batch-affine bucket accumulation (128 pending adds per inversion, Jacobian side buckets for collisions): msm-4096 44.0->36.3ms.
+- 2026-11-05: KZG blob API (blob_to_kzg_commitment, compute_kzg_proof, compute/verify_blob_kzg_proof, batch) with c-kzg vectors, round trips, fuzz; bench (ReleaseFast, Apple M-series, loaded host): commitment 26 ms, compute_blob_kzg_proof 27 ms, verify_blob_kzg_proof 1.1 ms, batch of 6 verify 3.9 ms (0.65 ms/blob).

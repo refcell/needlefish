@@ -166,8 +166,8 @@ fn encode_g1(point: G1) [48]u8 {
     return bls.g1.compress(affine);
 }
 
-fn lincomb(settings: *const Settings, scalars: *const [field_elements]u256) G1 {
-    return bls.msm.msm(G1, settings.g1_lagrange, scalars);
+fn lincomb(settings: *const Settings, workspace: *Workspace) G1 {
+    return bls.msm.msm(G1, settings.g1_lagrange, &workspace.scalars);
 }
 
 /// `blob_to_kzg_commitment`: MSM of the blob with the Lagrange setup.
@@ -177,7 +177,7 @@ pub fn blob_to_kzg_commitment(
     blob: *const Blob,
 ) Error!Commitment {
     try blob_to_scalars(blob, &workspace.scalars);
-    const commitment = encode_g1(lincomb(settings, &workspace.scalars));
+    const commitment = encode_g1(lincomb(settings, workspace));
     assert(commitment[0] & 0x80 != 0);
     return commitment;
 }
@@ -311,7 +311,7 @@ fn prove_loaded(settings: *const Settings, workspace: *Workspace, z: Fr) struct 
         assert(!z.is_zero() and index < field_elements);
         workspace.scalars[index] = domain_sum.mul(z.inverse()).to_int();
     }
-    return .{ .proof = lincomb(settings, &workspace.scalars), .y = y };
+    return .{ .proof = lincomb(settings, workspace), .y = y };
 }
 
 /// `verify_blob_kzg_proof`: true when `proof` proves the blob matches `commitment`.
