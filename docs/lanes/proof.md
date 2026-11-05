@@ -95,12 +95,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   agreed root (trace extension); otherwise derive until the target or L1 exhaustion and
   compare the tip's output root with the claim. Intermediate output roots (boot key 9)
   are loaded but not yet checked.
+- Host handler: chain data comes from a `Source` vtable (map-backed in tests; RPC later),
+  checked against the requested hash before storing. Precompile, account-proof and
+  starting-output hints are rejected: the Zig program runs precompiles natively and
+  gets state from the payload witness plus `l2-state-node`/`l2-code`.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host: hint handler over a chain `Source` (headers, list tries, blobs,
+  code/state nodes, payload witness); providers served from an empty store in tests.
 - 2026-11-05: host: preimage `Store` (keccak, ordered list tries via the new trie
   `NodeSink` hook on the hash builder, boot local keys).
 - 2026-11-05: `proof/program`, `proof/driver`, `proof/client` landed (sync, driver loop
