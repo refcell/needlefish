@@ -37,6 +37,9 @@ for url in "$L1" "$SEQ" "$VER"; do
   [ -n "$(rpc "$url" eth_chainId '[]' | field result)" ] || fail "no JSON-RPC at $url"
 done
 
+# L1 scan start for step 2, taken before the L2 transfer can possibly be batched.
+start_l1=$(($(rpc "$L1" eth_blockNumber '[]' | field result)))
+
 # 1. Sequencing: an L2 transfer from the smoke user lands in a block.
 tx=$("$BASE" devnet transfer --rpc "$SEQ" --chain-id "$L2_CHAIN_ID" --key-index "$USER_INDEX" \
   --to "$DEPLOYER_ADDRESS" --value 1000) || fail "could not send L2 transfer"
@@ -49,19 +52,14 @@ until_ok "L2 transfer $tx included" receipt_ok
 block=$((block_hex))
 ok "L2 transfer $tx included in block $block"
 
-# 2. Batching: the batcher sends a transaction to the batch inbox.
-start_l1=$(($(rpc "$L1" eth_blockNumber '[]' | field result)))
-inbox_tx_seen() {
-  local head; head=$(($(rpc "$L1" eth_blockNumber '[]' | field result)))
-  local n
-  for n in $(seq "$start_l1" "$head"); do
-    rpc "$L1" eth_getBlockByNumber "[\"$(printf '0x%x' "$n")\",true]" \
-      | grep -qi "\"to\":\"$BATCH_INBOX\"" && return 0
-  done
-  return 1
+# 2. Batching: a channel on L1 decodes to a batch for the transfer's L2 block.
+l2_timestamp=$(($(rpc "$SEQ" eth_getBlockByNumber "[\"$block_hex\",false]" | field timestamp)))
+batch_seen() {
+  "$BASE" devnet batches --rpc "$L1" --from "$start_l1" --inbox "$BATCH_INBOX" 2>/dev/null \
+    | grep -q "singular batch: timestamp $l2_timestamp,"
 }
-until_ok "batcher transaction to $BATCH_INBOX on L1" inbox_tx_seen
-ok "batch posted to L1 inbox $BATCH_INBOX"
+until_ok "batch for L2 block $block (timestamp $l2_timestamp) on L1" batch_seen
+ok "batch for L2 block $block decoded from L1 inbox $BATCH_INBOX"
 
 # 3. Derivation: the verifier's safe head reaches the block with the same hash.
 seq_hash=$(rpc "$SEQ" eth_getBlockByNumber "[\"$block_hex\",false]" | field hash)

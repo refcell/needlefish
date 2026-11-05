@@ -4,10 +4,12 @@
 //!   base devnet rollup --out DIR --timestamp SECONDS --l1-hash 0x.. --l2-hash 0x..
 //!   base devnet account INDEX
 //!   base devnet transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
+//!   base devnet batches --rpc L1_URL --from N [--to-block N] [--inbox 0x..] [--sender 0x..]
 //!
-//! `init` writes genesis files, a placeholder rollup.json, devnet.env and a fresh JWT
-//! secret. Once the ELs are up, `rollup` rewrites rollup.json with their real genesis
-//! hashes (until genesis hashing lands in-process).
+//! `init` writes genesis files, rollup.json (genesis hashes computed in process),
+//! devnet.env and a fresh JWT secret. `rollup` rewrites rollup.json with given hashes.
+//! `batches` decodes the batcher's channels from L1 blocks (defaults: devnet inbox and
+//! batcher account).
 
 const std = @import("std");
 const base = @import("base");
@@ -21,6 +23,7 @@ pub const usage =
     \\  rollup  --out DIR --timestamp SECONDS --l1-hash 0x.. --l2-hash 0x..
     \\  account INDEX
     \\  transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
+    \\  batches --rpc L1_URL --from N [--to-block N] [--inbox 0x..] [--sender 0x..]
     \\
 ;
 
@@ -36,6 +39,10 @@ const Flags = struct {
     to: ?[20]u8 = null,
     value: ?u256 = null,
     gas: ?u64 = null,
+    from_block: ?u64 = null,
+    to_block: ?u64 = null,
+    inbox: ?[20]u8 = null,
+    sender: ?[20]u8 = null,
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
@@ -79,6 +86,21 @@ fn parse_transfer_flag(flags: *Flags, arg: []const u8, value: []const u8) !void 
     } else if (std.mem.eql(u8, arg, "--gas")) {
         flags.gas = try std.fmt.parseInt(u64, value, 10);
     } else {
+        try parse_batches_flag(flags, arg, value);
+    }
+}
+
+fn parse_batches_flag(flags: *Flags, arg: []const u8, value: []const u8) !void {
+    const hex = base.common.primitives.hex;
+    if (std.mem.eql(u8, arg, "--from")) {
+        flags.from_block = try std.fmt.parseInt(u64, value, 10);
+    } else if (std.mem.eql(u8, arg, "--to-block")) {
+        flags.to_block = try std.fmt.parseInt(u64, value, 10);
+    } else if (std.mem.eql(u8, arg, "--inbox")) {
+        flags.inbox = try hex.decode_array(20, value);
+    } else if (std.mem.eql(u8, arg, "--sender")) {
+        flags.sender = try hex.decode_array(20, value);
+    } else {
         return error.UnknownFlag;
     }
 }
@@ -100,6 +122,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "init")) return command_init(init, flags);
     if (std.mem.eql(u8, command, "rollup")) return command_rollup(init, flags);
     if (std.mem.eql(u8, command, "transfer")) return command_transfer(init, flags);
+    if (std.mem.eql(u8, command, "batches")) return command_batches(init, flags);
     return usage_error();
 }
 
@@ -194,5 +217,43 @@ fn command_transfer(init: std.process.Init, flags: Flags) !u8 {
         return 1;
     };
     try write_stdout(init.io, "0x{x}\n", .{&hash.bytes});
+    return 0;
+}
+
+fn command_batches(init: std.process.Init, flags: Flags) !u8 {
+    const url = flags.rpc_url orelse return usage_error();
+    const from_block = flags.from_block orelse return usage_error();
+    var http = HttpTransport.init(init.gpa, init.io, url);
+    defer http.deinit();
+    var client = try base.batcher.rpc.Client.init(init.gpa, http.transport(), .{});
+    defer client.deinit(init.gpa);
+    const to_block = flags.to_block orelse
+        try base.batcher.rpc.quantity(u64, try client.call("eth_blockNumber", "[]"));
+    if (to_block < from_block) return usage_error();
+    const config: devnet.genesis.Config = .{ .genesis_timestamp = 0 };
+    const batcher_index = @backingInt(devnet.accounts.Role.batcher);
+    const params: devnet.inspect.Params = .{
+        .inbox = if (flags.inbox) |bytes| .{ .bytes = bytes } else config.batch_inbox(),
+        .sender = if (flags.sender) |bytes| .{ .bytes = bytes } else devnet.accounts.derive_dev(
+            batcher_index,
+        ).address,
+        .from_block = from_block,
+        .to_block = to_block,
+    };
+    var buffer: [4096]u8 = undefined;
+    var stdout = Io.File.stdout().writer(init.io, &buffer);
+    const out = &stdout.interface;
+    const arena = init.arena.allocator();
+    const summary = devnet.inspect.inspect(arena, &client, params, .{}, out) catch |err| {
+        std.debug.print("batches: {t} {s}\n", .{ err, client.last_error() });
+        return 1;
+    };
+    try out.print("blocks {d}..{d}: {d} inbox txs ({d} blob), {d} frames, {d} channels, " ++
+        "{d} singular + {d} span batches, {d} L2 txs\n", .{
+        from_block,               to_block,             summary.inbox_txs,
+        summary.blob_txs,         summary.frames,       summary.channels,
+        summary.singular_batches, summary.span_batches, summary.l2_transactions,
+    });
+    try out.flush();
     return 0;
 }

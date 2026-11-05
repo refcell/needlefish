@@ -19,7 +19,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
 - [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
 - [ ] `batcher/comp`: real brotli compressor (LZ77 + prefix codes), checked with `brotli -d`.
-- [ ] `batcher/batch`: singular batch RLP, span batch encoding.
+- [x] `batcher/batch`: singular batches (channel manager). Span batch encoding skipped: Base's
+  Denim upgrade makes derivation singular-only (see consensus span_batch.zig).
+- [x] `base devnet batches`: L1 batch inspector (channels -> batches via derivation code); smoke
+  check 2 now requires a decoded batch for the transfer's L2 block.
 - [x] `batcher/channel`: channel out (ratio estimate, compress on close, frames).
 - [x] `batcher/channel`: channel manager (double-buffered channels, backpressure, reorg detect,
   duration close); batches decode back via consensus SingleBatch.
@@ -33,7 +36,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/source`: EIP-7702 (type 4) transactions.
 - [x] `batcher/service` + `base batcher`: step loop (heads, load, frames, txmgr), calldata DA.
 - [x] `batcher/service`: safe-head stall watchdog (resubmit from safe+1; covers timed-out channels).
-- [ ] `base batcher`: metrics endpoint.
+- [ ] `base batcher`: metrics endpoint (blocked: utilities/http has only a parser, no server).
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
@@ -98,3 +101,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: KZG prover for blobs; setup Lagrange points permuted to bit-reversed order like
   c-kzg's loader (the file is in natural order).
 - 2026-11-05: blob DA end to end; anvil (c-kzg) accepted and mined our type-3 tx with sidecar.
+- 2026-11-05: `base devnet batches` inspector; live: 20 batches decoded from an anvil L1.

@@ -107,8 +107,8 @@ Each binary must accept at least the flags below. Lanes may add more.
 
 1. **Sequencing.** The smoke user sends an L2 transfer to the sequencer EL; it is in
    an L2 block (receipt status 1).
-2. **Batching.** An L1 transaction from the batcher to the batch inbox exists after
-   that L2 block.
+2. **Batching.** `base devnet batches` decodes, from batcher transactions to the batch
+   inbox, a singular batch with that L2 block's timestamp.
 3. **Derivation.** The verifier's `optimism_syncStatus.safe_l2` reaches the L2 block
    from step 1, and its hash equals the sequencer's hash for that number.
 4. **Deposits.** A deposit sent to the L1 portal shows up on L2 (the recipient balance
