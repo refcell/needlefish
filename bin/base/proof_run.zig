@@ -30,6 +30,8 @@ pub const Flags = struct {
     out: ?[]const u8 = null,
     /// L1 genesis JSON, for an L1 chain that is not built in (its `config` object).
     l1_genesis: ?[]const u8 = null,
+    /// L1 beacon API, for blob batches (without it blob hints fail).
+    l1_beacon: ?[]const u8 = null,
 };
 
 pub fn parse(args: []const []const u8) !Flags {
@@ -57,6 +59,8 @@ pub fn parse(args: []const []const u8) !Flags {
             flags.out = value;
         } else if (std.mem.eql(u8, name, "--l1-genesis")) {
             flags.l1_genesis = value;
+        } else if (std.mem.eql(u8, name, "--l1-beacon")) {
+            flags.l1_beacon = value;
         } else return error.InvalidArguments;
     }
     const required = [_]bool{
@@ -84,15 +88,17 @@ const Endpoints = struct {
 
 const response_bytes_max = 256 << 20;
 
+const http_options: http.client.Options = .{
+    .recv_buffer_size = response_bytes_max + 64 * 1024,
+    .limits = .{ .head_size_max = 8 * 1024, .body_size_max = response_bytes_max },
+    .request_timeout_ns = 120 * std.time.ns_per_s,
+};
+
 fn connect(endpoints: *Endpoints, allocator: std.mem.Allocator, flags: Flags) !void {
     const builtin = @import("builtin");
     endpoints.os_io = if (builtin.os.tag == .linux) try io.IO.init(.{}) else try io.IO.init();
     errdefer endpoints.os_io.deinit();
-    const options: http.client.Options = .{
-        .recv_buffer_size = response_bytes_max + 64 * 1024,
-        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = response_bytes_max },
-        .request_timeout_ns = 120 * std.time.ns_per_s,
-    };
+    const options = http_options;
     const l1_address = try consensus_cli.parse_url(flags.l1.?);
     const l2_address = try consensus_cli.parse_url(flags.l2.?);
     endpoints.l1 = try .init(allocator, &endpoints.os_io, l1_address, options, 4096);
@@ -168,7 +174,8 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     defer allocator.free(l1_genesis);
     const l1_config = try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
     try boot(&source, &store, flags, rollup_json, l1_config);
-    const verdict = try prove(allocator, &store, &source);
+    const os_io = &endpoints.os_io;
+    const verdict = try prove(allocator, &store, &source, os_io, flags.l1_beacon);
     if (flags.out) |path| try write_archive(init, &store, path);
     const line = "proof: block {d} output root 0x{x} claimed 0x{x}: {s} " ++
         "({d} preimages, {d} calls)\n";
@@ -183,10 +190,15 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     return if (verdict.holds) 0 else 1;
 }
 
+const BlobProvider = base.consensus.sources.blob_provider;
+const Beacon = host.beacon_blobs.BeaconBlobs(io.IO, BlobProvider.KzgVerifier);
+
 fn prove(
     allocator: std.mem.Allocator,
     store: *host.Store,
     source: *Source,
+    os_io: *io.IO,
+    beacon_url: ?[]const u8,
 ) !host.offline.Verdict {
     const storage = try allocator.create(kzg.blob.Settings.Storage);
     defer allocator.destroy(storage);
@@ -196,11 +208,34 @@ fn prove(
     defer allocator.destroy(roots);
     host.handler.fill_roots(roots);
     const settings = try kzg.blob.Settings.init(storage);
-    return host.native.run(allocator, store, source.as_source(), roots, .{
+    const options: proof.client.client.Options = .{
         .builder = proof.client.client.default_builder_config,
         .kzg_settings = &settings,
         .kzg_workspace = workspace,
-    });
+    };
+    const url = beacon_url orelse
+        return host.native.run(allocator, store, source.as_source(), roots, options);
+    // The verifier gets its own workspace: the handler uses `workspace` after a fetch.
+    const verifier_workspace = try allocator.create(kzg.blob.Workspace);
+    defer allocator.destroy(verifier_workspace);
+    const provider = try allocator.create(Beacon.Provider);
+    defer allocator.destroy(provider);
+    const verifier: BlobProvider.KzgVerifier = .{
+        .settings = &settings,
+        .workspace = verifier_workspace,
+    };
+    const address = try consensus_cli.parse_url(url);
+    try provider.init(allocator, os_io, address, http_options, verifier, .{});
+    defer provider.deinit();
+    var beacon: Beacon = .{
+        .provider = provider,
+        .verifier = verifier,
+        .pump = .{ .context = os_io, .step = Endpoints.step },
+        .steps_max = 300_000,
+    };
+    source.blobs = beacon.fetcher();
+    defer source.blobs = null;
+    return host.native.run(allocator, store, source.as_source(), roots, options);
 }
 
 test "proof run: flags" {

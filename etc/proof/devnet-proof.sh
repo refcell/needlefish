@@ -11,6 +11,7 @@ BLOCKS="${1:-8}"
 # shellcheck disable=SC1091
 . "$DIR/devnet.env"
 L1="http://127.0.0.1:$PORT_L1_HTTP"
+BEACON="http://127.0.0.1:$PORT_L1_BEACON"
 L2="http://127.0.0.1:$PORT_VERIFIER_HTTP"
 
 status=$(curl -s --max-time 2 -H 'content-type: application/json' \
@@ -24,12 +25,13 @@ agreed=$((safe - BLOCKS))
 archive="$DIR/proof-$safe.nfpa"
 
 echo "devnet-proof: proving block $safe from agreed block $agreed"
-"$BASE" proof run --l1 "$L1" --l2 "$L2" --rollup-config "$DIR/rollup.json" \
+"$BASE" proof run --l1 "$L1" --l1-beacon "$BEACON" --l2 "$L2" --rollup-config "$DIR/rollup.json" \
   --l1-genesis "$DIR/l1-genesis.json" --agreed "$agreed" --claimed "$safe" --out "$archive"
 echo "devnet-proof: replaying $archive offline"
 "$BASE" proof replay "$archive"
 wrong=0x$(printf 'ab%.0s' $(seq 1 32))
-if "$BASE" proof run --l1 "$L1" --l2 "$L2" --rollup-config "$DIR/rollup.json" \
+if "$BASE" proof run --l1 "$L1" --l1-beacon "$BEACON" --l2 "$L2" \
+  --rollup-config "$DIR/rollup.json" \
   --l1-genesis "$DIR/l1-genesis.json" --agreed "$agreed" --claimed "$safe" \
   --claim-root "$wrong"; then
   echo "devnet-proof: a wrong claim held"; exit 1
