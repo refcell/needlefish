@@ -75,6 +75,12 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   return `CellProofsUnsupported` until the crypto lane ships cells. Tests are ReleaseSafe-only.
 - `bundles` (base/base metering tooling) is not ported: nothing in base/base consumes it.
 
+- base/base `consensus/extra` (Holocene/Jovian extra data) is not duplicated: the node lane owns
+  it in `execution/chainspec/basefee.zig`. `consensus/source.rs` deposit source hashes live in
+  `consensus/protocol/deposits.zig`; `base_time` reuses that file through its test.
+- `create_address` hand-encodes `rlp([sender, nonce])` so primitives stays below rlp in the
+  import graph.
+
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
