@@ -13,4 +13,5 @@ pub const Sender = sender.Sender;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("sender_test.zig");
 }

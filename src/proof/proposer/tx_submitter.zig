@@ -65,6 +65,8 @@ pub const Config = struct {
     gas_buffer_percent: u8 = 20,
     tip_wei_default: u128 = 1_000_000_000,
     receipt_polls_max: u32 = 120,
+    /// Polls without a receipt before a fee-bumped resubmission (0: never).
+    resubmit_polls: u32 = 0,
     slots_max: u8 = 4,
     calldata_bytes_max: u32 = factory.extra_data_bytes_max + 1024,
 };
@@ -88,6 +90,7 @@ pub fn TxSubmitter(comptime EndpointType: type) type {
                 .gas_buffer_percent = config.gas_buffer_percent,
                 .tip_wei_default = config.tip_wei_default,
                 .receipt_polls_max = config.receipt_polls_max,
+                .resubmit_polls = config.resubmit_polls,
                 .slots_max = config.slots_max,
                 .calldata_bytes_max = config.calldata_bytes_max,
             });
