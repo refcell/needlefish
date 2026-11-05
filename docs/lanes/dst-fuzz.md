@@ -292,3 +292,5 @@ provably robust.
   exceed the model batcher's L1-observed `confirmed` ("real verifier safe beyond L1 batch
   data", safety). Mutant: gate off reports it on seed 850. Swarm 1..5000 green
   (ReleaseSafe).
+- 2026-11-05: project owner dropped flashblocks (AGENTS.md rule 10): removed the
+  flashblocks fuzz targets from `fuzz_targets_net.zig` (the sim had no flashblocks wiring).
