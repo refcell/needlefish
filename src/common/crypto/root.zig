@@ -7,6 +7,7 @@ const std = @import("std");
 pub const keccak = @import("keccak.zig");
 pub const keccak256 = keccak.keccak256;
 pub const bench = @import("bench.zig");
+pub const montgomery = @import("montgomery.zig");
 
 test {
     std.testing.refAllDecls(@This());
