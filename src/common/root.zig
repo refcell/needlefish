@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const primitives = @import("primitives/root.zig");
 pub const crypto = @import("crypto/root.zig");
+pub const rlp = @import("rlp/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
