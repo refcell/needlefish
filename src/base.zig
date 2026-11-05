@@ -13,6 +13,7 @@ pub const consensus = @import("consensus/root.zig");
 pub const batcher = @import("batcher/root.zig");
 pub const proof = @import("proof/root.zig");
 pub const builder = @import("builder/root.zig");
+pub const infra = @import("infra/root.zig");
 pub const testing = @import("testing/root.zig");
 
 pub const build_options = @import("build_options");

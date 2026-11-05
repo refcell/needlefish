@@ -15,10 +15,14 @@ hook); larger changes go through the owning lane. All IO through `src/utilities/
 every tool runs in the simulator. Bounded queues, static allocation after startup.
 
 ## Backlog
-- [ ] `infra/tx_manager`: nonce tracking, fee bumping (EIP-1559 + blob fee), resubmit on
+- [x] `infra/tx_manager` core: nonce tracking, fee bumping (EIP-1559 + blob fee), resubmit on
   timeout, receipt confirmation depth, bounded pending set (port
   `utilities/tx-manager`). Sim tests with a fake L1 that drops/reorders txs; fuzz the
   fee-bump state machine. Coordinate with batcher-devnet: it may switch to this later.
+- [ ] `infra/tx_manager` driver: JSON-RPC driver over the sans-IO core (fee suggestion via
+  `eth_maxPriorityFeePerGas`/latest base fee/`eth_blobBaseFee`, sign EIP-1559 txs with
+  `common/signer`, `eth_sendRawTransaction`, receipt + canonical-block check), gas
+  estimation, and a devnet test that sends transfers from a test-junk account.
 - [ ] `infra/websocket_proxy`: fan out an upstream flashblocks websocket to many
   subscribers with per-IP/API-key rate limits, auth by key, method/filter support,
   bounded per-client send queues that drop slow clients (port `websocket-proxy/src/*`).
@@ -49,5 +53,16 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   `just devnet smoke` (coordinate with batcher-devnet, who owns `etc/devnet`).
 
 ## Decisions
+- tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
+  consumes results; drivers (JSON-RPC, simulator) perform I/O. Keeps fee/retry/abort logic
+  deterministic and simulator-friendly, and avoids pulling the batcher's sync RPC client.
+- The batcher keeps its own `batcher/txmgr` (frame/blob specific). The infra manager is the
+  general-purpose one; batcher-devnet may migrate later.
+- Per-send published versions are a bounded ring (`hashes_max`); the oldest is forgotten
+  only on a bump, which happens only while nothing is mined, so no mined version is lost.
+- Deviation from base/base: "nonce too low" before any publish also resets the nonce cache
+  so the next send refetches the chain nonce instead of failing the same way.
 
 ## Log
+- 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
+  sans-IO manager) with unit tests, seeded + std.testing fuzz, and a faulty-L1 sim.
