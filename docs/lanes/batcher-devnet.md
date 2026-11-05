@@ -63,7 +63,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
   already on L1 after a restart (base/base `recent_txs.rs`).
 - [x] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
-- [ ] DST: a sim scenario driving admin stop/start/flush on the real batcher.
+- [x] DST: a sim scenario driving admin stop/start/flush on the real batcher.
 
 ## Draft devnet contract
 - L1: `node --dev-l1` (auto-mine, 2s blocks?), HTTP :8545, beacon API :5052.
@@ -154,3 +154,6 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `--sequencer-urls` (entries `URL` or `L2_URL=ROLLUP_URL`, because our EL and CL are
   separate processes); leader = first `admin_sequencerActive` true, kept when none is active;
   a new leader gets DA limits re-pushed. The devnet batcher uses it.
+- 2026-11-05: sim: `admin_ops_per_minute` fault class (real batcher stop/start/flush during the
+  fault phase; heal starts it), swarm-enabled with the real batcher; scenario test is
+  mutation-checked (no start on heal -> liveness failure).

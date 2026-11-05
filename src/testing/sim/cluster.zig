@@ -68,6 +68,9 @@ pub const Config = struct {
     frame_size: u32 = codec.frame_size_full,
     /// L1 congestion: fewest batcher transactions a block includes (see `L1`).
     l1_block_txs_min: u8 = nodes.l1_batches_max,
+    /// Real batcher only: admin stop/start/flush calls per minute (fault phase). Healing
+    /// starts the batcher again, so liveness must survive any stop/start/flush sequence.
+    admin_ops_per_minute: u32 = 0,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -101,6 +104,8 @@ pub const Config = struct {
         config.frame_size = frame_sizes[@intCast(prng.below(frame_sizes.len))];
         const txs_min = [_]u8{ nodes.l1_batches_max, 4, 2 };
         config.l1_block_txs_min = txs_min[@intCast(prng.below(txs_min.len))];
+        const admin_ops_per_minute: u32 = @intCast(swarm_level(prng, 6));
+        if (config.real_batcher) config.admin_ops_per_minute = admin_ops_per_minute;
         config.validate();
         return config;
     }
@@ -161,6 +166,7 @@ pub const Report = struct {
     evictions: u64 = 0,
     disk_faults: u64 = 0,
     l1_reorgs: u64 = 0,
+    admin_ops: u64 = 0,
     sequencer_head: u64 = 0,
     l1_head: u64 = 0,
     network: network_module.Stats = .{},
@@ -407,6 +413,11 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.mempool_evictions_per_minute, steps_per_minute)) {
             cluster.report.evictions += @intFromBool(cluster.l1.evict(prng));
         }
+        if (cluster.config.admin_ops_per_minute > 0) {
+            if (prng.chance(cluster.config.admin_ops_per_minute, steps_per_minute)) {
+                cluster.inject_admin(prng);
+            }
+        }
         if (cluster.heal_ns) |heal_ns| {
             if (cluster.now_ns >= heal_ns) {
                 cluster.network.heal();
@@ -462,7 +473,21 @@ pub const Cluster = struct {
         cluster.report.spam += 1;
     }
 
+    /// Admin API calls on the real batcher: stop (drops the pipeline), start, or flush
+    /// (refused while stopped, as `admin_flushBatcher` is).
+    fn inject_admin(cluster: *Cluster, prng: *Prng) void {
+        assert(cluster.config.admin_ops_per_minute > 0);
+        const real = cluster.real orelse return;
+        switch (prng.below(3)) {
+            0 => real.service.stop(),
+            1 => real.service.start(),
+            else => real.service.flush() catch assert(real.service.stopped),
+        }
+        cluster.report.admin_ops += 1;
+    }
+
     fn heal_all(cluster: *Cluster) void {
+        if (cluster.real) |real| real.service.start();
         cluster.network.heal();
         cluster.heal_ns = null;
         cluster.network.config.drop_ppm = 0;
@@ -699,6 +724,26 @@ test "cluster: real batcher service drives the chain to liveness without faults"
     const stats = cluster.real.?.stats();
     try std.testing.expect(stats.submitted > 0);
     try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+}
+
+test "cluster: real batcher stays live through admin stop/start/flush" {
+    for ([_]u64{ 11, 12, 13 }) |seed| {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 1,
+            .partitions_per_minute = 0,
+            .real_batcher = true,
+            .admin_ops_per_minute = 20,
+            .fault_end_ns = 240 * ns_per_s,
+            .production_end_ns = 300 * ns_per_s,
+            .settle_end_ns = 700 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        try std.testing.expect(report.admin_ops > 20);
+        try std.testing.expect(!cluster.real.?.service.stopped);
+        try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+    }
 }
 
 test "cluster: multi-frame channels across congested L1 blocks stay live" {
