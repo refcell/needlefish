@@ -163,3 +163,28 @@ test "op: L1 and operator fees count toward the balance check" {
     try testing.expectEqual(transaction.Invalid.insufficient_funds, result.invalid);
     try testing.expectEqual(gas_cost, try balance(&h, sender_address));
 }
+
+test "op: Canyon and Everest state transitions" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    try op_stack.apply_transition(&h.state, .canyon_create2_deployer);
+    const deployer = try h.state.load(op_stack.create2_deployer);
+    const code = try h.state.code(deployer);
+    try testing.expectEqual(@as(usize, 1584), code.len);
+    const keccak = @import("../../common/crypto/root.zig").keccak256;
+    const expected = primitives.hex_to_b256(
+        "b0550b5b431e30d38000efb7107aaa0ade03d48a7198a140edda9d27134468b2",
+    );
+    try testing.expectEqualSlices(u8, &expected, &keccak(code));
+
+    try op_stack.apply_transition(&h.state, .everest_nonce_manager);
+    const manager = try h.state.load(op_stack.nonce_manager);
+    try testing.expectEqualSlices(u8, &.{0xef}, try h.state.code(manager));
+    // Existing code is kept.
+    try h.database.put_account(op_stack.nonce_manager, 0, 0, &.{ 0x60, 0x00 });
+    h.state.reset(h.database.interface());
+    try op_stack.apply_transition(&h.state, .everest_nonce_manager);
+    const kept = try h.state.load(op_stack.nonce_manager);
+    try testing.expectEqualSlices(u8, &.{ 0x60, 0x00 }, try h.state.code(kept));
+}

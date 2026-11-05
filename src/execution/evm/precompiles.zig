@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 const primitives = @import("primitives.zig");
 const Fork = @import("fork.zig").Fork;
 const crypto = @import("../../common/crypto/root.zig");
+const op = @import("op.zig");
 const Address = primitives.Address;
 
 pub const Status = enum { success, failure, out_of_gas };
@@ -30,12 +31,17 @@ fn last_address(comptime fork: Fork) u64 {
     return 0x04;
 }
 
-pub fn lookup(comptime fork: Fork, address: Address) ?Precompile {
+/// `op_rules` is the OP Stack rule set (null on Ethereum): Fjord adds RIP-7212 P256VERIFY.
+pub fn lookup(comptime fork: Fork, op_rules: ?op.Rules, address: Address) ?Precompile {
     for (address[0..18]) |b| {
         if (b != 0) return null;
     }
     const number = std.mem.readInt(u16, address[18..20], .big);
-    if (fork.at_least(.osaka) and number == 0x100) return p256verify;
+    if (number == 0x100) {
+        if (fork.at_least(.osaka)) return p256verify(6900);
+        const rules = op_rules orelse return null;
+        return if (rules.at_least(.fjord)) p256verify(3450) else null;
+    }
     if (number == 0 or number > last_address(fork)) return null;
     return switch (number) {
         0x01 => ecrecover,
@@ -48,8 +54,8 @@ pub fn lookup(comptime fork: Fork, address: Address) ?Precompile {
     };
 }
 
-pub fn is_precompile(comptime fork: Fork, address: Address) bool {
-    return lookup(fork, address) != null;
+pub fn is_precompile(comptime fork: Fork, op_rules: ?op.Rules, address: Address) bool {
+    return lookup(fork, op_rules, address) != null;
 }
 
 fn charge(gas_limit: u64, cost: u64) ?Result {
@@ -106,15 +112,20 @@ fn blake2f(input: []const u8, gas_limit: u64, out: []u8) Result {
     return .{ .status = .success, .gas_used = rounds, .output_len = 64 };
 }
 
-/// EIP-7951 (Osaka) P256VERIFY: invalid signatures succeed with empty output.
-fn p256verify(input: []const u8, gas_limit: u64, out: []u8) Result {
-    const cost = 6900;
-    if (charge(gas_limit, cost)) |failure| return failure;
-    const word = crypto.precompile_p256verify(input) orelse {
-        return .{ .status = .success, .gas_used = cost };
-    };
-    out[0..32].* = word;
-    return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+/// P256VERIFY: RIP-7212 (3450 gas, OP Fjord) and EIP-7951 (6900 gas, Osaka). Invalid
+/// signatures succeed with empty output.
+fn p256verify(comptime cost: u64) Precompile {
+    comptime assert(cost == 3450 or cost == 6900);
+    return struct {
+        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+            if (charge(gas_limit, cost)) |failure| return failure;
+            const word = crypto.precompile_p256verify(input) orelse {
+                return .{ .status = .success, .gas_used = cost };
+            };
+            out[0..32].* = word;
+            return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+        }
+    }.run;
 }
 
 const ModexpRules = crypto.modexp.Rules;
@@ -160,12 +171,22 @@ fn unimplemented(input: []const u8, gas_limit: u64, out: []u8) Result {
 test "precompiles: sets by fork" {
     const one = primitives.address_from_int(1);
     const nine = primitives.address_from_int(9);
-    try std.testing.expect(is_precompile(.frontier, one));
-    try std.testing.expect(!is_precompile(.byzantium, nine));
-    try std.testing.expect(is_precompile(.istanbul, nine));
-    try std.testing.expect(!is_precompile(.osaka, primitives.address_from_int(0x12)));
-    try std.testing.expect(is_precompile(.osaka, primitives.address_from_int(0x100)));
-    try std.testing.expect(!is_precompile(.prague, primitives.address_from_int(0x100)));
+    try std.testing.expect(is_precompile(.frontier, null, one));
+    try std.testing.expect(!is_precompile(.byzantium, null, nine));
+    try std.testing.expect(is_precompile(.istanbul, null, nine));
+    try std.testing.expect(!is_precompile(.osaka, null, primitives.address_from_int(0x12)));
+    try std.testing.expect(is_precompile(.osaka, null, primitives.address_from_int(0x100)));
+    try std.testing.expect(!is_precompile(.prague, null, primitives.address_from_int(0x100)));
+    const p256_address = primitives.address_from_int(0x100);
+    try std.testing.expect(!is_precompile(.cancun, .ecotone, p256_address));
+    try std.testing.expect(is_precompile(.cancun, .fjord, p256_address));
+    const rip7212 = lookup(.cancun, .fjord, p256_address).?;
+    var out: [32]u8 = undefined;
+    const result = rip7212(&.{}, 10_000, &out);
+    try std.testing.expectEqual(@as(u64, 3450), result.gas_used);
+    try std.testing.expectEqual(@as(u32, 0), result.output_len);
+    const eip7951 = lookup(.osaka, .jovian, p256_address).?;
+    try std.testing.expectEqual(@as(u64, 6900), eip7951(&.{}, 10_000, &out).gas_used);
 }
 
 test "precompiles: identity and sha256" {

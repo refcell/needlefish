@@ -258,6 +258,12 @@ pub const Evm = struct {
         return delegate;
     }
 
+    /// OP Stack rules of the current block, or null on Ethereum.
+    pub fn op_rules(evm: *const Evm) ?@import("op.zig").Rules {
+        const context = evm.block.op orelse return null;
+        return context.rules;
+    }
+
     fn failed(gas_remaining: u64, exit: Exit) Step {
         return .{ .done = .{
             .status = exit.status(),
@@ -296,7 +302,7 @@ pub const Evm = struct {
                 return failed(request.gas_limit, .revert);
             }
         }
-        if (precompiles.lookup(fork, request.code_address)) |precompile| {
+        if (precompiles.lookup(fork, evm.op_rules(), request.code_address)) |precompile| {
             return evm.run_precompile(precompile, request, checkpoint);
         }
         const code_account = try evm.state.load(request.code_address);

@@ -10,9 +10,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2/SELFDESTRUCT (EIP-6780) with explicit frame stack (no recursion), max depth 1024.
 - [x] Transaction-level execution: intrinsic gas, nonce/balance checks, EIP-1559 fee handling, blob txs, EIP-7702 authorizations, access lists, coinbase/base-fee payments.
 - [x] OP-stack semantics: deposit tx processing (mint, no fee, gas accounting by fork, failed-deposit nonce bump), L1 cost charging to L1FeeVault, BaseFeeVault/SequencerFeeVault, operator fee (Isthmus), Base-specific changes in base/base.
-- [ ] Base fork precompile changes: RIP-7212 P256VERIFY at Fjord (3450 gas) before Azul's Osaka
-  pricing; BN254 pairing input caps (Granite 112687, Jovian 81984 bytes); BLS MSM/pairing caps
-  (Isthmus/Jovian); Canyon CREATE2-deployer and Everest nonce-manager state transitions.
+- [x] Base fork changes: RIP-7212 P256VERIFY at Fjord (3450 gas) until Osaka pricing (Azul);
+  Canyon CREATE2-deployer and Everest nonce-manager transitions (`op.apply_transition`).
+- [ ] BN254 pairing input caps (Granite 112687, Jovian 81984 bytes) and BLS MSM/pairing caps
+  (Isthmus/Jovian) once those precompiles exist.
 - [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory; Cobalt:
   tx-context 0x8130..aa02, 2D nonce manager 0x8130..aa01) and EIP-8130 (Everest, type 0x79).
 - [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas. Done: ecrecover,
@@ -64,6 +65,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: RIP-7212 P256VERIFY under OP Fjord; Canyon/Everest irregular transitions.
 - 2026-11-05: OP Stack handler: deposits (mint, halted deposit -> revert all but mint and
   nonce, full gas), L1/operator fees in the balance check, vault routing (base fee credited to
   BaseFeeVault, not burned), operator fee refund for unused gas.

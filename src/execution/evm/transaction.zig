@@ -237,13 +237,14 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     _ = try evm.state.access(tx.caller);
     if (tx.to) |to| _ = try evm.state.access(to);
     if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
+    const op_rules = evm.op_rules();
     var number: u64 = 1;
     while (number <= 0x11) : (number += 1) {
         const address = primitives.address_from_int(number);
-        if (precompiles.is_precompile(fork, address)) _ = try evm.state.access(address);
+        if (precompiles.is_precompile(fork, op_rules, address)) _ = try evm.state.access(address);
     }
     const p256 = primitives.address_from_int(0x100);
-    if (precompiles.is_precompile(fork, p256)) _ = try evm.state.access(p256);
+    if (precompiles.is_precompile(fork, op_rules, p256)) _ = try evm.state.access(p256);
     for (tx.access_list) |item| {
         const access = try evm.state.access(item.address);
         for (item.storage_keys) |key| {
