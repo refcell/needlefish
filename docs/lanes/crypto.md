@@ -63,6 +63,17 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] ecdh via constant-time GLV: deferred by decision. ECDH runs once per discv5 session
   handshake; ~11us saving does not justify a constant-time lambda split (current
   `split_lambda` is not audited for secret inputs).
+- [x] KZG blob verify perf: `evaluate_blob` evaluates straight from blob bytes as one
+  running fraction (4 muls/element, 4 independent lanes, raw limbs read as Montgomery form
+  with one final *R), replacing conversion + batch inversion (6 muls/element, serial chains).
+  Evaluation 330 -> 214us per blob; verify_blob_kzg_proof 1.05 -> 0.91-0.99ms; batch (6)
+  3.95 -> 3.25ms. 8 lanes (265us) and 2 lanes (247us) were slower. New component benches:
+  kzg/compute_challenge 45us, kzg/decompress_g1 37us.
+- [ ] bn254 pairing perf: profile the Miller loop vs final exponentiation split (494us for
+  2 pairs); candidates: cyclotomic squaring with compressed (Karabina) form, sparse line
+  multiplication by 034 lines, lazy Fp6 reduction now that bn254 Fp2 is lazy.
+- [ ] BLS pairing perf: same split for BLS (588us / 493us prepared); candidates: Karabina
+  compressed squarings in the hard part, multi-pairing shared final exponentiation already.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -343,3 +354,5 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: cell verify cost model (128 cells, 12.1 ms): ~5 ms proof decompression (sqrt ~15 us + subgroup check ~25 us each; no sound batched subgroup check because G1 cofactor has small factors), ~5 ms two 128-point MSMs, 1.3 ms 64-point MSM, 0.5 ms pairing. A 6-blob v1 sidecar is ~70-80 ms. No further work planned.
 - 2026-11-05: secp256k1 SEC1 encode/decode, plain verify, constant-time ecdh (`point.mul_ct`, RCB15 complete doubling) with std-oracle tests and a coverage fuzz target. BLS signatures (sign/aggregate) not added: base/base uses BLS12-381 only for the EIP-2537 precompiles, not p2p/consensus.
 - 2026-11-05: constant-time hardening (`ct.zig` value barrier) after advisor audit; verify r+n and infinity vectors added.
+- 2026-11-05: fuzz campaign (ReleaseSafe, nice 19): SEC1/verify/ecdh 200K runs, ecrecover precompile 500K runs, clean.
+- 2026-11-05: KZG `evaluate_blob` (fraction-sum barycentric, 4 lanes): batch verify (6) 3.95 -> 3.25ms.

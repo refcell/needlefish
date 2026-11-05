@@ -7,6 +7,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const blob = @import("blob.zig");
+const bls = @import("../bls12_381/root.zig");
 const Prng = @import("../../../testing/prng.zig").Prng;
 
 const batch_size = 6;
@@ -49,6 +50,65 @@ fn prepare() *State {
     }
     state_ready = true;
     return &state;
+}
+
+/// Fiat-Shamir challenge of one blob (sha256 over 128 KiB + reduction).
+pub fn compute_challenge(iterations: u32) u64 {
+    const context = prepare();
+    var accumulator: u64 = 0;
+    for (0..iterations) |index| {
+        const slot = index % batch_size;
+        const z = blob.compute_challenge(&context.blobs[slot], &context.commitments[slot]);
+        accumulator +%= z.limbs_value[0];
+    }
+    return accumulator;
+}
+
+/// Barycentric evaluation of one blob polynomial at a point outside the domain.
+pub fn evaluate_polynomial(iterations: u32) u64 {
+    const context = prepare();
+    for (&context.workspace.polynomial, 0..) |*element, index| {
+        element.* = bls.Fr.from_bytes_be(context.blobs[0][index * 32 ..][0..32]).?;
+    }
+    var z = blob.compute_challenge(&context.blobs[0], &context.commitments[0]);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const y = blob.evaluate_polynomial_in_evaluation_form(
+            &context.settings,
+            &context.workspace,
+            &context.workspace.polynomial,
+            z,
+        );
+        z = z.add(y);
+        accumulator +%= y.limbs_value[0];
+    }
+    return accumulator;
+}
+
+/// Barycentric evaluation straight from blob bytes (the verification path).
+pub fn evaluate_blob(iterations: u32) u64 {
+    const context = prepare();
+    var z = blob.compute_challenge(&context.blobs[0], &context.commitments[0]);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const y = blob.evaluate_blob(&context.settings, &context.blobs[0], z) catch
+            unreachable; // Canonical blob.
+        z = z.add(y);
+        accumulator +%= y.limbs_value[0];
+    }
+    return accumulator;
+}
+
+/// Commitment decompression with the subgroup check.
+pub fn decompress_g1(iterations: u32) u64 {
+    const context = prepare();
+    var accumulator: u64 = 0;
+    for (0..iterations) |index| {
+        const point = bls.g1.decompress(&context.commitments[index % batch_size]) catch
+            unreachable; // Valid commitment.
+        accumulator +%= point.x.limbs_value[0];
+    }
+    return accumulator;
 }
 
 pub fn blob_to_kzg_commitment(iterations: u32) u64 {

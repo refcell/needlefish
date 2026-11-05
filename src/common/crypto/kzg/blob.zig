@@ -232,6 +232,81 @@ fn evaluate_outside_domain(
     return sum.mul(factor);
 }
 
+/// Independent accumulators in `evaluate_blob`: they break the serial multiply chain.
+const evaluation_lanes = 4;
+
+/// R mod r: multiplying by it undoes reading raw limbs as a Montgomery form.
+const montgomery_r = Fr.from_int_comptime(1 << 256);
+
+/// Raw big-endian bytes as Montgomery limbs, i.e. the element value / R. Rejects
+/// non-canonical encodings like `Fr.from_bytes_be`.
+fn read_field_scaled(bytes: *const FieldBytes) Error!Fr {
+    const value = std.mem.readInt(u256, bytes, .big);
+    if (value >= kzg.bls_modulus) return error.InvalidFieldElement;
+    var element: Fr = undefined;
+    inline for (0..4) |index| element.limbs_value[index] = @truncate(value >> (64 * index));
+    assert(element.is_canonical());
+    return element;
+}
+
+const FractionSum = struct {
+    numerator: Fr,
+    denominator: Fr,
+    /// Domain index where z - w_i = 0, if any.
+    domain_index: ?u32,
+};
+
+/// sum_i p_i w_i / (z - w_i) as one fraction (p_i scaled by 1 / R), accumulated in
+/// `evaluation_lanes` independent chains: 4 multiplications per element, no inversion.
+fn fraction_sum(settings: *const Settings, blob: *const Blob, z: Fr) Error!FractionSum {
+    var numerators: [evaluation_lanes]Fr = @splat(Fr.zero);
+    var denominators: [evaluation_lanes]Fr = @splat(Fr.one);
+    var domain_index: ?u32 = null;
+    comptime assert(field_elements % evaluation_lanes == 0);
+    var index: u32 = 0;
+    while (index < field_elements) : (index += evaluation_lanes) {
+        inline for (0..evaluation_lanes) |lane| {
+            const element = index + lane;
+            const value = try read_field_scaled(blob[element * 32 ..][0..32]);
+            const root = settings.roots_brp[element];
+            var difference = z.sub(root);
+            if (difference.is_zero()) {
+                domain_index = @intCast(element);
+                difference = Fr.one; // Keeps the other terms well defined.
+            }
+            const term = value.mul(root);
+            numerators[lane] = numerators[lane].mul(difference).add(term.mul(denominators[lane]));
+            denominators[lane] = denominators[lane].mul(difference);
+        }
+    }
+    var numerator = numerators[0];
+    var denominator = denominators[0];
+    for (numerators[1..], denominators[1..]) |lane_numerator, lane_denominator| {
+        numerator = numerator.mul(lane_denominator).add(lane_numerator.mul(denominator));
+        denominator = denominator.mul(lane_denominator);
+    }
+    assert(!denominator.is_zero());
+    assert(index == field_elements);
+    return .{ .numerator = numerator, .denominator = denominator, .domain_index = domain_index };
+}
+
+/// The blob polynomial evaluated at `z`, straight from the blob bytes (verification
+/// paths). Equals `blob_to_polynomial` + `evaluate_polynomial_in_evaluation_form`.
+pub fn evaluate_blob(settings: *const Settings, blob: *const Blob, z: Fr) Error!Fr {
+    const sum = try fraction_sum(settings, blob, z);
+    if (sum.domain_index) |index| {
+        assert(settings.roots_brp[index].eql(z));
+        const scaled = try read_field_scaled(blob[index * 32 ..][0..32]);
+        return scaled.mul(montgomery_r);
+    }
+    var z_power = z;
+    for (0..field_elements_log2) |_| z_power = z_power.square();
+    const factor = z_power.sub(Fr.one).mul(Fr.from_int_comptime(inverse_width));
+    const result = sum.numerator.mul(sum.denominator.inverse()).mul(factor).mul(montgomery_r);
+    assert(result.is_canonical());
+    return result;
+}
+
 /// `evaluate_polynomial_in_evaluation_form`: the polynomial given by its evaluations
 /// over the (bit-reversed) domain, evaluated at `z`. Handles `z` equal to a root.
 pub fn evaluate_polynomial_in_evaluation_form(
@@ -324,10 +399,9 @@ pub fn verify_blob_kzg_proof(
 ) Error!bool {
     const commitment = try decode_g1(commitment_bytes);
     const proof = try decode_g1(proof_bytes);
-    try blob_to_polynomial(blob, &workspace.polynomial);
     const z = compute_challenge(blob, commitment_bytes);
-    const polynomial = &workspace.polynomial;
-    const y = evaluate_polynomial_in_evaluation_form(settings, workspace, polynomial, z);
+    const y = try evaluate_blob(settings, blob, z);
+    _ = workspace;
     return verify.verify_kzg_proof_points(commitment, z.to_int(), y.to_int(), proof);
 }
 
@@ -388,13 +462,11 @@ pub fn verify_blob_kzg_proof_batch(
     for (blobs, commitments, proofs, 0..) |blob, *commitment_bytes, *proof_bytes, index| {
         scratch.points[count + index] = try decode_g1(commitment_bytes);
         scratch.points[index] = try decode_g1(proof_bytes);
-        try blob_to_polynomial(blob, &workspace.polynomial);
         const z = compute_challenge(blob, commitment_bytes);
         scratch.zs[index] = z;
-        const polynomial = &workspace.polynomial;
-        scratch.ys[index] =
-            evaluate_polynomial_in_evaluation_form(settings, workspace, polynomial, z);
+        scratch.ys[index] = try evaluate_blob(settings, blob, z);
     }
+    _ = workspace;
     const r = batch_challenge(scratch, commitments, proofs, count);
     return check_batch(scratch, r, count);
 }
@@ -569,6 +641,29 @@ test "blob: evaluation of low-degree polynomials in evaluation form" {
         const value = evaluate(settings, &cubic, z);
         try testing.expect(value.eql(z.square().mul(z)));
     }
+}
+
+test "blob: evaluate_blob matches the evaluation-form evaluator" {
+    const settings = try shared_settings();
+    var prng = Prng.init(0xe7a1b10b);
+    var blob: Blob = undefined;
+    var polynomial: [field_elements]Fr = undefined;
+    for (0..3) |round| {
+        random_blob(&prng, &blob);
+        if (round == 0) blob = @splat(0);
+        try blob_to_polynomial(&blob, &polynomial);
+        var points: [5]Fr = undefined;
+        for (points[0..3]) |*z| z.* = Fr.from_int(prng.int(u256));
+        points[3] = settings.roots_brp[prng.int(u32) % field_elements];
+        points[4] = settings.roots_brp[field_elements - 1];
+        for (points) |z| {
+            const expected = evaluate(settings, &polynomial, z);
+            try testing.expect((try evaluate_blob(settings, &blob, z)).eql(expected));
+        }
+    }
+    blob[prng.int(u32) % field_elements * 32] = 0xff;
+    const z = Fr.from_int(prng.int(u256));
+    try testing.expectError(error.InvalidFieldElement, evaluate_blob(settings, &blob, z));
 }
 
 test "blob: invalid inputs are rejected" {
@@ -910,12 +1005,19 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     _ = verify_one(settings, &blob, &commitment, &proof) catch {};
     var z_bytes: FieldBytes = undefined;
     smith.bytes(&z_bytes);
-    const z = Fr.from_bytes_be(&z_bytes) orelse return;
+    var z = Fr.from_bytes_be(&z_bytes) orelse return;
+    // Bias toward in-domain points, which take the special case.
+    if (z_bytes[31] & 7 == 0) z = settings.roots_brp[z_bytes[30] % 32];
     var polynomial: [field_elements]Fr = undefined;
-    blob_to_polynomial(&blob, &polynomial) catch return;
-    _ = evaluate(settings, &polynomial, z);
+    const parsed = blob_to_polynomial(&blob, &polynomial);
+    const direct = evaluate_blob(settings, &blob, z);
+    parsed catch {
+        try testing.expectError(error.InvalidFieldElement, direct);
+        return;
+    };
+    try testing.expect((try direct).eql(evaluate(settings, &polynomial, z)));
 }
 
-test "blob: coverage-guided fuzz (never crashes)" {
+test "blob: coverage-guided fuzz (never crashes, evaluate_blob vs reference)" {
     try testing.fuzz({}, fuzz_one, .{});
 }

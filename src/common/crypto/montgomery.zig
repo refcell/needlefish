@@ -100,7 +100,7 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
             return out;
         }
 
-        fn is_canonical(element: Self) bool {
+        pub fn is_canonical(element: Self) bool {
             return limbs_to_int(element.limbs_value) < modulus;
         }
 

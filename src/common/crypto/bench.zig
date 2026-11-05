@@ -551,6 +551,14 @@ pub const cases = [_]Case{
         .iterations = 50,
         .run = kzg_bench.verify_blob_kzg_proof_batch_6,
     },
+    .{ .name = "kzg/compute_challenge", .iterations = 2_000, .run = kzg_bench.compute_challenge },
+    .{
+        .name = "kzg/evaluate_polynomial",
+        .iterations = 1_000,
+        .run = kzg_bench.evaluate_polynomial,
+    },
+    .{ .name = "kzg/evaluate_blob", .iterations = 1_000, .run = kzg_bench.evaluate_blob },
+    .{ .name = "kzg/decompress_g1", .iterations = 5_000, .run = kzg_bench.decompress_g1 },
     .{ .name = "kzg/compute_cells", .iterations = 20, .run = kzg_bench.compute_cells },
     .{
         .name = "kzg/compute_cells_and_kzg_proofs",
