@@ -14,6 +14,7 @@ const rpc = @import("../rpc/root.zig");
 const source = @import("../source/root.zig");
 const channel_manager = @import("../channel/manager.zig");
 const txmgr = @import("../txmgr/root.zig");
+const primitives = @import("../../common/primitives/root.zig");
 
 pub const Config = struct {
     channels: channel_manager.Config,
@@ -130,6 +131,25 @@ pub const Service = struct {
     }
 };
 
+/// The rollup.json fields the batcher needs (op-node JSON schema).
+pub const RollupFields = struct {
+    l1_chain_id: u64,
+    batch_inbox_address: primitives.Address,
+
+    pub fn parse(allocator: std.mem.Allocator, text: []const u8) !RollupFields {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+        defer parsed.deinit();
+        const chain_id = try rpc.field(parsed.value, "l1_chain_id");
+        const inbox = try rpc.field(parsed.value, "batch_inbox_address");
+        const fields: RollupFields = .{
+            .l1_chain_id = try rpc.number(chain_id),
+            .batch_inbox_address = .{ .bytes = try rpc.fixed(20, inbox) },
+        };
+        if (fields.l1_chain_id == 0) return error.MalformedResponse;
+        return fields;
+    }
+};
+
 fn read_heads(clients: Clients) Error!Heads {
     const l1 = try rpc.quantity(u64, try clients.l1.call("eth_blockNumber", "[]"));
     if (clients.rollup) |rollup| {
@@ -149,7 +169,6 @@ fn read_heads(clients: Clients) Error!Heads {
 
 const testing = std.testing;
 const consensus = @import("../../common/consensus/root.zig");
-const primitives = @import("../../common/primitives/root.zig");
 const protocol = @import("../../consensus/protocol/root.zig");
 const frame_module = @import("../frame/root.zig");
 const comp = @import("../comp/root.zig");
@@ -313,4 +332,16 @@ test "service: L2 blocks reach L1 as a complete channel of singular batches" {
         try testing.expectEqual(@as(usize, 0), batch.transactions.len);
     }
     try testing.expectEqual(@as(u64, 13), number);
+}
+
+test "service: rollup fields from the devnet rollup.json" {
+    var buffer: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const genesis = @import("../devnet/genesis.zig");
+    const anchor: genesis.GenesisAnchor = .{ .l1_hash = @splat(1), .l2_hash = @splat(2) };
+    try genesis.write_rollup_config(&writer, &.{ .genesis_timestamp = 1_700_000_000 }, anchor);
+    const fields = try RollupFields.parse(testing.allocator, writer.buffered());
+    try testing.expectEqual(@as(u64, 900), fields.l1_chain_id);
+    try testing.expectEqual(@as(u8, 0xff), fields.batch_inbox_address.bytes[0]);
+    try testing.expectError(error.MalformedResponse, RollupFields.parse(testing.allocator, "{}"));
 }
