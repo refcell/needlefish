@@ -500,7 +500,26 @@ test "service: --builder.enabled routes FCU and getPayload through the payload s
     defer service.deinit();
     try testing.expect(service.chain.payload_builder != null);
     const parent = primitives.B256{ .bytes = service.chain.head_hash() };
-    const attributes = fixture.attributes_l2(genesis_time + 1, 3);
+    // The devnet genesis activates Denim: block 1 follows the 200 ms schedule and carries
+    // the BaseTime deposit after a stand-in L1-info deposit.
+    const parts = service.chain.denim_schedule().?.parts(1);
+    var calldata: [2][consensus.base_time.calldata_length]u8 = .{
+        consensus.base_time.encode_calldata(0),
+        consensus.base_time.encode_calldata(parts.millis_part),
+    };
+    var info = consensus.base_time.deposit(1, &calldata[0]);
+    info.source_hash = .{ .bytes = @splat(1) };
+    const info_envelope: consensus.Envelope = .{ .deposit = info };
+    const metadata_deposit = consensus.base_time.deposit(1, &calldata[1]);
+    const metadata: consensus.Envelope = .{ .deposit = metadata_deposit };
+    var encoded: [2][256]u8 = undefined;
+    const transactions = [2][]const u8{
+        info_envelope.encode_to(&encoded[0]),
+        metadata.encode_to(&encoded[1]),
+    };
+    var attributes = fixture.attributes_l2(parts.seconds, 3);
+    attributes.transactions = &transactions;
+    attributes.no_tx_pool = true;
     const version = types.forkchoice_version(&service.spec, attributes.timestamp);
     const choice = fixture.forkchoice(parent);
     const updated = try service.engine.forkchoice_updated(version, choice, &attributes);
