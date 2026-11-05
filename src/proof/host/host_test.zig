@@ -239,3 +239,28 @@ test "host: fuzz hint routing" {
     var handler: handler_module.Handler = .{ .store = &store, .source = source.as_source() };
     try fuzz.run(&handler, fuzz_route, .{ .iterations = 512 });
 }
+
+test "host: a hint served once is not fetched again" {
+    var source: MapSource = .{ .arena = .init(testing.allocator) };
+    defer source.deinit();
+    var header: consensus.Header = .{ .number = 3 };
+    const hash = try source.add_block(&header, &.{});
+    var store: store_module.Store = .init(testing.allocator, .{});
+    defer store.deinit();
+    var handler: handler_module.Handler = .{ .store = &store, .source = source.as_source() };
+    const router = handler.router();
+    var text: [96]u8 = undefined;
+    const hint = try std.fmt.bufPrint(&text, "l1-block-header 0x{x}", .{&hash});
+    try router.route_hint(router.context, hint);
+    const count = store.count();
+    try router.route_hint(router.context, hint);
+    try testing.expectEqual(@as(u64, 1), handler.hints_skipped);
+    try testing.expectEqual(count, store.count());
+    // A failing hint is not remembered.
+    const unknown: Hash = @splat(0x42);
+    var missing_text: [96]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&missing_text, "l1-block-header 0x{x}", .{&unknown});
+    try testing.expectError(error.HintFailed, router.route_hint(router.context, missing));
+    try testing.expectError(error.HintFailed, router.route_hint(router.context, missing));
+    try testing.expectEqual(@as(u64, 1), handler.hints_skipped);
+}

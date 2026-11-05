@@ -19,6 +19,7 @@ const preimage = @import("../preimage/root.zig");
 const program = @import("../program/root.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
 const kzg = @import("../../common/crypto/kzg/root.zig");
+const crypto = @import("../../common/crypto/root.zig");
 const store_module = @import("store.zig");
 
 const Hash = [32]u8;
@@ -74,6 +75,14 @@ pub const Handler = struct {
     data_buffer: [preimage.hint.hint_size_max / 2]u8 = undefined,
     /// The last failure, for diagnostics.
     last_error: ?anyerror = null,
+    /// Digests of hints already served: the store is immutable, so serving one again
+    /// cannot add anything (the program re-sends hints before reads). A direct-mapped
+    /// table: a collision only costs a redundant fetch.
+    served: [served_slots]Hash = @splat(@splat(0)),
+    /// Hints answered from `served` without touching the source.
+    hints_skipped: u64 = 0,
+
+    pub const served_slots = 4096;
 
     pub fn router(handler: *Handler) preimage.Router {
         return .{ .context = handler, .route_hint = route_hint };
@@ -84,6 +93,12 @@ pub const Handler = struct {
         const hint = preimage.Hint.parse(text, &handler.data_buffer) catch
             return error.HintRejected;
         const hint_type = HintType.from_name(hint.type_name) orelse return error.HintRejected;
+        const digest = crypto.keccak256(text);
+        const slot = &handler.served[std.mem.readInt(u16, digest[0..2], .little) % served_slots];
+        if (std.mem.eql(u8, slot, &digest)) {
+            handler.hints_skipped += 1;
+            return;
+        }
         handler.handle(hint_type, hint.data) catch |err| {
             handler.last_error = err;
             return switch (err) {
@@ -91,6 +106,8 @@ pub const Handler = struct {
                 else => error.HintFailed,
             };
         };
+        // Only a fully served hint is remembered; a failed one is retried next time.
+        slot.* = digest;
     }
 
     pub const Error = store_module.Error || SourceError || error{

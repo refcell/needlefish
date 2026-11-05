@@ -51,9 +51,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/devnet-proof`: `etc/proof/devnet-proof.sh [blocks]` proves the verifier's
   safe head on the running devnet, replays the archive, and checks a wrong claim fails.
   First live run: agreed 100 -> claimed 140 holds (791 preimages, 40 s).
-- [ ] `proof/host-speed`: the RPC source pumps IO in 1 ms slices per call (40 s for 40
-  blocks, mostly idle): drive IO until completion without sleeping, and prefetch block
-  bodies with headers.
+- [x] `proof/host-speed`: the cost was re-served hints (2191 calls for 367 preimages on
+  10 blocks), not IO: the handler skips hints it already served. 40 blocks: 40 s -> 1.2 s
+  (506 calls).
 - [ ] `proof/rpc` + `proof/contracts`: typed L1/L2/rollup clients with caching, ABI
   bindings for DisputeGameFactory, AnchorStateRegistry, DelayedWETH (port `rpc/`,
   `contracts/`). ABI encode/decode fuzz tests.
@@ -132,6 +132,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host: served-hint dedupe; live 40-block proof 40 s -> 1.2 s.
 - 2026-11-05: custom chains in boot/client; first live devnet proof holds and replays.
 - 2026-11-05: `base proof run`: native mode over RPC, records a replayable archive.
 - 2026-11-05: driver: deposit-only retry limited to block-validity errors (soundness).
