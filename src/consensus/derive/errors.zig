@@ -18,6 +18,9 @@ pub const ProviderError = error{
     NotFound,
     /// The beacon node permanently lacks the blobs (missed or orphaned slot).
     BlobsUnavailable,
+    /// The execution client pruned the block body (no L1 info deposit to decode); only the
+    /// header is known. Derivation cannot go below it; startup recovers from checkpoints.
+    Pruned,
     OutOfMemory,
 };
 
@@ -74,6 +77,7 @@ pub fn kind(err: Error) Kind {
         error.BlobsOverFill,
         => .reset,
         error.OutOfMemory,
+        error.Pruned,
         error.MissingOrigin,
         error.ChannelProviderEmpty,
         error.ChannelNotFound,

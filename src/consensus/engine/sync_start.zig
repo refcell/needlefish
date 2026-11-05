@@ -11,8 +11,17 @@
 //!   fn l2_block_info_by_hash(self, hash: Hash) ProviderError!?L2BlockInfo
 //!   fn l1_block_info_by_number(self, number: u64) ProviderError!?BlockInfo
 //!   fn l1_head(self) ProviderError!BlockInfo
+//!   fn l2_block_info_by_number(self, number: u64) ProviderError!?L2BlockInfo
+//!   fn l2_pruned_header(self) ?BlockInfo      header of the last `error.Pruned` answer
+//!   fn l2_checkpoint(self, label: CheckpointLabel) ?L2BlockInfo
 //! L2 block infos carry the L1 origin decoded from the L1 info deposit (genesis rule
 //! applied by the client).
+//!
+//! Pruned bodies (base/base `current_with_checkpoint_reader`): when the execution client
+//! pruned the finalized or safe block's body, a checkpoint whose block matches the header is
+//! used instead (a mismatch is an error). Without one, a pruned safe head falls back to the
+//! finalized head, and a pruned finalized head to the earliest unpruned block, found by a
+//! resumable binary search up to `latest` (`find_earliest_unpruned_block`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -29,6 +38,7 @@ const RollupConfig = protocol.rollup_config.RollupConfig;
 pub const max_reorg_sequencing_windows: u64 = 5;
 
 pub const Label = enum { latest, safe, finalized };
+pub const CheckpointLabel = enum { safe, finalized };
 
 pub const L2ForkchoiceState = struct {
     unsafe_head: L2BlockInfo,
@@ -41,11 +51,28 @@ pub const Error = ProviderError || error{
     MismatchedFinalizedBlock,
     FinalizedL1OriginNotCanonical,
     TooDeepReorg,
+    /// A checkpoint exists for a pruned head but names a different block.
+    CheckpointMismatch,
+    /// The latest block is pruned too, so no unpruned block exists to start from.
+    LatestPruned,
 };
+
+/// Binary search state for the earliest unpruned block: every block below `low` is pruned,
+/// `best` (number `high`) is not.
+const Search = struct { low: u64, high: u64 = 0, best: ?L2BlockInfo = null };
 
 pub const StartFinder = struct {
     rollup: *const RollupConfig,
-    phase: enum { finalized, safe, unsafe_head, unsafe_walk, safe_walk, done } = .finalized,
+    phase: enum {
+        finalized,
+        finalized_search,
+        safe,
+        unsafe_head,
+        unsafe_walk,
+        safe_walk,
+        done,
+    } = .finalized,
+    search: Search = .{ .low = 0 },
     state: L2ForkchoiceState = undefined,
     previous_unsafe_origin: u64 = 0,
     l1_head_number: ?u64 = null,
@@ -77,13 +104,28 @@ pub const StartFinder = struct {
     pub fn step(finder: *StartFinder, client: anytype) Error!?L2ForkchoiceState {
         for (0..lookups_per_step_max) |_| {
             switch (finder.phase) {
-                .finalized => {
-                    const block = try client.l2_block_info_by_label(.finalized);
-                    finder.state.finalized_head = block orelse finder.genesis_head();
+                .finalized => finder.finalized_step(client) catch |err| {
+                    if (err != error.Pruned) return err;
+                    const header = client.l2_pruned_header() orelse return error.BlockNotFound;
+                    if (try checkpoint_for(client, .finalized, header)) |checkpoint| {
+                        finder.state.finalized_head = checkpoint;
+                        finder.phase = .safe;
+                    } else {
+                        finder.search = .{ .low = header.number + 1 };
+                        finder.phase = .finalized_search;
+                    }
+                },
+                .finalized_search => if (try finder.search_step(client)) |earliest| {
+                    finder.state.finalized_head = earliest;
                     finder.phase = .safe;
                 },
                 .safe => {
-                    const block = try client.l2_block_info_by_label(.safe);
+                    const block = client.l2_block_info_by_label(.safe) catch |err| blk: {
+                        if (err != error.Pruned) return err;
+                        const header = client.l2_pruned_header() orelse
+                            return error.BlockNotFound;
+                        break :blk try checkpoint_for(client, .safe, header);
+                    };
                     finder.state.safe_head = block orelse finder.state.finalized_head;
                     finder.phase = .unsafe_head;
                 },
@@ -107,6 +149,52 @@ pub const StartFinder = struct {
     }
 
     pub const lookups_per_step_max = 4096;
+
+    fn finalized_step(finder: *StartFinder, client: anytype) Error!void {
+        assert(finder.phase == .finalized);
+        const block = try client.l2_block_info_by_label(.finalized);
+        finder.state.finalized_head = block orelse finder.genesis_head();
+        finder.phase = .safe;
+    }
+
+    /// The checkpoint for `label` when it matches the pruned block's header.
+    fn checkpoint_for(
+        client: anytype,
+        label: CheckpointLabel,
+        header: BlockInfo,
+    ) Error!?L2BlockInfo {
+        const checkpoint = client.l2_checkpoint(label) orelse return null;
+        if (!std.meta.eql(checkpoint.block_info, header)) return error.CheckpointMismatch;
+        assert(checkpoint.block_info.hash.eql(header.hash));
+        return checkpoint;
+    }
+
+    /// One binary-search lookup; the earliest unpruned block once the range collapses.
+    fn search_step(finder: *StartFinder, client: anytype) Error!?L2BlockInfo {
+        const search = &finder.search;
+        if (search.best == null) {
+            const latest = client.l2_block_info_by_label(.latest) catch |err| return switch (err) {
+                error.Pruned => error.LatestPruned,
+                else => err,
+            };
+            const block = latest orelse return error.BlockNotFound;
+            if (block.block_info.number < search.low) return error.LatestPruned;
+            search.best = block;
+            search.high = block.block_info.number;
+        }
+        if (search.low >= search.high) return search.best.?;
+        const middle = search.low + (search.high - search.low) / 2;
+        const found = client.l2_block_info_by_number(middle) catch |err| {
+            if (err != error.Pruned) return err;
+            search.low = middle + 1;
+            return null;
+        };
+        const block = found orelse return error.BlockNotFound;
+        assert(block.block_info.number == middle);
+        search.best = block;
+        search.high = middle;
+        return null;
+    }
 
     /// One unsafe-walk iteration; true once the unsafe head's L1 origin is plausible.
     fn unsafe_walk_step(finder: *StartFinder, client: anytype) Error!bool {
@@ -188,6 +276,10 @@ const TestClient = struct {
     l1_reorg_from: u64 = std.math.maxInt(u64),
     unavailable_every: u32 = 0,
     calls: u32 = 0,
+    /// Blocks below this number have pruned bodies.
+    pruned_below: u64 = 0,
+    last_pruned: ?BlockInfo = null,
+    checkpoints: [2]?L2BlockInfo = .{ null, null }, // safe, finalized
 
     fn l1_hash(number: u64, canonical: bool) Hash {
         var hash: Hash = .{ .bytes = @splat(if (canonical) 0xaa else 0xbb) };
@@ -221,10 +313,32 @@ const TestClient = struct {
         }
     }
 
+    fn answer(client: *TestClient, block: L2BlockInfo) ProviderError!?L2BlockInfo {
+        if (block.block_info.number < client.pruned_below) {
+            client.last_pruned = block.block_info;
+            return error.Pruned;
+        }
+        return block;
+    }
+
     pub fn l2_block_info_by_label(client: *TestClient, label: Label) ProviderError!?L2BlockInfo {
         try client.maybe_unavailable();
         const index = client.labels[@backingInt(label)] orelse return null;
-        return client.l2[index];
+        return client.answer(client.l2[index]);
+    }
+
+    pub fn l2_block_info_by_number(client: *TestClient, number: u64) ProviderError!?L2BlockInfo {
+        try client.maybe_unavailable();
+        if (number >= client.l2_count) return null;
+        return client.answer(client.l2[number]);
+    }
+
+    pub fn l2_pruned_header(client: *TestClient) ?BlockInfo {
+        return client.last_pruned;
+    }
+
+    pub fn l2_checkpoint(client: *TestClient, label: CheckpointLabel) ?L2BlockInfo {
+        return client.checkpoints[@backingInt(label)];
     }
 
     pub fn l2_block_info_by_hash(client: *TestClient, hash: Hash) ProviderError!?L2BlockInfo {
@@ -289,6 +403,58 @@ test "sync start: safe head from the sequencing window, genesis defaults, errors
     client.labels = .{ 29, 4, 4 };
     finder = StartFinder.init(&rollup);
     try testing.expectError(error.TooDeepReorg, run(&finder, &client));
+}
+
+test "sync start: pruned heads recover from checkpoints or the earliest unpruned block" {
+    var rollup: RollupConfig = .{ .seq_window_size = 64 };
+    var client = TestClient.init(30, std.math.maxInt(u64));
+    rollup.genesis.l2.hash = client.l2[0].block_info.hash;
+    client.labels = .{ 29, 12, 4 };
+    client.pruned_below = 17;
+    // No checkpoints: finalized becomes the earliest unpruned block, safe falls back to it.
+    var finder = StartFinder.init(&rollup);
+    var state = try run(&finder, &client);
+    try testing.expectEqual(@as(u64, 17), state.finalized_head.block_info.number);
+    try testing.expectEqual(@as(u64, 17), state.safe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 29), state.unsafe_head.block_info.number);
+    // Matching checkpoints are used as they are.
+    client.checkpoints = .{ client.l2[12], client.l2[4] };
+    finder = StartFinder.init(&rollup);
+    state = try run(&finder, &client);
+    try testing.expectEqual(@as(u64, 4), state.finalized_head.block_info.number);
+    try testing.expectEqual(@as(u64, 12), state.safe_head.block_info.number);
+    // A checkpoint naming another block is an error.
+    client.checkpoints = .{ null, client.l2[5] };
+    finder = StartFinder.init(&rollup);
+    try testing.expectError(error.CheckpointMismatch, run(&finder, &client));
+    // Everything pruned: nothing to start from.
+    client.checkpoints = .{ null, null };
+    client.pruned_below = 30;
+    finder = StartFinder.init(&rollup);
+    try testing.expectError(error.LatestPruned, run(&finder, &client));
+}
+
+test "sync start: seeded fuzz, the binary search finds the earliest unpruned block" {
+    var prng = Prng.init(0x9a7e);
+    for (0..300) |_| {
+        var rollup: RollupConfig = .{ .seq_window_size = 64 };
+        var client = TestClient.init(32, std.math.maxInt(u64));
+        rollup.genesis.l2.hash = client.l2[0].block_info.hash;
+        const finalized: u32 = @intCast(prng.below(16));
+        client.labels = .{ 31, finalized + @as(u32, @intCast(prng.below(8))), finalized };
+        client.pruned_below = prng.below(33);
+        if (prng.chance(1, 3)) client.unavailable_every = 2 + @as(u32, @intCast(prng.below(4)));
+        var finder = StartFinder.init(&rollup);
+        const result = run(&finder, &client);
+        if (client.pruned_below == 32) {
+            try testing.expectError(error.LatestPruned, result);
+            continue;
+        }
+        const state = try result;
+        const expected = @max(finalized, client.pruned_below);
+        try testing.expectEqual(expected, state.finalized_head.block_info.number);
+        try testing.expect(state.safe_head.block_info.number >= expected);
+    }
 }
 
 test "sync start: seeded fuzz, unavailability does not change the result" {

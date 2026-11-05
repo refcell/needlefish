@@ -95,6 +95,27 @@ fn FinderClient(comptime Providers: type) type {
             return optional(L2BlockInfo, self.providers.l2.l2_block_info_by_hash(hash));
         }
 
+        pub fn l2_block_info_by_number(self: Self, number: u64) ProviderError!?L2BlockInfo {
+            return optional(L2BlockInfo, self.providers.l2.l2_block_info_by_number(number));
+        }
+
+        /// The header behind the last `error.Pruned` (providers without pruning: none).
+        pub fn l2_pruned_header(self: Self) ?BlockInfo {
+            const L2 = @typeInfo(@TypeOf(self.providers.l2)).pointer.child;
+            if (!@hasDecl(L2, "pruned_header")) return null;
+            return self.providers.l2.pruned_header();
+        }
+
+        /// Durable checkpoints, when the providers carry them (`checkpoints` field).
+        pub fn l2_checkpoint(self: Self, label: sync_start.CheckpointLabel) ?L2BlockInfo {
+            if (!@hasField(Providers, "checkpoints")) return null;
+            const checkpoints = self.providers.checkpoints orelse return null;
+            return switch (label) {
+                .safe => checkpoints.safe,
+                .finalized => checkpoints.finalized,
+            };
+        }
+
         pub fn l1_block_info_by_number(self: Self, number: u64) ProviderError!?BlockInfo {
             return optional(BlockInfo, self.providers.l1.l1_block_info_by_number(number));
         }

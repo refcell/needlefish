@@ -131,6 +131,12 @@ pub fn L2View(comptime IO: type) type {
             return view.provider.l2_block_info_by_number(number);
         }
 
+        /// The header behind the provider's last `error.Pruned`.
+        pub fn pruned_header(view: *Self) ?BlockInfo {
+            const pruned = view.provider.last_pruned orelse return null;
+            return pruned.header;
+        }
+
         pub fn l2_block_info_by_hash(view: *Self, hash: Hash) ProviderError!L2BlockInfo {
             return view.provider.l2_block_info_by_hash(hash);
         }
@@ -247,6 +253,8 @@ pub fn Node(comptime IO: type) type {
             engine: *Polling,
             l1_head: ?BlockInfo,
             l1_finalized: ?BlockInfo,
+            /// Durable safe/finalized heads for startup when the engine pruned their bodies.
+            checkpoints: ?checkpoint.Checkpoints = null,
         };
 
         allocator: Allocator,
@@ -606,6 +614,7 @@ pub fn Node(comptime IO: type) type {
                 .engine = &node.polling,
                 .l1_head = node.watcher.head(.latest),
                 .l1_finalized = node.watcher.head(.finalized),
+                .checkpoints = if (node.checkpoints) |store| store.loaded else null,
             };
         }
 
@@ -626,7 +635,9 @@ pub fn Node(comptime IO: type) type {
             node.polling.tick();
             if (node.blobs) |blobs| blobs.tick();
             const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
-            node.driver.tick(node.providers(), now_s);
+            // Startup may need the checkpoints, so the driver waits until they are read.
+            const checkpoints_ready = if (node.checkpoints) |store| store.loaded != null else true;
+            if (checkpoints_ready) node.driver.tick(node.providers(), now_s);
             if (node.network) |network| {
                 node.tick_signer(network);
                 node.tick_gossip(network);

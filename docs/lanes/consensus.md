@@ -26,7 +26,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] batch stream, batch queue, batch validator, batch provider
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
   - [x] attributes queue, pipeline core (step, reset, signals)
-- [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
+- [x] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [x] engine task queue: insert unsafe, consolidate (AttributesMatch), build/seal (Holocene
     deposits-only fallback), finalize, synchronize; deterministic mock engine, fuzzed
@@ -39,7 +39,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     `AwaitingELSyncCompletion` + `probe_el_sync`)
   - [x] checkpoint store (`service/checkpoint.zig`, `--checkpoint.path`): safe/finalized
     heads in base/base's 128-byte record layout, one crc-checked image via `StoreFile`
-  - [ ] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
+  - [x] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
     the start finder then uses a matching checkpoint, else binary-searches the earliest
     unpruned block (base/base `find_earliest_unpruned_block`)
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
@@ -78,6 +78,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- `ProviderError.Pruned` is critical for derivation (it cannot go below a pruned body). The
+  node holds the driver until the checkpoint file is read, so startup sees the checkpoints.
 - Checkpoints: base/base stores them in redb under its data dir by default; we write one
   fixed 269-byte image (magic, mask, two records, crc32) through the io layer and only when
   `--checkpoint.path` is given. A torn image loads as "no checkpoints".
@@ -196,6 +198,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: engine: startup recovers pruned safe/finalized heads from checkpoints or the earliest unpruned block.
 - 2026-11-05: service: durable safe/finalized checkpoints behind `--checkpoint.path`.
 - 2026-11-05: service: derivation and sequencing wait for EL sync, probing the engine every 2 s.
 - 2026-11-05: rpc: pre-Isthmus optimism_outputAtBlock from cached eth_getProof storage roots.

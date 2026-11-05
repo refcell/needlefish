@@ -162,3 +162,30 @@ test "l2 provider: seeded fuzz, queue stays bounded" {
     fixture.harness.run();
     try testing.expect(!provider.busy());
 }
+
+test "l2 provider: a pruned body surfaces once as Pruned with its header" {
+    var fixture: Fixture = .{};
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const Header = @import("../../common/consensus/root.zig").Header;
+    const header: Header = .{ .number = 10, .timestamp = 20, .gas_limit = 30_000_000 };
+    var text: [4096]u8 = undefined;
+    // No transactions: the body (and its L1 info deposit) was pruned.
+    const pruned = try fixtures.block_json(&text, &header, &.{}, true);
+    const by_number = "eth_getBlockByNumber";
+    fixture.fake.add(.{ .method = by_number, .params_contain = "\"0xa\"", .result = pruned });
+    const provider = &fixture.provider;
+    try testing.expectError(error.NotAvailable, provider.l2_block_info_by_number(10));
+    fixture.harness.run();
+    try testing.expectError(error.Pruned, provider.l2_block_info_by_number(10));
+    const last = provider.last_pruned.?;
+    try testing.expectEqual(@as(u64, 10), last.header.number);
+    try testing.expectEqual(@as(u64, 20), last.header.timestamp);
+    try testing.expectEqualSlices(u8, &header.hash().bytes, &last.header.hash.bytes);
+    try testing.expectEqual(@as(u64, 1), provider.stats.pruned);
+    try testing.expectEqual(@as(u64, 0), provider.stats.failures);
+    // Reported once; the next query fetches again.
+    try testing.expectError(error.NotAvailable, provider.l2_block_info_by_number(10));
+    fixture.harness.run();
+    try testing.expect(!provider.busy());
+}

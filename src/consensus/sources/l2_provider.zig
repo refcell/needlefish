@@ -6,8 +6,10 @@
 //! Same discipline as `l1_provider.zig`: a miss enqueues one fetch
 //! (`eth_getBlockByNumber`/`eth_getBlockByHash` with full transactions, for the L1 info
 //! deposit) and returns `error.NotAvailable`; a `null` result surfaces once as
-//! `error.NotFound`; failed or unverifiable responses are dropped and re-requested on the
-//! next query. With `jwt_secret` every request carries a fresh bearer token.
+//! `error.NotFound`; a block without its L1 info deposit (body pruned by the execution
+//! client) surfaces once as `error.Pruned`, its header kept in `last_pruned`; failed or
+//! unverifiable responses are dropped and re-requested on the next query. With
+//! `jwt_secret` every request carries a fresh bearer token.
 //! Bounds: one request in flight, a fixed de-duplicating queue, fixed LRU caches.
 //! Each cached block keeps only its `L2BlockInfo` and `SystemConfig`. Full safe blocks
 //! (`l2_block_by_number`, raw transactions for span batch checks) live in a few slots with
@@ -28,10 +30,12 @@ const protocol = @import("../protocol/root.zig");
 const errors = @import("../derive/errors.zig");
 const l2_block = @import("l2_block.zig");
 const l2_block_full = @import("l2_block_full.zig");
+const header_json = @import("header_json.zig");
 const SafeBlock = protocol.span_batch.SafeBlock;
 
 const B256 = primitives.B256;
 const L2BlockInfo = protocol.block.L2BlockInfo;
+const BlockInfo = protocol.block.BlockInfo;
 const SystemConfig = protocol.system_config.SystemConfig;
 const RollupConfig = protocol.rollup_config.RollupConfig;
 const ProviderError = errors.ProviderError;
@@ -79,10 +83,14 @@ pub const Request = union(enum) {
     }
 };
 
+/// A request answered by a block whose body the execution client pruned.
+pub const Pruned = struct { request: Request, header: BlockInfo };
+
 pub const Stats = struct {
     requests: u64 = 0,
     failures: u64 = 0,
     not_found: u64 = 0,
+    pruned: u64 = 0,
     dropped: u64 = 0,
 };
 
@@ -134,6 +142,10 @@ pub fn L2Provider(comptime IO: type) type {
         fulls: []FullEntry,
         missing: [missing_max]Request = undefined,
         missing_count: u32 = 0,
+        pruned: [missing_max]Pruned = undefined,
+        pruned_count: u32 = 0,
+        /// The most recent pruned answer reported by `error.Pruned`.
+        last_pruned: ?Pruned = null,
         clock: u64 = 0,
         stats: Stats = .{},
 
@@ -287,8 +299,15 @@ pub fn L2Provider(comptime IO: type) type {
             return null;
         }
 
-        /// Reports a recorded `null` result once, otherwise enqueues the fetch.
+        /// Reports a recorded `null` or pruned result once, otherwise enqueues the fetch.
         fn miss(provider: *Self, request: Request) ProviderError {
+            for (provider.pruned[0..provider.pruned_count], 0..) |pruned, index| {
+                if (!pruned.request.eql(request)) continue;
+                provider.pruned_count -= 1;
+                provider.pruned[index] = provider.pruned[provider.pruned_count];
+                provider.last_pruned = pruned;
+                return error.Pruned;
+            }
             for (provider.missing[0..provider.missing_count], 0..) |missing, index| {
                 if (!missing.eql(request)) continue;
                 provider.missing_count -= 1;
@@ -379,9 +398,34 @@ pub fn L2Provider(comptime IO: type) type {
                 },
             };
             if (std.mem.eql(u8, raw, "null")) return provider.record_missing(request);
-            provider.complete(request, raw) catch {
+            provider.complete(request, raw) catch |err| {
+                if (err == error.MissingL1InfoDeposit) {
+                    if (provider.record_pruned(request, raw)) return;
+                }
                 provider.stats.failures += 1;
             };
+        }
+
+        /// Keeps the header of a block whose body was pruned; false if it does not decode.
+        fn record_pruned(provider: *Self, request: Request, raw: []const u8) bool {
+            var extra: [header_json.extra_data_size_max]u8 = undefined;
+            const decoded = header_json.decode(raw, &extra) catch return false;
+            const header = decoded.block_info();
+            switch (request) {
+                .number, .full => |number| if (header.number != number) return false,
+                .hash => |hash| if (!header.hash.eql(hash)) return false,
+                .label => {},
+            }
+            provider.stats.pruned += 1;
+            if (provider.pruned_count == missing_max) {
+                const pruned = &provider.pruned;
+                std.mem.copyForwards(Pruned, pruned[0 .. missing_max - 1], pruned[1..]);
+                provider.pruned_count -= 1;
+            }
+            provider.pruned[provider.pruned_count] = .{ .request = request, .header = header };
+            provider.pruned_count += 1;
+            assert(provider.pruned_count <= missing_max);
+            return true;
         }
 
         fn record_missing(provider: *Self, request: Request) void {
