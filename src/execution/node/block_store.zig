@@ -90,10 +90,9 @@ pub const BlockStore = struct {
         while (store.head > store.tail) {
             const oldest = &store.entries[store.tail % store.entries.len];
             const ring_full = store.head - store.tail == store.entries.len;
-            // The new record covers ring positions [bytes_head, end); the oldest record's
-            // bytes come back around one lap later.
-            const oldest_end_next_lap = oldest.offset + oldest.len + store.bytes.len;
-            const overlaps = len > 0 and oldest_end_next_lap > store.bytes_head;
+            // The new record covers ring positions [bytes_head, end); the oldest record
+            // starts again one lap later, so they overlap once `end` passes that point.
+            const overlaps = len > 0 and oldest.offset + store.bytes.len < end;
             if (!ring_full and !overlaps) break;
             store.evict_oldest();
         }
@@ -165,6 +164,27 @@ test "block_store: put, get and canonical index" {
     try testing.expectError(error.RecordTooLarge, store.put(test_ref(9), &@as([65]u8, @splat(0))));
 }
 
+test "block_store: records survive until their bytes are reused" {
+    var store = try BlockStore.init(testing.allocator, .{ .blocks_max = 4, .bytes_max = 64 });
+    defer store.deinit(testing.allocator);
+    const ten: [10]u8 = @splat(1);
+    for (0..4) |n| try store.put(test_ref(n), &ten);
+    try testing.expectEqual(@as(u32, 4), store.count());
+    try store.put(test_ref(4), &ten);
+    try testing.expectEqual(@as(u32, 4), store.count());
+    try testing.expect(store.ref(test_ref(0).hash) == null);
+    var other = try BlockStore.init(testing.allocator, .{ .blocks_max = 4, .bytes_max = 64 });
+    defer other.deinit(testing.allocator);
+    const thirty: [30]u8 = @splat(2);
+    try other.put(test_ref(0), &thirty);
+    try other.put(test_ref(1), &thirty);
+    // 10 bytes do not fit at 60: skip to the next lap, reusing record 0's bytes only.
+    try other.put(test_ref(2), &ten);
+    try testing.expect(other.ref(test_ref(0).hash) == null);
+    try testing.expectEqualSlices(u8, &thirty, other.record(test_ref(1).hash).?);
+    try testing.expectEqual(@as(u32, 2), other.count());
+}
+
 /// Random records against a model of which recent records must survive.
 fn random_store(prng: *Prng) !void {
     const blocks_max = prng.range(1, 8);
@@ -191,6 +211,10 @@ fn random_store(prng: *Prng) !void {
         }
         try testing.expectEqual(@as(usize, store.count()), live);
         try testing.expect(live <= blocks_max);
+        // Bytes alone never force eviction of the previous record when both fit twice.
+        if (n > 0 and blocks_max > 1 and 2 * (lengths[n] + lengths[n - 1]) <= bytes_max) {
+            try testing.expect(store.record(test_ref(n - 1).hash) != null);
+        }
     }
 }
 

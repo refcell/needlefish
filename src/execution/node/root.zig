@@ -9,6 +9,8 @@ pub const executor = @import("executor.zig");
 pub const Executor = executor.Executor;
 pub const block_store = @import("block_store.zig");
 pub const BlockStore = block_store.BlockStore;
+pub const chain = @import("chain.zig");
+pub const Chain = chain.Chain;
 
 test {
     std.testing.refAllDecls(@This());

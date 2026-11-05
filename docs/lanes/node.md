@@ -4,6 +4,7 @@ Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
 Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 
 ## Backlog
+- [x] `node/chain`: Engine backend (import, forkchoice, reorg via rollback, builder, pool).
 - [x] `node/executor`: L1 block execution over evm + StateDb (deposit txs/L1 fees: pending).
 - [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
@@ -46,6 +47,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: chain backend for Engine(Chain): payload import (header checks, execution, root checks, rollback on mismatch), forkchoice canonicalization with state moves (undo rollback + re-execution, depth 256), payload builder (attributes txs + txpool, blob sidecars stripped), pool pruning. Decisions: reorged-out txs are not re-injected into the pool; L1 gas limit stays at the parent's when building.
 - 2026-11-05: executor split into begin/apply/finish (builder can skip bad txs); bounded block store ring; engine InsertResult/forkchoice gain `syncing` for unreachable state.
 - 2026-11-05: state db undo journal (bounded ring, per-block rollback) for root mismatches and reorgs. Decision: a storage wipe of pre-existing storage (impossible post-Cancun/EIP-7610) drops undo history instead of logging every slot.
 - 2026-11-05: L1 block executor (system calls, withdrawals, Prague requests, receipts, bloom, state root); OP deposits pending evm OP support.
