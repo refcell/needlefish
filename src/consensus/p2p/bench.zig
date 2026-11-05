@@ -14,6 +14,16 @@ const rpc = @import("gossip/rpc.zig");
 const seen = @import("gossip/seen.zig");
 const router_module = @import("gossip/router.zig");
 const peer_id = @import("peers/peer_id.zig");
+const service_module = @import("service.zig");
+const enr = @import("peers/enr.zig");
+const ssz = @import("gossip/ssz_payload.zig");
+const validity = @import("gossip/validity.zig");
+const primitives = @import("../../common/primitives/root.zig");
+const consensus_types = @import("../../common/consensus/root.zig");
+const common_secp256k1 = @import("../../common/crypto/secp256k1/root.zig");
+const rollup_config = @import("../protocol/rollup_config.zig");
+const Direction = @import("libp2p/connections.zig").Direction;
+const IpAddress = @import("peers/ip.zig").Address;
 const Prng = @import("../../testing/prng.zig").Prng;
 
 pub const Case = struct {
@@ -62,6 +72,18 @@ pub const cases = [_]Case{
         .name = "p2p/gossip publish+drain to 8 peers",
         .iterations = 1_000,
         .run = bench_router,
+        .bytes_per_op = payload_bytes,
+    },
+    .{
+        .name = "p2p/block gossip end to end 128 KiB",
+        .iterations = 200,
+        .run = bench_end_to_end,
+        .bytes_per_op = payload_bytes,
+    },
+    .{
+        .name = "p2p/block gossip sequencer 128 KiB",
+        .iterations = 200,
+        .run = bench_sequencer,
         .bytes_per_op = payload_bytes,
     },
 };
@@ -263,4 +285,226 @@ fn bench_router(iterations: u32) u64 {
 
 test "p2p bench: cases run" {
     for (cases) |case| _ = case.run(1);
+}
+
+// ------------------------------------------------------------- end to end
+
+/// Sequencer service -> noise -> verifier service for one 128 KiB block per op:
+/// SSZ encode, sign, snappy, gossipsub publish and drain (sequencer); seal and open in
+/// noise frames (wire); gossipsub decode, snappy, signature recovery, block-hash check,
+/// SSZ decode, and pop (verifier). Yamux framing and socket IO are not included.
+/// The sequencer-side block hash comes from the execution layer in production, so the
+/// fixture computes the transactions root once and only rehashes the header per op.
+const EndToEnd = struct {
+    rollup: rollup_config.RollupConfig,
+    sequencer_secret: [32]u8,
+    services: [2]*service_module.Service,
+    slots: [2]service_module.Slot,
+    prngs: [2]Prng,
+    wire: [2]noise.Transport,
+    transaction_storage: []u8,
+    transaction: []const u8,
+    transactions_storage: []u8,
+    transactions_root: primitives.B256,
+    buffer: []u8,
+    /// Where the receiving side's noise frames open into.
+    opened: []u8,
+    scratch: []u8,
+    now_ns: u64,
+    number: u64 = 0,
+
+    const allocator = std.heap.page_allocator;
+    const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
+
+    fn create() *EndToEnd {
+        const fixture = allocator.create(EndToEnd) catch @panic("bench e2e: out of memory");
+        fixture.init() catch |err| std.debug.panic("bench e2e: {s}", .{@errorName(err)});
+        return fixture;
+    }
+
+    fn init(fixture: *EndToEnd) !void {
+        fixture.rollup = .{ .l2_chain_id = 8453, .block_time = 2 };
+        fixture.rollup.upgrades.set(.ecotone, 0);
+        fixture.sequencer_secret = @splat(0);
+        fixture.sequencer_secret[31] = 5;
+        fixture.now_ns = 1_700_000_000 * std.time.ns_per_s;
+        fixture.buffer = try allocator.alloc(u8, 2 * payload_bytes);
+        fixture.opened = try allocator.alloc(u8, 2 * payload_bytes);
+        fixture.scratch = try allocator.alloc(u8, snappy.gossip_size_max);
+        var key_prng = Prng.init(0xe2e);
+        fixture.wire = handshake(&key_prng);
+        for (0..2) |index| fixture.services[index] = try fixture.create_service(index);
+        try fixture.connect();
+        try fixture.init_transaction();
+    }
+
+    fn create_service(fixture: *EndToEnd, index: usize) !*service_module.Service {
+        var secret: secp256k1.SecretKey = @splat(0);
+        secret[31] = @intCast(index + 1);
+        const record = try enr.build(secret, .{
+            .ip4 = .{ 10, 0, @intCast(index), 1 },
+            .udp = 9000,
+            .tcp = 9222,
+            .opstack = .{ .chain_id = 8453 },
+        });
+        const signer: primitives.Address = .{
+            .bytes = try common_secp256k1.address(fixture.sequencer_secret),
+        };
+        fixture.prngs[index] = Prng.init(index + 1);
+        return service_module.Service.create(allocator, .{
+            .rollup = &fixture.rollup,
+            .unsafe_block_signer = signer,
+            .disc = .{ .chain_id = 8453 },
+            .mcache = .{ .entries_max = 64, .arena_bytes = 16 * payload_bytes },
+        }, secret, record, fixture.prngs[index].random());
+    }
+
+    /// Links the two services directly and lets subscriptions and the mesh settle.
+    fn connect(fixture: *EndToEnd) !void {
+        for (0..2) |index| {
+            const other = 1 - index;
+            const record = &fixture.services[other].discovery.local_record;
+            const remote = peer_id.from_public_key(record.public_key);
+            const direction: Direction = if (index == 0) .outbound else .inbound;
+            const address: IpAddress = .{ .ip4 = .{ 10, 0, @intCast(other), 1 } };
+            try fixture.services[index].limits.begin(direction);
+            fixture.slots[index] = try fixture.services[index].on_connected(
+                remote,
+                direction,
+                address,
+                fixture.now_ns,
+            );
+        }
+        for (0..8) |_| {
+            fixture.now_ns += std.time.ns_per_s;
+            for (fixture.services) |service| service.tick(fixture.now_ns);
+            _ = fixture.pump();
+        }
+    }
+
+    fn init_transaction(fixture: *EndToEnd) !void {
+        fixture.transaction_storage = try allocator.alloc(u8, payload_bytes + 1024);
+        const deposit: consensus_types.Envelope = .{ .deposit = .{
+            .source_hash = .{ .bytes = @splat(1) },
+            .from = .zero,
+            .to = .create,
+            .mint = 0,
+            .value = 0,
+            .gas_limit = 1_000_000,
+            .is_system_transaction = false,
+            .input = payload()[0 .. payload_bytes - 256],
+        } };
+        fixture.transaction = deposit.encode_to(fixture.transaction_storage);
+        fixture.transactions_storage = try allocator.alloc(u8, fixture.transaction.len + 64);
+        fixture.transactions_root = validity.transactions_root(fixture.transaction_list());
+    }
+
+    fn transaction_list(fixture: *EndToEnd) ssz.Transactions {
+        return ssz.Transactions.encode(fixture.transactions_storage, &.{fixture.transaction});
+    }
+
+    /// Moves every queued RPC both ways through the noise wire; returns the frames moved.
+    fn pump(fixture: *EndToEnd) u32 {
+        var moved: u32 = 0;
+        for (0..64) |_| {
+            var any = false;
+            for (0..2) |from| {
+                const to = 1 - from;
+                const service = fixture.services[from];
+                const frame = service.drain_gossip(fixture.slots[from], fixture.buffer) orelse
+                    continue;
+                const opened = fixture.carry(from, frame);
+                const header = (rpc.frame_decode(opened, rpc.frame_size_max_default) catch
+                    unreachable).?;
+                const receiver = fixture.services[to];
+                receiver.on_gossip_frame(fixture.slots[to], header.payload, fixture.now_ns);
+                moved += 1;
+                any = true;
+            }
+            if (!any) break;
+        }
+        return moved;
+    }
+
+    /// Seals `frame` in noise frames and opens them on the other side into `opened`.
+    fn carry(fixture: *EndToEnd, from: usize, frame: []const u8) []const u8 {
+        assert(frame.len <= fixture.opened.len);
+        var sealed: [noise.prefix_length + noise.message_length_max]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < frame.len) {
+            const take = @min(frame.len - offset, noise.plaintext_length_max);
+            const chunk = frame[offset..][0..take];
+            const out = fixture.wire[from].encrypt_frame(chunk, &sealed) catch unreachable;
+            const target = fixture.opened[offset..][0..take];
+            const opened = (fixture.wire[1 - from].decrypt_frame(out, target) catch
+                unreachable).?;
+            assert(opened.plaintext.len == take);
+            offset += take;
+        }
+        return fixture.opened[0..frame.len];
+    }
+
+    /// One block. With `deliver` false the sequencer's frames are drained and dropped,
+    /// which isolates the sequencer stage.
+    fn step(fixture: *EndToEnd, deliver: bool) u64 {
+        fixture.number += 1;
+        fixture.now_ns += 2 * std.time.ns_per_s;
+        var value: ssz.ExecutionPayload = .{
+            .version = .v3,
+            .block_number = fixture.number,
+            .timestamp = fixture.now_ns / std.time.ns_per_s,
+            .gas_limit = 30_000_000,
+            .base_fee_per_gas = 1,
+            .extra_data = "base",
+            .transactions = fixture.transaction_list(),
+        };
+        const header = validity.header_from_payload(
+            &fixture.rollup,
+            &value,
+            beacon_root,
+            fixture.transactions_root,
+        );
+        value.block_hash = header.hash();
+        const sequencer = fixture.services[0];
+        const secret = fixture.sequencer_secret;
+        _ = sequencer.publish_block(secret, beacon_root, value, fixture.now_ns) catch
+            @panic("bench e2e: publish failed");
+        if (!deliver) {
+            var bytes: u64 = 0;
+            const slot = fixture.slots[0];
+            while (sequencer.drain_gossip(slot, fixture.buffer)) |frame| bytes += frame.len;
+            assert(bytes > 0);
+            return bytes;
+        }
+        _ = fixture.pump();
+        const verifier = fixture.services[1];
+        verifier.tick(fixture.now_ns);
+        const envelope = verifier.pop_block(fixture.scratch) orelse
+            @panic("bench e2e: block not delivered");
+        assert(envelope.payload.block_number == fixture.number);
+        return envelope.payload.transactions.bytes.len;
+    }
+};
+
+var end_to_end: ?*EndToEnd = null;
+var sequencer_only: ?*EndToEnd = null;
+
+fn bench_end_to_end(iterations: u32) u64 {
+    const fixture = end_to_end orelse blk: {
+        end_to_end = EndToEnd.create();
+        break :blk end_to_end.?;
+    };
+    var checksum: u64 = 0;
+    for (0..iterations) |_| checksum +%= fixture.step(true);
+    return checksum;
+}
+
+fn bench_sequencer(iterations: u32) u64 {
+    const fixture = sequencer_only orelse blk: {
+        sequencer_only = EndToEnd.create();
+        break :blk sequencer_only.?;
+    };
+    var checksum: u64 = 0;
+    for (0..iterations) |_| checksum +%= fixture.step(false);
+    return checksum;
 }

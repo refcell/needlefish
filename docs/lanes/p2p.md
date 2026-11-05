@@ -49,8 +49,11 @@ behind a small interface and switch later.
   junk RPC frames every 100 ms and wrong-signer blocks every 500 ms for 12 s; honest nodes
   get every honest block, keep honest links, disconnect it (`invalid_rpcs`), and reject
   its blocks (`invalid_signer`).
-- [ ] Bench: end-to-end gossip in SimIo (sequencer -> N verifiers, 128 KiB blocks):
-  CPU per block for encode, sign, snappy, noise, and validate; record in `docs/PERF.md`.
+- [x] Gossip bench end to end: `p2p/block gossip end to end 128 KiB` (sequencer `Service`
+  -> noise seal/open -> verifier `Service`, a real signed v3 block per op, validated and
+  popped) and `p2p/block gossip sequencer 128 KiB`; 1.09 ms and 0.30 ms per block (M4 Pro,
+  ReleaseFast, noisy run), split recorded in `docs/PERF.md`. Decision: in-memory services
+  with real noise instead of SimIo, so the numbers are CPU only, not simulated latency.
 - [ ] Completion-based UDP (`recvfrom`/`sendto` completions) for discovery on io_uring,
   replacing the polled path; coordinate with io-net (`just test-linux`).
 - Survey 2026-11-05: base/base `peers/monitoring.rs` (ban threshold/duration) and
@@ -407,3 +410,4 @@ behind a small interface and switch later.
 - 2026-11-05: crash-restart DST under packet loss.
 - 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.
 - 2026-11-05: hostile authenticated-plaintext fuzz (connection + network level).
+- 2026-11-05: end-to-end block gossip bench (1.09 ms/128 KiB block; verifier ~0.6 ms).

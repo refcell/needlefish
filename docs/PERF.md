@@ -254,6 +254,15 @@ up to ±15%).
 | p2p/gossip rpc decode 128 KiB publish | 21 | | zero-copy: cost is independent of payload size |
 | p2p/gossip seen insert | 5.7 | | open addressing, 8192 ids |
 | p2p/gossip publish+drain to 8 peers | 64 539 | 2 031 | id hash + 8 framed RPCs (copy per peer) |
+| p2p/block gossip end to end 128 KiB | 1 087 778 | 120 | sequencer service -> noise -> verifier service, one real signed block; no yamux/socket |
+| p2p/block gossip sequencer 128 KiB | 300 315 | 436 | SSZ + sign + snappy + publish + drain (the EL's block hash is excluded) |
+
+End-to-end split (same run, which was ~25% noisier than the rows above: handshake 833 µs):
+sequencer ~0.30 ms, wire (noise seal+open of the ~90 KiB snappy frame) ~0.15 ms, verifier
+~0.6 ms by subtraction. The verifier pays the block-hash check (keccak transactions root over
+the full payload plus decoding every transaction), signature recovery, and decompression.
+One block per 2 s costs ~0.05% of a core per peer hop; the next target is the verifier's
+transaction decode and root, which repeats work the engine does again on insert.
 
 ## Targets
 
