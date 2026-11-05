@@ -23,6 +23,8 @@ pub const Error = error{
     MissingSigner,
 };
 
+pub const ProofType = enum { tee, compressed };
+
 pub const Config = struct {
     dry_run: bool = false,
     prover_rpc: []const u8 = "",
@@ -43,6 +45,9 @@ pub const Config = struct {
     /// With the native prover: the L1 beacon API for blob batches (without it blob reads
     /// fail).
     l1_beacon: []const u8 = "",
+    /// What a prover service is asked for: `tee` (base/base, AWS Nitro) or `compressed`
+    /// (range jobs that `base prover-worker` proves natively).
+    prover_proof_type: ProofType = .tee,
     /// Stop after this many poll intervals (smoke tests); runs forever when null.
     ticks_max: ?u64 = null,
 
@@ -90,6 +95,7 @@ const Flag = enum {
     rollup_config,
     l1_genesis,
     l1_beacon,
+    prover_proof_type,
     ticks_max,
 };
 
@@ -140,6 +146,8 @@ fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
         .rollup_config => config.rollup_config = value,
         .l1_genesis => config.l1_genesis = value,
         .l1_beacon => config.l1_beacon = value,
+        .prover_proof_type => config.prover_proof_type =
+            std.meta.stringToEnum(ProofType, value) orelse return error.InvalidValue,
         .ticks_max => config.ticks_max = std.fmt.parseUnsigned(u64, value, 10) catch
             return error.InvalidValue,
     }
@@ -201,6 +209,14 @@ test "proposer config: flags, defaults and validation" {
         "--rollup-config", "rollup.json", "--ticks-max", "3", "--l1-beacon", "http://b:1",
     }));
     try testing.expectEqualStrings("http://b:1", native.l1_beacon);
+    try testing.expectEqual(ProofType.tee, native.prover_proof_type);
+    const compressed = try parse(&(required ++ [_][]const u8{
+        "--dry-run", "--prover-proof-type", "compressed",
+    }));
+    try testing.expectEqual(ProofType.compressed, compressed.prover_proof_type);
+    try testing.expectError(error.InvalidValue, parse(&(required ++ [_][]const u8{
+        "--dry-run", "--prover-proof-type", "snark",
+    })));
     try testing.expect(native.native_prover());
     try testing.expectEqual(@as(?u64, 3), native.ticks_max);
     try testing.expectError(error.UnknownFlag, parse(&.{"--nope"}));
