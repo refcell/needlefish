@@ -6,6 +6,7 @@
 //! - `state`: state provider (accounts, storage, code, block hashes) with a block overlay.
 
 const std = @import("std");
+pub const storage = @import("storage/root.zig");
 
 pub const changeset = @import("changeset.zig");
 pub const state = @import("state.zig");
