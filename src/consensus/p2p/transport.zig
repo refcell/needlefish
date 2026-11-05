@@ -12,9 +12,12 @@
 //! never meets a stale recv. A link still connecting closes at once (a late connect
 //! result is ignored).
 //!
-//! Discovery: with `Config.discovery_listen` set, the transport binds a UDP socket and,
-//! on every timer tick, drains received datagrams into `Service.on_datagram` (at most
-//! `datagrams_per_tick_max`) and sends everything `Service.pop_datagram` queued.
+//! Discovery: with `Config.discovery_listen` set, the transport binds a UDP socket and
+//! keeps one `recvfrom` completion in flight, feeding each datagram to
+//! `Service.on_datagram` as it arrives, and one `sendto` in flight, chained through
+//! everything `Service.pop_datagram` queued. A receive error is retried on the next tick
+//! (no hot loop). `stop` cancels both and closes the socket once both have returned;
+//! `busy` is true until then.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -45,8 +48,6 @@ pub const Config = struct {
 };
 
 /// Datagrams moved each way per timer tick (bounds the work of one tick).
-const datagrams_per_tick_max = 256;
-
 const socket_buffer_bytes = 16 * 1024;
 
 pub fn Transport(comptime IO: type) type {
@@ -92,6 +93,13 @@ pub fn Transport(comptime IO: type) type {
         listen_address: io_module.Address = undefined,
         udp: ?IO.Fd = null,
         udp_address: io_module.Address = undefined,
+        udp_recv_completion: IO.Completion = .{},
+        udp_send_completion: IO.Completion = .{},
+        udp_receiving: bool = false,
+        udp_sending: bool = false,
+        udp_recv_buffer: [io_module.datagram_size_max]u8 = undefined,
+        udp_send_buffer: [io_module.datagram_size_max]u8 = undefined,
+        udp_send_length: u32 = 0,
         accept_completion: IO.Completion = .{},
         timer_completion: IO.Completion = .{},
         links: []Link,
@@ -112,6 +120,7 @@ pub fn Transport(comptime IO: type) type {
             datagrams_received: u64 = 0,
             datagrams_sent: u64 = 0,
             datagrams_dropped: u64 = 0,
+            datagram_receive_errors: u64 = 0,
         };
 
         /// Allocates every link and buffer up front. `transport` must not move afterwards.
@@ -156,6 +165,8 @@ pub fn Transport(comptime IO: type) type {
         pub fn forget_after_crash(transport: *Self) void {
             transport.stopped = true;
             transport.udp = null;
+            transport.udp_receiving = false;
+            transport.udp_sending = false;
             for (transport.links) |*link| link.fd_shut = false;
             assert(transport.stopped);
         }
@@ -175,6 +186,7 @@ pub fn Transport(comptime IO: type) type {
                 errdefer transport.io.close_now(udp);
                 transport.udp_address = try transport.io.bind_udp(udp, address);
                 transport.udp = udp;
+                transport.submit_recvfrom();
             }
             transport.submit_accept();
             transport.submit_timer();
@@ -188,8 +200,17 @@ pub fn Transport(comptime IO: type) type {
                 if (link.state == .open or link.state == .connecting) transport.teardown(link);
             }
             transport.io.close_now(transport.listener);
-            if (transport.udp) |udp| transport.io.close_now(udp);
-            transport.udp = null;
+            if (transport.udp_receiving) transport.io.cancel(&transport.udp_recv_completion);
+            if (transport.udp_sending) transport.io.cancel(&transport.udp_send_completion);
+            transport.udp_close_if_idle();
+        }
+
+        /// True while a UDP completion is outstanding after `stop`; run the IO loop until
+        /// false before `deinit`.
+        pub fn busy(transport: *const Self) bool {
+            if (!transport.stopped) return transport.udp != null;
+            assert(transport.udp != null or !(transport.udp_receiving or transport.udp_sending));
+            return transport.udp != null;
         }
 
         fn now_ns(transport: *const Self) u64 {
@@ -217,7 +238,7 @@ pub fn Transport(comptime IO: type) type {
             result catch {};
             if (transport.stopped) return;
             const now = transport.now_ns();
-            transport.receive_datagrams(now);
+            if (transport.udp != null and !transport.udp_receiving) transport.submit_recvfrom();
             transport.service.tick(now);
             transport.send_datagrams();
             transport.execute_commands();
@@ -233,34 +254,89 @@ pub fn Transport(comptime IO: type) type {
             transport.submit_timer();
         }
 
-        /// Feeds queued UDP datagrams to discovery.
-        fn receive_datagrams(transport: *Self, now: u64) void {
-            const udp = transport.udp orelse return;
-            var buffer: [io_module.datagram_size_max]u8 = undefined;
-            var received: u32 = 0;
-            while (received < datagrams_per_tick_max) : (received += 1) {
-                const datagram = transport.io.recvfrom_now(udp, &buffer) orelse break;
-                transport.stats.datagrams_received += 1;
-                const from = endpoint_of(datagram.from);
-                transport.service.on_datagram(from, buffer[0..datagram.length], now);
-            }
-            assert(received <= datagrams_per_tick_max);
+        // ------------------------------------------------------------------ udp
+
+        fn submit_recvfrom(transport: *Self) void {
+            assert(!transport.stopped and !transport.udp_receiving);
+            const udp = transport.udp.?;
+            transport.udp_receiving = true;
+            transport.io.recvfrom(
+                *Self,
+                transport,
+                on_recvfrom,
+                &transport.udp_recv_completion,
+                udp,
+                &transport.udp_recv_buffer,
+            );
         }
 
-        /// Sends every datagram discovery queued (lost ones are discv5's to retry).
+        fn on_recvfrom(
+            transport: *Self,
+            completion: *IO.Completion,
+            result: io_module.ResultType(IO.Fd, .recvfrom),
+        ) void {
+            _ = completion;
+            assert(transport.udp_receiving);
+            transport.udp_receiving = false;
+            if (transport.stopped) return transport.udp_close_if_idle();
+            const datagram = result catch {
+                transport.stats.datagram_receive_errors += 1;
+                return; // The next timer tick resubmits.
+            };
+            assert(datagram.length <= transport.udp_recv_buffer.len);
+            transport.stats.datagrams_received += 1;
+            const bytes = transport.udp_recv_buffer[0..datagram.length];
+            transport.service.on_datagram(endpoint_of(datagram.from), bytes, transport.now_ns());
+            transport.send_datagrams();
+            transport.submit_recvfrom();
+        }
+
+        /// Sends the next datagram discovery queued, if none is in flight; each completion
+        /// sends the next (lost ones are discv5's to retry).
         fn send_datagrams(transport: *Self) void {
+            if (transport.stopped or transport.udp_sending) return;
             const udp = transport.udp orelse return;
-            var sent: u32 = 0;
-            while (sent < datagrams_per_tick_max) : (sent += 1) {
-                const datagram = transport.service.pop_datagram() orelse break;
-                const target = address_of(datagram.endpoint);
-                if (transport.io.sendto_now(udp, datagram.slice(), target)) {
-                    transport.stats.datagrams_sent += 1;
-                } else {
-                    transport.stats.datagrams_dropped += 1;
-                }
+            const datagram = transport.service.pop_datagram() orelse return;
+            const bytes = datagram.slice();
+            assert(bytes.len > 0 and bytes.len <= transport.udp_send_buffer.len);
+            @memcpy(transport.udp_send_buffer[0..bytes.len], bytes);
+            transport.udp_send_length = @intCast(bytes.len);
+            transport.udp_sending = true;
+            transport.io.sendto(
+                *Self,
+                transport,
+                on_sendto,
+                &transport.udp_send_completion,
+                udp,
+                transport.udp_send_buffer[0..bytes.len],
+                address_of(datagram.endpoint),
+            );
+        }
+
+        fn on_sendto(
+            transport: *Self,
+            completion: *IO.Completion,
+            result: io_module.ResultType(IO.Fd, .sendto),
+        ) void {
+            _ = completion;
+            assert(transport.udp_sending);
+            transport.udp_sending = false;
+            if (transport.stopped) return transport.udp_close_if_idle();
+            if (result) |_| {
+                transport.stats.datagrams_sent += 1;
+            } else |_| {
+                transport.stats.datagrams_dropped += 1;
             }
-            assert(sent <= datagrams_per_tick_max);
+            transport.send_datagrams();
+        }
+
+        /// Closes the UDP socket once stopped and no completion references it.
+        fn udp_close_if_idle(transport: *Self) void {
+            assert(transport.stopped);
+            if (transport.udp_receiving or transport.udp_sending) return;
+            const udp = transport.udp orelse return;
+            transport.io.close_now(udp);
+            transport.udp = null;
         }
 
         /// Runs the service's dial/disconnect commands and pumps fresh gossip output.

@@ -266,12 +266,12 @@ pub fn Network(comptime IO: type) type {
             self.transport.stop();
         }
 
-        /// True while the bootstore file still has an operation or its timer outstanding;
-        /// run the IO loop until false before `deinit`.
+        /// True while a bootstore/bootnodes file operation, its timer, or a UDP completion
+        /// is outstanding; after `stop`, run the IO loop until false before `deinit`.
         pub fn busy(self: *const Self) bool {
             const bootnodes = if (self.bootnodes_file) |*file| file.busy() else false;
             const bootstore = if (self.bootstore_file) |*file| file.busy() else false;
-            return bootnodes or bootstore;
+            return bootnodes or bootstore or self.transport.busy();
         }
 
         /// Frees memory after the IO layer crashed (`SimIo.crash`): nothing is drained or

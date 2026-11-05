@@ -54,8 +54,12 @@ behind a small interface and switch later.
   popped) and `p2p/block gossip sequencer 128 KiB`; 1.09 ms and 0.30 ms per block (M4 Pro,
   ReleaseFast, noisy run), split recorded in `docs/PERF.md`. Decision: in-memory services
   with real noise instead of SimIo, so the numbers are CPU only, not simulated latency.
-- [ ] Completion-based UDP (`recvfrom`/`sendto` completions) for discovery on io_uring,
-  replacing the polled path; coordinate with io-net (`just test-linux`).
+- [x] Completion-based UDP for discovery: the transport keeps one `recvfrom` and one
+  `sendto` completion in flight (io-net's ops on io_uring/kqueue/SimIo) instead of polling
+  on each tick, so datagrams reach discv5 on arrival rather than up to a tick later.
+  Receive errors retry on the next tick (`datagram_receive_errors`). `stop` cancels both
+  and closes the socket only after both return; `Transport.busy` (now part of
+  `Network.busy`) is true until then, so a reused descriptor never meets a stale op.
 - Survey 2026-11-05: base/base `peers/monitoring.rs` (ban threshold/duration) and
   `peers/nodes.rs` (per-chain bootnodes) are already covered; gossipsub IDONTWANT exists.
 - [x] DST: crash-restart under loss (4 seeds, 10% datagram loss, 0.05% resets):
@@ -411,3 +415,4 @@ behind a small interface and switch later.
 - 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.
 - 2026-11-05: hostile authenticated-plaintext fuzz (connection + network level).
 - 2026-11-05: end-to-end block gossip bench (1.09 ms/128 KiB block; verifier ~0.6 ms).
+\n- 2026-11-05: discv5 UDP moved to recvfrom/sendto completions; stop drains them.\n

@@ -157,6 +157,8 @@ const Cluster = struct {
         for (cluster.all()) |*node| node.transport.stop();
         cluster.world.run_for_ns(100 * ns_per_ms);
         for (cluster.all()) |*node| {
+            // Every canceled UDP completion returned and the socket closed.
+            assert(!node.transport.busy());
             node.transport.deinit();
             node.service.destroy(std.testing.allocator);
             node.io.deinit();
@@ -591,4 +593,26 @@ test "p2p transport: an authenticated peer sending junk RPCs is dropped, blocks 
     // Undecodable frames got the attacker disconnected; its blocks were rejected.
     try std.testing.expect(invalid_rpcs > 0);
     try std.testing.expect(invalid_signer > 0);
+}
+
+test "p2p transport: stop cancels the UDP completions, then closes the socket" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(0x7564_70);
+    defer cluster.deinit();
+    cluster.run(3 * ns_per_s);
+    const transport = &cluster.storage[1].transport;
+    try std.testing.expect(transport.stats.datagrams_received > 0);
+    try std.testing.expect(transport.busy()); // Running: the recvfrom stays in flight.
+    transport.stop();
+    // The canceled recvfrom has not returned yet, so the socket is still open.
+    try std.testing.expect(transport.busy());
+    try std.testing.expect(transport.udp != null);
+    cluster.world.run_for_ns(10 * ns_per_ms);
+    try std.testing.expect(!transport.busy());
+    try std.testing.expect(transport.udp == null);
+    // The rest keep discovering through the stopped node's absence.
+    const received = cluster.storage[2].transport.stats.datagrams_received;
+    cluster.run(2 * ns_per_s);
+    try std.testing.expect(cluster.storage[2].transport.stats.datagrams_received > received);
 }
