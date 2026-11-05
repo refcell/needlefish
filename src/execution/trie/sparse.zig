@@ -618,8 +618,15 @@ pub const SparseTrie = struct {
             },
             .extension => {
                 const target = current.body.children[0];
-                assert(target != none and target != unloaded);
-                current.ref = node.extension_ref(node_path, &self.child_ref(target));
+                assert(target != none);
+                // A witness extension that only changed its path (a parent branch collapsed
+                // into it) keeps its child unloaded: take the child ref from its source.
+                const target_ref = if (target == unloaded)
+                    (decode_node(current.source) catch unreachable).children[0]
+                else
+                    self.child_ref(target);
+                assert(target_ref.len > 0);
+                current.ref = node.extension_ref(node_path, &target_ref);
             },
             .branch => {
                 var decoded: ?Decoded = null;
@@ -813,6 +820,49 @@ test "sparse: updates from an unknown root keep untouched subtries as references
     try sparse.delete(&root, &fresh);
     try testing.expectEqual(none, root);
     try testing.expectEqual(node.empty_root, sparse.root_hash(root));
+}
+
+test "sparse: collapse into a witness extension with an unloaded child" {
+    const Trie = @import("trie.zig").TrieType(.{ .key_bytes_max = 32, .value_size_max = 33 });
+    var full = try Trie.init(testing.allocator, 64);
+    defer full.deinit(testing.allocator);
+    // Root branch: a leaf under nibble 0, and under nibble 1 a long hashed extension
+    // over a branch of two leaves.
+    const lone: [32]u8 = @splat(0x00);
+    var deep_a: [32]u8 = @splat(0x11);
+    var deep_b: [32]u8 = @splat(0x11);
+    deep_a[20] = 0x00;
+    deep_b[20] = 0xff;
+    try full.put(&lone, &.{ 0x82, 1, 2 });
+    try full.put(&deep_a, &.{ 0x82, 3, 4 });
+    try full.put(&deep_b, &.{ 0x82, 5, 6 });
+    var store: TestStore = .{};
+    defer store.preimages.deinit(testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const Collect = struct {
+        store: *TestStore,
+        arena: std.mem.Allocator,
+        pub fn visit(self: @This(), visit_info: @import("trie.zig").Visit) !void {
+            if (visit_info.encoding.len < 32 and visit_info.path.len > 0) return;
+            const copy = try self.arena.dupe(u8, visit_info.encoding);
+            try self.store.preimages.put(testing.allocator, node.keccak256(copy), copy);
+        }
+    };
+    try full.track_changes(testing.allocator);
+    const collect: Collect = .{ .store = &store, .arena = arena_state.allocator() };
+    const pre_root = full.root_hash();
+    try full.visit_nodes(full.root, .all, collect);
+    var sparse = try SparseTrie.init(testing.allocator, 64, .{
+        .context = &store,
+        .resolve = TestStore.resolve,
+    });
+    defer sparse.deinit(testing.allocator);
+    var root = try sparse.root_from_hash(pre_root);
+    // The delete collapses the root branch into the extension without loading its child.
+    try sparse.delete(&root, &lone);
+    _ = full.delete(&lone);
+    try testing.expectEqual(full.root_hash(), sparse.root_hash(root));
 }
 
 test "sparse: missing preimage is WitnessIncomplete" {
