@@ -26,7 +26,24 @@ fallback but hot paths should be our own, optimized implementations.
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
 - [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
-- [ ] Benchmarks for each; target parity with or better than best-known C implementations.
+- [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
+  BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
+
+## Bench snapshot (2026-11-05, Apple M4 Pro, ReleaseFast, host load ~24, ns/op)
+
+| op | ours | std |
+| --- | --- | --- |
+| keccak256 32 B / batch per msg / 4 KiB | 147 / 74 / 4367 | 150 / - / 4829 |
+| sha256 32 B / 4 KiB | 26 / 1427 | 29 / 1450 |
+| ripemd160 32 B / blake2f 12 rounds | 135 / 86 | - / 84 (blake2b 128 B) |
+| secp256k1 ecrecover / sign / pubkey | 28577 / 11212 / 9336 | verify 62509 / 74249 / 71221 |
+| p256 verify | 52890 | 88463 |
+| bn254 add / mul / pairing 2 pairs | 1716 / 12236 / 552420 | - |
+| bls12-381 g1 mul (glv) / g2 mul / pairing-2 | 41308 / 200005 / 687248 | - |
+| bls12-381 map_fp_to_g1 / g1 msm-64 | 41217 / 1232222 | - |
+| kzg point evaluation | 787632 | - |
+| modexp 2048 b e=65537 / full exp | 25718 / 2538656 | - |
+| Fp mul bn254 / bls12-381; inverse | 20 / 26; 1217 / 1832 | - |
 
 ## Decisions
 - Keccak permutation is generic over the lane type (`u64` or `@Vector(n, u64)`); batch width
