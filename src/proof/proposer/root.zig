@@ -23,4 +23,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("recovery_test.zig");
     _ = @import("pipeline_test.zig");
+    _ = @import("sim_test.zig");
 }
