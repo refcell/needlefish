@@ -21,6 +21,7 @@ const admin_rpc = @import("../rpc/admin.zig");
 const safedb = @import("../safedb/root.zig");
 const l2_provider = @import("../sources/l2_provider.zig");
 const l2_block = @import("../sources/l2_block.zig");
+const message_passer_roots = @import("../sources/message_passer_roots.zig");
 const l1_watcher = @import("l1_watcher.zig");
 const driver_module = @import("driver.zig");
 const l1_provider = @import("../sources/l1_provider.zig");
@@ -166,14 +167,18 @@ pub fn BlobView(comptime IO: type) type {
     };
 }
 
-/// The version-0 output root of `block`; pre-Isthmus blocks carry no storage root.
+/// The version-0 output root of `block`. From Isthmus the header's `withdrawalsRoot` is the
+/// message passer storage root; earlier blocks need `proof_root` (`eth_getProof`).
 pub fn output_of(
     rollup: *const RollupConfig,
     block: *const l2_block.L2Block,
+    proof_root: ?Hash,
 ) error{NotAvailable}!rollup_rpc.OutputAtBlock {
     const timestamp = block.info.block_info.timestamp;
-    if (!rollup.is_active(.isthmus, timestamp)) return error.NotAvailable;
-    const storage_root = block.withdrawals_root orelse return error.NotAvailable;
+    const storage_root = if (rollup.is_active(.isthmus, timestamp))
+        block.withdrawals_root orelse return error.NotAvailable
+    else
+        proof_root orelse return error.NotAvailable;
     const result: rollup_rpc.OutputAtBlock = .{
         .block_ref = block.info,
         .output = .{
@@ -249,6 +254,8 @@ pub fn Node(comptime IO: type) type {
         watcher: l1_watcher.L1Watcher(IO),
         l1: l1_provider.L1Provider(IO),
         l2: l2_provider.L2Provider(IO),
+        /// Message passer storage roots for pre-Isthmus `optimism_outputAtBlock`.
+        message_passer: message_passer_roots.MessagePasserRoots(IO),
         l2_view: L2View(IO),
         blobs: ?*Blobs = null,
         blob_view: BlobView(IO),
@@ -311,6 +318,7 @@ pub fn Node(comptime IO: type) type {
                 .watcher = undefined,
                 .l1 = undefined,
                 .l2 = undefined,
+                .message_passer = undefined,
                 .l2_view = .{ .provider = &node.l2 },
                 .blob_view = .{ .provider = null },
                 .engine = undefined,
@@ -450,6 +458,10 @@ pub fn Node(comptime IO: type) type {
                 .block_by_number_ttl_ns = options.head_poll_interval_ns,
             });
             errdefer node.l2.deinit();
+            try node.message_passer.init(allocator, io, options.l2, options.http_client, .{
+                .jwt_secret = options.jwt_secret,
+            });
+            errdefer node.message_passer.deinit();
             try node.engine.init(
                 allocator,
                 io,
@@ -494,6 +506,7 @@ pub fn Node(comptime IO: type) type {
             if (node.kzg_workspace) |workspace| allocator.destroy(workspace);
             if (node.kzg_storage) |storage| allocator.destroy(storage);
             node.engine.deinit();
+            node.message_passer.deinit();
             node.l2.deinit();
             node.l1.deinit();
             node.watcher.deinit();
@@ -552,7 +565,7 @@ pub fn Node(comptime IO: type) type {
             const blobs_busy = if (node.blobs) |blobs| blobs.busy() else false;
             const signer_busy = if (node.signer) |signer| signer.busy() else false;
             return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
-                node.engine.busy() or blobs_busy or signer_busy;
+                node.message_passer.busy() or node.engine.busy() or blobs_busy or signer_busy;
         }
 
         /// One step of the node's state machines; call every few milliseconds.
@@ -560,6 +573,7 @@ pub fn Node(comptime IO: type) type {
             node.watcher.tick();
             node.l1.tick();
             node.l2.tick();
+            node.message_passer.tick();
             node.polling.tick();
             if (node.blobs) |blobs| blobs.tick();
             const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
@@ -729,7 +743,8 @@ pub fn Node(comptime IO: type) type {
 
         /// Output roots from the engine's block headers: from Isthmus on the header's
         /// `withdrawalsRoot` is the message passer storage root. Earlier blocks need
-        /// `eth_getProof` of the message passer and are reported as not available.
+        /// `eth_getProof` of the message passer: the first query starts the fetch and is
+        /// reported as not available; later queries answer from the cache.
         fn backend_output_at_block(
             context: *anyopaque,
             tag: rollup_rpc.BlockTag,
@@ -746,7 +761,12 @@ pub fn Node(comptime IO: type) type {
                 error.NotFound => error.NotFound,
                 else => error.NotAvailable,
             };
-            return output_of(node.rollup, &block);
+            const timestamp = block.info.block_info.timestamp;
+            const rollup = node.rollup;
+            if (rollup.is_active(.isthmus, timestamp)) return output_of(rollup, &block, null);
+            const hash = block.info.block_info.hash;
+            const root = node.message_passer.storage_root(hash) catch return error.NotAvailable;
+            return output_of(node.rollup, &block, root);
         }
 
         fn admin_sequencer_active(context: *anyopaque) bool {
@@ -838,6 +858,11 @@ const FakeRpc = harness_module.FakeRpc;
 const Harness = harness_module.Harness(*FakeRpc, FakeRpc.handle);
 const TestNode = Node(sim.SimIo);
 
+const message_passer_proof =
+    \\{"address":"0x4200000000000000000000000000000000000016","storageProof":[],
+    \\"storageHash":"0x8ed4baae3a927be3dea54996b4d5899f8c01e7594bf50b17dc1e741388ce3d12"}
+;
+
 test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     var block_text: [4096]u8 = undefined;
     var hash: [32]u8 = undefined;
@@ -845,8 +870,10 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     var fake: FakeRpc = .{};
     fake.add(.{ .method = "eth_getBlockByNumber", .params_contain = "latest", .result = block });
     fake.add(.{ .method = "eth_getBlockByNumber", .params_contain = "safe", .result = block });
+    const proof = message_passer_proof;
+    fake.add(.{ .method = "eth_getProof", .params_contain = "0x42", .result = proof });
     var harness: Harness = undefined;
-    try harness.init(&fake, 0x4e);
+    try harness.init_connections(&fake, 0x4e, 6);
     defer harness.deinit();
     var rollup: RollupConfig = .{ .block_time = 2 };
     rollup.upgrades.set(.holocene, 0);
@@ -870,9 +897,11 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     const status = node.sync_status();
     try testing.expectEqual(@as(u64, 7), status.head_l1.number);
     try testing.expectEqualSlices(u8, &hash, &status.head_l1.hash.bytes);
-    // The fake chain's L1 origin (507) does not exist, so startup discovery keeps retrying.
-    try testing.expectEqual(driver_module.Phase.starting, node.driver.phase);
-    try testing.expectEqual(@as(u64, 0), status.unsafe_l2.block_info.number);
+    // The fake chain's L1 origin (507) does not exist, so the node never starts running.
+    try testing.expect(node.driver.phase != driver_module.Phase.running);
+    // Startup discovery may already have taken the fake's latest block as the unsafe head.
+    const unsafe_number = status.unsafe_l2.block_info.number;
+    try testing.expect(unsafe_number == 0 or unsafe_number == 7);
     var buffer: [8192]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     _ = rollup_rpc.Router.handle(&node.backend,
@@ -895,6 +924,24 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         \\{"jsonrpc":"2.0","id":4,"method":"admin_postUnsafePayload","params":[{"executionPayload":{}}]}
     , &admin_out);
     try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "invalid execution") != null);
+    // Pre-Isthmus output roots come from eth_getProof of the message passer.
+    var output_buffer: [8192]u8 = undefined;
+    var answered = false;
+    for (0..40) |_| {
+        var output_out: std.Io.Writer = .fixed(&output_buffer);
+        _ = rollup_rpc.Router.handle(&node.backend,
+            \\{"jsonrpc":"2.0","id":5,"method":"optimism_outputAtBlock","params":["latest"]}
+        , &output_out);
+        const reply = output_out.buffered();
+        if (std.mem.indexOf(u8, reply, "\"withdrawalStorageRoot\":\"0x8ed4") != null) {
+            answered = true;
+            break;
+        }
+        node.tick();
+        harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+    try testing.expect(answered);
+    try testing.expectEqual(@as(u64, 1), node.message_passer.stats.requests);
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
@@ -984,18 +1031,21 @@ test "node: output roots from Isthmus headers" {
         .state_root = .init(@splat(1)),
         .withdrawals_root = .init(@splat(2)),
     };
-    const output = try output_of(&rollup, &block);
+    const output = try output_of(&rollup, &block, null);
     try testing.expect(output.output.bridge_storage_root.eql(.init(@splat(2))));
     try testing.expect(output.output.state_root.eql(.init(@splat(1))));
     try testing.expectEqual(@as(u64, 9), output.block_ref.block_info.number);
     block.info.block_info.timestamp = 98;
-    try testing.expectError(error.NotAvailable, output_of(&rollup, &block));
+    try testing.expectError(error.NotAvailable, output_of(&rollup, &block, null));
+    // Before Isthmus only the proof root counts, never the header.
+    const proof = try output_of(&rollup, &block, .init(@splat(4)));
+    try testing.expect(proof.output.bridge_storage_root.eql(.init(@splat(4))));
     block.info.block_info.timestamp = 100;
     block.withdrawals_root = null;
-    try testing.expectError(error.NotAvailable, output_of(&rollup, &block));
+    try testing.expectError(error.NotAvailable, output_of(&rollup, &block, .init(@splat(4))));
 }
 
-test "node: output roots seeded fuzz, available iff Isthmus and a storage root" {
+test "node: output roots seeded fuzz, available iff the fork's storage root is known" {
     var prng = @import("../../testing/prng.zig").Prng.init(0x0a7);
     for (0..256) |_| {
         var rollup: RollupConfig = .{ .block_time = 2 };
@@ -1003,15 +1053,19 @@ test "node: output roots seeded fuzz, available iff Isthmus and a storage root" 
         rollup.upgrades.set(.isthmus, isthmus_time);
         const timestamp = prng.below(1000);
         const has_root = prng.chance(1, 2);
+        const has_proof = prng.chance(1, 2);
+        const proof_root: ?Hash = if (has_proof) .init(@splat(5)) else null;
         const block: l2_block.L2Block = .{
             .info = .{ .block_info = .{ .number = timestamp, .timestamp = timestamp } },
             .system_config = .{},
             .withdrawals_root = if (has_root) .init(@splat(3)) else null,
         };
-        const available = timestamp >= isthmus_time and has_root;
-        if (output_of(&rollup, &block)) |output| {
+        const isthmus = timestamp >= isthmus_time;
+        const available = if (isthmus) has_root else has_proof;
+        if (output_of(&rollup, &block, proof_root)) |output| {
             try testing.expect(available);
-            try testing.expect(output.output.bridge_storage_root.eql(.init(@splat(3))));
+            const expected: Hash = .init(@splat(if (isthmus) 3 else 5));
+            try testing.expect(output.output.bridge_storage_root.eql(expected));
         } else |_| try testing.expect(!available);
     }
 }

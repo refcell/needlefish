@@ -50,7 +50,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
   - [ ] EL sync from gossip (forkchoice to the gossiped tip when the gap exceeds the buffer; needs EL-side p2p sync)
   - [x] unsafe block signer from the L1 SystemConfig (`service/signer_watcher.zig`, polled every 60 s, applied to gossip validation); startup fallback: chain config, then `--p2p.unsafe.block.signer`, then the sequencer's own key
-  - [ ] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary
+  - [x] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary (done in `p2p.Network`
+    through the io layer; the binary forwards every `--p2p.*` flag)
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
   - [x] service: L1 head watcher (latest/safe/finalized polling, verified headers)
   - [x] service node stage 1: L1 watcher + engine label heads → optimism_* RPC server;
@@ -66,9 +67,13 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] devnet smoke green (sequencer produces blocks, verifier safe head follows)
   - [x] optimism_outputAtBlock from Isthmus headers (`withdrawalsRoot` = message passer
     storage root)
-  - [ ] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
+  - [x] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
+    (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Pre-Isthmus output roots: the RPC router is synchronous, so the first query for a block
+  starts an `eth_getProof` (keyed by block hash, 64-entry LRU) and answers "output not
+  available yet"; retries answer from the cache. Like base/base, the proof is not verified.
 - `base_upgradeReadiness` answers from the node's upgrade-signal observer (finalized reads every 15 min by default) instead of a fresh L1 read per query (base/base, 5 s cache), because the router is synchronous. The node only observes schedules (metrics-only), so without a target version it reports not ready, as base/base does in that mode.
 - Unsafe block signer: base/base reads the L1 SystemConfig once at startup (blocking, with retries); we poll it every 60 s without blocking startup, and until it answers validate against the fallback (chain config, flag, own sequencer key; zero when only L1 can tell, which rejects gossip until it does).
 - Deviation from base/base `batch_queue.rs`: `next_batch` advances the epoch list a second time, after `update_origin` appends the new origin (the Holocene `BatchValidator` order). Otherwise a reset point one L1 block behind the safe head's origin (always the case near genesis) leaves [reset origin, parent origin], every step fails `L1OriginMismatch`, and the reset repeats forever.
@@ -178,6 +183,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: pre-Isthmus optimism_outputAtBlock from cached eth_getProof storage roots.
 - 2026-11-05: protocol: span batches carry EIP-8130 transactions (base/base `SpanBatchEip8130TransactionData`).
 - 2026-11-05: engine: payload bodies by hash/range and capability exchange on the engine client, with codecs and fuzz.
 - 2026-11-05: rpc: `base_upgradeReadiness` evaluates the L1 upgrade-signal schedule with base/base's readiness predicates.

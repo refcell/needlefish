@@ -21,6 +21,7 @@ pub const engine_client = @import("engine_client.zig");
 pub const EngineClient = engine_client.EngineClient;
 pub const l2_provider = @import("l2_provider.zig");
 pub const L2Provider = l2_provider.L2Provider;
+pub const message_passer_roots = @import("message_passer_roots.zig");
 
 test {
     std.testing.refAllDecls(@This());
