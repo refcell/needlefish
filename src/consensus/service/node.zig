@@ -2,10 +2,10 @@
 //! watcher, the L2 chain provider over the authenticated engine endpoint, and the
 //! `optimism_*` JSON-RPC server, and is driven by `tick` from the binary's event loop.
 //!
-//! This first stage tracks heads: L1 latest/safe/finalized from the watcher and the engine's
-//! labeled L2 heads (latest/safe/finalized) through the L2 provider, served as
-//! `optimism_syncStatus` (the batcher's input). Startup forkchoice discovery, derivation
-//! and the engine task queue plug into `tick` as they land (see docs/lanes/consensus.md).
+//! Each tick drives the providers (L1 JSON-RPC, beacon blobs, L2 over the engine endpoint,
+//! the polling engine client) and then the `Driver` (startup forkchoice, derivation,
+//! engine tasks, finalization, sequencing). Sync status comes from the driver's heads,
+//! the pipeline origin, and the watcher's L1 heads.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,13 +20,31 @@ const rollup_rpc = @import("../rpc/rollup.zig");
 const safedb = @import("../safedb/root.zig");
 const l2_provider = @import("../sources/l2_provider.zig");
 const l1_watcher = @import("l1_watcher.zig");
+const driver_module = @import("driver.zig");
+const l1_provider = @import("../sources/l1_provider.zig");
+const blob_provider = @import("../sources/blob_provider.zig");
+const engine_client = @import("../sources/engine_client.zig");
+const polling_client = @import("../engine/polling_client.zig");
+const kzg = @import("../../common/crypto/kzg/root.zig");
+const derive_errors = @import("../derive/errors.zig");
+const blob_module = @import("../derive/blob.zig");
+
+const ProviderError = derive_errors.ProviderError;
+const BlockInfo = protocol.block.BlockInfo;
+const Hash = protocol.block.Hash;
+const L1BlobSchedule = protocol.l1_info.L1BlobSchedule;
 
 const Address = http_client.Address;
 const RollupConfig = protocol.rollup_config.RollupConfig;
 const SyncStatus = rollup_rpc.SyncStatus;
+const L2BlockInfo = protocol.block.L2BlockInfo;
+const SystemConfig = protocol.system_config.SystemConfig;
+const SafeBlock = protocol.span_batch.SafeBlock;
 
 pub const Options = struct {
     l1: Address,
+    /// Beacon API for blobs; without it blob batches are unavailable.
+    l1_beacon: ?Address = null,
     l2: Address,
     jwt_secret: jwt.Secret,
     rpc_address: Address,
@@ -36,6 +54,18 @@ pub const Options = struct {
     head_poll_interval_ns: u64 = std.time.ns_per_s,
     safedb_entries: u32 = 4096,
     http_client: http_client.Options = .{},
+    /// Engine API: an 8 MiB `newPayload` request, up to 16 MiB `getPayload` responses.
+    engine_http_client: http_client.Options = .{
+        .send_buffer_size = 8 * 1024 * 1024 + 64 * 1024,
+        .recv_buffer_size = 16 * 1024 * 1024 + 8 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 16 * 1024 * 1024 },
+    },
+    /// Blob sidecars: up to 128 blobs of 128 KiB, hex encoded.
+    beacon_http_client: http_client.Options = .{
+        .recv_buffer_size = 40 * 1024 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 40 * 1024 * 1024 - 8 * 1024 },
+    },
+    driver: driver_module.Options = .{},
     rpc_server: http.server.Options = .{
         .connections_max = 16,
         .recv_buffer_size = 64 * 1024,
@@ -44,14 +74,80 @@ pub const Options = struct {
     },
 };
 
+/// The L2 safe chain view the driver needs on top of the L2 provider. Full safe blocks
+/// (span batches overlapping the safe chain) are not fetched yet, so those checks stay
+/// undecided (`NotAvailable`) until the full-block fetch lands in the L2 provider.
+pub fn L2View(comptime IO: type) type {
+    return struct {
+        provider: *l2_provider.L2Provider(IO),
+
+        const Self = @This();
+
+        pub fn l2_block_info_by_number(view: *Self, number: u64) ProviderError!L2BlockInfo {
+            return view.provider.l2_block_info_by_number(number);
+        }
+
+        pub fn l2_block_info_by_hash(view: *Self, hash: Hash) ProviderError!L2BlockInfo {
+            return view.provider.l2_block_info_by_hash(hash);
+        }
+
+        pub fn l2_block_info_by_label(
+            view: *Self,
+            label: l2_provider.Label,
+        ) ProviderError!L2BlockInfo {
+            return view.provider.l2_block_info_by_label(label);
+        }
+
+        pub fn system_config_by_l2_hash(view: *Self, hash: Hash) ProviderError!SystemConfig {
+            return view.provider.system_config_by_l2_hash(hash);
+        }
+
+        pub fn l2_block_by_number(view: *Self, number: u64) ProviderError!SafeBlock {
+            _ = view;
+            _ = number;
+            return error.NotAvailable;
+        }
+    };
+}
+
+/// Blob access; without a beacon endpoint every blob fetch fails as unavailable.
+pub fn BlobView(comptime IO: type) type {
+    return struct {
+        provider: ?*blob_provider.BlobProvider(IO, blob_provider.KzgVerifier),
+
+        const Self = @This();
+
+        pub fn blobs(
+            view: *Self,
+            block: BlockInfo,
+            hashes: []const Hash,
+        ) ProviderError![]const *const blob_module.Blob {
+            const provider = view.provider orelse return error.BlobsUnavailable;
+            return provider.blobs(block, hashes);
+        }
+    };
+}
+
 pub fn Node(comptime IO: type) type {
     return struct {
         const Self = @This();
         const RpcServer = http.Server(IO, *Self, handle_rpc);
+        const Blobs = blob_provider.BlobProvider(IO, blob_provider.KzgVerifier);
+        const Engine = engine_client.EngineClient(IO);
+        const Polling = polling_client.PollingClient(IO);
         const backend_vtable: rollup_rpc.Backend.VTable = .{
             .sync_status = backend_sync_status,
             .output_at_block = backend_output_at_block,
             .safe_db = backend_safe_db,
+        };
+
+        pub const Providers = struct {
+            l1: *l1_provider.L1Provider(IO),
+            blobs: *BlobView(IO),
+            l2: *L2View(IO),
+            engine: *Polling,
+            l1_head: ?BlockInfo,
+            l1_finalized: ?BlockInfo,
         };
 
         allocator: Allocator,
@@ -60,11 +156,24 @@ pub fn Node(comptime IO: type) type {
         rollup: *const RollupConfig,
         options: Options,
         watcher: l1_watcher.L1Watcher(IO),
+        l1: l1_provider.L1Provider(IO),
         l2: l2_provider.L2Provider(IO),
+        l2_view: L2View(IO),
+        blobs: ?*Blobs = null,
+        blob_view: BlobView(IO),
+        kzg_storage: ?*kzg.blob.Settings.Storage = null,
+        kzg_settings: kzg.blob.Settings = undefined,
+        kzg_workspace: ?*kzg.blob.Workspace = null,
+        engine: Engine,
+        polling: Polling,
+        blob_schedule: L1BlobSchedule = .{},
+        driver: driver_module.Driver,
         rpc_server: RpcServer,
         backend: rollup_rpc.Backend,
         safe_db: safedb.SafeDB,
-        status: SyncStatus = .{},
+        logged_phase: driver_module.Phase = .starting,
+        logged_safe_number: u64 = 0,
+        logged_unsafe_number: u64 = 0,
 
         /// Builds the node in place; `node` must not move afterwards.
         pub fn init(
@@ -84,7 +193,13 @@ pub fn Node(comptime IO: type) type {
                 .rollup = rollup,
                 .options = options,
                 .watcher = undefined,
+                .l1 = undefined,
                 .l2 = undefined,
+                .l2_view = .{ .provider = &node.l2 },
+                .blob_view = .{ .provider = null },
+                .engine = undefined,
+                .polling = undefined,
+                .driver = undefined,
                 .rpc_server = undefined,
                 .backend = .{
                     .context = node,
@@ -95,22 +210,89 @@ pub fn Node(comptime IO: type) type {
                 .safe_db = try safedb.SafeDB.init(allocator, options.safedb_entries),
             };
             errdefer node.safe_db.deinit(allocator);
+            try node.init_sources();
+            errdefer node.deinit_sources();
+            try node.driver.init(
+                allocator,
+                rollup,
+                &node.blob_schedule,
+                &node.safe_db,
+                options.driver,
+            );
+            errdefer node.driver.deinit();
+            try node.rpc_server.init(allocator, io, node, options.rpc_server);
+        }
+
+        fn init_sources(node: *Self) !void {
+            const allocator = node.allocator;
+            const options = node.options;
+            const io = node.io;
             try node.watcher.init(allocator, io, options.l1, options.http_client, .{});
             errdefer node.watcher.deinit();
-            try node.l2.init(allocator, io, options.l2, options.http_client, rollup, .{
+            try node.l1.init(allocator, io, options.l1, options.http_client, .{
+                .batch_inbox = node.rollup.batch_inbox_address,
+            });
+            errdefer node.l1.deinit();
+            try node.l2.init(allocator, io, options.l2, options.http_client, node.rollup, .{
                 .jwt_secret = options.jwt_secret,
                 .block_by_number_ttl_ns = options.head_poll_interval_ns,
             });
             errdefer node.l2.deinit();
-            try node.rpc_server.init(allocator, io, node, options.rpc_server);
+            try node.engine.init(
+                allocator,
+                io,
+                options.l2,
+                options.engine_http_client,
+                options.jwt_secret,
+                .{ .genesis = node.rollup.genesis },
+            );
+            errdefer node.engine.deinit();
+            node.polling = Polling.init(&node.engine);
+            if (options.l1_beacon) |beacon| try node.init_blobs(beacon);
+            assert(node.l2_view.provider == &node.l2);
+        }
+
+        fn init_blobs(node: *Self, beacon: Address) !void {
+            const allocator = node.allocator;
+            const storage = try allocator.create(kzg.blob.Settings.Storage);
+            errdefer allocator.destroy(storage);
+            const workspace = try allocator.create(kzg.blob.Workspace);
+            errdefer allocator.destroy(workspace);
+            node.kzg_settings = try kzg.blob.Settings.init(storage);
+            const blobs = try allocator.create(Blobs);
+            errdefer allocator.destroy(blobs);
+            const verifier: blob_provider.KzgVerifier = .{
+                .settings = &node.kzg_settings,
+                .workspace = workspace,
+            };
+            const http_options = node.options.beacon_http_client;
+            try blobs.init(allocator, node.io, beacon, http_options, verifier, .{});
+            node.kzg_storage = storage;
+            node.kzg_workspace = workspace;
+            node.blobs = blobs;
+            node.blob_view.provider = blobs;
+        }
+
+        fn deinit_sources(node: *Self) void {
+            const allocator = node.allocator;
+            if (node.blobs) |blobs| {
+                blobs.deinit();
+                allocator.destroy(blobs);
+            }
+            if (node.kzg_workspace) |workspace| allocator.destroy(workspace);
+            if (node.kzg_storage) |storage| allocator.destroy(storage);
+            node.engine.deinit();
+            node.l2.deinit();
+            node.l1.deinit();
+            node.watcher.deinit();
         }
 
         /// Frees everything. The IO must not run afterwards (in-flight operations would
         /// complete into freed memory); the binary tears both down together.
         pub fn deinit(node: *Self) void {
             node.rpc_server.deinit();
-            node.l2.deinit();
-            node.watcher.deinit();
+            node.driver.deinit();
+            node.deinit_sources();
             node.safe_db.deinit(node.allocator);
             node.* = undefined;
         }
@@ -123,44 +305,82 @@ pub fn Node(comptime IO: type) type {
             return address;
         }
 
+        pub fn providers(node: *Self) Providers {
+            return .{
+                .l1 = &node.l1,
+                .blobs = &node.blob_view,
+                .l2 = &node.l2_view,
+                .engine = &node.polling,
+                .l1_head = node.watcher.head(.latest),
+                .l1_finalized = node.watcher.head(.finalized),
+            };
+        }
+
+        /// Whether any HTTP request is still in flight (drain before `deinit`).
+        pub fn busy(node: *const Self) bool {
+            const blobs_busy = if (node.blobs) |blobs| blobs.busy() else false;
+            return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
+                node.engine.busy() or blobs_busy;
+        }
+
         /// One step of the node's state machines; call every few milliseconds.
         pub fn tick(node: *Self) void {
             node.watcher.tick();
+            node.l1.tick();
             node.l2.tick();
-            node.refresh_l2_heads();
-            assert(node.status.finalized_l2.block_info.number <=
-                node.status.unsafe_l2.block_info.number or
-                node.status.unsafe_l2.block_info.hash.is_zero());
+            node.polling.tick();
+            if (node.blobs) |blobs| blobs.tick();
+            const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
+            node.driver.tick(node.providers(), now_s);
+            node.log_progress();
+            assert(node.driver.sync_state().is_ordered());
         }
 
-        /// Re-reads the engine's labeled heads (the provider refetches after its TTL).
-        fn refresh_l2_heads(node: *Self) void {
-            const labels = [_]l2_provider.Label{ .latest, .safe, .finalized };
-            var heads: [labels.len]?protocol.block.L2BlockInfo = @splat(null);
-            for (labels, 0..) |label, index| {
-                heads[index] = node.l2.l2_block_info_by_label(label) catch null;
+        fn log_progress(node: *Self) void {
+            const state = node.driver.sync_state();
+            if (node.driver.phase != node.logged_phase) {
+                node.logged_phase = node.driver.phase;
+                node.logger.log(.info, "consensus", "driver phase", .{
+                    .phase = @tagName(node.driver.phase),
+                    .unsafe = state.unsafe_head.block_info.number,
+                    .safe = state.safe_head.block_info.number,
+                });
             }
-            // Apply only a consistent snapshot so finalized <= safe <= unsafe holds.
-            const unsafe_head = heads[0] orelse return;
-            const safe_head = heads[1] orelse node.status.safe_l2;
-            const finalized_head = heads[2] orelse node.status.finalized_l2;
-            const unsafe_number = unsafe_head.block_info.number;
-            if (safe_head.block_info.number > unsafe_number) return;
-            if (finalized_head.block_info.number > safe_head.block_info.number) return;
-            node.status.unsafe_l2 = unsafe_head;
-            node.status.safe_l2 = safe_head;
-            node.status.local_safe_l2 = safe_head;
-            node.status.finalized_l2 = finalized_head;
+            const unsafe_head = state.unsafe_head;
+            if (unsafe_head.block_info.number != node.logged_unsafe_number) {
+                node.logged_unsafe_number = unsafe_head.block_info.number;
+                node.logger.log(.info, "consensus", "unsafe head", .{
+                    .number = unsafe_head.block_info.number,
+                    .l1_origin = unsafe_head.l1_origin.number,
+                    .sealed = node.driver.stats.sealed,
+                });
+            }
+            const safe_number = state.safe_head.block_info.number;
+            if (safe_number != node.logged_safe_number) {
+                node.logged_safe_number = safe_number;
+                node.logger.log(.info, "consensus", "safe head", .{
+                    .number = safe_number,
+                    .unsafe = state.unsafe_head.block_info.number,
+                    .finalized = state.finalized_head.block_info.number,
+                });
+            }
         }
 
         pub fn sync_status(node: *const Self) SyncStatus {
-            var status = node.status;
+            const state = node.driver.sync_state();
+            var status: SyncStatus = .{
+                .unsafe_l2 = state.unsafe_head,
+                .local_safe_l2 = state.local_safe_head,
+                .safe_l2 = state.safe_head,
+                .finalized_l2 = state.finalized_head,
+            };
+            if (node.driver.pipeline.origin()) |origin| status.current_l1 = origin;
             const watcher = &node.watcher;
             if (watcher.head(.latest)) |head| status.head_l1 = head;
             if (watcher.head(.safe)) |head| status.safe_l1 = head;
             if (watcher.head(.finalized)) |head| status.finalized_l1 = head;
-            assert(status.unsafe_l2.block_info.number >= status.safe_l2.block_info.number or
-                status.unsafe_l2.block_info.hash.is_zero());
+            status.current_l1_finalized = status.finalized_l1;
+            assert(status.unsafe_l2.block_info.number >= status.safe_l2.block_info.number);
             return status;
         }
 
@@ -209,7 +429,7 @@ const FakeRpc = harness_module.FakeRpc;
 const Harness = harness_module.Harness(*FakeRpc, FakeRpc.handle);
 const TestNode = Node(sim.SimIo);
 
-test "node: tracks L1 and engine heads and serves optimism_syncStatus" {
+test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     var block_text: [4096]u8 = undefined;
     var hash: [32]u8 = undefined;
     const block = try fixtures.l2_block_json(&block_text, 7, &hash);
@@ -239,18 +459,18 @@ test "node: tracks L1 and engine heads and serves optimism_syncStatus" {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
     const status = node.sync_status();
-    try testing.expectEqual(@as(u64, 7), status.unsafe_l2.block_info.number);
-    try testing.expectEqualSlices(u8, &hash, &status.safe_l2.block_info.hash.bytes);
-    try testing.expectEqual(@as(u64, 507), status.safe_l2.l1_origin.number);
     try testing.expectEqual(@as(u64, 7), status.head_l1.number);
-    try testing.expectEqual(@as(u64, 0), status.finalized_l2.block_info.number);
+    try testing.expectEqualSlices(u8, &hash, &status.head_l1.hash.bytes);
+    // The fake chain's L1 origin (507) does not exist, so startup discovery keeps retrying.
+    try testing.expectEqual(driver_module.Phase.starting, node.driver.phase);
+    try testing.expectEqual(@as(u64, 0), status.unsafe_l2.block_info.number);
     var buffer: [8192]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     _ = rollup_rpc.Router.handle(&node.backend,
         \\{"jsonrpc":"2.0","id":1,"method":"optimism_syncStatus"}
     , &out);
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"unsafe_l2\":{\"hash\"") != null);
-    while (node.watcher.busy() or node.l2.busy()) {
+    while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
 }

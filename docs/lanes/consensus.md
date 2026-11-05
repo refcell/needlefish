@@ -51,8 +51,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     check, pool gating; resets reported to the caller)
   - [x] service driver: startup forkchoice → synchronize + pipeline reset, derivation →
     consolidate, safedb + finalizer, sequencer build → seal (one loop, client-generic)
-  - [ ] service node stage 2: run the driver in `Node` over real providers (L1Provider,
-    BlobProvider + KZG, L2Provider with `l2_block_by_number`, polling engine client)
+  - [x] service node stage 2: run the driver in `Node` over real providers (L1Provider,
+    BlobProvider + KZG, L2Provider, polling engine client); logs phase/unsafe/safe heads
+  - [ ] L2Provider `l2_block_by_number` (full safe blocks via `l2_block_full`) so span
+    batches overlapping the safe chain decide instead of waiting
+  - [ ] devnet smoke green (sequencer produces blocks, verifier safe head follows)
   - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
@@ -157,6 +160,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: node runs the driver over real providers (`base consensus`).
 - 2026-11-05: service: driver (startup, derivation, finalization, sequencing), fuzzed.
 - 2026-11-05: sequencer: next-block attributes (build_on, pool gating), fuzzed.
 - 2026-11-05: engine: polling client over `sources.EngineClient` (keyed results, error

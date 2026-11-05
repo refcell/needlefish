@@ -136,10 +136,12 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     defer init.gpa.destroy(node);
     try node.init(init.gpa, &os_io, &logger, &rollup, .{
         .l1 = flags.l1.?,
+        .l1_beacon = flags.l1_beacon,
         .l2 = flags.l2.?,
         .jwt_secret = secret,
         .rpc_address = io.Address.ip4(flags.rpc_addr, flags.rpc_port),
         .sequencer = flags.sequencer,
+        .driver = .{ .sequencer = flags.sequencer },
         .version = base.build_options.version,
     });
     defer node.deinit();
