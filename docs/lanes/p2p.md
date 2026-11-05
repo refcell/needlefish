@@ -47,8 +47,9 @@ behind a small interface and switch later.
   3. Verifier restarted with only the bootstore: gossip resumed (unsafe 215 = sequencer,
      safe 209). Not conclusive for the file alone, since the sequencer may redial; the
      sim DST covers that.
-  Gap for the consensus lane: the CL RPC server does not mount the `opp2p_*` methods
-  (`p2p.rpc`), so `opp2p_peers` answers "method not found".
+  Fixed: `p2p.rpc.Merged(Inner, inner_methods)` merges another method table with
+  `opp2p_*` over one context (batches included; -32601 when p2p is off), and the node's
+  RPC server now serves it (small integration edit in `service/node.zig`).
 - [x] In-process interop (`interop_test.zig`): two full `Network`s find each other via discv5
   over SimIo UDP only (ENR bootnodes, no enode), gossip randomized Ecotone (v3) and Isthmus
   (v4) blocks both ways, and every received block round-trips through the consensus
@@ -374,3 +375,4 @@ behind a small interface and switch later.
 - 2026-11-05: --p2p.bootnodes-file read through the io layer.
 - 2026-11-05: identify peerstore + opp2p_peers(false) disconnected peers.
 - 2026-11-05: devnet real-process interop checked (enode, discv5 ENR, bootstore restart).
+- 2026-11-05: opp2p_* served by the consensus node RPC via p2p.rpc.Merged.

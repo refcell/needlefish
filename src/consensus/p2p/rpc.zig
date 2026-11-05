@@ -75,6 +75,51 @@ fn Counted(
 
 pub const Router = rpc.Router(*Service, &methods);
 
+/// Serves another method table (`inner_methods`, e.g. the rollup node's) and `opp2p_*`
+/// from one router, batches included. With p2p off (`Context.p2p == null`) the opp2p
+/// methods reply -32601, as an unknown method would.
+pub fn Merged(comptime Inner: type, comptime inner_methods: []const rpc.Method(Inner)) type {
+    return struct {
+        pub const Context = struct {
+            inner: Inner,
+            p2p: ?*Service,
+        };
+
+        pub const all = merged: {
+            var out: [inner_methods.len + methods.len]rpc.Method(*const Context) = undefined;
+            for (inner_methods, 0..) |method, index| out[index] = .{
+                .name = method.name,
+                .handler = InnerHandler(method.handler).handle,
+            };
+            for (methods, inner_methods.len..) |method, index| out[index] = .{
+                .name = method.name,
+                .handler = P2pHandler(method.handler).handle,
+            };
+            break :merged out;
+        };
+
+        pub const Router = rpc.Router(*const Context, &all);
+
+        fn InnerHandler(comptime handler: *const fn (Inner, *Call) HandlerError!void) type {
+            return struct {
+                fn handle(context: *const Context, call: *Call) HandlerError!void {
+                    return handler(context.inner, call);
+                }
+            };
+        }
+
+        fn P2pHandler(comptime handler: *const fn (*Service, *Call) HandlerError!void) type {
+            return struct {
+                fn handle(context: *const Context, call: *Call) HandlerError!void {
+                    const service = context.p2p orelse
+                        return call.fail(rpc.code.method_not_found, "method not found");
+                    return handler(service, call);
+                }
+            };
+        }
+    };
+}
+
 const connectedness_not_connected = 0;
 const connectedness_connected = 1;
 const connectedness_cannot_connect = 3;

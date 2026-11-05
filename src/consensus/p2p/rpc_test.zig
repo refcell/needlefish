@@ -301,3 +301,42 @@ test "p2p rpc: fuzz peer info from identify bytes" {
     const fuzz = @import("../../testing/fuzz.zig");
     try fuzz.run_bytes({}, fuzz_peer_info, fuzz.Options{ .input_size_max = 4096, .corpus = &.{} });
 }
+
+const InnerContext = struct { answer: u64 };
+
+const utilities_rpc = @import("../../utilities/rpc/root.zig");
+
+fn inner_answer(
+    context: *const InnerContext,
+    call: *utilities_rpc.Call,
+) utilities_rpc.HandlerError!void {
+    try call.params.finish();
+    try call.writer.integer(context.answer);
+}
+
+const TestMerged = p2p_rpc.Merged(*const InnerContext, &.{
+    .{ .name = "test_answer", .handler = inner_answer },
+});
+
+test "p2p rpc: merged router serves inner and opp2p methods, batches included" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const inner: InnerContext = .{ .answer = 42 };
+    var storage: [16 * 1024]u8 = undefined;
+    const batch =
+        \\[{"jsonrpc":"2.0","id":1,"method":"test_answer","params":[]},
+        \\ {"jsonrpc":"2.0","id":2,"method":"opp2p_peerCount","params":[]}]
+    ;
+    var out = std.Io.Writer.fixed(&storage);
+    const on: TestMerged.Context = .{ .inner = &inner, .p2p = fixture.service };
+    _ = TestMerged.Router.handle(&on, batch, &out);
+    try expect_contains(out.buffered(), "\"id\":1,\"result\":42");
+    try expect_contains(out.buffered(), "\"connectedGossip\":2");
+    // p2p off: the opp2p method is unknown, the inner one still answers.
+    out = std.Io.Writer.fixed(&storage);
+    const off: TestMerged.Context = .{ .inner = &inner, .p2p = null };
+    _ = TestMerged.Router.handle(&off, batch, &out);
+    try expect_contains(out.buffered(), "\"id\":1,\"result\":42");
+    try expect_contains(out.buffered(), "-32601");
+}

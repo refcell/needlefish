@@ -31,6 +31,10 @@ const kzg = @import("../../common/crypto/kzg/root.zig");
 const derive_errors = @import("../derive/errors.zig");
 const blob_module = @import("../derive/blob.zig");
 const p2p_network = @import("../p2p/network.zig");
+const p2p_rpc = @import("../p2p/rpc.zig");
+/// `optimism_*`, `admin_*`, and (with p2p on) `opp2p_*` from one router.
+const RpcRouter = p2p_rpc.Merged(*const rollup_rpc.Backend, &rollup_rpc.node_methods);
+const RpcOutcome = @import("../../utilities/rpc/root.zig").Outcome;
 const p2p_options = @import("../p2p/options.zig");
 const secp256k1 = @import("../p2p/peers/secp256k1.zig");
 const enr = @import("../p2p/peers/enr.zig");
@@ -646,9 +650,14 @@ pub fn Node(comptime IO: type) type {
             response: *http.ResponseBuilder,
         ) void {
             if (request.method != .POST) return response.fail(405);
-            const out = response.writer();
-            const outcome = rollup_rpc.NodeRouter.handle(&node.backend, request.body, out);
+            const outcome = node.serve_rpc(request.body, response.writer());
             if (outcome == .empty) response.status = 204;
+        }
+
+        fn serve_rpc(node: *Self, body: []const u8, out: *std.Io.Writer) RpcOutcome {
+            const p2p = if (node.network) |network| network.service else null;
+            const context: RpcRouter.Context = .{ .inner = &node.backend, .p2p = p2p };
+            return RpcRouter.Router.handle(&context, body, out);
         }
 
         fn from_context(context: *anyopaque) *Self {
@@ -998,6 +1007,12 @@ test "node: receives gossiped unsafe blocks from a p2p peer" {
         harness.world.run_for_ns(10 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(u64, 1), node.gossip.received);
+    var rpc_buffer: [512]u8 = undefined;
+    var rpc_out: std.Io.Writer = .fixed(&rpc_buffer);
+    _ = node.serve_rpc(
+        \\{"jsonrpc":"2.0","id":1,"method":"opp2p_peerCount","params":[]}
+    , &rpc_out);
+    try testing.expect(std.mem.indexOf(u8, rpc_out.buffered(), "\"connectedGossip\":1") != null);
     try testing.expectEqual(@as(u64, 0), node.gossip.undecodable);
     // Startup has not finished (no L1), so the driver does not take the block yet.
     try testing.expectEqual(@as(u64, 1), node.driver.stats.unsafe_ignored);
