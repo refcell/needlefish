@@ -10,6 +10,7 @@ pub const channel = @import("channel/root.zig");
 pub const devnet = @import("devnet/root.zig");
 pub const txdata = @import("txdata/root.zig");
 pub const rpc = @import("rpc/root.zig");
+pub const source = @import("source/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

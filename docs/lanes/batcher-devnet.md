@@ -20,6 +20,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/txdata`: EIP-1559 calldata tx building + signing, gas, fee bumps.
 - [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
 - [ ] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
+- [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
+- [ ] `batcher/source`: EIP-7702 (type 4) transactions.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
@@ -59,3 +61,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: devnet.sh supervisor (bash 3.2 compatible) + smoke.sh.
 - 2026-11-05: rpc client, `base devnet transfer`; signing + portal deposit log verified
   against a local dev node; portal log decodes with consensus `decode_deposit_log`.
+- 2026-11-05: L2 block source decoding with hash check and mutation fuzz.
