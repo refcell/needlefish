@@ -7,7 +7,8 @@
 //! (`eth_getBlockByNumber`/`eth_getBlockByHash` with full transactions, for the L1 info
 //! deposit) and returns `error.NotAvailable`; a `null` result surfaces once as
 //! `error.NotFound`; failed or unverifiable responses are dropped and re-requested on the
-//! next query. Bounds: one request in flight, a fixed de-duplicating queue, fixed LRU caches.
+//! next query. With `jwt_secret` every request carries a fresh bearer token.
+//! Bounds: one request in flight, a fixed de-duplicating queue, fixed LRU caches.
 //! Each cached block keeps only its `L2BlockInfo` and `SystemConfig`, so caching allocates
 //! nothing after `init`. By-number results expire after `block_by_number_ttl_ns` because
 //! unsafe L2 numbers move on reorgs; hash-keyed results are immutable.
@@ -19,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const rpc = @import("../../utilities/rpc/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const http_client = @import("../../utilities/http/client.zig");
+const jwt = @import("../../utilities/jwt/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const protocol = @import("../protocol/root.zig");
 const errors = @import("../derive/errors.zig");
@@ -39,6 +41,8 @@ pub const Options = struct {
     cache_entries: u32 = 256,
     queue_size: u32 = 16,
     block_by_number_ttl_ns: u64 = 2 * std.time.ns_per_s,
+    /// Authenticates every request with a fresh JWT (the engine endpoint serves `eth_*`).
+    jwt_secret: ?jwt.Secret = null,
 };
 
 pub const Request = struct {
@@ -242,6 +246,11 @@ pub fn L2Provider(comptime IO: type) type {
                     "eth_getBlockByHash";
                 const in_flight = &provider.in_flight.?;
                 const client = &provider.client;
+                if (provider.options.jwt_secret) |secret| {
+                    var token_buffer: [jwt.token_size_max]u8 = undefined;
+                    const now_s = provider.io.now_realtime_ns() / std.time.ns_per_s;
+                    client.set_bearer(jwt.create(secret, now_s, &token_buffer));
+                }
                 client.call(*Self, provider, on_result, method, in_flight, write_params) catch {
                     provider.in_flight = null;
                     provider.stats.failures += 1;

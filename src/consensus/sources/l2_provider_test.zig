@@ -97,7 +97,7 @@ const Fixture = struct {
 
 test "l2 provider: misses fetch, completions fill info and system config" {
     var fixture: Fixture = .{};
-    try fixture.init(.{});
+    try fixture.init(.{ .jwt_secret = .{ .bytes = @splat(0x42) } });
     defer fixture.deinit();
     const provider = &fixture.provider;
     try testing.expectError(error.NotAvailable, provider.l2_block_info_by_number(7));
@@ -117,6 +117,7 @@ test "l2 provider: misses fetch, completions fill info and system config" {
     try testing.expectEqual(@as(?u32, 6), config.eip1559_elasticity);
     try testing.expectEqual(protocol.l2_system_config.encode_scalar(2, 3), config.scalar);
     try testing.expect(config.batcher_address.eql(.init(@splat(0xba))));
+    try testing.expect(std.mem.startsWith(u8, fixture.fake.authorization(), "Bearer ey"));
 }
 
 test "l2 provider: null once as NotFound, malformed dropped, by-number expiry" {
