@@ -93,6 +93,17 @@ test "eth: chain values and head block" {
     try expect_contains(future, "error");
 }
 
+test "eth: miner_setMaxDASize sets the builder DA limits" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const result = try h.request("miner_setMaxDASize", "[\"0x64\",\"0x3e8\"]");
+    try testing.expectEqualStrings("\"result\":true", result);
+    try testing.expectEqual(@as(u64, 100), h.node.chain.da_limits.tx_bytes_max);
+    try testing.expectEqual(@as(u64, 1000), h.node.chain.da_limits.block_bytes_max);
+    try expect_contains(try h.request("miner_setMaxDASize", "[\"0x1\"]"), "error");
+    try testing.expectEqual(@as(u64, 1000), h.node.chain.da_limits.block_bytes_max);
+}
+
 test "eth: send raw transaction, mine, receipt, logs and nonce" {
     const h = try Harness.create();
     defer h.destroy();

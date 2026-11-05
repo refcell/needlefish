@@ -60,6 +60,7 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "eth_call", .handler = eth_call },
     .{ .name = "eth_estimateGas", .handler = estimate_gas },
     .{ .name = "eth_getLogs", .handler = get_logs },
+    .{ .name = "miner_setMaxDASize", .handler = set_max_da_size },
 };
 
 pub const Router = rpc.Router(*Api, &methods);
@@ -120,6 +121,17 @@ fn gas_price(api: *Api, call: *Call) HandlerError!void {
 
 fn max_priority_fee(_: *Api, call: *Call) HandlerError!void {
     try call.writer.quantity(default_priority_fee);
+}
+
+/// `miner_setMaxDASize(maxTxSize, maxBlockSize)`: the batcher's DA throttle; 0 lifts a
+/// limit. Takes effect from the next payload build.
+fn set_max_da_size(api: *Api, call: *Call) HandlerError!void {
+    const tx_bytes_max = try call.params.quantity(u64);
+    const block_bytes_max = try call.params.quantity(u64);
+    try call.params.finish();
+    api.chain.da_limits = .{ .tx_bytes_max = tx_bytes_max, .block_bytes_max = block_bytes_max };
+    assert(api.chain.da_limits.block_bytes_max == block_bytes_max);
+    try call.writer.boolean(true);
 }
 
 fn blob_base_fee(api: *Api, call: *Call) HandlerError!void {

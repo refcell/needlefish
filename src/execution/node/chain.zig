@@ -10,6 +10,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
+const flz = @import("../../common/flz/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
@@ -93,6 +94,21 @@ pub const Record = struct {
 
 pub const TxLocation = struct { block_hash: Hash, index: u32 };
 
+/// Builder DA limits set by the batcher (`miner_setMaxDASize`); 0 means no limit. Sizes
+/// are FastLZ-estimated compressed bytes of the EIP-2718 encoding (base/base
+/// `estimated_da_size`). Applied to pool transactions on L2 only.
+pub const DaLimits = struct {
+    tx_bytes_max: u64 = 0,
+    block_bytes_max: u64 = 0,
+
+    /// Whether a transaction of `size_bytes` fits after `used_bytes` of the block.
+    pub fn admits(limits: DaLimits, used_bytes: u64, size_bytes: u64) bool {
+        if (limits.tx_bytes_max != 0 and size_bytes > limits.tx_bytes_max) return false;
+        const total = used_bytes +| size_bytes;
+        return limits.block_bytes_max == 0 or total <= limits.block_bytes_max;
+    }
+};
+
 pub const Chain = struct {
     pub const Built = BuiltPayload;
 
@@ -101,6 +117,7 @@ pub const Chain = struct {
     executor: *Executor,
     store: block_store.BlockStore,
     pool: ?*txpool.Pool = null,
+    da_limits: DaLimits = .{},
     staging: []u8,
     select_buffer: []*const txpool.Tx,
     transactions_buffer: [][]const u8,
@@ -556,11 +573,15 @@ pub const Chain = struct {
     ) Error!u32 {
         const pool = chain.pool orelse return start;
         var count = start;
+        var da_used_bytes: u64 = 0;
+        const limit_da = chain.spec.mode == .l2;
         const selected = pool.select(env.base_fee, chain.select_buffer);
         for (chain.select_buffer[0..selected]) |tx| {
             if (count == chain.transactions_buffer.len) break;
             if (building.gas_used + tx.gas_limit > env.gas_limit) continue;
             const raw = try canonical_form(tx.raw, chain.build_bytes[chain.build_len..]);
+            const da_bytes = if (limit_da) flz.estimated_size_bytes(raw) else 0;
+            if (!chain.da_limits.admits(da_used_bytes, da_bytes)) continue;
             if (raw.ptr != tx.raw.ptr) chain.build_len += raw.len;
             chain.executor.apply(building, raw) catch |err| switch (err) {
                 error.InvalidTransaction,
@@ -572,6 +593,7 @@ pub const Chain = struct {
             };
             chain.transactions_buffer[count] = raw;
             count += 1;
+            da_used_bytes += da_bytes;
         }
         return count;
     }

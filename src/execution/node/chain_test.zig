@@ -11,6 +11,7 @@ const payload = @import("../payload/root.zig");
 const txpool = @import("../txpool/root.zig");
 const engine_module = @import("../engine/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
+const flz = @import("../../common/flz/root.zig");
 const chain_module = @import("chain.zig");
 const Executor = @import("executor.zig").Executor;
 const StateDb = @import("state_db.zig").StateDb;
@@ -43,7 +44,8 @@ fn import(from: *Node, to: *Node, hash: B256) !types.PayloadStatus {
         .parent_beacon_block_root = stored.header.parent_beacon_block_root,
         .execution_requests = requests[0..count],
     };
-    return to.engine.new_payload(types.new_payload_version(spec, p.timestamp), &p, &params);
+    const version = types.new_payload_version(to.spec, p.timestamp);
+    return to.engine.new_payload(version, &p, &params);
 }
 
 test "chain: build, import on a second node, pool inclusion and pruning" {
@@ -79,6 +81,54 @@ test "chain: build, import on a second node, pool inclusion and pruning" {
     try testing.expectEqualSlices(u8, &hash.bytes, &location.block_hash);
     try testing.expectEqual(@as(u32, 0), location.index);
     try testing.expect(follower.chain.find_transaction(@splat(0)) == null);
+}
+
+test "chain: DA limits admit by tx and cumulative block size" {
+    const none: chain_module.DaLimits = .{};
+    try testing.expect(none.admits(std.math.maxInt(u64), std.math.maxInt(u64)));
+    const limits: chain_module.DaLimits = .{ .tx_bytes_max = 100, .block_bytes_max = 250 };
+    try testing.expect(limits.admits(0, 100));
+    try testing.expect(!limits.admits(0, 101));
+    try testing.expect(limits.admits(150, 100));
+    try testing.expect(!limits.admits(151, 100));
+    try testing.expect(!limits.admits(std.math.maxInt(u64), 1));
+}
+
+fn included_count(node: *Node, hash: B256) !u32 {
+    var decoder = node.chain.record(hash.bytes).?.transactions;
+    var count: u32 = 0;
+    while (!decoder.is_empty()) : (count += 1) _ = try decoder.bytes();
+    return count;
+}
+
+test "chain: L2 blocks build and import; DA limits gate pool transactions" {
+    const l2 = &chainspec.ChainSpec.presets.base_devnet;
+    const builder = try Node.create_for(l2);
+    defer builder.destroy();
+    const follower = try Node.create_for(l2);
+    defer follower.destroy();
+    var buffers: [3][256]u8 = undefined;
+    for (&buffers, 0..) |*buffer, nonce| try submit(builder, 1, nonce, 5, buffer);
+    // A plain transfer estimates to ~100 compressed bytes; room for two, not three.
+    var selected: [1]*const txpool.Tx = undefined;
+    try testing.expectEqual(@as(u32, 1), builder.pool.select(0, &selected));
+    const size = flz.estimated_size_bytes(selected[0].raw);
+    try testing.expect(size > 0);
+    builder.chain.da_limits = .{ .block_bytes_max = 2 * size + size / 2 };
+    const genesis: B256 = .{ .bytes = builder.chain.genesis_hash };
+    const first = try build(builder, genesis, 2, 0xfe);
+    try testing.expectEqual(@as(u32, 2), try included_count(builder, first));
+    try testing.expectEqual(types.Status.valid, (try import(builder, follower, first)).status);
+    const v = types.forkchoice_version(l2, 2);
+    _ = try builder.engine.forkchoice_updated(v, forkchoice(first), null);
+    builder.chain.da_limits = .{ .tx_bytes_max = size - 1 };
+    const blocked = try build(builder, first, 4, 0xfe);
+    try testing.expectEqual(@as(u32, 0), try included_count(builder, blocked));
+    builder.chain.da_limits = .{};
+    // New attributes (fee recipient), so a new payload ID instead of the cached build.
+    const second = try build(builder, first, 4, 0xfd);
+    try testing.expectEqual(@as(u32, 1), try included_count(builder, second));
+    try testing.expectEqual(types.Status.valid, (try import(builder, follower, second)).status);
 }
 
 test "chain: tampered payload is invalid and leaves state untouched" {
