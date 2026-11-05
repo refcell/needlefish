@@ -415,4 +415,5 @@ behind a small interface and switch later.
 - 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.
 - 2026-11-05: hostile authenticated-plaintext fuzz (connection + network level).
 - 2026-11-05: end-to-end block gossip bench (1.09 ms/128 KiB block; verifier ~0.6 ms).
-\n- 2026-11-05: discv5 UDP moved to recvfrom/sendto completions; stop drains them.\n
+
+- 2026-11-05: discv5 UDP moved to recvfrom/sendto completions; stop drains them.
