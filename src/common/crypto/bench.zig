@@ -389,7 +389,41 @@ fn bench_verify_std(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_field_inverse(comptime F: type, comptime vartime: bool) fn (u32) u64 {
+    return struct {
+        fn run(iterations: u32) u64 {
+            var a = F.from_int(0x1234_5678_9abc_def0);
+            const b = F.from_int(3);
+            for (0..iterations) |_| {
+                a = if (vartime) a.inverse() else a.inverse_constant_time();
+                a = a.add(b);
+            }
+            return a.limbs_value[0];
+        }
+    }.run;
+}
+
 pub const cases = [_]Case{
+    .{
+        .name = "field/bn254 inverse_constant_time",
+        .iterations = 20_000,
+        .run = bench_field_inverse(Bn254Fp, false),
+    },
+    .{
+        .name = "field/bn254 inverse",
+        .iterations = 20_000,
+        .run = bench_field_inverse(Bn254Fp, true),
+    },
+    .{
+        .name = "field/bls12-381 inverse_constant_time",
+        .iterations = 20_000,
+        .run = bench_field_inverse(Bls12Fp, false),
+    },
+    .{
+        .name = "field/bls12-381 inverse",
+        .iterations = 20_000,
+        .run = bench_field_inverse(Bls12Fp, true),
+    },
     .{ .name = "kzg/point evaluation", .iterations = 200, .run = bench_kzg_point_evaluation },
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },

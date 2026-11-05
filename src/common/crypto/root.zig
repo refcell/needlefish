@@ -12,6 +12,7 @@ pub const blake2f = @import("blake2f.zig");
 pub const secp256k1 = @import("secp256k1/root.zig");
 pub const bench = @import("bench.zig");
 pub const montgomery = @import("montgomery.zig");
+pub const safegcd = @import("safegcd.zig");
 pub const kzg = @import("kzg/root.zig");
 pub const bls12_381 = @import("bls12_381/root.zig");
 pub const bigint = @import("bigint.zig");

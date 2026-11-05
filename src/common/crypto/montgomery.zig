@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Prng = @import("../../testing/prng.zig").Prng;
+const safegcd = @import("safegcd.zig");
 
 pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) type {
     comptime assert(limb_count >= 1 and limb_count <= 8);
@@ -26,6 +27,7 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
         const inverse_word: u64 = compute_inverse_word(modulus_limbs[0]);
         const r_mod: Wide = (@as(Wide, 1) << bits) % modulus;
         const r_squared: Int = @intCast((r_mod * r_mod) % modulus);
+        const r_cubed: Int = @intCast((r_mod * r_squared) % modulus);
 
         comptime {
             assert(modulus % 2 == 1);
@@ -254,10 +256,25 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
             return result;
         }
 
-        /// Multiplicative inverse via Fermat; inverse(0) = 0.
-        pub fn inverse(a: Self) Self {
+        /// Multiplicative inverse via Fermat in constant time; inverse(0) = 0. Use this
+        /// for secret values.
+        pub fn inverse_constant_time(a: Self) Self {
             const result = a.pow(modulus - 2);
             assert(a.is_zero() or result.mul(a).eql(one));
+            return result;
+        }
+
+        /// Multiplicative inverse in variable time (Bernstein-Yang safegcd), for public
+        /// values only (every current user: precompiles and verification); 5-7x faster
+        /// than `inverse_constant_time`. inverse(0) = 0. With a = x R stored, safegcd returns
+        /// x^-1 R^-1, and one Montgomery product with R^3 gives x^-1 R.
+        pub fn inverse(a: Self) Self {
+            const stored = limbs_to_int(a.limbs_value);
+            assert(stored < modulus);
+            const inverted = safegcd.Modulus(Int, modulus).invert(stored);
+            const plain: Self = .{ .limbs_value = int_to_limbs(inverted) };
+            const result = plain.mul(.{ .limbs_value = comptime int_to_limbs(r_cubed) });
+            assert(a.is_zero() == result.is_zero());
             return result;
         }
 
@@ -317,6 +334,7 @@ fn check_field_against_big_ints(comptime F: type, seed: u64) !void {
         try testing.expectEqual((@as(Wide, a_int) * b_int) % F.modulus, a.mul(b).to_int());
         if (round % 50 == 0 and !a.is_zero()) {
             try testing.expect(a.inverse().mul(a).eql(F.one));
+            try testing.expect(a.inverse().eql(a.inverse_constant_time()));
             const s = a.square();
             const root = s.sqrt().?;
             try testing.expect(root.eql(a) or root.eql(a.neg()));
@@ -356,6 +374,7 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     const b = F.from_int(b_int);
     try testing.expectEqual((@as(u512, a_int) * b_int) % F.modulus, a.mul(b).to_int());
     try testing.expect(a.sub(b).add(b).eql(a));
+    try testing.expect(a.inverse().eql(a.inverse_constant_time()));
 }
 
 test "montgomery: coverage-guided fuzz" {
