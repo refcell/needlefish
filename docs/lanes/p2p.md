@@ -68,8 +68,13 @@ behind a small interface and switch later.
 - [x] `Service` DST: invalid-block attacker banned by every honest peer (discv5 ban +
   disconnect) while honest gossip continues; crash/restart reconnects and receives
   blocks; 8 nodes with resets behind `-Dslow-tests`.
-- [ ] Node integration: expose `Service` + `Transport` to the consensus node binary
-  (config from CLI flags mirroring base/base `--p2p.*`), keys from the node key file.
+- [x] Node integration: `options.zig` parses `--p2p.*` with base/base CLI defaults;
+  `network.zig` `Network(IO)` builds the ENR, Service, and Transport, seeds bootnodes
+  (chain defaults when none given), exposes `publish_block`/`pop_block`/`peer_count`.
+  Consensus lane: `p2p.network.Network(IO).init(...)`, `start()`, then call
+  `pop_block` each loop; sequencer calls `publish_block`.
+- [ ] `--p2p.bootnodes-file` / `--p2p.bootstore`: persist and reload peers via
+  `peers/store.zig` once the binary reads files.
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
@@ -198,6 +203,10 @@ behind a small interface and switch later.
   redials per 60 min (`peer_redialing = null` in the bare gater stays the library
   default). Without both, a dropped peer was never reconnected.
 
+- Options: base/base defaults (`ban.peers` false, `topic-scoring` false, `redial` 500 per
+  60 min, peers.hi 30). `Service`/handler library defaults keep topic scoring on, which
+  the handler tests rely on; the options layer sets base/base's CLI value.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -227,3 +236,4 @@ behind a small interface and switch later.
 - 2026-11-05: TCP transport over utilities/io; SimIo cluster gossips blocks end to end.
 - 2026-11-05: redial from lookups; gossip survives random connection resets in DST.
 - 2026-11-05: DST attacker/crash/8-node scenarios.
+- 2026-11-05: `--p2p.*` options and embeddable `Network(IO)`.
