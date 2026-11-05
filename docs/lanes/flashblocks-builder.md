@@ -39,9 +39,12 @@ can drive the builder and the flashblocks consumer.
   footprint limit is enforced today.
 - [ ] `builder/core` generator: incremental intermediate roots (executor "continue block"
   after a commit) instead of re-executing the block prefix per flashblock.
-- [ ] `builder/core` service: Engine API integration (`forkchoiceUpdated` with
+- [x] `builder/core` service: Engine API integration (`forkchoiceUpdated` with
   attributes starts a job, `getPayload` returns the best sealed payload), resting /
   cancellation on new FCU (port `service.rs`, `resting.rs`).
+- [ ] `builder/core` service wiring: Engine API `forkchoiceUpdated`/`getPayload` handlers that
+  route through `multiplex.Router(Service)` and turn a resolved `service.Payload` into an
+  execution payload envelope; an IO timer that calls `tick` at `next_deadline_ns`.
 - [x] `builder/metering`: per-tx execution metering store and extension hooks
   (port `crates/builder/metering`, `execution_metering_mode.rs`).
 - [x] `builder/multiplex`: router between the canonical EL and the builder for Engine
@@ -103,6 +106,16 @@ can drive the builder and the flashblocks consumer.
   included in gas); over-budget or failing pool txs skip their sender's later nonces
   (`mark_invalid`). Accepted transactions are copied into a generator-owned buffer so pool
   eviction cannot dangle them.
+- `builder/core/service`: a synchronous state machine over injected time. `send_new_payload`
+  (FCU with attributes) cancels the previous job (base/base `ensure_only_one_payload`), builds
+  and publishes flashblock 0; `tick(now)` builds every flashblock whose deadline passed (burst
+  on late ticks) and drops the job at its `PayloadJobDeadline`; `resolve` returns the last
+  sealed block and ends the job. Resolved, cancelled and expired ids answer null, as in reth's
+  `PayloadBuilderService`. `best_payload` answers `BuildFailed` for the active id (base/base
+  marks it unsupported). `send_new_payload` uses the last tick's time (the multiplex interface
+  carries no clock). Resting carry is 0 (base/base `RestingPayloadTransactions` defaults hold
+  nothing back). A failed flashblock build stops the job but its last sealed block stays
+  resolvable (base/base's watch channel keeps the last value).
 
 - `execution/flashblocks` consumer: the pending view stores what flashblocks carry (txs,
   hashes, withdrawals, latest delta roots/gas/hash, base) in a fixed ring of `blocks_max`
@@ -137,3 +150,6 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: `execution/flashblocks` consumer: validation, pending blocks, cache, processor,
   state builder interface, resuming ws subscriber with backoff and keepalive; SimIo DST
   against `builder/publish` (resets, partitions, floods) checks exactly-once assembly.
+- 2026-11-05: `builder/core` payload service (FCU starts/cancels a job, deadline ticks build and
+  publish flashblocks, getPayload resolves the last sealed block), multiplex `Builder` interface,
+  seeded + fuzz model check of FCU/resolve/tick interleavings.
