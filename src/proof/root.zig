@@ -10,6 +10,7 @@ pub const program = @import("program/root.zig");
 pub const driver = @import("driver/root.zig");
 pub const client = @import("client/root.zig");
 pub const host = @import("host/root.zig");
+pub const contracts = @import("contracts/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
