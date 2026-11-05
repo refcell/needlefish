@@ -246,8 +246,10 @@ pub fn SuperBlockType(comptime Storage: type) type {
             };
         }
 
+        /// May run with an operation in flight: after a simulated crash the storage has
+        /// dropped it and will never call back.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            assert(self.state == .idle);
+            assert(self.buffer.len > 0);
             allocator.free(self.buffer);
             self.* = undefined;
         }
