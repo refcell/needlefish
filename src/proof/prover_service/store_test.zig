@@ -117,6 +117,7 @@ test "prover service store: lease ownership, expiry and submit" {
     const response = store_module.to_get_proof(store.get("early").?);
     try testing.expectEqualStrings("proof", response.result.?.compressed.proof);
     try testing.expectEqual(.terminal, store.heartbeat(&new_lease, 10, 18 * s_ns).auth);
+    try testing.expectEqual(store_module.Stats{ .created = 2, .succeeded = 1 }, store.stats);
 }
 
 test "prover service store: cancel, delete, reaper and listing" {
@@ -165,6 +166,8 @@ test "prover service store: cancel, delete, reaper and listing" {
     const failed_only = store.list(0, .failed, &out);
     try testing.expectEqual(@as(u64, 1), failed_only.total);
     try testing.expectEqual(@as(usize, 0), store.list(5, null, &out).page.len);
+    const stats: store_module.Stats = .{ .created = 3, .cancelled = 1, .expired = 1, .failed = 1 };
+    try testing.expectEqual(stats, store.stats);
 }
 
 test "prover service store: backend sessions" {

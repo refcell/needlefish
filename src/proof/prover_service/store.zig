@@ -182,8 +182,22 @@ pub const CancelOutcome = enum {
 
 pub const DeleteOutcome = enum { deleted, not_found, not_completed };
 
+/// Job outcomes since startup (base/base `prover_service.*` metrics).
+pub const Stats = struct {
+    created: u64 = 0,
+    /// Failed requests requeued by a retrying `create`.
+    retried: u64 = 0,
+    succeeded: u64 = 0,
+    failed: u64 = 0,
+    cancelled: u64 = 0,
+    abandoned: u64 = 0,
+    /// Expired leases reaped (stuck requests).
+    expired: u64 = 0,
+};
+
 pub const Store = struct {
     config: Config,
+    stats: Stats = .{},
     jobs: []Job,
     /// Slot indexes, for sorting a listing.
     order: []u32,
@@ -267,6 +281,7 @@ pub const Store = struct {
             slot.request = request.*;
             slot.created_ns = now_ns;
             slot.updated_ns = now_ns;
+            store.stats.created += 1;
             return .created;
         };
         if (job.state != .failed and job.state != .cancelled) {
@@ -290,6 +305,7 @@ pub const Store = struct {
         job.completed_ns = 0;
         job.updated_ns = now_ns;
         job.sessions = .{ null, null };
+        store.stats.retried += 1;
         assert(job.state == .pending);
         return .requeued;
     }
@@ -412,10 +428,12 @@ pub const Store = struct {
             protocol.ErrorMessage.from(message[0..protocol.error_message_bytes_max]);
         job.clear_lease();
         job.updated_ns = now_ns;
+        store.stats.abandoned += 1;
         if (job.attempt >= store.config.reclaim_attempts) {
             fail_sessions(job);
             job.state = .failed;
             job.completed_ns = now_ns;
+            store.stats.failed += 1;
             return .{ answer, .failed };
         }
         job.state = .pending;
@@ -444,6 +462,7 @@ pub const Store = struct {
         job.state = .succeeded;
         job.completed_ns = now_ns;
         job.updated_ns = now_ns;
+        store.stats.succeeded += 1;
         for (&job.sessions) |*maybe| if (maybe.*) |*session| {
             const active = session.state == .submitting or session.state == .running;
             if (active) session.state = .completed;
@@ -469,6 +488,7 @@ pub const Store = struct {
         job.completed_ns = now_ns;
         job.updated_ns = now_ns;
         job.clear_lease();
+        store.stats.cancelled += 1;
         assert(job.terminal());
         return .cancelled;
     }
@@ -490,6 +510,7 @@ pub const Store = struct {
         for (store.jobs) |*job| {
             if (job.state != .claimed or !job.expired(now_ns)) continue;
             changed += 1;
+            store.stats.expired += 1;
             job.clear_lease();
             job.updated_ns = now_ns;
             if (job.attempt < store.config.reclaim_attempts) {
@@ -499,6 +520,7 @@ pub const Store = struct {
             fail_sessions(job);
             job.state = .failed;
             job.completed_ns = now_ns;
+            store.stats.failed += 1;
             job.error_message = .{};
             const text = std.fmt.bufPrint(
                 &job.error_message.buffer,

@@ -57,6 +57,8 @@ pub const Service = struct {
     message: [512]u8 = undefined,
     page: []*const store_module.Job,
     summaries: []protocol.ProofSummary,
+    /// JSON-RPC bodies handled.
+    requests: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -108,6 +110,7 @@ pub const Service = struct {
         request: *const http.Request,
         response: *http.ResponseBuilder,
     ) void {
+        service.requests += 1;
         _ = Router.handle(service, request.body, response.writer());
     }
 

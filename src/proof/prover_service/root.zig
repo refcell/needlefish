@@ -13,6 +13,7 @@ pub const client = @import("client.zig");
 pub const challenger_prover = @import("challenger_prover.zig");
 pub const proposer_native = @import("proposer_native.zig");
 pub const worker = @import("worker.zig");
+pub const exporter = @import("exporter.zig");
 pub const native_backend = @import("native_backend.zig");
 
 test {
