@@ -359,4 +359,22 @@ pub const StateTrie = struct {
         if (self.entries.getPtr(address_hash)) |entry| root_index = entry.storage_root;
         self.storage.prove_in(root_index, &slot_hash, proof);
     }
+
+    /// Hashed siblings along an account's path (see `TrieType.visit_siblings_in`).
+    pub fn visit_account_siblings(self: *StateTrie, address_hash: Hash, visitor: anytype) !void {
+        try self.flush();
+        assert(self.dirty_len == 0);
+        try self.accounts.visit_siblings_in(self.accounts.root, &address_hash, visitor);
+    }
+
+    /// Hashed siblings along a slot's path in the account's storage trie.
+    pub fn visit_storage_siblings(
+        self: *StateTrie,
+        address_hash: Hash,
+        slot_hash: Hash,
+        visitor: anytype,
+    ) !void {
+        const entry = self.entries.getPtr(address_hash) orelse return;
+        try self.storage.visit_siblings_in(entry.storage_root, &slot_hash, visitor);
+    }
 };

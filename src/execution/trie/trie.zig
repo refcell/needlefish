@@ -1148,5 +1148,47 @@ pub fn TrieType(comptime config: Config) type {
                 }
             }
         }
+
+        /// Calls `visitor.visit(encoding)` for every hashed child, off `key`'s path, of each
+        /// branch on `key`'s path. Deleting `key` can collapse such a branch into its last
+        /// child, which a stateless (sparse) delete must then decode: witnesses need these.
+        pub fn visit_siblings_in(
+            self: *Self,
+            root: NodeIndex,
+            key: []const u8,
+            visitor: anytype,
+        ) !void {
+            assert(key.len <= config.key_bytes_max);
+            _ = self.root_hash_of(root);
+            const path = Nibbles.from_bytes(key);
+            var rest: []const u8 = path.slice();
+            var index = root;
+            var depth: u32 = 0;
+            var buffer: [node_bytes_max]u8 = undefined;
+            while (index != none) : (depth += 1) {
+                assert(depth <= depth_max);
+                const current = &self.nodes[index];
+                switch (current.kind) {
+                    .free => unreachable, // Reachable nodes are never on the free list.
+                    .leaf => return,
+                    .extension => {
+                        if (!current.path_prefixes(rest)) return;
+                        rest = rest[current.path_len..];
+                        index = current.body.extension.child;
+                    },
+                    .branch => {
+                        if (rest.len == 0) return;
+                        for (current.body.branch[0..16], 0..) |child, nibble| {
+                            if (child == none or nibble == rest[0]) continue;
+                            assert(self.cache[child].len > 0);
+                            if (!self.cache[child].is_hash()) continue;
+                            try visitor.visit(self.encode_full(&self.nodes[child], &buffer));
+                        }
+                        index = current.body.branch[rest[0]];
+                        rest = rest[1..];
+                    },
+                }
+            }
+        }
     };
 }

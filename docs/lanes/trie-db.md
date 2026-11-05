@@ -32,11 +32,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`db/history.zig`; in memory only, not yet journaled or fed by `Database`)
 - [ ] Window pruner: bounded work per tick, removes history older than the window; crash-safe
   through the storage engine journal.
-- [ ] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
+- [x] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
   block, verified by re-executing statelessly against a sparse trie built from the witness.
+  (`db/witness.zig`, `trie/sparse.zig`; verification replays reads + the block's changeset,
+  `SparseState.database()` is the evm backend for real stateless re-execution)
 - [ ] Differential tests: historical proof at block N == proof from a State unwound to N;
   witness-only re-execution root == stored root (base/base `witness_differential`).
-  (historical half done in `db/history_test.zig`; witness half pending)
+  (historical half done in `db/history_test.zig`; witness-only changeset replay root == full
+  root in `db/witness_test.zig`; EVM re-execution over `SparseState` pending a block executor)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -191,6 +194,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   Paths are never freed (stale paths keep one base version): bounded by `paths_max`; the
   window pruner item should reclaim them.
 
+- Execution witness (`db/witness.zig`): alloy `ExecutionWitness` shape (`state`, `codes`,
+  `keys`, `headers` as byte lists). `Recorder` wraps the evm `Database` and records reads in
+  insertion order (bounded sets; full -> `StateFull`). `Builder.build` gathers a superset
+  (eth_getProof nodes of every read or written key, plus hashed siblings along deleted keys'
+  paths via `TrieType.visit_siblings_in`), replays reads + changeset on a `SparseState` over
+  it, and emits only the nodes the replay decoded: minimal for that replay, so dropping any
+  node is `WitnessIncomplete` (tested for every node). Chosen over computing exact collapse
+  siblings up front, which needs the post-order of deletes. Keys: addresses (20 B) then slot
+  keys (32 B), touched order. Headers are opaque caller bytes; `SparseState` maps them to
+  block hashes by decoding field 8 (number). A destroyed account's storage trie is dropped
+  whole, not slot by slot; a wipe without destroy deletes slot by slot (the changeset spells
+  them out), so its witness holds that storage trie.
+- Sparse trie (`trie/sparse.zig`): own pool (not `TrieType`): nodes are unresolved refs,
+  leaves, extensions, or branches; a node decoded from the witness keeps its preimage slice and
+  materializes children lazily (one pool node per untouched branch, not 17). Fixed 32-byte
+  keys only: branch values and off-length leaves are `InvalidWitness`. A delete resolves and
+  shape-checks the surviving sibling before changing anything, so `WitnessIncomplete` leaves
+  the trie unchanged.
+
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
   all ethereum/tests TrieTests vectors pass.
@@ -227,3 +249,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   rotten newest checkpoint (any sector) reopens via the older zone plus the longer journal.
   Engine fault injection now also rots the newest checkpoint (fallbacks asserted), database
   crash test too; superblock fallback fields fuzzed.
+- 2026-11-05: execution witness + stateless `SparseState`: witness-only replay root == full
+  State root (8 seeds x 4 blocks with deletes/wipes/destroys), every witness node required,
+  sparse trie differential against `TrieType` with shared prefixes, fuzzed node decoder.

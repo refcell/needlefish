@@ -7,6 +7,7 @@
 //! - `proof`: proof verification.
 //! - `ordered`: transactions, receipts, and withdrawals roots.
 //! - `state_trie`: account and storage tries with an incremental state root.
+//! - `sparse`: sparse trie over witness preimages, for stateless updates.
 
 const std = @import("std");
 
@@ -18,6 +19,7 @@ pub const trie = @import("trie.zig");
 pub const proof = @import("proof.zig");
 pub const ordered = @import("ordered.zig");
 pub const state_trie = @import("state_trie.zig");
+pub const sparse = @import("sparse.zig");
 pub const bench = @import("bench.zig");
 
 pub const Nibbles = nibbles.Nibbles;
@@ -31,6 +33,7 @@ pub const verify_proof = proof.verify;
 pub const ordered_trie_root = ordered.ordered_trie_root;
 pub const StateTrie = state_trie.StateTrie;
 pub const Account = state_trie.Account;
+pub const SparseTrie = sparse.SparseTrie;
 
 test {
     std.testing.refAllDecls(@This());
