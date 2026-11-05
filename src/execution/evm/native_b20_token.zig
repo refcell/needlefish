@@ -41,7 +41,8 @@ pub const role_operator: u256 =
 pub const wad: u256 = 1_000_000_000_000_000_000;
 pub const decimals_min: u8 = 6;
 pub const decimals_max: u8 = 18;
-/// V1 surfaces end at Beryl; V2 (Cobalt) adds seize, the UI multiplier, and metering.
+/// V1 surfaces end at Beryl; V2 (Cobalt) adds seize, the UI multiplier, and metering. V3
+/// (Denim) keeps the V2 ABI; its logic changes are gated on the upgrade in `native_b20`.
 pub const Version = enum(u8) { v1 = 1, v2 = 2 };
 
 pub fn version_of(context: *const Context) Version {
@@ -580,7 +581,9 @@ fn seize(context: *Context, arguments: *const Arguments) Error!void {
     const to = arguments.address(1);
     const amount = arguments.uint256(2);
     const invalid_receiver = b20.is_zero(to) or std.mem.eql(u8, &from, &to);
-    if (b20.is_zero(to)) return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    if (b20.receiver_rejected(context, to)) {
+        return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    }
     if (b20.is_zero(from)) return context.revert_word(b20.error_invalid_sender, address_word(from));
     if (invalid_receiver) return context.revert_word(b20.error_invalid_receiver, address_word(to));
     try b20.ensure_seizable(context, from);
@@ -600,7 +603,9 @@ fn mint_guarded(context: *Context, to: Address, amount: u256, privileged: bool) 
 
 /// Mint after pause/role checks: receiver, mint policy, supply cap, balance.
 fn mint(context: *Context, to: Address, amount: u256) Error!void {
-    if (b20.is_zero(to)) return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    if (b20.receiver_rejected(context, to)) {
+        return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    }
     try b20.ensure_policy(context, .mint_receiver, to);
     const supply = try context.sload(b20.slot_total_supply);
     const cap = try context.sload(b20.slot_supply_cap);

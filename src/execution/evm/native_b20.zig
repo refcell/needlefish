@@ -269,6 +269,30 @@ fn ensure_policy_id(context: *Context, scope: PolicyScope, id: u64, account: Add
 
 pub const TransferPolicies = struct { sender: u64, receiver: u64, executor: u64 };
 
+/// V3 (Denim) also rejects crediting the token's own address.
+pub fn receiver_rejected(context: *const Context, to: Address) bool {
+    if (is_zero(to)) return true;
+    return context.upgrade.at_least(.denim) and same(to, context.address);
+}
+
+/// V2: executor (only when caller != from), sender, receiver. V3: executor always; the sender
+/// check is skipped when caller == from and both lanes hold the same id.
+fn ensure_transfer_policies(context: *Context, from: Address, to: Address) Error!void {
+    const policies = try transfer_policies(context);
+    const caller = context.caller;
+    const own = same(caller, from);
+    if (context.upgrade.at_least(.denim)) {
+        try ensure_policy_id(context, .transfer_executor, policies.executor, caller);
+        if (!own or policies.executor != policies.sender) {
+            try ensure_policy_id(context, .transfer_sender, policies.sender, from);
+        }
+    } else {
+        if (!own) try ensure_policy_id(context, .transfer_executor, policies.executor, caller);
+        try ensure_policy_id(context, .transfer_sender, policies.sender, from);
+    }
+    try ensure_policy_id(context, .transfer_receiver, policies.receiver, to);
+}
+
 /// V2: the three transfer policy ids from one read of the packed slot.
 pub fn transfer_policies(context: *Context) Error!TransferPolicies {
     const packed_ids = try context.sload(slot_transfer_policies);
@@ -341,13 +365,11 @@ pub fn move_balance(context: *Context, from: Address, to: Address, amount: u256)
 pub fn transfer_v2(context: *Context, to: Address, amount: u256, privileged: bool) Error!void {
     try ensure_not_paused(context, .transfer);
     const from = context.caller;
-    if (is_zero(to)) return context.revert_word(error_invalid_receiver, address_word(to));
-    if (is_zero(from)) return context.revert_word(error_invalid_sender, address_word(from));
-    if (!privileged) {
-        const policies = try transfer_policies(context);
-        try ensure_policy_id(context, .transfer_sender, policies.sender, from);
-        try ensure_policy_id(context, .transfer_receiver, policies.receiver, to);
+    if (receiver_rejected(context, to)) {
+        return context.revert_word(error_invalid_receiver, address_word(to));
     }
+    if (is_zero(from)) return context.revert_word(error_invalid_sender, address_word(from));
+    if (!privileged) try ensure_transfer_policies(context, from, to);
     try move_balance(context, from, to, amount);
 }
 
@@ -360,7 +382,9 @@ pub fn transfer_from_v2(
     privileged: bool,
 ) Error!void {
     try ensure_not_paused(context, .transfer);
-    if (is_zero(to)) return context.revert_word(error_invalid_receiver, address_word(to));
+    if (receiver_rejected(context, to)) {
+        return context.revert_word(error_invalid_receiver, address_word(to));
+    }
     if (is_zero(from)) return context.revert_word(error_invalid_sender, address_word(from));
     const caller = context.caller;
     const allowance = try context.sload(allowance_slot(from, caller));
@@ -372,14 +396,7 @@ pub fn transfer_from_v2(
             word(amount),
         });
     }
-    if (!privileged) {
-        const policies = try transfer_policies(context);
-        if (!same(caller, from)) {
-            try ensure_policy_id(context, .transfer_executor, policies.executor, caller);
-        }
-        try ensure_policy_id(context, .transfer_sender, policies.sender, from);
-        try ensure_policy_id(context, .transfer_receiver, policies.receiver, to);
-    }
+    if (!privileged) try ensure_transfer_policies(context, from, to);
     try move_balance(context, from, to, amount);
     if (!is_infinite) try context.sstore(allowance_slot(from, caller), allowance - amount);
 }

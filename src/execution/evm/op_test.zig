@@ -822,7 +822,9 @@ fn fuzz_token(h: *Harness, smith: *testing.Smith) anyerror!void {
     const floor = 21_000 + calldata_gas(input) * 10 / 4;
     const gas_limit = floor + prng.below(120_000);
     const value: u256 = if (prng.chance(1, 16)) 1 else 0;
-    h.evm.block.op.?.upgrade = if (prng.chance(1, 2)) .beryl else .cobalt;
+    const upgrades = [3]@TypeOf(h.evm.block.op.?.upgrade){ .beryl, .cobalt, .denim };
+    const pick: usize = if (prng.chance(1, 3)) 0 else if (prng.chance(1, 2)) 1 else 2;
+    h.evm.block.op.?.upgrade = upgrades[pick];
     const token = if (prng.chance(1, 2)) token_address else stablecoin_address;
     const executed = try native_call_gas(h, token, input, value, gas_limit);
     try testing.expect(executed.gas_used <= gas_limit);
@@ -1130,4 +1132,22 @@ test "op: B-20 V2 schedules, matures, and cancels UI multiplier updates" {
     try testing.expectEqual(@as(usize, 2), set.logs.len);
     try testing.expectEqual(3 * wad, output_int(try token_call(&h, .multiplier, &.{})));
     try testing.expectEqual(@as(u256, 0), output_int(try token_call(&h, .effective_at, &.{})));
+}
+
+test "op: B-20 V3 rejects crediting the token and always checks the executor policy" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    _ = try token_call(&h, .mint, &.{ address_int(sender_address), 600 });
+    h.evm.block.op.?.upgrade = .cobalt;
+    const allowed = try token_call(&h, .transfer, &.{ address_int(token_address), 1 });
+    try testing.expect(allowed.status == .success);
+    h.evm.block.op.?.upgrade = .denim;
+    const rejected = try token_call(&h, .transfer, &.{ address_int(token_address), 1 });
+    try testing.expect(rejected.status == .revert);
+    try testing.expectEqualSlices(u8, &b20.error_invalid_receiver, rejected.output[0..4]);
+    const minted = try token_call(&h, .mint, &.{ address_int(token_address), 1 });
+    try testing.expect(minted.status == .revert);
+    const sent = try token_call(&h, .transfer, &.{ address_int(holder), 1 });
+    try testing.expect(sent.status == .success);
 }
