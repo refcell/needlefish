@@ -196,3 +196,7 @@ provably robust.
   host over hint and oracle duplexes; hinted gets return keccak-verified values,
   unhinted gets fail framed, bad hints are acknowledged. The proof lane already fuzzes
   key, hint text/frames, pipe, and oracle requests per module. 2/2 mutants caught.
+- 2026-11-05: model-based JSON-RPC router fuzz (`fuzz_targets_rpc.zig`): singles and
+  batches of calls, notifications, null/string ids, unknown methods, bad params,
+  failing and overflowing handlers, malformed objects; responses checked in order
+  against a spec model; arbitrary bodies give empty or valid JSON. 2/2 mutants caught.
