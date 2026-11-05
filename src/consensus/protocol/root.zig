@@ -6,6 +6,7 @@ const std = @import("std");
 pub const block = @import("block.zig");
 pub const frame = @import("frame.zig");
 pub const channel = @import("channel.zig");
+pub const brotli = @import("brotli.zig");
 pub const rollup_config = @import("rollup_config.zig");
 pub const system_config = @import("system_config.zig");
 pub const log = @import("log.zig");
