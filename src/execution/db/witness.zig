@@ -309,6 +309,8 @@ pub const NodeStore = struct {
     count: u32 = 0,
     arena: []u8,
     arena_len: u32 = 0,
+    /// Asked for preimages the store lacks (see `SparseState.Fallback`).
+    fallback: ?sparse.Resolver = null,
 
     pub fn init(allocator: std.mem.Allocator, items_max: u32, bytes_max: u32) !NodeStore {
         assert(items_max > 0);
@@ -365,7 +367,10 @@ pub const NodeStore = struct {
 
     fn resolve(context: *anyopaque, hash: *const Hash) ?[]const u8 {
         const self: *NodeStore = @ptrCast(@alignCast(context));
-        const position = self.index.get(hash.*) orelse return null;
+        const position = self.index.get(hash.*) orelse {
+            const fallback = self.fallback orelse return null;
+            return fallback.resolve(fallback.context, hash);
+        };
         const entry = &self.entries[position];
         entry.accessed = true;
         assert(std.mem.eql(u8, &entry.hash, hash));
@@ -427,6 +432,17 @@ pub const SparseState = struct {
     /// A read through `database()` failed for want of witness data (the evm only sees
     /// `DatabaseFailure`).
     incomplete: bool = false,
+    fallback: ?Fallback = null,
+
+    /// Source for trie nodes, codes and block hashes missing from the loaded witness, for
+    /// a verifier that fetches them on demand (the fault-proof program's preimage
+    /// oracle). Returned slices must stay valid until `reset`. Null means missing.
+    pub const Fallback = struct {
+        context: *anyopaque,
+        node: *const fn (context: *anyopaque, hash: *const Hash) ?[]const u8,
+        code: *const fn (context: *anyopaque, hash: *const Hash) ?[]const u8,
+        block_hash: *const fn (context: *anyopaque, number: u64) ?Hash,
+    };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !SparseState {
         assert(config.storage_tries_max > 0);
@@ -475,6 +491,14 @@ pub const SparseState = struct {
         // The pool was just emptied and has at least one node.
         self.account_root = self.trie.root_from_hash(pre_state_root) catch unreachable;
         assert(self.state_root_clean(pre_state_root));
+    }
+
+    /// Consults `fallback` whenever the witness lacks a node, code or block hash.
+    pub fn set_fallback(self: *SparseState, fallback: ?Fallback) void {
+        self.fallback = fallback;
+        self.nodes.fallback = null;
+        if (fallback) |f| self.nodes.fallback = .{ .context = f.context, .resolve = f.node };
+        assert((self.fallback == null) == (self.nodes.fallback == null));
     }
 
     fn state_root_clean(self: *SparseState, root: Hash) bool {
@@ -540,14 +564,26 @@ pub const SparseState = struct {
 
     pub fn code_by_hash(self: *SparseState, hash: Hash) Error![]const u8 {
         if (std.mem.eql(u8, &hash, &node.empty_code_hash)) return &.{};
-        return self.codes.get(&hash) orelse error.WitnessIncomplete;
+        if (self.codes.get(&hash)) |code| return code;
+        const fallback = self.fallback orelse return error.WitnessIncomplete;
+        return fallback.code(fallback.context, &hash) orelse error.WitnessIncomplete;
     }
 
     pub fn block_hash(self: *const SparseState, number: u64) ?Hash {
         for (self.headers[0..self.headers_len]) |entry| {
             if (entry.number == number) return entry.hash;
         }
-        return null;
+        const fallback = self.fallback orelse return null;
+        return fallback.block_hash(fallback.context, number);
+    }
+
+    /// The storage root in `address`'s account leaf (post-state after `apply`), or the
+    /// empty root for a missing account.
+    pub fn account_storage_root(self: *SparseState, address: Address) Error!Hash {
+        const account = try self.account_state(&node.keccak256(&address)) orelse {
+            return node.empty_root;
+        };
+        return account.storage_root;
     }
 
     /// The state root after every `apply` so far.
