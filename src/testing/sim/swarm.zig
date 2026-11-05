@@ -14,7 +14,13 @@ const Config = cluster_module.Config;
 const Cluster = cluster_module.Cluster;
 
 /// Seeds that once failed, kept forever as regression tests. Append on every fix.
-pub const regression_seeds = [_]u64{};
+/// They are tied to `Config.random`: when config generation changes, a seed maps to a
+/// new config and only keeps value as extra coverage.
+pub const regression_seeds = [_]u64{
+    56, // Checkpoint restored safe head without the matching L1 block hash.
+    1275, 2506, // Rewind restored a safe head above the post-restart unsafe head.
+    3426, 4530, // Clamping that safe head instead left a derivation gap.
+};
 
 pub const Outcome = enum { ok, safety, liveness };
 
@@ -54,7 +60,7 @@ pub fn run_range(allocator: std.mem.Allocator, seed_first: u64, count: u64) !Ran
     return result;
 }
 
-const reduction_count = 11;
+const reduction_count = 12;
 
 /// Apply reduction `index` to `config`. Returns null when it would change nothing.
 fn reduce(config: Config, index: u32) ?Config {
@@ -78,6 +84,7 @@ fn reduce(config: Config, index: u32) ?Config {
         },
         9 => next.crashes_per_minute = config.crashes_per_minute / 2,
         10 => next.clock_skew_ns_max = 0,
+        11 => next.l1_reorgs_per_minute = 0,
         else => unreachable,
     }
     if (std.meta.eql(next, config)) return null;

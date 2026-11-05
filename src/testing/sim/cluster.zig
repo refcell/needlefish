@@ -41,6 +41,7 @@ pub const Config = struct {
     /// Probability a restart loses the latest durable write, in parts per million.
     disk_fault_ppm: u32 = 100_000,
     downtime_ns_max: u64 = 60 * ns_per_s,
+    l1_reorgs_per_minute: u32 = 0,
     /// Each non-L1 node's clock is offset by up to this much, re-drawn on restart.
     clock_skew_ns_max: u64 = 0,
 
@@ -62,6 +63,7 @@ pub const Config = struct {
             .disk_fault_ppm = @intCast(swarm_level(prng, 500_000)),
             .downtime_ns_max = prng.range(1, 120) * ns_per_s,
             .clock_skew_ns_max = swarm_level(prng, 30) * ns_per_s,
+            .l1_reorgs_per_minute = @intCast(swarm_level(prng, 3)),
         };
         config.validate();
         return config;
@@ -101,6 +103,7 @@ pub const Report = struct {
     crashes: u64 = 0,
     partitions: u64 = 0,
     disk_faults: u64 = 0,
+    l1_reorgs: u64 = 0,
     sequencer_head: u64 = 0,
     l1_head: u64 = 0,
     network: network_module.Stats = .{},
@@ -115,7 +118,7 @@ pub const Cluster = struct {
     network: nodes.Net,
     l1: nodes.L1,
     sequencer: nodes.Sequencer,
-    batcher: nodes.Batcher = .{},
+    batcher: nodes.Batcher,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
     restart_ns: [network_module.node_count_max]?u64 = @splat(null),
@@ -123,6 +126,8 @@ pub const Cluster = struct {
     clock_offset_ns: [network_module.node_count_max]i64 = @splat(0),
     heal_ns: ?u64 = null,
     safe_floor: [verifier_count_max]u64 = @splat(0),
+    /// Follower rewinds seen per verifier; an L1 reorg may legitimately lower safe heads.
+    rewinds_seen: [verifier_count_max]u64 = @splat(0),
     report: Report = .{},
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, config: Config) !Cluster {
@@ -133,14 +138,18 @@ pub const Cluster = struct {
         errdefer l1.deinit(allocator);
         var sequencer_chain = try nodes.Chain.init(allocator, config.block_count_max());
         errdefer sequencer_chain.deinit(allocator);
+        var batcher = try nodes.Batcher.init(allocator, config.l1_block_count_max());
+        errdefer batcher.deinit(allocator);
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
-        errdefer for (verifiers[0..initialized]) |*v| v.chain.deinit(allocator);
+        errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
         while (initialized < config.verifier_count) : (initialized += 1) {
-            verifiers[initialized] = .{
-                .id = nodes.node_verifier_first + initialized,
-                .chain = try nodes.Chain.init(allocator, config.block_count_max()),
-            };
+            verifiers[initialized] = try nodes.Verifier.init(
+                allocator,
+                nodes.node_verifier_first + initialized,
+                config.block_count_max(),
+                config.l1_block_count_max(),
+            );
         }
         return .{
             .config = config,
@@ -154,12 +163,14 @@ pub const Cluster = struct {
                 .block_time_ns = config.l2_block_time_ns,
                 .next_block_ns = config.l2_block_time_ns,
             },
+            .batcher = batcher,
             .verifiers = verifiers,
         };
     }
 
     pub fn deinit(cluster: *Cluster, allocator: std.mem.Allocator) void {
-        for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| v.chain.deinit(allocator);
+        for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| v.deinit(allocator);
+        cluster.batcher.deinit(allocator);
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -262,6 +273,13 @@ pub const Cluster = struct {
                 cluster.report.crashes += 1;
             }
         }
+        if (prng.chance(cluster.config.l1_reorgs_per_minute, steps_per_minute)) {
+            const depth_max = @min(nodes.l1_reorg_depth_max, cluster.l1.head);
+            if (depth_max > 0) {
+                cluster.l1.reorg(prng.range(1, depth_max));
+                cluster.report.l1_reorgs += 1;
+            }
+        }
         if (cluster.heal_ns) |heal_ns| {
             if (cluster.now_ns >= heal_ns) {
                 cluster.network.heal();
@@ -321,6 +339,10 @@ pub const Cluster = struct {
         for (cluster.verifiers[0..cluster.config.verifier_count], 0..) |*v, index| {
             if (v.safe_head > v.unsafe_head) return cluster.fail("safe > unsafe", v.id);
             if (v.unsafe_head > sequencer.head) return cluster.fail("unsafe > sequencer", v.id);
+            if (v.follower.rewinds != cluster.rewinds_seen[index]) {
+                cluster.rewinds_seen[index] = v.follower.rewinds;
+                cluster.safe_floor[index] = v.safe_head;
+            }
             if (v.safe_head < cluster.safe_floor[index]) {
                 return cluster.fail("safe head decreased", v.id);
             }

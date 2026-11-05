@@ -30,6 +30,9 @@ pub const node_batcher: NodeId = 2;
 pub const node_verifier_first: NodeId = 3;
 
 pub const genesis_hash: u64 = 0x6765_6e65_7369_7300;
+pub const l1_genesis_hash: u64 = 0x6c31_6765_6e65_7369;
+/// Deepest L1 reorg the fault injector produces. Followers must handle any depth.
+pub const l1_reorg_depth_max = 3;
 
 pub fn block_hash(parent_hash: u64, number: u64, payload: u64) u64 {
     assert(number > 0);
@@ -45,6 +48,9 @@ pub const Batch = struct {
 
 pub const L1Block = struct {
     number: u64,
+    /// Random per block version: a reorged block at the same height gets a new hash.
+    hash: u64,
+    parent_hash: u64,
     batch_count: u8,
     batches: [l1_batches_max]Batch,
 };
@@ -167,11 +173,18 @@ pub const L1 = struct {
     next_block_ns: u64,
     mempool: [l1_mempool_max]Batch = undefined,
     mempool_count: u8 = 0,
+    reorgs: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, block_count_max: u64, block_time_ns: u64) !L1 {
         assert(block_time_ns > 0);
         const blocks = try allocator.alloc(L1Block, block_count_max + 1);
-        blocks[0] = .{ .number = 0, .batch_count = 0, .batches = undefined };
+        blocks[0] = .{
+            .number = 0,
+            .hash = l1_genesis_hash,
+            .parent_hash = 0,
+            .batch_count = 0,
+            .batches = undefined,
+        };
         return .{ .blocks = blocks, .block_time_ns = block_time_ns, .next_block_ns = 0 };
     }
 
@@ -187,6 +200,8 @@ pub const L1 = struct {
         const number = l1.head + 1;
         const block = &l1.blocks[number];
         block.number = number;
+        block.parent_hash = l1.blocks[l1.head].hash;
+        block.hash = env.prng.int(u64) | 1;
         block.batch_count = @min(l1.mempool_count, l1_batches_max);
         @memcpy(block.batches[0..block.batch_count], l1.mempool[0..block.batch_count]);
         std.mem.copyForwards(
@@ -201,6 +216,31 @@ pub const L1 = struct {
         while (verifier < env.verifier_count) : (verifier += 1) {
             env.send(node_l1, node_verifier_first + verifier, .{ .l1_block = block.* });
         }
+    }
+
+    /// Orphan the top `depth` blocks. Their batches return to the mempool front when
+    /// there is room (as re-broadcast transactions would); the rest are lost and the
+    /// batcher must resubmit. Replacement blocks follow on the normal schedule.
+    pub fn reorg(l1: *L1, depth: u64) void {
+        assert(depth > 0 and depth <= l1_reorg_depth_max);
+        assert(depth <= l1.head);
+        var restored: [l1_mempool_max]Batch = undefined;
+        var restored_count: u8 = 0;
+        var number = l1.head + 1 - depth;
+        while (number <= l1.head) : (number += 1) {
+            const block = &l1.blocks[number];
+            for (block.batches[0..block.batch_count]) |batch| {
+                if (restored_count == l1_mempool_max) break;
+                restored[restored_count] = batch;
+                restored_count += 1;
+            }
+        }
+        const kept = @min(l1.mempool_count, l1_mempool_max - restored_count);
+        @memcpy(restored[restored_count..][0..kept], l1.mempool[0..kept]);
+        l1.mempool_count = restored_count + kept;
+        @memcpy(l1.mempool[0..l1.mempool_count], restored[0..l1.mempool_count]);
+        l1.head -= depth;
+        l1.reorgs += 1;
     }
 
     pub fn on_message(l1: *L1, env: *const Env, from: NodeId, message: Message) void {
@@ -220,26 +260,75 @@ pub const L1 = struct {
     }
 };
 
-/// Follows L1 in order, re-requesting missed blocks. Embedded in batcher and verifier.
+/// Follows L1 in order, re-requesting missed blocks and detecting reorgs by hash.
+/// Embedded in batcher and verifier; `hashes` is durable across restarts.
 pub const L1Follower = struct {
+    /// Hash of every processed L1 block, index = number.
+    hashes: []u64,
     /// Next L1 block number to process.
     cursor: u64 = 1,
     head_known: u64 = 0,
     request_ns: u64 = 0,
+    rewinds: u64 = 0,
 
     pub const request_timeout_ns: u64 = 1 * std.time.ns_per_s;
 
-    /// Returns true when `block` is the next block to process.
-    pub fn accept(follower: *L1Follower, env: *const Env, self: NodeId, block: L1Block) bool {
+    pub const Accepted = struct {
+        /// Owner must restore its state to just after L1 block `rewind_to - 1`.
+        rewind_to: ?u64 = null,
+        /// Owner must process the block (after any rewind).
+        process: bool = false,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, block_count_max: u64) !L1Follower {
+        const hashes = try allocator.alloc(u64, block_count_max + 1);
+        @memset(hashes, 0);
+        hashes[0] = l1_genesis_hash;
+        return .{ .hashes = hashes };
+    }
+
+    pub fn deinit(follower: *L1Follower, allocator: std.mem.Allocator) void {
+        allocator.free(follower.hashes);
+        follower.* = undefined;
+    }
+
+    /// Restart from a durable cursor: hashes below it are on disk.
+    pub fn reset(follower: *L1Follower, cursor: u64) void {
+        assert(cursor > 0);
+        follower.* = .{ .hashes = follower.hashes, .cursor = cursor, .rewinds = follower.rewinds };
+    }
+
+    pub fn accept(follower: *L1Follower, env: *const Env, self: NodeId, block: L1Block) Accepted {
         assert(block.number > 0);
+        if (block.number >= follower.hashes.len) return .{};
         follower.head_known = @max(follower.head_known, block.number);
-        if (block.number == follower.cursor) {
-            follower.cursor += 1;
-            if (follower.cursor <= follower.head_known) follower.request(env, self);
-            return true;
+        var result: Accepted = .{};
+        if (block.number < follower.cursor) {
+            if (follower.hashes[block.number] == block.hash) return .{};
+            // Reorg: this height changed under us. Re-derive from here.
+            follower.cursor = block.number;
+            result.rewind_to = block.number;
         }
-        if (block.number > follower.cursor) follower.request(env, self);
-        return false;
+        if (block.number > follower.cursor) {
+            follower.request(env, self);
+            return result;
+        }
+        assert(block.number == follower.cursor);
+        if (block.parent_hash != follower.hashes[block.number - 1]) {
+            // The reorg goes deeper than this block: step back and fetch the parent.
+            assert(block.number > 1); // Genesis never reorgs.
+            follower.cursor = block.number - 1;
+            result.rewind_to = follower.cursor;
+            follower.rewinds += 1;
+            follower.request(env, self);
+            return result;
+        }
+        if (result.rewind_to != null) follower.rewinds += 1;
+        follower.hashes[block.number] = block.hash;
+        follower.cursor += 1;
+        if (follower.cursor <= follower.head_known) follower.request(env, self);
+        result.process = true;
+        return result;
     }
 
     pub fn tick(follower: *L1Follower, env: *const Env, self: NodeId) void {
@@ -270,7 +359,9 @@ pub fn batch_extension(head: u64, batch: Batch) ?struct { first: u64, last: u64 
 }
 
 pub const Batcher = struct {
-    follower: L1Follower = .{},
+    follower: L1Follower,
+    /// Confirmed head after each processed L1 block, for rewinds on L1 reorgs.
+    confirmed_at: []u64,
     /// Highest L2 block included contiguously on L1.
     confirmed: u64 = 0,
     /// Highest L2 block submitted to L1.
@@ -282,6 +373,20 @@ pub const Batcher = struct {
     pub const submit_interval_ns: u64 = 6 * std.time.ns_per_s;
     pub const resubmit_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
+    pub fn init(allocator: std.mem.Allocator, l1_block_count_max: u64) !Batcher {
+        var follower = try L1Follower.init(allocator, l1_block_count_max);
+        errdefer follower.deinit(allocator);
+        const confirmed_at = try allocator.alloc(u64, l1_block_count_max + 1);
+        @memset(confirmed_at, 0);
+        return .{ .follower = follower, .confirmed_at = confirmed_at };
+    }
+
+    pub fn deinit(batcher: *Batcher, allocator: std.mem.Allocator) void {
+        batcher.follower.deinit(allocator);
+        allocator.free(batcher.confirmed_at);
+        batcher.* = undefined;
+    }
+
     pub fn tick(batcher: *Batcher, env: *const Env, sequencer: *const Sequencer) void {
         batcher.follower.tick(env, node_batcher);
         if (env.now_ns < batcher.next_submit_ns) return;
@@ -290,7 +395,7 @@ pub const Batcher = struct {
         assert(batcher.submitted >= batcher.confirmed);
         if (batcher.submitted == batcher.confirmed) batcher.progress_ns = env.now_ns;
         if (env.now_ns > batcher.progress_ns + resubmit_timeout_ns) {
-            // Submissions were lost (dropped, mempool full, or partition): resubmit.
+            // Submissions were lost (dropped, mempool full, partition, reorg): resubmit.
             batcher.submitted = batcher.confirmed;
             batcher.progress_ns = env.now_ns;
         }
@@ -314,24 +419,41 @@ pub const Batcher = struct {
             .l1_block => |block| block,
             else => return,
         };
-        if (!batcher.follower.accept(env, node_batcher, block)) return;
+        const accepted = batcher.follower.accept(env, node_batcher, block);
+        if (accepted.rewind_to) |cursor| {
+            batcher.confirmed = batcher.confirmed_at[cursor - 1];
+            batcher.progress_ns = env.now_ns;
+        }
+        if (!accepted.process) return;
         for (block.batches[0..block.batch_count]) |batch| {
             if (batch_extension(batcher.confirmed, batch)) |extension| {
                 batcher.confirmed = extension.last;
                 batcher.progress_ns = env.now_ns;
             }
         }
+        batcher.confirmed_at[block.number] = batcher.confirmed;
     }
 
     /// Crash-restart: the batcher keeps no state; it re-reads L1 from genesis.
     pub fn restart(batcher: *Batcher, env: *const Env) void {
-        batcher.* = .{ .next_submit_ns = env.now_ns, .progress_ns = env.now_ns };
+        batcher.follower.reset(1);
+        batcher.* = .{
+            .follower = batcher.follower,
+            .confirmed_at = batcher.confirmed_at,
+            .next_submit_ns = env.now_ns,
+            .progress_ns = env.now_ns,
+        };
     }
 };
 
+/// Written atomically after each L1 block. It must name the L1 block it reflects
+/// (`l1_hash`): the per-block arrays may already hold a newer version of that height,
+/// and restoring `safe_head` without the matching hash leaves the follower believing
+/// it derived a block it did not (found by the swarm: seed 56, L1 reorg + disk fault).
 pub const Checkpoint = struct {
     safe_head: u64 = 0,
     l1_cursor: u64 = 1,
+    l1_hash: u64 = l1_genesis_hash,
 };
 
 pub const Verifier = struct {
@@ -339,7 +461,9 @@ pub const Verifier = struct {
     chain: Chain,
     safe_head: u64 = 0,
     unsafe_head: u64 = 0,
-    follower: L1Follower = .{},
+    follower: L1Follower,
+    /// Safe head after each processed L1 block (durable), for rewinds on L1 reorgs.
+    safe_at: []u64,
     /// Last two durable checkpoints. A disk fault loses the latest write.
     checkpoint: Checkpoint = .{},
     checkpoint_previous: Checkpoint = .{},
@@ -350,6 +474,29 @@ pub const Verifier = struct {
     equivocations: u64 = 0,
 
     pub const sync_timeout_ns: u64 = 500 * std.time.ns_per_ms;
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        id: NodeId,
+        block_count_max: u64,
+        l1_block_count_max: u64,
+    ) !Verifier {
+        assert(id >= node_verifier_first);
+        var chain = try Chain.init(allocator, block_count_max);
+        errdefer chain.deinit(allocator);
+        var follower = try L1Follower.init(allocator, l1_block_count_max);
+        errdefer follower.deinit(allocator);
+        const safe_at = try allocator.alloc(u64, l1_block_count_max + 1);
+        @memset(safe_at, 0);
+        return .{ .id = id, .chain = chain, .follower = follower, .safe_at = safe_at };
+    }
+
+    pub fn deinit(verifier: *Verifier, allocator: std.mem.Allocator) void {
+        verifier.chain.deinit(allocator);
+        verifier.follower.deinit(allocator);
+        allocator.free(verifier.safe_at);
+        verifier.* = undefined;
+    }
 
     pub fn tick(verifier: *Verifier, env: *const Env) void {
         verifier.follower.tick(env, verifier.id);
@@ -366,12 +513,24 @@ pub const Verifier = struct {
             },
             .l1_block => |block| {
                 assert(from == node_l1);
-                if (!verifier.follower.accept(env, verifier.id, block)) return;
+                const accepted = verifier.follower.accept(env, verifier.id, block);
+                if (accepted.rewind_to) |cursor| {
+                    // L1 reorg: safe blocks derived from orphaned L1 blocks are no longer
+                    // safe. Unsafe blocks stay; re-derivation will confirm or replace them.
+                    verifier.safe_head = verifier.safe_at[cursor - 1];
+                    // After a restart the unsafe head may sit below what the per-block
+                    // record says was derived. Those blocks are on disk (the chain is
+                    // durable), so take them back rather than leave a derivation gap.
+                    verifier.unsafe_head = @max(verifier.unsafe_head, verifier.safe_head);
+                }
+                if (!accepted.process) return;
                 for (block.batches[0..block.batch_count]) |batch| verifier.derive(batch);
+                verifier.safe_at[block.number] = verifier.safe_head;
                 verifier.checkpoint_previous = verifier.checkpoint;
                 verifier.checkpoint = .{
                     .safe_head = verifier.safe_head,
                     .l1_cursor = verifier.follower.cursor,
+                    .l1_hash = block.hash,
                 };
             },
             else => {},
@@ -441,7 +600,9 @@ pub const Verifier = struct {
         assert(checkpoint.l1_cursor > 0);
         verifier.safe_head = checkpoint.safe_head;
         verifier.unsafe_head = checkpoint.safe_head;
-        verifier.follower = .{ .cursor = checkpoint.l1_cursor };
+        verifier.follower.reset(checkpoint.l1_cursor);
+        verifier.follower.hashes[checkpoint.l1_cursor - 1] = checkpoint.l1_hash;
+        verifier.safe_at[checkpoint.l1_cursor - 1] = checkpoint.safe_head;
         verifier.checkpoint = checkpoint;
         verifier.checkpoint_previous = checkpoint;
         verifier.sequencer_head_known = 0;

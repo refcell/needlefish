@@ -43,3 +43,6 @@ provably robust.
   reassembly vs model, trie proof tamper + garbage. Uncovered list: re-audit as lanes land.
 - 2026-11-05: sim clock skew (per-node offset, re-drawn on restart = clock jumps; network
   stays on global time); minimizer reduction for skew.
+- 2026-11-05: sim L1 reorgs (hash-linked L1, follower rewind, per-L1-block safe/confirmed
+  records). Swarm found 3 model bugs, all durable-state atomicity: checkpoint without its
+  L1 hash; rewind above post-restart unsafe head; clamp leaving a gap. 10k seeds green.

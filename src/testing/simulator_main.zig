@@ -61,8 +61,12 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
         .{ seed, report.steps, report.sequencer_head, report.l1_head },
     );
     std.debug.print(
-        "  crashes={d} partitions={d} disk_faults={d} sent={d} delivered={d} dropped={d}\n",
-        .{ report.crashes, report.partitions, report.disk_faults, n.sent, n.delivered, dropped },
+        "  crashes={d} partitions={d} disk_faults={d} l1_reorgs={d} sent={d} delivered={d} " ++
+            "dropped={d}\n",
+        .{
+            report.crashes, report.partitions, report.disk_faults, report.l1_reorgs,
+            n.sent,         n.delivered,       dropped,
+        },
     );
 }
 
@@ -71,7 +75,7 @@ fn print_config(config: Config) void {
     std.debug.print(
         "  verifiers={d} latency={d}..{d}ms drop={d}ppm dup={d}ppm crashes/min={d} " ++
             "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
-            "clock_skew_max={d}ms\n",
+            "clock_skew_max={d}ms l1_reorgs/min={d}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -84,6 +88,7 @@ fn print_config(config: Config) void {
             config.downtime_ns_max / ms,
             config.fault_end_ns / ms,
             config.clock_skew_ns_max / ms,
+            config.l1_reorgs_per_minute,
         },
     );
 }
