@@ -21,7 +21,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `native_abi.zig`).
 - [x] PolicyRegistry V2 (Cobalt: composite policies, children arrays with tail cleanup) and
   V3 (Denim: inverted policy ids).
-- [ ] Base native precompiles (Beryl+: B20 factory, B20 tokens). Breakdown (base/base
+- [x] Base native precompiles (Beryl+: B20 factory, B20 tokens). Breakdown (base/base
   `crates/common/precompiles/src`, non-test lines): common core storage/accounting/ops
   (~1k), factory (~1k: dispatch, variant address derivation, logic v1), Asset V1/V2/V3
   (~3.5k), Stablecoin V1/V2/V3 (~2.5k), dynamic lookup (`lookup.rs`, 0xb2-prefixed
@@ -79,6 +79,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   ReleaseSafe soak clean. The GeneralStateTests are the differential check against the
   reference clients (zero dependencies rules out linking another EVM).
 - [x] Performance: micro benchmarks (`evm/bench.zig`, results in docs/PERF.md).
+- [ ] EIP-8130 execution (Everest, type 0x79). The tx type, structure checks, and intrinsic
+  gas live in `src/common/consensus/eip8130*.zig` (common lane); the EVM side mirrors base
+  `crates/execution/eip8130/src` (~8k non-test lines) and `crates/common/evm2/src`
+  (`everest.rs`, `transaction.rs`, `handler.rs`). Order: (1) AccountConfiguration storage
+  (`account_config.rs`: actor configs, policies) as `eip8130_config.zig`; (2) authenticator
+  verification (`verify.rs`); (3) config-change authorization (`authorize.rs`); (4) the
+  account-changes apply step (`apply.rs`: authorize/revoke/create, CREATE2 address,
+  delegation indicator, `IAccountConfiguration` logs); (5) validate/fee/payer/dispatch
+  (`validate.rs`, `fee.rs`, `dispatch.rs`) and nonce-manager integration; (6) wire 0x79
+  into `transaction.zig` from Everest with receipts.
 - [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
   compare with revm on the same machine; profile call-frame and keccak paths.
 
