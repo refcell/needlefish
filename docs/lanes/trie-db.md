@@ -113,10 +113,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`SparseState.apply_hashed` + `ChangesetHashes` from `Builder.hash_keys`; batched
   `SparseTrie.update_root_refs`; one account lookup per storage run; storage-heavy build
   15.7 -> 12.5 ms, verifier replay 9.9 -> 8.2-9.4 ms; docs/PERF.md "db witness: hashed keys")
-- [ ] The verified witness build is still ~8 ms of sparse apply on the storage-heavy block,
+- [x] The verified witness build is still ~8 ms of sparse apply on the storage-heavy block,
   split between node keccak, RLP decode (~15k pool nodes resolved, `decode_node` again for
   dirty branches' unloaded children at rehash) and pool-node copies. Cache decoded child refs
   or decode lazily per item.
+  (unloaded child slots hold item offsets into the parent preimage, one-pass branch decode,
+  direct dirty-branch encoding, digest-keyed maps; storage-heavy build 16.1 -> 10.8 ms,
+  replay 9.6 -> 6.4 ms under load; docs/PERF.md "db witness: sparse apply without
+  re-decoding")
+- [ ] The sparse apply is now keccak-bound: ~32% of the storage-heavy verified build is the
+  rehash of ~15k dirty nodes (two lanes per `keccak256_batch` on NEON) and ~13% is `resolve`
+  (branch scan + first touch of each preimage). Options: a wider software batch on aarch64
+  (4 lanes over two NEON registers), or skip the post-root rehash where a caller only needs
+  the witness (`verify_root = false` already does).
 - [x] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
   size the rpc response buffer for witnesses or stream the JSON.
   (shared lazy large send buffers in `http.server` (`Options.large_send_buffers_max/size`,
@@ -527,6 +536,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   through `keccak256_batch` (one waiting slot per length and batch lane, flushed one by one at
   the end of the level) instead of sorting by length. The serial post-order rehash stays as
   `root_hash_serial`, fuzzed against it ("seeded differential of the batched root").
+- `SparseTrie` unloaded children: a child slot of a witness-decoded node is a pool index, `none`,
+  or `unloaded_first + offset` where `offset` (< 1024; preimages are at most 532 bytes) is
+  the byte offset of the child's RLP item in the parent's preimage. A valid child item (32-byte
+  hash string or short list) is its own reference, so materializing or rehashing reads it in
+  place. Chosen over caching decoded `RlpNode`s per branch (544 B per node) because the
+  offset fits in the existing slot. `decode_layout` (offsets) is the strict decoder;
+  `decode_node` copies the references out of it. Branches go through a one-pass scan first
+  (`decode_branch_fast`), fuzzed to accept exactly what the item decoder accepts.
+- Witness hash maps (`NodeStore.index`, `SparseState.storage_roots`) use `DigestContext`:
+  keys are keccak digests, so the map hash is their first eight bytes. As deterministic as
+  the unseeded `AutoContext` it replaces, and digests are equally grindable under both.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -766,6 +786,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   12.5 ms, 1k-account 3.2 -> 2.5 ms, evm block 2.2 -> 1.8-2.0 ms; verifier replay 9.9 ->
   8.2-9.4 ms. Witness bytes identical to before (differential digests across 72 builds);
   new seeded differential of batched vs serial sparse roots over three tries per pool.
+- 2026-11-05: sparse apply without re-decoding: unloaded child slots carry the child's item
+  offset in the parent preimage (no `decode_node` at rehash or in `child_at`), one-pass
+  branch decode in `resolve`, dirty branches encoded straight from cached refs, digest-keyed
+  witness maps. Storage-heavy verified build 16.1 -> 10.8 ms, unverified 5.1 -> 4.2 ms,
+  replay 9.6 -> 6.4 ms; 1k-account 2.59 -> 1.96 ms; evm block 2.11 -> 1.35 ms, stateless evm
+  1.35 -> 0.98 ms (interleaved medians, load 50-75). Witness bytes unchanged (same node
+  counts and sizes; differential, codec, rpc and proof tests pass); fast branch decode fuzzed
+  against the item decoder.
 - 2026-11-05: history window rebuilt on open: `open` unwinds State through the retained
   canonical changesets to the window start, `reset`s history there, and re-applies with
   `commit_block` (O(window) at open, configurable). Seeded workload (2 seeds + a retention-4

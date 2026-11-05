@@ -11,7 +11,10 @@
 //! every leaf ends exactly at the key's last nibble. Nodes that break these rules are
 //! `error.InvalidWitness`. Many tries share one fixed node pool (`*_in` style roots), sized
 //! at init. Children of a node decoded from the witness are materialized lazily from its
-//! preimage, so an untouched branch costs one pool node, not seventeen. No recursion.
+//! preimage, so an untouched branch costs one pool node, not seventeen: each child slot holds
+//! the byte offset of the child's item in that preimage until then, so neither materializing
+//! a child nor rehashing a dirty branch over unloaded children decodes the preimage again.
+//! No recursion.
 //!
 //! Root computation rehashes dirty nodes level by level, deepest first, across any number
 //! of tries at once (`update_root_refs`), batching equal-length encodings through
@@ -64,8 +67,36 @@ pub const DecodeError = error{InvalidNode};
 
 pub const NodeIndex = u32;
 pub const none: NodeIndex = std.math.maxInt(NodeIndex);
-/// A child present in the parent's preimage but not yet given a pool node.
-const unloaded: NodeIndex = none - 1;
+/// Bound on a decoded node's preimage, so a child's item offset fits an `unloaded` slot.
+const source_bytes_max = 1024;
+/// A child present in the parent's preimage but not yet given a pool node is
+/// `unloaded_first + offset`, where `offset` locates its RLP item in the parent's `source`:
+/// materializing or re-referencing it never decodes the parent again.
+const unloaded_first: NodeIndex = none - source_bytes_max;
+
+comptime {
+    // Every preimage `decode_layout` accepts is at most a full branch.
+    assert(encoding_bytes_max < source_bytes_max);
+    assert(unloaded_first > std.math.maxInt(u16));
+}
+
+fn unloaded_at(offset: u32) NodeIndex {
+    assert(offset > 0 and offset < source_bytes_max);
+    const index = unloaded_first + offset;
+    assert(index != none);
+    return index;
+}
+
+fn is_unloaded(index: NodeIndex) bool {
+    return index >= unloaded_first and index != none;
+}
+
+fn unloaded_offset(index: NodeIndex) u32 {
+    assert(is_unloaded(index));
+    const offset = index - unloaded_first;
+    assert(offset > 0);
+    return offset;
+}
 
 pub const DecodedKind = enum { leaf, extension, branch };
 
@@ -79,34 +110,125 @@ pub const Decoded = struct {
     children: [16]RlpNode = @splat(.{}),
 };
 
-fn decode_child(item: rlp.Item) DecodeError!RlpNode {
+/// One node as decoded from its RLP with child references left in the input: each is
+/// located by the byte offset of its RLP item, 0 when empty (offset 0 is the list header).
+pub const Layout = struct {
+    kind: DecodedKind,
+    path: Nibbles = .{},
+    /// Leaf value.
+    value: []const u8 = &.{},
+    /// Child item offsets by nibble; an extension uses slot 0.
+    child_offsets: [16]u16 = @splat(0),
+};
+
+/// Whether a branch or extension child item is present; rejects malformed references.
+fn check_child(item: rlp.Item) DecodeError!bool {
     switch (item.kind) {
         .string => {
-            if (item.payload.len == 0) return .{};
+            if (item.payload.len == 0) return false;
             if (item.payload.len != 32) return error.InvalidNode;
-            return RlpNode.from_hash(item.payload[0..32].*);
+            return true;
         },
         .list => {
             if (item.raw.len >= 32) return error.InvalidNode;
-            return RlpNode.from_rlp(item.raw);
+            return true;
         },
     }
 }
 
+fn item_offset(bytes: []const u8, item: rlp.Item) u16 {
+    const offset = @intFromPtr(item.raw.ptr) - @intFromPtr(bytes.ptr);
+    assert(offset > 0 and offset + item.raw.len <= bytes.len);
+    assert(offset < source_bytes_max);
+    return @intCast(offset);
+}
+
+/// The reference whose RLP item starts at `offset` of `bytes`, a preimage `decode_layout`
+/// accepted with that child offset: a 32-byte hash string or an embedded list under 32 bytes.
+/// Either way the item's bytes are the reference itself.
+pub fn child_ref_at(bytes: []const u8, offset: u32) RlpNode {
+    const item = child_item_at(bytes, offset);
+    var result: RlpNode = .{ .len = @intCast(item.len) };
+    @memcpy(result.bytes[0..item.len], item);
+    assert(result.len > 0);
+    return result;
+}
+
+/// The bytes of the reference `child_ref_at` returns, in place.
+fn child_item_at(bytes: []const u8, offset: u32) []const u8 {
+    assert(offset > 0 and offset < bytes.len);
+    const prefix = bytes[offset];
+    const length: u32 = if (prefix == 0xa0) 33 else 1 + @as(u32, prefix - 0xc0);
+    assert(prefix == 0xa0 or (prefix >= 0xc0 and length < 32));
+    assert(offset + length <= bytes.len);
+    return bytes[offset..][0..length];
+}
+
+/// The byte length of a branch child item in the forms a valid branch child takes: the
+/// empty string, a 32-byte hash string, or a short list under 32 bytes. Null for any other
+/// item (an invalid child, or not a branch at all), or one running past `rest`.
+fn branch_child_length(rest: []const u8) ?u32 {
+    if (rest.len == 0) return null;
+    const prefix = rest[0];
+    const length: u32 = switch (prefix) {
+        0x80 => 1,
+        0xa0 => 33,
+        0xc0...0xf7 => 1 + @as(u32, prefix - 0xc0),
+        else => return null,
+    };
+    if (length >= 32 and prefix != 0xa0) return null;
+    if (length > rest.len) return null;
+    assert(length >= 1 and length <= 33);
+    return length;
+}
+
+/// `decode_layout` of a list payload that is a well-formed branch, in one pass without
+/// building items; null when it is anything else (the strict decoder then decides). Accepts
+/// exactly the branches `decode_layout_items` accepts, with the same offsets.
+fn decode_branch_fast(bytes: []const u8, payload: []const u8) ?Layout {
+    const payload_start = @intFromPtr(payload.ptr) - @intFromPtr(bytes.ptr);
+    assert(payload_start > 0 and payload_start + payload.len == bytes.len);
+    var result: Layout = .{ .kind = .branch };
+    var position: u32 = 0;
+    var children: u32 = 0;
+    for (&result.child_offsets) |*offset| {
+        const length = branch_child_length(payload[position..]) orelse return null;
+        // Only the empty string is an empty slot (`0xc0`, the empty list, is a child).
+        if (payload[position] != 0x80) {
+            offset.* = @intCast(payload_start + position);
+            children += 1;
+        }
+        position += length;
+    }
+    // The value slot: the empty string, ending the list.
+    if (position + 1 != payload.len or payload[position] != 0x80) return null;
+    if (children < 2) return null;
+    assert(children <= 16);
+    return result;
+}
+
 /// Decodes one state-trie node strictly: canonical RLP, no branch values, a branch has at
 /// least two children, paths fit a 32-byte key, leaf values are non-empty and bounded.
-pub fn decode_node(bytes: []const u8) DecodeError!Decoded {
+pub fn decode_layout(bytes: []const u8) DecodeError!Layout {
     const outer = rlp.decode_item(bytes) catch return error.InvalidNode;
     if (outer.kind != .list or outer.encoded_length != bytes.len) return error.InvalidNode;
+    if (decode_branch_fast(bytes, outer.payload)) |layout| return layout;
+    return decode_layout_items(bytes, outer.payload);
+}
+
+/// The reference decoder behind `decode_layout`: splits the list into items first.
+fn decode_layout_items(bytes: []const u8, payload: []const u8) DecodeError!Layout {
+    assert(payload.len < bytes.len);
     var items: [17]rlp.Item = undefined;
-    const count = rlp.decode_list(outer.payload, &items) catch return error.InvalidNode;
+    const count = rlp.decode_list(payload, &items) catch return error.InvalidNode;
     if (count == 17) {
         if (items[16].kind != .string or items[16].payload.len != 0) return error.InvalidNode;
-        var result: Decoded = .{ .kind = .branch };
+        var result: Layout = .{ .kind = .branch };
         var children: u32 = 0;
-        for (items[0..16], &result.children) |item, *child| {
-            child.* = try decode_child(item);
-            children += @intFromBool(child.len > 0);
+        for (items[0..16], &result.child_offsets) |item, *offset| {
+            if (!try check_child(item)) continue;
+            offset.* = item_offset(bytes, item);
+            children += 1;
         }
         if (children < 2) return error.InvalidNode;
         return result;
@@ -125,9 +247,20 @@ pub fn decode_node(bytes: []const u8) DecodeError!Decoded {
         return .{ .kind = .leaf, .path = decoded.path, .value = value.payload };
     }
     if (decoded.path.len == 0) return error.InvalidNode;
-    var result: Decoded = .{ .kind = .extension, .path = decoded.path };
-    result.children[0] = try decode_child(items[1]);
-    if (result.children[0].len == 0) return error.InvalidNode;
+    if (!try check_child(items[1])) return error.InvalidNode;
+    var result: Layout = .{ .kind = .extension, .path = decoded.path };
+    result.child_offsets[0] = item_offset(bytes, items[1]);
+    return result;
+}
+
+/// `decode_layout` with the child references copied out.
+pub fn decode_node(bytes: []const u8) DecodeError!Decoded {
+    const layout = try decode_layout(bytes);
+    var result: Decoded = .{ .kind = layout.kind, .path = layout.path, .value = layout.value };
+    for (layout.child_offsets, &result.children) |offset, *child| {
+        if (offset > 0) child.* = child_ref_at(bytes, offset);
+    }
+    assert(layout.kind != .leaf or result.children[0].len == 0);
     return result;
 }
 
@@ -147,7 +280,8 @@ const Node = struct {
     value_len: u8 = 0,
     /// The node's reference while clean; `len == 0` once it or a descendant changed.
     ref: RlpNode = .{},
-    /// The witness preimage of a decoded extension or branch, for its `unloaded` children.
+    /// The witness preimage of a decoded extension or branch: its unloaded children
+    /// (`unloaded_at`) are item offsets into it.
     source: []const u8 = &.{},
     path: [key_nibbles]u8 = undefined,
     body: Body = .{ .children = undefined },
@@ -175,7 +309,7 @@ pub const SparseTrie = struct {
         nodes_max: u32,
         resolver: Resolver,
     ) !SparseTrie {
-        assert(nodes_max > 0 and nodes_max < unloaded);
+        assert(nodes_max > 0 and nodes_max < unloaded_first);
         const nodes = try lazy.alloc(allocator, Node, nodes_max);
         errdefer lazy.free(allocator, nodes);
         const dirty = try lazy.alloc(allocator, u64, nodes_max);
@@ -272,9 +406,9 @@ pub const SparseTrie = struct {
             @memcpy(embedded[0..current.ref.len], current.ref.slice());
             break :blk embedded[0..current.ref.len];
         };
-        const decoded = decode_node(bytes) catch return error.InvalidWitness;
+        const decoded = decode_layout(bytes) catch return error.InvalidWitness;
         var children: u32 = 0;
-        for (decoded.children) |ref| children += @intFromBool(ref.len > 0);
+        for (decoded.child_offsets) |offset| children += @intFromBool(offset > 0);
         if (!from_witness and self.free_count < children) return error.SparseFull;
         current.path_len = decoded.path.len;
         @memcpy(current.path[0..decoded.path.len], decoded.path.slice());
@@ -287,12 +421,14 @@ pub const SparseTrie = struct {
         }
         current.kind = if (decoded.kind == .branch) .branch else .extension;
         current.body = .{ .children = @splat(none) };
-        for (decoded.children, 0..) |ref, nibble| {
-            if (ref.len == 0) continue;
-            current.body.children[nibble] = unloaded;
-            if (!from_witness) {
+        for (decoded.child_offsets, 0..) |offset, nibble| {
+            if (offset == 0) continue;
+            if (from_witness) {
+                current.body.children[nibble] = unloaded_at(offset);
+            } else {
                 // Capacity checked above, before the node changed.
-                current.body.children[nibble] = self.alloc_unresolved(ref) catch unreachable;
+                current.body.children[nibble] =
+                    self.alloc_unresolved(child_ref_at(bytes, offset)) catch unreachable;
             }
         }
         current.source = if (from_witness) bytes else &.{};
@@ -304,29 +440,12 @@ pub const SparseTrie = struct {
         const current = &self.nodes[parent];
         assert(current.kind == .branch or current.kind == .extension);
         const index = current.body.children[nibble];
-        if (index != unloaded) return index;
-        const ref = source_child(current.source, if (current.kind == .branch) nibble else 1);
-        assert(ref.len > 0);
+        assert(index != none);
+        if (!is_unloaded(index)) return index;
+        const ref = child_ref_at(current.source, unloaded_offset(index));
         const created = try self.alloc_unresolved(ref);
         current.body.children[nibble] = created;
         return created;
-    }
-
-    /// The reference in list item `item_index` of `source`, a preimage that `decode_node`
-    /// accepted when its node was resolved (so every step below succeeds). Skips to the one
-    /// item instead of decoding all seventeen.
-    fn source_child(source: []const u8, item_index: u8) RlpNode {
-        assert(item_index < 16);
-        // `resolve` decoded this exact preimage strictly; decoding is deterministic.
-        const outer = rlp.decode_item(source) catch unreachable;
-        var rest = outer.payload;
-        var index: u8 = 0;
-        while (index < item_index) : (index += 1) {
-            const skipped = rlp.decode_item(rest) catch unreachable;
-            rest = rest[@intCast(skipped.encoded_length)..];
-        }
-        const item = rlp.decode_item(rest) catch unreachable;
-        return decode_child(item) catch unreachable;
     }
 
     /// Checks the fixed-key-length shape of a resolved node `rest_len` nibbles above the end.
@@ -393,7 +512,7 @@ pub const SparseTrie = struct {
     }
 
     fn new_extension(self: *SparseTrie, path: []const u8, target: NodeIndex) Error!NodeIndex {
-        assert(path.len > 0 and target != none and target != unloaded);
+        assert(path.len > 0 and target != none and !is_unloaded(target));
         const index = try self.alloc(.extension);
         const extension = &self.nodes[index];
         extension.path_len = @intCast(path.len);
@@ -681,9 +800,8 @@ pub const SparseTrie = struct {
         assert(current.kind == .extension);
         const target = current.body.children[0];
         assert(target != none);
-        // Validated when the node was resolved; decoding is deterministic.
-        const target_ref = if (target == unloaded)
-            (decode_node(current.source) catch unreachable).children[0]
+        const target_ref = if (is_unloaded(target))
+            child_ref_at(current.source, unloaded_offset(target))
         else
             self.child_ref(target);
         assert(target_ref.len > 0);
@@ -699,16 +817,13 @@ pub const SparseTrie = struct {
     ) u32 {
         const current = &self.nodes[index];
         assert(current.kind == .branch);
-        var decoded: ?Decoded = null;
         var count: u32 = 0;
         mask.* = 0;
         for (current.body.children, 0..) |child_index, nibble| {
             if (child_index == none) continue;
             mask.* |= @as(u16, 1) << @intCast(nibble);
-            if (child_index == unloaded) {
-                // Validated when the node was resolved; decoding is deterministic.
-                if (decoded == null) decoded = decode_node(current.source) catch unreachable;
-                refs[count] = decoded.?.children[nibble];
+            if (is_unloaded(child_index)) {
+                refs[count] = child_ref_at(current.source, unloaded_offset(child_index));
             } else {
                 refs[count] = self.child_ref(child_index);
             }
@@ -758,17 +873,52 @@ pub const SparseTrie = struct {
                 const target_ref = self.extension_target_ref(index);
                 node.encode_extension(&sink, node_path, &target_ref);
             },
-            .branch => {
-                var refs: [16]RlpNode = undefined;
-                var mask: u16 = 0;
-                const count = self.branch_refs(index, &refs, &mask);
-                node.encode_branch(&sink, mask, refs[0..count], &.{});
-            },
+            .branch => return self.encode_dirty_branch(index, buffer),
             .free, .unresolved => unreachable, // Unresolved nodes are never dirty.
         }
         const encoded = sink.result();
         assert(encoded.len > 0);
         return encoded;
+    }
+
+    /// `node.encode_branch` of a dirty branch without a value, writing each child reference
+    /// straight from its pool node or its parent's preimage (no `RlpNode` copies).
+    fn encode_dirty_branch(
+        self: *const SparseTrie,
+        index: NodeIndex,
+        buffer: *[encoding_bytes_max]u8,
+    ) []const u8 {
+        const current = &self.nodes[index];
+        assert(current.kind == .branch and current.ref.len == 0);
+        var items: [16][]const u8 = undefined;
+        // One byte per empty slot and one for the empty value.
+        var payload_length: u32 = 1;
+        var children: u32 = 0;
+        for (current.body.children, &items) |child_index, *item| {
+            item.* = if (child_index == none)
+                &.{0x80}
+            else if (is_unloaded(child_index))
+                child_item_at(current.source, unloaded_offset(child_index))
+            else
+                self.nodes[child_index].ref.slice();
+            payload_length += @intCast(item.len);
+            children += @intFromBool(child_index != none);
+        }
+        assert(children >= 1);
+        var written = rlp.write_list_header(buffer, payload_length);
+        for (items) |item| {
+            // Fixed-size copies for the two common shapes instead of a memcpy call each.
+            switch (item.len) {
+                1 => buffer[written] = item[0],
+                33 => buffer[written..][0..33].* = item[0..33].*,
+                else => @memcpy(buffer[written..][0..item.len], item),
+            }
+            written += @intCast(item.len);
+        }
+        buffer[written] = 0x80;
+        written += 1;
+        assert(written == rlp.header_length(payload_length) + payload_length);
+        return buffer[0..written];
     }
 
     /// Recomputes the references of every dirty node below `root`, children first, one
@@ -797,7 +947,7 @@ pub const SparseTrie = struct {
             else
                 current.body.children[0..];
             for (children) |child_index| {
-                if (child_index == none or child_index == unloaded) continue;
+                if (child_index == none or is_unloaded(child_index)) continue;
                 if (self.nodes[child_index].ref.len > 0) continue;
                 assert(stack_len < stack.len);
                 stack[stack_len] = .{ .index = child_index, .expanded = false };
@@ -872,7 +1022,7 @@ pub const SparseTrie = struct {
                     .free, .unresolved => unreachable, // Unresolved nodes are never dirty.
                 };
                 for (children) |child_index| {
-                    if (child_index == none or child_index == unloaded) continue;
+                    if (child_index == none or is_unloaded(child_index)) continue;
                     if (self.nodes[child_index].ref.len > 0) continue;
                     assert(stack_len < stack.len);
                     stack[stack_len] = @as(u64, depth + 1) << 32 | child_index;
@@ -956,7 +1106,25 @@ pub const SparseTrie = struct {
 const testing = std.testing;
 const Prng = @import("../../testing/prng.zig").Prng;
 
+/// The one-pass branch decoder accepts exactly what the item decoder accepts as a branch.
+fn check_branch_fast(bytes: []const u8) !void {
+    const outer = rlp.decode_item(bytes) catch return;
+    if (outer.kind != .list or outer.encoded_length != bytes.len) return;
+    const fast = decode_branch_fast(bytes, outer.payload);
+    const reference = decode_layout_items(bytes, outer.payload) catch {
+        try testing.expect(fast == null);
+        return;
+    };
+    const layout = fast orelse {
+        try testing.expect(reference.kind != .branch);
+        return;
+    };
+    try testing.expectEqual(DecodedKind.branch, reference.kind);
+    try testing.expectEqualSlices(u16, &reference.child_offsets, &layout.child_offsets);
+}
+
 fn check_decode(bytes: []const u8) !void {
+    try check_branch_fast(bytes);
     const decoded = decode_node(bytes) catch return;
     switch (decoded.kind) {
         .leaf => try testing.expect(decoded.value.len > 0 and decoded.value.len <= value_bytes_max),
@@ -1001,7 +1169,14 @@ test "sparse: seeded node decoder fuzz" {
             },
             else => {
                 const mask: u16 = @intCast(prng.range(1, 0xffff));
-                for (&refs) |*ref| ref.* = RlpNode.from_hash(node.keccak256(&value));
+                for (&refs) |*ref| {
+                    // Some children embedded: a short leaf encodes in under 32 bytes.
+                    const short_path = path[0..prng.range(0, @min(8, path_len))];
+                    ref.* = if (prng.chance(1, 3))
+                        node.leaf_ref(short_path, value[0..prng.range(1, 8)])
+                    else
+                        RlpNode.from_hash(node.keccak256(&value));
+                }
                 node.encode_branch(&sink, mask, refs[0..@popCount(mask)], &.{});
             },
         }

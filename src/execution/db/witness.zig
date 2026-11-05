@@ -46,6 +46,23 @@ pub const AccountInfo = state_module.AccountInfo;
 
 pub const Error = error{ WitnessFull, KeysFull, UnknownCode, InvalidHeaderChain } || sparse.Error;
 
+/// Hash-map context for keccak256 digests: their bytes are already uniform, so the map
+/// hash is eight of them (no second hash per lookup). No weaker against crafted keys than
+/// the unseeded default: both are deterministic functions of a digest anyone can grind.
+const DigestContext = struct {
+    pub fn hash(_: DigestContext, key: Hash) u64 {
+        return std.mem.readInt(u64, key[0..8], .little);
+    }
+
+    pub fn eql(_: DigestContext, a: Hash, b: Hash) bool {
+        return std.mem.eql(u8, &a, &b);
+    }
+};
+
+fn DigestMap(comptime V: type) type {
+    return std.HashMapUnmanaged(Hash, V, DigestContext, std.hash_map.default_max_load_percentage);
+}
+
 /// A bounded list of byte strings in one arena. The arena and ends are reserved at init and
 /// committed on first touch (`lazy_alloc`), so an idle list costs no resident memory.
 pub const ByteList = struct {
@@ -315,7 +332,7 @@ pub const Recorder = struct {
 pub const NodeStore = struct {
     const Entry = struct { hash: Hash, offset: u32, len: u32, accessed: bool };
 
-    index: std.AutoHashMapUnmanaged(Hash, u32) = .empty,
+    index: DigestMap(u32) = .empty,
     entries: []Entry,
     count: u32 = 0,
     arena: []u8,
@@ -626,7 +643,7 @@ pub const SparseState = struct {
     trie: sparse.SparseTrie,
     account_root: sparse.NodeIndex = sparse.none,
     /// Storage trie roots by address hash, opened on first use from the account leaf.
-    storage_roots: std.AutoHashMapUnmanaged(Hash, sparse.NodeIndex) = .empty,
+    storage_roots: DigestMap(sparse.NodeIndex) = .empty,
     storage_tries_max: u32,
     /// Per-block scratch of `apply`, one entry per storage trie written (at most
     /// `storage_tries_max`): the run's address hash and pre-state account, and the storage

@@ -247,6 +247,53 @@ Takeaways:
   reads hashed for the walk) made the unverified build 30% slower (6.0-6.4 ms) because reads
   repeat the written keys; hashing `touched` once and looking up changeset entries fixed it.
 
+## 2026-11-05 db witness: sparse apply without re-decoding (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+Same bench (`zig build bench -Doptimize=ReleaseFast -- db/witness`), medians of 11 per run;
+the machine was loaded (load average 50-75 on 14 cores), so "before" (the tree just before
+the change) and "after" binaries ran interleaved, 4 full runs each, and the table gives the
+median of the four medians. Witnesses are byte-identical: the same node counts and encoded
+bytes as before, and the differential, codec, rpc, and proof-lane tests pass unchanged.
+
+| Block | build before | build after | unverified before | unverified after | replay before | replay after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k account writes | 2.59 ms | 1.96 ms | 0.72 ms | 0.61 ms | 1.07 ms | 0.70 ms |
+| 1k acct + 4k slot writes | 16.1 ms | 10.8 ms | 5.1 ms | 4.2 ms | 9.6 ms | 6.4 ms |
+| 200 evm SLOAD+SSTORE calls | 2.11 ms | 1.35 ms | 0.49 ms | 0.36 ms | 0.98 ms | 0.63 ms |
+
+Stateless evm re-execution (`apply_evm`) 1.35 -> 0.98 ms. Under this load the storage-heavy
+build's spread was 12.2-17.3 ms before and 9.6-11.2 ms after; a separate 5-round interleave
+gave 12.6-23.5 ms (before) vs 9.7-13.0 ms (after). The sparse apply plus post-root
+(verified minus unverified) is ~11 -> ~6.6 ms on this run, ~8 -> ~5.5 ms on quieter samples.
+
+What changed (`trie/sparse.zig`, `db/witness.zig`):
+- An unloaded child slot holds the byte offset of the child's RLP item in the parent's
+  preimage (`unloaded_first + offset`; pool indices stay below it). Materializing a child and
+  rehashing a dirty branch over unloaded children read that one item in place: no
+  `decode_node` of the parent at rehash (was ~10% of the build in the profile) and no
+  item-by-item skip in `child_at`.
+- `resolve` uses `decode_layout` (offsets, no `RlpNode` copies), with a one-pass branch scan
+  (`decode_branch_fast`: each child is `0x80`, `0xa0` + 32 bytes, or a short list) and the
+  item decoder as the strict fallback for everything else. A seeded and a coverage fuzz check
+  the scan accepts exactly the branches the item decoder accepts, with the same offsets.
+- Dirty branches encode straight into the hash buffer from the children's cached references
+  or the parent's preimage (no `[16]RlpNode` gather), with fixed-size copies for the 1- and
+  33-byte items.
+- `NodeStore` and `SparseState.storage_roots` key their maps by keccak digests, so the map
+  hash is the digest's first eight bytes instead of a wyhash of all 32.
+
+Profile (`sample`, 600 extra storage-heavy builds; share of samples in the build): before,
+apply + post-root 66% (rehash keccak ~23%, `decode_node`/`decode_item` ~23% of which ~9% at
+rehash, memmove ~5%); after, ~57%: rehash keccak ~32% (15 270 node encodings of 1-2 keccak
+blocks each, batched two at a time on NEON), `resolve` ~13% (the branch scan and first touch
+of each preimage), the rest `put`, map lookups, and copies.
+
+Takeaways:
+- The apply is now keccak-bound: every dirty node of the 1k storage tries and the account
+  trie must be rehashed; fewer hashes would need fewer dirty nodes, not faster decode.
+- Do not cache decoded child refs per resolved branch (16 x 34 B per node, ~8 MB for this
+  pool): the item offsets fit in the existing child slots and cost nothing.
+
 ## 2026-11-05 db reads (aarch64-macos, Apple M4 Pro, 48 GB, ReleaseFast, 34023ca8)
 
 `zig build bench -Doptimize=ReleaseFast -- db/read` (`db/read_bench.zig`, ~4 s after the
