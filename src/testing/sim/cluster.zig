@@ -76,13 +76,10 @@ pub const Config = struct {
     /// the model batcher's submissions.
     real_batcher: bool = false,
     /// Random pending L1 transactions evicted per minute (fault phase). The real
-    /// batcher's txmgr starts from the `pending` nonce after a restart and so cannot
-    /// recover an evicted tx it never tracked (lane notes); the swarm keeps evictions
-    /// and real-batcher crashes apart until that is fixed.
+    /// batcher's txmgr must re-submit an evicted nonce, across restarts too.
     mempool_evictions_per_minute: u32 = 0,
-    /// Chance an orphaned transaction is lost instead of re-injected on an L1 reorg.
-    /// The real batcher's txmgr cannot recover such a nonce gap yet (lane notes), so the
-    /// swarm enables this only for the model batcher.
+    /// Chance an orphaned transaction is lost instead of re-injected on an L1 reorg; the
+    /// batcher must notice the lost nonce and fill the gap.
     reorg_tx_loss_ppm: u32 = 0,
     /// Largest frame both batchers write. Below the full size, channels span several L1
     /// transactions and blocks, and derivation reassembles them in the channel bank.
@@ -122,12 +119,9 @@ pub const Config = struct {
             .spam_per_minute = @intCast(swarm_level(prng, 6)),
             .real_batcher = prng.chance(1, 2),
         };
-        const evictions_per_minute: u32 = @intCast(swarm_level(prng, 6));
-        if (!config.real_batcher or config.crashes_per_minute == 0) {
-            config.mempool_evictions_per_minute = evictions_per_minute;
-        }
-        const reorg_tx_loss_ppm: u32 = @intCast(swarm_level(prng, 500_000));
-        if (!config.real_batcher) config.reorg_tx_loss_ppm = reorg_tx_loss_ppm;
+        // Drawn here (not in the literal) to keep the stream of existing seeds.
+        config.mempool_evictions_per_minute = @intCast(swarm_level(prng, 6));
+        config.reorg_tx_loss_ppm = @intCast(swarm_level(prng, 500_000));
         const frame_sizes = [_]u32{ codec.frame_size_full, 1024, 512, 256 };
         config.frame_size = frame_sizes[@intCast(prng.below(frame_sizes.len))];
         const txs_min = [_]u8{ nodes.l1_batches_max, 4, 2 };
@@ -1014,13 +1008,8 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .real_batcher = smith.value(bool),
         .real_verifier = smith.value(bool),
     };
-    const evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
-    if (!config.real_batcher or config.crashes_per_minute == 0) {
-        config.mempool_evictions_per_minute = evictions_per_minute;
-    }
-    if (!config.real_batcher) {
-        config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
-    }
+    config.mempool_evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
+    config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
     var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
     defer cluster.deinit(std.testing.allocator);
     _ = try cluster.run();

@@ -23,7 +23,7 @@ provably robust.
 - [x] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
   reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
-- [ ] Sim: enable both tx-loss faults for the real batcher (with crashes) once txmgr recovers
+- [x] Sim: enable both tx-loss faults for the real batcher (with crashes) once txmgr recovers
   nonce gaps (see notes); today they are drawn only where txmgr can survive them.
 - [x] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
   minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
@@ -200,3 +200,9 @@ provably robust.
   batches of calls, notifications, null/string ids, unknown methods, bad params,
   failing and overflowing handlers, malformed objects; responses checked in order
   against a spec model; arbitrary bodies give empty or valid JSON. 2/2 mutants caught.
+- 2026-11-05: tx-loss faults (evictions, reorg loss) now drawn for the real batcher too,
+  with crashes, after the batcher lane's txmgr fixes (e187ca3, 5efd773). ~16% of seeds
+  run all three on the real batcher; swarm 1..3000 green. Mutant (txmgr reset keeps its
+  nonce counter, so a lost nonce is never refilled): 62/600 seeds fail liveness.
+  Disabling only `needs_reset` survives: the service's safe-head stall reset and the
+  contiguous `pending` nonce also repair a gap.
