@@ -121,6 +121,7 @@ const Cluster = struct {
                 .table = .{ .subnet_bucket_max = 0, .subnet_table_max = 0 },
             },
             .mcache = .{ .entries_max = 64, .arena_bytes = 1 << 20 },
+            .ban_enabled = true,
         }, secret, node.record, node.prng.random());
         try node.transport.init(allocator, &node.io, node.service, .{
             .listen = io_module.Address.ip4(host, port),

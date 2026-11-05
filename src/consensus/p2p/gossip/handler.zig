@@ -37,6 +37,15 @@ pub const Config = struct {
     score_level: score.Level = .light,
     topic_scoring: bool = true,
     mcache: @import("mcache.zig").Config = .{},
+    mesh: Mesh = .{},
+};
+
+/// Gossipsub mesh degrees (base/base `--p2p.gossip.mesh.*`).
+pub const Mesh = struct {
+    d: u32 = 8,
+    d_low: u32 = 6,
+    d_high: u32 = 12,
+    d_lazy: u32 = 6,
 };
 
 pub const Stats = struct {
@@ -88,6 +97,12 @@ pub const BlockGossip = struct {
         gossip.router = try Router.init(allocator, .{
             .message_id = message_id,
             .message_id_context = gossip,
+            .d = config.mesh.d,
+            .d_low = config.mesh.d_low,
+            .d_high = config.mesh.d_high,
+            .d_lazy = config.mesh.d_lazy,
+            .d_score = @min(4, config.mesh.d),
+            .d_out = @min(2, config.mesh.d / 2),
             .peer_params = score.peer_params(
                 config.score_level,
                 config.topic_scoring,

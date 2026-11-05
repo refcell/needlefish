@@ -13,8 +13,9 @@
 //!   consensus:   `publish_block`, `pop_block`
 //!   time:        `tick(now_ns)`
 //! Every valid discovered record is dialed when the gater and limits allow (base/base
-//! dials all of them). Every 15 s peers scoring under the ban threshold are disconnected
-//! and banned in discovery for the ban duration (base/base `PeerMonitoring`).
+//! dials all of them). With bans enabled (`--p2p.ban.peers`, off by default), every 15 s
+//! peers under the ban threshold are disconnected and banned in discovery for the ban
+//! duration (base/base `PeerMonitoring`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,7 +47,9 @@ pub const Config = struct {
     /// base/base CLI defaults: 500 redials per 60 min (`--p2p.redial`, `.period`).
     gater: gater_module.Config = .{ .peer_redialing = 500 },
     limits: connections.Limits = .{},
-    /// base/base `PeerMonitoring` (`--p2p.ban.threshold`, `--p2p.ban.duration`).
+    /// base/base `PeerMonitoring` (`--p2p.ban.peers`, default off; `--p2p.ban.threshold`,
+    /// `--p2p.ban.duration`).
+    ban_enabled: bool = false,
     ban_threshold: f64 = -100,
     ban_duration_ns: u64 = 3600 * ns_per_s,
     heartbeat_interval_ns: u64 = 500 * ns_per_ms,
@@ -54,6 +57,9 @@ pub const Config = struct {
     gater_prune_interval_ns: u64 = 60 * ns_per_s,
     pending_dial_prune_interval_ns: u64 = 5 * ns_per_s,
     mcache: @import("gossip/mcache.zig").Config = .{},
+    mesh: gossip_handler.Mesh = .{},
+    score_level: @import("peers/score.zig").Level = .light,
+    topic_scoring: bool = true,
 };
 
 pub const Command = union(enum) {
@@ -127,6 +133,9 @@ pub const Service = struct {
             .unsafe_block_signer = config.unsafe_block_signer,
             .block_time_s = config.block_time_s,
             .mcache = config.mcache,
+            .mesh = config.mesh,
+            .score_level = config.score_level,
+            .topic_scoring = config.topic_scoring,
         }, random);
         errdefer service.gossip.destroy(allocator);
         service.gater = try gater_module.Gater.init(allocator, config.gater);
@@ -356,6 +365,7 @@ pub const Service = struct {
 
     /// Disconnects peers under the ban threshold and bans them in discovery.
     fn ban_low_scores(service: *Service, now_ns: u64) void {
+        if (!service.config.ban_enabled) return;
         for (&service.connected, 0..) |*connection, slot| {
             if (!connection.active or connection.disconnecting) continue;
             const value = service.gossip.router.peer_score_value(@intCast(slot));

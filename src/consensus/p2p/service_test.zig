@@ -78,6 +78,7 @@ const Net = struct {
                     .table = .{ .subnet_bucket_max = 0, .subnet_table_max = 0 },
                 },
                 .mcache = .{ .entries_max = 64, .arena_bytes = 1 << 20 },
+                .ban_enabled = true,
             }, secret, net.records[index], net.prngs[index].random());
         }
         for (1..nodes) |index| net.services[index].add_boot_record(&net.records[0], net.now_ns);
