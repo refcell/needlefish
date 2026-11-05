@@ -15,6 +15,7 @@ const evm_module = @import("evm.zig");
 const precompiles = @import("precompiles.zig");
 const Fork = @import("fork.zig").Fork;
 const op = @import("op.zig");
+const native = @import("native.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const Evm = evm_module.Evm;
@@ -245,6 +246,7 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     }
     const p256 = primitives.address_from_int(0x100);
     if (precompiles.is_precompile(fork, op_upgrade, p256)) _ = try evm.state.access(p256);
+    for (native.warm_addresses(op_upgrade)) |address| _ = try evm.state.access(address);
     for (tx.access_list) |item| {
         const access = try evm.state.access(item.address);
         for (item.storage_keys) |key| {

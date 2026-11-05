@@ -14,8 +14,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   Canyon CREATE2-deployer and Everest nonce-manager transitions (`op.apply_transition`).
 - [x] BN254 pairing input caps (Granite 112687, Jovian 81984 bytes) and BLS MSM/pairing caps
   (Isthmus/Jovian).
-- [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory; Cobalt:
-  tx-context 0x8130..aa02, 2D nonce manager 0x8130..aa01) and EIP-8130 (Everest, type 0x79).
+- [x] Native precompile framework (`native.zig`) and Cobalt tx-context 0x8130..aa02 and 2D
+  nonce manager 0x8130..aa01 getters.
+- [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory, B20 tokens)
+  and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
   0x01-0x11 and P256VERIFY (0x100).
   (crypto lane, 2026-11-05: all now on main: `crypto.bn254.precompile_bn254_{add,mul,pairing}`,
@@ -64,8 +66,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   node should size `memory_bytes_max` from its max tx gas.
 - Precompiles call `common.crypto` (ecrecover, sha256, ripemd160, modexp, blake2f, p256).
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
+- Native precompiles meter state access with the Osaka schedule regardless of fork (base/base
+  passes `GasParams::default()`); they run against the journal and are warmed at tx start
+  when their upgrade is active. Errors revert with the bare selector (Cobalt+ encoding).
 
 ## Log
+- 2026-11-05: native precompile framework; Cobalt TxContext and NonceManager getters.
 - 2026-11-05: pre-Osaka wide-modulus MODEXP via startup-sized scratch (`precompiles.Buffers`).
 - 2026-11-05: EVM micro benchmarks: 0.74 ns/instruction, 117 ns/call frame, 0.70 us/tx.
 - 2026-11-05: bn254, KZG, BLS12-381 precompiles wired with Base caps; state tests 100%

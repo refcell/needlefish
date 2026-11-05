@@ -17,6 +17,7 @@ const gas = @import("gas.zig");
 const interpreter = @import("interpreter.zig");
 const precompiles = @import("precompiles.zig");
 const crypto = @import("../../common/crypto/root.zig");
+const native = @import("native.zig");
 const Fork = @import("fork.zig").Fork;
 const Address = primitives.Address;
 const State = state_module.State;
@@ -312,6 +313,10 @@ pub const Evm = struct {
         if (precompiles.lookup(fork, evm.op_upgrade(), request.code_address)) |precompile| {
             return evm.run_precompile(precompile, request, checkpoint);
         }
+        if (native.lookup(evm.op_upgrade(), request.code_address)) |contract| {
+            const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
+            return evm.run_native(contract, request, checkpoint, call);
+        }
         const code_account = try evm.state.load(request.code_address);
         const code = try evm.state.code(code_account);
         if (code.len == 0) {
@@ -360,6 +365,45 @@ pub const Evm = struct {
             .gas_remaining = request.gas_limit - result.gas_used,
             .gas_refund = 0,
             .output = evm.return_buffer[0..result.output_len],
+        } };
+    }
+
+    const NativeCall = struct { caller: Address, value: u256, is_static: bool };
+
+    /// Base native precompile: runs against the journal; a revert or halt rolls back.
+    fn run_native(
+        evm: *Evm,
+        contract: native.Native,
+        request: CallRequest,
+        checkpoint: state_module.Checkpoint,
+        call: NativeCall,
+    ) Error!Step {
+        var context = native.Context{
+            .state = evm.state,
+            .upgrade = evm.op_upgrade().?,
+            .address = request.code_address,
+            .caller = call.caller,
+            .origin = evm.tx.origin,
+            .value = call.value,
+            .is_static = call.is_static,
+            .gas_limit = request.gas_limit,
+            .out = evm.return_buffer,
+        };
+        const is_direct = request.kind == .call or request.kind == .staticcall;
+        const result = try native.run(contract, &context, request.input, is_direct);
+        assert(result.gas_used <= request.gas_limit);
+        if (result.status != .success) evm.state.revert(checkpoint);
+        const exit: Exit = switch (result.status) {
+            .success => .return_,
+            .revert => .revert,
+            .halt => .out_of_gas,
+        };
+        return .{ .done = .{
+            .status = exit.status(),
+            .exit = exit,
+            .gas_remaining = request.gas_limit - result.gas_used,
+            .gas_refund = result.refund,
+            .output = result.output,
         } };
     }
 
