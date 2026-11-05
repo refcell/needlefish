@@ -11,7 +11,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [ ] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
 - [ ] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
-- [ ] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
+- [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
 - [ ] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
 - [ ] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
 - [ ] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
@@ -31,6 +31,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - Receipts support EIP-658 status only (no pre-Byzantium state root): every chain we run is
   post-merge.
 - Tx/receipt/withdrawal roots call the trie lane's `ordered_trie_root` with caller scratch.
+- `chains` holds canonical per-chain data only (identity, timing, upgrade timestamps, genesis
+  anchors, L1 contracts, bootnodes, L1 fork schedules). `RollupConfig`/`Upgrade` enums live in
+  `consensus/protocol` and `ChainSpec` in `execution/chainspec`; they can derive from `chains`.
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
@@ -38,3 +41,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
 - 2026-11-05: consensus tx types + envelope, signatures, recovery; EIP-155 and Base deposit vectors.
 - 2026-11-05: header/receipts/logs/withdrawals/block/body, roots, EIP-7685; mainnet genesis + Cancun/Prague block vectors.
+- 2026-11-05: chains (mainnet/sepolia/zeronet/devnet, L1 mainnet/sepolia/holesky/hoodi/devnet).
