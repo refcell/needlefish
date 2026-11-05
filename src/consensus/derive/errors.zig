@@ -25,6 +25,7 @@ pub const Error = ProviderError || error{
     // Temporary.
     Eof,
     NotEnoughData,
+    MissingL1Data,
     // Reset.
     ReorgDetected,
     HoloceneActivation,
@@ -45,7 +46,12 @@ pub const Error = ProviderError || error{
 
 pub fn kind(err: Error) Kind {
     return switch (err) {
-        error.NotAvailable, error.NotFound, error.Eof, error.NotEnoughData => .temporary,
+        error.NotAvailable,
+        error.NotFound,
+        error.Eof,
+        error.NotEnoughData,
+        error.MissingL1Data,
+        => .temporary,
         error.ReorgDetected,
         error.HoloceneActivation,
         error.BadParentHash,
