@@ -11,7 +11,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
 - [ ] `batcher/comp`: real brotli compressor (LZ77 + prefix codes), checked with `brotli -d`.
 - [ ] `batcher/batch`: singular batch RLP, span batch encoding.
-- [ ] `batcher/channel`: channel out (compress, size limits, frames), channel manager.
+- [x] `batcher/channel`: channel out (ratio estimate, compress on close, frames).
+- [ ] `batcher/channel`: channel manager (block queue, timeouts, tx tracking, reorgs).
 - [ ] `batcher/txdata`: EIP-1559 / EIP-4844 tx building + signing, tx manager.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [ ] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`.
@@ -25,6 +26,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - L2 verifier: `node` HTTP :10545, engine :10551; `consensus` RPC :8547 (derives from L1 only).
 
 ## Decisions
+- 2026-11-05: ChannelOut uses a ratio size estimate and compresses once on close
+  (deterministic, no shadow compressor); misestimates only change the frame count.
+- 2026-11-05: singular/span batch types are the consensus lane's (base/base keeps them
+  in `base-protocol`); the batcher adds encoders there or locally once they land.
 - 2026-11-05: devnet chain ids L1 900 / L2 901, batch inbox `0xff00..0901`, batcher =
   dev mnemonic index 6, sequencer = index 5 (matches base/base devnet-env roles).
 - 2026-11-05: default channel compression is zlib via std.compress.flate (still valid
@@ -34,3 +39,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: DEVNET.md contract; batcher frame + blob codecs with fuzz tests.
 - 2026-11-05: batcher/frame reuses consensus Frame; comp: zlib + stored brotli (verified
   against the brotli CLI).
+- 2026-11-05: ChannelOut with fuzzed reassembly through the consensus Channel.

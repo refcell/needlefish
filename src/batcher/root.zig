@@ -6,6 +6,7 @@ const std = @import("std");
 pub const frame = @import("frame/root.zig");
 pub const blobs = @import("blobs/root.zig");
 pub const comp = @import("comp/root.zig");
+pub const channel = @import("channel/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
