@@ -11,6 +11,10 @@ pub const header = @import("header.zig");
 pub const receipt = @import("receipt.zig");
 pub const block = @import("block.zig");
 pub const sidecar = @import("sidecar.zig");
+pub const item_list = @import("item_list.zig");
+pub const eip8130 = @import("eip8130.zig");
+pub const eip8130_structure = @import("eip8130_structure.zig");
+pub const eip8130_test = @import("eip8130_test.zig");
 
 pub const Signature = signature.Signature;
 pub const Recoverer = signature.Recoverer;

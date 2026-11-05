@@ -27,50 +27,7 @@ pub const Withdrawal = struct {
 };
 
 /// A validated RLP list payload whose items decode as `Item` via `decode_item`.
-fn ItemList(comptime Item: type, comptime decode_item: anytype) type {
-    return struct {
-        payload: []const u8 = &.{},
-        count: u32 = 0,
-
-        const Self = @This();
-        pub const empty: Self = .{};
-
-        pub const Iterator = struct {
-            decoder: rlp.Decoder,
-
-            pub fn next(self: *Iterator) ?Item {
-                if (self.decoder.is_empty()) return null;
-                return decode_item(&self.decoder) catch unreachable; // Validated.
-            }
-        };
-
-        pub fn iterator(list: Self) Iterator {
-            return .{ .decoder = rlp.Decoder.init(list.payload) };
-        }
-
-        pub fn from_payload(payload: []const u8) !Self {
-            var decoder = rlp.Decoder.init(payload);
-            var count: u32 = 0;
-            // Every item consumes at least one byte: bounded by payload.len.
-            while (!decoder.is_empty()) : (count += 1) _ = try decode_item(&decoder);
-            return .{ .payload = payload, .count = count };
-        }
-
-        pub fn rlp_length(list: Self) usize {
-            return rlp.list_length(list.payload.len);
-        }
-
-        pub fn rlp_encode(list: Self, encoder: *rlp.Encoder) void {
-            encoder.list_header(list.payload.len);
-            encoder.raw(list.payload);
-        }
-
-        pub fn decode_list(decoder: *rlp.Decoder) !Self {
-            const items = try decoder.list();
-            return from_payload(items.input);
-        }
-    };
-}
+const ItemList = @import("item_list.zig").ItemList;
 
 fn decode_withdrawal(decoder: *rlp.Decoder) rlp.Error!Withdrawal {
     return rlp.decode(Withdrawal, decoder);

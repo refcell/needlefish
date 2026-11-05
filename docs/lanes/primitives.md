@@ -44,6 +44,12 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - Pooled blob txs (`consensus/sidecar.zig`): blobs/commitments/proofs are zero-copy fixed-item
   lists; `validate` checks counts and versioned hashes only. KZG blob/cell proof verification
   waits on the crypto lane (only point evaluation exists); txpool must call it once it lands.
+- EIP-8130 (`consensus/eip8130*.zig`) mirrors base/base encoding, signing hashes (0x79 sender,
+  0x7a payer, 0x7901 replay id), raw-k1 recovery (low s), static/timestamp/structural checks.
+  base/base ships no golden vectors; tests pin a hand-checked byte layout. `Envelope` wiring
+  is a separate step because other lanes switch exhaustively over it.
+- `.cache/push.sh` reruns the full suite after a race only when the new upstream commits touch
+  `src/common/` or build files; otherwise it compiles and tidies (disjoint merge).
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
@@ -56,3 +62,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: genesis (JSON, alloc, state/storage roots, fork-aware header incl. Isthmus).
 - 2026-11-05: signatures now use crypto lane secp256k1 (ecrecover, constant-time sign).
 - 2026-11-05: pooled EIP-4844 network form (v0 sidecar, EIP-7594 v1 cell proofs), `PooledTx`.
+- 2026-11-05: EIP-8130 tx type (encode/decode, hashes, sender/payer recovery, validation).
