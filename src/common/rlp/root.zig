@@ -193,6 +193,25 @@ test "rlp: ethereum invalid vectors" {
     try testing.expect(count >= 26);
 }
 
+test "rlp: ethereum random vectors" {
+    // RLPTests/RandomRLPTests: `"in": "VALID"` means `out` is well-formed RLP, so the
+    // strict structural walk must accept it and re-encode it byte-identical.
+    const text = @embedFile("testdata/randomRLPTest.json");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    var iterator = parsed.value.object.iterator();
+    var count: usize = 0;
+    while (iterator.next()) |entry| : (count += 1) {
+        try testing.expectEqualStrings("VALID", entry.value_ptr.object.get("in").?.string);
+        var input_buffer: [256]u8 = undefined;
+        const out_text = entry.value_ptr.object.get("out").?.string;
+        const input = try hex.decode_into(&input_buffer, out_text);
+        var output: [256]u8 = undefined;
+        try testing.expectEqualSlices(u8, input, try reencode(&output, input));
+    }
+    try testing.expect(count >= 1);
+}
+
 /// Writes a random tree of at most `item_max` items into `writer`.
 fn write_random_tree(prng: *Prng, writer: *TreeWriter, item_max: usize) void {
     writer.begin_list();

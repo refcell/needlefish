@@ -54,7 +54,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   byte-identical re-encode, header hash, transactions/ommers/withdrawals roots, genesis RLP.
   `BlockchainTests/`: 3370 valid ok, 0 failures. `fixtures_blockchain_tests.tgz` (1.3 GiB
   extracted, 2998 Prague files): 77758 valid ok, 0 failures. Curated vectors committed.
-- [ ] RLPTests/RandomRLPTests: run through the strict decoder (round trip or reject).
+- [x] RLPTests/RandomRLPTests: run through the strict decoder (round trip or reject).
+- [ ] chains golden test: cross-check every `chains` constant (ids, hashes, addresses, block
+  times, upgrade times) against base/base `crates/common/chains/src/config.rs`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -157,5 +159,5 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: ethereum/tests GenesisTests vectors (genesis block RLP parity).
 - 2026-11-05: `genesis.feature` BaseFeature registry.
 - 2026-11-05: ethereum/tests keyaddrtest vectors (seed -> key -> address).
-
 - 2026-11-05: `blockrlp` BlockchainTests runner, 0 failures over 81k blocks.
+- 2026-11-05: RLPTests RandomRLPTests vector.
