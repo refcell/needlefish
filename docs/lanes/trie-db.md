@@ -55,9 +55,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Feed the history store from the durable database: every head move (apply/unwind) updates
   `history.Store`; rebuilt with `reset` at open; `Database.proof_at(block, address, slots)`
   for `eth_getProof` with a block tag inside the window.
-- [ ] Witness codec for the proof lane: canonical binary encoding of `Witness` (length-prefixed
-  sections, sorted dedup nodes/codes), strict fuzzed decoder, plus `keccak256(preimage)` keyed
-  iteration for the preimage oracle (keccak preimage type).
+- [x] Witness codec for the proof lane: canonical binary encoding of a `Witness` (strict
+  decoder, encode(decode(x)) == x) plus a keccak256 preimage view (iterator + lookup by digest).
+  (`db/witness_codec.zig`)
 - [ ] Witness size + build-time benchmarks (nodes, bytes, us per block) for 1k-account and
   storage-heavy blocks; record in docs/PERF.md.
 - [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
@@ -240,6 +240,23 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   second executor, so no extra executor memory. The RPC writes the generator's witness
   (one bounded buffer set, `Limits.witness`, default on; null disables the method).
 
+- Witness codec (`db/witness_codec.zig`): own format, not RLP or JSON: `"NFWT"`, u32 version,
+  then state, codes, keys, headers, each `count | payload_bytes | (u32 len | bytes)*`, all
+  little-endian u32. One canonical form so a witness has one byte string (hashable, cacheable,
+  comparable): state and codes strictly ascending by keccak256 (dedup), keys 20 or 32 bytes
+  strictly ascending bytewise, headers strictly ascending block number (two different headers
+  with one number are rejected at encode). The decoder accepts only that form and is bounded by
+  the output `Witness` capacities (`WitnessFull`); seeded and coverage-guided fuzz check that
+  every accepted input re-encodes to itself. Encoding sorts index arrays in an `Encoder`
+  allocated from the witness config (no allocation per encode). Sorting by digest makes the
+  sections binary-searchable: `lookup(digest)` costs one keccak per probe and needs no index.
+- Preimage view: base/base `crates/proof/preimage/src/key.rs` (`PreimageKeyType::Keccak256 =
+  2`, oracle key = type byte + low 31 digest bytes) and `crates/proof/host/src/handler.rs`
+  (`execution_witness_preimages` hashes every `state`, `codes`, and `keys` item).
+  `PreimageIterator` yields that same set (digest, bytes) and `preimage_key` renders the oracle
+  key; keys are searched linearly since they sort by bytes, not digest. No lookup by oracle
+  key: it drops the digest's high byte, so hosts load their key-value store from the iterator.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -362,3 +379,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   blocks, rebuilds a `SparseState`, re-executes with the node executor statelessly to the
   header root, head and root unchanged; durable node test witnesses 3 blocks after a side
   branch with no journal entries, side block and genesis refused, node keeps building.
+- 2026-11-05: witness codec: canonical encoding + strict decoder + keccak preimage view; builder
+  witnesses (4 seeds x 3 blocks) round-trip byte for byte, a `SparseState` loaded from the
+  decoded witness replays to the same root, every node/code/key found by digest; decoder fuzzed.

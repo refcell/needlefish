@@ -6,6 +6,7 @@
 //! - `state`: state provider (accounts, storage, code, block hashes) with a block overlay.
 //! - `witness`: execution witness (`debug_executionWitness`) and stateless `SparseState`.
 //! - `witness_block`: the witness of a stored block (unwind to its parent, run, restore).
+//! - `witness_codec`: canonical witness encoding and its keccak256 preimage view (proof lane).
 
 const std = @import("std");
 pub const storage = @import("storage/root.zig");
@@ -19,6 +20,7 @@ pub const evm_backend = @import("evm_backend.zig");
 pub const history = @import("history.zig");
 pub const witness = @import("witness.zig");
 pub const witness_block = @import("witness_block.zig");
+pub const witness_codec = @import("witness_codec.zig");
 pub const database = @import("database.zig");
 pub const bench = @import("bench.zig");
 
@@ -38,5 +40,6 @@ test {
     _ = @import("witness_test.zig");
     _ = @import("witness_evm_test.zig");
     _ = @import("witness_block_test.zig");
+    _ = @import("witness_codec_test.zig");
     _ = @import("database_test.zig");
 }
