@@ -62,6 +62,17 @@ behind a small interface and switch later.
   `Network.busy`) is true until then, so a reused descriptor never meets a stale op.
 - [x] Perf: verifier stage benches (`p2p/stage *`) and `pop_block` reuses the payload hash
   validation computed (`block.decode_known_hash`): end to end 1.02 -> 0.83 ms per block.
+- [x] Real-socket interop (`loopback_test.zig`): two `Network`s on the OS backend
+  (kqueue on macOS, io_uring on Linux via `just test-linux`) over 127.0.0.1 and ::1, on
+  kernel-assigned free ports (never the devnet's fixed ports). Each knows only the other's
+  ENR; the test waits for a completed discv5 handshake on both sides (a real UDP round
+  trip; boot ENRs are also dialed over TCP, so a connection alone proves nothing), then
+  gossips a block each way and drains the UDP completions on stop. Negative control:
+  dropping received datagrams in the transport fails it with `NotConnected`. Decision:
+  this replaces the devnet recheck of completion UDP, whose p2p ports are fixed.
+- [x] Fix: publishing the same block again, or more than `blocks_per_height_max` blocks at
+  one height, hit the `SeenHashes.insert` assert (a crash in a retrying sequencer). Our
+  own block is now recorded only when `check` passes; regression test in `service_test`.
 - [x] Perf: decompress each gossip block once per message: the handler tags its scratch
   with the message id whose bytes it holds (`block.message_id_and_bytes`), and validation
   decodes from it when the tag matches (`stats.decompress_reused`), else decompresses.
@@ -426,3 +437,4 @@ behind a small interface and switch later.
 - 2026-11-05: verifier stage benches; pop_block reuses the validated payload hash (e2e -19%). Devnet recheck of completion UDP skipped: another lane's devnet held the ports.
 
 - 2026-11-05: gossip validation reuses the message-id decompression.
+- 2026-11-05: real-socket loopback interop (IPv4+IPv6, kqueue+io_uring); fixed republish crash.

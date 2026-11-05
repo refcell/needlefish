@@ -303,8 +303,13 @@ pub const BlockGossip = struct {
             &gossip.compressor,
             gossip.publish_output,
         );
-        // Remember our own block so echoes of it count as duplicates at this height.
-        gossip.validator.seen.insert(payload.block_number, payload.block_hash);
+        // Remember our own block so echoes of it count as duplicates at this height. A
+        // republish, or more blocks at one height than the table keeps, is not recorded
+        // again (`insert` requires a passing `check`).
+        const seen = &gossip.validator.seen;
+        if (seen.check(payload.block_number, payload.block_hash)) |_| {
+            seen.insert(payload.block_number, payload.block_hash);
+        } else |_| {}
         const id = try gossip.router.publish(topic, message, now_ns);
         gossip.stats.published += 1;
         return id;

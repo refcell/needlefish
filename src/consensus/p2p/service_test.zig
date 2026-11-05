@@ -234,6 +234,37 @@ test "p2p service: discovery, dialing, and block gossip end to end" {
     }
 }
 
+test "p2p service: republishing a block or many blocks at one height does not crash" {
+    const net = try std.testing.allocator.create(Net);
+    defer std.testing.allocator.destroy(net);
+    try net.init();
+    defer net.deinit();
+    for (0..12) |_| try net.step(500 * ns_per_ms);
+    const sequencer = net.services[1];
+    const value = try net.payload(42);
+    // The same block again and again (a retrying sequencer).
+    for (0..8) |_| {
+        _ = sequencer.publish_block(net.sequencer_secret, beacon_root, value, net.now_ns) catch {};
+        net.pump_gossip();
+    }
+    // Distinct blocks at one height, more than the seen table keeps per height.
+    for (0..8) |index| {
+        var other = value;
+        other.gas_limit += index + 1;
+        other.block_hash = try validity.block_hash(&net.rollup, &other, beacon_root);
+        _ = sequencer.publish_block(net.sequencer_secret, beacon_root, other, net.now_ns) catch {};
+        net.pump_gossip();
+    }
+    // The original block still reached every other node.
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    for (net.services, 0..) |service, index| {
+        if (index == 1) continue;
+        const envelope = service.pop_block(scratch) orelse return error.BlockNotDelivered;
+        try std.testing.expect(envelope.payload.block_hash.eql(value.block_hash));
+    }
+}
+
 test "p2p service: peers under the ban threshold are disconnected and banned" {
     const net = try std.testing.allocator.create(Net);
     defer std.testing.allocator.destroy(net);
