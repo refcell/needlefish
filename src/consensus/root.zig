@@ -7,6 +7,7 @@ pub const protocol = @import("protocol/root.zig");
 pub const p2p = @import("p2p/root.zig");
 pub const derive = @import("derive/root.zig");
 pub const safedb = @import("safedb/root.zig");
+pub const engine = @import("engine/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

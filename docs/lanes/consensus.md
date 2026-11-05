@@ -23,7 +23,10 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] batch stream, batch queue, batch validator
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
   - [ ] attributes queue, pipeline core (step, reset, signals)
-- [ ] `engine`: engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
+- [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
+  - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
+  - [ ] engine task queue: insert unsafe, consolidate, build/seal, finalize, synchronize
+  - [ ] starting forkchoice discovery (find_starting_forkchoice), EL sync
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
@@ -64,6 +67,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   the channel's decompressed buffer.
 
 ## Log
+- 2026-11-05: engine: sync state + forkchoice state, L2 finalizer (bounded, fuzzed).
 - 2026-11-05: safedb: safe head updates, reset semantics, lookup, record codec, fuzz.
 - 2026-11-05: derive: channel bank (Granite ready selection, size prune), assembler, provider.
 - 2026-11-05: derive: calldata/blob data source, L1 retrieval, frame queue + Holocene prune.
