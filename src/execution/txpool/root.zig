@@ -13,6 +13,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 pub const slab = @import("slab.zig");
+pub const validate = @import("validate.zig");
 
 pub const Address = primitives.Address;
 pub const B256 = primitives.B256;
