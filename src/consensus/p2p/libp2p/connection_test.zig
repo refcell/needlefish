@@ -13,6 +13,7 @@ const peer_id = @import("../peers/peer_id.zig");
 const multiaddr = @import("../peers/multiaddr.zig");
 const secp256k1 = @import("../peers/secp256k1.zig");
 const rpc = @import("../gossip/rpc.zig");
+const yamux = @import("yamux.zig");
 const fuzz = @import("../../../testing/fuzz.zig");
 pub const Prng = @import("../../../testing/prng.zig").Prng;
 
@@ -483,5 +484,229 @@ test "connection: fuzz listener input" {
         .input_size_max = 512,
         .iterations = 256,
         .corpus = &corpus,
+    });
+}
+
+// ------------------------------------------------- hostile authenticated plaintext
+//
+// The attacker holds valid noise keys (it completed the handshake), so the AEAD accepts
+// everything it sends: the yamux, multistream, and gossipsub layers must defend
+// themselves. Each input rewinds an established pair from a snapshot, encrypts hostile
+// plaintext with the dialer's real transport, and feeds it to the listener.
+
+const Snapshot = struct {
+    listener: Connection,
+    listener_memory: []u8,
+    dialer_transport: noise.Transport,
+
+    fn save(pair: *const Pair) !Snapshot {
+        const memory = try testing.allocator.dupe(u8, pair.listener.memory);
+        return .{
+            .listener = pair.listener,
+            .listener_memory = memory,
+            .dialer_transport = pair.dialer.transport,
+        };
+    }
+
+    fn restore(snapshot: *const Snapshot, pair: *Pair) void {
+        assert(pair.listener.memory.ptr == snapshot.listener.memory.ptr);
+        pair.listener = snapshot.listener;
+        @memcpy(pair.listener.memory, snapshot.listener_memory);
+        pair.dialer.transport = snapshot.dialer_transport;
+        pair.listener_record = .{};
+    }
+
+    fn deinit(snapshot: *Snapshot) void {
+        testing.allocator.free(snapshot.listener_memory);
+    }
+};
+
+const hostile_protocols = [_][]const u8{
+    "/meshsub/1.1.0", "/meshsub/1.2.0", "/ipfs/ping/1.0.0", "/ipfs/id/1.0.0", "/x",
+};
+
+/// Writes one yamux frame header (fields big-endian, as on the wire).
+fn yamux_header(out: []u8, frame_type: u8, flags: u16, stream: u32, length: u32) void {
+    assert(out.len >= 12);
+    out[0] = 0;
+    out[1] = frame_type;
+    std.mem.writeInt(u16, out[2..4], flags, .big);
+    std.mem.writeInt(u32, out[4..8], stream, .big);
+    std.mem.writeInt(u32, out[8..12], length, .big);
+}
+
+/// A length-prefixed multistream line, `text` + "\n".
+fn multistream_line(out: []u8, text: []const u8) usize {
+    assert(text.len + 1 < 0x80 and out.len >= text.len + 2);
+    out[0] = @intCast(text.len + 1);
+    @memcpy(out[1..][0..text.len], text);
+    out[1 + text.len] = '\n';
+    return text.len + 2;
+}
+
+/// Hostile plaintext for one noise frame: raw garbage, random yamux frames, or a new
+/// stream that negotiates a real protocol and then sends malformed gossipsub frames.
+fn hostile_plaintext(random: std.Random, out: []u8) []const u8 {
+    assert(out.len >= 2048);
+    switch (random.uintLessThan(u8, 4)) {
+        0 => {
+            const length = random.uintAtMost(usize, 512) + 1;
+            random.bytes(out[0..length]);
+            return out[0..length];
+        },
+        1, 3 => {
+            var used: usize = 0;
+            for (0..random.uintAtMost(usize, 3) + 1) |_| {
+                const declared = if (random.boolean())
+                    random.uintAtMost(u32, 300)
+                else
+                    random.int(u32);
+                const stream = switch (random.uintLessThan(u8, 4)) {
+                    0 => 0,
+                    1 => random.uintAtMost(u32, 8),
+                    2 => random.uintAtMost(u32, 1000) | 1,
+                    else => random.int(u32),
+                };
+                const frame_type = random.uintAtMost(u8, 4);
+                yamux_header(out[used..], frame_type, random.int(u16) & 0xf, stream, declared);
+                used += 12;
+                const body = @min(declared, 300);
+                if (frame_type == 0 and used + body <= out.len) {
+                    random.bytes(out[used..][0..body]);
+                    used += body;
+                }
+            }
+            return out[0..used];
+        },
+        else => return hostile_stream(random, out),
+    }
+}
+
+fn hostile_stream(random: std.Random, out: []u8) []const u8 {
+    var body: [1536]u8 = undefined;
+    var used = multistream_line(&body, multistream.header);
+    const protocol = hostile_protocols[random.uintLessThan(usize, hostile_protocols.len)];
+    used += multistream_line(body[used..], protocol);
+    for (0..random.uintAtMost(usize, 4)) |_| {
+        // A gossipsub frame: a varint length (sometimes huge or truncated) and junk.
+        const declared = if (random.boolean()) random.uintAtMost(u64, 200) else random.int(u64);
+        var header: [rpc.varint_length_max]u8 = undefined;
+        const prefix = rpc.frame_header(&header, declared);
+        const prefix_length = if (random.uintLessThan(u8, 8) == 0) prefix.len - 1 else prefix.len;
+        if (used + prefix_length + 200 > body.len) break;
+        @memcpy(body[used..][0..prefix_length], prefix[0..prefix_length]);
+        used += prefix_length;
+        const junk = @min(declared, 200);
+        random.bytes(body[used..][0..junk]);
+        used += junk;
+    }
+    const stream = (random.uintAtMost(u32, 500) * 2 + 101) | 1; // A fresh dialer stream.
+    yamux_header(out, 0, yamux.flag_syn, stream, @intCast(used));
+    @memcpy(out[12..][0..used], body[0..used]);
+    return out[0 .. 12 + used];
+}
+
+/// Feeds hostile frames to the listener; returns true if it closed. The listener must
+/// either accept every byte or close with a reason, never deliver an oversized frame,
+/// and keep a consistent state.
+fn feed_hostile(pair: *Pair, random: std.Random, frames: u32) !bool {
+    var plaintext: [2048]u8 = undefined;
+    var sealed: [2048 + noise.prefix_length + noise.tag_length]u8 = undefined;
+    for (0..frames) |_| {
+        const message = hostile_plaintext(random, &plaintext);
+        const frame = try pair.dialer.transport.encrypt_frame(message, &sealed);
+        pair.now_ns += ns_per_ms;
+        const consumed = pair.listener.receive(frame, pair.now_ns) catch |err| {
+            try testing.expectEqual(error.Closed, err);
+            pair.listener_record.drain(&pair.listener);
+            try testing.expect(pair.listener.closed_reason() != null);
+            return true;
+        };
+        try testing.expectEqual(frame.len, consumed);
+        pair.listener_record.drain(&pair.listener);
+        _ = pair.listener.flush(&flush_buffer); // Its replies go nowhere.
+        if (pair.listener.closed_reason() != null) return true;
+        try testing.expect(pair.listener.is_established());
+    }
+    return false;
+}
+
+test "connection: seeded fuzz of hostile plaintext from an authenticated peer" {
+    var prng = Prng.init(0x6873_7469);
+    var pair = try Pair.init(&prng);
+    defer pair.deinit();
+    var mutation: Mutation = .{ .prng = &prng, .chunk_max = 4096 };
+    try pair.pump(&mutation);
+    try expect_established(&pair, null);
+    var snapshot = try Snapshot.save(&pair);
+    defer snapshot.deinit();
+    var closed: u32 = 0;
+    var survived: u32 = 0;
+    var delivered: u32 = 0;
+    for (0..256) |_| {
+        snapshot.restore(&pair);
+        const random = prng.random();
+        if (try feed_hostile(&pair, random, random.uintAtMost(u32, 16) + 1)) {
+            closed += 1;
+        } else {
+            survived += 1;
+            // Still established: time keeps working and the listener stays bounded.
+            pair.listener.tick(pair.now_ns + ping.interval_ns);
+            _ = pair.listener.flush(&flush_buffer);
+            pair.listener_record.drain(&pair.listener);
+        }
+        // Junk on a negotiated meshsub stream reaches the gossip layer (the router
+        // rejects it); count it to prove the generator gets that deep.
+        delivered += pair.listener_record.gossip_count;
+        try testing.expect(pair.listener.is_established() or
+            pair.listener.closed_reason() != null);
+    }
+    // Both outcomes occur: junk that yamux rejects, and junk that stays inside a stream.
+    try testing.expect(closed > 0);
+    try testing.expect(survived > 0);
+    try testing.expect(delivered > 0);
+}
+
+const HostileFixture = struct {
+    pair: *Pair,
+    snapshot: *const Snapshot,
+};
+
+fn fuzz_hostile(fixture: *HostileFixture, input: []const u8) anyerror!void {
+    const pair = fixture.pair;
+    fixture.snapshot.restore(pair);
+    var sealed: [noise.prefix_length + 1024 + noise.tag_length]u8 = undefined;
+    var rest = input;
+    while (rest.len > 0) {
+        const take = @min(rest.len, @as(usize, rest[0]) * 4 + 1, 1024);
+        const frame = try pair.dialer.transport.encrypt_frame(rest[0..take], &sealed);
+        rest = rest[take..];
+        const consumed = pair.listener.receive(frame, 1) catch |err| {
+            try testing.expectEqual(error.Closed, err);
+            try testing.expect(pair.listener.closed_reason() != null);
+            return;
+        };
+        try testing.expectEqual(frame.len, consumed);
+        pair.listener_record.drain(&pair.listener);
+        _ = pair.listener.flush(&flush_buffer);
+    }
+    try testing.expect(pair.listener.is_established() or pair.listener.closed_reason() != null);
+}
+
+test "connection: fuzz plaintext bytes from an authenticated peer" {
+    var prng = Prng.init(0x6670_6c61);
+    var pair = try Pair.init(&prng);
+    defer pair.deinit();
+    var mutation: Mutation = .{ .prng = &prng, .chunk_max = 4096 };
+    try pair.pump(&mutation);
+    try expect_established(&pair, null);
+    var snapshot = try Snapshot.save(&pair);
+    defer snapshot.deinit();
+    var fixture: HostileFixture = .{ .pair = &pair, .snapshot = &snapshot };
+    var corpus_frame: [64]u8 = undefined;
+    yamux_header(&corpus_frame, 0, yamux.flag_syn, 101, 20);
+    try fuzz.run_bytes(&fixture, fuzz_hostile, .{
+        .input_size_max = 4096,
+        .corpus = &.{ corpus_frame[0..32], "\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" },
     });
 }

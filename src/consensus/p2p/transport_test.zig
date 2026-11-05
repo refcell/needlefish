@@ -509,3 +509,86 @@ test "p2p transport: chaos seed sweep with loss, resets, and a partition (slow)"
         }
     }
 }
+
+/// Sends one junk gossipsub frame (random protobuf bytes) on every open link of `node`.
+fn send_junk_frames(node: *Node, random: std.Random) u32 {
+    const rpc = @import("gossip/rpc.zig");
+    var sent: u32 = 0;
+    for (node.transport.links) |*link| {
+        if (link.state != .open or !link.connection_live) continue;
+        if (!link.connection.is_established()) continue;
+        var frame: [rpc.varint_length_max + 256]u8 = undefined;
+        const length = random.uintAtMost(usize, 255) + 1;
+        const prefix = rpc.frame_header(&frame, length);
+        random.bytes(frame[prefix.len..][0..length]);
+        link.connection.send_gossip(frame[0 .. prefix.len + length]) catch continue;
+        sent += 1;
+    }
+    node.transport.pump_all();
+    return sent;
+}
+
+/// Pops every queued block on node `index`; true if one of them is `number`.
+fn drain_has(cluster: *Cluster, index: usize, number: u64, scratch: []u8) bool {
+    var found = false;
+    for (0..64) |_| {
+        const envelope = cluster.storage[index].service.pop_block(scratch) orelse break;
+        if (envelope.payload.block_number == number) found = true;
+    }
+    return found;
+}
+
+test "p2p transport: an authenticated peer sending junk RPCs is dropped, blocks keep flowing" {
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(0x6a75_6e6b);
+    defer cluster.deinit();
+    cluster.run(8 * ns_per_s);
+    const attacker = nodes - 1;
+    var prng = Prng.init(0x6a75);
+    const random = prng.random();
+    var junk_sent: u32 = 0;
+    var wrong_key: [32]u8 = @splat(0);
+    wrong_key[31] = 9;
+    for (0..6) |round| {
+        // 2 s of attack: junk frames every 100 ms, a badly signed block every 500 ms.
+        for (0..20) |step| {
+            junk_sent += send_junk_frames(&cluster.storage[attacker], random);
+            if (step % 5 == 0) {
+                cluster.publish_signed(attacker, 1000 + round * 4 + step / 5, wrong_key) catch {};
+            }
+            cluster.run(100 * ns_per_ms);
+        }
+        const number = 10 + round;
+        try cluster.publish(0, number);
+        cluster.run(1 * ns_per_s);
+        for (1..attacker) |index| {
+            if (!drain_has(cluster, index, number, scratch)) {
+                std.debug.print("junk rpc: node {d} missed block {d}\n", .{ index, number });
+                return error.BlockNotDelivered;
+            }
+        }
+    }
+    try std.testing.expect(junk_sent > 0);
+    const attacker_key = try secp256k1.public_key(cluster.storage[attacker].secret);
+    const attacker_peer = peer_id.from_public_key(attacker_key);
+    var invalid_rpcs: u64 = 0;
+    var invalid_signer: u64 = 0;
+    for (cluster.all()[0..attacker]) |*node| {
+        invalid_rpcs += node.service.stats.invalid_rpcs;
+        const reason = @backingInt(validity.Reason.invalid_signer);
+        invalid_signer += node.service.gossip.stats.failed[reason];
+        // Honest nodes stay connected to at least one other honest node.
+        var honest_links: u32 = 0;
+        for (&node.service.connected) |*connection| {
+            if (!connection.active) continue;
+            honest_links += @intFromBool(!connection.peer.eql(&attacker_peer));
+        }
+        try std.testing.expect(honest_links >= 1);
+    }
+    // Undecodable frames got the attacker disconnected; its blocks were rejected.
+    try std.testing.expect(invalid_rpcs > 0);
+    try std.testing.expect(invalid_signer > 0);
+}

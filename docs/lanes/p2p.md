@@ -37,9 +37,18 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
-- [ ] Fuzz: hostile bytes on a live, authenticated connection (random yamux frames,
-  multistream, and gossipsub protobuf after the noise handshake) against a full `Network`
-  in SimIo; the node must stay up, keep serving honest peers, and score/close the attacker.
+- [x] Fuzz: hostile bytes on a live, authenticated connection.
+  Connection level (`connection_test.zig`): an established pair is snapshotted (struct +
+  backing memory + the dialer's noise transport) and rewound per input; the dialer seals
+  hostile plaintext with its real keys: random bytes, random yamux headers/flags/ids/
+  lengths, and fresh SYN streams negotiating meshsub/ping/identify followed by huge,
+  truncated, or junk gossipsub frames. Seeded (256 inputs; both closes and survivals occur,
+  junk reaches the gossip layer) plus `fuzz.run_bytes`. Invariant: every byte is consumed
+  or the connection closes with a reason; state stays established-xor-closed.
+  Network level (`transport_test.zig`): in a 4-node cluster an authenticated attacker sends
+  junk RPC frames every 100 ms and wrong-signer blocks every 500 ms for 12 s; honest nodes
+  get every honest block, keep honest links, disconnect it (`invalid_rpcs`), and reject
+  its blocks (`invalid_signer`).
 - [ ] Bench: end-to-end gossip in SimIo (sequencer -> N verifiers, 128 KiB blocks):
   CPU per block for encode, sign, snappy, noise, and validate; record in `docs/PERF.md`.
 - [ ] Completion-based UDP (`recvfrom`/`sendto` completions) for discovery on io_uring,
@@ -397,3 +406,4 @@ behind a small interface and switch later.
 - 2026-11-05: opp2p_* served by the consensus node RPC via p2p.rpc.Merged.
 - 2026-11-05: crash-restart DST under packet loss.
 - 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.
+- 2026-11-05: hostile authenticated-plaintext fuzz (connection + network level).
