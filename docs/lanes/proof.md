@@ -57,9 +57,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/contracts`: ABI codec (static words + `bytes`, strict decode) and call/return
   codecs for DisputeGameFactory (packed extraData, game lookup key, createWithInitData),
   AnchorStateRegistry, DelayedWETH; fuzzed.
-- [ ] `proof/rpc`: typed blocking L1/L2/rollup clients over `rpc.Client` (eth_call with
-  the contract codecs, `optimism_outputAtBlock`, `optimism_syncStatus`, safe/finalized
-  heads) for the proposer and challenger (port `rpc/`).
+- [x] `proof/rpc`: blocking `Endpoint` (pump-driven `rpc.Client`, bounded steps, per-call
+  arena) shared with the host source; typed execution calls (block number, raw headers by
+  number/tag/hash, `eth_call`, balance) and rollup calls (`optimism_syncStatus`,
+  `optimism_outputAtBlock`); canned-server SimIo test.
 - [ ] `proof/proposer`: output-root proposal pipeline (targets, intervals, collector,
   submitter via the batcher's txmgr), `bin/base proposer`, DST test with L1 reorgs.
 - [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
@@ -135,6 +136,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/rpc`: blocking endpoint + typed L1/L2/rollup calls; host source on it.
 - 2026-11-05: `proof/contracts`: ABI codec and dispute-game contract call codecs.
 - 2026-11-05: host: served-hint dedupe; live 40-block proof 40 s -> 1.2 s.
 - 2026-11-05: custom chains in boot/client; first live devnet proof holds and replays.

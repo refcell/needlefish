@@ -199,7 +199,7 @@ test "rpc source: L1 provider reads a mined block through hints served over HTTP
     try testing.expect(receipts[1].success);
     const parent = try l1.l1_block_info_by_number(0);
     try testing.expect(parent.hash.eql(.{ .bytes = genesis_hash }));
-    try testing.expect(source.calls >= 4);
+    try testing.expect(source.calls() >= 4);
 
     // The payload witness of the canonical child of genesis.
     const count = store.count();
