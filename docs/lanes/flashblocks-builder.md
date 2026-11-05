@@ -37,7 +37,7 @@ can drive the builder and the flashblocks consumer.
   cancellation on new FCU (port `service.rs`, `resting.rs`).
 - [ ] `builder/metering`: per-tx execution metering store and extension hooks
   (port `crates/builder/metering`, `execution_metering_mode.rs`).
-- [ ] `builder/multiplex`: router between the canonical EL and the builder for Engine
+- [x] `builder/multiplex`: router between the canonical EL and the builder for Engine
   API calls (port `crates/builder/multiplex`).
 - [ ] `execution/flashblocks` consumer: WebSocket subscription to a flashblocks feed
   with reconnect/backoff, ordering/validation (index, parent hash, payload id), pending
@@ -53,6 +53,10 @@ can drive the builder and the flashblocks consumer.
   sequence for a block replays to exactly the sealed block.
 
 ## Decisions
+- Multiplex is a synchronous router over a comptime `Builder` interface (both builders
+  in-process); it ports routing, shadow `no_tx_pool` builds, 128-id route memory, health,
+  and the event filter. Wiring it to the Engine API service comes with `builder/core`
+  service.
 - Best-txs walks one `Pool.select` snapshot per flashblock; committed hashes persist per
   block. Resting predicates/parking (base/base `RestingPredicateMode`, default off) are
   deferred. The rejection cache is FIFO with TTL (moka TinyLFU approximated).
@@ -80,3 +84,4 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: `builder/publish` replay ring + `Publisher(IO)` over the ws server with resume
   replay, base/base metrics, and a SimIo DST (resets, partitions, floods, reconnects).
 - 2026-11-05: `builder/core` best-transactions view and rejection cache, model-checked fuzz.
+- 2026-11-05: `builder/multiplex` router (Denim one-shot selection, shadow builds, health).
