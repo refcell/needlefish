@@ -23,6 +23,7 @@ pub const secp256k1_length = 2 + secp256k1_protobuf_prefix.len + secp256k1.compr
 pub const Error = error{ InvalidPeerId, InvalidText };
 
 pub const PeerId = struct {
+    /// Bytes past `length` are always zero so `std.meta.eql` agrees with `eql`.
     bytes: [length_max]u8,
     length: u8,
 
@@ -53,7 +54,7 @@ pub const PeerId = struct {
 
 pub fn from_public_key(key: secp256k1.PublicKey) PeerId {
     assert(key[0] == 0x02 or key[0] == 0x03);
-    var peer: PeerId = .{ .bytes = undefined, .length = secp256k1_length };
+    var peer: PeerId = .{ .bytes = @splat(0), .length = secp256k1_length };
     peer.bytes[0] = multihash_identity;
     peer.bytes[1] = secp256k1_protobuf_prefix.len + secp256k1.compressed_length;
     @memcpy(peer.bytes[2..6], &secp256k1_protobuf_prefix);
@@ -74,7 +75,7 @@ pub fn from_bytes(bytes: []const u8) Error!PeerId {
         multihash_sha256 => if (size.value != 32) return error.InvalidPeerId,
         else => return error.InvalidPeerId,
     }
-    var peer: PeerId = .{ .bytes = undefined, .length = @intCast(bytes.len) };
+    var peer: PeerId = .{ .bytes = @splat(0), .length = @intCast(bytes.len) };
     @memcpy(peer.bytes[0..bytes.len], bytes);
     return peer;
 }
