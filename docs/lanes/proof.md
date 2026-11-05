@@ -45,8 +45,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
   canonical archive, offline replay, JSON-RPC source. Left: beacon blobs in the RPC
   source and a server loop over fds for a separate client process.
-- [ ] `bin/base proof`: `replay <archive>` done. Left: `run` (native mode against
-  devnet RPCs for an L2 block) that records the archive.
+- [x] `bin/base proof`: `replay <archive>` (offline) and `run` (native mode against
+  L1/L2 execution RPCs; boot values from `--agreed`/`--claimed` headers, output roots
+  from state root + withdrawals root; `--out` records the archive).
+- [ ] `proof/devnet-proof`: run `base proof run` against a live local devnet (node
+  `--dev-l1` + L2 node + consensus + batcher) in a script under `etc/`, then replay the
+  archive; fix whatever the real chain exposes.
 - [ ] `proof/rpc` + `proof/contracts`: typed L1/L2/rollup clients with caching, ABI
   bindings for DisputeGameFactory, AnchorStateRegistry, DelayedWETH (port `rpc/`,
   `contracts/`). ABI encode/decode fuzz tests.
@@ -121,6 +125,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `base proof run`: native mode over RPC, records a replayable archive.
 - 2026-11-05: driver: deposit-only retry limited to block-validity errors (soundness).
 - 2026-11-05: host: RPC-backed source over the node's debug endpoints (SimIo HTTP test).
 - 2026-11-05: `base proof replay <archive>`: offline client run over a recorded archive.

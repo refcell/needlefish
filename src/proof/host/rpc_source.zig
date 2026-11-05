@@ -201,6 +201,15 @@ pub fn RpcSource(comptime IO: type) type {
             return source.witness_items(witness);
         }
 
+        /// The raw header of block `number` (null: the latest) on `chain`; valid until the
+        /// next call. For choosing boot values, so it is not hash-checked here.
+        pub fn header_by_number(source: *Self, chain: Chain, number: ?u64) SourceError![]const u8 {
+            _ = source.arena.reset(.retain_capacity);
+            const param: Param = if (number) |value| .{ .number = value } else .latest;
+            const raw = try source.call(source.client_of(chain), "debug_getRawHeader", param);
+            return source.hex_value(raw);
+        }
+
         /// Decodes a JSON hex string into arena bytes.
         fn hex_value(source: *Self, raw: []const u8) SourceError![]const u8 {
             var scanner = json.Scanner.init(raw);
@@ -277,11 +286,13 @@ pub fn RpcSource(comptime IO: type) type {
 const Param = union(enum) {
     hash: Hash,
     number: u64,
+    latest,
 
     fn write(param: Param, writer: *json.Writer) json.Writer.WriteError!void {
         switch (param) {
             .hash => |hash| try writer.data(&hash),
             .number => |number| try writer.quantity(number),
+            .latest => try writer.string("latest"),
         }
     }
 };
