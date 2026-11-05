@@ -142,7 +142,7 @@ pub const L2ChainProvider = struct {
         return error.NotFound;
     }
 
-    fn fetch_header(self: *L2ChainProvider, hash: Hash) Failure!consensus.Header {
+    pub fn fetch_header(self: *L2ChainProvider, hash: Hash) Failure!consensus.Header {
         try hint.send(self.hints, .l2_block_header, &.{&hash});
         const encoded = try self.resolver.get(&hash);
         const header = consensus.Header.decode(encoded) catch return error.InvalidHeader;
@@ -238,7 +238,7 @@ pub const L2ChainProvider = struct {
 };
 
 /// The L1 info of the block's first transaction, which must be a deposit.
-fn decode_l1_info(transactions: []const []const u8) Failure!protocol.L1BlockInfo {
+pub fn decode_l1_info(transactions: []const []const u8) Failure!protocol.L1BlockInfo {
     if (transactions.len == 0) return error.MissingL1InfoDeposit;
     const first = consensus.Envelope.decode(transactions[0]) catch return error.InvalidTransaction;
     if (!first.is_deposit()) return error.MissingL1InfoDeposit;

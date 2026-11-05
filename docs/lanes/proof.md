@@ -27,12 +27,16 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (trie DB with account/storage/code fetch via hints), building header + receipts and
   checking the output root (port `executor/src/{builder,db}`). Test: re-execute a block
   built by the node lane from a witness and match its state root.
-- [ ] `proof/program` boot info + caching oracle + L1/L2 chain providers over the
+- [x] `proof/program` boot info + caching oracle + L1/L2 chain providers over the
   oracle (port `proof/src/{boot,caching_oracle,l1,l2,hint,sync}.rs`), feeding the
   consensus lane's derivation pipeline.
-- [ ] `proof/driver` + `proof/client`: prologue / derive-and-execute loop to the claimed
+- [x] `proof/driver` + `proof/client`: prologue / derive-and-execute loop to the claimed
   L2 block / epilogue that compares the computed output root with the claim (port
   `driver/src/*`, `client/src/*`). End-to-end test with an in-memory recorded oracle.
+- [ ] `proof/e2e`: record a real oracle (sim or devnet: L1 with batcher frames, L2 blocks
+  and witnesses) and run the client through derive + execute of several blocks, checking
+  the claimed output root; include a Holocene deposit-only retry case. (The current client
+  test covers boot, safe head, providers, pipeline reset and L1 exhaustion only.)
 - [ ] `proof/host`: KV stores (mem, disk via io, split, boot), online backend that
   serves hints by fetching from L1/L2/beacon RPC and records preimages, offline backend
   that replays them, server loop over the preimage channel (port `host/src/*`).
@@ -84,12 +88,21 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   with `set_head`; blocks the program built are kept in a 64-entry ring (`remember`)
   so block info / system config never depend on the host knowing a block the program
   derived differently. Full safe blocks (span batch checks) still come from the oracle.
+- No separate caching oracle: `OracleResolver` caches every hash-verified keccak read
+  (headers, trie nodes) and in-process reads are cheap; blob elements are read once.
+  The driver empties the providers' resolver between steps when it is half full.
+- Client: claimed block below the safe head is `InvalidClaimedBlock`; equal returns the
+  agreed root (trace extension); otherwise derive until the target or L1 exhaustion and
+  compare the tip's output root with the claim. Intermediate output roots (boot key 9)
+  are loaded but not yet checked.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/program`, `proof/driver`, `proof/client` landed (sync, driver loop
+  with deposit-only retry, client prologue/epilogue, e2e over L1 exhaustion).
 - 2026-11-05: program: L1 blob provider (field-element reassembly, KZG check) and L2
   chain provider (deposit-derived block info and system config).
 - 2026-11-05: program: typed hints and the oracle-backed L1 chain provider (headers,

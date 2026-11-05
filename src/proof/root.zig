@@ -7,6 +7,8 @@ pub const preimage = @import("preimage/root.zig");
 pub const mpt = @import("mpt/root.zig");
 pub const executor = @import("executor/root.zig");
 pub const program = @import("program/root.zig");
+pub const driver = @import("driver/root.zig");
+pub const client = @import("client/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
