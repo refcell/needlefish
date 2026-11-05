@@ -73,10 +73,13 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   init bond from `initBonds`, `eth_estimateGas`, EIP-1559 signing via `batcher/txdata`,
   receipt polling, revert classification (data selector, selector text, error name) of
   estimation errors and replayed failed receipts; dropped after N empty polls.
-- [ ] `bin/base proposer`: done: `proposer/config.zig` (base/base `cli.rs`/`config.rs`
-  flag names, defaults, validation; fuzzed) and the dry-run submitter. Left: the binary
-  (endpoints, pipeline driven by `utilities.io` time) once the prover-service requester
-  lands; health/metrics later.
+- [x] `bin/base proposer`: `proposer/config.zig` (base/base `cli.rs`/`config.rs` flags,
+  defaults, validation; fuzzed), dry-run submitter, `--prover-rpc native` (in-process
+  native prover over the L1/L2 endpoints), JSON-RPC submitter from `--private-key`,
+  pipeline ticked by the IO clock (`--ticks-max` for smoke runs). Dry-run smoke on the
+  devnet (no factory deployed there, so nothing to propose).
+- [ ] `proposer` follow-ups: `--prover-rpc <url>` via the prover-service requester,
+  `--l1-beacon` for the native prover's blob reads, health/metrics/admin endpoints.
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
@@ -203,6 +206,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   with the sampled intermediate roots; it stands in for base/base's TEE/ZK prover service
   so `base proposer` runs end to end. Requests are proven synchronously in `request` (a
   tick blocks for the proof); at most 8 sessions.
+- `base proposer` with the native prover sends the witness archive as `initData`
+  (calldata cap raised to 4 MiB): L1 nodes cap transactions near 128 KiB, so this mode is
+  for local chains; real deployments use a prover service with compact proofs.
 - Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
   batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
   estimation, no revert data), while a game creation needs the bond as value and the
@@ -234,6 +240,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `base proposer` (native prover, dry-run, JSON-RPC submitter).
 - 2026-11-05: proposer native prover (witness archive as initData), e2e replayed.
 - 2026-11-05: proposer checks the proof L1 head against the finalized L2 origin.
 - 2026-11-05: proposer config (flags + validation) and dry-run submitter.

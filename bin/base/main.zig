@@ -8,6 +8,7 @@ const batcher = @import("batcher.zig");
 const node = @import("node.zig");
 const consensus = @import("consensus.zig");
 const proof = @import("proof.zig");
+const proposer = @import("proposer.zig");
 const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
 const snapshotter = @import("snapshotter.zig");
@@ -24,6 +25,7 @@ const usage =
     \\  node       execution node (--dev-l1 for a standalone L1 dev chain)
     \\  consensus  consensus (rollup) node: derivation, engine driving, optimism_* RPC
     \\  proof      fault-proof tooling (replay a recorded preimage archive)
+    \\  proposer   propose output-root dispute games
     \\  balance-monitor  poll an account balance, serve metrics and health
     \\  load-test  send a seeded transaction workload, report inclusion latency
     \\  snapshotter  create, restore, or verify node datadir snapshots
@@ -38,6 +40,7 @@ test {
     _ = node;
     _ = consensus;
     _ = proof;
+    _ = proposer;
     _ = balance_monitor;
     _ = load_test;
     _ = snapshotter;
@@ -71,6 +74,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "batcher")) {
         std.process.exit(try batcher.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "proposer")) {
+        std.process.exit(try proposer.main(init, args[2..]));
     }
     if (std.mem.eql(u8, command, "proof")) {
         std.process.exit(try proof.main(init, args[2..]));
