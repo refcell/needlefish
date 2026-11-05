@@ -110,6 +110,9 @@ Each binary must accept at least the flags below. Lanes may add more.
   `admin_getThrottleController`, `admin_setThrottleController`); `--stopped` starts with ingestion stopped.
   `--sequencer-urls URL|L2_URL=ROLLUP_URL,...` replaces `--l2`/`--rollup-rpc`; the leader is
   the first endpoint whose rollup node answers `admin_sequencerActive` with true.
+  base/base flag names also work: `--l1-rpc-url`, `--poll-interval S`,
+  `--data-availability-type`, `--max-blobs-per-tx`, `--resubmission-timeout S`,
+  `--max-calldata-size-bytes`.
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 

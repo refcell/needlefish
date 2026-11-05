@@ -64,9 +64,12 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   already on L1 after a restart (base/base `recent_txs.rs`).
 - [x] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
 - [x] DST: a sim scenario driving admin stop/start/flush on the real batcher.
-- [ ] `batcher`: base/base flag names as aliases (`--l1-rpc-url`, `--poll-interval` seconds,
+- [x] `batcher`: base/base flag names as aliases (`--l1-rpc-url`, `--poll-interval` seconds,
   `--data-availability-type`, `--resubmission-timeout`, `--max-blobs-per-tx`,
-  `--compressed-size-target`, `--max-calldata-size-bytes`, `--network-timeout`).
+  `--max-calldata-size-bytes`).
+- [ ] `batcher`: `--network-timeout` (needs a request timeout in the HTTP transport).
+- [ ] `batcher`: `--compressed-size-target` (close the channel once compressed output passes
+  the target, keeping the batch that reached it).
 - [ ] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
 - [ ] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
@@ -168,3 +171,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: sim: `admin_ops_per_minute` fault class (real batcher stop/start/flush during the
   fault phase; heal starts it), swarm-enabled with the real batcher; scenario test is
   mutation-checked (no start on heal -> liveness failure).
+
+- 2026-11-05: smoke re-run on 77c9635: all checks pass. Live check: with
+  `--sequencer-urls verifier,sequencer` the batcher picks #1 via `admin_sequencerActive` and
+  batches; "no sequencer active" is now logged on change only.
+- 2026-11-05: base/base flag aliases; flag parsing seeded-fuzzed against its invariants.

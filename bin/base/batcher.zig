@@ -17,6 +17,8 @@ const usage =
     \\         [--throttle-strategy off|step|linear|quadratic]
     \\         [--admin-port P [--admin-addr IP]] [--stopped] [--num-confirmations N]
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
+    \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
+    \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
     \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
     \\         [--wait-node-sync-timeout SECONDS]]
@@ -61,6 +63,12 @@ const Flags = struct {
     wait_node_sync_timeout_s: u64 = 600,
     /// Recent-tx window selecting the sync target; 0 = the L1 head.
     check_recent_txs_depth: u64 = 0,
+    /// Frames (blobs) per blob transaction, 1..6 (base/base `--max-blobs-per-tx`).
+    blobs_per_tx: u8 = 6,
+    /// Same-nonce resubmission timeout (base/base `--resubmission-timeout`, seconds).
+    resubmit_after_ms: u64 = 12_000,
+    /// Calldata payload limit incl. the version byte (`--max-calldata-size-bytes`).
+    calldata_bytes_max: u32 = tx_data_bytes_max,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -78,6 +86,10 @@ fn parse_flags(args: []const []const u8) !Flags {
         }
         if (i + 1 == args.len) return error.MissingValue;
         const value = args[i + 1];
+        if (try apply_alias(&flags, arg, value)) {
+            i += 2;
+            continue;
+        }
         if (eql(u8, arg, "--rollup-config")) {
             flags.rollup_config = value;
         } else if (eql(u8, arg, "--l1")) {
@@ -109,16 +121,6 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.wait_node_sync_timeout_s = try std.fmt.parseInt(u64, value, 10);
         } else if (eql(u8, arg, "--sub-safety-margin")) {
             flags.sub_safety_margin = try std.fmt.parseInt(u64, value, 10);
-        } else if (eql(u8, arg, "--num-confirmations")) {
-            flags.confirmations = try std.fmt.parseInt(u64, value, 10);
-            if (flags.confirmations == 0) return error.InvalidConfirmations;
-        } else if (eql(u8, arg, "--min-tip-cap")) {
-            flags.min_tip_wei = try parse_gwei(value);
-        } else if (eql(u8, arg, "--min-basefee")) {
-            flags.min_base_fee_wei = try parse_gwei(value);
-        } else if (eql(u8, arg, "--max-pending-transactions")) {
-            flags.pending_max = try std.fmt.parseInt(u8, value, 10);
-            if (flags.pending_max == 0) return error.InvalidPendingMax;
         } else if (eql(u8, arg, "--admin-port")) {
             flags.admin_port = try std.fmt.parseInt(u16, value, 10);
         } else if (eql(u8, arg, "--admin-addr")) {
@@ -165,7 +167,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     init.io.random(&seed);
     // One frame per transaction payload: the payload is `version byte ++ frame`.
     const payload_max: u32 = switch (flags.data_availability) {
-        .calldata => tx_data_bytes_max,
+        .calldata => flags.calldata_bytes_max,
         .blobs => batcher.blobs.blob_data_length_max,
     };
     var service = try batcher.service.Service.init(init.gpa, .{
@@ -185,7 +187,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             .tx_data_bytes_max = payload_max,
             .data_availability = flags.data_availability,
             // op-batcher's blob default: up to 6 frames (blobs) per transaction.
-            .blobs_per_tx = if (flags.data_availability == .blobs) 6 else 1,
+            .blobs_per_tx = if (flags.data_availability == .blobs) flags.blobs_per_tx else 1,
+            .resubmit_after_ms = flags.resubmit_after_ms,
             .slots_max = flags.pending_max,
             .confirmations = flags.confirmations,
             .min_tip_wei = flags.min_tip_wei,
@@ -217,6 +220,7 @@ fn run(
     try endpoints.init(init.gpa, init.io, entries);
     defer endpoints.deinit(init.gpa);
     var leader = endpoints.tracker();
+    var active_count: u8 = 1;
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
     if (flags.wait_node_sync) {
         try wait_for_node_sync(init, flags, &l1, leader.current().rollup, service);
@@ -229,7 +233,7 @@ fn run(
     var throttle_logged: batcher.throttle.Outcome = .idle;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
-        const clients = follow_leader(&leader, &l1, endpoints.has_rollup, service);
+        const clients = follow_leader(&leader, &l1, endpoints.has_rollup, service, &active_count);
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
             metrics.record(report, service.txs.pending_count());
@@ -253,13 +257,17 @@ fn follow_leader(
     l1: *batcher.rpc.Client,
     has_rollup: bool,
     service: *batcher.service.Service,
+    last_active_count: *u8,
 ) batcher.service.Clients {
     const refresh = leader.refresh();
+    const active_changed = refresh.active_count != last_active_count.*;
+    last_active_count.* = refresh.active_count;
     if (refresh.leader_changed) {
         std.debug.print("batcher: sequencer leader is now #{d}\n", .{leader.leader});
         service.throttle.pushed = null;
     }
-    if (refresh.active_count == 0) {
+    // Logged on change only: the refresh runs every step.
+    if (!active_changed) {} else if (refresh.active_count == 0) {
         std.debug.print("batcher: no sequencer is active; keeping #{d}\n", .{leader.leader});
     } else if (refresh.active_count > 1) {
         std.debug.print("batcher: {d} sequencers are active\n", .{refresh.active_count});
@@ -282,6 +290,60 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
             .{},
         ),
     }
+}
+
+/// base/base `BatcherArgs` names (`base-batcher` flags) for the same settings, so its
+/// command lines work unchanged. Returns false for flags it does not know.
+fn apply_alias(flags: *Flags, arg: []const u8, value: []const u8) !bool {
+    if (try apply_txmgr_flag(flags, arg, value)) return true;
+    return apply_alias_settings(flags, arg, value);
+}
+
+/// base/base tx manager flags.
+fn apply_txmgr_flag(flags: *Flags, arg: []const u8, value: []const u8) !bool {
+    const eql = std.mem.eql;
+    if (eql(u8, arg, "--num-confirmations")) {
+        flags.confirmations = try std.fmt.parseInt(u64, value, 10);
+        if (flags.confirmations == 0) return error.InvalidConfirmations;
+    } else if (eql(u8, arg, "--min-tip-cap")) {
+        flags.min_tip_wei = try parse_gwei(value);
+    } else if (eql(u8, arg, "--min-basefee")) {
+        flags.min_base_fee_wei = try parse_gwei(value);
+    } else if (eql(u8, arg, "--max-pending-transactions")) {
+        flags.pending_max = try std.fmt.parseInt(u8, value, 10);
+        if (flags.pending_max == 0) return error.InvalidPendingMax;
+    } else return false;
+    return true;
+}
+
+fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool {
+    const eql = std.mem.eql;
+    const parse = std.fmt.parseInt;
+    if (eql(u8, arg, "--l1-rpc-url")) {
+        flags.l1 = value;
+    } else if (eql(u8, arg, "--poll-interval")) {
+        const seconds = try parse(u64, value, 10);
+        if (seconds == 0 or seconds > 3600) return error.InvalidPollInterval;
+        flags.poll_interval_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--data-availability-type")) {
+        const blobs = eql(u8, value, "blobs") or eql(u8, value, "blob");
+        if (!blobs and !eql(u8, value, "calldata")) return error.UnknownDataAvailability;
+        flags.data_availability = if (blobs) .blobs else .calldata;
+    } else if (eql(u8, arg, "--max-blobs-per-tx")) {
+        flags.blobs_per_tx = try parse(u8, value, 10);
+        if (flags.blobs_per_tx == 0 or flags.blobs_per_tx > 6) return error.InvalidBlobsPerTx;
+    } else if (eql(u8, arg, "--resubmission-timeout")) {
+        const seconds = try parse(u64, value, 10);
+        if (seconds == 0 or seconds > 3600) return error.InvalidResubmissionTimeout;
+        flags.resubmit_after_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--max-calldata-size-bytes")) {
+        flags.calldata_bytes_max = try parse(u32, value, 10);
+        // Room for the version byte and a frame header plus data; at most the tx cap.
+        const valid = flags.calldata_bytes_max >= 64 and
+            flags.calldata_bytes_max <= tx_data_bytes_max;
+        if (!valid) return error.InvalidCalldataSize;
+    } else return false;
+    return true;
 }
 
 /// Valueless flags; returns false for flags that take a value.
@@ -474,6 +536,26 @@ test "batcher: flags" {
     try std.testing.expectError(error.SequencerUrlsReplaceL2, parse_flags(&both));
     const urls = [_][]const u8{ "--sequencer-urls", "http://b:2", "--wait-node-sync" };
     try std.testing.expect((try parse_flags(&urls)).wait_node_sync);
+    const aliases = [_][]const u8{
+        "--l1-rpc-url",             "http://l1:1", "--poll-interval",           "3",
+        "--data-availability-type", "blob",        "--max-blobs-per-tx",        "2",
+        "--resubmission-timeout",   "48",          "--max-calldata-size-bytes", "1000",
+    };
+    const alias_flags = try parse_flags(&aliases);
+    try std.testing.expectEqualStrings("http://l1:1", alias_flags.l1.?);
+    try std.testing.expectEqual(@as(u64, 3000), alias_flags.poll_interval_ms);
+    try std.testing.expectEqual(.blobs, alias_flags.data_availability);
+    try std.testing.expectEqual(@as(u8, 2), alias_flags.blobs_per_tx);
+    try std.testing.expectEqual(@as(u64, 48_000), alias_flags.resubmit_after_ms);
+    try std.testing.expectEqual(@as(u32, 1000), alias_flags.calldata_bytes_max);
+    const bad_aliases = [_][2][]const u8{
+        .{ "--poll-interval", "0" },          .{ "--max-blobs-per-tx", "7" },
+        .{ "--data-availability-type", "x" }, .{ "--max-calldata-size-bytes", "10" },
+        .{ "--resubmission-timeout", "0" },
+    };
+    for (bad_aliases) |pair| {
+        try std.testing.expect(std.meta.isError(parse_flags(&pair)));
+    }
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
@@ -483,4 +565,61 @@ test "batcher: flags" {
 
 test {
     _ = sequencer_clients;
+}
+
+const fuzz_flag_names = [_][]const u8{
+    "--poll-interval",            "--max-blobs-per-tx",       "--resubmission-timeout",
+    "--max-calldata-size-bytes",  "--data-availability-type", "--num-confirmations",
+    "--max-pending-transactions", "--sub-safety-margin",      "--max-channel-duration",
+    "--check-recent-txs-depth",   "--wait-node-sync",         "--stopped",
+};
+const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
+
+/// Parsed flags always satisfy the bounds the batcher relies on.
+fn check_flag_invariants(flags: Flags) !void {
+    try std.testing.expect(flags.blobs_per_tx >= 1 and flags.blobs_per_tx <= 6);
+    try std.testing.expect(flags.poll_interval_ms > 0);
+    try std.testing.expect(flags.resubmit_after_ms > 0);
+    try std.testing.expect(flags.calldata_bytes_max >= 64);
+    try std.testing.expect(flags.calldata_bytes_max <= tx_data_bytes_max);
+    try std.testing.expect(flags.confirmations >= 1 and flags.pending_max >= 1);
+    try std.testing.expect(flags.sub_safety_margin < flags.max_channel_duration);
+}
+
+fn fuzz_args(bytes: []const u8, args: *[16][]const u8) usize {
+    var count: usize = 0;
+    for (bytes) |byte| {
+        if (count == args.len) break;
+        args[count] = if (byte & 1 == 0)
+            fuzz_flag_names[(byte >> 1) % fuzz_flag_names.len]
+        else
+            fuzz_flag_values[(byte >> 1) % fuzz_flag_values.len];
+        count += 1;
+    }
+    return count;
+}
+
+test "batcher: seeded fuzz of flag parsing keeps invariants" {
+    var prng = base.testing.Prng.init(0xf1a9);
+    for (0..2000) |_| {
+        var bytes: [16]u8 = undefined;
+        prng.fill(&bytes);
+        var args: [16][]const u8 = undefined;
+        const count = fuzz_args(bytes[0..prng.range(0, 16)], &args);
+        const flags = parse_flags(args[0..count]) catch continue;
+        try check_flag_invariants(flags);
+    }
+}
+
+test "batcher: fuzz flag parsing" {
+    try std.testing.fuzz({}, fuzz_flags, .{});
+}
+
+fn fuzz_flags(_: void, smith: *std.testing.Smith) anyerror!void {
+    var bytes: [16]u8 = undefined;
+    const length = smith.slice(&bytes);
+    var args: [16][]const u8 = undefined;
+    const count = fuzz_args(bytes[0..length], &args);
+    const flags = parse_flags(args[0..count]) catch return;
+    try check_flag_invariants(flags);
 }
