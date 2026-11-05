@@ -21,6 +21,8 @@ pub const Kind = enum {
     uint8,
     /// `bytes4`: left-aligned, the low 28 bytes must be zero.
     bytes4,
+    uint48,
+    uint16,
     /// UTF-8 `string`; invalid UTF-8 fails the tuple type check.
     string,
     bytes,
@@ -244,6 +246,8 @@ fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) 
         .bytes32, .uint256 => true,
         .uint8 => zero(word[0..31]),
         .bytes4 => zero(word[4..32]),
+        .uint48 => zero(word[0..26]),
+        .uint16 => zero(word[0..30]),
         .address_array => for (0..elements.count()) |index| {
             if (!zero(elements.word(@intCast(index))[0..12])) break false;
         } else true,
