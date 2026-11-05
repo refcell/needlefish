@@ -99,6 +99,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (`prover_service_*`, `prover_worker_*` over `proof.telemetry`); `base prover-service` and
   `base prover-worker` take `--health.*`/`--metrics.*` (off by default: health port 0,
   metrics port 9300, since the service itself listens on 7300).
+- [ ] `proof/eip2935-lookback`: the L2 chain provider's by-number lookups leap through the
+  EIP-2935 history ring from Isthmus (base/base `eip_2935_history_lookup`), falling back to
+  the parent walk. Done: `mpt/key_reader.zig`, `program/eip2935.zig`, provider leaps.
+  Left: host `l2-account-storage-proof` hints (`eth_getProof`) so leaps get their nodes.
+- [ ] `proof/schedule-id`: base/base `ScheduleId::pin` in `BootInfo` (upgrade-schedule hash
+  chain committed by boot, as `ProtocolVersions.activatedScheduleId`).
 - [ ] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
   COSE_Sign1 attestation documents, X.509 chain to the AWS Nitro root (std
   `crypto.Certificate`), P-384 ECDSA signature, PCRs, and the `VerifierJournal` ABI.
@@ -310,6 +316,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: EIP-2935 history leaps in the L2 chain provider (client side).
 - 2026-11-05: prover-service and prover-worker metrics and health.
 - 2026-11-05: shared proof telemetry exporter; challenger health and metrics.
 - 2026-11-05: proposer admin JSON-RPC (start/stop/running).

@@ -22,6 +22,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const protocol = @import("../../consensus/protocol/root.zig");
 const derive = @import("../../consensus/derive/root.zig");
 const hint = @import("hint.zig");
+const eip2935 = @import("eip2935.zig");
 
 const B256 = primitives.B256;
 const Hash = [32]u8;
@@ -77,6 +78,9 @@ pub const L2ChainProvider = struct {
     remembered: [remembered_max]Remembered = undefined,
     remembered_count: u32 = 0,
     remembered_next: u32 = 0,
+    /// EIP-2935 leaps taken, and those that failed (falling back to the parent walk).
+    leaps: u64 = 0,
+    leaps_failed: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -191,13 +195,24 @@ pub const L2ChainProvider = struct {
         return .{ .info = info, .system_config = system_config, .transactions = transactions };
     }
 
-    /// The hash of block `number`, walking parent hashes back from the head.
+    /// The hash of block `number`, walking back from the head: from Isthmus by EIP-2935
+    /// leaps through the history contract's ring buffer (base/base `header_by_number`), by
+    /// parent hashes otherwise or once a leap fails.
     fn hash_by_number(self: *L2ChainProvider, number: u64) Failure!?B256 {
         if (number > self.head.number) return null;
         var current = if (number <= self.cursor.number) self.cursor else self.head;
         var steps: u64 = 0;
+        var linear = false;
         while (current.number > number) : (steps += 1) {
             if (steps >= walk_steps_max) return error.TooManyItems;
+            if (!linear and self.rollup.is_active(.isthmus, current.timestamp)) {
+                if (self.leap(current, number)) |next| {
+                    current = next;
+                    continue;
+                }
+                self.leaps_failed += 1;
+                linear = true;
+            }
             const parent = current.parent_hash.bytes;
             const header = try self.fetch_header(parent);
             if (header.number + 1 != current.number) return error.InvalidHeader;
@@ -206,6 +221,19 @@ pub const L2ChainProvider = struct {
         assert(current.number == number);
         self.cursor = current;
         return current.hash;
+    }
+
+    /// One EIP-2935 leap from `current` toward `number`; null when it fails for any reason.
+    fn leap(self: *L2ChainProvider, current: protocol.BlockInfo, number: u64) ?protocol.BlockInfo {
+        assert(number < current.number);
+        const header = self.fetch_header(current.hash.bytes) catch return null;
+        const hash = eip2935.lookup(self.resolver.resolver(), self.hints, &header, number) catch
+            return null;
+        const target = self.fetch_header(hash) catch return null;
+        // The ring holds blocks below `current`, at or above `number` or the window's start.
+        if (target.number >= current.number or target.number < number) return null;
+        self.leaps += 1;
+        return info_of(&target, hash);
     }
 
     // Chain-provider contract.

@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const boot = @import("boot.zig");
+pub const eip2935 = @import("eip2935.zig");
 pub const hint = @import("hint.zig");
 pub const intermediate_roots = @import("intermediate_roots.zig");
 pub const l1_chain_provider = @import("l1_chain_provider.zig");
