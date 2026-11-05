@@ -728,8 +728,13 @@ pub const Chain = struct {
 
     /// Points the canonical index at `head`'s ancestry and refreshes the txpool for the
     /// newly canonical blocks.
+    /// Points the number index at `head`'s branch: entries above the head are dropped
+    /// (a reorg to a lower head), then the branch is written down to the first number
+    /// that already maps to it. Entries below that point are consistent, since every
+    /// earlier call wrote its branch down to such a point too.
     fn mark_canonical(chain: *Chain, head: Hash) void {
         var cursor = chain.store.ref(head) orelse return;
+        chain.store.clear_canonical_above(cursor.number);
         var steps: u32 = 0;
         while (steps < chain.store.entries.len) : (steps += 1) {
             if (chain.store.canonical_hash(cursor.number)) |existing| {

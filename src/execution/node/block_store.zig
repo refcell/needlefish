@@ -136,6 +136,16 @@ pub const BlockStore = struct {
         store.canonical_numbers[index] = number;
     }
 
+    /// Drops every canonical index entry above `number` (the head moved lower).
+    pub fn clear_canonical_above(store: *BlockStore, number: u64) void {
+        for (store.canonical_numbers) |*entry| {
+            if (entry.*) |at| if (at > number) {
+                entry.* = null;
+            };
+        }
+        assert(store.canonical_hash(number + 1) == null);
+    }
+
     pub fn canonical_hash(store: *const BlockStore, number: u64) ?Hash {
         const index = number % store.canonical.len;
         if (store.canonical_numbers[index] != number) return null;

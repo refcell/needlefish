@@ -177,6 +177,36 @@ test "chain: reorg between sibling branches" {
     try testing.expectEqualSlices(u8, &root_a2, &(try node.db.root()));
 }
 
+test "chain: reorg to a lower side block and back restores the number index" {
+    const node = try Node.create();
+    defer node.destroy();
+    var a: [7]B256 = undefined;
+    a[0] = .{ .bytes = node.chain.genesis_hash };
+    for (1..7) |number| a[number] = try build(node, a[number - 1], 12 * number, 0xaa);
+    const b5 = try build(node, a[4], 12 * 5 + 1, 0xbb);
+    const v = types.forkchoice_version(spec, 72);
+    _ = try node.engine.forkchoice_updated(v, forkchoice(a[6]), null);
+    _ = try node.engine.forkchoice_updated(v, forkchoice(b5), null);
+    try testing.expectEqualSlices(u8, &b5.bytes, &node.chain.store.canonical_hash(5).?);
+    try testing.expect(node.chain.store.canonical_hash(6) == null);
+    _ = try node.engine.forkchoice_updated(v, forkchoice(a[6]), null);
+    for (a, 0..) |hash, number| {
+        try testing.expectEqualSlices(u8, &hash.bytes, &node.chain.store.canonical_hash(number).?);
+    }
+}
+
+/// The number index maps exactly the head's ancestry.
+fn expect_index(node: *Node, head: B256) !void {
+    var cursor = node.chain.store.ref(head.bytes).?;
+    try testing.expect(node.chain.store.canonical_hash(cursor.number + 1) == null);
+    while (true) {
+        const indexed = node.chain.store.canonical_hash(cursor.number).?;
+        try testing.expectEqualSlices(u8, &cursor.hash, &indexed);
+        if (cursor.number == 0) break;
+        cursor = node.chain.store.ref(cursor.parent_hash).?;
+    }
+}
+
 /// Random builds on random known blocks and random forkchoice moves; a follower imports
 /// every block and must agree on every state.
 fn random_chain(prng: *Prng) !void {
@@ -213,6 +243,8 @@ fn random_chain(prng: *Prng) !void {
         try testing.expectEqualSlices(u8, &(try builder.db.root()), &(try follower.db.root()));
         const header = builder.chain.header(head.bytes).?;
         try testing.expectEqualSlices(u8, &header.state_root.bytes, &(try builder.db.root()));
+        try expect_index(builder, head);
+        try expect_index(follower, head);
     }
 }
 
