@@ -8,7 +8,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
 - [x] `batcher/frame`: frame encode/decode, tx data parse (fuzzed).
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
-- [ ] `batcher/comp`: zlib (std flate) channel compressor; brotli encoder (own impl).
+- [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
+- [ ] `batcher/comp`: real brotli compressor (LZ77 + prefix codes), checked with `brotli -d`.
 - [ ] `batcher/batch`: singular batch RLP, span batch encoding.
 - [ ] `batcher/channel`: channel out (compress, size limits, frames), channel manager.
 - [ ] `batcher/txdata`: EIP-1559 / EIP-4844 tx building + signing, tx manager.
@@ -31,3 +32,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 
 ## Log
 - 2026-11-05: DEVNET.md contract; batcher frame + blob codecs with fuzz tests.
+- 2026-11-05: batcher/frame reuses consensus Frame; comp: zlib + stored brotli (verified
+  against the brotli CLI).
