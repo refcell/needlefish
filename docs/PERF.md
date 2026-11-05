@@ -163,7 +163,7 @@ up to ±15%).
 
 | Case | ns/op | MB/s | Notes |
 | --- | ---: | ---: | --- |
-| p2p/noise XX handshake | 757 468 | | ~1 300 handshakes/s per core; secp256k1 sign+verify dominate |
+| p2p/noise XX handshake | 633 434 | | ~1 580 handshakes/s per core; was 770 µs on std secp256k1, now `common.crypto.secp256k1`; X25519 (std) is most of the rest |
 | p2p/noise transport seal+open 64 KiB | 83 000 | 785 | 16-block ChaCha20 passes (8-block tail) + std Poly1305; 8-block only: 729 MB/s; std AEAD: 338 MB/s |
 | p2p/poly1305 std 64 KiB | 16 361 | 4006 | std; a 4-lane 26-bit variant gave +8%, not kept |
 | p2p/snappy compress 128 KiB | 77 974 | 1 681 | semi-compressible payload |

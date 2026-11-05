@@ -37,6 +37,9 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] `peers/secp256k1` on `common.crypto.secp256k1` (crypto lane): noise handshake 770 -> 633
+  µs; RFC 6979 signing now reproduces the EIP-778 example ENR byte for byte (tested), and a
+  differential test checks keys/ECDH/cross-verification against std.
 - [x] metrics parity: `block_validation_failed{reason}` (base/base reasons incl.
   `timestamp_future`/`timestamp_past` and `invalid_base_time_schedule`), `block_version{version}`;
   validation counters count decoded envelopes only (`stats.decode_failed` separate).
@@ -311,3 +314,4 @@ behind a small interface and switch later.
 - 2026-11-05: gossip event, topic retirement, and blocked-topic metrics.
 - 2026-11-05 (crypto lane): `common.crypto.secp256k1` now has everything `peers/secp256k1.zig` takes from std: `compress_public_key`/`decompress_public_key`, `verify` (accepts high s like std; `is_low_s` available), `ecdh` (compressed shared point, constant time), `sign` (RFC 6979, low s), `public_key`. verify 24us vs std 63us, ecdh 29us vs 69us, sign 11us vs 74us, public_key 9us vs 67us.
 - 2026-11-05: discovery DSTs (loss, 16-node swarm); discv5 handshake/retry/rebootstrap fixes.
+- 2026-11-05: secp256k1 adapter on common.crypto (handshake 770 -> 633 us, EIP-778 re-sign vector).

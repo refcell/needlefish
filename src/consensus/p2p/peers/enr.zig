@@ -327,6 +327,17 @@ const eip778_text = "enr:-IS4QHCYrYZbAKWCBRlAy5zzaDZXJBGkcnh4MHcBFZntXNFrdvJjX04
     "rkTfj499SZuOh8R33Ls8RRcy5wBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_ox" ++
     "Vtw0RW_QAdpzBQA8yWM0xOIN1ZHCCdl8";
 
+test "enr: re-signing the EIP-778 example reproduces it byte for byte" {
+    // EIP-778's key; RFC 6979 nonces (as libsecp256k1) make the signature deterministic.
+    const secret = try hex.decode_array(
+        32,
+        "b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291",
+    );
+    const record = try build(secret, .{ .ip4 = .{ 127, 0, 0, 1 }, .udp = 30303 });
+    var text: [text_length_max]u8 = undefined;
+    try std.testing.expectEqualStrings(eip778_text, encode_text(&text, &record));
+}
+
 test "enr: EIP-778 vector" {
     const record = try decode_text(eip778_text);
     try std.testing.expectEqual(@as(u64, 1), record.sequence);
