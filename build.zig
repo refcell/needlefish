@@ -71,13 +71,17 @@ pub fn build(b: *std.Build) void {
         .description = "Run micro benchmarks",
     });
 
-    add_vector_tools(b, base, target, optimize);
+    const statetest = add_vector_tools(b, base, target, optimize);
+    // Compile (not run) the state-test runner on every `zig build test`: it is the EVM's
+    // conformance oracle, and cross-lane API changes once broke it unnoticed.
+    test_step.dependOn(&statetest.step);
 
     // Compile-only check for editors and CI speed.
     const check_step = b.step("check", "Compile everything without running");
     check_step.dependOn(&unit_tests.step);
     check_step.dependOn(&sim.step);
     check_step.dependOn(&bench.step);
+    check_step.dependOn(&statetest.step);
 }
 
 /// Runners over public vectors fetched by `just vectors`.
@@ -86,9 +90,9 @@ fn add_vector_tools(
     base: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) void {
+) *std.Build.Step.Compile {
     // ethereum/tests GeneralStateTests runner (vectors from `just vectors`).
-    _ = add_tool(b, base, target, optimize, .{
+    const statetest = add_tool(b, base, target, optimize, .{
         .name = "statetest",
         .path = "src/execution/evm/state_test_main.zig",
         .step = "statetest",
@@ -118,6 +122,7 @@ fn add_vector_tools(
         .step = "genesischeck",
         .description = "Check genesis files: zig build genesischeck -- <genesis.json>...",
     });
+    return statetest;
 }
 
 const Tool = struct {

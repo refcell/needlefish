@@ -163,6 +163,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: `zig build test` (and `check`) now compiles the statetest runner.
 - 2026-11-05: u256 DIV/MOD family via Knuth D (`uint.zig`): snailtracer 50.5 -> 27.1 ms,
   ahead of revm on the same machine. Embedded EEST 7702 fixture guards the statetest runner
   (it stopped compiling after a trie error-set change; `zig build test` did not build it).
