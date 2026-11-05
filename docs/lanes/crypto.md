@@ -35,6 +35,13 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] bls: prepared G2 lines (`pairing.prepare`, `pairing_check_prepared`); KZG fixed G2 lines
   prepared at comptime.
 - [ ] bls: GLV-split scalars inside large G1 MSM (halves windows).
+- [x] fuzz coverage audit: every precompile/decoder file has a std.testing.fuzz target; added
+  safegcd (BLS + secp moduli) and lazy-reduction checks to the montgomery target.
+- [ ] safegcd codegen: generic `safegcd.Modulus(u256, ..)` is ~10% slower in ecrecover than the
+  identical specialized secp256k1/modinv.zig; find the cause (would speed every Fp inverse).
+- [ ] p256: wider static generator table (window 8, 64 affine entries) for verify.
+- [ ] fuzz campaigns: 30-minute `zig build test --fuzz -Doptimize=ReleaseSafe` runs per crypto
+  target when host load allows; commit any reproducer as a regression test.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).

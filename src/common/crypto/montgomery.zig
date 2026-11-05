@@ -507,6 +507,13 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual((@as(u512, a_int) * b_int) % F.modulus, a.mul(b).to_int());
     try testing.expect(a.sub(b).add(b).eql(a));
     try testing.expect(a.inverse().eql(a.inverse_constant_time()));
+    // Lazy reduction on bn254 (the only tower using it) against the fused product.
+    const L = Field(4, bn254_p);
+    const c = L.from_int(smith.value(u256) % L.modulus);
+    const d = L.from_int(smith.value(u256) % L.modulus);
+    try testing.expect(L.reduce_wide(L.mul_wide(c, d)).eql(c.mul(d)));
+    const sum_product = L.mul_wide(L.add_unreduced(c, d), L.add_unreduced(d, c));
+    try testing.expect(L.reduce_wide(sum_product).eql(c.add(d).square()));
 }
 
 test "montgomery: coverage-guided fuzz" {

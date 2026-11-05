@@ -225,3 +225,23 @@ test "safegcd: bn254, p256, bls12-381 and secp256k1 moduli" {
         4,
     );
 }
+
+const bls_modulus: u384 = (0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf << 192) |
+    0x6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab;
+const secp256k1_modulus: u256 =
+    0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f;
+
+fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
+    const x = smith.value(u384) % bls_modulus;
+    const inverse = Modulus(u384, bls_modulus).invert(x);
+    const expected: u768 = if (x == 0) 0 else 1;
+    try testing.expectEqual(expected, @as(u768, inverse) * x % bls_modulus);
+    const y = smith.value(u256) % secp256k1_modulus;
+    const inverse_y = Modulus(u256, secp256k1_modulus).invert(y);
+    const expected_y: u512 = if (y == 0) 0 else 1;
+    try testing.expectEqual(expected_y, @as(u512, inverse_y) * y % secp256k1_modulus);
+}
+
+test "safegcd: coverage-guided fuzz" {
+    try testing.fuzz({}, fuzz_one, .{});
+}
