@@ -237,6 +237,6 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     _ = precompile_bn254_pairing(data) catch {};
 }
 
-test "precompile: coverage-guided fuzz never crashes" {
+test "bn254 precompile: coverage-guided fuzz never crashes" {
     try testing.fuzz({}, fuzz_one, .{});
 }

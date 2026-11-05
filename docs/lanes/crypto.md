@@ -395,3 +395,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: msm_precomputed vs msm fuzz 50K runs clean (229 coverage points).
 - 2026-11-05: cells verify fuzz 20K runs clean (123 coverage points).
 - 2026-11-05: cells recovery fuzz 20K runs clean (1380 unique runs, 140 coverage points).
+- 2026-11-05: BLS precompile fuzz 200K runs clean (171 coverage points); bn254/BLS precompile fuzz tests renamed with curve prefixes so each can be filtered alone.

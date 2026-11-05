@@ -407,6 +407,6 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
     _ = run(address, buffer[1..length], &out) catch {};
 }
 
-test "precompile: coverage-guided fuzz never crashes" {
+test "bls12-381 precompile: coverage-guided fuzz never crashes" {
     try testing.fuzz({}, fuzz_one, .{});
 }
