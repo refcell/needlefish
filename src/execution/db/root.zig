@@ -7,6 +7,16 @@
 
 const std = @import("std");
 
+pub const changeset = @import("changeset.zig");
+pub const state = @import("state.zig");
+pub const overlay = @import("overlay.zig");
+
+pub const Changeset = changeset.Changeset;
+pub const AccountInfo = changeset.AccountInfo;
+pub const State = state.State;
+pub const Overlay = overlay.Overlay;
+
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("state_test.zig");
 }
