@@ -127,12 +127,19 @@ pub const Limits = struct {
     code_bytes_max: u32 = 1 << 24,
 };
 
+/// Zero-length placeholder while a `replace_code` undo pair is half applied.
+const undo_code_placeholder = [_]u8{0};
+
 const EntryKind = enum(u8) {
     account_warmed,
     account_touched,
     balance,
     nonce,
     code_set,
+    /// `replace_code` undo pair: `code_restore_pointer` (old hash, old pointer) is recorded
+    /// first, `code_restore_length` (old length) second, so undo sees the length first.
+    code_restore_pointer,
+    code_restore_length,
     account_created,
     self_destructed,
     slot_value,
@@ -263,6 +270,24 @@ pub const State = struct {
                 const account = account_at(entry);
                 account.info.code_hash = primitives.keccak_empty;
                 account.info.code = &.{};
+            },
+            .code_restore_length => {
+                const account = account_at(entry);
+                // Stash the length in the slice until the pointer entry restores it; the
+                // placeholder is never read.
+                const length: usize = @intCast(entry.extra);
+                account.info.code = @as([*]const u8, &undo_code_placeholder)[0..length];
+            },
+            .code_restore_pointer => {
+                const account = account_at(entry);
+                const stash = account.info.code.?;
+                const length = stash.len;
+                assert(length == 0 or stash.ptr == @as([*]const u8, &undo_code_placeholder));
+                account.info.code = if (length == 0)
+                    &.{}
+                else
+                    @as([*]const u8, @ptrFromInt(@as(usize, @intCast(entry.extra))))[0..length];
+                account.info.code_hash = primitives.u256_to_b256(entry.word);
             },
             .account_created => {
                 const account = account_at(entry);
@@ -404,6 +429,19 @@ pub const State = struct {
         account.info.code = stored;
         account.info.code_hash = primitives.keccak256(stored);
         account.dirty = true;
+    }
+
+    /// Journaled overwrite of existing code (EIP-8130 delegation installs, which may
+    /// replace an earlier delegation indicator or clear it).
+    pub fn replace_code(state: *State, account: *Account, bytes: []const u8) Error!void {
+        const previous = try state.code(account);
+        const previous_pointer: u64 = if (previous.len == 0) 0 else @intFromPtr(previous.ptr);
+        const previous_hash = primitives.b256_to_u256(account.info.code_hash);
+        const target = @intFromPtr(account);
+        try state.record(.code_restore_pointer, target, previous_hash, previous_pointer);
+        try state.record(.code_restore_length, @intFromPtr(account), 0, previous.len);
+        try state.set_code_unjournaled(account, bytes);
+        assert(account.info.code.?.len == bytes.len);
     }
 
     /// Set code outside the journal (EIP-7702 delegations at transaction start).

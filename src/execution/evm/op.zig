@@ -54,6 +54,8 @@ pub const Upgrade = enum(u8) {
     cobalt,
     denim,
     everest,
+    /// EIP-8130 keystore: config changes and actor authentication beyond the inline EOA.
+    zenith,
 
     pub fn at_least(upgrade: Upgrade, other: Upgrade) bool {
         return @backingInt(upgrade) >= @backingInt(other);

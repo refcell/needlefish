@@ -58,11 +58,15 @@ pub const Store = struct {
     state: *State,
 
     fn load(store: Store, slot: u256) state_module.Error!u256 {
-        return store.state.storage_value(address, slot);
+        // Warming read, like base's gas-free journal provider: later calls in the
+        // transaction see the account and slot warm.
+        const access = try store.state.access(address);
+        const slot_access = try store.state.storage_access(access.account, slot);
+        return slot_access.slot.present;
     }
 
     fn write(store: Store, slot: u256, value: u256) state_module.Error!void {
-        const account = try store.state.load(address);
+        const account = (try store.state.access(address)).account;
         const access = try store.state.storage_access(account, slot);
         try store.state.storage_write(account, access.slot, value);
         assert(access.slot.present == value);

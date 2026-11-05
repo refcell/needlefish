@@ -27,6 +27,7 @@ const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
 pub const Error = config.Error || error{
     MalformedAuthorizeData,
+    CreateDestinationOccupied,
     MalformedRevokeData,
     InvalidChangePayload,
     EpochSaturated,
@@ -428,11 +429,15 @@ fn actors_commitment(actors: eip8130.InitialActors) B256 {
 
 /// Deploy a created account's runtime (account changes apply at transaction start,
 /// outside the execution journal, like EIP-7702 authorizations).
+/// Journaled; the destination must have neither code nor a nonce.
 pub fn deploy_created(state: *state_module.State, created: Created) Error!void {
     const account = try state.load(created.address);
     assert(created.code.len > 0);
-    try state.set_code_unjournaled(account, created.code);
+    const occupied = account.info.has_code() or account.info.nonce != 0;
+    if (occupied) return error.CreateDestinationOccupied;
+    try state.set_code(account, created.code);
     try state.touch(account);
+    assert(account.info.has_code());
 }
 
 /// Point `account` at `target` with a delegation indicator (zero target clears the code).
@@ -448,10 +453,10 @@ pub fn install_delegation(
     const replaceable = code.len == 0 or std.mem.startsWith(u8, code, &prefix);
     if (!replaceable) return error.NonDelegatableCode;
     if (is_zero(&target)) {
-        try state.set_code_unjournaled(account, &.{});
+        try state.replace_code(account, &.{});
     } else {
         const indicator = eip8130.delegation_indicator(.init(target));
-        try state.set_code_unjournaled(account, &indicator);
+        try state.replace_code(account, &indicator);
     }
     try state.touch(account);
 }
@@ -620,6 +625,8 @@ test "eip8130 apply: create derives the CREATE2 address and authorizes sorted ac
     try testing.expect(try store.is_actor(created.address, @splat(2)));
     try testing.expectError(error.AlreadyInitialized, apply_create(store, entry));
     try deploy_created(&fixture.state, created);
+    const occupied = deploy_created(&fixture.state, created);
+    try testing.expectError(error.CreateDestinationOccupied, occupied);
 
     const reversed = [2]eip8130.InitialActor{ actors[1], actors[0] };
     var unsorted = entry;
@@ -642,8 +649,18 @@ test "eip8130 apply: delegation replaces only empty code or an indicator" {
     const loaded = try fixture.state.load(account);
     const code = try fixture.state.code(loaded);
     try testing.expectEqualSlices(u8, &eip8130.delegation_indicator_prefix, code[0..3]);
+    const hash = loaded.info.code_hash;
+    // Journaled: a reverted re-delegation restores the previous indicator exactly.
+    const point = fixture.state.checkpoint();
+    try install_delegation(&fixture.state, account, @splat(0x78));
+    fixture.state.revert(point);
+    try testing.expectEqualSlices(u8, code, try fixture.state.code(loaded));
+    try testing.expectEqualSlices(u8, &hash, &loaded.info.code_hash);
     try install_delegation(&fixture.state, account, @splat(0));
     try testing.expectEqual(@as(usize, 0), (try fixture.state.code(loaded)).len);
+    fixture.state.revert(point);
+    try testing.expectEqualSlices(u8, &hash, &loaded.info.code_hash);
+    try install_delegation(&fixture.state, account, @splat(0));
     try fixture.state.set_code_unjournaled(loaded, &.{0x00});
     try testing.expectError(
         error.NonDelegatableCode,
