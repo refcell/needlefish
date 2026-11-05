@@ -11,6 +11,8 @@ const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const db_module = @import("../db/root.zig");
 const trie = @import("../trie/root.zig");
 const service = @import("service.zig");
+const http = @import("../../utilities/http/root.zig");
+const io = @import("../../utilities/io/root.zig");
 
 const witness = db_module.witness;
 const page_bytes = 4096;
@@ -135,14 +137,47 @@ test "witness memory: default generator reserves its bound and stays non-residen
     if (!std.debug.runtime_safety) try testing.expect(total.resident_bytes <= 1 << 20);
 }
 
-test "witness memory: the default response bound fits the HTTP send buffer" {
+test "witness memory: the default response bound fits the HTTP large send buffer" {
     const limits: service.Limits = .{};
     const config = limits.witness_config().?;
     const head_reserve_bytes = 1024;
-    const send_bytes = limits.http.send_buffer_size;
+    try testing.expect(limits.http.large_send_buffers_max > 0);
+    const send_bytes = limits.http.large_send_buffer_size;
     try testing.expect(limits.witness_response_bytes_max + head_reserve_bytes < send_bytes);
+    // A storage-heavy witness (1.28 MB binary, ~2.6 MB of hex JSON) fits; 1 MiB did not.
+    try testing.expect(limits.witness_response_bytes_max > 2_600_000);
+    try testing.expect(limits.http.send_buffer_size < 2_600_000);
     try testing.expectEqual(limits.witness_response_bytes_max, config.response_bytes_max);
     try testing.expect(config.witness.state_bytes_max <= config.response_bytes_max / 2);
     try testing.expect(config.witness.keys_max ==
         config.builder.keys.accounts_max + config.builder.keys.slots_max);
+}
+
+fn handle_nothing(
+    context: *u8,
+    request: *const http.Request,
+    response: *http.ResponseBuilder,
+) void {
+    _ = context;
+    _ = request;
+    _ = response;
+}
+
+test "witness memory: the node's HTTP large send buffers are reserved, not resident" {
+    const limits: service.Limits = .{};
+    const options = limits.http;
+    var meter = try Meter.init(128 << 20);
+    defer meter.deinit();
+    const Server = http.Server(io.SimIo, *u8, handle_nothing);
+    var server: Server = undefined;
+    var context: u8 = 0;
+    // `init` only stores the IO pointer; nothing runs on it.
+    var sim_io: io.SimIo = undefined;
+    try server.init(meter.fixed.allocator(), &sim_io, &context, options);
+    const large_bytes = @as(u64, options.large_send_buffer_size) * options.large_send_buffers_max;
+    try testing.expectEqual(large_bytes, server.large_memory.len);
+    const idle = usage(&meter);
+    try testing.expect(idle.reserved_bytes >= large_bytes);
+    // Only the connection table (debug-filled in safe builds) is written at init.
+    try testing.expect(idle.resident_bytes <= 16 * page_bytes);
 }

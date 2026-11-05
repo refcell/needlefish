@@ -144,8 +144,8 @@ pub const Limits = struct {
     /// (`lazy_alloc`); only the hash-map indexes are written at init (their metadata in
     /// ReleaseFast, all of them in safe builds, where `Allocator.alloc` fills memory).
     /// - keys: 4096 accounts + 16384 slots. Each witness key is at least 20 bytes, at least
-    ///   45 JSON bytes, so the default response carries at most ~23k keys; more could never
-    ///   be served. Below the executor's per-block bounds: heavier blocks fail `KeysFull`.
+    ///   45 JSON bytes. Below the executor's per-block bounds: heavier blocks fail
+    ///   `KeysFull`.
     /// - sparse.nodes_max 16384: candidate proof nodes (a superset of the witness nodes),
     ///   ~5 per touched key below a 64k-account trie, shared near the root. Bytes: 4 MiB
     ///   (256 B average; a full branch is 532 B). trie_nodes_max: 4 sparse nodes per
@@ -175,17 +175,22 @@ pub const Limits = struct {
         .changeset = undefined,
         .depth_max = 1024,
     },
-    /// Bound on a `debug_executionWitness` result's JSON: the HTTP send buffer (1 MiB) less
-    /// the head reserve (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB). Larger
-    /// witnesses fail with "witness too large" instead of an overflowing response. Raising
-    /// it needs a larger `http.send_buffer_size` too.
-    witness_response_bytes_max: u32 = (1 << 20) - (2 << 10),
+    /// Bound on a `debug_executionWitness` result's JSON: an HTTP large send buffer (16 MiB)
+    /// less the head reserve (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB). A
+    /// storage-heavy witness is ~2.6 MB of JSON. Larger witnesses fail with "witness too
+    /// large" instead of an overflowing response. Raising it needs a larger
+    /// `http.large_send_buffer_size` too.
+    witness_response_bytes_max: u32 = (16 << 20) - (2 << 10),
     http: http.server.Options = .{
         // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
         .connections_max = 16,
         .recv_buffer_size = 4 << 20,
         .send_buffer_size = 1 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
+        // Responses sized up front past 1 MiB (witnesses): 32 MiB reserved, committed only
+        // as written; two connections can send one at a time.
+        .large_send_buffers_max = 2,
+        .large_send_buffer_size = 16 << 20,
     },
     beacon_http: http.server.Options = .{
         .connections_max = 8,

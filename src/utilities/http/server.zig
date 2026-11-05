@@ -7,6 +7,15 @@
 //! Pipelined requests already in the receive buffer are answered in order before reading
 //! more. When the pool is full, new connections are closed immediately.
 //!
+//! Large responses: an optional pool of larger send buffers (`large_send_buffers_max` x
+//! `large_send_buffer_size`) is shared by all connections, reserved at `init` and committed
+//! by the OS only when written (`lazy_alloc`). A handler that asks the response writer for
+//! more capacity than the connection's buffer has left (`std.Io.Writer.ensureUnusedCapacity`
+//! or any other rebase) moves the response written so far into a free large buffer, which
+//! the connection holds until that response is sent. Plain writes past the end still fail,
+//! so only handlers that size their output up front use the pool. With none free, the
+//! rebase fails like a full buffer.
+//!
 //! Timeouts: the owner calls `tick()` from its event loop (every few hundred milliseconds).
 //! A connection waiting for a new request longer than `idle_timeout_ns`, or making no
 //! progress on a partial request or a response for `io_timeout_ns`, is shut down; its pending
@@ -32,6 +41,10 @@ pub const Options = struct {
     send_buffer_size: u32 = 256 * 1024,
     backlog: u31 = 128,
     limits: parser.Limits = .{ .head_size_max = 8 * 1024, .body_size_max = 56 * 1024 },
+    /// Shared large send buffers (see the module comment). Zero disables.
+    large_send_buffers_max: u32 = 0,
+    /// Size of each large send buffer, head reserve included; above `send_buffer_size`.
+    large_send_buffer_size: u32 = 0,
     /// Keep-alive connections with no request in progress. Zero disables.
     idle_timeout_ns: u64 = 60 * std.time.ns_per_s,
     /// No progress on a partially received request or an unsent response. Zero disables.
@@ -55,11 +68,21 @@ pub fn reason_phrase(status: u16) []const u8 {
     };
 }
 
+/// Hands a response a larger send buffer of at least `size_bytes`, or null if none is free.
+pub const Grow = struct {
+    context: *anyopaque,
+    acquire: *const fn (context: *anyopaque, size_bytes: usize) ?[]u8,
+};
+
 /// Builds one response in the connection's send buffer. The body is written first through
 /// `writer()`; the head is placed directly in front of it when the response is finished, so
-/// the body is never copied.
+/// the body is never copied (except once, when it moves into a larger buffer via `grow`).
+/// The builder must not move once the body has been written to.
 pub const ResponseBuilder = struct {
     buffer: []u8,
+    /// Source of a larger buffer for a rebase of the body writer (null: rebases fail).
+    grow: ?Grow = null,
+    grown: bool = false,
     /// The client's socket address (unspecified 0.0.0.0:0 if the backend cannot tell).
     /// Behind a load balancer, resolve the real client with `trusted_proxy`.
     peer: Address = Address.ip4(.{ 0, 0, 0, 0 }, 0),
@@ -71,7 +94,40 @@ pub const ResponseBuilder = struct {
 
     pub fn init(buffer: []u8) ResponseBuilder {
         assert(buffer.len > head_reserve_size);
-        return .{ .buffer = buffer, .body = .fixed(buffer[head_reserve_size..]) };
+        return .{ .buffer = buffer, .body = body_writer(buffer) };
+    }
+
+    const body_vtable: std.Io.Writer.VTable = .{
+        .drain = std.Io.Writer.fixedDrain,
+        .flush = std.Io.Writer.noopFlush,
+        .rebase = body_rebase,
+    };
+
+    /// A fixed writer over the body part of `buffer` whose rebase can grow (`grow`).
+    fn body_writer(buffer: []u8) std.Io.Writer {
+        assert(buffer.len > head_reserve_size);
+        return .{ .vtable = &body_vtable, .buffer = buffer[head_reserve_size..] };
+    }
+
+    /// Moves the body into a larger buffer with `capacity` bytes free after it. Everything
+    /// written so far is kept, so `preserve` holds trivially and offsets stay valid.
+    fn body_rebase(body: *std.Io.Writer, preserve: usize, capacity: usize) error{WriteFailed}!void {
+        const builder: *ResponseBuilder = @alignCast(@fieldParentPtr("body", body));
+        assert(preserve <= body.end);
+        assert(body.buffer.len - body.end < capacity);
+        if (builder.grown) return error.WriteFailed;
+        const grow = builder.grow orelse return error.WriteFailed;
+        const size_bytes = std.math.add(usize, head_reserve_size + body.end, capacity) catch
+            return error.WriteFailed;
+        const large = grow.acquire(grow.context, size_bytes) orelse return error.WriteFailed;
+        assert(large.len >= size_bytes);
+        const written = body.end;
+        @memcpy(large[head_reserve_size..][0..written], body.buffer[0..written]);
+        builder.buffer = large;
+        builder.grown = true;
+        body.buffer = large[head_reserve_size..];
+        assert(body.end == written);
+        assert(body.buffer.len - body.end >= capacity);
     }
 
     pub fn writer(builder: *ResponseBuilder) *std.Io.Writer {
@@ -87,7 +143,7 @@ pub const ResponseBuilder = struct {
     /// Discards the body written so far and replies with a short plain-text error.
     pub fn fail(builder: *ResponseBuilder, status: u16) void {
         assert(status >= 400);
-        builder.body = .fixed(builder.buffer[head_reserve_size..]);
+        builder.body = body_writer(builder.buffer);
         builder.status = status;
         builder.content_type = "text/plain";
         builder.extra_headers_count = 0;
@@ -148,6 +204,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             recv_size: u32 = 0,
             send_buffer: []u8,
             send_remaining: []const u8 = "",
+            /// The large send buffer holding the response being sent, if any.
+            large_index: ?u32 = null,
             /// Bytes of `recv_buffer` used by the request being answered.
             consumed: u32 = 0,
             keep_alive: bool = false,
@@ -169,7 +227,11 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         stopping: bool = false,
         connections: []Connection,
         memory: []u8,
+        /// `large_send_buffers_max` buffers of `large_send_buffer_size` bytes.
+        large_memory: []u8,
         requests_handled: u64 = 0,
+        /// Responses moved into a large send buffer.
+        responses_grown: u64 = 0,
         connections_rejected: u64 = 0,
         connections_timed_out: u64 = 0,
 
@@ -189,6 +251,13 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             const memory_size = @as(usize, per_connection) * options.connections_max;
             const memory = try lazy_alloc.alloc(allocator, u8, memory_size);
             errdefer lazy_alloc.free(allocator, memory);
+            if (options.large_send_buffers_max > 0) {
+                assert(options.large_send_buffer_size > options.send_buffer_size);
+            }
+            const large_size = @as(usize, options.large_send_buffer_size) *
+                options.large_send_buffers_max;
+            const large_memory = try lazy_alloc.alloc(allocator, u8, large_size);
+            errdefer lazy_alloc.free(allocator, large_memory);
             const connections = try allocator.alloc(Connection, options.connections_max);
             for (connections, 0..) |*connection, index| {
                 const base = memory[index * per_connection ..][0..per_connection];
@@ -205,6 +274,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                 .options = options,
                 .connections = connections,
                 .memory = memory,
+                .large_memory = large_memory,
             };
         }
 
@@ -216,6 +286,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             assert(server.connections.len > 0);
             server.allocator.free(server.connections);
             lazy_alloc.free(server.allocator, server.memory);
+            lazy_alloc.free(server.allocator, server.large_memory);
             server.* = undefined;
         }
 
@@ -389,8 +460,12 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                     connection_recv(connection);
                 },
                 .complete => |complete| {
+                    assert(connection.large_index == null);
                     var builder = ResponseBuilder.init(connection.send_buffer);
                     builder.peer = connection.peer;
+                    if (server.options.large_send_buffers_max > 0) {
+                        builder.grow = .{ .context = connection, .acquire = large_acquire };
+                    }
                     handler(server.context, &complete.message, &builder);
                     server.requests_handled += 1;
                     connection.consumed = complete.consumed;
@@ -398,6 +473,39 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
                     connection_send(connection, builder.finish(connection.keep_alive));
                 },
             }
+        }
+
+        /// `Grow.acquire` for a connection's response: the first large buffer no other
+        /// connection holds, if it is big enough.
+        fn large_acquire(context: *anyopaque, size_bytes: usize) ?[]u8 {
+            const connection: *Connection = @ptrCast(@alignCast(context));
+            const server = connection.server;
+            assert(connection.large_index == null);
+            assert(connection.state == .receiving);
+            const buffer_size = server.options.large_send_buffer_size;
+            if (size_bytes > buffer_size) return null;
+            var index: u32 = 0;
+            while (index < server.options.large_send_buffers_max) : (index += 1) {
+                if (server.large_held(index)) continue;
+                connection.large_index = index;
+                server.responses_grown += 1;
+                return server.large_memory[@as(usize, index) * buffer_size ..][0..buffer_size];
+            }
+            return null;
+        }
+
+        fn large_held(server: *const Self, index: u32) bool {
+            assert(index < server.options.large_send_buffers_max);
+            for (server.connections) |*connection| {
+                if (connection.large_index == index) return true;
+            }
+            return false;
+        }
+
+        /// The response is sent (or abandoned): its large buffer is free again.
+        fn connection_release_large(connection: *Connection) void {
+            assert(connection.state == .sending or connection.state == .receiving);
+            connection.large_index = null;
         }
 
         fn connection_reply_error(connection: *Connection, status: u16) void {
@@ -431,6 +539,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             if (connection.send_remaining.len > 0) {
                 return connection_send(connection, connection.send_remaining);
             }
+            connection_release_large(connection);
             if (!connection.keep_alive) return connection_close(connection);
             // Drop the answered request; pipelined bytes move to the front.
             const rest = connection.recv_buffer[connection.consumed..connection.recv_size];
@@ -443,6 +552,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         fn connection_close(connection: *Connection) void {
             assert(connection.state != .free);
             assert(connection.state != .closing);
+            connection_release_large(connection);
             connection.state = .closing;
             const io = connection.server.io;
             io.close(*Connection, connection, on_close, &connection.completion, connection.fd);

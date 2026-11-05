@@ -92,8 +92,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Faster `witness.Builder.build`: 4-5x the cost of applying the block (30.7 vs 8.2 ms on
   the storage-heavy block); collect proof nodes in one sorted multi-key trie walk instead of
   one proof per key, and skip the sparse replay when the caller does not need the root.
-- [ ] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
+- [x] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
   size the rpc response buffer for witnesses or stream the JSON.
+  (shared lazy large send buffers in `http.server` (`Options.large_send_buffers_max/size`,
+  grown on a body-writer rebase); `debug_executionWitness` sizes with `ensureUnusedCapacity`;
+  node default 2 x 16 MiB, `witness_response_bytes_max` 16 MiB - 2 KiB;
+  `rpc/debug_http_test.zig`, `http/large_test.zig`, `node/witness_memory_test.zig`)
+- [ ] End-to-end rpc test with a real witness over 1 MiB (storage-heavy fixture block) through
+  the large send buffers; today only a 3 MiB generic response covers that path.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -321,6 +327,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `eth.Api` stays unchanged. Not done: the generator's `Overlay` (18 MiB of hash maps for one
   block's writes) could borrow the `StateDb` overlay, idle between blocks.
 
+- Witness responses over the 1 MiB send buffer: a small pool of shared large send buffers in
+  `http.server`, not a streamed body. Streaming would need a body-producer API in the server
+  (a response spanning several sends), the router's rewind-on-failure and batch envelope to
+  work without a buffer, and the generator's single `Witness` pinned until the last chunk is
+  sent (another connection's witness call would otherwise overwrite it mid-stream). The pool
+  keeps the existing one-buffer-per-response model: `Options.large_send_buffers_max` x
+  `large_send_buffer_size`, reserved at init through `lazy_alloc` (committed only as written,
+  so an idle node's resident memory is unchanged). The body writer is fixed as before, but its
+  `rebase` moves the body written so far (envelope, batch prefix) into a free large buffer and
+  the connection holds it until the response is sent or the connection closes. Only a rebase
+  grows (`ensureUnusedCapacity`, i.e. a handler that sized its output up front); plain writes
+  past the end still overflow, so other methods keep their bounds and cannot hog the pool.
+  No free buffer, or one too small, fails the rebase like a full buffer: the witness RPC
+  replies -32000 "witness too large", as it does over the configured bound (checked first,
+  before any buffer is taken). Node default: 2 x 16 MiB (32 MiB reserved, 0 resident when
+  idle) and `witness_response_bytes_max` 16 MiB - 2 KiB, so the derived `Witness` lists grow
+  to 4 MiB state / 8 MiB codes / 8 MiB headers (reserved, lazily committed). APIs are
+  additive (`ResponseBuilder.grow` defaults to null; `ResponseBuilder.init` unchanged).
+
 - Database-owned history (`DatabaseType`, `Config.history`, null = off): the database owns a
   `history.Store` and enables `StateTrie.track_changes` only when it is configured. Live head
   moves update it inside `move_state`: unwinds, then `unwind_to(fork point)`, then
@@ -512,3 +537,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   unsorted, broken middle link, wrong tail hash/number, missing parent, and pre-root mismatch
   are rejected; seeded + `std.testing.fuzz` chain mutations verify only suffixes of the valid
   chain. Witness tests now use real linked headers (`db/witness_header_chain.zig`).
+- 2026-11-05: Witness responses over 1 MiB: shared lazily committed large send buffers in
+  `http.server` (grown on a body-writer rebase, held until sent), `debug_executionWitness`
+  requests its exact JSON length from the writer; node default 2 x 16 MiB, bound 16 MiB -
+  2 KiB. Tests: a 3 MiB sized response over SimIo (500 for unsized overflow, 503 beyond the
+  buffer, busy pool), the witness over real HTTP with a 2 KiB send buffer equals the router's
+  output byte for byte, over-bound and over-buffer still -32000, the node's large buffers
+  reserved but not resident at init.

@@ -16,6 +16,7 @@ pub const server = @import("server.zig");
 pub const client = @import("client.zig");
 pub const Server = server.Server;
 pub const ResponseBuilder = server.ResponseBuilder;
+pub const Grow = server.Grow;
 pub const Client = client.Client;
 
 test {
@@ -23,4 +24,5 @@ test {
     _ = @import("server_test.zig");
     _ = @import("timeout_test.zig");
     _ = @import("framing_test.zig");
+    _ = @import("large_test.zig");
 }

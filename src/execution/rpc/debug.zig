@@ -7,9 +7,12 @@
 //! `debug_executionWitness(block)` (base/base, alloy `ExecutionWitness`): the pre-state trie
 //! nodes, codes, touched keys, and ancestor headers a stateless client needs to re-execute
 //! the block, as `{state, codes, keys, headers}` hex arrays (`node/witness.zig`). A witness
-//! whose JSON exceeds the generator's `response_bytes_max` or the space left in the response
-//! buffer fails with -32000 "witness too large" (as does one that overflowed the generator's
-//! output buffers) instead of an overflowing response.
+//! whose JSON exceeds the generator's `response_bytes_max`, or that the response writer
+//! cannot make room for, fails with -32000 "witness too large" (as does one that overflowed
+//! the generator's output buffers) instead of an overflowing response. The exact length is
+//! computed first and room for it requested from the writer (`ensureUnusedCapacity`): over
+//! HTTP that moves a response larger than the connection's send buffer into one of the
+//! server's shared, lazily committed large send buffers (`http.server` "Large responses").
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -113,12 +116,15 @@ pub fn execution_witness(api: *eth.Api, call: *Call) HandlerError!void {
     };
     const built = &generator.witness;
     const w = call.writer;
-    // The response's closing `}` follows, and a full buffer reads as overflow: keep one more.
-    const space_bytes = w.out.buffer.len - w.out.end;
     const length = witness_json_length(built);
-    if (length > generator.response_bytes_max or length + 2 > space_bytes) {
+    if (length > generator.response_bytes_max) {
         return call.fail(rpc.code.server_error, witness_too_large);
     }
+    // The response's closing `}` follows, and a full buffer reads as overflow: keep one more.
+    w.out.ensureUnusedCapacity(@intCast(length + 2)) catch {
+        return call.fail(rpc.code.server_error, witness_too_large);
+    };
+    assert(w.out.buffer.len - w.out.end >= length + 2);
     const start = w.out.end;
     try w.begin_object();
     try write_list(w, "state", &built.state);
