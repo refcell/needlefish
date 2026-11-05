@@ -3,6 +3,7 @@
 //!   base devnet init   --out DIR [--force] [--timestamp SECONDS]
 //!   base devnet rollup --out DIR --timestamp SECONDS --l1-hash 0x.. --l2-hash 0x..
 //!   base devnet account INDEX
+//!   base devnet transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
 //!
 //! `init` writes genesis files, a placeholder rollup.json, devnet.env and a fresh JWT
 //! secret. Once the ELs are up, `rollup` rewrites rollup.json with their real genesis
@@ -12,12 +13,14 @@ const std = @import("std");
 const base = @import("base");
 const devnet = base.batcher.devnet;
 const Io = std.Io;
+const HttpTransport = @import("http_transport.zig").HttpTransport;
 
 pub const usage =
     \\usage: base devnet <init|rollup|account> [flags]
     \\  init    --out DIR [--force] [--timestamp SECONDS]
     \\  rollup  --out DIR --timestamp SECONDS --l1-hash 0x.. --l2-hash 0x..
     \\  account INDEX
+    \\  transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
     \\
 ;
 
@@ -27,6 +30,12 @@ const Flags = struct {
     timestamp: ?u64 = null,
     l1_hash: ?[32]u8 = null,
     l2_hash: ?[32]u8 = null,
+    rpc_url: ?[]const u8 = null,
+    chain_id: ?u64 = null,
+    key_index: ?u32 = null,
+    to: ?[20]u8 = null,
+    value: ?u256 = null,
+    gas: ?u64 = null,
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
@@ -50,10 +59,28 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--l2-hash")) {
             flags.l2_hash = try base.common.primitives.hex.decode_array(32, value);
         } else {
-            return error.UnknownFlag;
+            try parse_transfer_flag(&flags, arg, value);
         }
     }
     return flags;
+}
+
+fn parse_transfer_flag(flags: *Flags, arg: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, arg, "--rpc")) {
+        flags.rpc_url = value;
+    } else if (std.mem.eql(u8, arg, "--chain-id")) {
+        flags.chain_id = try std.fmt.parseInt(u64, value, 10);
+    } else if (std.mem.eql(u8, arg, "--key-index")) {
+        flags.key_index = try std.fmt.parseInt(u32, value, 10);
+    } else if (std.mem.eql(u8, arg, "--to")) {
+        flags.to = try base.common.primitives.hex.decode_array(20, value);
+    } else if (std.mem.eql(u8, arg, "--value")) {
+        flags.value = try std.fmt.parseInt(u256, value, 10);
+    } else if (std.mem.eql(u8, arg, "--gas")) {
+        flags.gas = try std.fmt.parseInt(u64, value, 10);
+    } else {
+        return error.UnknownFlag;
+    }
 }
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
@@ -72,6 +99,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse_flags(args[1..]) catch return usage_error();
     if (std.mem.eql(u8, command, "init")) return command_init(init, flags);
     if (std.mem.eql(u8, command, "rollup")) return command_rollup(init, flags);
+    if (std.mem.eql(u8, command, "transfer")) return command_transfer(init, flags);
     return usage_error();
 }
 
@@ -140,4 +168,29 @@ fn write_rendered(
     defer allocating.deinit();
     try devnet.init.render(&allocating.writer, file, config, anchor, .{});
     try dir.writeFile(init.io, .{ .sub_path = file.name(), .data = allocating.written() });
+}
+
+fn command_transfer(init: std.process.Init, flags: Flags) !u8 {
+    const url = flags.rpc_url orelse return usage_error();
+    const params: devnet.transfer.Params = .{
+        .chain_id = flags.chain_id orelse return usage_error(),
+        .key_index = flags.key_index orelse return usage_error(),
+        .to = .{ .bytes = flags.to orelse return usage_error() },
+        .value_wei = flags.value orelse return usage_error(),
+        .gas_limit = flags.gas,
+    };
+    var http = HttpTransport.init(init.gpa, init.io, url);
+    defer http.deinit();
+    var client = try base.batcher.rpc.Client.init(init.gpa, http.transport(), .{
+        .request_bytes_max = 4096,
+        .response_bytes_max = 1024 * 1024,
+        .parse_bytes_max = 4 * 1024 * 1024,
+    });
+    defer client.deinit(init.gpa);
+    const hash = devnet.transfer.transfer(&client, params) catch |err| {
+        std.debug.print("transfer: {t} {s}\n", .{ err, client.last_error() });
+        return 1;
+    };
+    try write_stdout(init.io, "0x{x}\n", .{&hash.bytes});
+    return 0;
 }

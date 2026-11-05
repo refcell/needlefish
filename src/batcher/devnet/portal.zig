@@ -102,3 +102,35 @@ test "portal: bytecode shape" {
     }
     try testing.expectEqual(@as(u32, 1), logs);
 }
+
+test "portal: consensus decodes the log this code emits" {
+    // Log emitted by `code` for a 1 ETH call from dev account 1 (captured on a dev node).
+    const deposits = @import("../../consensus/protocol/deposits.zig");
+    var sender_word: [32]u8 = @splat(0);
+    _ = try std.fmt.hexToBytes(sender_word[12..], "70997970c51812dc3a010c7d01b50e0d17dc79c8");
+    const topics = [_]primitives.B256{
+        .{ .bytes = transaction_deposited_topic },
+        .{ .bytes = sender_word },
+        .{ .bytes = sender_word },
+        .{ .bytes = @splat(0) },
+    };
+    // Same layout the bytecode writes to memory: offset, length, mint, value, gas, flag.
+    var data: [0xa0]u8 = @splat(0);
+    data[31] = 0x20;
+    data[63] = opaque_data_length;
+    const one_ether: u256 = 1_000_000_000_000_000_000;
+    std.mem.writeInt(u256, data[0x40..0x60], one_ether, .big);
+    std.mem.writeInt(u256, data[0x60..0x80], one_ether, .big);
+    std.mem.writeInt(u64, data[0x80..0x88], receive_deposit_gas_limit, .big);
+    const tx = try deposits.decode_deposit_log(.{ .bytes = @splat(1) }, 0, .{
+        .address = .{ .bytes = @splat(0) },
+        .topics = &topics,
+        .data = &data,
+    });
+    try testing.expectEqual(@as(u128, one_ether), tx.mint);
+    try testing.expectEqual(one_ether, tx.value);
+    try testing.expectEqual(receive_deposit_gas_limit, tx.gas_limit);
+    try testing.expectEqualSlices(u8, sender_word[12..], &tx.from.bytes);
+    try testing.expectEqualSlices(u8, sender_word[12..], &tx.to.?.bytes);
+    try testing.expectEqual(@as(usize, 0), tx.input.len);
+}

@@ -17,11 +17,14 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `batcher/batch`: singular batch RLP, span batch encoding.
 - [x] `batcher/channel`: channel out (ratio estimate, compress on close, frames).
 - [ ] `batcher/channel`: channel manager (block queue, timeouts, tx tracking, reorgs).
-- [ ] `batcher/txdata`: EIP-1559 / EIP-4844 tx building + signing, tx manager.
+- [x] `batcher/txdata`: EIP-1559 calldata tx building + signing, gas, fee bumps.
+- [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
+- [ ] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
-- [ ] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
+- [x] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
+- [x] `batcher/rpc`: JSON-RPC client over an injected transport (HTTP in bin, canned in tests).
 - [ ] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
 
@@ -32,6 +35,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - L2 verifier: `node` HTTP :10545, engine :10551; `consensus` RPC :8547 (derives from L1 only).
 
 ## Decisions
+- 2026-11-05: batcher carries a minimal JSON-RPC client (`batcher/rpc`) behind a
+  `Transport` interface until `utilities/rpc` lands; binaries use std.http.Client.
 - 2026-11-05: no L1 deployment step. A hand-assembled portal stub at 0x..de90 emits
   `TransactionDeposited` (receive()-style deposit to msg.sender); system config has no code.
 - 2026-11-05: L2 activates every OP upgrade through Jovian at genesis; Base-only upgrades
@@ -52,3 +57,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: ChannelOut with fuzzed reassembly through the consensus Channel.
 - 2026-11-05: dev accounts (BIP39/32), portal stub, genesis/rollup writers, `base devnet init`.
 - 2026-11-05: devnet.sh supervisor (bash 3.2 compatible) + smoke.sh.
+- 2026-11-05: rpc client, `base devnet transfer`; signing + portal deposit log verified
+  against a local dev node; portal log decodes with consensus `decode_deposit_log`.

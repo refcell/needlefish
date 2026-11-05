@@ -7,6 +7,7 @@ pub const accounts = @import("accounts.zig");
 pub const portal = @import("portal.zig");
 pub const genesis = @import("genesis.zig");
 pub const init = @import("init.zig");
+pub const transfer = @import("transfer.zig");
 
 test {
     std.testing.refAllDecls(@This());
