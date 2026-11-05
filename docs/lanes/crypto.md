@@ -30,8 +30,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
-- [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
-  recover. Landed (ddbf591, 4391655, ef23739); review pending.
+- [x] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
+  recover. Landed (ddbf591, 4391655, ef23739); reviewed clean; ReleaseSafe vectors incl. FK20 pass.
 - [x] bls: prepared G2 lines (`pairing.prepare`, `pairing_check_prepared`); KZG fixed G2 lines
   prepared at comptime.
 - [x] bls GLV-split MSM: closed. Needs 2n half-scalars of scratch (128 KiB at n = 4096) or
@@ -316,3 +316,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
   verify_cell_kzg_proof_batch, recover_cells_and_kzg_proofs; all c-kzg vectors (see Decisions).
   Bench (ReleaseFast, M4 Pro, loaded host): compute_cells 1.38 ms, compute_cells_and_kzg_proofs
   189 ms, verify batch 1 cell 2.11 ms / 128 cells 13.7 ms, recover from 64 cells + proofs 207 ms.
+- 2026-11-05: EIP-7594 cells (FK20 compute 189 ms/blob, batch verify, recovery) reviewed: no defects; setup bytes match public c-kzg setup; ReleaseSafe cell tests (FK20 proofs) green.
