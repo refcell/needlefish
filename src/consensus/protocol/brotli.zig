@@ -162,6 +162,29 @@ pub fn decompress(
     return output;
 }
 
+/// Channel-reader semantics (base/base `Brotli::decompress`): output past
+/// `output_limit_bytes` is truncated, and a stream that fails after producing output keeps
+/// that output. Fails only when the stream produced nothing. Caller owns the result.
+pub fn decompress_truncating(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    output_limit_bytes: u64,
+) Error![]u8 {
+    const decoder = try allocator.create(Decoder);
+    defer allocator.destroy(decoder);
+    const limit: usize = @intCast(@min(output_limit_bytes, std.math.maxInt(usize)));
+    var sink: Sink = .{ .buffer = &.{}, .limit = limit, .allocator = allocator };
+    errdefer allocator.free(sink.buffer);
+    decoder.decode(&sink, input) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OutputLimitExceeded, error.InvalidData, error.Truncated => {
+            if (sink.len == 0) return err;
+        },
+    };
+    assert(sink.len <= limit);
+    return allocator.realloc(sink.buffer, sink.len);
+}
+
 /// Decodes `input` into `out` with caller-owned scratch. See `Decoder.decompress_into`.
 pub fn decompress_into(decoder: *Decoder, out: []u8, input: []const u8) Error![]u8 {
     return decoder.decompress_into(out, input);

@@ -14,6 +14,7 @@ const flate = std.compress.flate;
 
 const rlp = @import("../../common/rlp/root.zig");
 const BatchType = @import("batch.zig").BatchType;
+const brotli = @import("brotli.zig");
 
 pub const zlib_deflate_method: u8 = 8;
 pub const zlib_reserved_method: u8 = 15;
@@ -75,8 +76,11 @@ pub fn decompress_channel(
         return decompress_zlib(allocator, data, limit);
     }
     if (data[0] == channel_version_brotli and brotli_supported) {
-        // Brotli decoding lands with `brotli.zig`; until then a brotli channel is dropped.
-        return error.BrotliFailed;
+        // The version byte is not part of the brotli stream.
+        return brotli.decompress_truncating(allocator, data[1..], limit) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.BrotliFailed;
+        };
     }
     return error.UnsupportedCompression;
 }
@@ -155,10 +159,23 @@ fn channel(data: []const u8, brotli_supported: bool) DecompressError![]u8 {
     return decompress_channel(testing.allocator, data, 1 << 20, brotli_supported);
 }
 
+test "batch reader: brotli channel" {
+    // `xyzzy.compressed` from the public google/brotli test corpus, version-prefixed.
+    const stream = @embedFile("testdata/brotli/xyzzy.compressed");
+    const data = [_]u8{channel_version_brotli} ++ stream.*;
+    const output = try decompress_channel(testing.allocator, &data, 100, true);
+    defer testing.allocator.free(output);
+    try testing.expectEqualStrings("Xyzzy", output);
+    const truncated = try decompress_channel(testing.allocator, &data, 3, true);
+    defer testing.allocator.free(truncated);
+    try testing.expectEqualStrings("Xyz", truncated);
+    try testing.expectError(error.BrotliFailed, channel(&.{ channel_version_brotli, 0xff }, true));
+}
+
 test "batch reader: compression type detection" {
     try testing.expectError(error.EmptyData, decompress_channel(testing.allocator, "", 10, true));
-    const brotli = [_]u8{ channel_version_brotli, 0xff };
-    try testing.expectError(error.UnsupportedCompression, channel(&brotli, false));
+    const brotli_bad = [_]u8{ channel_version_brotli, 0xff };
+    try testing.expectError(error.UnsupportedCompression, channel(&brotli_bad, false));
     try testing.expectError(error.UnsupportedCompression, channel(&.{0x02}, true));
     try testing.expectError(error.ZlibFailed, channel(&.{ 0x78, 0x00, 0x00 }, false));
 }
