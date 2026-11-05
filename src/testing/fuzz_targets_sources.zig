@@ -238,7 +238,8 @@ fn fuzz_blobs(case: *BlobCase, smith: *Smith) anyerror!void {
     const fewer = case.decoded[0 .. case.count - 1];
     if (sidecars) {
         var decoded_sidecars: [blobs_max]Sidecar = undefined;
-        const result = beacon_json.decode_sidecars(text.slice(), fewer, decoded_sidecars[0..fewer.len]);
+        const fewer_sidecars = decoded_sidecars[0..fewer.len];
+        const result = beacon_json.decode_sidecars(text.slice(), fewer, fewer_sidecars);
         try std.testing.expectError(error.TooLarge, result);
         // A sidecar missing a required field: rejected.
         blobs_response(&text, &prng, case, true, @intCast(prng.below(3)));

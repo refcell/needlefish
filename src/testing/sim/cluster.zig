@@ -451,8 +451,7 @@ pub const Cluster = struct {
         if (prng.chance(cluster.config.crashes_per_minute, steps_per_minute)) {
             // Any node but L1. Crashing an already-down node extends nothing.
             const node: NodeId = @intCast(prng.range(1, 2 + cluster.config.verifier_count));
-            const fragile = node == nodes.node_verifier_first and cluster.real_verifier_fragile();
-            if (cluster.up(node) and !fragile) {
+            if (cluster.up(node)) {
                 cluster.restart_ns[node] = cluster.now_ns +
                     prng.range(step_ns, cluster.config.downtime_ns_max);
                 cluster.report.crashes += 1;
@@ -460,7 +459,7 @@ pub const Cluster = struct {
         }
         if (prng.chance(cluster.config.l1_reorgs_per_minute, steps_per_minute)) {
             const depth_max = @min(nodes.l1_reorg_depth_max, cluster.l1.head);
-            if (depth_max > 0 and !cluster.real_verifier_fragile()) {
+            if (depth_max > 0) {
                 const depth = prng.range(1, depth_max);
                 const loss_ppm = cluster.config.reorg_tx_loss_ppm;
                 cluster.l1.reorg(&cluster.env(nodes.node_l1), depth, prng, loss_ppm);
@@ -491,21 +490,6 @@ pub const Cluster = struct {
             cluster.heal_ns = cluster.now_ns + prng.range(step_ns, cluster.config.downtime_ns_max);
             cluster.report.partitions += 1;
         }
-    }
-
-    /// BUG(derive): a pipeline reset whose safe head has L1 origin `genesis.l1 + 1` walks
-    /// back to the L2 genesis, so the batch queue holds `[genesis.l1, origin]` and every
-    /// step fails with `L1OriginMismatch`, which resets again: the driver never recovers.
-    /// base/base's `batch_queue.rs` has the same edge (it mirrors op-node). Until the
-    /// derive lane fixes it, nothing makes the real verifier reset in that window: its
-    /// node does not crash and L1 does not reorg (the random draws still happen).
-    fn real_verifier_fragile(cluster: *const Cluster) bool {
-        const verifier = cluster.real_verifier orelse return false;
-        const engine = &verifier.engine;
-        const labeled = engine.blocks[engine.safe].info.l1_origin.number;
-        const driver = if (verifier.safe_head()) |safe| safe.l1_origin.number else labeled;
-        const fragile = codec.rollup.genesis.l1.number + 1;
-        return labeled == fragile or driver == fragile;
     }
 
     /// Half symmetric group splits, half asymmetric: random one-way link cuts, which

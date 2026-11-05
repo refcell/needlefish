@@ -20,7 +20,7 @@ provably robust.
   - [x] Verifier derivation: the real consensus `Driver` (pipeline, engine task queue,
     startup discovery) as the first verifier's consensus client (`sim/real_verifier.zig`).
   - [ ] Sequencer: the real driver in sequencer mode producing the L2 chain.
-- [ ] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
+- [x] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
   reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
 - [ ] Sim: enable both tx-loss faults for the real batcher (with crashes) once txmgr recovers
@@ -189,3 +189,5 @@ provably robust.
 - 2026-11-05: beacon API decoder fuzz (`fuzz_targets_sources.zig`): integers (decimal and
   QUANTITY among noise fields), blobs and sidecars (any field order, extra and missing
   fields), arbitrary bytes. Sidecar field-swap mutant caught.
+- 2026-11-05: derive lane fixed the reset livelock (db0b967); dropped the
+  `real_verifier_fragile` gate. Seed 48 and 2000 swarm seeds green.
