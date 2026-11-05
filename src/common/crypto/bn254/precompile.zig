@@ -119,6 +119,7 @@ pub fn precompile_bn254_pairing(input: []const u8) Error![32]u8 {
 }
 
 const testing = std.testing;
+const Prng = @import("../../../testing/prng.zig").Prng;
 const vectors = @import("vectors.zig");
 
 fn decode_hex(comptime hex: []const u8, buffer: []u8) []u8 {
@@ -197,7 +198,6 @@ test "precompile: short inputs are right-padded with zeros" {
 }
 
 test "precompile: seeded fuzz never crashes and is consistent" {
-    const Prng = @import("../../../testing/prng.zig").Prng;
     var prng = Prng.init(0xb254);
     var buffer: [pairing_pair_length * 2]u8 = undefined;
     for (0..200) |_| {
@@ -288,4 +288,14 @@ fn fuzz_algebra(_: void, smith: *testing.Smith) anyerror!void {
 
 test "bn254 precompile: coverage-guided fuzz of add, mul, pairing vs group laws" {
     try testing.fuzz({}, fuzz_algebra, .{});
+}
+
+test "bn254 precompile: group laws on seeded random scalars" {
+    var prng = Prng.init(0x6c617773);
+    var input: [96]u8 = undefined;
+    for (0..3) |_| {
+        prng.fill(&input);
+        var smith: testing.Smith = .{ .in = &input };
+        try fuzz_algebra({}, &smith);
+    }
 }

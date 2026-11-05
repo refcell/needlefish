@@ -410,3 +410,69 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
 test "bls12-381 precompile: coverage-guided fuzz never crashes" {
     try testing.fuzz({}, fuzz_one, .{});
 }
+
+fn reduce_r(value: u512) u256 {
+    return @intCast(value % fields.r);
+}
+
+/// [scalar]G1 and [scalar]G2 by plain double-and-add (independent of GLV/GLS and MSM).
+fn g1_multiple(scalar: u256) [g1_length]u8 {
+    var out: [g1_length]u8 = undefined;
+    encode_g1(g1.generator.to_jacobian().mul(scalar).to_affine(), &out);
+    return out;
+}
+
+fn g2_multiple(scalar: u256) [g2_length]u8 {
+    var out: [g2_length]u8 = undefined;
+    encode_g2(g2.generator.to_jacobian().mul(scalar).to_affine(), &out);
+    return out;
+}
+
+fn scalar_bytes(scalar: u256) [scalar_length]u8 {
+    var out: [scalar_length]u8 = undefined;
+    std.mem.writeInt(u256, &out, scalar, .big);
+    return out;
+}
+
+/// Valid points from fuzzed scalars: add, MSM (G1 two-point Pippenger, G2 one-point GLS),
+/// and pairing bilinearity against double-and-add.
+fn fuzz_algebra(_: void, smith: *testing.Smith) anyerror!void {
+    const a = reduce_r(smith.value(u256));
+    const b = reduce_r(smith.value(u256));
+    const c = smith.value(u256);
+    const point_a = g1_multiple(a);
+    const point_b = g1_multiple(b);
+    var g1_out: [g1_length]u8 = undefined;
+    try g1_add(&(point_a ++ point_b), &g1_out);
+    try testing.expectEqualSlices(u8, &g1_multiple(reduce_r(@as(u512, a) + b)), &g1_out);
+    // [c](aG) + [a](bG) = (ac + ab)G.
+    try g1_msm(&(point_a ++ scalar_bytes(c) ++ point_b ++ scalar_bytes(a)), &g1_out);
+    const combined = reduce_r(@as(u512, reduce_r(@as(u512, a) * c)) + reduce_r(@as(u512, a) * b));
+    try testing.expectEqualSlices(u8, &g1_multiple(combined), &g1_out);
+    const q = g2_multiple(b);
+    var g2_out: [g2_length]u8 = undefined;
+    try g2_msm(&(q ++ scalar_bytes(c)), &g2_out);
+    try testing.expectEqualSlices(u8, &g2_multiple(reduce_r(@as(u512, b) * c)), &g2_out);
+    // e(aG1, bG2) e(-(ab)G1, G2) = 1, and e(aG1, bG2) alone is 1 only when ab = 0.
+    const ab = reduce_r(@as(u512, a) * b);
+    const negated = g1_multiple(if (ab == 0) 0 else fields.r - ab);
+    var check: [32]u8 = undefined;
+    try pairing_check(&(point_a ++ q ++ negated ++ g2_multiple(1)), &check);
+    try testing.expectEqual(@as(u8, 1), check[31]);
+    try pairing_check(&(point_a ++ q), &check);
+    try testing.expectEqual(@as(u8, @intFromBool(ab == 0)), check[31]);
+}
+
+test "bls12-381 precompile: coverage-guided fuzz of add, msm, pairing vs group laws" {
+    try testing.fuzz({}, fuzz_algebra, .{});
+}
+
+test "bls12-381 precompile: group laws on seeded random scalars" {
+    var prng = Prng.init(0x6c617773);
+    var input: [96]u8 = undefined;
+    for (0..3) |_| {
+        prng.fill(&input);
+        var smith: testing.Smith = .{ .in = &input };
+        try fuzz_algebra({}, &smith);
+    }
+}
