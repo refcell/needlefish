@@ -44,7 +44,7 @@ allocation after startup.
   TUI is out of scope until the CLI commands are complete.
 - [ ] `infra/audit`: transaction-event audit stream (port `audit/src/*`) over the node's
   RPC, metrics exported.
-- [ ] `infra/snapshotter`: datadir snapshot create/restore for the node (port
+- [x] `infra/snapshotter`: datadir snapshot create/restore for the node (port
   `snapshotter/src/*`), coordinate with trie-db for a consistent DB checkpoint.
 - [ ] Devnet smoke: add load-test + websocket-proxy + withdrawer steps to
   `just devnet smoke` (coordinate with batcher-devnet, who owns `etc/devnet`).
@@ -67,6 +67,13 @@ allocation after startup.
   per send (`BlobStore`); bumps re-sign fees only. Blob candidates are plain carriers (no
   calldata, no value, gas 21000) because `batcher/txdata/blob.sign` builds that shape.
   Sidecar v1 (cell proofs) is the default, as L1 mempools require it since Osaka.
+- snapshotter: zero dependencies, so no Docker socket and no S3. The tip check matches base/base
+  (10 s freshness, skip and leave the node running); stop/start are operator shell commands
+  (`--stop-cmd`/`--start-cmd`, start also runs after a failure); the store is a directory.
+  needlefish has one `node.db`, so it is split into fixed-size chunks stored by BLAKE3
+  content address (reuse without comparing against the previous manifest); no compression
+  yet. Restore verifies every chunk and renames a temp file into place. A consistent copy
+  needs the node stopped; an online engine checkpoint export (trie-db) is future work.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
   address; deploying a token is future work), open-loop pacer with 2x catch-up, one
   tx_manager driver per sender, latency via reservoir sampling. Default senders are dev
@@ -108,3 +115,6 @@ allocation after startup.
   upstreams; smoke-tested against a local HTTP upstream (incl. a 200 KB response).
 - 2026-11-05: tx_manager blob mode (EIP-4844 sidecars v0/v1, `eth_blobBaseFee`, blob fee
   bumps) with fake-L1 tests that decode the network form.
+- 2026-11-05: snapshotter (manifest codec + fuzz, tip check) and `base snapshotter
+  create|restore|verify`; smoke: 100 MB node.db round-trips byte-identical, re-create reuses
+  all chunks, a corrupted chunk fails verify, a stale node is skipped.

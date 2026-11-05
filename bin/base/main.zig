@@ -10,6 +10,7 @@ const consensus = @import("consensus.zig");
 const proof = @import("proof.zig");
 const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
+const snapshotter = @import("snapshotter.zig");
 const roxy = @import("roxy.zig");
 
 const usage =
@@ -24,6 +25,7 @@ const usage =
     \\  proof      fault-proof tooling (replay a recorded preimage archive)
     \\  balance-monitor  poll an account balance, serve metrics and health
     \\  load-test  send a seeded transaction workload, report inclusion latency
+    \\  snapshotter  create, restore, or verify node datadir snapshots
     \\  roxy       JSON-RPC reverse proxy: load balancing, retries, method allowlist
     \\
 ;
@@ -36,6 +38,7 @@ test {
     _ = proof;
     _ = balance_monitor;
     _ = load_test;
+    _ = snapshotter;
     _ = roxy;
 }
 
@@ -71,6 +74,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "balance-monitor")) {
         std.process.exit(try balance_monitor.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "snapshotter")) {
+        std.process.exit(try snapshotter.main(init, args[2..]));
     }
     if (std.mem.eql(u8, command, "load-test")) {
         std.process.exit(try load_test.main(init, args[2..]));
