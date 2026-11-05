@@ -379,7 +379,7 @@ const Children = struct {
 
 fn read_children(context: *Context, id: u64) Error!Children {
     const length_slot = children_length_slot(id);
-    const length = try context.sload(length_slot);
+    const length = try context.sload_at(address, length_slot);
     if (length > std.math.maxInt(u32)) {
         return context.revert_word(error_panic, native.u256_word(panic_overflow));
     }
@@ -388,7 +388,7 @@ fn read_children(context: *Context, id: u64) Error!Children {
     // Stored lists come from `write_children`, which bounds them to `children_max`.
     assert(children.count <= children_max);
     const data_slot = std.mem.readInt(u256, &keccak256(&native.u256_word(length_slot)), .big);
-    const word = try context.sload(data_slot);
+    const word = try context.sload_at(address, data_slot);
     for (0..children.count) |index| children.ids[index] = @truncate(word >> @intCast(64 * index));
     return children;
 }
@@ -399,7 +399,7 @@ fn write_children(context: *Context, id: u64, children: Array) Error!void {
     assert(children.count() >= children_min and children.count() <= children_max);
     if (context.is_static) return context.revert(&.{});
     const length_slot = children_length_slot(id);
-    const old_length = try context.sload(length_slot);
+    const old_length = try context.sload_at(address, length_slot);
     if (old_length > std.math.maxInt(u32)) {
         return context.revert_word(error_panic, native.u256_word(panic_overflow));
     }
@@ -426,7 +426,7 @@ fn is_zero(account: Address) bool {
 
 /// The packed word of an existing policy, or a PolicyNotFound revert.
 fn require_custom(context: *Context, id: u64) Error!u256 {
-    const word = try context.sload(policy_slot(id));
+    const word = try context.sload_at(address, policy_slot(id));
     if (word & exists_bit == 0) return context.revert_selector(error_policy_not_found);
     return word;
 }
@@ -447,7 +447,7 @@ fn require_batch(context: *Context, accounts: Array) Error!void {
 // ------------------------------------------------------------------ logic
 
 fn ensure_initialized(context: *Context) Error!u64 {
-    const counter: u64 = @truncate(try context.sload(next_counter_slot));
+    const counter: u64 = @truncate(try context.sload_at(address, next_counter_slot));
     if (counter >= builtin_policy_count) return counter;
     try context.install_marker();
     try context.sstore(policy_slot(always_allow_id), exists_bit);
@@ -589,7 +589,7 @@ fn stage_update_admin(context: *Context, id: u64, new_admin: Address) Error!void
 
 fn finalize_update_admin(context: *Context, id: u64) Error!void {
     const word = try require_custom(context, id);
-    const pending = to_address(@truncate(try context.sload(pending_slot(id))));
+    const pending = to_address(@truncate(try context.sload_at(address, pending_slot(id))));
     if (is_zero(pending)) return context.revert_selector(error_no_pending_admin);
     if (!same(pending, context.caller)) return context.revert_selector(error_unauthorized);
     try context.sstore(policy_slot(id), pack_policy(context.caller));
@@ -640,7 +640,8 @@ fn update_membership(
     try emit_membership(context, id, expected_type, add, accounts);
 }
 
-fn is_authorized(context: *Context, id: u64, account: Address) Error!bool {
+/// Policy evaluation for the registry and for B-20 tokens (reads target the registry).
+pub fn is_authorized(context: *Context, id: u64, account: Address) Error!bool {
     const version = version_of(context);
     if (version == .v1) {
         // V1 rejects malformed ids before the built-in fast paths; the result is the same.
@@ -687,23 +688,23 @@ fn authorized_leaf(context: *Context, version: Version, id: u64, account: Addres
         inverted = true;
     }
     if (!is_well_formed(version, base) or is_composite(base)) return inverted;
-    const member = try context.sload(member_slot(base, account)) != 0;
+    const member = try context.sload_at(address, member_slot(base, account)) != 0;
     const authorized = if (id_type(base) == type_allowlist) member else !member;
     return authorized != inverted;
 }
 
-fn policy_exists(context: *Context, version: Version, policy_id: u64) Error!bool {
+pub fn policy_exists(context: *Context, version: Version, policy_id: u64) Error!bool {
     const id = base_id(version, policy_id);
     if (version == .v1 and id_type(id) > type_allowlist) return false;
     if (is_builtin(id)) return true;
     if (!is_well_formed(version, id)) return false;
-    return try context.sload(policy_slot(id)) & exists_bit != 0;
+    return try context.sload_at(address, policy_slot(id)) & exists_bit != 0;
 }
 
 fn policy_admin(context: *Context, version: Version, policy_id: u64) Error!Address {
     const id = base_id(version, policy_id);
     if (!is_well_formed(version, id)) return primitives.address_zero;
-    const word = try context.sload(policy_slot(id));
+    const word = try context.sload_at(address, policy_slot(id));
     if (word & exists_bit == 0) return primitives.address_zero;
     return packed_admin(word);
 }
@@ -711,7 +712,7 @@ fn policy_admin(context: *Context, version: Version, policy_id: u64) Error!Addre
 fn pending_policy_admin(context: *Context, version: Version, policy_id: u64) Error!Address {
     const id = base_id(version, policy_id);
     if (!is_well_formed(version, id) or is_builtin(id)) return primitives.address_zero;
-    return to_address(@truncate(try context.sload(pending_slot(id))));
+    return to_address(@truncate(try context.sload_at(address, pending_slot(id))));
 }
 
 fn composite_policy_child_ids(
