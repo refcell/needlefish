@@ -12,6 +12,7 @@ pub const retrieval = @import("retrieval.zig");
 pub const frame_queue = @import("frame_queue.zig");
 pub const channel_stage = @import("channel_stage.zig");
 pub const channel_reader = @import("channel_reader.zig");
+pub const batch_stage = @import("batch_stage.zig");
 pub const upgrades = @import("upgrades.zig");
 pub const attributes = @import("attributes.zig");
 pub const test_chain = @import("test_chain.zig");

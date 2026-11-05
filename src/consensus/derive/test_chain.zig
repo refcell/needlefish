@@ -13,6 +13,8 @@ const providers = @import("providers.zig");
 const blob = @import("blob.zig");
 
 const BlockInfo = protocol.block.BlockInfo;
+const L2BlockInfo = protocol.block.L2BlockInfo;
+const SafeBlock = protocol.span_batch.SafeBlock;
 const Hash = protocol.block.Hash;
 const Receipt = protocol.log.Receipt;
 const L1Header = protocol.l1_info.L1Header;
@@ -21,8 +23,10 @@ const ProviderError = errors.ProviderError;
 
 pub const blocks_max = 64;
 pub const system_configs_max = 16;
+pub const l2_blocks_max = 64;
 
 pub const SystemConfigEntry = struct { l2_hash: Hash, config: SystemConfig };
+pub const SafeBlockEntry = struct { number: u64, block: SafeBlock };
 
 pub const TestChain = struct {
     blocks: [blocks_max]BlockInfo = undefined,
@@ -37,6 +41,14 @@ pub const TestChain = struct {
     base_fees: [blocks_max]?u64 = @splat(null),
     system_configs: [system_configs_max]SystemConfigEntry = undefined,
     system_config_count: u32 = 0,
+    /// L2 safe chain: block infos searched in insertion order (duplicates allowed, the
+    /// first match wins), full blocks keyed by number.
+    l2_blocks: [l2_blocks_max]L2BlockInfo = undefined,
+    l2_block_count: u32 = 0,
+    l2_safe_blocks: [l2_blocks_max]SafeBlockEntry = undefined,
+    l2_safe_block_count: u32 = 0,
+    /// Every L2 query returns `error.NotAvailable` while set.
+    l2_unavailable: bool = false,
 
     /// Builds `count` linked blocks starting at `first_number` with `block_time` spacing.
     pub fn init(count: u32, first_number: u64, block_time: u64) TestChain {
@@ -126,6 +138,45 @@ pub const TestChain = struct {
         return error.NotFound;
     }
 
+    pub fn add_l2_block(chain: *TestChain, info: L2BlockInfo) void {
+        assert(chain.l2_block_count < l2_blocks_max);
+        chain.l2_blocks[chain.l2_block_count] = info;
+        chain.l2_block_count += 1;
+    }
+
+    pub fn add_l2_safe_block(chain: *TestChain, number: u64, block: SafeBlock) void {
+        assert(chain.l2_safe_block_count < l2_blocks_max);
+        chain.l2_safe_blocks[chain.l2_safe_block_count] = .{ .number = number, .block = block };
+        chain.l2_safe_block_count += 1;
+    }
+
+    pub fn l2_block_info_by_number(chain: *TestChain, number: u64) ProviderError!L2BlockInfo {
+        assert(chain.l2_block_count <= l2_blocks_max);
+        if (chain.l2_unavailable) return error.NotAvailable;
+        for (chain.l2_blocks[0..chain.l2_block_count]) |info| {
+            if (info.block_info.number == number) return info;
+        }
+        return error.NotFound;
+    }
+
+    pub fn l2_block_info_by_hash(chain: *TestChain, hash: Hash) ProviderError!L2BlockInfo {
+        assert(chain.l2_block_count <= l2_blocks_max);
+        if (chain.l2_unavailable) return error.NotAvailable;
+        for (chain.l2_blocks[0..chain.l2_block_count]) |info| {
+            if (info.block_info.hash.eql(hash)) return info;
+        }
+        return error.NotFound;
+    }
+
+    pub fn l2_block_by_number(chain: *TestChain, number: u64) ProviderError!SafeBlock {
+        assert(chain.l2_safe_block_count <= l2_blocks_max);
+        if (chain.l2_unavailable) return error.NotAvailable;
+        for (chain.l2_safe_blocks[0..chain.l2_safe_block_count]) |entry| {
+            if (entry.number == number) return entry.block;
+        }
+        return error.NotFound;
+    }
+
     pub fn blobs(
         chain: *TestChain,
         block: BlockInfo,
@@ -158,4 +209,18 @@ test "test chain: headers and system configs" {
     chain.add_system_config(.zero, .{ .gas_limit = 8 });
     try std.testing.expectEqual(@as(u64, 8), (try chain.system_config_by_l2_hash(.zero)).gas_limit);
     try std.testing.expectEqual(@as(u32, 1), chain.system_config_count);
+}
+
+test "test chain: l2 safe chain" {
+    var chain = TestChain.init(0, 0, 12);
+    chain.add_l2_block(.{ .block_info = .{ .number = 4, .hash = .init(@splat(4)) } });
+    chain.add_l2_safe_block(4, .{ .transactions = &.{}, .l1_origin_number = 2 });
+    const info = try chain.l2_block_info_by_number(4);
+    try std.testing.expect(info.block_info.hash.eql(.init(@splat(4))));
+    const by_hash = try chain.l2_block_info_by_hash(.init(@splat(4)));
+    try std.testing.expectEqual(@as(u64, 4), by_hash.block_info.number);
+    try std.testing.expectEqual(@as(?u64, 2), (try chain.l2_block_by_number(4)).l1_origin_number);
+    try std.testing.expectError(error.NotFound, chain.l2_block_info_by_number(5));
+    chain.l2_unavailable = true;
+    try std.testing.expectError(error.NotAvailable, chain.l2_block_by_number(4));
 }
