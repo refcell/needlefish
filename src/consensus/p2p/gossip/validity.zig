@@ -204,11 +204,26 @@ pub fn block_hash(
     if (payload.base_fee_per_gas > std.math.maxInt(u64)) return error.BaseFeeOverflow;
     if (payload.withdrawals.count > 0) return error.Withdrawals;
     try check_transactions(payload.transactions);
+    const root = transactions_root(payload.transactions);
+    const header = header_from_payload(config, payload, parent_beacon_block_root, root);
+    if (!header.optionals_contiguous()) return error.BlockHash;
+    return header.hash();
+}
+
+/// The block header a payload describes (alloy `try_into_block` header mapping).
+pub fn header_from_payload(
+    config: *const RollupConfig,
+    payload: *const ssz.ExecutionPayload,
+    parent_beacon_block_root: ?B256,
+    transactions_root_value: B256,
+) Header {
+    assert(payload.base_fee_per_gas <= std.math.maxInt(u64));
+    assert(payload.extra_data.len <= ssz.extra_data_size_max);
     var header: Header = .{
         .parent_hash = payload.parent_hash,
         .beneficiary = payload.fee_recipient,
         .state_root = payload.state_root,
-        .transactions_root = transactions_root(payload.transactions),
+        .transactions_root = transactions_root_value,
         .receipts_root = payload.receipts_root,
         .logs_bloom = payload.logs_bloom,
         .number = payload.block_number,
@@ -229,9 +244,8 @@ pub fn block_hash(
     if (config.is_feature_active(.empty_requests_hash, payload.timestamp)) {
         header.requests_hash = common_block.empty_requests_hash;
     }
-    if (!header.optionals_contiguous()) return error.BlockHash;
     assert(header.base_fee_per_gas != null);
-    return header.hash();
+    return header;
 }
 
 /// v3/v4 field rules (base/base `validate_version_specific_payload`).
@@ -591,6 +605,69 @@ test "validity: seeded fuzz of the BaseTime schedule check" {
             result,
         );
     }
+}
+
+test "validity: block hash of a real Base mainnet block (30000000)" {
+    // Header fields of Base mainnet block 30000000 from the public base/base fixture
+    // `crates/execution/flashblocks-node/benches/fixtures/base_mainnet_blocks.json`; its
+    // 1006 transactions are represented by the published transactions root.
+    var config: RollupConfig = .{ .l2_chain_id = 8453, .block_time = 2 };
+    config.upgrades = .base_mainnet;
+    var bloom: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &bloom,
+        "" ++
+            "03a8022a41c49951880a3009e6a080d611623abc894844000784ca90e78ee57827fcd32130894504" ++
+            "46028051140e95ad64589a3506286231d773831de0fedf4e8465243a2252a46d9bcbc41e9102ab2d" ++
+            "82cf68d0d04d84ab77d2282c87a0ab4039c90837ba4e8c90600d252329500e07e50034466e1fbe82" ++
+            "30e7ac54483a2389806c31ed8b0a10dcc1c547042c3f3c12081af57169350afc992b8cc6314c9c22" ++
+            "4b801a7788b1d873306019423050c3033ea950c81dff528e154203711a406a87ec28949b25410561" ++
+            "0481b93d407391fb4ca109012f26021320b3e4c7422c65d443d71a1121a5a658f85b03ba631315b1" ++
+            "91839102439ce172a3464520284d2835",
+    );
+    const payload: ssz.ExecutionPayload = .{
+        .version = .v3,
+        .parent_hash = try hex_b256(
+            "6831d48969d8d6d6198ddd60bbdb233f0a002f9674d3ca27f1def0d13ee19570",
+        ),
+        .fee_recipient = .{ .bytes = (try hex_b256(
+            "0000000000000000000000004200000000000000000000000000000000000011",
+        )).bytes[12..].* },
+        .state_root = try hex_b256(
+            "013a354fa6aed2264f2009c7b2ac5700f67e55531518cd6bc65a0b8e91298b38",
+        ),
+        .receipts_root = try hex_b256(
+            "5b70c6a3f036dbe5411c731e48a22beb5893151686e980c2144bd23916ce2d7b",
+        ),
+        .logs_bloom = .{ .bytes = bloom },
+        .prev_randao = try hex_b256(
+            "c355ef1002b862857745d465014cb7c33a3ed910da3223487f1bf4104f66645e",
+        ),
+        .block_number = 30000000,
+        .gas_limit = 140000000,
+        .gas_used = 59041113,
+        .timestamp = 1746789347,
+        .extra_data = &.{ 0x00, 0x00, 0x00, 0x00, 0xfa, 0x00, 0x00, 0x00, 0x02 },
+        .base_fee_per_gas = 2388680,
+    };
+    const beacon_root = try hex_b256(
+        "b5aa7923b1b2b397887dc40ebc9234e4bc4c365d00473416b40503d440a14f3b",
+    );
+    const transactions_root_value = try hex_b256(
+        "9e78d4f68f59d302cbf5bfdef5666e4be161942e560cb3519b9fb0b95797d130",
+    );
+    const header = header_from_payload(&config, &payload, beacon_root, transactions_root_value);
+    try testing.expect(header.requests_hash == null); // Before Isthmus.
+    const expected = try hex_b256(
+        "4153b494cd159df8d742381b13f0523d6f5620151b025cb62fcb2f4e5f898697",
+    );
+    try testing.expect(header.hash().eql(expected));
+}
+
+fn hex_b256(text: []const u8) !B256 {
+    var result: B256 = undefined;
+    _ = try std.fmt.hexToBytes(&result.bytes, text);
+    return result;
 }
 
 test "validity: at most five blocks per height" {
