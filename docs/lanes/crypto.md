@@ -34,7 +34,8 @@ fallback but hot paths should be our own, optimized implementations.
   recover. (in progress, worker)
 - [x] bls: prepared G2 lines (`pairing.prepare`, `pairing_check_prepared`); KZG fixed G2 lines
   prepared at comptime.
-- [ ] bls: GLV-split scalars inside large G1 MSM (halves windows).
+- [x] bls GLV-split MSM: closed. Needs 2n half-scalars of scratch (128 KiB at n = 4096) or
+  per-window recomputation (~same cost as the ~5 ms of bucket sums it saves).
 - [x] fuzz coverage audit: every precompile/decoder file has a std.testing.fuzz target; added
   safegcd (BLS + secp moduli) and lazy-reduction checks to the montgomery target.
 - [x] safegcd codegen: the generic copy's i318 accumulator was the 10% gap; rounded to whole
