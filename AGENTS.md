@@ -49,6 +49,11 @@ Read this whole file before you change anything. These rules are not optional.
    `README.md`) take small, additive edits; resolve rebase conflicts by keeping both.
 9. **Never write `.github/workflows/`** — the push token lacks workflow scope and the push is
    rejected. CI lives in `etc/ci/ci.yml`.
+10. **No flashblocks. Native 200 ms blocks.** The project owner decided needlefish does not
+   implement flashblocks (no flashblock stream, websocket feed, or pending-flashblock RPC).
+   L2 blocks are full blocks built by a regular block builder at Base's native subsecond
+   cadence: 200 ms (`SubsecondBlocks`, active from Denim), sealed 150 ms into each slot.
+   The devnet runs 200 ms L2 blocks. Do not add flashblocks code; delete it where found.
 
 ## Style: TigerStyle (see docs/TIGER_STYLE.md)
 

@@ -7,7 +7,8 @@
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
 
 needlefish is [Base](https://base.org), the Ethereum L2, rewritten from scratch in Zig: execution
-client, rollup consensus node, batcher, and tooling, with zero dependencies.
+client, rollup consensus node, block builder, batcher, and tooling, with zero dependencies.
+L2 blocks are full blocks at Base's native 200 ms subsecond cadence; there are no flashblocks.
 
 It is a ground-up port of the public [base/base](https://github.com/base/base) repository and
 keeps its layout, so every crate there has an obvious home here.
@@ -44,6 +45,7 @@ keeps its layout, so every crate there has an obvious home here.
 | Execution node | `src/execution/{chainspec,txpool,payload,engine,node}` | block executor, txpool, payload builder, Engine API, `eth_` RPC, L1 dev mode | in progress |
 | Consensus node | `src/consensus` | protocol types, derivation pipeline, engine driver, sequencer | in progress |
 | P2P | `src/consensus/p2p` | discv5, libp2p (noise, multiplexing), gossipsub, peer scoring | in progress |
+| Block builder | `src/builder` | regular block builder for native 200 ms blocks, Engine API payload jobs | in progress |
 | Batcher | `src/batcher` | channels, frames, compression, span batches, blobs, submission | in progress |
 | Simulator | `src/testing` | cluster simulator, swarm runs, seed minimization, fuzz targets, benches | in progress |
 | Proofs | `src/proof` | fault-proof program, preimage oracle, proposer, challenger | planned |
@@ -99,8 +101,8 @@ just devnet reset    # wipe .devnet/ and start fresh
 | L2 verifier EL | `base node` | http 10545, engine 10551 |
 | L2 verifier CL | `base consensus` | rpc 8547 |
 
-L1 is chain 900 with 2 s blocks; L2 is chain 901 with 1 s blocks and every hardfork active at
-genesis. Prefunded accounts come from the public dev mnemonic
+L1 is chain 900 with 2 s blocks; L2 is chain 901 with native 200 ms blocks and every hardfork
+active at genesis. Prefunded accounts come from the public dev mnemonic
 `test test test test test test test test test test test junk`. Everything the devnet writes,
 including the generated JWT secret, stays in the git-ignored `.devnet/` directory.
 [docs/DEVNET.md](docs/DEVNET.md) has the full process contract, flags, and smoke test.

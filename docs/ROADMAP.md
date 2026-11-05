@@ -7,8 +7,8 @@ L2 sequencer + batcher + verifier and `just devnet smoke` passes.
 Phase 2 lanes (spawn when a phase-1 lane finishes):
 - **p2p**: discv5, libp2p (noise, yamux/mplex, multistream), gossipsub for unsafe
   blocks, peer scoring (`crates/consensus/{disc,gossip,peers}`).
-- **flashblocks-builder**: flashblocks types, websocket feed, builder/multiplexer
-  (`crates/builder`, `crates/common/flashblocks`, `crates/execution/flashblocks*`).
+- **builder**: regular block builder at native 200 ms subsecond blocks (no flashblocks;
+  `crates/builder/core` non-flashblocks parts, `crates/execution/payload`).
 - **proof**: fault-proof program (client/host/preimage oracle), MPT proofs, executor,
   proposer, challenger (`crates/proof/*`).
 - **infra-tools**: basectl, websocket-proxy, roxy, load tester, balance monitor,
