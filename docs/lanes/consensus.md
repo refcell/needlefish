@@ -10,7 +10,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
   - [x] rollup config + hardfork activation, system config + L1 log updates
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
-  - [ ] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian)
+  - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
   - [ ] batch validity rules (singular, span, Holocene)
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
 - [ ] `derive`: pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
@@ -36,6 +36,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - Zig 0.17 has no array `**` operator: use `@splat`.
 
 ## Log
+- 2026-11-05: L1 info deposit (4 formats, base/base vectors), fork selection, blob fee.
 - 2026-11-05: user deposits, deposit tx 2718 encoding (base/base vectors), source hashes.
 - 2026-11-05: rollup config (upgrades, features, Denim schedule), system config updates.
 - 2026-11-05: protocol frames, channels, block info with seeded + std fuzz tests.

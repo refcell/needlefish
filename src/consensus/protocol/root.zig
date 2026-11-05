@@ -10,6 +10,7 @@ pub const rollup_config = @import("rollup_config.zig");
 pub const system_config = @import("system_config.zig");
 pub const log = @import("log.zig");
 pub const deposits = @import("deposits.zig");
+pub const l1_info = @import("l1_info.zig");
 
 pub const BlockId = block.BlockId;
 pub const BlockInfo = block.BlockInfo;
@@ -22,6 +23,7 @@ pub const Upgrade = rollup_config.Upgrade;
 pub const Feature = rollup_config.Feature;
 pub const SystemConfig = system_config.SystemConfig;
 pub const DepositTx = deposits.DepositTx;
+pub const L1BlockInfo = l1_info.L1BlockInfo;
 
 test {
     std.testing.refAllDecls(@This());
