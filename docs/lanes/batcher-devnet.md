@@ -23,7 +23,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
 - [x] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
 - [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
-- [ ] `batcher/source`: EIP-7702 (type 4) transactions.
+- [x] `batcher/source`: EIP-7702 (type 4) transactions.
 - [x] `batcher/service` + `base batcher`: step loop (heads, load, frames, txmgr), calldata DA.
 - [x] `batcher/service`: safe-head stall watchdog (resubmit from safe+1; covers timed-out channels).
 - [ ] `base batcher`: metrics endpoint, blob DA.
@@ -87,3 +87,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: safe-head stall watchdog instead of per-channel inclusion tracking (decision below).
 - 2026-11-05: in-process genesis hashes for rollup.json (anvil is no reference: it skips the
   genesis state root).
+- 2026-11-05: block source handles EIP-7702 txs (authorization list rebuilt, hash-checked).

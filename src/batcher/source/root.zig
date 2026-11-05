@@ -164,6 +164,24 @@ pub const Decoder = struct {
                 .input = input,
                 .access_list = try decoder.access_list(tx),
             }, .signature = try typed_signature(tx) } },
+            4 => return .{ .eip7702 = .{ .tx = .{
+                .chain_id = try rpc.quantity(u64, try rpc.field(tx, "chainId")),
+                .nonce = nonce,
+                .max_priority_fee_per_gas = try rpc.quantity(
+                    u128,
+                    try rpc.field(tx, "maxPriorityFeePerGas"),
+                ),
+                .max_fee_per_gas = try rpc.quantity(u128, try rpc.field(tx, "maxFeePerGas")),
+                .gas_limit = gas_limit,
+                .to = switch (to) {
+                    .call => |address| address,
+                    .create => return error.MalformedResponse,
+                },
+                .value = value,
+                .input = input,
+                .access_list = try decoder.access_list(tx),
+                .authorization_list = try authorization_list(decoder, tx),
+            }, .signature = try typed_signature(tx) } },
             else => return error.UnsupportedTxType,
         }
     }
@@ -172,7 +190,8 @@ pub const Decoder = struct {
     fn access_list(decoder: *Decoder, tx: json.Value) Error!consensus.AccessList {
         const list = (tx.object.get("accessList")) orelse return .empty;
         if (list != .array) return error.MalformedResponse;
-        var encoder = rlp.Encoder.init(decoder.access_list_scratch);
+        const half = decoder.access_list_scratch.len / 2;
+        var encoder = rlp.Encoder.init(decoder.access_list_scratch[0..half]);
         var addresses: u32 = 0;
         var keys_total: u32 = 0;
         for (list.array.items) |item| {
@@ -195,6 +214,37 @@ pub const Decoder = struct {
         };
     }
 };
+
+/// Rebuilds the RLP payload of the JSON `authorizationList` (EIP-7702) into the second
+/// half of the scratch memory (the access list uses the first).
+fn authorization_list(decoder: *Decoder, tx: json.Value) Error!consensus.AuthorizationList {
+    const list = try rpc.field(tx, "authorizationList");
+    if (list != .array) return error.MalformedResponse;
+    const half = decoder.access_list_scratch.len / 2;
+    var encoder = rlp.Encoder.init(decoder.access_list_scratch[half..]);
+    for (list.array.items) |item| {
+        const chain_id = try rpc.quantity(u256, try rpc.field(item, "chainId"));
+        const address = try rpc.fixed(20, try rpc.field(item, "address"));
+        const nonce = try rpc.quantity(u64, try rpc.field(item, "nonce"));
+        const y_parity = try rpc.quantity(u8, try rpc.field(item, "yParity"));
+        const r = try rpc.quantity(u256, try rpc.field(item, "r"));
+        const s = try rpc.quantity(u256, try rpc.field(item, "s"));
+        const payload = rlp.int_length(chain_id) + 21 + rlp.int_length(nonce) +
+            rlp.int_length(y_parity) + rlp.int_length(r) + rlp.int_length(s);
+        if (encoder.remaining() < rlp.list_length(payload)) return error.BlockTooLarge;
+        encoder.list_header(payload);
+        encoder.int(chain_id);
+        encoder.bytes(&address);
+        encoder.int(nonce);
+        encoder.int(y_parity);
+        encoder.int(r);
+        encoder.int(s);
+    }
+    const result = consensus.AuthorizationList.from_payload(encoder.written()) catch
+        return error.MalformedResponse;
+    assert(result.count == list.array.items.len);
+    return result;
+}
 
 fn rlp_list_length(payload_length: usize) usize {
     return rlp.list_length(payload_length);
@@ -359,4 +409,79 @@ test "source: decodes a block with an L1 info deposit, a 1559 and a legacy tx" {
         defer value.deinit();
         _ = decoder.decode(value.value) catch continue;
     }
+}
+
+test "source: rebuilds an EIP-7702 transaction with its authorization list" {
+    const user = accounts.derive_dev(1);
+    const authorizations = [_]consensus.Authorization{
+        .{
+            .chain_id = 901,
+            .address = .{
+                .bytes = @splat(0x44),
+            },
+            .nonce = 3,
+            .y_parity = 1,
+            .r = 7,
+            .s = 9,
+        },
+        .{ .chain_id = 0, .address = .{
+            .bytes = @splat(0x55),
+        }, .nonce = 0, .y_parity = 0, .r = 1, .s = 2 },
+    };
+    var list_buffer: [512]u8 = undefined;
+    var envelope: consensus.Envelope = .{ .eip7702 = .{ .tx = .{
+        .chain_id = 901,
+        .nonce = 4,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 300,
+        .gas_limit = 80_000,
+        .to = .{ .bytes = @splat(0x66) },
+        .value = 0,
+        .input = &.{0x01},
+        .access_list = .empty,
+        .authorization_list = consensus.AuthorizationList.build(&list_buffer, &authorizations),
+    }, .signature = .{ .y_parity = false, .r = 1, .s = 1 } } };
+    envelope.eip7702.signature = try consensus.signature.sign(
+        user.private_key,
+        envelope.signing_hash().?,
+    );
+    const tx = envelope.eip7702.tx;
+    const signature = envelope.eip7702.signature;
+    var text: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&text);
+    try w.print("{{\"type\":\"0x4\",\"chainId\":\"0x{x}\",\"maxPriorityFeePerGas\":\"0x2\",", .{
+        tx.chain_id,
+    });
+    try w.print("\"maxFeePerGas\":\"0x{x}\",", .{tx.max_fee_per_gas});
+    try w.print("\"to\":\"0x{x}\",", .{&tx.to.bytes});
+    try w.writeAll("\"accessList\":[],\"authorizationList\":[");
+    for (authorizations, 0..) |item, index| {
+        if (index > 0) try w.writeAll(",");
+        try w.print("{{\"chainId\":\"0x{x}\",\"address\":\"0x{x}\",\"nonce\":\"0x{x}\",", .{
+            item.chain_id,
+            &item.address.bytes,
+            item.nonce,
+        });
+        try w.print("\"yParity\":\"0x{x}\",\"r\":\"0x{x}\",\"s\":\"0x{x}\"}}", .{
+            item.y_parity,
+            item.r,
+            item.s,
+        });
+    }
+    try w.print("],\"yParity\":\"0x{x}\",", .{@intFromBool(signature.y_parity)});
+    try write_common(&w, tx.nonce, tx.gas_limit, tx.value, tx.input);
+    try w.print("\"r\":\"0x{x}\",\"s\":\"0x{x}\",", .{ signature.r, signature.s });
+    try w.print("\"hash\":\"0x{x}\"}}", .{&envelope.hash().bytes});
+
+    const parsed = try json.parseFromSlice(json.Value, testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    var decoder = try Decoder.init(testing.allocator, .{
+        .tx_count_max = 2,
+        .tx_bytes_max = 2048,
+        .input_bytes_max = 2048,
+    });
+    defer decoder.deinit(testing.allocator);
+    const encoded = try decoder.encode_transaction(parsed.value, 4);
+    var expected: [1024]u8 = undefined;
+    try testing.expectEqualSlices(u8, envelope.encode_to(&expected), encoded);
 }
