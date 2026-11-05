@@ -373,6 +373,29 @@ pub const StateTrie = struct {
         try self.accounts.visit_siblings_in(self.accounts.root, &address_hash, visitor);
     }
 
+    /// The account trie nodes of many keys in one walk (`TrieType.visit_paths_in`).
+    pub fn visit_account_paths(
+        self: *StateTrie,
+        targets: []const trie_module.PathTarget,
+        visitor: anytype,
+    ) !void {
+        try self.flush();
+        assert(self.dirty_len == 0);
+        try self.accounts.visit_paths_in(self.accounts.root, targets, visitor);
+    }
+
+    /// The nodes of many slots of the account's storage trie in one walk; nothing when the
+    /// account has no storage (as `prove_storage`).
+    pub fn visit_storage_paths(
+        self: *StateTrie,
+        address_hash: Hash,
+        targets: []const trie_module.PathTarget,
+        visitor: anytype,
+    ) !void {
+        const entry = self.entries.getPtr(address_hash) orelse return;
+        try self.storage.visit_paths_in(entry.storage_root, targets, visitor);
+    }
+
     /// Hashed siblings along a slot's path in the account's storage trie.
     pub fn visit_storage_siblings(
         self: *StateTrie,

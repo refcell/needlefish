@@ -8,6 +8,7 @@
 //! - `ordered`: transactions, receipts, and withdrawals roots.
 //! - `state_trie`: account and storage tries with an incremental state root.
 //! - `sparse`: sparse trie over witness preimages, for stateless updates.
+//! - `path_targets`: sorted key paths for multi-key walks (witness proofs in one descent).
 
 const std = @import("std");
 
@@ -20,6 +21,7 @@ pub const proof = @import("proof.zig");
 pub const ordered = @import("ordered.zig");
 pub const state_trie = @import("state_trie.zig");
 pub const sparse = @import("sparse.zig");
+pub const path_targets = @import("path_targets.zig");
 pub const bench = @import("bench.zig");
 
 pub const Nibbles = nibbles.Nibbles;
@@ -34,6 +36,7 @@ pub const ordered_trie_root = ordered.ordered_trie_root;
 pub const StateTrie = state_trie.StateTrie;
 pub const Account = state_trie.Account;
 pub const SparseTrie = sparse.SparseTrie;
+pub const PathTarget = path_targets.PathTarget;
 
 test {
     std.testing.refAllDecls(@This());

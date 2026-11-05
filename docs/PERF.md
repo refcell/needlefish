@@ -151,7 +151,8 @@ contracts, one SLOAD + SSTORE each) through the real evm. Bytes = canonical
 | 200 evm SLOAD+SSTORE calls | 1 484 | 391 701 | 1 | 611 | 4.4 ms | 0.38 + 0.51 + 1.25 ms |
 
 "build" = `Builder.build` (proofs of every touched key, deleted keys' siblings, replay on
-its scratch sparse state, witness copy-out). "load + replay" = `SparseState.reset` +
+its scratch sparse state, witness copy-out); this table is the original builder, see
+"2026-11-05 db witness builder: sorted multi-key walk" below for the current numbers. "load + replay" = `SparseState.reset` +
 `load` (decoded witness) + `witness.replay` (reads + changeset, root checked against the
 builder's).
 
@@ -180,6 +181,41 @@ Takeaways:
   account-only block.
 - Codec: encode sorts by keccak256 of every item (~400 ns per node), decode re-hashes every
   item for the strict order check; both ~0.5-0.75 GB/s, small next to build.
+
+## 2026-11-05 db witness builder: sorted multi-key walk (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+Same bench and blocks as "db witness" above (`zig build bench -Doptimize=ReleaseFast --
+db/witness`), two runs (medians of 11 each). `Builder.build` now collects candidate nodes in
+one depth-first walk per trie over the touched keys sorted by hashed path (each node visited
+once with its cached hash: no per-key proof, re-encoding, or keccak per node), pre-marks read
+keys' proof nodes instead of replaying the reads, and applies only the changeset on the
+scratch sparse trie. "unverified" = `build_with(.., .{ .verify_root = false })`: no post-root,
+and blocks without deletions (all three here) skip the sparse apply. Witnesses are unchanged:
+the same node counts and encoded bytes as before (and byte-equal to the old collection in
+`db/witness_differential_test.zig`).
+
+| Block | build before | build after | unverified | apply (full state) |
+| --- | ---: | ---: | ---: | ---: |
+| 1k account writes | 7.8 ms | 3.2-3.3 ms | 0.63-0.71 ms | |
+| 1k acct + 4k slot writes | 36.9 ms | 15.8-16.0 ms | 4.6-4.7 ms | 8.2 ms |
+| 200 evm SLOAD+SSTORE calls | 4.0 ms | 2.2-2.3 ms | 0.40-0.45 ms | |
+
+"before" = the same machine just before the change (run-to-run spread ~15%; the table above
+recorded 30.7 ms for the storage-heavy build). The verifier's `witness.replay` also got
+cheaper (16.8 -> 9.9 ms storage-heavy, 1.48 -> 1.10 ms 1k-account): materializing a child of a
+decoded branch now skips to its RLP item instead of decoding all seventeen.
+
+Profile of the storage-heavy build before (temporary timers, per build): per-key proofs
+14.2 ms, sparse reads replay 5.9 ms, sparse changeset apply 5.3 ms, post-root 2.8 ms, rest
+< 0.2 ms. After: account walk ~1.4 ms, storage walks ~3.2 ms (mostly keccak of 5k keys and
+cache misses on ~1k storage tries), sparse apply ~9 ms (it now also resolves the nodes the
+reads replay used to), post-root ~2.6 ms.
+
+Takeaways:
+- The verified build is ~2x the full-state apply (16 vs 8.2 ms), down from 4.5x; the rest
+  is the sparse apply (node resolution, RLP decode, per-write keccak of slot and address
+  keys) and its root. Next: pass the walk's hashed keys into the apply and batch-hash keys.
+- Collection alone (unverified, no deletions) is ~0.6x the full-state apply.
 
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 

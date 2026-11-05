@@ -1156,6 +1156,156 @@ pub const Store = struct {
         _ = try self.walk_path(owner, account.storage_root, slot_hash, number, sink);
     }
 
+    /// The account trie nodes at block `number` of many keys in one walk
+    /// (`StateTrie.visit_account_paths`).
+    pub fn visit_account_paths(
+        self: *const Store,
+        number: u64,
+        targets: []const trie.PathTarget,
+        sink: anytype,
+    ) !void {
+        const root = try self.state_root_at(number);
+        try self.walk_paths(null, root, targets, number, sink);
+    }
+
+    /// The storage trie nodes at block `number` of many slots of one account in one walk;
+    /// nothing when the account is absent (`StateTrie.visit_storage_paths`).
+    pub fn visit_storage_paths(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        targets: []const trie.PathTarget,
+        sink: anytype,
+    ) !void {
+        const account = try self.account_at(number, address_hash) orelse return;
+        const owner: ?Hash = address_hash.*;
+        try self.walk_paths(owner, account.storage_root, targets, number, sink);
+    }
+
+    /// `TrieType.visit_paths_in` on the trie of `owner` at block `number`: one depth-first
+    /// walk visiting each proof node of every target (and siblings of `siblings` targets)
+    /// once, as `sink.visit(hash, bytes, marked)`. Hashes are the parents' references, which
+    /// `checked_node` verified.
+    fn walk_paths(
+        self: *const Store,
+        owner: ?Hash,
+        root: Hash,
+        targets: []const trie.PathTarget,
+        number: u64,
+        sink: anytype,
+    ) !void {
+        assert(trie.path_targets.sorted(targets));
+        if (std.mem.eql(u8, &root, &trie.empty_root) or targets.len == 0) return;
+        var stack: [trie.path_targets.stack_frames_max]PathFrame = undefined;
+        const end: u32 = @intCast(targets.len);
+        stack[0] = .{ .reference = .{ .hash = root }, .start = 0, .end = end, .consumed = 0 };
+        var stack_len: u32 = 1;
+        var visited: u64 = 0;
+        while (stack_len > 0) : (visited += 1) {
+            // At most one frame per path node of each target.
+            assert(visited <= targets.len * (path_nibbles_max + 1));
+            stack_len -= 1;
+            const frame = stack[stack_len];
+            const range = targets[frame.start..frame.end];
+            assert(range.len > 0 and frame.consumed <= path_nibbles_max);
+            const prefix = trie.Nibbles.from_bytes(&range[0].path);
+            const path = prefix.slice()[0..frame.consumed];
+            const bytes = try self.checked_node(owner, path, number, frame.reference);
+            if (frame.consumed == 0 or bytes.len >= 32) {
+                assert(frame.reference == .hash);
+                const marked = trie.path_targets.any_mark(range);
+                try sink.visit(&frame.reference.hash, bytes, marked);
+            }
+            const view = node_view(bytes) catch return error.HistoryCorrupt;
+            const off_path = view == .branch and frame.consumed < path_nibbles_max and
+                trie.path_targets.any_siblings(range);
+            if (off_path) try self.visit_off_path(owner, number, &view.branch, frame, range, sink);
+            stack_len = push_children(&view, frame, targets, &stack, stack_len);
+        }
+    }
+
+    /// Pushes the frames of `view`'s children that targets enter (branch children last
+    /// nibble first, so they pop in nibble order). Returns the new stack length.
+    fn push_children(
+        view: *const NodeView,
+        frame: PathFrame,
+        targets: []const trie.PathTarget,
+        stack: *[trie.path_targets.stack_frames_max]PathFrame,
+        stack_len: u32,
+    ) u32 {
+        switch (view.*) {
+            .leaf => return stack_len,
+            .extension => |*extension| {
+                const path = &extension.path;
+                var start = frame.start;
+                while (start < frame.end and
+                    !extends(&targets[start], frame.consumed, path)) start += 1;
+                var end = start;
+                while (end < frame.end and extends(&targets[end], frame.consumed, path)) end += 1;
+                if (start == end) return stack_len;
+                assert(stack_len < stack.len);
+                const length: u32 = @intCast(path.slice().len);
+                stack[stack_len] = .{
+                    .reference = extension.child,
+                    .start = start,
+                    .end = end,
+                    .consumed = frame.consumed + length,
+                };
+                return stack_len + 1;
+            },
+            .branch => |*children| {
+                if (frame.consumed == path_nibbles_max) return stack_len;
+                const range = targets[frame.start..frame.end];
+                var length = stack_len;
+                var end: u32 = @intCast(range.len);
+                while (end > 0) {
+                    const start = trie.path_targets.group_start(range, end, frame.consumed);
+                    const nibble = trie.path_targets.nibble(&range[start], frame.consumed);
+                    if (children[nibble]) |child| {
+                        assert(length < stack.len);
+                        stack[length] = .{
+                            .reference = child,
+                            .start = frame.start + start,
+                            .end = frame.start + end,
+                            .consumed = frame.consumed + 1,
+                        };
+                        length += 1;
+                    }
+                    end = start;
+                }
+                assert(length <= stack_len + 16);
+                return length;
+            },
+        }
+    }
+
+    /// Visits the hashed children of a branch that no target of `range` takes.
+    fn visit_off_path(
+        self: *const Store,
+        owner: ?Hash,
+        number: u64,
+        children: *const [16]?Reference,
+        frame: PathFrame,
+        range: []const trie.PathTarget,
+        sink: anytype,
+    ) !void {
+        assert(frame.consumed < path_nibbles_max);
+        const taken = trie.path_targets.taken_mask(range, frame.consumed);
+        const prefix = trie.Nibbles.from_bytes(&range[0].path);
+        var child_path: [path_nibbles_max]u8 = undefined;
+        @memcpy(child_path[0..frame.consumed], prefix.slice()[0..frame.consumed]);
+        for (children, 0..) |reference, nibble| {
+            if (taken & (@as(u16, 1) << @intCast(nibble)) != 0) continue;
+            const child = reference orelse continue;
+            if (child != .hash) continue;
+            child_path[frame.consumed] = @intCast(nibble);
+            const path = child_path[0 .. frame.consumed + 1];
+            const bytes = try self.checked_node(owner, path, number, child);
+            assert(bytes.len >= 32);
+            try sink.visit(&child.hash, bytes, false);
+        }
+    }
+
     /// Visits the hashed siblings along `address_hash`'s path in the account trie at
     /// block `number` (`StateTrie.visit_account_siblings`).
     pub fn visit_account_siblings(
@@ -1183,6 +1333,41 @@ pub const Store = struct {
     }
 };
 
+/// A node of `Store.walk_paths` (by its parent's reference) and the targets entering it.
+const PathFrame = struct { reference: Reference, start: u32, end: u32, consumed: u32 };
+
+/// The children of one decoded trie node (`Store.walk_paths`).
+const NodeView = union(enum) {
+    leaf,
+    extension: struct { path: trie.Nibbles, child: Reference },
+    branch: [16]?Reference,
+};
+
+/// Decodes a node strictly enough to walk it (`step_node`'s rules, all children at once).
+fn node_view(bytes: []const u8) StepError!NodeView {
+    const outer = try rlp.decode_item(bytes);
+    if (outer.kind != .list or outer.encoded_length != bytes.len) return error.InvalidNode;
+    var items: [17]rlp.Item = undefined;
+    const count = rlp.decode_list(outer.payload, &items) catch return error.InvalidNode;
+    if (count == 17) {
+        if (items[16].kind != .string) return error.InvalidNode;
+        var children: [16]?Reference = undefined;
+        for (items[0..16], &children) |item, *child| child.* = try child_reference(item);
+        return .{ .branch = children };
+    }
+    if (count != 2 or items[0].kind != .string) return error.InvalidNode;
+    const decoded = nibbles_module.hex_prefix_decode(items[0].payload) catch {
+        return error.InvalidNode;
+    };
+    if (decoded.leaf) {
+        if (items[1].kind != .string or items[1].payload.len == 0) return error.InvalidNode;
+        return .leaf;
+    }
+    if (decoded.path.slice().len == 0) return error.InvalidNode;
+    const child = try child_reference(items[1]) orelse return error.InvalidNode;
+    return .{ .extension = .{ .path = decoded.path, .child = child } };
+}
+
 fn append_node(proof: anytype, bytes: []const u8) void {
     assert(proof.count < proof.ends.len);
     const start = if (proof.count == 0) 0 else proof.ends[proof.count - 1];
@@ -1207,6 +1392,17 @@ fn ProofSink(comptime ProofPointer: type) type {
 const NullSink = struct {
     pub fn visit(_: NullSink, _: []const u8) error{}!void {}
 };
+
+/// Whether `target`'s path continues with `path` after its first `consumed` nibbles.
+fn extends(target: *const trie.PathTarget, consumed: u32, path: *const trie.Nibbles) bool {
+    const nibbles = path.slice();
+    if (consumed + nibbles.len > path_nibbles_max) return false;
+    for (nibbles, 0..) |value, offset| {
+        const at: u32 = consumed + @as(u32, @intCast(offset));
+        if (trie.path_targets.nibble(target, at) != value) return false;
+    }
+    return true;
+}
 
 const Reference = union(enum) {
     hash: Hash,

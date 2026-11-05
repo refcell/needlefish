@@ -40,6 +40,7 @@ test {
     _ = @import("chain_test.zig");
     _ = @import("history_test.zig");
     _ = @import("witness_test.zig");
+    _ = @import("witness_differential_test.zig");
     _ = @import("witness_evm_test.zig");
     _ = @import("witness_block_test.zig");
     _ = @import("witness_codec_test.zig");

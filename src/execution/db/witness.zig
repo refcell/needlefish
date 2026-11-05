@@ -16,10 +16,11 @@
 //! (`trie/sparse.zig`) to get the post-state root.
 //!
 //! The builder gathers a superset first (proofs of every touched key, plus the hashed
-//! siblings along deleted keys' paths, which a collapsing branch merges into its parent),
-//! then replays the block on a `SparseState` over that superset and keeps only the nodes
-//! the replay decoded. So the witness is minimal for this replay: dropping any node makes
-//! the same replay fail with `WitnessIncomplete`.
+//! siblings along deleted keys' paths, which a collapsing branch merges into its parent), in
+//! one sorted multi-key walk per trie. Read keys' proof nodes are kept (a sparse read decodes
+//! exactly those); the changeset is applied on a `SparseState` over the superset and the
+//! nodes it decodes are kept too. So the witness is minimal for `replay`: dropping any node
+//! makes the same replay fail with `WitnessIncomplete`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -355,6 +356,36 @@ pub const NodeStore = struct {
         self.index.putAssumeCapacityNoClobber(hash, self.count);
         self.count += 1;
         return hash;
+    }
+
+    /// `add` for a preimage whose keccak256 the caller already knows (a trie's cached
+    /// reference, or one verified on the way). `accessed` pre-marks it as decoded (OR-ed
+    /// into an existing entry).
+    fn add_hashed(
+        self: *NodeStore,
+        hash: *const Hash,
+        bytes: []const u8,
+        accessed: bool,
+    ) error{WitnessFull}!void {
+        if (self.index.getPtr(hash.*)) |position| {
+            assert(position.* < self.count);
+            self.entries[position.*].accessed = self.entries[position.*].accessed or accessed;
+            return;
+        }
+        if (self.count == self.entries.len) return error.WitnessFull;
+        if (bytes.len > self.arena.len - self.arena_len) return error.WitnessFull;
+        const offset = self.arena_len;
+        @memcpy(self.arena[offset..][0..bytes.len], bytes);
+        self.arena_len += @intCast(bytes.len);
+        self.entries[self.count] = .{
+            .hash = hash.*,
+            .offset = offset,
+            .len = @intCast(bytes.len),
+            .accessed = accessed,
+        };
+        self.index.putAssumeCapacityNoClobber(hash.*, self.count);
+        self.count += 1;
+        assert(self.index.count() == self.count);
     }
 
     fn bytes_of(self: *const NodeStore, entry: *const Entry) []const u8 {
@@ -941,8 +972,36 @@ pub const SparseState = struct {
     }
 };
 
+/// Options of `Builder.build_with`.
+pub const BuildOptions = struct {
+    /// Apply the changeset on the scratch sparse trie and return the post-state root it
+    /// computes from the witness alone (callers compare it with the block's root: a wrong
+    /// witness or changeset fails there). Without it the root is not computed (null), and a
+    /// block without deletions skips the sparse apply entirely: its witness is then exactly
+    /// the proof nodes of the touched keys. The witness is the same either way. On by
+    /// default; node and rpc paths keep it on, benchmarks turn it off to measure collection.
+    verify_root: bool = true,
+};
+
+/// A storage slot target: the account's trie and the slot's path in it.
+const StorageTarget = struct { address_hash: Hash, target: trie.PathTarget };
+
+fn storage_target_less(_: void, a: StorageTarget, b: StorageTarget) bool {
+    return switch (std.mem.order(u8, &a.address_hash, &b.address_hash)) {
+        .lt => true,
+        .gt => false,
+        .eq => trie.path_targets.order(&a.target, &b.target) == .lt,
+    };
+}
+
 /// Builds witnesses from a pre-state `State`. Owns its scratch (a sparse state over the
-/// candidate nodes, a key set, and proof buffers), allocated once at init.
+/// candidate nodes, a key set, sorted key paths, and proof buffers), allocated once at init.
+///
+/// Candidate nodes come from one sorted multi-key walk per trie (`TrieType.visit_paths_in`,
+/// `history.Store` walks): every proof node of a touched key and every hashed sibling along a
+/// deleted key's path, each visited once with its hash (no per-key proof, re-encoding, or
+/// re-hashing). Nodes on read keys' paths are marked as decoded up front (a sparse read
+/// decodes exactly its proof nodes), so only the changeset is applied on the sparse trie.
 pub const Builder = struct {
     pub const Config = struct {
         /// Candidate nodes and bytes: proofs of every touched key plus deleted keys' siblings.
@@ -954,6 +1013,11 @@ pub const Builder = struct {
     touched: KeySet,
     account_proof: *trie.StateTrie.AccountProof,
     storage_proof: *trie.StateTrie.StorageProof,
+    /// Reads plus changeset accounts (twice the key limit: both may list every key).
+    account_targets: []trie.PathTarget,
+    /// Reads plus changeset slots, then one account's slot paths at a time.
+    storage_targets: []StorageTarget,
+    storage_paths: []trie.PathTarget,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Builder {
         var scratch = try SparseState.init(allocator, config.sparse);
@@ -963,15 +1027,29 @@ pub const Builder = struct {
         const account_proof = try lazy.create(allocator, trie.StateTrie.AccountProof);
         errdefer lazy.destroy(allocator, account_proof);
         const storage_proof = try lazy.create(allocator, trie.StateTrie.StorageProof);
+        errdefer lazy.destroy(allocator, storage_proof);
+        const accounts_max = 2 * config.keys.accounts_max;
+        const slots_max = 2 * config.keys.slots_max;
+        const account_targets = try lazy.alloc(allocator, trie.PathTarget, accounts_max);
+        errdefer lazy.free(allocator, account_targets);
+        const storage_targets = try lazy.alloc(allocator, StorageTarget, slots_max);
+        errdefer lazy.free(allocator, storage_targets);
+        const storage_paths = try lazy.alloc(allocator, trie.PathTarget, slots_max);
         return .{
             .scratch = scratch,
             .touched = touched,
             .account_proof = account_proof,
             .storage_proof = storage_proof,
+            .account_targets = account_targets,
+            .storage_targets = storage_targets,
+            .storage_paths = storage_paths,
         };
     }
 
     pub fn deinit(self: *Builder, allocator: std.mem.Allocator) void {
+        lazy.free(allocator, self.storage_paths);
+        lazy.free(allocator, self.storage_targets);
+        lazy.free(allocator, self.account_targets);
         lazy.destroy(allocator, self.storage_proof);
         lazy.destroy(allocator, self.account_proof);
         self.touched.deinit(allocator);
@@ -1002,8 +1080,8 @@ pub const Builder = struct {
         };
     }
 
-    /// `build` over any pre-state node source (`StateSource`, `HistorySource`): proofs of
-    /// every touched key, hashed siblings along deleted keys, and codes by hash.
+    /// `build` over any pre-state node source (`StateSource`, `HistorySource`), with the
+    /// post-state root verified (`BuildOptions.verify_root`).
     pub fn build_from(
         self: *Builder,
         source: anytype,
@@ -1012,6 +1090,21 @@ pub const Builder = struct {
         headers: []const []const u8,
         out: *Witness,
     ) !Hash {
+        const root = try self.build_with(source, reads, changeset, headers, out, .{});
+        // `verify_root` always computes the root.
+        return root orelse unreachable;
+    }
+
+    /// `build_from` with `options`: the post-state root, or null when not verified.
+    pub fn build_with(
+        self: *Builder,
+        source: anytype,
+        reads: *const KeySet,
+        changeset: *const Changeset,
+        headers: []const []const u8,
+        out: *Witness,
+        options: BuildOptions,
+    ) !?Hash {
         const pre_root = try source.pre_root();
         out.clear();
         self.touched.clear();
@@ -1021,14 +1114,25 @@ pub const Builder = struct {
             try self.touched.add_slot(change.address, change.slot);
         }
         self.scratch.clear(pre_root);
-        try self.collect_proofs(source);
-        try self.collect_siblings(source, changeset);
-        try replay(&self.scratch, reads, changeset);
-        const post_root = self.scratch.state_root();
+        try self.collect_accounts(source, reads, changeset);
+        try self.collect_storage(source, reads, changeset);
+        const apply = options.verify_root or has_deletions(changeset);
+        var post_root: ?Hash = null;
+        if (apply) {
+            try self.scratch.apply(changeset);
+            if (options.verify_root) post_root = self.scratch.state_root();
+        }
         const nodes = self.scratch.nodes;
         for (nodes.entries[0..nodes.count]) |*entry| {
-            if (entry.accessed) try out.state.append(nodes.bytes_of(entry));
+            if (entry.accessed or !apply) try out.state.append(nodes.bytes_of(entry));
         }
+        try self.copy_out(source, headers, out);
+        assert(options.verify_root == (post_root != null));
+        return post_root;
+    }
+
+    /// Codes by hash, key preimages, and headers.
+    fn copy_out(self: *Builder, source: anytype, headers: []const []const u8, out: *Witness) !void {
         for (self.touched.codes.slice()) |hash| {
             if (std.mem.eql(u8, &hash, &node.empty_code_hash)) continue;
             try out.codes.append(source.code_by_hash(hash) orelse return error.UnknownCode);
@@ -1041,42 +1145,112 @@ pub const Builder = struct {
         }
         for (headers) |header| try out.headers.append(header);
         assert(out.keys.count == self.touched.accounts.len + self.touched.slots.len);
-        return post_root;
     }
 
+    /// Adds walked nodes to the scratch store; marked nodes count as decoded.
     const Collector = struct {
         store: *NodeStore,
 
-        pub fn visit(self: Collector, bytes: []const u8) error{WitnessFull}!void {
-            _ = try self.store.add(bytes);
+        pub fn visit(
+            self: Collector,
+            hash: *const Hash,
+            bytes: []const u8,
+            marked: bool,
+        ) error{WitnessFull}!void {
+            try self.store.add_hashed(hash, bytes, marked);
         }
     };
 
-    fn collect_proofs(self: *Builder, source: anytype) !void {
-        const collector: Collector = .{ .store = self.scratch.nodes };
-        for (self.touched.accounts.slice()) |*address| {
-            try source.visit_account_proof(&node.keccak256(address), collector);
+    /// One walk of the account trie: every touched account (reads, a prefix of `touched`,
+    /// marked) and the siblings of destroyed ones.
+    fn collect_accounts(
+        self: *Builder,
+        source: anytype,
+        reads: *const KeySet,
+        changeset: *const Changeset,
+    ) !void {
+        const touched = self.touched.accounts.slice();
+        const targets = self.account_targets;
+        assert(touched.len <= targets.len / 2 and reads.accounts.len <= touched.len);
+        for (touched, targets[0..touched.len], 0..) |*address, *target, index| {
+            assert(index >= reads.accounts.len or
+                std.mem.eql(u8, address, &reads.accounts.items[index]));
+            target.* = .{ .path = node.keccak256(address), .mark = index < reads.accounts.len };
         }
-        for (self.touched.slots.slice()) |*key| {
-            const address_hash = node.keccak256(&key.address);
-            try source.visit_storage_proof(&address_hash, &slot_hash_of(key.slot), collector);
-        }
-    }
-
-    fn collect_siblings(self: *Builder, source: anytype, changeset: *const Changeset) !void {
-        const collector: Collector = .{ .store = self.scratch.nodes };
+        var count: u32 = @intCast(touched.len);
         for (changeset.account_changes()) |*change| {
             if (change.new != null) continue;
-            try source.visit_account_siblings(&node.keccak256(&change.address), collector);
+            if (count == targets.len) return error.KeysFull;
+            targets[count] = .{ .path = node.keccak256(&change.address), .siblings = true };
+            count += 1;
         }
+        const unique = trie.path_targets.sort_unique(targets[0..count]);
+        assert(unique == touched.len);
+        const collector: Collector = .{ .store = self.scratch.nodes };
+        try source.visit_account_paths(targets[0..unique], collector);
+    }
+
+    /// One walk per touched storage trie: every touched slot (reads, a prefix of `touched`,
+    /// marked) and the siblings of deleted ones.
+    fn collect_storage(
+        self: *Builder,
+        source: anytype,
+        reads: *const KeySet,
+        changeset: *const Changeset,
+    ) !void {
+        const touched = self.touched.slots.slice();
+        const targets = self.storage_targets;
+        assert(touched.len <= targets.len / 2 and reads.slots.len <= touched.len);
+        // Slots of one account usually come together: hash each run's address once.
+        var run_address: Address = undefined;
+        var run_hash: Hash = undefined;
+        for (touched, targets[0..touched.len], 0..) |*key, *target, index| {
+            if (index == 0 or !std.mem.eql(u8, &key.address, &run_address)) {
+                run_address = key.address;
+                run_hash = node.keccak256(&run_address);
+            }
+            target.* = .{
+                .address_hash = run_hash,
+                .target = .{ .path = slot_hash_of(key.slot), .mark = index < reads.slots.len },
+            };
+        }
+        var count: u32 = @intCast(touched.len);
         for (changeset.storage_changes()) |*change| {
             if (change.new != 0) continue;
-            const address_hash = node.keccak256(&change.address);
-            const slot_hash = slot_hash_of(change.slot);
-            try source.visit_storage_siblings(&address_hash, &slot_hash, collector);
+            if (count == targets.len) return error.KeysFull;
+            targets[count] = .{
+                .address_hash = node.keccak256(&change.address),
+                .target = .{ .path = slot_hash_of(change.slot), .siblings = true },
+            };
+            count += 1;
+        }
+        std.sort.pdq(StorageTarget, targets[0..count], {}, storage_target_less);
+        const collector: Collector = .{ .store = self.scratch.nodes };
+        var start: u32 = 0;
+        while (start < count) {
+            const address_hash = &targets[start].address_hash;
+            var end = start;
+            var unique: u32 = 0;
+            while (end < count and std.mem.eql(u8, &targets[end].address_hash, address_hash)) {
+                self.storage_paths[unique] = targets[end].target;
+                unique += 1;
+                end += 1;
+            }
+            unique = trie.path_targets.sort_unique(self.storage_paths[0..unique]);
+            try source.visit_storage_paths(address_hash, self.storage_paths[0..unique], collector);
+            assert(end > start);
+            start = end;
         }
     }
 };
+
+/// A changeset that deletes an account or a slot (a delete can collapse a branch, which
+/// only a sparse apply resolves exactly).
+fn has_deletions(changeset: *const Changeset) bool {
+    for (changeset.account_changes()) |*change| if (change.new == null) return true;
+    for (changeset.storage_changes()) |*change| if (change.new == 0) return true;
+    return false;
+}
 
 /// Witness nodes from the live trie of a pre-state `State` (`Builder.state_source`).
 pub const StateSource = struct {
@@ -1111,6 +1285,23 @@ pub const StateSource = struct {
         for (0..self.storage_proof.count) |index| {
             try visitor.visit(self.storage_proof.node_at(@intCast(index)));
         }
+    }
+
+    pub fn visit_account_paths(
+        self: StateSource,
+        targets: []const trie.PathTarget,
+        visitor: anytype,
+    ) !void {
+        try self.state.state_trie.visit_account_paths(targets, visitor);
+    }
+
+    pub fn visit_storage_paths(
+        self: StateSource,
+        address_hash: *const Hash,
+        targets: []const trie.PathTarget,
+        visitor: anytype,
+    ) !void {
+        try self.state.state_trie.visit_storage_paths(address_hash.*, targets, visitor);
     }
 
     pub fn visit_account_siblings(
@@ -1161,6 +1352,23 @@ pub const HistorySource = struct {
         visitor: anytype,
     ) !void {
         try self.store.visit_storage_proof(self.number, address_hash, slot_hash, visitor);
+    }
+
+    pub fn visit_account_paths(
+        self: HistorySource,
+        targets: []const trie.PathTarget,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_account_paths(self.number, targets, visitor);
+    }
+
+    pub fn visit_storage_paths(
+        self: HistorySource,
+        address_hash: *const Hash,
+        targets: []const trie.PathTarget,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_storage_paths(self.number, address_hash, targets, visitor);
     }
 
     pub fn visit_account_siblings(

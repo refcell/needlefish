@@ -74,9 +74,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] `SparseState.reset` / `SparseTrie.clear` is O(pool capacity): ~370 us per reset for a
   104k-node pool, paid by every `Builder.build` and verifier load. Clear only used nodes
   (or track a high-water mark).
-- [ ] `Builder.build` is 4-5x a full-state block apply (30.7 vs 8.2 ms storage-heavy): proves
+- [x] `Builder.build` is 4-5x a full-state block apply (30.7 vs 8.2 ms storage-heavy): proves
   every key separately, then replays on a sparse trie. Share proof walks (sorted keys, one
   descent) or build the witness from the full trie's dirty-path walk.
+  (sorted multi-key walk, see the next item)
 - [ ] (blocked: base/base commits no reth witness fixtures and running reth is out of scope)
   Byte-compare our `debug_executionWitness` against reth's output for public fixture blocks;
   revisit when public fixtures exist. Meanwhile: the `witness-diff` port below.
@@ -95,9 +96,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   and head; consider generating from the history store instead (no state disturbance).
   (`witness_block.Generator.generate_history` / `database_witness_history`, preferred by
   `database_witness`; `witness.HistorySource`; history walks in `history.Store`)
-- [ ] Faster `witness.Builder.build`: 4-5x the cost of applying the block (30.7 vs 8.2 ms on
+- [x] Faster `witness.Builder.build`: 4-5x the cost of applying the block (30.7 vs 8.2 ms on
   the storage-heavy block); collect proof nodes in one sorted multi-key trie walk instead of
   one proof per key, and skip the sparse replay when the caller does not need the root.
+  (`trie/path_targets.zig`, `TrieType.visit_paths_in`, `history.Store.walk_paths`,
+  `Builder.build_with` + `BuildOptions.verify_root`; storage-heavy build 36.9 -> 15.8-16.0 ms
+  verified, 4.6-4.7 ms unverified; byte-identical witnesses checked against the old
+  collection by `db/witness_differential_test.zig`; docs/PERF.md "db witness")
+- [ ] Witness build with `verify_root` is now dominated by the sparse apply (~9 ms of 16 on
+  the storage-heavy block: node resolution + RLP decode + per-write keccak of slot and
+  address keys) and the post-root (~2.6 ms). Pass the hashed keys the walk already computed
+  into the apply, and batch-hash keys with `keccak256_batch`.
 - [x] Witness responses over 1 MiB: the storage-heavy witness is 1.28 MB binary (2.6 MB hex);
   size the rpc response buffer for witnesses or stream the JSON.
   (shared lazy large send buffers in `http.server` (`Options.large_send_buffers_max/size`,
@@ -405,6 +414,22 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   bodies at 1 MiB). Bounds: tool limits 512Ki nodes/keys, 16Ki codes, 1 GiB input, 1 MiB
   per item, lazily committed; walk bounded by `leaves_max`, `walk_steps_max`, and a
   fixed DFS stack (`stack_frames_max`), truncation reported.
+- Witness builder collection (`Builder.build_with`): one depth-first walk per trie over the
+  touched keys sorted by hashed path (`path_targets.sort_unique`, flags OR-ed: `mark` = read,
+  `siblings` = deleted). Each proof node and each hashed sibling of a deleted key's branch is
+  visited once with its hash (live trie: the cached `RlpNode`; history: the parent reference
+  `checked_node` verified), so nothing is re-encoded or re-hashed per key; the node store
+  still deduplicates by hash (identical nodes across storage tries). Read keys' proof nodes
+  are pre-marked "decoded" instead of replaying the reads, because a sparse `get` resolves
+  exactly its key's proof nodes. `BuildOptions.verify_root` (default on; `build`/
+  `build_from` and the node/rpc paths use it) applies the changeset on the scratch sparse
+  trie and returns its root; off returns null, and a changeset with no deleted account or
+  slot then skips the sparse apply (a put resolves its whole proof path, so the witness is
+  exactly the touched keys' proof nodes); deletions still run the apply, since only it knows
+  which collapsing branch needs which sibling. The witness is the same set either way;
+  `Witness.state` order is now walk order (codec encoding sorts by hash, so encoded bytes
+  are unchanged). The old per-key collection lives on as the reference in
+  `db/witness_differential_test.zig`.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -583,3 +608,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   parent-bound `SparseState`, re-executes with the node executor, root == header. With the
   pool disabled (the old 1 MiB path), too small, or busy with a concurrent witness: -32000
   "witness too large"; the buffer is released and serves the next witness. ~0.1 s in Debug.
+- 2026-11-05: witness builder: sorted multi-key proof walk for live and history sources,
+  read paths pre-marked, `BuildOptions.verify_root`, cheaper sparse child materialization
+  (skip to one RLP item). Storage-heavy build 36.9 -> 15.9 ms (4.6 ms unverified), 1k-account
+  7.8 -> 3.2 ms (0.63-0.71 ms), evm block 4.0 -> 2.2 ms (0.40-0.45 ms); witnesses
+  byte-identical (differential test vs the old collection on random states, both sources).

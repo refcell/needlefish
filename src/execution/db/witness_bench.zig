@@ -10,7 +10,8 @@
 //! - 200 calls from distinct senders to distinct contracts through the real evm.
 //! Per block it reports the witness shape (state nodes, canonical encoded bytes, codes,
 //! keys) and medians of: reads/execution over the plain backend vs through
-//! `witness.Recorder` (the recorder's overhead), `Builder.build`, codec encode/decode,
+//! `witness.Recorder` (the recorder's overhead), `Builder.build` (root verified) and
+//! `Builder.build_with` with `verify_root = false` (same witness), codec encode/decode,
 //! `SparseState` load + `witness.replay`, and (evm block) stateless re-execution.
 //!
 //! Benchmark scaffolding: fixtures come from the page allocator, sized from the shape.
@@ -66,6 +67,7 @@ const Metric = enum(u8) {
     reads_plain,
     reads_recorded,
     build,
+    build_unverified,
     builder_reset,
     reset,
     encode,
@@ -376,6 +378,8 @@ fn measure_sample(
     );
     clock = lap(io, report, .build, sample, clock);
     report.builder_trie_used = trie_used(&fixture.builder.scratch);
+    try measure_unverified(io, fixture, report, sample);
+    clock = bench.now_ns(io);
     // `build` starts with this reset; timed alone to show its share (O(pool capacity)).
     fixture.builder.scratch.reset(fixture.pre_root, no_headers_parent);
     clock = lap(io, report, .builder_reset, sample, clock);
@@ -407,6 +411,25 @@ fn measure_sample(
     report.codes = fixture.built.codes.count;
     report.keys = fixture.built.keys.count;
     report.encoded_bytes = @intCast(size);
+}
+
+/// `Builder.build_with` without root verification; must give the witness `build` gave.
+fn measure_unverified(io: std.Io, fixture: *Fixture, report: *Report, sample: u32) !void {
+    const nodes = fixture.built.state.count;
+    const source = fixture.builder.state_source(&fixture.state);
+    const options: witness.BuildOptions = .{ .verify_root = false };
+    const clock = bench.now_ns(io);
+    const unverified = try fixture.builder.build_with(
+        source,
+        &fixture.recorder.keys,
+        &fixture.changeset,
+        &.{},
+        &fixture.built,
+        options,
+    );
+    _ = lap(io, report, .build_unverified, sample, clock);
+    assert(unverified == null);
+    if (fixture.built.state.count != nodes) return error.WitnessMismatch;
 }
 
 fn trie_used(sparse: *const witness.SparseState) u32 {
@@ -451,6 +474,9 @@ fn print_report(name: []const u8, report: *Report) void {
     });
     std.debug.print("  {s:<38} {d:>10.1} us (+ recorder {d:.1} us, scratch reset {d:.1} us)\n", .{
         "Builder.build", build, recorded - plain, report.median_us(.builder_reset),
+    });
+    std.debug.print("  {s:<38} {d:>10.1} us\n", .{
+        "Builder.build_with verify_root=false", report.median_us(.build_unverified),
     });
     std.debug.print("  {s:<38} {d:>10.1} us / {d:.1} us / {d:.1} us\n", .{
         "SparseState reset / load / replay",

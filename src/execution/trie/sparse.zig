@@ -255,12 +255,28 @@ pub const SparseTrie = struct {
         assert(current.kind == .branch or current.kind == .extension);
         const index = current.body.children[nibble];
         if (index != unloaded) return index;
-        // The source decoded when the node was resolved, and decoding is deterministic.
-        const decoded = decode_node(current.source) catch unreachable;
-        assert(decoded.children[nibble].len > 0);
-        const created = try self.alloc_unresolved(decoded.children[nibble]);
+        const ref = source_child(current.source, if (current.kind == .branch) nibble else 1);
+        assert(ref.len > 0);
+        const created = try self.alloc_unresolved(ref);
         current.body.children[nibble] = created;
         return created;
+    }
+
+    /// The reference in list item `item_index` of `source`, a preimage that `decode_node`
+    /// accepted when its node was resolved (so every step below succeeds). Skips to the one
+    /// item instead of decoding all seventeen.
+    fn source_child(source: []const u8, item_index: u8) RlpNode {
+        assert(item_index < 16);
+        // `resolve` decoded this exact preimage strictly; decoding is deterministic.
+        const outer = rlp.decode_item(source) catch unreachable;
+        var rest = outer.payload;
+        var index: u8 = 0;
+        while (index < item_index) : (index += 1) {
+            const skipped = rlp.decode_item(rest) catch unreachable;
+            rest = rest[@intCast(skipped.encoded_length)..];
+        }
+        const item = rlp.decode_item(rest) catch unreachable;
+        return decode_child(item) catch unreachable;
     }
 
     /// Checks the fixed-key-length shape of a resolved node `rest_len` nibbles above the end.

@@ -18,6 +18,8 @@ const node = @import("node.zig");
 const rlp = @import("rlp.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
 const nibbles_module = @import("nibbles.zig");
+const path_targets = @import("path_targets.zig");
+pub const PathTarget = path_targets.PathTarget;
 const Nibbles = nibbles_module.Nibbles;
 const RlpNode = node.RlpNode;
 const Hash = node.Hash;
@@ -1189,6 +1191,145 @@ pub fn TrieType(comptime config: Config) type {
                     },
                 }
             }
+        }
+
+        /// A node of `visit_paths_in` and the range of targets whose paths enter it.
+        const PathFrame = struct { index: NodeIndex, start: u32, end: u32, consumed: u32 };
+
+        /// One walk for many keys: visits, once each, the nodes `prove_in` returns for every
+        /// target plus, for targets with `siblings`, the nodes `visit_siblings_in` visits.
+        /// Calls `visitor.visit(hash, encoding, marked)` with the node's hash (its cached
+        /// reference; the root is hashed even when short) and whether it lies on a `mark`
+        /// target's path (siblings never are). `targets` must be sorted and unique
+        /// (`path_targets.sort_unique`). Depth first, children in nibble order.
+        pub fn visit_paths_in(
+            self: *Self,
+            root: NodeIndex,
+            targets: []const PathTarget,
+            visitor: anytype,
+        ) !void {
+            comptime assert(config.key_bytes_max == 32);
+            assert(path_targets.sorted(targets));
+            if (root == none or targets.len == 0) return;
+            _ = self.root_hash_of(root);
+            var stack: [path_targets.stack_frames_max]PathFrame = undefined;
+            stack[0] = .{ .index = root, .start = 0, .end = @intCast(targets.len), .consumed = 0 };
+            var stack_len: u32 = 1;
+            var buffer: [node_bytes_max]u8 = undefined;
+            var visited: u64 = 0;
+            while (stack_len > 0) : (visited += 1) {
+                // A walk enters each node of the trie at most once.
+                assert(visited < self.nodes.len);
+                stack_len -= 1;
+                const frame = stack[stack_len];
+                const range = targets[frame.start..frame.end];
+                assert(range.len > 0 and frame.consumed <= path_max);
+                const current = &self.nodes[frame.index];
+                const reference = &self.cache[frame.index];
+                if (frame.consumed == 0 or reference.is_hash()) {
+                    const hash = reference.root_hash();
+                    const encoding = self.encode_full(current, &buffer);
+                    try visitor.visit(&hash, encoding, path_targets.any_mark(range));
+                }
+                switch (current.kind) {
+                    .free => unreachable, // Reachable nodes are never on the free list.
+                    .leaf => {},
+                    .extension => {
+                        stack_len = self.push_extension(&stack, stack_len, frame, targets);
+                    },
+                    .branch => {
+                        if (frame.consumed == path_max) continue;
+                        if (path_targets.any_siblings(range)) {
+                            try self.visit_off_path(current, frame, range, visitor, &buffer);
+                        }
+                        stack_len = self.push_branch(&stack, stack_len, frame, targets);
+                    },
+                }
+            }
+        }
+
+        /// Visits the hashed children of `current` (a branch) that no target of `range` takes.
+        fn visit_off_path(
+            self: *Self,
+            current: *const Node,
+            frame: PathFrame,
+            range: []const PathTarget,
+            visitor: anytype,
+            buffer: *[node_bytes_max]u8,
+        ) !void {
+            assert(current.kind == .branch);
+            const taken = path_targets.taken_mask(range, frame.consumed);
+            for (current.body.branch[0..16], 0..) |child, nibble| {
+                if (child == none) continue;
+                if (taken & (@as(u16, 1) << @intCast(nibble)) != 0) continue;
+                const reference = &self.cache[child];
+                assert(reference.len > 0);
+                if (!reference.is_hash()) continue;
+                const hash: Hash = reference.bytes[1..33].*;
+                try visitor.visit(&hash, self.encode_full(&self.nodes[child], buffer), false);
+            }
+        }
+
+        /// Pushes one frame per present child of `frame`'s branch that targets take, last
+        /// nibble first (so they pop in nibble order). Returns the new stack length.
+        fn push_branch(
+            self: *const Self,
+            stack: *[path_targets.stack_frames_max]PathFrame,
+            stack_len: u32,
+            frame: PathFrame,
+            targets: []const PathTarget,
+        ) u32 {
+            const current = &self.nodes[frame.index];
+            assert(current.kind == .branch and frame.consumed < path_max);
+            const range = targets[frame.start..frame.end];
+            var length = stack_len;
+            var end: u32 = @intCast(range.len);
+            while (end > 0) {
+                const start = path_targets.group_start(range, end, frame.consumed);
+                const nibble = path_targets.nibble(&range[start], frame.consumed);
+                const child = current.body.branch[nibble];
+                if (child != none) {
+                    assert(length < stack.len);
+                    stack[length] = .{
+                        .index = child,
+                        .start = frame.start + start,
+                        .end = frame.start + end,
+                        .consumed = frame.consumed + 1,
+                    };
+                    length += 1;
+                }
+                end = start;
+            }
+            assert(length <= stack_len + 16);
+            return length;
+        }
+
+        /// Pushes the extension's child with the targets whose paths run through the whole
+        /// extension path (contiguous: targets are sorted). Returns the new stack length.
+        fn push_extension(
+            self: *const Self,
+            stack: *[path_targets.stack_frames_max]PathFrame,
+            stack_len: u32,
+            frame: PathFrame,
+            targets: []const PathTarget,
+        ) u32 {
+            const current = &self.nodes[frame.index];
+            assert(current.kind == .extension and current.path_len > 0);
+            var start = frame.start;
+            while (start < frame.end and
+                !current.path_prefixes_key(&targets[start].path, frame.consumed)) start += 1;
+            var end = start;
+            while (end < frame.end and
+                current.path_prefixes_key(&targets[end].path, frame.consumed)) end += 1;
+            if (start == end) return stack_len;
+            assert(stack_len < stack.len);
+            stack[stack_len] = .{
+                .index = current.body.extension.child,
+                .start = start,
+                .end = end,
+                .consumed = frame.consumed + current.path_len,
+            };
+            return stack_len + 1;
         }
     };
 }
