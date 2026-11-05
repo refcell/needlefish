@@ -47,6 +47,8 @@ Read this whole file before you change anything. These rules are not optional.
    Edit other lanes' files only for tiny integration fixes (build breaks, a missing
    `pub`). Shared files (`build.zig`, `src/base.zig`, `src/*/root.zig`, `Justfile`,
    `README.md`) take small, additive edits; resolve rebase conflicts by keeping both.
+9. **Never write `.github/workflows/`** — the push token lacks workflow scope and the push is
+   rejected. CI lives in `etc/ci/ci.yml`.
 
 ## Style: TigerStyle (see docs/TIGER_STYLE.md)
 
