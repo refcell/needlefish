@@ -135,8 +135,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Linux io_uring run of the storage engine: run `IoStorage` engine/database tests under
   `just test-linux` (Docker) and fix any backend differences (fsync vs fdatasync, short
   writes); record results.
-- [ ] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
+- [x] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
   hit/miss latency on 100k accounts and the overlay read path; compare with trie `get`.
+  (`db/read_bench.zig`, `-- db/read`; docs/PERF.md "db reads")
+- [ ] evm backend `basic` hit costs ~330 ns (vs 17 ns for `State.basic`): it keccaks the
+  address on every hit only to answer `has_storage` from `StateTrie`. Keep a has-storage
+  flag (or slot count) per account in `State` so the vtable read stays a table lookup.
 - [ ] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
   sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
 
@@ -699,3 +703,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   slots 3.40 -> 2.37 ms (4 threads), db/block 8.05 -> 6.87 ms, db/commit sim cpu p50
   ~8.2 -> ~6.9 ms (medians, load 25-60 on 14 cores). Seeded differential (caches, roots,
   change marks; threads 3-4 vs 0, incl. deletions, wipes, early flushes) and a fuzz.
+- 2026-11-05: read-path bench (`db/read_bench.zig`): flat-table reads 14-41 ns, the
+  vtable adds ~1-3 ns except `basic` hits (+~310 ns keccak for `has_storage`, backlog);
+  `StateTrie` reads are dominated by keying keccak (300 / 450 ns vs 23 / 34 ns prehashed).

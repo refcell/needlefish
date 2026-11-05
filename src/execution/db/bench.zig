@@ -32,6 +32,8 @@ const Prng = @import("../../testing/prng.zig").Prng;
 
 /// Witness size and build-time benchmarks (`witness_bench.zig`), run by `bench_main.zig`.
 pub const witness = @import("witness_bench.zig");
+/// Read-path benchmarks (`read_bench.zig`), run by `bench_main.zig`.
+pub const read = @import("read_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -674,6 +676,7 @@ fn delete_scratch(io: std.Io) void {
 
 test {
     _ = witness;
+    _ = read;
 }
 
 test "bench: cases are well formed" {

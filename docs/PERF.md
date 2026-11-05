@@ -247,6 +247,44 @@ Takeaways:
   reads hashed for the walk) made the unverified build 30% slower (6.0-6.4 ms) because reads
   repeat the written keys; hashing `touched` once and looking up changeset entries fixed it.
 
+## 2026-11-05 db reads (aarch64-macos, Apple M4 Pro, 48 GB, ReleaseFast, 34023ca8)
+
+`zig build bench -Doptimize=ReleaseFast -- db/read` (`db/read_bench.zig`, ~4 s after the
+fixture; whole `db/` run ~15 s). State = the db bench state (100k accounts, 1k contracts x 64
+slots) plus 1k 64-byte codes; the overlay holds one uncommitted measured block (1k accounts,
+4k slots). Each case reads 65 536 random keys from a seeded `Prng`; median of 15 passes,
+ns/op. The machine was heavily loaded (load average ~35-46 from other jobs): the table gives
+the best of 5 runs and the range; keccak-bound rows swing the most.
+
+| Read | best | range | notes |
+| --- | ---: | ---: | --- |
+| `State.basic` hit / miss | 17.0 / 19.8 | 17-56 / 20-22 | one `AutoHashMap` probe |
+| `State.storage` hit | 29.2 | 29-42 | 52-byte key |
+| `State.storage` miss, account exists / absent | 19.8 / 20.0 | 20-21 / 20-21 | |
+| `State.code_by_hash` hit | 14.2 | 14-16 | |
+| vtable `basic` hit / miss | 326 / 22.4 | 326-829 / 22-39 | hit keccaks the address |
+| vtable `storage` hit | 28.8 | 29-65 | |
+| vtable `storage` miss, account exists / absent | 21.8 / 21.7 | 22-27 / 22-23 | |
+| vtable `code_by_hash` hit | 15.5 | 15-38 | |
+| `Overlay.basic` in overlay / fall-through | 8.4 / 21.5 | 8-9 / 21-41 | 1k-entry map, then State |
+| `Overlay.storage` in overlay / fall-through | 21.4 / 52.8 | 21-58 / 53-139 | fall-through = 3 probes |
+| `StateTrie.get_account` prehashed / +keccak | 23.3 / 300 | 23-71 / 300-758 | by-hash entry map |
+| account trie walk (`accounts.get`) prehashed | 26.3 | 26-59 | real path walk |
+| `StateTrie.get_storage` prehashed / +2 keccak | 34.2 / 449 | 34-109 / 449-1144 | storage trie walk |
+
+Takeaways:
+- Flat tables vs trie: the trie walk itself is cheap at this size (account walk 26 ns vs
+  17 ns for `State.basic`, storage walk 34 ns vs 29 ns; the working set is mostly
+  cache-resident), but a trie read needs keccak of its keys first: 300 ns per account and
+  450 ns per slot here. The flat tables keyed by raw address/slot are what make reads cheap.
+- The vtable indirection costs ~1-3 ns per call (storage, code, misses): noise. `basic` hits
+  are the exception: `evm_backend.basic` keccaks the address to answer `has_storage` from
+  `StateTrie`, ~310 ns extra per account load (19x a table read). Lane backlog item.
+- Overlay reads: a key in the overlay is as cheap as State or cheaper (small map); a miss
+  costs the overlay probe on top of State (basic +4 ns; storage ~+20 ns because it probes the
+  account map and the slot map before falling through).
+- Misses are as cheap as hits (no negative-lookup penalty in the open-addressing tables).
+
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `TrieType` nodes keep only what their kind needs: a packed path (2 nibbles per byte, stored in
