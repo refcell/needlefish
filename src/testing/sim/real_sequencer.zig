@@ -37,6 +37,7 @@ const Prng = @import("../prng.zig").Prng;
 const codec = @import("codec.zig");
 const nodes = @import("nodes.zig");
 const real_verifier = @import("real_verifier.zig");
+const real_execution = @import("real_execution.zig");
 
 const B256 = protocol.block.Hash;
 const L2BlockInfo = protocol.block.L2BlockInfo;
@@ -64,12 +65,17 @@ pub const RealSequencer = struct {
     driver: Driver,
     restarts: u32 = 0,
     gossiped: u64 = 0,
+    block_count_max: u64,
+    /// Real execution: the execution lane's engine (with a txpool) replaces `engine`.
+    exec: ?*real_execution.ExecEngine = null,
+    exec_client: real_execution.Client = undefined,
 
     /// Heap-allocated: the driver keeps pointers to the rollup config and safe db.
     pub fn create(
         allocator: std.mem.Allocator,
         block_count_max: u64,
         seed: u64,
+        execution: real_execution.Execution,
     ) !*RealSequencer {
         const sequencer = try allocator.create(RealSequencer);
         errdefer allocator.destroy(sequencer);
@@ -80,13 +86,19 @@ pub const RealSequencer = struct {
             .client = undefined,
             .safe_db = undefined,
             .driver = undefined,
+            .block_count_max = block_count_max,
         };
         errdefer sequencer.engine.deinit(allocator);
         sequencer.engine.pool = Prng.init(seed ^ 0x706f_6f6c);
-        sequencer.client = .{
-            .engine = &sequencer.engine,
-            .prng = Prng.init(seed ^ 0x7365_7175_656e_6365),
-        };
+        const client_prng = Prng.init(seed ^ 0x7365_7175_656e_6365);
+        sequencer.client = .{ .engine = &sequencer.engine, .prng = client_prng };
+        if (execution == .real) {
+            const exec = try real_execution.ExecEngine.create(allocator, seed, .sequencer);
+            sequencer.exec = exec;
+            sequencer.exec_client = .{ .engine = exec, .prng = client_prng };
+            sequencer.rollup = real_execution.rollup_config(exec.genesis_hash);
+        }
+        errdefer if (sequencer.exec) |exec| exec.destroy();
         try sequencer.start();
         assert(sequencer.driver.phase == .starting);
         assert(sequencer.driver.sequencer_active);
@@ -97,6 +109,7 @@ pub const RealSequencer = struct {
         const allocator = sequencer.allocator;
         sequencer.stop();
         sequencer.engine.deinit(allocator);
+        if (sequencer.exec) |exec| exec.destroy();
         allocator.destroy(sequencer);
     }
 
@@ -119,13 +132,19 @@ pub const RealSequencer = struct {
 
     /// Crash-restart: driver state is lost; the engine keeps its chain, and on a disk
     /// fault loses its last label update (`lose_unflushed` with no blocks lost).
+    /// With real execution, the execution db keeps every block (its writes land) and a disk
+    /// fault loses the last label update only.
     pub fn restart(sequencer: *RealSequencer, disk_fault: bool) !void {
-        const head = sequencer.engine.head();
+        const head = sequencer.engine_head();
         sequencer.stop();
-        if (disk_fault) sequencer.engine.lose_unflushed(0);
+        if (sequencer.exec) |exec| {
+            try exec.restart(if (disk_fault) .labels else .none);
+        } else if (disk_fault) sequencer.engine.lose_unflushed(0);
         try sequencer.start();
         sequencer.restarts += 1;
-        assert(sequencer.engine.head() == head);
+        // Real execution may recover a built, never gossiped payload as its head.
+        assert(sequencer.engine_head() == head or
+            (sequencer.exec != null and sequencer.engine_head() == head + 1));
         assert(sequencer.driver.phase == .starting);
     }
 
@@ -153,9 +172,26 @@ pub const RealSequencer = struct {
             .l1_head = if (view.l1_reachable) l1.info(confirmed) else null,
             .l1_finalized = if (view.l1_reachable) l1.info(confirmed) else null,
         };
-        const capacity = sequencer.engine.blocks.len - 1;
-        const now_ms_max = codec.rollup.l2_block_timestamp_ms(capacity);
-        sequencer.driver.tick(providers, @min(view.now_ns / std.time.ns_per_ms, now_ms_max));
+        const now_ms_max = codec.rollup.l2_block_timestamp_ms(sequencer.block_count_max);
+        const now_ms = @min(view.now_ns / std.time.ns_per_ms, now_ms_max);
+        if (sequencer.exec) |exec| {
+            exec.tick();
+            const exec_providers: real_verifier.ExecProviders = .{
+                .l1 = l1,
+                .blobs = l1,
+                .l2 = exec,
+                .engine = &sequencer.exec_client,
+                .l1_head = providers.l1_head,
+                .l1_finalized = providers.l1_finalized,
+            };
+            return sequencer.driver.tick(exec_providers, now_ms);
+        }
+        sequencer.driver.tick(providers, now_ms);
+    }
+
+    pub fn engine_head(sequencer: *const RealSequencer) u64 {
+        if (sequencer.exec) |exec| return exec.head_number();
+        return sequencer.engine.head();
     }
 
     pub fn safe_number(sequencer: *const RealSequencer) u64 {
@@ -170,8 +206,9 @@ pub const RealSequencer = struct {
         chain: *nodes.Sequencer,
         l1: *const nodes.L1,
     ) ?[]const u8 {
-        const engine = &sequencer.engine;
         if (sequencer.driver.stats.critical_errors != 0) return "real sequencer critical error";
+        if (sequencer.exec) |exec| return record_executed(exec, chain, l1);
+        const engine = &sequencer.engine;
         // Rewritten blocks at or below the recorded head must be the recorded ones.
         var number = engine.written_low;
         while (number <= @min(chain.head, engine.head())) : (number += 1) {
@@ -186,7 +223,8 @@ pub const RealSequencer = struct {
             number = chain.head + 1;
             assert(number <= chain.chain.capacity());
             const block = &engine.blocks[number];
-            if (check_block(block, chain, l1)) |reason| return reason;
+            const transactions = SimEngine.slices(block, &engine.read_slices);
+            if (check_block(block.info, transactions, chain, l1)) |reason| return reason;
             const payload = codec.payload_from_tx(block.transaction(1)).?;
             const hash = chain.chain.put(number, payload);
             if (!block.info.block_info.hash.eql(codec.word_hash(hash))) {
@@ -204,21 +242,57 @@ pub const RealSequencer = struct {
         return null;
     }
 
+    /// Real execution: the engine's canonical blocks above the recorded head are checked
+    /// like the sim engine's and recorded with their real hash and state root.
+    fn record_executed(
+        exec: *real_execution.ExecEngine,
+        chain: *nodes.Sequencer,
+        l1: *const nodes.L1,
+    ) ?[]const u8 {
+        assert(chain.chain.real);
+        // The recorded head still canonical implies its whole prefix is (parent hashes).
+        const recorded = exec.canonical_hash(chain.head) orelse
+            return "real sequencer unsafe head went back";
+        if (!recorded.eql(chain.chain.real_hashes[chain.head])) return "real sequencer equivocated";
+        while (chain.head < exec.head_number()) {
+            const number = chain.head + 1;
+            assert(number <= chain.chain.capacity());
+            const hash = exec.canonical_hash(number).?;
+            var transactions: [real_execution.block_transactions_max][]const u8 = undefined;
+            const payload = exec.payload_of(hash, &transactions).?;
+            const info = exec.block_info(number) orelse
+                return "real sequencer block without an L1 info deposit";
+            if (check_block(info, payload.transactions, chain, l1)) |reason| return reason;
+            _ = chain.chain.put(number, codec.payload_from_tx(payload.transactions[1]).?);
+            chain.chain.real_hashes[number] = hash;
+            chain.chain.real_state_roots[number] = payload.state_root;
+            const origin = info.l1_origin;
+            chain.chain.origins[number] = .{
+                .number = origin.number,
+                .hash = low_word(origin.hash).?,
+                .sequence_number = info.sequence_number,
+            };
+            chain.head = number;
+        }
+        assert(chain.head == exec.head_number());
+        return null;
+    }
+
     /// The model sequencer's guarantees for block `chain.head + 1`.
     fn check_block(
-        block: *const real_verifier.Block,
+        info: L2BlockInfo,
+        transactions: []const []const u8,
         chain: *const nodes.Sequencer,
         l1: *const nodes.L1,
     ) ?[]const u8 {
-        const info = block.info;
         const number = info.block_info.number;
         assert(number == chain.head + 1);
-        if (block.tx_count != 2) return "real sequencer block without one user tx";
-        const deposit = block.transaction(0);
+        if (transactions.len != 2) return "real sequencer block without one user tx";
+        const deposit = transactions[0];
         if (deposit.len == 0 or deposit[0] != deposit_tx_type) {
             return "real sequencer block does not start with the L1 info deposit";
         }
-        if (codec.payload_from_tx(block.transaction(1)) == null) {
+        if (codec.payload_from_tx(transactions[1]) == null) {
             return "real sequencer block without one user tx";
         }
         const parent_time = codec.rollup.l2_block_timestamp(number - 1);
@@ -262,8 +336,14 @@ pub const RealSequencer = struct {
         const number = payload.block_number;
         if (number == 0 or number > chain.head) return error.GossipDiverged;
         if (payload.transactions.len != 2) return error.GossipDiverged;
-        const hash = low_word(payload.block_hash) orelse return error.GossipDiverged;
-        if (hash != chain.chain.hashes[number]) return error.GossipDiverged;
+        if (chain.chain.real) {
+            if (!payload.block_hash.eql(chain.chain.real_hashes[number])) {
+                return error.GossipDiverged;
+            }
+        } else if (low_word(payload.block_hash) != chain.chain.hashes[number]) {
+            return error.GossipDiverged;
+        }
+        const hash = chain.chain.hashes[number];
         const user = codec.payload_from_tx(payload.transactions[1]) orelse
             return error.GossipDiverged;
         if (user != chain.chain.payloads[number]) return error.GossipDiverged;

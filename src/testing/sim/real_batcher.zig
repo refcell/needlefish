@@ -204,20 +204,24 @@ const Backend = struct {
         const encoded = info.encode_calldata(&calldata);
         var payload: [8]u8 = undefined;
         std.mem.writeInt(u64, &payload, chain.payloads[number], .big);
-        const envelope = codec.payload_envelope(&payload);
+        const envelope = switch (chain.tx_format()) {
+            .model => codec.payload_envelope(&payload),
+            .signed => codec.payload_envelope_signed(&payload),
+        };
         const tx = envelope.eip1559.tx;
+        const signature = envelope.eip1559.signature;
         try out.print("\"result\":{{\"number\":\"0x{x}\",\"hash\":\"0x{x}\"," ++
             "\"parentHash\":\"0x{x}\",\"timestamp\":\"0x{x}\",\"transactions\":[", .{
             number,
-            &codec.word_hash(chain.hashes[number]).bytes,
-            &codec.word_hash(chain.hashes[number - 1]).bytes,
+            &chain.batch_hash(number).bytes,
+            &chain.batch_hash(number - 1).bytes,
             number * codec.l2_block_time_s,
         });
         try out.print("{{\"type\":\"0x7e\",\"input\":\"0x{x}\"}},", .{encoded});
         try out.print("{{\"type\":\"0x2\",\"chainId\":\"0x{x}\",\"nonce\":\"0x0\"," ++
             "\"gas\":\"0x{x}\",\"value\":\"0x0\",\"to\":\"0x{x}\",\"input\":\"0x{x}\"," ++
             "\"maxPriorityFeePerGas\":\"0x{x}\",\"maxFeePerGas\":\"0x{x}\"," ++
-            "\"accessList\":[],\"yParity\":\"0x0\",\"r\":\"0x1\",\"s\":\"0x1\"," ++
+            "\"accessList\":[],\"yParity\":\"0x{x}\",\"r\":\"0x{x}\",\"s\":\"0x{x}\"," ++
             "\"hash\":\"0x{x}\"}}]}}", .{
             tx.chain_id,
             tx.gas_limit,
@@ -225,6 +229,9 @@ const Backend = struct {
             &payload,
             tx.max_priority_fee_per_gas,
             tx.max_fee_per_gas,
+            @intFromBool(signature.y_parity),
+            signature.r,
+            signature.s,
             &envelope.hash().bytes,
         });
     }

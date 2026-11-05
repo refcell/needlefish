@@ -144,11 +144,50 @@ pub fn payload_envelope(payload: *const [8]u8) tx_module.Envelope {
 }
 
 pub fn payload_tx(payload: u64, out: *[payload_tx_length_max]u8) []u8 {
+    return payload_tx_as(.model, payload, out);
+}
+
+/// How payload transactions are signed. `model` carries placeholder signature values;
+/// `signed` (real execution, `real_execution.zig`) is a real signature by a key derived
+/// from the payload, so every payload has its own sender at nonce 0. Its fees are zero:
+/// the simulated L2 keeps a zero base fee, so an unfunded sender's transaction executes.
+pub const TxFormat = enum { model, signed };
+
+/// Intrinsic gas of a `signed` payload transaction: 21000 plus 16 per nonzero input byte.
+pub const signed_gas_limit = 21_000 + 8 * 16;
+
+pub fn payload_tx_as(format: TxFormat, payload: u64, out: *[payload_tx_length_max]u8) []u8 {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, payload, .big);
-    const encoded = payload_envelope(&bytes).encode_to(out);
+    const envelope = switch (format) {
+        .model => payload_envelope(&bytes),
+        .signed => payload_envelope_signed(&bytes),
+    };
+    const encoded = envelope.encode_to(out);
     assert(encoded.len <= payload_tx_length_max);
+    assert(payload_from_tx(encoded) == payload);
     return encoded;
+}
+
+/// The private key of a payload's sender (see `TxFormat.signed`).
+pub fn payload_key(payload: *const [8]u8) [32]u8 {
+    var preimage: [24]u8 = ("nf-sim-payload::" ++ @as([8]u8, @splat(0))).*;
+    @memcpy(preimage[16..24], payload);
+    const key = primitives.keccak256(&preimage).bytes;
+    assert(!std.mem.allEqual(u8, &key, 0));
+    return key;
+}
+
+/// The model's payload transaction, really signed by the payload's own key.
+pub fn payload_envelope_signed(payload: *const [8]u8) tx_module.Envelope {
+    var tx = payload_envelope(payload).eip1559.tx;
+    tx.max_priority_fee_per_gas = 0;
+    tx.max_fee_per_gas = 0;
+    tx.gas_limit = signed_gas_limit;
+    // Proof: a keccak digest is a valid secp256k1 scalar except with probability 2^-127.
+    const envelope = tx_module.sign(tx, payload_key(payload)) catch unreachable;
+    assert(envelope == .eip1559);
+    return envelope;
 }
 
 pub fn payload_from_tx(encoded: []const u8) ?u64 {
@@ -246,26 +285,38 @@ pub const Encoder = struct {
     /// tx data (one frame each). `hashes[i]` is the hash of block `first - 1 + i` (so it
     /// starts at the parent); `origins[i]` is the L1 origin of block `first + i`. The
     /// result borrows the encoder until the next call.
+    /// `real_hashes` (real execution) parallels `hashes` with the blocks' real hashes:
+    /// batches then name real parents and carry `TxFormat.signed` transactions.
     pub fn encode(
         encoder: *Encoder,
         first: u64,
         hashes: []const u64,
+        real_hashes: ?[]const B256,
         payloads: []const u64,
         origins: []const Origin,
     ) []const []const u8 {
         assert(first > 0 and payloads.len > 0 and payloads.len <= blocks_max);
         assert(hashes.len == payloads.len + 1);
         assert(origins.len == payloads.len);
+        if (real_hashes) |real| assert(real.len == hashes.len);
+        const format: TxFormat = if (real_hashes == null) .model else .signed;
         const manager = &encoder.manager;
         manager.reset();
         for (payloads, 0..) |payload, offset| {
             const number = first + offset;
             var transaction_buffer: [payload_tx_length_max]u8 = undefined;
-            const transactions = [_][]const u8{payload_tx(payload, &transaction_buffer)};
+            const transactions = [_][]const u8{
+                payload_tx_as(format, payload, &transaction_buffer),
+            };
+            const hash = if (real_hashes) |real|
+                real[offset + 1]
+            else
+                word_hash(hashes[offset + 1]);
+            const parent = if (real_hashes) |real| real[offset] else word_hash(hashes[offset]);
             const block: source.L2Block = .{
                 .number = number,
-                .hash = word_hash(hashes[offset + 1]),
-                .parent_hash = word_hash(hashes[offset]),
+                .hash = hash,
+                .parent_hash = parent,
                 .timestamp = number * l2_block_time_s,
                 .l1_origin = .{
                     .number = origins[offset].number,
@@ -586,6 +637,7 @@ test "codec: encode then decode round trips every batch size" {
         const frames = fixture.encoder.encode(
             1,
             fixture.hashes[0 .. count + 1],
+            null,
             fixture.payloads[1..][0..count],
             fixture.origins[1..][0..count],
         );
@@ -598,12 +650,53 @@ test "codec: encode then decode round trips every batch size" {
     }
 }
 
+test "codec: signed payload transactions recover their payload's sender" {
+    const signature = @import("../../common/consensus/signature.zig");
+    var buffer: [payload_tx_length_max]u8 = undefined;
+    for ([_]u64{ 0, 1, 0xdead_beef, std.math.maxInt(u64) }) |payload| {
+        const encoded = payload_tx_as(.signed, payload, &buffer);
+        try testing.expectEqual(payload, payload_from_tx(encoded).?);
+        const envelope = try tx_module.Envelope.decode(encoded);
+        const signed = envelope.eip1559;
+        try testing.expectEqual(@as(u128, 0), signed.tx.max_fee_per_gas);
+        const sender = signature.recover_address(envelope.signing_hash().?, signed.signature).?;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, payload, .big);
+        const expected = signature.address_from_private(payload_key(&bytes)).?;
+        try testing.expect(sender.eql(expected));
+    }
+    // Different payloads never share a sender (each sender sends once, at nonce 0).
+    var a: [8]u8 = @splat(1);
+    var b: [8]u8 = @splat(2);
+    try testing.expect(!std.mem.eql(u8, &payload_key(&a), &payload_key(&b)));
+}
+
+test "codec: real hashes and signed transactions round trip through a channel" {
+    var fixture: Fixture = undefined;
+    try fixture.init(3);
+    defer fixture.deinit();
+    var real: [9]B256 = undefined;
+    for (&real, 0..) |*hash, index| hash.* = primitives.keccak256(&.{@as(u8, @intCast(index))});
+    const frames = fixture.encoder.encode(
+        1,
+        fixture.hashes[0..9],
+        &real,
+        fixture.payloads[1..][0..8],
+        fixture.origins[1..][0..8],
+    );
+    try testing.expectEqual(@as(usize, 1), frames.len);
+    const blocks = fixture.decoder.decode(frames[0]) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u8, 8), blocks.count);
+    try testing.expectEqualSlices(u64, fixture.payloads[1..][0..8], blocks.payloads[0..8]);
+}
+
 fn fuzz_tamper(fixture: *Fixture, smith: *std.testing.Smith) anyerror!void {
     const count: u8 = smith.valueRangeAtMost(u8, 1, blocks_max);
     const first: u64 = smith.valueRangeAtMost(u8, 1, blocks_max + 1 - count);
     const encoded = fixture.encoder.encode(
         first,
         fixture.hashes[first - 1 ..][0 .. count + 1],
+        null,
         fixture.payloads[first..][0..count],
         fixture.origins[first..][0..count],
     )[0];
@@ -651,11 +744,11 @@ test "codec: derive stages keep the batcher's channel and drop an attacker's" {
     defer pool.deinit(testing.allocator);
     const origins = fixture.origins[1..3];
     const hashes = fixture.hashes[0..3];
-    const honest = fixture.encoder.encode(1, hashes, fixture.payloads[1..3], origins)[0];
+    const honest = fixture.encoder.encode(1, hashes, null, fixture.payloads[1..3], origins)[0];
     const honest_index = pool.append(honest).?;
     var forged_payloads = fixture.payloads;
     for (&forged_payloads) |*payload| payload.* +%= 1;
-    const forged = fixture.encoder.encode(1, hashes, forged_payloads[1..3], origins)[0];
+    const forged = fixture.encoder.encode(1, hashes, null, forged_payloads[1..3], origins)[0];
     const forged_index = pool.append(forged).?;
     // Order the attacker first: it must not shadow or displace the batcher's data.
     var block: WindowBlock = .{ .number = 5, .hash = 0xaa, .parent_hash = 0xbb, .count = 2 };
@@ -703,7 +796,7 @@ test "codec: multi-frame channels complete across blocks, not when lost or timed
     defer pool.deinit(testing.allocator);
     const hashes = fixture.hashes[0 .. blocks_max + 1];
     const payloads = fixture.payloads[1..][0..blocks_max];
-    const frames = encoder.encode(1, hashes, payloads, fixture.origins[1..][0..blocks_max]);
+    const frames = encoder.encode(1, hashes, null, payloads, fixture.origins[1..][0..blocks_max]);
     try testing.expect(frames.len >= 3);
     var window: [window_blocks_max]WindowBlock = undefined;
     // One frame per block, all inside the channel timeout: decodes in the last block.

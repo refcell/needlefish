@@ -17,6 +17,7 @@ const Prng = @import("../prng.zig").Prng;
 const network_module = @import("network.zig");
 const NodeId = network_module.NodeId;
 const codec = @import("codec.zig");
+const B256 = @import("../../common/primitives/root.zig").B256;
 
 pub const batch_blocks_max = 8;
 pub const l1_batches_max = 8;
@@ -108,6 +109,12 @@ pub const Chain = struct {
     hashes: []u64,
     payloads: []u64,
     origins: []codec.Origin,
+    /// Real execution (`Config.real_execution`, sequencer chain only): the block hashes
+    /// and state roots the execution lane's engine computed for the same blocks, filled
+    /// by `real_execution.Reference`. Batches then carry real hashes and signed txs.
+    real: bool = false,
+    real_hashes: []B256,
+    real_state_roots: []B256,
 
     pub fn init(allocator: std.mem.Allocator, block_count_max: u64) !Chain {
         assert(block_count_max > 0);
@@ -116,18 +123,52 @@ pub const Chain = struct {
         const payloads = try allocator.alloc(u64, block_count_max + 1);
         errdefer allocator.free(payloads);
         const origins = try allocator.alloc(codec.Origin, block_count_max + 1);
+        errdefer allocator.free(origins);
+        const real_hashes = try allocator.alloc(B256, block_count_max + 1);
+        errdefer allocator.free(real_hashes);
+        const real_state_roots = try allocator.alloc(B256, block_count_max + 1);
         @memset(hashes, 0);
         @memset(payloads, 0);
         @memset(origins, codec.genesis_origin);
+        @memset(real_hashes, .zero);
+        @memset(real_state_roots, .zero);
         hashes[0] = genesis_hash;
-        return .{ .hashes = hashes, .payloads = payloads, .origins = origins };
+        return .{
+            .hashes = hashes,
+            .payloads = payloads,
+            .origins = origins,
+            .real_hashes = real_hashes,
+            .real_state_roots = real_state_roots,
+        };
     }
 
     pub fn deinit(chain: *Chain, allocator: std.mem.Allocator) void {
         allocator.free(chain.hashes);
         allocator.free(chain.payloads);
         allocator.free(chain.origins);
+        allocator.free(chain.real_hashes);
+        allocator.free(chain.real_state_roots);
         chain.* = undefined;
+    }
+
+    pub fn tx_format(chain: *const Chain) codec.TxFormat {
+        return if (chain.real) .signed else .model;
+    }
+
+    /// The hash batches and RPC name for block `number`: real or the widened model word.
+    pub fn batch_hash(chain: *const Chain, number: u64) B256 {
+        assert(number <= chain.capacity());
+        if (!chain.real) return codec.word_hash(chain.hashes[number]);
+        assert(number == 0 or !chain.real_hashes[number].is_zero());
+        return chain.real_hashes[number];
+    }
+
+    /// The real hashes of blocks `first .. first + count` for `codec.Encoder.encode`, or
+    /// null without real execution.
+    pub fn real_slice(chain: *const Chain, first: u64, count: u64) ?[]const B256 {
+        if (!chain.real) return null;
+        assert(first + count <= chain.real_hashes.len);
+        return chain.real_hashes[first..][0..count];
     }
 
     pub fn capacity(chain: *const Chain) u64 {
@@ -755,6 +796,7 @@ pub const Batcher = struct {
         const frames = batcher.encoder.encode(
             first,
             sequencer.chain.hashes[first - 1 .. first + count],
+            sequencer.chain.real_slice(first - 1, count + 1),
             sequencer.chain.payloads[first .. first + count],
             sequencer.chain.origins[first .. first + count],
         );

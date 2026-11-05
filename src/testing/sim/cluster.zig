@@ -44,6 +44,9 @@ const codec = @import("codec.zig");
 const real_batcher = @import("real_batcher.zig");
 const real_verifier = @import("real_verifier.zig");
 const real_sequencer = @import("real_sequencer.zig");
+const real_execution = @import("real_execution.zig");
+const real_reference = @import("real_reference.zig");
+const RealBatcher = real_batcher.RealBatcher;
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
@@ -110,6 +113,12 @@ pub const Config = struct {
     /// Run the consensus lane's real driver in sequencer mode (see `real_sequencer.zig`)
     /// as the sequencer node: it produces the chain the model sequencer would.
     real_sequencer: bool = false,
+    /// Run the execution lane's real engine (Engine API, payload builder, EVM, durable
+    /// state db; see `real_execution.zig`) behind the real verifier and real sequencer
+    /// instead of the sim engine. Payload transactions are real signed transactions and a
+    /// reference engine executes the sequencer chain (`real_reference.zig`). Needs
+    /// `real_verifier` or `real_sequencer`.
+    real_execution: bool = false,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -163,8 +172,21 @@ pub const Config = struct {
         }
         // Drawn after every other field so the existing streams stay the same.
         config.real_sequencer = prng.chance(1, 2);
+        // Drawn last too; it only matters with a real driver node.
+        config.real_execution = prng.chance(1, 2);
+        if (!config.real_verifier and !config.real_sequencer) config.real_execution = false;
+        config.fit_real_execution();
         config.validate();
         return config;
+    }
+
+    /// Real execution's channels are about four times the model's (incompressible
+    /// signatures and 32-byte hashes: 1040 against 271 bytes for 8 blocks), so frames grow
+    /// fourfold to keep the L1 congestion model's throughput.
+    pub fn fit_real_execution(config: *Config) void {
+        if (!config.real_execution) return;
+        config.frame_size = @min(config.frame_size * 4, codec.frame_size_full);
+        assert(config.frame_size >= 4 * codec.frame_size_min);
     }
 
     pub fn validate(config: Config) void {
@@ -180,6 +202,7 @@ pub const Config = struct {
         assert(config.frame_size <= codec.frame_size_full);
         assert(config.l1_block_txs_min >= 1);
         assert(config.l1_block_txs_min <= nodes.l1_batches_max);
+        assert(!config.real_execution or config.real_verifier or config.real_sequencer);
     }
 
     pub fn block_count_max(config: Config) u64 {
@@ -189,8 +212,10 @@ pub const Config = struct {
     /// Batcher submissions over the whole run: one per submit interval, doubled for the
     /// immediate submission after each batcher restart.
     pub fn tx_count_max(config: Config) u32 {
-        // Each submission is one channel of up to ~1.1 KiB compressed, one tx per frame.
-        const frames: u64 = 1100 / (config.frame_size - 23) + 2;
+        // Each submission is one channel of up to ~1.1 KiB compressed (~2.2 KiB with real
+        // execution's signed transactions and real hashes), one tx per frame.
+        const channel_bytes: u64 = if (config.real_execution) 2200 else 1100;
+        const frames: u64 = channel_bytes / (config.frame_size - 23) + 2;
         const submissions = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
         const batcher = frames * submissions;
         // Chance-per-step injection can exceed the mean; four times it is ample headroom.
@@ -248,6 +273,10 @@ pub const Cluster = struct {
     real: ?*real_batcher.RealBatcher,
     real_verifier: ?*real_verifier.RealVerifier,
     real_sequencer: ?*real_sequencer.RealSequencer,
+    /// Real execution: the reference engine executing the sequencer chain, and the first
+    /// invariant it reported (checked with the other safety invariants).
+    reference: ?*real_reference.Reference,
+    reference_failure: ?[]const u8 = null,
     /// Real verifier safe head floor; reset on its restarts and on L1 reorgs.
     real_safe_floor: u64 = 0,
     real_reorgs_seen: u64 = 0,
@@ -288,14 +317,12 @@ pub const Cluster = struct {
         errdefer attacker.deinit(allocator);
         var byzantine = try codec.Encoder.init(allocator, 0x6279_7a61, byzantine_frame_size);
         errdefer byzantine.deinit(allocator);
-        const RealBatcher = real_batcher.RealBatcher;
-        const frame_size = config.frame_size;
-        const real = if (config.real_batcher)
-            try RealBatcher.create(allocator, frame_size)
-        else
-            null;
+        const size = config.frame_size;
+        const real = if (config.real_batcher) try RealBatcher.create(allocator, size) else null;
         errdefer if (real) |r| r.destroy(allocator);
         batcher.submitting = real == null;
+        const reference = try create_reference(allocator, config, seed, &sequencer_chain);
+        errdefer if (reference) |r| r.destroy();
         const verifier_real = try create_real(real_verifier.RealVerifier, allocator, config, seed);
         errdefer if (verifier_real) |v| v.destroy();
         const sequencer_real =
@@ -332,9 +359,24 @@ pub const Cluster = struct {
             .real = real,
             .real_verifier = verifier_real,
             .real_sequencer = sequencer_real,
+            .reference = reference,
             .allocator = allocator,
             .verifiers = verifiers,
         };
+    }
+
+    /// Real execution's reference engine, attached to the model sequencer chain.
+    fn create_reference(
+        allocator: std.mem.Allocator,
+        config: Config,
+        seed: u64,
+        chain: *nodes.Chain,
+    ) !?*real_reference.Reference {
+        if (!config.real_execution) return null;
+        const reference = try real_reference.Reference.create(allocator, seed);
+        reference.attach(chain);
+        assert(chain.real);
+        return reference;
     }
 
     /// The real driver node of type `T` when the config enables it, else null.
@@ -350,7 +392,8 @@ pub const Cluster = struct {
             else => comptime unreachable,
         };
         if (!enabled) return null;
-        const node = try T.create(allocator, config.block_count_max(), seed);
+        const execution: real_execution.Execution = if (config.real_execution) .real else .sim;
+        const node = try T.create(allocator, config.block_count_max(), seed, execution);
         assert(node.restarts == 0);
         return node;
     }
@@ -364,6 +407,7 @@ pub const Cluster = struct {
         if (cluster.real) |real| real.destroy(allocator);
         if (cluster.real_verifier) |v| v.destroy();
         if (cluster.real_sequencer) |s| s.destroy();
+        if (cluster.reference) |r| r.destroy();
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -467,6 +511,7 @@ pub const Cluster = struct {
             .pool = &cluster.tx_pool,
             .l1_reachable = cluster.linked(node, nodes.node_l1),
             .now_ns = cluster.env(node).now_ns,
+            .reference = if (cluster.reference) |reference| reference.engine else null,
         };
     }
 
@@ -486,6 +531,13 @@ pub const Cluster = struct {
         if (sequencer.record(&cluster.sequencer, &cluster.l1)) |reason| {
             return cluster.fail(reason, node);
         }
+        if (cluster.reference) |reference| {
+            const chain = &cluster.sequencer.chain;
+            const head = cluster.sequencer.head;
+            if (reference.import(chain, head, sequencer.exec.?)) |reason| {
+                return cluster.fail(reason, node);
+            }
+        }
         const gossip = sequencer.take_gossip(&cluster.sequencer) catch
             return cluster.fail("real sequencer gossip differs from its chain", node);
         const block = gossip orelse return;
@@ -503,6 +555,13 @@ pub const Cluster = struct {
         cluster.l1.tick(&cluster.env(nodes.node_l1));
         if (cluster.up(nodes.node_sequencer)) {
             cluster.sequencer.tick(&cluster.env(nodes.node_sequencer), &cluster.l1);
+        }
+        // Before the batchers read the new blocks: they post the real hashes.
+        if (cluster.reference) |reference| {
+            if (cluster.real_sequencer == null and cluster.reference_failure == null) {
+                const pool = &cluster.tx_pool;
+                cluster.reference_failure = reference.follow(&cluster.sequencer, &cluster.l1, pool);
+            }
         }
         if (cluster.up(nodes.node_batcher)) {
             const e = cluster.env(nodes.node_batcher);
@@ -643,7 +702,7 @@ pub const Cluster = struct {
         }
         const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
         const origins = cluster.sequencer.chain.origins[first..][0..count];
-        const frames = cluster.attacker.encode(first, hashes, payloads[0..count], origins);
+        const frames = cluster.attacker.encode(first, hashes, null, payloads[0..count], origins);
         assert(frames.len == 1); // The attacker writes full-size frames.
         const tx_index = cluster.tx_pool.append(frames[0]) orelse return;
         const e = cluster.env(nodes.node_l1);
@@ -677,12 +736,17 @@ pub const Cluster = struct {
         switch (prng.below(4)) {
             0, 1 => {
                 const first = prng.range(1, head);
-                const count: usize = @intCast(@min(codec.blocks_max, head - first + 1));
+                // Real execution's blocks are ~4x larger: replays of at most 3 blocks keep
+                // the model's mostly single-frame channels. A truncated multi-frame channel
+                // blocks the pre-Holocene channel bank until it times out (50 L1 blocks).
+                const replay_max: u64 = if (cluster.sequencer.chain.real) 3 else codec.blocks_max;
+                const count: usize = @intCast(@min(replay_max, head - first + 1));
                 const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
                 const payloads = cluster.sequencer.chain.payloads[first..][0..count];
                 var frames_buffer: [codec.frames_max][]const u8 = undefined;
                 const origins = cluster.sequencer.chain.origins[first..][0..count];
-                const frames = cluster.byzantine.encode(first, hashes, payloads, origins);
+                const real = cluster.sequencer.chain.real_slice(first - 1, count + 1);
+                const frames = cluster.byzantine.encode(first, hashes, real, payloads, origins);
                 assert(frames.len <= byzantine_frames_max);
                 @memcpy(frames_buffer[0..frames.len], frames);
                 // Fisher-Yates: frames arrive in any order.
@@ -804,6 +868,7 @@ pub const Cluster = struct {
     }
 
     fn check_safety(cluster: *Cluster) Failure!void {
+        if (cluster.reference_failure) |reason| return cluster.fail(reason, nodes.node_sequencer);
         try cluster.check_real_verifier();
         const sequencer = &cluster.sequencer;
         if (cluster.batcher.confirmed > sequencer.head) {
@@ -915,7 +980,7 @@ pub const Cluster = struct {
                 "  real sequencer: engine_head={d} safe={d} phase={s} resets={d} " ++
                     "critical={d} last_error={s}\n",
                 .{
-                    sequencer.engine.head(),
+                    sequencer.engine_head(),
                     sequencer.safe_number(),
                     @tagName(driver.phase),
                     driver.stats.resets,
@@ -1255,6 +1320,8 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     config.mempool_evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);
     config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
     config.real_sequencer = smith.value(bool);
+    config.real_execution = smith.value(bool) and (config.real_verifier or config.real_sequencer);
+    config.fit_real_execution();
     // BUG(batcher): see `Config.random`.
     if (config.real_batcher and config.real_verifier) {
         config.reorg_tx_loss_ppm = 0;
@@ -1325,4 +1392,93 @@ test "cluster: real sequencer recovers its unsafe head across crashes" {
         try std.testing.expectEqual(report.sequencer_head, sequencer.safe_number());
         try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
     }
+}
+
+test "cluster: real execution behind the real verifier reaches liveness without faults" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 51, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_batcher = real,
+            .real_verifier = true,
+            .real_execution = true,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const verifier = cluster.real_verifier.?;
+        const exec = verifier.exec.?;
+        try std.testing.expectEqual(report.sequencer_head, verifier.safe_number());
+        try std.testing.expectEqual(report.sequencer_head, exec.head_number());
+        try std.testing.expectEqual(report.sequencer_head, verifier.checked);
+        // Gossip inserts every block before its batch lands (no local builds).
+        try std.testing.expect(exec.inserts >= report.sequencer_head);
+        try std.testing.expectEqual(@as(u64, 0), exec.builds);
+        const head_hash = cluster.sequencer.chain.real_hashes[report.sequencer_head];
+        try std.testing.expect(exec.head_hash().eql(head_hash));
+    }
+}
+
+test "cluster: real execution behind the real sequencer and verifier reaches liveness" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 52, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_batcher = real,
+            .real_verifier = real,
+            .real_sequencer = true,
+            .real_execution = true,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const sequencer = cluster.real_sequencer.?;
+        try std.testing.expect(report.sequencer_head >= 59);
+        try std.testing.expectEqual(report.sequencer_head, sequencer.exec.?.head_number());
+        try std.testing.expectEqual(report.sequencer_head, sequencer.safe_number());
+        try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+        // A second engine imported every block the sequencer's engine built.
+        try std.testing.expectEqual(report.sequencer_head, cluster.reference.?.imported);
+        if (real) {
+            const verifier = cluster.real_verifier.?;
+            try std.testing.expectEqual(report.sequencer_head, verifier.safe_number());
+            try std.testing.expectEqual(report.sequencer_head, verifier.checked);
+        }
+    }
+}
+
+test "cluster: real execution recovers from crashes and power loss on its db" {
+    var blocks_lost: u64 = 0;
+    for ([_]u64{ 61, 62, 63 }) |seed| {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 1,
+            .crashes_per_minute = 6,
+            .partitions_per_minute = 1,
+            .disk_fault_ppm = 700_000,
+            .l1_reorgs_per_minute = @intFromBool(seed != 61),
+            .real_batcher = seed == 62,
+            .real_verifier = true,
+            .real_sequencer = seed == 63,
+            .real_execution = true,
+            .fault_end_ns = 240 * ns_per_s,
+            .production_end_ns = 300 * ns_per_s,
+            .settle_end_ns = 700 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const exec = cluster.real_verifier.?.exec.?;
+        try std.testing.expect(exec.restarts > 0);
+        try std.testing.expect(exec.disk_faults > 0);
+        try std.testing.expectEqual(report.sequencer_head, cluster.real_verifier.?.safe_number());
+        try std.testing.expectEqual(report.sequencer_head, exec.head_number());
+        blocks_lost += exec.blocks_lost;
+    }
+    // Some power loss found unsynced blocks, which the restarted node re-derived.
+    try std.testing.expect(blocks_lost > 0);
 }

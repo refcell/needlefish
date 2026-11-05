@@ -39,6 +39,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const Prng = @import("../prng.zig").Prng;
 const codec = @import("codec.zig");
 const nodes = @import("nodes.zig");
+const real_execution = @import("real_execution.zig");
 
 const B256 = primitives.B256;
 const BlockInfo = protocol.block.BlockInfo;
@@ -71,6 +72,8 @@ pub const View = struct {
     pool: *const codec.TxPool,
     l1_reachable: bool,
     now_ns: u64,
+    /// Real execution: the reference engine, which holds the sequencer's executed blocks.
+    reference: ?*real_execution.ExecEngine = null,
 };
 
 pub fn low_word(hash: B256) ?u64 {
@@ -276,7 +279,7 @@ pub const SimEngine = struct {
         return null;
     }
 
-    fn slices(block: *const Block, out: *[block_txs_max][]const u8) []const []const u8 {
+    pub fn slices(block: *const Block, out: *[block_txs_max][]const u8) []const []const u8 {
         for (0..block.tx_count) |index| out[index] = block.transaction(index);
         return out[0..block.tx_count];
     }
@@ -570,7 +573,7 @@ pub const EngineClient = struct {
 
 /// The sequencer's view when it built a block: final L1 origins (never reorged, see
 /// `nodes.Sequencer.next_origin`) and the genesis system config the model never changes.
-const GossipChain = struct {
+pub const GossipChain = struct {
     l1: *L1View,
 
     pub fn l1_header_by_hash(chain: GossipChain, hash: B256) ProviderError!L1Header {
@@ -608,14 +611,21 @@ fn sequencer_block_info(sequencer: *const nodes.Sequencer, number: u64) L2BlockI
     return result;
 }
 
-pub const Providers = struct {
-    l1: *L1View,
-    blobs: *L1View,
-    l2: *SimEngine,
-    engine: *EngineClient,
-    l1_head: ?BlockInfo,
-    l1_finalized: ?BlockInfo,
-};
+/// The driver's providers over an L2 engine (`SimEngine` or `real_execution.ExecEngine`)
+/// and its polling client.
+pub fn ProvidersOf(comptime L2: type, comptime Client: type) type {
+    return struct {
+        l1: *L1View,
+        blobs: *L1View,
+        l2: *L2,
+        engine: *Client,
+        l1_head: ?BlockInfo,
+        l1_finalized: ?BlockInfo,
+    };
+}
+
+pub const Providers = ProvidersOf(SimEngine, EngineClient);
+pub const ExecProviders = ProvidersOf(real_execution.ExecEngine, real_execution.Client);
 
 pub const RealVerifier = struct {
     allocator: std.mem.Allocator,
@@ -636,12 +646,16 @@ pub const RealVerifier = struct {
     sync_ns: u64 = 0,
     gossip_received: u64 = 0,
     gossip_kept: u64 = 0,
+    /// Real execution: the execution lane's engine replaces `engine` (left idle).
+    exec: ?*real_execution.ExecEngine = null,
+    exec_client: real_execution.Client = undefined,
 
     /// Heap-allocated: the driver keeps pointers to the rollup config and safe db.
     pub fn create(
         allocator: std.mem.Allocator,
         block_count_max: u64,
         seed: u64,
+        execution: real_execution.Execution,
     ) !*RealVerifier {
         const verifier = try allocator.create(RealVerifier);
         errdefer allocator.destroy(verifier);
@@ -658,6 +672,13 @@ pub const RealVerifier = struct {
         };
         errdefer verifier.engine.deinit(allocator);
         verifier.client = .{ .engine = &verifier.engine, .prng = Prng.init(seed) };
+        if (execution == .real) {
+            const exec = try real_execution.ExecEngine.create(allocator, seed, .follower);
+            verifier.exec = exec;
+            verifier.exec_client = .{ .engine = exec, .prng = Prng.init(seed) };
+            verifier.rollup = real_execution.rollup_config(exec.genesis_hash);
+        }
+        errdefer if (verifier.exec) |exec| exec.destroy();
         try verifier.start();
         assert(verifier.driver.phase == .starting);
         return verifier;
@@ -667,6 +688,7 @@ pub const RealVerifier = struct {
         const allocator = verifier.allocator;
         verifier.stop();
         verifier.engine.deinit(allocator);
+        if (verifier.exec) |exec| exec.destroy();
         allocator.free(verifier.gossip_scratch);
         allocator.destroy(verifier);
     }
@@ -693,7 +715,11 @@ pub const RealVerifier = struct {
     /// and startup discovery rebuilds the heads from them.
     pub fn restart(verifier: *RealVerifier, blocks_lost: ?u64) !void {
         verifier.stop();
-        if (blocks_lost) |count| verifier.engine.lose_unflushed(count);
+        if (verifier.exec) |exec| {
+            // A disk fault is power loss on the execution db's storage.
+            try exec.restart(if (blocks_lost == null) .none else .power);
+            verifier.checked = 0;
+        } else if (blocks_lost) |count| verifier.engine.lose_unflushed(count);
         try verifier.start();
         verifier.restarts += 1;
         verifier.sequencer_head_known = 0;
@@ -717,6 +743,9 @@ pub const RealVerifier = struct {
         verifier.sequencer_head_known = @max(verifier.sequencer_head_known, number);
         if (verifier.driver.phase != .running) return;
         if (number <= verifier.unsafe_number()) return; // Stale: skip the build work.
+        if (verifier.exec != null) {
+            return verifier.insert_executed(sequencer, view, number, payload);
+        }
         var fixed: std.heap.FixedBufferAllocator = .init(verifier.gossip_scratch);
         var builder = attributes_module.AttributesBuilder.init(
             fixed.allocator(),
@@ -761,6 +790,30 @@ pub const RealVerifier = struct {
         verifier.gossip_kept += @intFromBool(verifier.driver.insert_unsafe(&envelope));
     }
 
+    /// Real execution: the gossiped payload is the block the reference engine executed for
+    /// the sequencer chain (same deposit, signed transaction, hash and state root).
+    fn insert_executed(
+        verifier: *RealVerifier,
+        sequencer: *const nodes.Sequencer,
+        view: View,
+        number: u64,
+        payload: u64,
+    ) void {
+        const chain = &sequencer.chain;
+        assert(chain.real);
+        assert(chain.payloads[number] == payload);
+        const reference = view.reference.?;
+        const hash = chain.real_hashes[number];
+        var transactions: [real_execution.block_transactions_max][]const u8 = undefined;
+        const executed = reference.payload_of(hash, &transactions) orelse return;
+        assert(codec.payload_from_tx(executed.transactions[1]) == payload);
+        const envelope: InsertEnvelope = .{
+            .payload = executed,
+            .parent_beacon_block_root = reference.header(hash).?.parent_beacon_block_root,
+        };
+        verifier.gossip_kept += @intFromBool(verifier.driver.insert_unsafe(&envelope));
+    }
+
     /// The first block to request from the sequencer when the unsafe head lags the gossip
     /// seen, at most once per `sync_timeout_ns`; null when nothing is missing.
     pub fn sync_request(verifier: *RealVerifier, now_ns: u64) ?u64 {
@@ -777,18 +830,33 @@ pub const RealVerifier = struct {
         verifier.l1_view = .{ .l1 = view.l1, .pool = view.pool, .reachable = view.l1_reachable };
         const l1 = &verifier.l1_view;
         const final_depth = nodes.l1_reorg_depth_max;
+        const l1_head = if (view.l1_reachable) l1.info(view.l1.head) else null;
+        const l1_finalized = if (view.l1_reachable and view.l1.head >= final_depth)
+            l1.info(view.l1.head - final_depth)
+        else
+            null;
+        const now_ms = view.now_ns / std.time.ns_per_ms;
+        if (verifier.exec) |exec| {
+            exec.tick();
+            const providers: ExecProviders = .{
+                .l1 = l1,
+                .blobs = l1,
+                .l2 = exec,
+                .engine = &verifier.exec_client,
+                .l1_head = l1_head,
+                .l1_finalized = l1_finalized,
+            };
+            return verifier.driver.tick(providers, now_ms);
+        }
         const providers: Providers = .{
             .l1 = l1,
             .blobs = l1,
             .l2 = &verifier.engine,
             .engine = &verifier.client,
-            .l1_head = if (view.l1_reachable) l1.info(view.l1.head) else null,
-            .l1_finalized = if (view.l1_reachable and view.l1.head >= final_depth)
-                l1.info(view.l1.head - final_depth)
-            else
-                null,
+            .l1_head = l1_head,
+            .l1_finalized = l1_finalized,
         };
-        verifier.driver.tick(providers, view.now_ns / std.time.ns_per_ms);
+        verifier.driver.tick(providers, now_ms);
     }
 
     /// The driver's safe head, or null during startup discovery (heads not yet known).
@@ -819,6 +887,7 @@ pub const RealVerifier = struct {
     /// invariant, or null.
     pub fn check(verifier: *RealVerifier, sequencer: *const nodes.Sequencer) ?[]const u8 {
         if (verifier.driver.stats.critical_errors != 0) return "real verifier critical error";
+        if (verifier.exec) |exec| return verifier.check_executed(exec, sequencer);
         const safe = (verifier.safe_head() orelse return null).block_info;
         if (safe.number > sequencer.head) return "real verifier safe > sequencer";
         const expected = codec.word_hash(sequencer.chain.hashes[safe.number]);
@@ -858,6 +927,97 @@ pub const RealVerifier = struct {
         if (l1_origin.number != origin.number or
             !l1_origin.hash.eql(codec.word_hash(origin.hash)) or
             block.info.sequence_number != origin.sequence_number)
+        {
+            return "real verifier derived a different L1 origin";
+        }
+        return null;
+    }
+
+    /// Real execution: the driver's heads are reference blocks (real hashes) and match the
+    /// engine's head and labels, and every engine block up to the safe head has the
+    /// reference's hash and state root (`check_executed_block`).
+    fn check_executed(
+        verifier: *RealVerifier,
+        exec: *real_execution.ExecEngine,
+        sequencer: *const nodes.Sequencer,
+    ) ?[]const u8 {
+        const chain = &sequencer.chain;
+        assert(chain.real);
+        const safe = (verifier.safe_head() orelse return null).block_info;
+        if (safe.number > sequencer.head) return "real verifier safe > sequencer";
+        if (!safe.hash.eql(chain.real_hashes[safe.number])) {
+            return "real verifier safe head diverged";
+        }
+        const unsafe = verifier.unsafe_head().?.block_info;
+        if (unsafe.number < safe.number) return "real verifier safe > unsafe";
+        if (unsafe.number > sequencer.head) return "real verifier unsafe > sequencer";
+        if (!unsafe.hash.eql(chain.real_hashes[unsafe.number])) {
+            return "real verifier unsafe head diverged";
+        }
+        if (verifier.check_labels(exec)) |reason| return reason;
+        // A reorg replaced checked blocks: check again from the last one still canonical.
+        while (verifier.checked > 0) : (verifier.checked -= 1) {
+            const hash = exec.canonical_hash(verifier.checked) orelse continue;
+            if (hash.eql(chain.real_hashes[verifier.checked])) break;
+        }
+        while (verifier.checked < safe.number) {
+            const number = verifier.checked + 1;
+            if (check_executed_block(exec, chain, number)) |reason| return reason;
+            verifier.checked = number;
+        }
+        assert(verifier.checked >= safe.number);
+        return null;
+    }
+
+    /// The driver's view is the engine's: its unsafe head is the engine's head block, and
+    /// its safe and finalized heads are the engine's labels.
+    fn check_labels(
+        verifier: *const RealVerifier,
+        exec: *const real_execution.ExecEngine,
+    ) ?[]const u8 {
+        const state = verifier.driver.sync_state();
+        if (!state.unsafe_head.block_info.hash.eql(exec.label_hash(.latest))) {
+            return "real verifier unsafe head is not its engine's head";
+        }
+        if (!state.safe_head.block_info.hash.eql(exec.label_hash(.safe))) {
+            return "real verifier safe head is not its engine's safe label";
+        }
+        if (!state.finalized_head.block_info.hash.eql(exec.label_hash(.finalized))) {
+            return "real verifier finalized head is not its engine's finalized label";
+        }
+        return null;
+    }
+
+    /// Canonical engine block `number` is the reference's: same hash and state root, the
+    /// sequencer's L1 origin, and exactly the deposit and the signed payload transaction.
+    fn check_executed_block(
+        exec: *real_execution.ExecEngine,
+        chain: *const nodes.Chain,
+        number: u64,
+    ) ?[]const u8 {
+        assert(number > 0);
+        const hash = exec.canonical_hash(number) orelse
+            return "real verifier safe block missing from its engine";
+        if (!hash.eql(chain.real_hashes[number])) {
+            return "real verifier block hash differs from the reference's";
+        }
+        if (!exec.header(hash).?.state_root.eql(chain.real_state_roots[number])) {
+            return "real verifier state root differs from the reference's";
+        }
+        var transactions: [real_execution.block_transactions_max][]const u8 = undefined;
+        const payload = exec.payload_of(hash, &transactions).?;
+        if (payload.transactions.len < 2) return "real verifier derived a deposit-only block";
+        if (payload.transactions.len > 2) return "real verifier derived extra transactions";
+        var buffer: [codec.payload_tx_length_max]u8 = undefined;
+        const expected = codec.payload_tx_as(.signed, chain.payloads[number], &buffer);
+        if (!std.mem.eql(u8, payload.transactions[1], expected)) {
+            return "real verifier derived a different transaction";
+        }
+        const info = exec.block_info(number).?;
+        const origin = chain.origins[number];
+        if (info.l1_origin.number != origin.number or
+            !info.l1_origin.hash.eql(codec.word_hash(origin.hash)) or
+            info.sequence_number != origin.sequence_number)
         {
             return "real verifier derived a different L1 origin";
         }

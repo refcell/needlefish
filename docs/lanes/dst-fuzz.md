@@ -21,7 +21,7 @@ provably robust.
     startup discovery) as the first verifier's consensus client (`sim/real_verifier.zig`).
   - [x] Sequencer: the real driver in sequencer mode producing the L2 chain
     (`sim/real_sequencer.zig`, `Config.real_sequencer`).
-  - [ ] Execution: the execution lane's engine (Engine API handlers, payload builder, EVM,
+  - [x] Execution: the execution lane's engine (Engine API handlers, payload builder, EVM,
     state db) behind the real verifier/sequencer drivers instead of the sim engine, with
     disk faults on its durable db.
   - [ ] P2P: the consensus p2p gossip stack (envelope encode/validate, signer checks)
@@ -302,3 +302,34 @@ provably robust.
   (ReleaseSafe).
 - 2026-11-05: project owner dropped flashblocks (AGENTS.md rule 10): removed the
   flashblocks fuzz targets from `fuzz_targets_net.zig` (the sim had no flashblocks wiring).
+- 2026-11-05: real execution (`sim/real_execution.zig`, `sim/real_reference.zig`,
+  `Config.real_execution`, drawn last in `Config.random`, only with a real driver node;
+  smith config; swarm reduction 19). The real verifier's and real sequencer's engine is the
+  execution lane's `Engine(Chain)` called in-process (no sockets): Granite L2 chainspec from
+  genesis, zero base fee, EVM, payload builder, txpool (sequencer), and the durable db
+  (`Durable(SimStorage)`, latency up to 8 steps). Payload txs are real signed EIP-1559
+  txs (key = keccak of the payload, zero fees) carrying the model payload, so block hashes
+  and state roots are real; channels carry the real 32-byte hashes. A reference engine
+  executes the model sequencer chain (attributes from the real `AttributesBuilder`,
+  `no_tx_pool`) or, with the real sequencer, imports its blocks by newPayload; its hash and
+  state root per block are recorded in the model chain and the real verifier's gossip is
+  the reference's executed payload. Invariants: driver heads are reference blocks; driver
+  unsafe/safe/finalized heads equal the engine's head and labels; every canonical engine
+  block up to safe has the reference's hash and state root, one deposit plus the signed
+  tx, and the sequencer's origin; the reference finds the real sequencer's blocks valid
+  with the same state root. Crash restarts reopen the db (startup discovery via
+  `Chain.restore`); a disk fault is power loss on the storage (unsynced writes lost,
+  labels recovered to the newest ancestor of the recovered head) on the verifier, and a
+  label-update loss on the sequencer. Observation (execution lane, not gated): the durable
+  head is the last executed block, so a built payload never chosen by forkchoiceUpdated
+  becomes the head after a restart. Sim calibration: real channels are ~4x the model's
+  (1040 vs 271 bytes for 8 blocks), so real execution quadruples `frame_size` (capped) and
+  byzantine replays stop at 3 blocks (a truncated multi-frame channel blocks the
+  pre-Holocene channel bank for 50 L1 blocks; seeds 1122, 2452). `newPayloadV3` drops
+  `execution_requests` as on the wire. Tests: fault-free liveness behind the real verifier
+  (model/real batcher), behind the real sequencer + verifier, and crashes + power loss
+  (seeds 61-63, blocks lost > 0). Mutants: finalized label not updated (finalized head
+  not the engine's label), reference records the parent state root (state root differs),
+  real sequencer records a zero state root (reference state root differs), restart skips
+  label recovery (safe head not the engine's safe label), power loss without crash (no
+  blocks lost): 5/5 caught. Swarm 1..3000 green (ReleaseSafe, 12 shards of 250).
