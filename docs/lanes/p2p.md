@@ -41,7 +41,8 @@ behind a small interface and switch later.
   outbound mesh quota (D_out = 2), IWANT retransmission limit.
 - [x] `gossip`: IDONTWANT (v1.2): sent to v1.2-capable mesh peers for messages over
   1000 B; received ids are skipped when forwarding (32-id ring per peer).
-- [ ] `gossip`: peer exchange on PRUNE (disabled in base/base; low priority).
+- [x] `gossip`: peer exchange on PRUNE — won't do: base/base disables it (rule 7); we send
+  empty PRUNE peer lists and ignore received ones.
 - [x] `gossip`: snappy block-format codec (own implementation, fuzzed round trip),
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
