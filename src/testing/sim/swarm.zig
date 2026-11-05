@@ -54,7 +54,7 @@ pub fn run_range(allocator: std.mem.Allocator, seed_first: u64, count: u64) !Ran
     return result;
 }
 
-const reduction_count = 10;
+const reduction_count = 11;
 
 /// Apply reduction `index` to `config`. Returns null when it would change nothing.
 fn reduce(config: Config, index: u32) ?Config {
@@ -77,6 +77,7 @@ fn reduce(config: Config, index: u32) ?Config {
             next.settle_end_ns -= cut;
         },
         9 => next.crashes_per_minute = config.crashes_per_minute / 2,
+        10 => next.clock_skew_ns_max = 0,
         else => unreachable,
     }
     if (std.meta.eql(next, config)) return null;

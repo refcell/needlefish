@@ -41,6 +41,8 @@ pub const Config = struct {
     /// Probability a restart loses the latest durable write, in parts per million.
     disk_fault_ppm: u32 = 100_000,
     downtime_ns_max: u64 = 60 * ns_per_s,
+    /// Each non-L1 node's clock is offset by up to this much, re-drawn on restart.
+    clock_skew_ns_max: u64 = 0,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -59,6 +61,7 @@ pub const Config = struct {
             .partitions_per_minute = @intCast(swarm_level(prng, 4)),
             .disk_fault_ppm = @intCast(swarm_level(prng, 500_000)),
             .downtime_ns_max = prng.range(1, 120) * ns_per_s,
+            .clock_skew_ns_max = swarm_level(prng, 30) * ns_per_s,
         };
         config.validate();
         return config;
@@ -72,6 +75,7 @@ pub const Config = struct {
         assert(config.production_end_ns < config.settle_end_ns);
         assert(config.disk_fault_ppm <= 1_000_000);
         assert(config.downtime_ns_max > 0);
+        assert(config.clock_skew_ns_max <= config.settle_end_ns - config.production_end_ns);
     }
 
     pub fn block_count_max(config: Config) u64 {
@@ -115,6 +119,8 @@ pub const Cluster = struct {
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
     restart_ns: [network_module.node_count_max]?u64 = @splat(null),
+    /// Per node clock offset from global time. L1 is the reference and stays at zero.
+    clock_offset_ns: [network_module.node_count_max]i64 = @splat(0),
     heal_ns: ?u64 = null,
     safe_floor: [verifier_count_max]u64 = @splat(0),
     report: Report = .{},
@@ -160,13 +166,23 @@ pub const Cluster = struct {
         cluster.* = undefined;
     }
 
-    fn env(cluster: *Cluster) nodes.Env {
+    fn env(cluster: *Cluster, node: NodeId) nodes.Env {
+        const offset_ns = cluster.clock_offset_ns[node];
+        const local_ns: i64 = @as(i64, @intCast(cluster.now_ns)) + offset_ns;
         return .{
-            .now_ns = cluster.now_ns,
+            .now_ns = @intCast(@max(0, local_ns)),
+            .global_ns = cluster.now_ns,
             .prng = &cluster.prng_network,
             .network = &cluster.network,
             .verifier_count = cluster.config.verifier_count,
         };
+    }
+
+    fn random_clock_offset(cluster: *Cluster) i64 {
+        const skew_max: i64 = @intCast(cluster.config.clock_skew_ns_max);
+        if (skew_max == 0) return 0;
+        const span: u64 = @intCast(2 * skew_max);
+        return @as(i64, @intCast(cluster.prng_faults.range(0, span))) - skew_max;
     }
 
     fn up(cluster: *const Cluster, node: NodeId) bool {
@@ -176,6 +192,11 @@ pub const Cluster = struct {
     /// Run all phases. Returns the report, or a Failure after printing a diagnosis.
     pub fn run(cluster: *Cluster) Failure!Report {
         const steps_max = cluster.config.settle_end_ns / step_ns;
+        assert(cluster.now_ns == 0);
+        var node: NodeId = nodes.node_sequencer;
+        while (node < nodes.node_verifier_first + cluster.config.verifier_count) : (node += 1) {
+            cluster.clock_offset_ns[node] = cluster.random_clock_offset();
+        }
         var step: u64 = 0;
         while (step < steps_max) : (step += 1) {
             cluster.now_ns += step_ns;
@@ -198,9 +219,9 @@ pub const Cluster = struct {
     }
 
     fn deliver(cluster: *Cluster) void {
-        const e = cluster.env();
         while (cluster.network.pop_due(cluster.now_ns)) |packet| {
             if (!cluster.up(packet.to)) continue;
+            const e = cluster.env(packet.to);
             switch (packet.to) {
                 nodes.node_l1 => cluster.l1.on_message(&e, packet.from, packet.message),
                 nodes.node_sequencer => {
@@ -217,12 +238,15 @@ pub const Cluster = struct {
     }
 
     fn tick(cluster: *Cluster) void {
-        const e = cluster.env();
-        cluster.l1.tick(&e);
-        if (cluster.up(nodes.node_sequencer)) cluster.sequencer.tick(&e);
-        if (cluster.up(nodes.node_batcher)) cluster.batcher.tick(&e, &cluster.sequencer);
+        cluster.l1.tick(&cluster.env(nodes.node_l1));
+        if (cluster.up(nodes.node_sequencer)) {
+            cluster.sequencer.tick(&cluster.env(nodes.node_sequencer));
+        }
+        if (cluster.up(nodes.node_batcher)) {
+            cluster.batcher.tick(&cluster.env(nodes.node_batcher), &cluster.sequencer);
+        }
         for (cluster.verifiers[0..cluster.config.verifier_count]) |*verifier| {
-            if (cluster.up(verifier.id)) verifier.tick(&e);
+            if (cluster.up(verifier.id)) verifier.tick(&cluster.env(verifier.id));
         }
     }
 
@@ -263,13 +287,15 @@ pub const Cluster = struct {
     }
 
     fn restart_due(cluster: *Cluster) void {
-        const e = cluster.env();
         for (&cluster.restart_ns, 0..) |*restart_ns, node_index| {
             const ns = restart_ns.* orelse continue;
             if (cluster.now_ns < ns) continue;
             restart_ns.* = null;
             const node: NodeId = @intCast(node_index);
             assert(node != nodes.node_l1);
+            // A restart may come back with a different clock: jumps forward or backward.
+            cluster.clock_offset_ns[node] = cluster.random_clock_offset();
+            const e = cluster.env(node);
             switch (node) {
                 nodes.node_sequencer => cluster.sequencer.restart(&e),
                 nodes.node_batcher => cluster.batcher.restart(&e),

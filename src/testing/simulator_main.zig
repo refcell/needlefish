@@ -70,7 +70,8 @@ fn print_config(config: Config) void {
     const ms = std.time.ns_per_ms;
     std.debug.print(
         "  verifiers={d} latency={d}..{d}ms drop={d}ppm dup={d}ppm crashes/min={d} " ++
-            "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms\n",
+            "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
+            "clock_skew_max={d}ms\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -82,6 +83,7 @@ fn print_config(config: Config) void {
             config.disk_fault_ppm,
             config.downtime_ns_max / ms,
             config.fault_end_ns / ms,
+            config.clock_skew_ns_max / ms,
         },
     );
 }

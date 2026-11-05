@@ -41,3 +41,5 @@ provably robust.
 - 2026-11-05: bench harness (calibrated, best-of-5, MB/s) over lane case tables; docs/PERF.md baseline.
 - 2026-11-05: fuzz audit pass 1: tx canonical round trip (+network form), channel
   reassembly vs model, trie proof tamper + garbage. Uncovered list: re-audit as lanes land.
+- 2026-11-05: sim clock skew (per-node offset, re-drawn on restart = clock jumps; network
+  stays on global time); minimizer reduction for skew.

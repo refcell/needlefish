@@ -61,13 +61,16 @@ pub const Net = network_module.Network(Message);
 
 /// What a node sees of the world during one callback.
 pub const Env = struct {
+    /// The node's local clock: global time plus its (possibly skewed) offset.
     now_ns: u64,
+    /// Global simulated time; only the network uses it.
+    global_ns: u64,
     prng: *Prng,
     network: *Net,
     verifier_count: u8,
 
     pub fn send(env: *const Env, from: NodeId, to: NodeId, message: Message) void {
-        env.network.send(env.prng, env.now_ns, from, to, message);
+        env.network.send(env.prng, env.global_ns, from, to, message);
     }
 };
 
