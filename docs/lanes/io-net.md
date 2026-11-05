@@ -6,13 +6,16 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `io`: completion-based IO interface (TigerBeetle-style): `accept/connect/recv/send/read/write/fsync/timeout/close`, callbacks with user context, `run_for_ns`/`tick`. Backends: io_uring (Linux, own ring setup via std.os.linux), kqueue (macOS), and `SimIo` (deterministic: simulated time, network with latency/drop/reorder/partition, disk with faults) seeded by `testing.Prng`. Same API, chosen at comptime.
 - [x] `time`: monotonic + realtime via IO; simulated clock for DST.
 - [x] `json`: fast zero-alloc JSON tokenizer/writer for JSON-RPC (hex quantities, 0x data) — fuzzed.
-- [ ] `http`: HTTP/1.1 server + client on the IO interface (keep-alive, pipelining, bounded buffers), fuzzed parser.
+- [x] `http`: HTTP/1.1 server + client on the IO interface (keep-alive, pipelining, bounded buffers), fuzzed parser.
 - [ ] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
 - [ ] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [ ] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [ ] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [ ] Linux CI coverage for io_uring (`just test-linux`).
+- [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
+  server can stop with an accept in flight and a client can abandon a request on timeout.
+- [ ] `http`: per-connection idle/read timeouts on the server; request timeout on client.
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -27,6 +30,10 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   `crash()` drops unsynced data). Stream model is TCP-like: per-direction order, bounded
   receive ring as flow control, per-segment latency, partitions stall, resets surface as
   `ConnectionResetByPeer`. Packet drop is modeled as delay (TCP retransmits) not loss.
+- HTTP server: fixed connection pool, one op in flight per connection, synchronous
+  handler writing into `ResponseBuilder` (body first, head prepended, no copy). Client:
+  one keep-alive connection, one request in flight, retries once only when a reused
+  connection dies before any response byte (never resends after a partial response).
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -39,3 +46,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: time: Clock(IO) with monotonic clamp, Deadline, drift-free Ticker, ManualClock.
 - 2026-11-05: json: validating zero-alloc Scanner (skip, unescape), Writer, QUANTITY/DATA hex; fuzzed.
 - 2026-11-05: http: incremental HTTP/1.1 parser (pipelining, in-place chunked, smuggling checks); fuzzed.
+- 2026-11-05: http: Server(IO, Ctx, handler) and Client(IO) with keep-alive and pipelining; SimIo + kqueue + io_uring tests.

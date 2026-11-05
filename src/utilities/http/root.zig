@@ -12,6 +12,13 @@ pub const Headers = parser.Headers;
 pub const parse_request = parser.parse_request;
 pub const parse_response = parser.parse_response;
 
+pub const server = @import("server.zig");
+pub const client = @import("client.zig");
+pub const Server = server.Server;
+pub const ResponseBuilder = server.ResponseBuilder;
+pub const Client = client.Client;
+
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("server_test.zig");
 }
