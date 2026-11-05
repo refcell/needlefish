@@ -12,7 +12,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [ ] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
 - [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
-- [ ] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
+- [x] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
 - [x] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
 - [ ] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
 
@@ -36,6 +36,10 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   `consensus/protocol` and `ChainSpec` in `execution/chainspec`; they can derive from `chains`.
 - base/base `common/flz` and `common/l1-fees` map to `src/common/flz` and `src/common/l1_fees`
   (added to this lane). The fork gate is a local `l1_fees.Rules` enum; callers map upgrades.
+- genesis: base/base `dev.json` `stateRoot` is stale (22 accounts, root of an older set);
+  the dev test pins our root. Verified locally that Base mainnet/Sepolia/Zeronet genesis
+  JSON (9 MB each, not committed) reproduce the genesis hashes in `chains`. Genesis JSON
+  writing stays with batcher `devnet/genesis.zig` (its only producer).
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
@@ -45,3 +49,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: header/receipts/logs/withdrawals/block/body, roots, EIP-7685; mainnet genesis + Cancun/Prague block vectors.
 - 2026-11-05: chains (mainnet/sepolia/zeronet/devnet, L1 mainnet/sepolia/holesky/hoodi/devnet).
 - 2026-11-05: flz (FastLZ length, base/base vectors) and l1_fees (Bedrock..Jovian, operator fee).
+- 2026-11-05: genesis (JSON, alloc, state/storage roots, fork-aware header incl. Isthmus).
