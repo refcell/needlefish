@@ -12,6 +12,8 @@ pub const basefee = @import("basefee.zig");
 pub const blob = @import("blob.zig");
 pub const BaseFeeParams = basefee.BaseFeeParams;
 pub const BlobParams = blob.BlobParams;
+pub const from_genesis_module = @import("genesis.zig");
+pub const from_genesis = from_genesis_module.from_genesis;
 
 pub const Mode = enum { l1, l2 };
 
