@@ -50,6 +50,14 @@ pub const Config = struct {
     prover_proof_type: ProofType = .tee,
     /// Stop after this many poll intervals (smoke tests); runs forever when null.
     ticks_max: ?u64 = null,
+    /// Liveness, readiness and metrics (`exporter.zig`) on `--health.addr`/`--health.port`
+    /// (base/base defaults; port 0 disables), and on the metrics port when
+    /// `--metrics.enabled`; both serve the same endpoints.
+    health_addr: [4]u8 = @splat(0),
+    health_port: u16 = 8080,
+    metrics_enabled: bool = false,
+    metrics_addr: [4]u8 = @splat(0),
+    metrics_port: u16 = 7300,
 
     pub fn native_prover(config: *const Config) bool {
         return std.mem.eql(u8, config.prover_rpc, "native");
@@ -97,6 +105,11 @@ const Flag = enum {
     l1_beacon,
     prover_proof_type,
     ticks_max,
+    health_addr,
+    health_port,
+    metrics_enabled,
+    metrics_addr,
+    metrics_port,
 };
 
 fn flag_of(name: []const u8) Error!Flag {
@@ -104,7 +117,7 @@ fn flag_of(name: []const u8) Error!Flag {
     var buffer: [64]u8 = undefined;
     if (name.len - 2 > buffer.len) return error.UnknownFlag;
     const field = buffer[0 .. name.len - 2];
-    for (name[2..], field) |char, *out| out.* = if (char == '-') '_' else char;
+    for (name[2..], field) |char, *out| out.* = if (char == '-' or char == '.') '_' else char;
     return std.meta.stringToEnum(Flag, field) orelse error.UnknownFlag;
 }
 
@@ -114,8 +127,8 @@ pub fn parse(args: []const []const u8) Error!Config {
     var index: usize = 0;
     while (index < args.len) {
         const flag = try flag_of(args[index]);
-        if (flag == .dry_run) {
-            config.dry_run = true;
+        if (flag == .dry_run or flag == .metrics_enabled) {
+            if (flag == .dry_run) config.dry_run = true else config.metrics_enabled = true;
             index += 1;
             continue;
         }
@@ -129,9 +142,15 @@ pub fn parse(args: []const []const u8) Error!Config {
 }
 
 fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
-    assert(flag != .dry_run);
+    assert(flag != .dry_run and flag != .metrics_enabled);
     switch (flag) {
-        .dry_run => unreachable,
+        .dry_run, .metrics_enabled => unreachable,
+        .health_addr => config.health_addr = try parse_ip4(value),
+        .metrics_addr => config.metrics_addr = try parse_ip4(value),
+        .health_port => config.health_port = std.fmt.parseUnsigned(u16, value, 10) catch
+            return error.InvalidValue,
+        .metrics_port => config.metrics_port = std.fmt.parseUnsigned(u16, value, 10) catch
+            return error.InvalidValue,
         .prover_rpc => config.prover_rpc = value,
         .l1_eth_rpc => config.l1_eth_rpc = value,
         .l2_eth_rpc => config.l2_eth_rpc = value,
@@ -151,6 +170,18 @@ fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
         .ticks_max => config.ticks_max = std.fmt.parseUnsigned(u64, value, 10) catch
             return error.InvalidValue,
     }
+}
+
+fn parse_ip4(text: []const u8) Error![4]u8 {
+    var bytes: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, text, '.');
+    for (&bytes) |*byte| {
+        byte.* = std.fmt.parseUnsigned(u8, parts.next() orelse "", 10) catch
+            return error.InvalidValue;
+    }
+    if (parts.next() != null) return error.InvalidValue;
+    assert(text.len >= 7);
+    return bytes;
 }
 
 fn parse_fixed(comptime size: usize, text: []const u8) Error![size]u8 {
@@ -220,6 +251,19 @@ test "proposer config: flags, defaults and validation" {
     try testing.expect(native.native_prover());
     try testing.expectEqual(@as(?u64, 3), native.ticks_max);
     try testing.expectError(error.UnknownFlag, parse(&.{"--nope"}));
+    try testing.expectEqual(@as(u16, 8080), dry.health_port);
+    try testing.expect(!dry.metrics_enabled);
+    const served = try parse(&(required ++ [_][]const u8{
+        "--dry-run",     "--metrics.enabled", "--metrics.port", "9300",
+        "--health.addr", "127.0.0.1",         "--health.port",  "0",
+    }));
+    try testing.expect(served.metrics_enabled);
+    try testing.expectEqual(@as(u16, 9300), served.metrics_port);
+    try testing.expectEqual(@as(u16, 0), served.health_port);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, served.health_addr);
+    try testing.expectError(error.InvalidValue, parse(&(required ++ [_][]const u8{
+        "--dry-run", "--health.addr", "127.0.0",
+    })));
     try testing.expectError(error.MissingValue, parse(&.{"--game-type"}));
     try testing.expectError(error.ZeroPollInterval, parse(&(required ++ [_][]const u8{
         "--dry-run", "--poll-interval", "0s",
