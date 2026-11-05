@@ -247,7 +247,7 @@ fn run_seed(seed: u64) !void {
 }
 
 test "history: proofs at every block of the window match an unwound state" {
-    // Two seeds keep Debug runtime low; the long fuzz run covers more.
+    // Two seeds keep Debug runtime low; raise the count locally for deeper runs.
     for (0..2) |seed| try run_seed(0x415700 + seed);
 }
 
