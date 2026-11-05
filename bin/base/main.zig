@@ -12,6 +12,7 @@ const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
 const snapshotter = @import("snapshotter.zig");
 const roxy = @import("roxy.zig");
+const basectl = @import("basectl.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -27,6 +28,7 @@ const usage =
     \\  load-test  send a seeded transaction workload, report inclusion latency
     \\  snapshotter  create, restore, or verify node datadir snapshots
     \\  roxy       JSON-RPC reverse proxy: load balancing, retries, method allowlist
+    \\  basectl    operator commands: sync-status, block, txpool, doctor, ...
     \\
 ;
 
@@ -40,6 +42,7 @@ test {
     _ = load_test;
     _ = snapshotter;
     _ = roxy;
+    _ = basectl;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -83,6 +86,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "roxy")) {
         std.process.exit(try roxy.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "basectl")) {
+        std.process.exit(try basectl.main(init, args[2..]));
     }
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);

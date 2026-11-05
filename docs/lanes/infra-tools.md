@@ -38,7 +38,7 @@ allocation after startup.
   resumes (port `withdrawer/src/*`). Sim/devnet test over the proof lane's contracts.
 - [x] `bin/base balance-monitor`: wire `src/utilities/balance_monitor` into a
   subcommand with metrics + health endpoints (`src/infra/balance_monitor` exporter).
-- [ ] `infra/basectl` core: `sync-status`, `block`, `txpool`, `batcher`, `p2p`,
+- [x] `infra/basectl` core: `sync-status`, `block`, `txpool`, `batcher`, `p2p`,
   `sequencer`, `conductor`, `proofs`, `upgrade-readiness`, `doctor` as plain-text CLI
   commands over the node/consensus/batcher RPCs (port `basectl/src/{commands,rpc}`).
   TUI is out of scope until the CLI commands are complete.
@@ -98,6 +98,29 @@ allocation after startup.
   -32600. Without an allowlist bodies are forwarded unparsed.
 - roxy flags: `BASE_ROXY_*` env prefix (base/base uses `ROXY_LISTEN_ADDR`); upstreams are
   `http://IPv4:PORT` only (no DNS, no TLS), matching the other `bin/base` tools.
+- basectl: each command is fetch (through `batcher/rpc`, so tests use a fake transport) ->
+  fixed-size report (owned `Text`/`List`, no allocation) -> text or `--json` render. Read-only
+  commands only; base/base's mutating actions (batcher start/stop, peer add/ban, txpool clear,
+  conductor transfer/pause, sequencer start/stop, prover propose/submit) are not ported.
+- basectl takes endpoints from flags (`--l1-rpc`, `--l2-rpc`, `--rollup-rpc`, `--batcher-rpc`,
+  `--conductor-rpc`, env `BASE_BASECTL_*`) defaulting to the devnet ports, instead of
+  base/base's named chain configs; an empty URL disables an endpoint.
+- basectl conductor/sequencer read one node (the given conductor + rollup RPC) rather than
+  discovering the cluster; the raft membership is still listed from
+  `conductor_clusterMembership`.
+- basectl reads that get JSON-RPC -32601 render "unavailable (method not served)" and never
+  fail a command on their own. Not served by needlefish yet: `admin_nodeInfo` (EL identity
+  in `p2p`) and every `conductor_*` method (no conductor server). `txpool` falls back from
+  `txpool_status` to counting `txpool_content`.
+- basectl proofs lists dispute games from the L1 `DisputeGameFactory` (`--factory`, eth_call
+  `gameCount`/`gameAtIndex`/`status`/`l2BlockNumber`/`rootClaim`); prover-service views are
+  out of scope.
+- basectl doctor checks: endpoint reachability, L1/L2 chain ids vs `optimism_rollupConfig`,
+  L1/L2/unsafe heads advancing over two samples (`--sample-interval-ms`), safe and finalized
+  lag (base/base 150/300 safe defaults; finalized 2000/7200 is ours), CL/EL peers (warn below
+  5, fail below `--peer-fail-below`, default 1 as base/base's fail-at-zero), batcher stopped,
+  and sequencer active vs conductor leadership. base/base's public-tip, bootnode, reth.toml,
+  and external reachability checks need config/services we do not have and are omitted.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -118,3 +141,7 @@ allocation after startup.
 - 2026-11-05: snapshotter (manifest codec + fuzz, tip check) and `base snapshotter
   create|restore|verify`; smoke: 100 MB node.db round-trips byte-identical, re-create reuses
   all chunks, a corrupted chunk fails verify, a stale node is skipped.
+- 2026-11-05: basectl core and `base basectl` (sync-status, block, txpool, batcher, p2p,
+  sequencer, conductor, proofs, upgrade-readiness, doctor) with canned-response tests,
+  seeded + std.testing fuzz of every decoder, and doctor pass/warn/fail tests; smoke-tested
+  against a running devnet (doctor caught a stopped L1 and a 1148-block safe lag).
