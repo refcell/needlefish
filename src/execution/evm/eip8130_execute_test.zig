@@ -226,3 +226,76 @@ test "eip8130 execute: 2D nonce channels advance and reject replays" {
     // The context getters saw the sender during the calls; transient slots reset after.
     try testing.expectEqual(@as(u256, 0), h.state.transient_load(native.tx_context_address, 0));
 }
+
+const fuzz = @import("../../testing/fuzz.zig");
+
+test "eip8130 execute: fuzz phases, gas, fees, and nonces" {
+    try fuzz.run_bytes({}, fuzz_execute, .{ .seed = 0x8130_e8ec, .iterations = 48 });
+}
+
+/// Reads bounded choices from the fuzz input; exhausted input reads as zero.
+const Cursor = struct {
+    input: []const u8,
+    index: usize = 0,
+
+    fn byte(cursor: *Cursor) u8 {
+        if (cursor.index >= cursor.input.len) return 0;
+        defer cursor.index += 1;
+        return cursor.input[cursor.index];
+    }
+
+    fn below(cursor: *Cursor, limit: u8) u8 {
+        std.debug.assert(limit > 0);
+        return cursor.byte() % limit;
+    }
+};
+
+/// Invariants: a rejection changes nothing; an included transaction moves exactly the
+/// payer's loss to the fee recipients, bills at most `gas_limit` plus the payer floor,
+/// and commits a prefix of its phases (all of them exactly when it succeeds).
+fn fuzz_execute(_: void, input: []const u8) anyerror!void {
+    var cursor = Cursor{ .input = input };
+    var h: Harness = undefined;
+    try setup(&h);
+    defer h.deinit(testing.allocator);
+    if (cursor.below(8) == 7) h.evm.block.op = .{ .upgrade = .denim };
+    const targets = [_]Address{ store_target, revert_target, primitives.address_from_int(0xe0) };
+    var phase_targets: [3][3]Address = undefined;
+    var phases: [3][]const Address = undefined;
+    const phase_count = 3 - cursor.below(4);
+    for (0..phase_count) |index| {
+        const call_count = 3 - cursor.below(4);
+        for (0..call_count) |call| phase_targets[index][call] = targets[cursor.below(3)];
+        phases[index] = phase_targets[index][0..call_count];
+    }
+    var tx = base_tx();
+    // Zero bytes (exhausted input) map to a valid transaction.
+    tx.gas_limit = 400_000 - @as(u64, cursor.byte()) * 1_500;
+    tx.max_fee_per_gas = 20 - cursor.below(16);
+    tx.max_priority_fee_per_gas = cursor.below(6);
+    tx.nonce_key = cursor.below(3);
+    tx.nonce_sequence = @intFromBool(cursor.below(8) == 7);
+    var built: Built = undefined;
+    try built.init(tx, phases[0..phase_count]);
+    const env = built.env();
+    const result = try transaction.transact(&h.evm, .osaka, &env);
+    switch (result) {
+        .invalid => |reason| {
+            try testing.expectEqual(transaction.Invalid.eip8130_rejected, reason);
+            try testing.expectEqual(funding, try balance(&h, dev_address));
+            try testing.expectEqual(@as(u64, 0), (try h.state.load(dev_address)).info.nonce);
+        },
+        .executed => |executed| {
+            const paid = funding - try balance(&h, dev_address);
+            const received = try balance(&h, coinbase) +
+                try balance(&h, op_stack.base_fee_vault) +
+                try balance(&h, op_stack.l1_fee_vault) +
+                try balance(&h, op_stack.operator_fee_vault);
+            try testing.expectEqual(paid, received);
+            try testing.expect(executed.gas_used <= tx.gas_limit + 100_000);
+            try testing.expect(executed.committed_phases <= phase_count);
+            const all = executed.committed_phases == phase_count;
+            try testing.expectEqual(all, executed.status == .success);
+        },
+    }
+}

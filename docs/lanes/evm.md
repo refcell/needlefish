@@ -93,11 +93,24 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   journaled unmetered `Store`); (2)+(3) `eip8130_auth.zig` (scopes, resolved actors,
   k1/P-256/WebAuthn/delegate dispatch with the canonical-ABI WebAuthn guard and low-s
   P-256, one-hop delegation without recursion, sender/payer `verify`, config-change
-  `authorize_changes` with channel sequences and the changes digest).
+  `authorize_changes` with channel sequences and the changes digest); (4)
+  `eip8130_apply.zig`; (5) `eip8130_tx.zig` + `eip8130_nonce.zig` (journaled 2D nonce
+  manager, expiring-nonce replay ring); (6) `eip8130_execute.zig` mirrors base
+  `crates/common/evm/src/eip8130.rs`: pre-call pipeline, payer pre-charge with L1/operator
+  fees, atomic call phases from one gas pool with the policy gate, settlement to the four
+  recipients, `Executed.committed_phases` for the receipt. Keystore (full config changes and
+  non-k1 actors) turns on at Zenith; Everest runs `authorize_without_keystore`.
+  Left: `simulate`/gas estimation (`Eip8130Executor::simulate`); sponsored-payer and
+  keystore end-to-end tests; the node lane must map consensus 0x79 envelopes to
+  `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw }`.
 - [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
   compare with revm on the same machine; profile call-frame and keccak paths.
 
 ## Decisions
+- EIP-8130 pre-call reads warm the accounts and slots they touch (base's gas-free journal
+  provider loads through the journal), so later calls see them warm. Code installs from
+  account changes are journaled (`State.replace_code` for delegation indicators) so a
+  rejected transaction discards them.
 - Push loop under load: main takes about one commit a minute while a full `zig build test`
   takes ~10 minutes on the shared machine, so a retest after every rejected push never wins.
   The loop runs the full test and tidy once on the rebased tree; after a rejection it
@@ -142,6 +155,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: EIP-8130 execution: nonce manager storage, journaled code installs, the
+  enshrined executor (`eip8130_execute.zig`), end-to-end tests and an executor fuzz.
 - 2026-11-05: B-20 core, Asset/Stablecoin V1 tokens, and factory native precompiles.
 - 2026-11-05: native string/bytes storage (`native_storage.zig`) with Cobalt tail cleanup.
 - 2026-11-05: PolicyRegistry V2/V3 (composite and inverted policies).
