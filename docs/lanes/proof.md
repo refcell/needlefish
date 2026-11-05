@@ -40,11 +40,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [ ] `proof/e2e-2`: extend the e2e: epoch change across L1 blocks, span batches, blob
   batches (l1-blob through the host), a Holocene deposit-only retry (invalid user tx in a
   batch), and intermediate output roots (boot key 9).
-- [ ] `proof/host`: KV stores (mem, disk via io, split, boot), online backend that
-  serves hints by fetching from L1/L2/beacon RPC and records preimages, offline backend
-  that replays them, server loop over the preimage channel (port `host/src/*`).
-- [ ] `bin/base proof`: run host + client in one process (native mode) against devnet
-  RPCs for a given L2 block; record a witness file and replay it offline.
+- [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
+  canonical archive, offline replay. Left: the RPC-backed `Source` (L1/L2 execution
+  RPC + beacon blobs + `debug_executePayload` witness) and a server loop over fds for a
+  separate client process.
+- [ ] `bin/base proof`: `replay <archive>` done. Left: `run` (native mode against
+  devnet RPCs for an L2 block) that records the archive.
 - [ ] `proof/rpc` + `proof/contracts`: typed L1/L2/rollup clients with caching, ABI
   bindings for DisputeGameFactory, AnchorStateRegistry, DelayedWETH (port `rpc/`,
   `contracts/`). ABI encode/decode fuzz tests.
@@ -111,6 +112,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `base proof replay <archive>`: offline client run over a recorded archive.
 - 2026-11-05: host: canonical preimage archive for record/replay (strict decoder, fuzz).
 - 2026-11-05: `proof/e2e` landed: real derive + execute of 3 L2 blocks through the host.
 - 2026-11-05: host: hint handler over a chain `Source` (headers, list tries, blobs,

@@ -24,6 +24,40 @@ const Hash = [32]u8;
 const Allocator = std.mem.Allocator;
 const L1BlobSchedule = protocol.l1_info.L1BlobSchedule;
 
+/// Limits sized for real L2 blocks (the CLI default); tests pass smaller ones.
+pub const default_builder_config: executor.builder.Config = .{
+    .sparse = .{
+        .nodes_max = 1 << 18,
+        .node_bytes_max = 1 << 27,
+        .codes_max = 4096,
+        .code_bytes_max = 1 << 27,
+        .headers_max = 256,
+        .trie_nodes_max = 1 << 19,
+        .storage_tries_max = 1 << 14,
+    },
+    .changeset = .{
+        .accounts_max = 1 << 16,
+        .storage_max = 1 << 18,
+        .codes_max = 4096,
+        .code_bytes_max = 1 << 26,
+    },
+    .executor = .{
+        .scratch_bytes = 1 << 26,
+        .transactions_max = 1 << 14,
+        .evm = .{ .memory_bytes_max = 1 << 26, .code_arena_bytes = 1 << 26 },
+        .limits = .{
+            .accounts_max = 1 << 16,
+            .slots_max = 1 << 18,
+            .transient_slots_max = 1 << 14,
+            .journal_entries_max = 1 << 20,
+            .logs_max = 1 << 16,
+            .log_data_bytes_max = 1 << 24,
+            .code_bytes_max = 1 << 26,
+        },
+    },
+    .resolver = .{ .bytes_max = 1 << 28, .entries_max = 1 << 20 },
+};
+
 pub const Options = struct {
     builder: executor.builder.Config,
     resolver: mpt.oracle_resolver.Options = .{ .bytes_max = 64 << 20, .entries_max = 1 << 18 },

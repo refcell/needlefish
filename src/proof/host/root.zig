@@ -6,6 +6,7 @@ const std = @import("std");
 pub const store = @import("store.zig");
 pub const handler = @import("handler.zig");
 pub const archive = @import("archive.zig");
+pub const offline = @import("offline.zig");
 
 pub const Store = store.Store;
 pub const BootValues = store.BootValues;
