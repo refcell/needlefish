@@ -132,9 +132,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (or checkpoint the history store), bounded by the window.
   (`Database.history_rebuild_window`, `Config.history_rebuild_on_open`; rebuild from
   retained changesets, see Decisions; `db/database_history_test.zig`)
-- [ ] Linux io_uring run of the storage engine: run `IoStorage` engine/database tests under
+- [x] Linux io_uring run of the storage engine: run `IoStorage` engine/database tests under
   `just test-linux` (Docker) and fix any backend differences (fsync vs fdatasync, short
-  writes); record results.
+  writes); record results. (all green on io_uring, no fixes needed; see Decisions and Log)
 - [x] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
   hit/miss latency on 100k accounts and the overlay read path; compare with trie `get`.
   (`db/read_bench.zig`, `-- db/read`; docs/PERF.md "db reads")
@@ -568,6 +568,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   shape-checks the surviving sibling before changing anything, so `WitnessIncomplete` leaves
   the trie unchanged.
 
+- Linux io_uring storage run: no backend fix was needed. `IORING_OP_FSYNC` is issued with
+  flags 0 (full fsync, not `IORING_FSYNC_DATASYNC`), so file-size growth from appending
+  writes is durable, matching `F_FULLFSYNC` on Darwin. The file is opened buffered (no
+  `O_DIRECT`), so there is no alignment requirement beyond the 4 KiB sector contract, and no
+  preallocation: reads past end of file zero-fill. Short reads/writes are resubmitted by
+  `IoStorage` and covered by the flaky-IO test. The real-file test ("engine over the os
+  backend on a real file") already runs on both io_uring and kqueue, so no new test.
+
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
   all ethereum/tests TrieTests vectors pass.
@@ -706,3 +714,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: read-path bench (`db/read_bench.zig`): flat-table reads 14-41 ns, the
   vtable adds ~1-3 ns except `basic` hits (+~310 ns keccak for `has_storage`, backlog);
   `StateTrie` reads are dominated by keying keccak (300 / 450 ns vs 23 / 34 ns prehashed).
+- 2026-11-05: Linux io_uring run of the storage engine (Docker, aarch64 kernel 6.8, Zig
+  0.17.1, `-Drequire-io-uring=true`, so a missing ring fails instead of skipping). The
+  `just test-linux` recipe with `-Dtest-filter=<f>` per filter and caches in the container
+  (`ZIG_GLOBAL_CACHE_DIR=/tmp/zg ZIG_LOCAL_CACHE_DIR=/tmp/zc`): `zig build test
+  -Drequire-io-uring=true -Dtest-filter=<f> --summary all` for f in io_storage, database,
+  engine, journal, superblock, checkpoint, `io:`: all exit 0, 0 skipped (122, 130, 217, 126,
+  123, 129, 126 tests; database 6 s, engine 4 s). Includes the real-file
+  format/commit/checkpoint/reopen-on-a-fresh-fd test over io_uring. No code changes.
