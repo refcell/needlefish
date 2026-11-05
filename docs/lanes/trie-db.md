@@ -48,6 +48,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   restore the head. Bounded scratch; refuses blocks outside retention.
 - [ ] `debug_executionWitness(block)` handler in `rpc/debug.zig` (small additive integration
   edit in the rpc lane) returning `{state, codes, keys, headers}` as hex arrays.
+- [ ] Feed the history store from the durable database: every head move (apply/unwind) updates
+  `history.Store`; rebuilt with `reset` at open; `Database.proof_at(block, address, slots)`
+  for `eth_getProof` with a block tag inside the window.
+- [ ] Witness codec for the proof lane: canonical binary encoding of `Witness` (length-prefixed
+  sections, sorted dedup nodes/codes), strict fuzzed decoder, plus `keccak256(preimage)` keyed
+  iteration for the preimage oracle (keccak preimage type).
+- [ ] Witness size + build-time benchmarks (nodes, bytes, us per block) for 1k-account and
+  storage-heavy blocks; record in docs/PERF.md.
+- [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
+  blocks (committed small vectors); document any intended differences.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
