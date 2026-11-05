@@ -43,7 +43,11 @@ fn load_and_hash(text: []const u8) ![32]u8 {
     const parsed = try genesis.parse(testing.allocator, text);
     defer parsed.deinit();
     var db = try StateDb.init(testing.allocator, .{
-        .trie = .{ .accounts_max = 256, .account_nodes_max = 1 << 12, .storage_nodes_max = 1 << 12 },
+        .trie = .{
+            .accounts_max = 256,
+            .account_nodes_max = 1 << 12,
+            .storage_nodes_max = 1 << 12,
+        },
         .code_bytes_max = 1 << 18,
         .codes_max = 64,
         .undo_entries_max = 16,
