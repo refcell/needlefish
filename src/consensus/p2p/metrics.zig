@@ -9,6 +9,8 @@
 //! exported because the state machines have no wall clock. `gossip_event{type="not_supported"}`
 //! stays 0: peers without gossipsub fail stream negotiation and are closed by the transport.
 //! Discovery: `discovery_dropped{closed}` stays 0 (the discovered queue cannot close).
+//! Local additions (not in base/base), under `base_node_p2p_`: identify peerstore size and
+//! evictions, bootstore records, and bootstore file events.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -94,6 +96,7 @@ fn type_labels(comptime names: []const [:0]const u8) [names.len][1]metrics.Label
 }
 
 /// Transport counters `update` reads (a copy of `Transport(IO).Stats`).
+/// Transport and network-level counters that live outside `Service`.
 pub const TransportStats = struct {
     accepted: u64 = 0,
     dialed: u64 = 0,
@@ -101,6 +104,19 @@ pub const TransportStats = struct {
     closed: u64 = 0,
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
+    bootstore_records: u32 = 0,
+    /// Indexed like `bootstore_events`.
+    bootstore_events: [bootstore_events.len]u64 = @splat(0),
+};
+
+/// Bootstore file events: `store_file.Stats` fields plus contents that were not valid JSON.
+pub const bootstore_events = [_][]const u8{
+    "open_error", "load", "load_error", "save", "save_error", "save_skipped", "invalid",
+};
+const bootstore_event_labels = labels: {
+    var out: [bootstore_events.len][1]metrics.Label = undefined;
+    for (bootstore_events, &out) |name, *label| label.* = .{.{ .name = "type", .value = name }};
+    break :labels out;
 };
 
 pub const Metrics = struct {
@@ -130,11 +146,15 @@ pub const Metrics = struct {
     block_topic_blocked_total: [versions.len * directions.len]Counter = @splat(.{}),
     peer_scores: metrics.Histogram = .init(&observations.score_bounds),
     connection_duration: metrics.Histogram = .init(&observations.duration_bounds_s),
+    peerstore_peers: Gauge = .{},
+    peerstore_evictions: Counter = .{},
+    bootstore_records: Gauge = .{},
+    bootstore_file: [bootstore_events.len]Counter = @splat(.{}),
 
     pub const entries_count = 10 + discovery_events.len + discovery_drops.len +
         4 * versions.len + connection_types.len + reasons.len + dial_errors.len +
         inbound_errors.len + 2 + gossip_events.len + retirable_versions +
-        versions.len * directions.len + rpc.method_count;
+        versions.len * directions.len + rpc.method_count + 3 + bootstore_events.len;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -198,7 +218,27 @@ pub const Metrics = struct {
             "Bytes sent on p2p TCP connections",
             &self.p2p_bytes_sent,
         );
+        try self.register_stores(registry);
         assert(registry.count - count_before == entries_count);
+    }
+
+    fn register_stores(self: *Metrics, registry: anytype) metrics.RegisterError!void {
+        const count_before = registry.count;
+        try registry.gauge("base_node_p2p_peerstore_peers", "Peers in the identify " ++
+            "peerstore, connected or not", &self.peerstore_peers);
+        try registry.counter("base_node_p2p_peerstore_evictions", "Peers evicted from the " ++
+            "full identify peerstore", &self.peerstore_evictions);
+        const records = &self.bootstore_records;
+        try registry.gauge("base_node_p2p_bootstore_records", "ENRs in the bootstore", records);
+        for (&self.bootstore_file, &bootstore_event_labels) |*counter, *labels| {
+            try registry.register(.{
+                .name = "base_node_p2p_bootstore_file",
+                .help = "Bootstore file events by type",
+                .labels = labels,
+                .metric = .{ .counter = counter },
+            });
+        }
+        assert(registry.count - count_before == 3 + bootstore_events.len);
     }
 
     /// discv5 metrics, scope `base_node_disc` like base/base `disc/src/metrics.rs`.
@@ -353,6 +393,12 @@ pub const Metrics = struct {
             gauge.set(@intCast(count));
         }
         copy_histogram(&self.connection_duration, &service.stats.connection_durations);
+        self.peerstore_peers.set(service.peerstore.count);
+        store(&self.peerstore_evictions, service.peerstore.evictions);
+        self.bootstore_records.set(transport.bootstore_records);
+        for (&self.bootstore_file, transport.bootstore_events) |*counter, count| {
+            store(counter, count);
+        }
         assert(self.block_validation_total.get() >= self.block_validation_success.get());
     }
 };

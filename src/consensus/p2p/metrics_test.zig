@@ -37,7 +37,16 @@ test "p2p metrics: register, update, and render" {
     cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
 
     _ = fixture.call("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"opp2p_peerCount\"}");
-    cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
+    const identified: @import("libp2p/identify.zig").Identify = .{ .agent_version = "x" };
+    fixture.service.on_identified(0, &identified);
+    var network: p2p_metrics.TransportStats = .{
+        .accepted = 1,
+        .dialed = 2,
+        .bytes_received = 120,
+        .bootstore_records = 5,
+    };
+    network.bootstore_events[3] = 2; // save
+    cells.update(fixture.service, network);
     var buffer: [32 * 1024]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
     try registry.write_prometheus(&out);
@@ -51,6 +60,11 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_dial_peer_error{type=\"blocked_subnet\"} 2\n");
     try expect_contains(text, "base_node_inbound_connection_error{type=\"blocked_peer\"} 0\n");
     try expect_contains(text, "base_node_p2p_bytes_received 120\n");
+    try expect_contains(text, "base_node_p2p_peerstore_peers 1\n");
+    try expect_contains(text, "base_node_p2p_peerstore_evictions 0\n");
+    try expect_contains(text, "base_node_p2p_bootstore_records 5\n");
+    try expect_contains(text, "base_node_p2p_bootstore_file{type=\"save\"} 2\n");
+    try expect_contains(text, "base_node_p2p_bootstore_file{type=\"invalid\"} 0\n");
     try expect_contains(text, "# TYPE base_node_peer_scores histogram\n");
     try expect_contains(text, "base_node_disc_discovery_peer_count ");
     try expect_contains(text, "base_node_disc_discovery_event{type=\"discovered\"} ");

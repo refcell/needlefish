@@ -42,10 +42,11 @@ behind a small interface and switch later.
   `Network.deinit_after_crash` (`Transport`/`StoreFile.forget_after_crash`: nothing is
   closed twice), and require it to reload its bootstore, reconnect, and gossip both ways.
   (The peer may also redial; the clean-restart DST isolates the bootstore path.)
-- [ ] Devnet: run both CLs with discovery + bootstore (ENR bootnode instead of enode) once
-  the batcher-devnet lane agrees; verified by hand on 2026-11-05 (see above).
-- [ ] Peerstore/bootstore observability: local metrics for peerstore size and evictions
-  and bootstore file save/load errors (not in base/base; keep names under `base_node_p2p_`).
+- [x] Devnet discovery: handed to batcher-devnet as a backlog note with the exact
+  `devnet.sh` change (their lane owns the script); verified by hand on 2026-11-05.
+- [x] Peerstore/bootstore observability (local, not in base/base):
+  `base_node_p2p_peerstore_peers`, `_peerstore_evictions`, `_bootstore_records`,
+  `_bootstore_file{type=open_error|load|load_error|save|save_error|save_skipped|invalid}`.
 - [x] Real-process interop on the all-Zig devnet (`just devnet up`, kqueue sockets),
   checked by hand on 2026-11-05:
   1. As scripted (enode bootnode, discovery off): the verifier CL's unsafe head tracked
@@ -386,3 +387,5 @@ behind a small interface and switch later.
 - 2026-11-05: devnet real-process interop checked (enode, discv5 ENR, bootstore restart).
 - 2026-11-05: opp2p_* served by the consensus node RPC via p2p.rpc.Merged.
 - 2026-11-05: crash-restart DST under packet loss.
+
+- 2026-11-05: peerstore/bootstore metrics; devnet discovery note for batcher-devnet.

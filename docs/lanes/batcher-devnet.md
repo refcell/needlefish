@@ -55,6 +55,14 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/rpc`: JSON-RPC client over an injected transport (HTTP in bin, canned in tests).
 - [x] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
+- [ ] (from p2p lane) Run the CLs with discv5 + bootstore instead of an enode-only link,
+  like a real network. In `start_consensus`: drop `--p2p.no-discovery --p2p.no-bootstore`
+  from `p2p`, pass the sequencer's `enr=` (from its "p2p listening" log line) as the
+  verifier's `--p2p.bootnodes`, and give each CL `--p2p.bootstore "$DIR/<name>/bootstore.json"`.
+  Verified by hand on 2026-11-05: the verifier finds the sequencer over UDP and its unsafe
+  head tracks it (see `docs/lanes/p2p.md`). `opp2p_peerCount` on the verifier RPC now
+  answers, which a smoke step can assert (`connectedGossip >= 1`). The p2p lane will not
+  edit `devnet.sh`; take it whenever it suits the devnet contract.
 - [x] `batcher/admin`: base/base admin JSON-RPC (start/stop/flush/status/throttle info) and
   `--stopped`, `--admin-port`, `--admin-addr`; one event loop serves admin + metrics.
 - [x] `batcher`: `--num-confirmations` (free a slot only N blocks after inclusion), `--min-tip-cap`,

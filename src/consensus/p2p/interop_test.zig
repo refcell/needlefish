@@ -354,6 +354,11 @@ test "p2p interop: a restarted node finds its peer again from the bootstore file
     try testing.expectEqual(@as(u64, 0), restarted.bootstore_invalid);
     try testing.expect(restarted.store.?.count >= 1);
     try testing.expectEqual(@as(u32, 1), restarted.peer_count());
+    var cells: @import("metrics.zig").Metrics = .{};
+    restarted.update_metrics(&cells);
+    try testing.expectEqual(@as(u64, 1), cells.bootstore_file[1].get()); // load
+    try testing.expect(cells.bootstore_records.get() >= 1);
+    try testing.expect(cells.peerstore_peers.get() >= 1);
     var prng = Prng.init(7);
     try pair.exchange(1, 1, prng.random());
 }

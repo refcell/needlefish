@@ -373,14 +373,25 @@ pub fn Network(comptime IO: type) type {
         /// Copies service and transport state into `metrics` (call before each scrape).
         pub fn update_metrics(self: *const Self, metrics: *metrics_module.Metrics) void {
             const stats = self.transport.stats;
-            metrics.update(self.service, .{
+            var network: metrics_module.TransportStats = .{
                 .accepted = stats.accepted,
                 .dialed = stats.dialed,
                 .dial_failures = stats.dial_failures,
                 .closed = stats.closed,
                 .bytes_received = stats.bytes_received,
                 .bytes_sent = stats.bytes_sent,
-            });
+                .bootstore_records = if (self.store) |*store| store.count else 0,
+            };
+            if (self.bootstore_file) |*file| {
+                const file_stats = file.stats;
+                network.bootstore_events = .{
+                    file_stats.open_errors, file_stats.loads,
+                    file_stats.load_errors, file_stats.saves,
+                    file_stats.save_errors, file_stats.saves_skipped,
+                    self.bootstore_invalid,
+                };
+            }
+            metrics.update(self.service, network);
         }
     };
 }
