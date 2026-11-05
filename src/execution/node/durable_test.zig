@@ -196,6 +196,34 @@ test "durable: blocks survive a crash and the node continues from the recovered 
     try testing.expectEqualSlices(u8, &third.bytes, &h.head().bytes);
 }
 
+test "durable: a restart resumes on the forkchoice head, not an unadopted block" {
+    const h = try Harness.create(5);
+    defer h.destroy();
+    var buffers: [2][256]u8 = undefined;
+    try fixture.submit(h.node.?, 1, 0, 5, &buffers[0]);
+    const first = try h.build_head(h.head(), 12, 0xfe);
+    const root = try h.node.?.db.root();
+    // Built (getPayload) but never adopted by a forkchoice update: the sequencer crashed
+    // in between. The state is already back on the head.
+    try fixture.submit(h.node.?, 1, 1, 7, &buffers[1]);
+    const orphan = try fixture.build(h.node.?, first, 24, 0xfe);
+    try testing.expectEqualSlices(u8, &first.bytes, &h.node.?.chain.state_hash);
+    try testing.expectEqualSlices(u8, &root, &(try h.node.?.db.root()));
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &first.bytes, &h.head().bytes);
+    try testing.expectEqualSlices(u8, &root, &(try h.node.?.db.root()));
+    try testing.expect(h.node.?.chain.store.ref(orphan.bytes) == null);
+    // Adopting a built block re-applies it; that head survives a restart.
+    const second = try fixture.build(h.node.?, first, 24, 0xfd);
+    try testing.expectEqualSlices(u8, &first.bytes, &h.node.?.chain.state_hash);
+    const version = @import("../engine/root.zig").types.forkchoice_version(fixture.spec, 24);
+    _ = try h.node.?.engine.forkchoice_updated(version, fixture.forkchoice(second), null);
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &second.bytes, &h.head().bytes);
+}
+
 test "durable: a reorg moves the shared state through stored changesets" {
     const h = try Harness.create(2);
     defer h.destroy();

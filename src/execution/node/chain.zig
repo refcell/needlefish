@@ -408,6 +408,7 @@ pub const Chain = struct {
             chain.db.rollback() catch unreachable;
             return .{ .invalid = @errorName(err) };
         };
+        chain.settle_head();
         return .valid;
     }
 
@@ -438,6 +439,7 @@ pub const Chain = struct {
             else => return error.InternalError,
         };
         chain.remember_build(entry);
+        chain.settle_head();
     }
 
     fn remember_build(chain: *Chain, entry: Built) void {
@@ -844,6 +846,19 @@ pub const Chain = struct {
     /// Brings `db` to the post-state of `target`: roll back to the common ancestor with
     /// the current state, then re-execute stored blocks up to `target`. Checks first, so
     /// a failure leaves the state where it was.
+    /// Durable mode: the database head is the forkchoice head at rest, so a restart
+    /// resumes there (as reth restores its persisted canonical head) and never on a block
+    /// that was built or imported but not made canonical. A stored non-head block's
+    /// changeset is unwound now and re-applied when a forkchoice update adopts it. A failed
+    /// move keeps the state where it is (best effort; the next state move retries).
+    fn settle_head(chain: *Chain) void {
+        if (chain.journal == null) return;
+        const head = chain.forkchoice.head_block_hash.bytes;
+        if (std.mem.eql(u8, &chain.state_hash, &head)) return;
+        chain.move_state(head) catch return;
+        assert(std.mem.eql(u8, &chain.state_hash, &head));
+    }
+
     pub fn move_state(chain: *Chain, target: Hash) Error!void {
         if (std.mem.eql(u8, &target, &chain.state_hash)) return;
         if (chain.journal) |journal| {
@@ -1007,10 +1022,11 @@ pub const Chain = struct {
         const transactions = chain.transactions_buffer[0..count];
         chain.seal(&child, transactions, attributes.withdrawals, &executed);
         try chain.store_block(&child, transactions, attributes.withdrawals, &executed);
+        const block_hash = child.hash();
         return .{
             .id = id,
             .timestamp = attributes.timestamp,
-            .block_hash = child.hash(),
+            .block_hash = block_hash,
             .block_value = executed.fees,
         };
     }
