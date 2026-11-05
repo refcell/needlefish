@@ -347,6 +347,16 @@ pub const tee_session_label = "tee/aws_nitro";
 /// base/base `ProofSessionId::derive`: UUIDv5 (OID namespace) of
 /// `namespace ":" proof_subtype ":" root`.
 pub fn derive_session_id(namespace: []const u8, proof_subtype: []const u8, root: Hash) SessionId {
+    return derive_session_id_components(namespace, proof_subtype, &.{&root});
+}
+
+/// base/base `ProofSessionId::derive_from_components`: UUIDv5 (OID namespace) of
+/// `namespace (":" component)*` with `proof_subtype` as the first component.
+pub fn derive_session_id_components(
+    namespace: []const u8,
+    proof_subtype: []const u8,
+    components: []const []const u8,
+) SessionId {
     assert(namespace.len > 0);
     assert(proof_subtype.len > 0);
     var hasher = std.crypto.hash.Sha1.init(.{});
@@ -354,8 +364,10 @@ pub fn derive_session_id(namespace: []const u8, proof_subtype: []const u8, root:
     hasher.update(namespace);
     hasher.update(":");
     hasher.update(proof_subtype);
-    hasher.update(":");
-    hasher.update(&root);
+    for (components) |component| {
+        hasher.update(":");
+        hasher.update(component);
+    }
     var digest: [20]u8 = undefined;
     hasher.final(&digest);
     var uuid: [16]u8 = digest[0..16].*;

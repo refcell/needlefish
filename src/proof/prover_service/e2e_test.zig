@@ -295,3 +295,48 @@ test "prover service e2e: worker abandons an unsupported job and lists over the 
     try testing.expectError(error.Rejected, client.prove_block_range(&request));
     try testing.expectEqual(protocol.code.failed_precondition, client.last_code);
 }
+
+test "prover service e2e: the challenger prover requests and receives a TEE proof" {
+    const challenger_chain = @import("../challenger/chain.zig");
+    const challenger_prover = @import("challenger_prover.zig");
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var adapter: challenger_prover.ChallengerProver(io.SimIo) = .{
+        .client = &harness.nodes[0].client,
+    };
+    const prover = adapter.prover();
+    const game: challenger_chain.Address = @splat(0x9a);
+    const request: challenger_chain.ProofRequest = .{ .tee = .{
+        .l1_head = @splat(0x40),
+        .l1_head_number = 40,
+        .agreed_l2_head_hash = @splat(0x0a),
+        .agreed_l2_output_root = @splat(0x0b),
+        .claimed_l2_output_root = @splat(0x0c),
+        .claimed_l2_block_number = 110,
+        .proposer = @splat(0x0d),
+        .schedule_l2_block_number = 110,
+        .intermediate_block_interval = 10,
+    } };
+    const handle = try prover.request(game, 3, request);
+    try testing.expect(try prover.poll(handle) == .queued);
+    // The same (game, index, kind) maps to the same service session.
+    const again = try prover.request(game, 3, request);
+    try testing.expect(again != handle);
+    try testing.expectEqual(@as(u32, 1), harness.store.count());
+    const clock = Clock.of(io.SimIo, &harness.client_io);
+    var quick: FakeBackend = .{ .polls_needed = 1 };
+    const client = &harness.nodes[1].client;
+    var worker: Worker = .init(client, quick.backend(), clock, worker_config("c"));
+    var ticks: u32 = 0;
+    while (worker.stats.submitted == 0 and ticks < 20) : (ticks += 1) {
+        harness.advance(std.time.ns_per_s);
+        worker.tick();
+    }
+    try testing.expectEqual(@as(u64, 1), worker.stats.submitted);
+    const status = try prover.poll(again);
+    const result = status.succeeded.?;
+    try testing.expectEqual(@as(u8, 0x0c), result.tee.output_root[0]);
+    try testing.expectEqual(@as(usize, 65), result.tee.signature.len);
+    // The handle whose slot was reused is stale.
+    try testing.expectError(error.ProverUnavailable, prover.poll(handle + 64));
+}
