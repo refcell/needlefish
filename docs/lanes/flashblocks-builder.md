@@ -25,7 +25,7 @@ can drive the builder and the flashblocks consumer.
 - [x] `builder/core` flashblocks timing: per-block deadline schedule (interval,
   leeway, first-flashblock offset; port `deadline.rs`, `config.rs`), pure state machine
   over injected time, exhaustive + fuzz tests of schedule invariants.
-- [ ] `builder/core` best-transactions iterator: priority-ordered txpool view that
+- [x] `builder/core` best-transactions iterator: priority-ordered txpool view that
   skips already-included and invalid txs across flashblocks (port `best_txs.rs`).
 - [ ] `builder/core` flashblock generator: build index 0 (deposits + system txs) then
   incremental flashblocks from the pending state, each producing a delta (txs,
@@ -53,6 +53,9 @@ can drive the builder and the flashblocks consumer.
   sequence for a block replays to exactly the sealed block.
 
 ## Decisions
+- Best-txs walks one `Pool.select` snapshot per flashblock; committed hashes persist per
+  block. Resting predicates/parking (base/base `RestingPredicateMode`, default off) are
+  deferred. The rejection cache is FIFO with TTL (moka TinyLFU approximated).
 - Publisher replays inside `on_open` on the event loop, so replay and live messages
   cannot interleave and base/base's dedup set is unnecessary. A subscriber whose replay
   backlog overflows its send buffer is closed (base/base: replay send timeout). Slow
@@ -76,3 +79,4 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: builder/core timing schedule (deadline.rs, config.rs) with exhaustive + fuzz tests.
 - 2026-11-05: `builder/publish` replay ring + `Publisher(IO)` over the ws server with resume
   replay, base/base metrics, and a SimIo DST (resets, partitions, floods, reconnects).
+- 2026-11-05: `builder/core` best-transactions view and rejection cache, model-checked fuzz.
