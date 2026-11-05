@@ -231,6 +231,13 @@ pub const Pool = struct {
         return std.mem.order(u8, left, right) == .lt;
     }
 
+    /// The sender index of `address`, when it has pool transactions.
+    pub fn sender_of(pool: *const Pool, address: Address) ?u32 {
+        const index = pool.by_sender.get(address) orelse return null;
+        assert(pool.senders[index].count > 0);
+        return index;
+    }
+
     pub fn sender_address(pool: *const Pool, sender: u32) Address {
         assert(sender < pool.senders.len);
         assert(pool.senders[sender].count > 0);

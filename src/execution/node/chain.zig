@@ -177,6 +177,9 @@ pub const Chain = struct {
     /// Times the window was rebuilt from scratch (reorgs, moves, full store).
     history_resets: u64 = 0,
     da_limits: DaLimits = .{},
+    /// `miner_setGasLimit`: gas the builder fills with pool transactions, capped by the
+    /// block gas limit; 0 fills the whole block (base/base `GasLimitConfig`).
+    gas_limit_target: u64 = 0,
     staging: []u8,
     select_buffer: []*const txpool.Tx,
     transactions_buffer: [][]const u8,
@@ -771,9 +774,12 @@ pub const Chain = struct {
         var da_used_bytes: u64 = 0;
         const limit_da = chain.spec.mode == .l2;
         const selected = pool.select(env.base_fee, chain.select_buffer);
+        const target = chain.gas_limit_target;
+        const gas_limit = if (target == 0) env.gas_limit else @min(target, env.gas_limit);
+        assert(gas_limit <= env.gas_limit);
         for (chain.select_buffer[0..selected]) |tx| {
             if (count == chain.transactions_buffer.len) break;
-            if (building.gas_used + tx.gas_limit > env.gas_limit) continue;
+            if (building.gas_used + tx.gas_limit > gas_limit) continue;
             const raw = try canonical_form(tx.raw, chain.build_bytes[chain.build_len..]);
             const da_bytes = if (limit_da) flz.estimated_size_bytes(raw) else 0;
             if (!chain.da_limits.admits(da_used_bytes, da_bytes)) continue;

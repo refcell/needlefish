@@ -497,6 +497,61 @@ test "eth: txpool content, contentFrom and inspect list pending and queued by se
     );
 }
 
+test "eth: miner DA getter and gas limit target cap block building" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try testing.expectEqualStrings(
+        "\"result\":[\"0x0\",\"0x0\"]",
+        try h.request("miner_getMaxDASize", "[]"),
+    );
+    _ = try h.request("miner_setMaxDASize", "[\"0x100\",\"0x1000\"]");
+    try testing.expectEqualStrings(
+        "\"result\":[\"0x100\",\"0x1000\"]",
+        try h.request("miner_getMaxDASize", "[]"),
+    );
+    // Room for two 21000-gas transfers: the third waits for the next block.
+    const target = try h.request("miner_setGasLimit", "[\"0xa410\"]");
+    try testing.expectEqualStrings("\"result\":true", target);
+    var buffer: [256]u8 = undefined;
+    for (0..3) |nonce| try fixture.submit(h.node, 1, nonce, 1, &buffer);
+    const first = try h.mine(12);
+    const header = h.node.chain.header(first.bytes).?;
+    try testing.expectEqual(@as(u64, 42_000), header.gas_used);
+    try testing.expectEqual(fixture.spec.gas_limit, header.gas_limit);
+    _ = try h.request("miner_setGasLimit", "[\"0x0\"]");
+}
+
+test "eth: base_transactionStatus and admin drop methods" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 1, &buffer);
+    try fixture.submit(h.node, 2, 0, 1, &buffer);
+    try fixture.submit(h.node, 2, 1, 1, &buffer);
+    const pool = &h.node.pool;
+    var iterator = pool.sender_transactions(pool.sender_of(fixture.address_of(1)).?);
+    const hash = iterator.next().?.tx.hash;
+    var body: [256]u8 = undefined;
+    const status_format =
+        request_prefix_format ++ "base_transactionStatus\",\"params\":[\"0x{x}\"]}}";
+    var status_buffer: [256]u8 = undefined;
+    const status_body = try std.fmt.bufPrint(&status_buffer, status_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(status_body), "{\"status\":\"Known\"}");
+    const drop_format = request_prefix_format ++ "admin_dropTransaction\",\"params\":[\"0x{x}\"]}}";
+    const drop_body = try std.fmt.bufPrint(&body, drop_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(drop_body), "\"result\":true");
+    try expect_contains(try h.request_runtime(drop_body), "\"result\":false");
+    try expect_contains(try h.request_runtime(status_body), "{\"status\":\"Unknown\"}");
+    const two = fixture.address_of(2);
+    const sender_format =
+        request_prefix_format ++ "admin_dropSenderTransactions\",\"params\":[\"0x{x}\"]}}";
+    const sender_body = try std.fmt.bufPrint(&body, sender_format, .{&two.bytes});
+    const dropped = try h.request_runtime(sender_body);
+    try testing.expectEqual(@as(usize, 2), count_of(dropped, "\"0x"));
+    try testing.expectEqual(@as(u32, 0), pool.count());
+    try expect_contains(try h.request_runtime(sender_body), "\"result\":[]");
+}
+
 fn txpool_scenario(seed: u64) !void {
     var prng = Prng.init(seed);
     const h = try Harness.create();
@@ -568,6 +623,11 @@ const method_names = [_][]const u8{
     "txpool_content",
     "txpool_contentFrom",
     "txpool_inspect",
+    "miner_getMaxDASize",
+    "miner_setGasLimit",
+    "base_transactionStatus",
+    "admin_dropTransaction",
+    "admin_dropSenderTransactions",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

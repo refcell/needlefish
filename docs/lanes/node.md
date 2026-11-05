@@ -28,6 +28,14 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
 - [x] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
 - [x] Persistence + restart, reorg handling via forkchoice.
+- [x] rpc: miner_getMaxDASize, miner_setGasLimit (builder fill target), base_transactionStatus,
+  admin_dropTransaction, admin_dropSenderTransactions.
+- [ ] rpc: eth_config (EIP-7910 fork config: current/next/last, blob schedule, precompiles,
+  system contracts).
+- [ ] rpc: eth_createAccessList (needs an access-list inspector from the evm).
+- [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
+  timeout; needs async handler support in the rpc router).
+- [ ] rpc: debug_executePayload; eth_simulateV1.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
@@ -65,6 +73,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: perf profile after pipelining: the executing thread finishes early and spends ~half its samples helping recovery, so block time is bounded by secp256k1 ecrecover throughput (~30 us each, crypto lane) plus ~5% thread spawn; no large lever left in this lane. Added miner/base/admin pool methods (base/base shapes: `[maxTx, maxBlock]`, `{"status":"Known"|"Unknown"}`, drop returns hashes lowest nonce first); `miner_setGasLimit` caps pool selection, not the header gas limit, as base/base's standard builder.
 - 2026-11-05: perf: execution now runs behind sender recovery (`senders.Pipeline`: workers claim 8-tx batches in order and publish per-batch done flags; the executor waits per transaction and recovers unclaimed batches itself instead of idling). Interleaved A/B of ReleaseFast bench binaries on a loaded host (load 14-25 on 14 cores): 500-transfer block median 6.2 ms vs 7.5 ms before (9 runs each). Next perf targets: commit/trie root (~2 ms of the remaining main-thread time) and spawn cost (a resident pool needs std.Io-free sync; still deferred).
 - 2026-11-05: eth_call/estimateGas at older blocks: `Executor.simulate_on` swaps the evm database for a `HistoryDatabase` (proof per account/slot read; code from the head code store; BLOCKHASH from the head ring, valid for canonical ancestors). The block is resolved before the call object is parsed so historical call data stays clear of the proof buffers at the scratch tail. Context matches the head path (block N+1 on N's state) for consistency between `latest` and explicit numbers.
 - 2026-11-05: txpool_content/contentFrom/inspect (reth shapes: EIP-55 sender keys sorted ascending like reth's BTreeMap, decimal nonce keys; inspect gas price is the fee cap). Pool gained a read API (`sorted_senders`, `sender_transactions`); the sorted index list lives at the tail of the RPC scratch. Oversized listings fail with the router's response-size error rather than truncating.

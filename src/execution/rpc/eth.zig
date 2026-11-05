@@ -73,6 +73,8 @@ const core_methods = [_]rpc.Method(*Api){
     .{ .name = "eth_getLogs", .handler = get_logs },
     .{ .name = "eth_getProof", .handler = @import("eth_proof.zig").get_proof },
     .{ .name = "miner_setMaxDASize", .handler = set_max_da_size },
+    .{ .name = "miner_getMaxDASize", .handler = get_max_da_size },
+    .{ .name = "miner_setGasLimit", .handler = set_gas_limit },
     .{ .name = "debug_getRawHeader", .handler = debug.get_raw_header },
     .{ .name = "debug_getRawBlock", .handler = debug.get_raw_block },
     .{ .name = "debug_getRawReceipts", .handler = debug.get_raw_receipts },
@@ -148,6 +150,26 @@ fn set_max_da_size(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     api.chain.da_limits = .{ .tx_bytes_max = tx_bytes_max, .block_bytes_max = block_bytes_max };
     assert(api.chain.da_limits.block_bytes_max == block_bytes_max);
+    try call.writer.boolean(true);
+}
+
+/// `miner_getMaxDASize`: `[maxTxSize, maxBlockSize]` (0 when unset), as base/base.
+fn get_max_da_size(api: *Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    const limits = api.chain.da_limits;
+    try call.writer.begin_array();
+    try call.writer.quantity(limits.tx_bytes_max);
+    try call.writer.quantity(limits.block_bytes_max);
+    try call.writer.end_array();
+}
+
+/// `miner_setGasLimit(gasLimit)`: gas the builder fills with pool transactions (capped
+/// by the block gas limit; the header keeps the block's limit); 0 lifts it.
+fn set_gas_limit(api: *Api, call: *Call) HandlerError!void {
+    const gas_limit = try call.params.quantity(u64);
+    try call.params.finish();
+    api.chain.gas_limit_target = gas_limit;
+    assert(api.chain.gas_limit_target == gas_limit);
     try call.writer.boolean(true);
 }
 

@@ -1,5 +1,6 @@
-//! The txpool namespace beyond `txpool_status`: `txpool_content`, `txpool_contentFrom`
-//! and `txpool_inspect`, shaped like reth (base/base): `pending` and `queued` maps keyed
+//! Pool listing and control beyond `txpool_status`: `base_transactionStatus`, the admin
+//! drop methods, and `txpool_content`, `txpool_contentFrom` and `txpool_inspect`, shaped
+//! like reth (base/base). Listings use `pending` and `queued` maps keyed
 //! by the sender's EIP-55 address, then by the decimal nonce. Content values are pending
 //! transaction objects (as `eth_getTransactionByHash`); inspect values are one-line
 //! summaries, `"<to>: <value> wei + <gas> gas × <gas price> wei"` with `contract creation`
@@ -29,7 +30,53 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "txpool_content", .handler = content },
     .{ .name = "txpool_contentFrom", .handler = content_from },
     .{ .name = "txpool_inspect", .handler = inspect },
+    .{ .name = "base_transactionStatus", .handler = transaction_status },
+    .{ .name = "admin_dropTransaction", .handler = drop_transaction },
+    .{ .name = "admin_dropSenderTransactions", .handler = drop_sender_transactions },
 };
+
+/// `base_transactionStatus(hash)`: `{"status":"Known"}` while the transaction is in the
+/// pool, else `"Unknown"` (base/base without a sequencer client to forward to).
+fn transaction_status(api: *Api, call: *Call) HandlerError!void {
+    const hash: primitives.B256 = .{ .bytes = try call.params.fixed(32) };
+    try call.params.finish();
+    const known = if (api.pool) |pool| pool.get(hash) != null else false;
+    try call.writer.begin_object();
+    try call.writer.key("status");
+    try call.writer.string(if (known) "Known" else "Unknown");
+    try call.writer.end_object();
+}
+
+/// `admin_dropTransaction(hash)`: removes one pool transaction; true when it was there.
+fn drop_transaction(api: *Api, call: *Call) HandlerError!void {
+    const hash: primitives.B256 = .{ .bytes = try call.params.fixed(32) };
+    try call.params.finish();
+    const removed = if (api.pool) |pool| pool.remove(hash) else false;
+    assert(api.pool == null or api.pool.?.get(hash) == null);
+    try call.writer.boolean(removed);
+}
+
+/// `admin_dropSenderTransactions(address)`: removes every pool transaction of the
+/// sender and returns their hashes, lowest nonce first.
+fn drop_sender_transactions(api: *Api, call: *Call) HandlerError!void {
+    const address: primitives.Address = .{ .bytes = try call.params.fixed(20) };
+    try call.params.finish();
+    const w = call.writer;
+    try w.begin_array();
+    if (api.pool) |pool| {
+        // One removal per transaction: bounded by the per-sender slot limit.
+        var removals: u32 = 0;
+        while (pool.sender_of(address)) |sender| : (removals += 1) {
+            assert(removals < pool.config.account_slots_max);
+            var iterator = pool.sender_transactions(sender);
+            const hash = iterator.next().?.tx.hash;
+            const removed = pool.remove(hash);
+            assert(removed);
+            try w.data(&hash.bytes);
+        }
+    }
+    try w.end_array();
+}
 
 const Mode = enum { content, inspect };
 
