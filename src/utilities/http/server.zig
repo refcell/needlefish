@@ -158,6 +158,9 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         listener: Fd = undefined,
         address: Address = undefined,
         accept_completion: IO.Completion = .{},
+        /// `accept_completion` is in flight (an accept or the accept backoff timeout).
+        accept_pending: bool = false,
+        listener_open: bool = false,
         stopping: bool = false,
         connections: []Connection,
         memory: []u8,
@@ -200,7 +203,12 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             };
         }
 
+        /// Frees the pools. If the IO keeps running afterwards, call `stop()` and run the IO
+        /// until `stopped()` first: an accept or connection operation still in flight would
+        /// otherwise complete into freed memory (owners that tear down the IO together with
+        /// the server may skip this).
         pub fn deinit(server: *Self) void {
+            assert(server.connections.len > 0);
             server.allocator.free(server.connections);
             server.allocator.free(server.memory);
             server.* = undefined;
@@ -211,14 +219,38 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             server.listener = try server.io.open_socket_tcp(address.family);
             errdefer server.io.close_now(server.listener);
             server.address = try server.io.listen(server.listener, address, server.options.backlog);
+            server.listener_open = true;
             server.accept();
             return server.address;
         }
 
-        /// Stops accepting new connections. Open connections finish their current request.
+        /// Stops accepting new connections and shuts down idle keep-alive connections; a
+        /// request in progress is answered, then its connection closes. The in-flight accept
+        /// is canceled and the listener closes from its callback. Run the IO until
+        /// `stopped()` before `deinit`.
         pub fn stop(server: *Self) void {
             assert(!server.stopping);
             server.stopping = true;
+            for (server.connections) |*connection| {
+                const idle = connection.state == .receiving and connection.recv_size == 0;
+                if (idle) server.io.shutdown_now(connection.fd);
+            }
+            if (server.accept_pending) {
+                server.io.cancel(&server.accept_completion);
+            } else {
+                server.close_listener();
+            }
+        }
+
+        /// True once the listener is closed and no connection is open.
+        pub fn stopped(server: *const Self) bool {
+            return !server.accept_pending and !server.listener_open and
+                server.connections_open() == 0;
+        }
+
+        fn close_listener(server: *Self) void {
+            if (!server.listener_open) return;
+            server.listener_open = false;
             server.io.close_now(server.listener);
         }
 
@@ -250,6 +282,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         }
 
         fn accept(server: *Self) void {
+            assert(!server.accept_pending);
+            server.accept_pending = true;
             server.io.accept(*Self, server, on_accept, &server.accept_completion, server.listener);
         }
 
@@ -259,12 +293,15 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             result: io_common.AcceptError!Fd,
         ) void {
             assert(completion == &server.accept_completion);
+            assert(server.accept_pending);
+            server.accept_pending = false;
             if (server.stopping) {
                 if (result) |fd| server.io.close_now(fd) else |_| {}
-                return;
+                return server.close_listener();
             }
             const fd = result catch {
                 // Back off instead of spinning on a persistent error like EMFILE.
+                server.accept_pending = true;
                 server.io.timeout(*Self, server, on_accept_backoff, completion, accept_backoff_ns);
                 return;
             };
@@ -287,8 +324,11 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             result: io_common.TimeoutError!void,
         ) void {
             _ = completion;
-            result catch {};
-            if (!server.stopping) server.accept();
+            result catch {}; // Canceled by `stop`, handled below.
+            assert(server.accept_pending);
+            server.accept_pending = false;
+            if (server.stopping) return server.close_listener();
+            server.accept();
         }
 
         fn connection_acquire(server: *Self) ?*Connection {

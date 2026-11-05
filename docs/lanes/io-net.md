@@ -81,3 +81,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: test-linux (io_uring, Docker): 1040/1047 pass incl. ws/shutdown; fixed a timing-flaky file test (waits for each callback instead of a fixed 1 ms).
 - 2026-11-05: `-Drequire-io-uring=true` (CI ubuntu + `just test-linux`) turns io_uring-unavailable skips into failures; shared `io.init_for_test()`. test-linux green with it.
 - 2026-11-05: io: `cancel` on io_uring/kqueue/SimIo; tests for timeout/accept/recv cancel and completion reuse, green on io_uring in Docker.
+- 2026-11-05: http/ws servers: `stop()` cancels the in-flight accept and closes the listener from its callback (no io_uring accept outliving the server), shuts down idle keep-alive connections. ws `deinit` asserts `stopped()`; http `deinit` stays lenient because execution/node deinits without stopping (it tears the IO down together).

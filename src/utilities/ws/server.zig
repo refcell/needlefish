@@ -64,6 +64,9 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
         listener: Fd = undefined,
         address: Address = undefined,
         accept_completion: IO.Completion = .{},
+        /// `accept_completion` is in flight (an accept or the accept backoff timeout).
+        accept_pending: bool = false,
+        listener_open: bool = false,
         listening: bool = false,
         connections: []Connection,
         memory: []u8,
@@ -115,9 +118,9 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
             };
         }
 
+        /// Requires `stopped()`.
         pub fn deinit(server: *Self) void {
-            assert(!server.listening);
-            for (server.connections) |*connection| assert(connection.stream.state == .idle);
+            assert(server.stopped());
             server.allocator.free(server.connections);
             server.allocator.free(server.memory);
             server.* = undefined;
@@ -130,17 +133,36 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
             errdefer server.io.close_now(server.listener);
             server.address = try server.io.listen(server.listener, address, server.options.backlog);
             server.listening = true;
+            server.listener_open = true;
             server.accept();
             return server.address;
         }
 
-        /// Stops accepting and aborts every connection; each gets its `on_close`.
+        /// Stops accepting and aborts every connection; each gets its `on_close`. The
+        /// in-flight accept is canceled; run the IO until `stopped()` before `deinit`.
         pub fn stop(server: *Self) void {
-            if (server.listening) {
-                server.listening = false;
-                server.io.close_now(server.listener);
+            server.listening = false;
+            if (server.accept_pending) {
+                server.io.cancel(&server.accept_completion);
+            } else {
+                server.close_listener();
             }
             for (server.connections) |*connection| connection.stream.abort();
+        }
+
+        /// True once the listener is closed and every connection has reported `on_close`.
+        pub fn stopped(server: *const Self) bool {
+            if (server.accept_pending or server.listener_open) return false;
+            for (server.connections) |*connection| {
+                if (connection.stream.state != .idle) return false;
+            }
+            return true;
+        }
+
+        fn close_listener(server: *Self) void {
+            if (!server.listener_open) return;
+            server.listener_open = false;
+            server.io.close_now(server.listener);
         }
 
         pub fn connections_open(server: *const Self) u32 {
@@ -191,6 +213,8 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
         }
 
         fn accept(server: *Self) void {
+            assert(!server.accept_pending);
+            server.accept_pending = true;
             server.io.accept(*Self, server, on_accept, &server.accept_completion, server.listener);
         }
 
@@ -200,12 +224,15 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
             result: io_common.AcceptError!Fd,
         ) void {
             assert(completion == &server.accept_completion);
+            assert(server.accept_pending);
+            server.accept_pending = false;
             if (!server.listening) {
                 if (result) |fd| server.io.close_now(fd) else |_| {}
-                return;
+                return server.close_listener();
             }
             const fd = result catch {
                 // Back off instead of spinning on a persistent error like EMFILE.
+                server.accept_pending = true;
                 server.io.timeout(*Self, server, on_accept_backoff, completion, accept_backoff_ns);
                 return;
             };
@@ -226,8 +253,11 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
             result: io_common.TimeoutError!void,
         ) void {
             _ = completion;
-            result catch {};
-            if (server.listening) server.accept();
+            result catch {}; // Canceled by `stop`, handled below.
+            assert(server.accept_pending);
+            server.accept_pending = false;
+            if (!server.listening) return server.close_listener();
+            server.accept();
         }
 
         fn connection_id(connection: *const Connection) ConnectionId {

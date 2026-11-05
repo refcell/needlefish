@@ -106,7 +106,7 @@ test "http: server and client keep-alive over SimIo" {
     var echo: Echo = .{};
     var server: SimServer() = undefined;
     try server.init(std.testing.allocator, &harness.server_io, &echo, small_server);
-    defer server.deinit();
+    defer stop_server(&server, &harness.world);
     const bound = try server.listen(Address.ip4(.{ 10, 0, 0, 1 }, 8545));
 
     const SimClient = client_module.Client(io.SimIo);
@@ -138,7 +138,7 @@ test "http: client retries once after the server drops an idle connection" {
     var echo: Echo = .{};
     var server: SimServer() = undefined;
     try server.init(std.testing.allocator, &harness.server_io, &echo, small_server);
-    defer server.deinit();
+    defer stop_server(&server, &harness.world);
     const bound = try server.listen(Address.ip4(.{ 10, 0, 0, 1 }, 8545));
     const SimClient = client_module.Client(io.SimIo);
     var client = try SimClient.init(std.testing.allocator, &harness.client_io, bound, small_client);
@@ -201,7 +201,7 @@ fn raw_exchange(request: []const u8, seed: u64) !struct { [2048]u8, usize, bool 
     var echo: Echo = .{};
     var server: SimServer() = undefined;
     try server.init(std.testing.allocator, &harness.server_io, &echo, small_server);
-    defer server.deinit();
+    defer stop_server(&server, &harness.world);
     const bound = try server.listen(Address.ip4(.{ 10, 0, 0, 1 }, 80));
     var peer: RawPeer = .{
         .io = &harness.client_io,
@@ -241,9 +241,15 @@ test "http: server and client over the OS backend" {
     const OsServer = server_module.Server(io.IO, *Echo, Echo.handle);
     var server: OsServer = undefined;
     try server.init(std.testing.allocator, &os_io, &echo, small_server);
-    defer server.deinit();
     const bound = try server.listen(Address.loopback(0));
-    defer server.stop();
+    defer {
+        server.stop();
+        var rounds: u32 = 0;
+        while (!server.stopped() and rounds < 1000) : (rounds += 1) {
+            os_io.run_for_ns(std.time.ns_per_ms) catch break;
+        }
+        server.deinit();
+    }
     const OsClient = client_module.Client(io.IO);
     var client = try OsClient.init(std.testing.allocator, &os_io, bound, small_client);
     defer client.deinit();
@@ -256,4 +262,14 @@ test "http: server and client over the OS backend" {
     }
     try std.testing.expectEqual(@as(u32, 1), collector.count);
     try std.testing.expectEqualStrings("/x:hi", collector.body(0));
+}
+
+/// Stops `server`, runs `world` until it has drained, then frees it.
+fn stop_server(server: anytype, world: *io.SimWorld) void {
+    server.stop();
+    var rounds: u32 = 0;
+    while (!server.stopped() and rounds < 10_000) : (rounds += 1) {
+        world.run_for_ns(std.time.ns_per_ms);
+    }
+    server.deinit();
 }

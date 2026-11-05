@@ -86,7 +86,7 @@ test "http: server closes idle keep-alive connections" {
     defer harness.deinit();
     var server: server_module.Server(SimIo, void, Ok.handle) = undefined;
     try server.init(std.testing.allocator, &harness.server_io, {}, server_options);
-    defer server.deinit();
+    defer stop_server(&server, &harness.world);
     const bound = try server.listen(Address.ip4(.{ 10, 0, 0, 1 }, 8545));
     const Client = client_module.Client(SimIo);
     var client = try Client.init(std.testing.allocator, &harness.client_io, bound, .{
@@ -154,7 +154,7 @@ test "http: server times out a stalled partial request" {
     defer harness.deinit();
     var server: server_module.Server(SimIo, void, Ok.handle) = undefined;
     try server.init(std.testing.allocator, &harness.server_io, {}, server_options);
-    defer server.deinit();
+    defer stop_server(&server, &harness.world);
     const bound = try server.listen(Address.ip4(.{ 10, 0, 0, 1 }, 8545));
     const client_io = &harness.client_io;
     var partial: Partial = .{ .io = client_io, .fd = try client_io.open_socket_tcp(.ip4) };
@@ -193,4 +193,14 @@ test "http: client request times out when the server never answers" {
     try std.testing.expectEqual(@as(u32, 1), result.calls);
     try std.testing.expectEqual(@as(?client_module.Error, error.Timeout), result.err);
     try std.testing.expect(!client.busy());
+}
+
+/// Stops `server`, runs `world` until it has drained, then frees it.
+fn stop_server(server: anytype, world: *io.SimWorld) void {
+    server.stop();
+    var rounds: u32 = 0;
+    while (!server.stopped() and rounds < 10_000) : (rounds += 1) {
+        world.run_for_ns(std.time.ns_per_ms);
+    }
+    server.deinit();
 }

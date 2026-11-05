@@ -212,7 +212,14 @@ test "rpc: client and server over SimIo" {
         .send_buffer_size = 4096,
         .limits = limits,
     });
-    defer server.deinit();
+    defer {
+        server.stop();
+        var rounds: u32 = 0;
+        while (!server.stopped() and rounds < 10_000) : (rounds += 1) {
+            world.run_for_ns(std.time.ns_per_ms);
+        }
+        server.deinit();
+    }
     const bound = try server.listen(io.Address.ip4(.{ 10, 0, 0, 1 }, 8545));
 
     var client = try rpc.Client(io.SimIo).init(std.testing.allocator, &client_io, bound, .{
