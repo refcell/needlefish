@@ -836,5 +836,6 @@ test {
     _ = @import("eth_test.zig");
     _ = @import("debug_test.zig");
     _ = @import("debug_http_test.zig");
+    _ = @import("debug_large_test.zig");
     _ = @import("eth_proof_test.zig");
 }

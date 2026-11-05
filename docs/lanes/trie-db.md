@@ -104,8 +104,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   grown on a body-writer rebase); `debug_executionWitness` sizes with `ensureUnusedCapacity`;
   node default 2 x 16 MiB, `witness_response_bytes_max` 16 MiB - 2 KiB;
   `rpc/debug_http_test.zig`, `http/large_test.zig`, `node/witness_memory_test.zig`)
-- [ ] End-to-end rpc test with a real witness over 1 MiB (storage-heavy fixture block) through
+- [x] End-to-end rpc test with a real witness over 1 MiB (storage-heavy fixture block) through
   the large send buffers; today only a 3 MiB generic response covers that path.
+  (`rpc/debug_large_test.zig`: code-heavy block instead of storage-heavy, see Log)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -574,3 +575,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   diverging accounts and slots, stable text report) and `bin/witness-diff`. Tests: identical
   -> empty, changed storage leaf -> account + slot named, missing code / extra key, leaf only
   in one walk, parser shapes and errors, `std.testing.fuzz` + seeded mutated-JSON fuzz.
+- 2026-11-05: end-to-end `debug_executionWitness` over 1 MiB (`rpc/debug_large_test.zig`). A real
+  block (24 calls from distinct senders, each to its own 24 KiB contract doing `SSTORE(0, 1)`)
+  has a 1.18 MB JSON witness, mostly codes: the cheapest way past 1 MiB in Debug (a
+  storage-heavy block needs ~1k contracts x 4k slots of pre-state). Served over SimIo HTTP with
+  the node's 1 MiB send buffer and one 2 MiB large buffer; the client decodes it, rebuilds a
+  parent-bound `SparseState`, re-executes with the node executor, root == header. With the
+  pool disabled (the old 1 MiB path), too small, or busy with a concurrent witness: -32000
+  "witness too large"; the buffer is released and serves the next witness. ~0.1 s in Debug.
