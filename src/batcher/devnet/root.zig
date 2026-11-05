@@ -4,6 +4,9 @@
 const std = @import("std");
 
 pub const accounts = @import("accounts.zig");
+pub const portal = @import("portal.zig");
+pub const genesis = @import("genesis.zig");
+pub const init = @import("init.zig");
 
 test {
     std.testing.refAllDecls(@This());

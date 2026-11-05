@@ -5,7 +5,11 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 
 ## Backlog
 - [x] `docs/DEVNET.md`: topology, ports, process contract (see draft below), smoke test definition.
-- [ ] `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
+- [x] `base devnet init` (first cut: funded accounts, portal stub, rollup.json; genesis hashes
+  patched by `base devnet rollup` after ELs start; predeploys still TODO)
+- [ ] devnet genesis: predeploys (L1Block, GasPriceOracle, fee vaults, proxies) from public
+  allocs; compute genesis hashes in-process once trie lands.
+- [ ] (orig) `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
 - [x] `batcher/frame`: frame encode/decode, tx data parse (fuzzed).
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
 - [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
@@ -26,6 +30,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - L2 verifier: `node` HTTP :10545, engine :10551; `consensus` RPC :8547 (derives from L1 only).
 
 ## Decisions
+- 2026-11-05: no L1 deployment step. A hand-assembled portal stub at 0x..de90 emits
+  `TransactionDeposited` (receive()-style deposit to msg.sender); system config has no code.
+- 2026-11-05: L2 activates every OP upgrade through Jovian at genesis; Base-only upgrades
+  (azul+) stay off until node/consensus support them. L2 genesis extraData is Jovian format.
 - 2026-11-05: ChannelOut uses a ratio size estimate and compresses once on close
   (deterministic, no shadow compressor); misestimates only change the frame count.
 - 2026-11-05: singular/span batch types are the consensus lane's (base/base keeps them
@@ -40,3 +48,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: batcher/frame reuses consensus Frame; comp: zlib + stored brotli (verified
   against the brotli CLI).
 - 2026-11-05: ChannelOut with fuzzed reassembly through the consensus Channel.
+- 2026-11-05: dev accounts (BIP39/32), portal stub, genesis/rollup writers, `base devnet init`.

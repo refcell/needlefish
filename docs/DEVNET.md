@@ -32,6 +32,12 @@ scripts) and the lanes that own each binary. If you change a flag or port here, 
 | L2 verifier EL | `base node` | http 10545, engine 10551 | `.devnet/ver-el` |
 | L2 verifier CL | `base consensus` | rpc 8547 | `.devnet/ver-cl` |
 
+L1 contracts are placed in the L1 genesis alloc (no deployment step): a minimal
+deposit portal at `0x000000000000000000000000000000000000de90` (any call deposits
+`msg.value` to `msg.sender` on L2, see `src/batcher/devnet/portal.zig`) and the system
+config address `0x0000000000000000000000000000000000005cf9` (no code yet; the genesis
+system config in `rollup.json` applies until the contract lands).
+
 Each process runs as `zig-out/bin/base <subcommand>` until a lane ships its own binary,
 then the script switches to that binary. Logs go to `.devnet/logs/<process>.log`,
 pids to `.devnet/pids/<process>.pid`.
@@ -44,7 +50,7 @@ pids to `.devnet/pids/<process>.pid`.
 | L2 chain id | 901 | OP Stack devnet convention |
 | L1 block time | 2 s | fast feedback, still exercises epochs |
 | L2 block time | 1 s | Base mainnet block time |
-| Batch inbox | `0xff00000000000000000000000000000000000901` | `0xff00..` ++ L2 chain id |
+| Batch inbox | `0xff00000000000000000000000000000000000385` | `0xff` ++ zeros ++ L2 chain id (901 = 0x385) |
 | Sequencer window | 3600 L1 blocks | rollup default |
 | Channel timeout | 300 L1 blocks | Granite value |
 | Max sequencer drift | 1800 s | Fjord constant |

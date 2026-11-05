@@ -3,14 +3,20 @@
 
 const std = @import("std");
 const base = @import("base");
+const devnet = @import("devnet.zig");
 
 const usage =
     \\usage: base <command> [args]
     \\
     \\commands:
     \\  version    print version
+    \\  devnet     generate local devnet config (base devnet init)
     \\
 ;
+
+test {
+    _ = devnet;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -26,6 +32,9 @@ pub fn main(init: std.process.Init) !void {
             base.build_options.git_rev,
         });
         return;
+    }
+    if (std.mem.eql(u8, command, "devnet")) {
+        std.process.exit(try devnet.main(init, args[2..]));
     }
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);
