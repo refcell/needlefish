@@ -102,6 +102,10 @@ pub const Options = struct {
     follow_source: ?Address = null,
     /// Sequencer conductor (`--conductor.rpc`): commits sealed payloads, gates starting.
     conductor: ?Address = null,
+    /// Serve `admin_*` (`--rpc.enable-admin`); base/base leaves them off by default.
+    rpc_admin: bool = false,
+    /// Serve `dev_*` (`--rpc.dev-enabled`), including the engine queue subscription.
+    rpc_dev: bool = false,
     /// WebSocket JSON-RPC with head subscriptions (`--rpc.ws-enabled`); off when null.
     ws_address: ?Address = null,
     /// Prometheus `GET /metrics` (`--metrics.enabled`); not served when null.
@@ -380,7 +384,8 @@ pub fn Node(comptime IO: type) type {
                     .vtable = &backend_vtable,
                     .version = options.version,
                     .rollup = rollup,
-                    .admin = &admin_vtable,
+                    .admin = if (options.rpc_admin) &admin_vtable else null,
+                    .dev = if (options.rpc_dev) &admin_vtable else null,
                 },
                 .safe_db = try safedb.SafeDB.init(allocator, options.safedb_entries),
                 .gossip_arena = .init(allocator),
@@ -421,6 +426,7 @@ pub fn Node(comptime IO: type) type {
             errdefer node.allocator.destroy(ws_rpc);
             try ws_rpc.init(node.allocator, node.io, &node.backend);
             ws_rpc.fallback = .{ .context = node, .serve = ws_serve_rpc };
+            ws_rpc.dev_enabled = node.options.rpc_dev;
             node.ws_rpc = ws_rpc;
         }
 
@@ -1218,6 +1224,7 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         .l1 = harness.address,
         .l2 = harness.address,
         .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_admin = true,
         .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
         .http_client = harness_module.client_options,
         .checkpoint_path = "checkpoint.bin",

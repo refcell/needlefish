@@ -159,7 +159,8 @@ start_consensus() {
   # Unsafe-block gossip: the verifier dials the sequencer's enode (logged at startup).
   local p2p=(--p2p.listen.ip 127.0.0.1 --p2p.no-discovery --p2p.no-bootstore)
   start seq-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_SEQUENCER_ENGINE" \
-    --rpc.port "$PORT_SEQUENCER_RPC" --sequencer --sequencer.key-index "$SEQUENCER_INDEX" \
+    --rpc.port "$PORT_SEQUENCER_RPC" --rpc.enable-admin --sequencer \
+    --sequencer.key-index "$SEQUENCER_INDEX" \
     "${p2p[@]}" --p2p.listen.tcp 9222 --p2p.listen.udp 9223
   local enode="" tries=0
   while [ -z "$enode" ] && [ "$tries" -lt 50 ]; do

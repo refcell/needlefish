@@ -81,6 +81,8 @@ pub fn WsRpc(comptime IO: type) type {
         next_id: u64 = 1,
         last: ?Sample = null,
         fallback: ?Fallback = null,
+        /// `dev_subscribe_engine_queue_size` is served only with `--rpc.dev-enabled`.
+        dev_enabled: bool = false,
         notifications: u64 = 0,
         send_failures: u64 = 0,
 
@@ -169,7 +171,9 @@ pub fn WsRpc(comptime IO: type) type {
             if (method_raw.len < 2 or method_raw[0] != '"') return false;
             const method = method_raw[1 .. method_raw.len - 1];
             const request_id = (json.find_path(payload, &.{"id"}) catch null) orelse "null";
-            for (subscribe_methods, 0..) |name, index| {
+            const topics_served = if (ws_rpc.dev_enabled) topic_count else topic_count - 1;
+            comptime assert(@backingInt(Topic.engine_queue_size) == topic_count - 1);
+            for (subscribe_methods[0..topics_served], 0..) |name, index| {
                 if (!std.mem.eql(u8, name, method)) continue;
                 const subscription = ws_rpc.next_id;
                 ws_rpc.next_id += 1;
@@ -177,7 +181,7 @@ pub fn WsRpc(comptime IO: type) type {
                 ws_rpc.reply(id, request_id, "{d}", .{subscription});
                 return true;
             }
-            for (unsubscribe_methods, 0..) |name, index| {
+            for (unsubscribe_methods[0..topics_served], 0..) |name, index| {
                 if (!std.mem.eql(u8, name, method)) continue;
                 const params = (json.find_path(payload, &.{"params"}) catch null) orelse "[]";
                 const wanted = parse_subscription_id(params) orelse 0;
@@ -481,6 +485,7 @@ test "ws rpc: subscriptions notify on change; other methods go to the router" {
     const ws_rpc = try allocator.create(SimWsRpc);
     defer allocator.destroy(ws_rpc);
     try ws_rpc.init(allocator, &server_io, &backend);
+    ws_rpc.dev_enabled = true;
     defer {
         ws_rpc.stop();
         var rounds: u32 = 0;

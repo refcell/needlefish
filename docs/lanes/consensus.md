@@ -42,7 +42,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
     the start finder then uses a matching checkpoint, else binary-searches the earliest
     unpruned block (base/base `find_earliest_unpruned_block`)
-- [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
+- [x] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
@@ -55,6 +55,10 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] admin_overrideLeader (no conductor: InternalError like base/base),
     admin_refreshUpgradeSignal (-32004 outside runtime-admin mode), dev_taskQueueLength
   - [ ] admin_clearPendingP2pConnections (needs a dial-abort API in `p2p.Service`)
+  - [ ] `--l1.verifier-confs` (default 0) / `--sequencer.l1-confs` (default 4): derive and
+    pick origins at the L1 head minus confirmations
+  - [ ] `--sequencer.recover` (initial recover mode), `--rpc.disabled`
+  - [ ] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
   - [x] `ws_subscribe_{unsafe,safe,finalized}_head` and `dev_subscribe_engine_queue_size`
@@ -91,6 +95,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Admin and dev RPC are off by default like base/base (unmerged modules answer -32601). The devnet sequencer passes `--rpc.enable-admin` because the batcher finds the leader with `admin_sequencerActive`.
 - Admin errors follow base/base exactly (codes and redacted messages) even where ours were more descriptive; reasons go to the log instead.
 - WebSocket RPC listens on its own port (default 7546) because the HTTP server cannot upgrade; ids are numbers and notifications use the subscribe method name, like jsonrpsee; only changes after subscribing are sent.
 - Conductor: leadership is polled every 1 s and admin_startSequencer answers from the last poll (the admin API is synchronous; base/base asks per call). Commits are JSON-RPC only and retried every 100 ms until accepted; the deposits-only fallback payload is committed too.
@@ -216,6 +221,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: `admin_*` only with `--rpc.enable-admin`, `dev_*` (and the engine queue ws subscription) only with `--rpc.dev-enabled`, else -32601; devnet sequencer enables admin for the batcher's leader check.
 - 2026-11-05: rpc: WebSocket requests use the node's merged router (opp2p_* included); devnet verifier serves metrics and smoke checks the safe-head metric (not run: ports held by another devnet).
 - 2026-11-05: rpc: admin error codes and idempotent start/stop match base/base.
 - 2026-11-05: rpc: WebSocket RPC (--rpc.ws-enabled/--rpc.ws-port): head and engine queue size subscriptions, router fallback.

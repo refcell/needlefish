@@ -86,7 +86,13 @@ pub const methods = [_]rpc.Method(*const Backend){
 
 fn admin(backend: *const Backend, call: *Call) HandlerError!*const VTable {
     const vtable = backend.admin orelse
-        return call.fail(rpc.code.server_error, "admin api not available");
+        return call.fail(rpc.code.method_not_found, "method not found");
+    return vtable;
+}
+
+fn dev(backend: *const Backend, call: *Call) HandlerError!*const VTable {
+    const vtable = backend.dev orelse
+        return call.fail(rpc.code.method_not_found, "method not found");
     return vtable;
 }
 
@@ -151,7 +157,7 @@ fn refresh_upgrade_signal(backend: *const Backend, call: *Call) HandlerError!voi
 
 fn task_queue_length(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try dev(backend, call);
     try call.writer.integer(vtable.task_queue_length(backend.context));
 }
 
@@ -301,6 +307,7 @@ const StubNode = struct {
             .version = "test",
             .rollup = &node.config,
             .admin = &vtable,
+            .dev = &vtable,
         };
     }
 };
@@ -387,10 +394,19 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
     try testing.expect(contains(health, "\"version\":\"test\""));
     var disabled = backend;
     disabled.admin = null;
+    disabled.dev = null;
     const unavailable = call_text(&disabled,
         \\{"jsonrpc":"2.0","id":7,"method":"admin_sequencerActive"}
     , &buffer);
-    try testing.expect(contains(unavailable, "admin api not available"));
+    try testing.expect(contains(unavailable, "-32601"));
+    const no_dev = call_text(&disabled,
+        \\{"jsonrpc":"2.0","id":18,"method":"dev_taskQueueLength"}
+    , &buffer);
+    try testing.expect(contains(no_dev, "-32601"));
+    const still_healthy = call_text(&disabled,
+        \\{"jsonrpc":"2.0","id":19,"method":"healthz"}
+    , &buffer);
+    try testing.expect(contains(still_healthy, "\"version\":\"test\""));
     node.sequencer = false;
     const verifier = call_text(&backend,
         \\{"jsonrpc":"2.0","id":16,"method":"admin_stopSequencer"}

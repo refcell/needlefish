@@ -76,8 +76,11 @@ pub const Backend = struct {
     vtable: *const VTable,
     version: []const u8,
     rollup: *const RollupConfig,
-    /// `admin_*` methods; null disables them.
+    /// `admin_*` methods (`--rpc.enable-admin`); null answers -32601 like base/base, where
+    /// the module is not merged.
     admin: ?*const admin_module.VTable = null,
+    /// `dev_*` methods (`--rpc.dev-enabled`) over the same vtable; null answers -32601.
+    dev: ?*const admin_module.VTable = null,
     /// `base_*` methods; null when no upgrade-signal contract is configured.
     base: ?*const base_module.VTable = null,
 

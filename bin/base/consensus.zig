@@ -16,7 +16,7 @@ const accounts = base.batcher.devnet.accounts;
 const usage =
     \\usage: base consensus --rollup-config ROLLUP.json --l1 URL --l2 URL --l2-jwt FILE
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
-    \\         [--rpc.ws-enabled [--rpc.ws-port P]]
+    \\         [--rpc.ws-enabled [--rpc.ws-port P]] [--rpc.enable-admin] [--rpc.dev-enabled]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
@@ -42,6 +42,8 @@ pub const Flags = struct {
     rpc_port: u16 = 7545,
     /// WebSocket RPC on its own port (base/base serves it on the HTTP port).
     rpc_ws_enabled: bool = false,
+    rpc_admin: bool = false,
+    rpc_dev: bool = false,
     rpc_ws_port: u16 = 7546,
     /// Prometheus endpoint (base/base defaults: disabled, 0.0.0.0:9090).
     metrics_enabled: bool = false,
@@ -105,6 +107,14 @@ fn parse_ip4(text: []const u8) ![4]u8 {
 fn apply_switch(flags: *Flags, arg: []const u8) bool {
     if (std.mem.eql(u8, arg, "--sequencer")) {
         flags.sequencer = true;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--rpc.enable-admin")) {
+        flags.rpc_admin = true;
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--rpc.dev-enabled")) {
+        flags.rpc_dev = true;
         return true;
     }
     if (std.mem.eql(u8, arg, "--rpc.ws-enabled")) {
@@ -245,6 +255,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
         .checkpoint_path = flags.checkpoint_path,
         .follow_source = flags.source_l2_rpc,
+        .rpc_admin = flags.rpc_admin,
+        .rpc_dev = flags.rpc_dev,
         .ws_address = if (flags.rpc_ws_enabled)
             io.Address.ip4(flags.rpc_addr, flags.rpc_ws_port)
         else
@@ -373,6 +385,10 @@ test "consensus: flags" {
     const with_ws = try parse_flags(&ws_args);
     try std.testing.expect(with_ws.rpc_ws_enabled);
     try std.testing.expectEqual(@as(u16, 9546), with_ws.rpc_ws_port);
+    try std.testing.expect(!with_ws.rpc_admin and !with_ws.rpc_dev);
+    const admin_args = required ++ [_][]const u8{ "--rpc.enable-admin", "--rpc.dev-enabled" };
+    const with_admin = try parse_flags(&admin_args);
+    try std.testing.expect(with_admin.rpc_admin and with_admin.rpc_dev);
     try std.testing.expectEqual(@as(u16, 8547), conducted.conductor_rpc.?.port);
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
