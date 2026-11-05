@@ -48,6 +48,17 @@ pub fn verify_kzg_proof(
     const z = try read_scalar(z_bytes);
     const y = try read_scalar(y_bytes);
 
+    return verify_kzg_proof_points(commitment, z, y, proof);
+}
+
+/// `verify_kzg_proof` on decoded points and canonical scalars (z, y < r).
+pub fn verify_kzg_proof_points(
+    commitment: bls.G1Affine,
+    z: u256,
+    y: u256,
+    proof: bls.G1Affine,
+) bool {
+    assert(z < setup.bls_modulus and y < setup.bls_modulus);
     // e(C - [y]G1, G2) * e(-proof, [tau - z]G2) == 1 is rewritten with
     // e(proof, [z]G2) = e([z]proof, G2) so both G2 inputs are fixed and only G1
     // scalar multiplications remain: e(C - [y]G1 + [z]proof, G2) * e(-proof, [tau]G2).
@@ -56,6 +67,11 @@ pub fn verify_kzg_proof(
         .sub(bls.g1.mul_glv(g1_generator, y))
         .add(bls.g1.mul_glv(proof.to_jacobian(), z))
         .to_affine();
+    return pairing_check_fixed_g2(left, proof);
+}
+
+/// True when e(left, G2) * e(-proof, [tau]G2) == 1 (the shared form of every KZG check).
+pub fn pairing_check_fixed_g2(left: bls.G1Affine, proof: bls.G1Affine) bool {
     const pairs = [2]bls.pairing.Pair{
         .{ .g1 = left, .g2 = bls.g2.generator },
         .{ .g1 = proof.neg(), .g2 = tau_g2 },

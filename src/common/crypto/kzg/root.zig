@@ -103,6 +103,8 @@ pub const success_output: [64]u8 = blk: {
 
 pub const verify = @import("verify.zig");
 pub const verify_kzg_proof = verify.verify_kzg_proof;
+pub const blob = @import("blob.zig");
+pub const bench = @import("bench.zig");
 pub const precompile_point_evaluation = verify.precompile_point_evaluation;
 
 const testing = std.testing;
