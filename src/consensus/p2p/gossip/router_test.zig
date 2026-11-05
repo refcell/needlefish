@@ -281,6 +281,47 @@ test "router: mesh keeps the outbound quota when trimmed" {
     }
 }
 
+test "router: IDONTWANT is sent for large messages and honored when forwarding" {
+    var prng = Prng.init(4);
+    var router = try Router.init(std.testing.allocator, scored_config(), prng.random());
+    defer router.deinit(std.testing.allocator);
+    _ = try router.subscribe(topic_name);
+    var message: rpc.RpcDefault = undefined;
+    message.reset();
+    try message.add_subscription(.{ .subscribe = true, .topic_id = topic_name });
+    try message.add_graft(topic_name);
+    var buffer: [8192]u8 = undefined;
+    const join = message.encode(&buffer);
+    var slots: [3]Slot = undefined;
+    for (&slots, 0..) |*slot, index| {
+        slot.* = router.add_peer(test_peer_id(index), true, null, 0).?;
+        try router.on_rpc(slot.*, join, 0);
+        router.set_idontwant_capable(slot.*, true);
+    }
+    var output: [Router.drain_buffer_min]u8 = undefined;
+    for (slots) |slot| while (router.drain(slot, &output)) |_| {};
+    const data: [2000]u8 = @splat(0xab);
+    const id = test_message_id(null, topic_name, &data);
+    // Peer 2 says it does not want the message before we have it.
+    message.reset();
+    try message.add_idontwant(&.{&id});
+    try router.on_rpc(slots[2], message.encode(&buffer), 1);
+    message.reset();
+    try message.add_publish(.{ .topic = topic_name, .data = &data });
+    try router.on_rpc(slots[0], message.encode(&buffer), 2);
+    // Peer 1 gets IDONTWANT right away; the source and peer 2 do not.
+    const frame = router.drain(slots[1], &output).?;
+    var decoded: rpc.RpcDefault = undefined;
+    try decoded.decode((try rpc.frame_decode(frame, rpc.frame_size_max_default)).?.payload);
+    try std.testing.expectEqual(@as(usize, 1), decoded.idontwant_slice().len);
+    try std.testing.expect(router.drain(slots[0], &output) == null);
+    const event = router.pop_event().?;
+    router.validate(&event.id, .accept);
+    // Forwarded to peer 1 only.
+    try std.testing.expect(router.drain(slots[1], &output) != null);
+    try std.testing.expect(router.drain(slots[2], &output) == null);
+}
+
 const FuzzContext = struct {};
 
 fn fuzz_on_rpc(_: FuzzContext, input: []const u8) anyerror!void {

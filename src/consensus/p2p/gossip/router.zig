@@ -56,6 +56,9 @@ pub const Config = struct {
     opportunistic_graft_ticks: u32 = 60,
     opportunistic_graft_peers: u32 = 2,
     message_size_max: u32 = 10 * (1 << 20),
+    /// v1.2: messages larger than this trigger IDONTWANT to mesh peers (rust-libp2p
+    /// `idontwant_message_size_threshold`).
+    idontwant_size_min: u32 = 1000,
     message_id: MessageIdFn,
     message_id_context: ?*anyopaque = null,
     thresholds: score.Thresholds = score.thresholds,
@@ -76,6 +79,8 @@ const queue_max = 256;
 const ihave_out_max = 64;
 const iwant_out_max = 64;
 const promises_max = 32;
+const dont_want_max = 32;
+const idontwant_out_max = 32;
 const deliveries_max = 1024;
 const events_max = 256;
 const no_source: Slot = std.math.maxInt(Slot);
@@ -113,11 +118,33 @@ const Peer = struct {
     queue_head: u32 = 0,
     queue_count: u32 = 0,
     dropped: u64 = 0,
+    /// The peer negotiated `/meshsub/1.2.0` and understands IDONTWANT.
+    idontwant_capable: bool = false,
+    /// Ids the peer told us not to send (ring; covers ids we have not seen yet).
+    dont_want: [dont_want_max]Id = undefined,
+    dont_want_next: u32 = 0,
+    dont_want_count: u32 = 0,
+    idontwant_out: [idontwant_out_max]Id = undefined,
+    idontwant_out_count: u32 = 0,
+
+    fn does_not_want(peer: *const Peer, id: *const Id) bool {
+        for (peer.dont_want[0..peer.dont_want_count]) |*other| {
+            if (std.mem.eql(u8, other, id)) return true;
+        }
+        return false;
+    }
+
+    fn remember_dont_want(peer: *Peer, id: *const Id) void {
+        peer.dont_want[peer.dont_want_next] = id.*;
+        peer.dont_want_next = (peer.dont_want_next + 1) % dont_want_max;
+        peer.dont_want_count = @min(peer.dont_want_count + 1, dont_want_max);
+        assert(peer.does_not_want(id));
+    }
 
     fn has_output(peer: *const Peer) bool {
         return peer.send_subscriptions or peer.graft_pending != 0 or
             peer.prune_pending != 0 or peer.ihave_count > 0 or peer.iwant_count > 0 or
-            peer.queue_count > 0;
+            peer.queue_count > 0 or peer.idontwant_out_count > 0;
     }
 
     fn enqueue(peer: *Peer, id: *const Id) void {
@@ -459,7 +486,39 @@ pub const Router = struct {
         for (message.prune_slice()) |prune| router.on_prune(slot, prune, now_ns);
         for (message.ihave_slice()) |ihave| router.on_ihave(slot, ihave, now_ns);
         for (message.iwant_slice()) |iwant| router.on_iwant(slot, message.ids(iwant.message_ids));
+        for (message.idontwant_slice()) |entry| {
+            router.on_idontwant(slot, message.ids(entry.message_ids));
+        }
         assert(router.peer(slot).active);
+    }
+
+    /// Marks the ids as delivered to `slot` so they are not forwarded to it. Bounded to
+    /// `dont_want_max` ids per RPC entry, like rust-libp2p's per-heartbeat cap.
+    fn on_idontwant(router: *Router, slot: Slot, ids: []const []const u8) void {
+        const target = router.peer(slot);
+        for (ids[0..@min(ids.len, dont_want_max)]) |raw| {
+            if (raw.len != seen_cache.id_length) continue;
+            const id: *const Id = raw[0..seen_cache.id_length];
+            if (router.find_delivery(id)) |delivery| delivery.peers |= bit(slot);
+            target.remember_dont_want(id);
+        }
+    }
+
+    /// Tells v1.2 mesh peers (except those that already have it) to skip a large message.
+    fn send_idontwant(router: *Router, topic: u8, id: *const Id, has: PeerSet) void {
+        var targets = router.mesh[topic] & ~has;
+        while (targets != 0) : (targets &= targets - 1) {
+            const target = &router.peers[@ctz(targets)];
+            if (!target.idontwant_capable or target.does_not_want(id)) continue;
+            if (target.idontwant_out_count == idontwant_out_max) continue;
+            target.idontwant_out[target.idontwant_out_count] = id.*;
+            target.idontwant_out_count += 1;
+        }
+    }
+
+    /// Records that the transport negotiated `/meshsub/1.2.0` with `slot`.
+    pub fn set_idontwant_capable(router: *Router, slot: Slot, capable: bool) void {
+        router.peer(slot).idontwant_capable = capable;
     }
 
     fn on_subscription(router: *Router, slot: Slot, sub_opts: rpc.SubOpts) void {
@@ -485,6 +544,9 @@ pub const Router = struct {
         if (!router.seen.insert(&id, now_ns)) return router.on_duplicate(slot, &id, now_ns);
         router.fulfil_promises(&id);
         _ = router.cache.put(&id, topic, data, false) orelse return;
+        if (data.len > router.config.idontwant_size_min) {
+            router.send_idontwant(topic, &id, bit(slot));
+        }
         router.add_delivery(.{
             .id = id,
             .topic = topic,
@@ -653,7 +715,9 @@ pub const Router = struct {
         var targets = router.mesh[delivery.topic] & ~delivery.peers;
         delivery.peers |= targets;
         while (targets != 0) : (targets &= targets - 1) {
-            router.peers[@ctz(targets)].enqueue(&delivery.id);
+            const target = &router.peers[@ctz(targets)];
+            if (target.does_not_want(&delivery.id)) continue;
+            target.enqueue(&delivery.id);
         }
     }
 
@@ -955,7 +1019,7 @@ pub const Router = struct {
         const budget = output.len - rpc.varint_length_max;
         while (target.queue_count > 0) {
             const id = &target.queue[target.queue_head];
-            const entry = router.cache.find(id);
+            const entry = if (target.does_not_want(id)) null else router.cache.find(id);
             if (entry) |cached| {
                 const outgoing: rpc.Message = .{
                     .topic = router.topics[cached.topic].slice(),
@@ -980,7 +1044,7 @@ pub const Router = struct {
     // grafts, and prunes; <= ihave_out_max + iwant_out_max message ids.
     comptime {
         assert(topics_max <= limits.subscriptions_max and topics_max <= limits.graft_max);
-        assert(ihave_out_max + iwant_out_max <= limits.message_ids_max);
+        assert(ihave_out_max + iwant_out_max + idontwant_out_max <= limits.message_ids_max);
     }
 
     fn drain_control(router: *Router, target: *Peer) rpc.Error!void {
@@ -1013,6 +1077,13 @@ pub const Router = struct {
             }
             try message.add_iwant(router.id_slices[0..target.iwant_count]);
             target.iwant_count = 0;
+        }
+        if (target.idontwant_out_count > 0) {
+            for (target.idontwant_out[0..target.idontwant_out_count], 0..) |*id, index| {
+                router.id_slices[index] = id;
+            }
+            try message.add_idontwant(router.id_slices[0..target.idontwant_out_count]);
+            target.idontwant_out_count = 0;
         }
     }
 
