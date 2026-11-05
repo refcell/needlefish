@@ -32,8 +32,12 @@ pub const Param = union(enum) {
     /// A block tag (`latest`, `safe`, `finalized`) or any other string.
     string: []const u8,
     address: Address,
+    /// Hex data (`eth_sendRawTransaction`).
+    bytes: []const u8,
     /// `{"to": .., "data": ..}` for `eth_call`.
     call: struct { to: Address, data: []const u8 },
+    /// `{"from", "to", "value", "data"}` for `eth_estimateGas` and replayed calls.
+    transaction: Transaction,
 
     fn write(param: Param, writer: *json.Writer) json.Writer.WriteError!void {
         switch (param) {
@@ -41,6 +45,7 @@ pub const Param = union(enum) {
             .number => |number| try writer.quantity(number),
             .string => |text| try writer.string(text),
             .address => |address| try writer.data(&address),
+            .bytes => |bytes| try writer.data(bytes),
             .call => |call| {
                 try writer.begin_object();
                 try writer.key("to");
@@ -49,7 +54,28 @@ pub const Param = union(enum) {
                 try writer.data(call.data);
                 try writer.end_object();
             },
+            .transaction => |transaction| try transaction.write(writer),
         }
+    }
+};
+
+pub const Transaction = struct {
+    from: Address,
+    to: Address,
+    value: u256,
+    data: []const u8,
+
+    fn write(transaction: Transaction, writer: *json.Writer) json.Writer.WriteError!void {
+        try writer.begin_object();
+        try writer.key("from");
+        try writer.data(&transaction.from);
+        try writer.key("to");
+        try writer.data(&transaction.to);
+        try writer.key("value");
+        try writer.quantity(transaction.value);
+        try writer.key("data");
+        try writer.data(transaction.data);
+        try writer.end_object();
     }
 };
 
@@ -88,6 +114,8 @@ pub fn Endpoint(comptime IO: type) type {
         arena: std.heap.ArenaAllocator,
         result: ?CallResult = null,
         calls: u64 = 0,
+        /// The JSON-RPC error of the last call that failed with one (arena copies).
+        last_error: ?rpc.client.RpcError = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -112,6 +140,7 @@ pub fn Endpoint(comptime IO: type) type {
         /// Frees the previous call's results.
         pub fn reset(endpoint: *Self) void {
             assert(endpoint.result == null);
+            endpoint.last_error = null;
             _ = endpoint.arena.reset(.retain_capacity);
         }
 
@@ -119,12 +148,23 @@ pub fn Endpoint(comptime IO: type) type {
             assert(client == endpoint.client);
             assert(endpoint.result == null);
             // The client reuses its body buffer: keep a copy.
+            const arena = endpoint.arena.allocator();
             endpoint.result = if (result) |value| switch (value) {
-                .ok => |raw| if (endpoint.arena.allocator().dupe(u8, raw)) |copy|
+                .ok => |raw| if (arena.dupe(u8, raw)) |copy|
                     .{ .ok = copy }
                 else |_|
                     error.InvalidResponse,
-                .rpc_error => value,
+                .rpc_error => |failure| copy: {
+                    const message = arena.dupe(u8, failure.message) catch
+                        break :copy error.InvalidResponse;
+                    const data = arena.dupe(u8, failure.data) catch
+                        break :copy error.InvalidResponse;
+                    break :copy .{ .rpc_error = .{
+                        .code = failure.code,
+                        .message = message,
+                        .data = data,
+                    } };
+                },
             } else |err| err;
         }
 
@@ -143,9 +183,13 @@ pub fn Endpoint(comptime IO: type) type {
             }
             const result = endpoint.result.?;
             endpoint.result = null;
+            endpoint.last_error = null;
             const raw = switch (result catch return error.CallFailed) {
                 .ok => |raw| raw,
-                .rpc_error => return error.NotFound,
+                .rpc_error => |failure| {
+                    endpoint.last_error = failure;
+                    return error.NotFound;
+                },
             };
             if (std.mem.eql(u8, raw, "null")) return error.NotFound;
             return raw;

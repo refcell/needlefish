@@ -69,8 +69,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   block, factory `gameCount`/`games`/`gameImpls`, verifier `version` +
   `intervalsForStartingBlock` with the legacy getters below 0.3.0). The `Prover` client
   comes with `proof/prover-service`.
-- [ ] `proof/proposer-txmgr`: `Submitter` over the batcher lane's txmgr (init bond from
-  `initBonds`, revert selector mapping incl. `GameAlreadyExists`, receipt polling).
+- [x] `proof/proposer-txmgr`: `Submitter` over JSON-RPC (`proposer/tx_submitter.zig`):
+  init bond from `initBonds`, `eth_estimateGas`, EIP-1559 signing via `batcher/txdata`,
+  receipt polling, revert classification (data selector, selector text, error name) of
+  estimation errors and replayed failed receipts; dropped after N empty polls.
 - [ ] `bin/base proposer`: flags/config validation (base/base `config.rs`/`cli.rs`), dry-run
   submitter, the pipeline driven by `utilities.io` time, health/metrics later.
 - [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
@@ -186,12 +188,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Proposer proof L1 head is the rollup node's `finalized_l1` (added to the rpc
   `SyncStatus`); the base/base check that it is not below the finalized L2 block's L1
   origin waits for the adapter (the `SyncStatus` type has no L1 origin).
+- Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
+  batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
+  estimation, no revert data), while a game creation needs the bond as value and the
+  revert selector. No fee bumping: a dropped creation fails, and the pipeline's restart
+  re-proposes at a fresh nonce (base/base's `TxManager` resubmits in place).
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/proposer-txmgr`: proposer tx submitter with revert classification.
 - 2026-11-05: `proof/proposer-adapters`: RPC `Chain` for the proposer, canned-RPC tests.
 - 2026-11-05: `proof/proposer` first slice: intervals, recovery walk, dispatcher/collector
   pipeline over injected interfaces, fakes, ported recovery tests, DST with L1 reorgs.
