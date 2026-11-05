@@ -340,3 +340,83 @@ test "prover service e2e: the challenger prover requests and receives a TEE proo
     // The handle whose slot was reused is stale.
     try testing.expectError(error.ProverUnavailable, prover.poll(handle + 64));
 }
+
+/// Answers `compressed` jobs with fixed archive bytes.
+const CompressedBackend = struct {
+    started: u32 = 0,
+    pending: bool = false,
+
+    fn backend(fake: *CompressedBackend) worker_module.Backend {
+        return .{ .context = fake, .vtable = &.{
+            .start = start,
+            .poll = poll,
+            .cancel = cancel,
+        } };
+    }
+
+    fn start(context: *anyopaque, job: *const protocol.ProofJob) worker_module.BackendError!void {
+        const fake: *CompressedBackend = @ptrCast(@alignCast(context));
+        if (job.request.request != .compressed) return error.Unsupported;
+        fake.started += 1;
+        fake.pending = true;
+    }
+
+    fn poll(context: *anyopaque) worker_module.BackendError!?protocol.ProofResult {
+        const fake: *CompressedBackend = @ptrCast(@alignCast(context));
+        assert(fake.pending);
+        fake.pending = false;
+        return .{ .compressed = .{ .zk_vm = .sp1, .proof = "NFPA-archive" } };
+    }
+
+    fn cancel(context: *anyopaque) void {
+        const fake: *CompressedBackend = @ptrCast(@alignCast(context));
+        fake.pending = false;
+    }
+};
+
+test "prover service e2e: the proposer's native mode proves through a compressed worker" {
+    const fakes = @import("../proposer/fakes.zig");
+    const intervals = @import("../proposer/intervals.zig");
+    const proposer_native = @import("proposer_native.zig");
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const valid = try intervals.validate(10, 5);
+    var chain: fakes.FakeChain = .{
+        .game_type = 621,
+        .anchor_state_registry = @splat(0xa5),
+        .schedule = .{ .slow = valid, .fast = valid, .fast_activation_block = 0 },
+        .salt = 3,
+        .anchor = undefined,
+    };
+    chain.anchor = .{ .root = chain.root_at(0), .l2_block_number = 0 };
+    const adapter = try testing.allocator.create(proposer_native.NativeProposerProver(io.SimIo));
+    defer testing.allocator.destroy(adapter);
+    adapter.* = .{ .client = &harness.nodes[0].client, .chain = chain.interface() };
+    const prover = adapter.prover();
+    var request = proof_request;
+    request.agreed_l2_block_number = 100;
+    request.claimed_l2_block_number = 110;
+    request.intermediate_block_interval = 5;
+    request.claimed_l2_output_root = chain.root_at(110);
+    try prover.request(&request);
+    try testing.expect(try prover.poll(request.session()) == .pending);
+    const clock = Clock.of(io.SimIo, &harness.client_io);
+    var fake: CompressedBackend = .{};
+    var config = worker_config("n");
+    config.proof_type = .compressed;
+    config.zk_vms = &.{.sp1};
+    var worker: Worker = .init(&harness.nodes[1].client, fake.backend(), clock, config);
+    var ticks: u32 = 0;
+    while (worker.stats.submitted == 0 and ticks < 20) : (ticks += 1) {
+        harness.advance(std.time.ns_per_s);
+        worker.tick();
+    }
+    try testing.expectEqual(@as(u64, 1), worker.stats.submitted);
+    const proof = (try prover.poll(request.session())).succeeded;
+    try testing.expectEqualStrings("NFPA-archive", proof.init_data);
+    try testing.expectEqual(@as(usize, 2), proof.intermediate_roots.len);
+    try testing.expectEqual(chain.root_at(105), proof.intermediate_roots[0]);
+    try testing.expectEqual(request.claimed_l2_output_root, proof.intermediate_roots[1]);
+    try prover.delete(request.session());
+    try testing.expectError(error.NotFound, prover.poll(request.session()));
+}
