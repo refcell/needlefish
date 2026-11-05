@@ -78,8 +78,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   native prover over the L1/L2 endpoints), JSON-RPC submitter from `--private-key`,
   pipeline ticked by the IO clock (`--ticks-max` for smoke runs). Dry-run smoke on the
   devnet (no factory deployed there, so nothing to propose).
-- [ ] `proposer` follow-ups: `--prover-rpc <url>` via the prover-service requester,
-  `--l1-beacon` for the native prover's blob reads, health/metrics/admin endpoints.
+- [x] `proposer` provers: `--prover-rpc <url>` through the prover-service
+  `ProposerProver`, `--l1-beacon` blob reads for the native prover (shared with
+  `proof run` in `bin/base/beacon.zig`).
+- [ ] `proposer` health/metrics/admin endpoints (base/base `health_addr`, `admin_addr`).
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
@@ -270,6 +272,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: `base proposer --prover-rpc <url>` and `--l1-beacon`.
 - 2026-11-05: `base proposer` (native prover, dry-run, JSON-RPC submitter).
 - 2026-11-05: proposer native prover (witness archive as initData), e2e replayed.
 - 2026-11-05: proposer checks the proof L1 head against the finalized L2 origin.

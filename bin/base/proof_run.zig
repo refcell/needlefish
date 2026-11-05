@@ -6,6 +6,7 @@ const std = @import("std");
 const Io = std.Io;
 const base = @import("base");
 const consensus_cli = @import("consensus.zig");
+const beacon = @import("beacon.zig");
 
 const io = base.utilities.io;
 const http = base.utilities.http;
@@ -198,14 +199,11 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     return if (verdict.holds) 0 else 1;
 }
 
-const BlobProvider = base.consensus.sources.blob_provider;
-
 const ProveContext = struct {
     os_io: *io.IO,
     beacon_url: ?[]const u8,
     witness: ?*host.Store,
 };
-const Beacon = host.beacon_blobs.BeaconBlobs(io.IO, BlobProvider.KzgVerifier);
 
 fn prove(
     allocator: std.mem.Allocator,
@@ -230,25 +228,10 @@ fn prove(
     const witness = context.witness;
     const url = context.beacon_url orelse
         return host.native.run(allocator, store, source.as_source(), roots, options, witness);
-    // The verifier gets its own workspace: the handler uses `workspace` after a fetch.
-    const verifier_workspace = try allocator.create(kzg.blob.Workspace);
-    defer allocator.destroy(verifier_workspace);
-    const provider = try allocator.create(Beacon.Provider);
-    defer allocator.destroy(provider);
-    const verifier: BlobProvider.KzgVerifier = .{
-        .settings = &settings,
-        .workspace = verifier_workspace,
-    };
-    const address = try consensus_cli.parse_url(url);
-    try provider.init(allocator, os_io, address, http_options, verifier, .{});
-    defer provider.deinit();
-    var beacon: Beacon = .{
-        .provider = provider,
-        .verifier = verifier,
-        .pump = .{ .context = os_io, .step = Endpoints.step },
-        .steps_max = 300_000,
-    };
-    source.blobs = beacon.fetcher();
+    const pump: proof.rpc.endpoint.Pump = .{ .context = os_io, .step = Endpoints.step };
+    const blobs = try beacon.Blobs.create(allocator, os_io, url, &settings, http_options, pump);
+    defer blobs.destroy(allocator);
+    source.blobs = blobs.fetcher();
     defer source.blobs = null;
     return host.native.run(allocator, store, source.as_source(), roots, options, witness);
 }

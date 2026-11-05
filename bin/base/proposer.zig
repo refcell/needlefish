@@ -6,6 +6,7 @@ const std = @import("std");
 const Io = std.Io;
 const base = @import("base");
 const consensus_cli = @import("consensus.zig");
+const beacon = @import("beacon.zig");
 
 const io = base.utilities.io;
 const http = base.utilities.http;
@@ -65,10 +66,6 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("proposer: {t}\n{s}", .{ err, usage });
         return 2;
     };
-    if (!config.native_prover()) {
-        std.debug.print("proposer: only --prover-rpc native is supported so far\n", .{});
-        return 2;
-    }
     const allocator = init.gpa;
     const service = try allocator.create(Service);
     defer allocator.destroy(service);
@@ -116,34 +113,13 @@ fn disconnect(service: *Service) void {
     service.os_io.deinit();
 }
 
-/// Builds the native prover and the submitter, then ticks the pipeline.
+/// Opens the prover and the submitter, then ticks the pipeline.
 fn run(init: std.process.Init, service: *Service, config: *const proposer.config.Config) !u8 {
     const allocator = init.gpa;
-    const rollup_json = try Io.Dir.cwd().readFileAlloc(
-        init.io,
-        config.rollup_config,
-        allocator,
-        .limited(proof.program.boot.rollup_config_bytes_max),
-    );
-    defer allocator.free(rollup_json);
-    const l1_genesis = try read_optional(init, config.l1_genesis);
-    defer allocator.free(l1_genesis);
-    const l1_config = try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
-    const rollup = try protocol.rollup_json.parse(rollup_json);
-    var source: Source = .init(allocator, &service.l1_client, &service.l2_client, service.pump(), .{
-        .steps_max = 300_000,
-    });
-    defer source.deinit();
-    const kzg_state = try KzgState.create(allocator);
-    defer kzg_state.destroy(allocator);
-    var native = try proposer.native_prover.NativeProver.init(allocator, source.as_source(), .{
-        .rollup_config_json = rollup_json,
-        .chain_id = rollup.l2_chain_id,
-        .l1_config_json = l1_config,
-        .options = kzg_state.options(),
-        .roots_brp = kzg_state.roots,
-    });
-    defer native.deinit();
+    const provers = try allocator.create(Provers);
+    defer allocator.destroy(provers);
+    const prover = try provers.open(init, service, config);
+    defer provers.close(allocator);
     var dry_run: proposer.dry_run.DryRun = .{};
     var submitter: ?Submitter = null;
     defer if (submitter) |*sender| sender.deinit(allocator);
@@ -156,9 +132,108 @@ fn run(init: std.process.Init, service: *Service, config: *const proposer.config
         .proposer = address,
         .anchor_state_registry = config.anchor_state_registry,
         .poll_interval_ns = config.poll_interval_ms * std.time.ns_per_ms,
-    }, service.chain.chain(), native.prover_interface(), submit);
-    return tick_loop(service, config, &native, &dry_run);
+    }, service.chain.chain(), prover, submit);
+    return tick_loop(service, config, &dry_run);
 }
+
+const RemoteClient = proof.prover_service.client.Client(io.IO);
+const RemoteProver = proof.prover_service.client.ProposerProver(io.IO);
+
+/// The proposer's prover: in-process native (`--prover-rpc native`, with optional beacon
+/// blobs) or a prover service over JSON-RPC.
+const Provers = struct {
+    mode: enum { native, remote },
+    rollup_json: []u8 = &.{},
+    l1_genesis: []u8 = &.{},
+    source: Source = undefined,
+    kzg_state: *KzgState = undefined,
+    blobs: ?*beacon.Blobs = null,
+    native: proposer.native_prover.NativeProver = undefined,
+    remote_http: Source.Client = undefined,
+    remote_endpoint: Endpoint = undefined,
+    remote_client: RemoteClient = undefined,
+    remote: RemoteProver = undefined,
+
+    fn open(
+        provers: *Provers,
+        init: std.process.Init,
+        service: *Service,
+        config: *const proposer.config.Config,
+    ) !proposer.interfaces.Prover {
+        if (config.native_prover()) {
+            provers.* = .{ .mode = .native };
+            return provers.open_native(init, service, config);
+        }
+        provers.* = .{ .mode = .remote };
+        const allocator = init.gpa;
+        const address = try consensus_cli.parse_url(config.prover_rpc);
+        provers.remote_http = try .init(allocator, &service.os_io, address, http_options, 4096);
+        errdefer provers.remote_http.deinit();
+        provers.remote_endpoint = .init(allocator, &provers.remote_http, service.pump(), 300_000);
+        errdefer provers.remote_endpoint.deinit();
+        provers.remote_client = try .init(allocator, &provers.remote_endpoint, .{});
+        provers.remote = .{ .client = &provers.remote_client };
+        return provers.remote.prover();
+    }
+
+    fn open_native(
+        provers: *Provers,
+        init: std.process.Init,
+        service: *Service,
+        config: *const proposer.config.Config,
+    ) !proposer.interfaces.Prover {
+        const allocator = init.gpa;
+        provers.rollup_json = try Io.Dir.cwd().readFileAlloc(
+            init.io,
+            config.rollup_config,
+            allocator,
+            .limited(proof.program.boot.rollup_config_bytes_max),
+        );
+        provers.l1_genesis = try read_optional(init, config.l1_genesis);
+        const l1_config = try base.utilities.json.find_path(provers.l1_genesis, &.{"config"}) orelse
+            "";
+        const rollup = try protocol.rollup_json.parse(provers.rollup_json);
+        provers.source = .init(allocator, &service.l1_client, &service.l2_client, service.pump(), .{
+            .steps_max = 300_000,
+        });
+        provers.kzg_state = try KzgState.create(allocator);
+        if (config.l1_beacon.len > 0) {
+            const settings = &provers.kzg_state.settings;
+            const url = config.l1_beacon;
+            const pump = service.pump();
+            const os_io = &service.os_io;
+            provers.blobs = try .create(allocator, os_io, url, settings, http_options, pump);
+            provers.source.blobs = provers.blobs.?.fetcher();
+        }
+        provers.native = try .init(allocator, provers.source.as_source(), .{
+            .rollup_config_json = provers.rollup_json,
+            .chain_id = rollup.l2_chain_id,
+            .l1_config_json = l1_config,
+            .options = provers.kzg_state.options(),
+            .roots_brp = provers.kzg_state.roots,
+        });
+        return provers.native.prover_interface();
+    }
+
+    /// Releases what `open` acquired; on an `open` error, the process exits.
+    fn close(provers: *Provers, allocator: std.mem.Allocator) void {
+        switch (provers.mode) {
+            .remote => {
+                provers.remote_client.deinit(allocator);
+                provers.remote_endpoint.deinit();
+                provers.remote_http.deinit();
+            },
+            .native => {
+                provers.native.deinit();
+                if (provers.blobs) |blobs| blobs.destroy(allocator);
+                provers.kzg_state.destroy(allocator);
+                provers.source.deinit();
+                allocator.free(provers.l1_genesis);
+                allocator.free(provers.rollup_json);
+            },
+        }
+    }
+};
 
 fn open_submitter(
     allocator: std.mem.Allocator,
@@ -183,7 +258,6 @@ fn open_submitter(
 fn tick_loop(
     service: *Service,
     config: *const proposer.config.Config,
-    native: *const proposer.native_prover.NativeProver,
     dry_run: *const proposer.dry_run.DryRun,
 ) !u8 {
     const interval_ns = config.poll_interval_ms * std.time.ns_per_ms;
@@ -192,11 +266,11 @@ fn tick_loop(
     while (config.ticks_max == null or ticks < config.ticks_max.?) : (ticks += 1) {
         service.pipeline.tick(service.os_io.now_monotonic_ns() - start_ns);
         const stats = service.pipeline.stats;
-        std.debug.print("proposer: tick {d}: {d} proofs, {d} dry-run sends, {d} restarts\n", .{
+        std.debug.print("proposer: tick {d}: {d} skipped, {d} restarts, {d} dry-run sends\n", .{
             stats.ticks,
-            native.proofs_total,
-            dry_run.sent,
+            stats.skipped,
             stats.restarts,
+            dry_run.sent,
         });
         try service.os_io.run_for_ns(interval_ns);
     }
