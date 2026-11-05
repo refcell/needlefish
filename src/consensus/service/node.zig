@@ -43,6 +43,8 @@ const primitives = @import("../../common/primitives/root.zig");
 const gossip_bridge = @import("gossip_bridge.zig");
 const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
+const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
+const base_rpc = @import("../rpc/base.zig");
 
 const ProviderError = derive_errors.ProviderError;
 const BlockInfo = protocol.block.BlockInfo;
@@ -68,11 +70,19 @@ pub const P2p = struct {
     seed: u64,
 };
 
+/// The L1 `ProtocolVersions` upgrade-signal contract (base/base `--upgrade-signal.*`): the
+/// node observes its schedule (metrics-only mode) and serves `base_upgradeReadiness`.
+pub const UpgradeSignal = struct {
+    contract: [20]u8,
+    block_tag: upgrade_signal.BlockTag = .finalized,
+};
+
 /// Gossiped blocks handed to the driver per tick.
 const gossip_blocks_per_tick: u32 = 8;
 
 pub const Options = struct {
     p2p: ?P2p = null,
+    upgrade_signal: ?UpgradeSignal = null,
     l1: Address,
     /// Beacon API for blobs; without it blob batches are unavailable.
     l1_beacon: ?Address = null,
@@ -211,6 +221,11 @@ pub fn Node(comptime IO: type) type {
             .reset_derivation_pipeline = admin_reset_derivation_pipeline,
             .post_unsafe_payload = admin_post_unsafe_payload,
         };
+        const base_vtable: base_rpc.VTable = .{
+            .config = base_config,
+            .status = base_status,
+            .now_s = base_now_s,
+        };
         const backend_vtable: rollup_rpc.Backend.VTable = .{
             .sync_status = backend_sync_status,
             .output_at_block = backend_output_at_block,
@@ -263,9 +278,12 @@ pub fn Node(comptime IO: type) type {
         /// config names the contract).
         signer: ?*Signer = null,
         signer_version: u64 = 0,
+        /// Observes the L1 upgrade-signal schedule when configured.
+        upgrade: ?*Upgrade = null,
 
         pub const Network = p2p_network.Network(IO);
         pub const Signer = signer_watcher.SignerWatcher(IO);
+        pub const Upgrade = upgrade_signal.Observer(IO, *Self);
         pub const GossipStats = struct {
             received: u64 = 0,
             undecodable: u64 = 0,
@@ -322,7 +340,46 @@ pub fn Node(comptime IO: type) type {
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
             errdefer node.rpc_server.deinit();
+            if (options.upgrade_signal) |config| try node.init_upgrade(&config);
+            errdefer node.deinit_upgrade();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_upgrade(node: *Self, config: *const UpgradeSignal) !void {
+            assert(node.upgrade == null);
+            assert(!std.mem.allEqual(u8, &config.contract, 0));
+            const observer = try node.allocator.create(Upgrade);
+            errdefer node.allocator.destroy(observer);
+            try observer.init(node.allocator, node.io, node.options.l1, config.contract, .{
+                .layer = .consensus,
+                .reader = .{ .block_tag = config.block_tag },
+            }, node, on_upgrade_schedule);
+            node.upgrade = observer;
+            node.backend.base = &base_vtable;
+        }
+
+        fn deinit_upgrade(node: *Self) void {
+            const observer = node.upgrade orelse return;
+            observer.stop();
+            var rounds: u32 = 0;
+            while (!observer.stopped() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
+            observer.deinit();
+            node.allocator.destroy(observer);
+            node.upgrade = null;
+            node.backend.base = null;
+        }
+
+        fn on_upgrade_schedule(node: *Self, schedule: *const upgrade_signal.Schedule) void {
+            assert(schedule.count > 0);
+            var version_text: [64]u8 = undefined;
+            const version = std.fmt.bufPrint(&version_text, "{f}", .{schedule.minimum_version});
+            node.logger.log(.info, "consensus", "upgrade signal schedule", .{
+                .l1_block = schedule.l1_block_number,
+                .signals = schedule.signals_count(),
+                .minimum_protocol_version = version catch "unprintable",
+            });
         }
 
         fn init_p2p(node: *Self, p2p: *const P2p) !void {
@@ -446,6 +503,7 @@ pub fn Node(comptime IO: type) type {
         /// complete into freed memory); the binary tears both down together.
         pub fn deinit(node: *Self) void {
             node.deinit_p2p();
+            node.deinit_upgrade();
             node.gossip_arena.deinit();
             node.rpc_server.deinit();
             node.driver.deinit();
@@ -460,6 +518,7 @@ pub fn Node(comptime IO: type) type {
             node.logger.log(.info, "consensus", "rpc listening", .{ .port = address.port });
             assert(address.family == node.options.rpc_address.family);
             if (node.network) |network| try node.start_p2p(network);
+            if (node.upgrade) |observer| observer.start();
             return address;
         }
 
@@ -740,6 +799,28 @@ pub fn Node(comptime IO: type) type {
             });
         }
 
+        fn base_config(context: *anyopaque) base_rpc.Config {
+            const node = from_context(context);
+            const tag = node.options.upgrade_signal.?.block_tag;
+            return .{
+                .node_version = base_rpc.advertised_version(node.options.version),
+                .mode = .metrics_only, // Schedules are observed, not applied.
+                .halt_lead_s = base_rpc.halt_lead_s(tag),
+            };
+        }
+
+        fn base_status(context: *anyopaque) base_rpc.Status {
+            const node = from_context(context);
+            const observer = node.upgrade.?; // Proof: `backend.base` is set only with it.
+            if (observer.observed) return .{ .schedule = &observer.last };
+            if (observer.metrics.empty_schedule_reads_total.get() > 0) return .empty;
+            return .unavailable;
+        }
+
+        fn base_now_s(context: *anyopaque) u64 {
+            return from_context(context).io.now_realtime_ns() / std.time.ns_per_s;
+        }
+
         fn backend_safe_db(context: *anyopaque) ?*const safedb.SafeDB {
             return &from_context(context).safe_db;
         }
@@ -817,6 +898,81 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
+}
+
+test "node: observes the upgrade signal and serves base_upgradeReadiness" {
+    const contract = upgrade_signal.contract;
+    var schedule_data: [64 + 32 * 2]u8 = undefined;
+    const encoded = contract.encode_schedule(&.{ 1_000, 2_000 }, &schedule_data);
+    var schedule_text: [2 + 2 * schedule_data.len + 2]u8 = undefined;
+    const schedule_hex = std.fmt.bytesToHex(schedule_data, .lower);
+    const schedule_result = try std.fmt.bufPrint(&schedule_text, "\"0x{s}\"", .{
+        schedule_hex[0 .. 2 * encoded.len],
+    });
+    var version_word: [32]u8 = undefined;
+    const minimum = upgrade_signal.Version.pack(2, 0, 0, 0);
+    std.mem.writeInt(u256, &version_word, minimum.packed_value, .big);
+    var version_text: [70]u8 = undefined;
+    const version_hex = std.fmt.bytesToHex(version_word, .lower);
+    const version_result = try std.fmt.bufPrint(&version_text, "\"0x{s}\"", .{&version_hex});
+    const schedule_selector = std.fmt.bytesToHex(contract.get_schedule_selector, .lower);
+    const version_selector = std.fmt.bytesToHex(contract.minimum_protocol_version_selector, .lower);
+    const hash_hex = "abababababababababababababababab" ++ "abababababababababababababababab";
+    var fake: FakeRpc = .{};
+    fake.add(.{
+        .method = "eth_getBlockByNumber",
+        .params_contain = "finalized",
+        .result = "{\"number\":\"0x309\",\"hash\":\"0x" ++ hash_hex ++ "\"}",
+    });
+    const call = "eth_call";
+    fake.add(.{ .method = call, .params_contain = &schedule_selector, .result = schedule_result });
+    fake.add(.{ .method = call, .params_contain = &version_selector, .result = version_result });
+    var harness: Harness = undefined;
+    try harness.init_connections(&fake, 0x5b, 4); // The upgrade reader is one more client.
+    defer harness.deinit();
+    const rollup: RollupConfig = .{ .block_time = 2 };
+    var log_buffer: [8192]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const node = try testing.allocator.create(TestNode);
+    defer testing.allocator.destroy(node);
+    try node.init(testing.allocator, &harness.client_io, &logger, &rollup, .{
+        .l1 = harness.address,
+        .l2 = harness.address,
+        .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
+        .http_client = harness_module.client_options,
+        .version = "1.5.0",
+        .upgrade_signal = .{ .contract = @splat(0xc0) },
+    });
+    defer node.deinit();
+    var buffer: [4096]u8 = undefined;
+    const request =
+        \\{"jsonrpc":"2.0","id":1,"method":"base_upgradeReadiness","params":["1.5.0"]}
+    ;
+    var out: std.Io.Writer = .fixed(&buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend, request, &out);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "-32006") != null);
+    _ = try node.start();
+    for (0..20) |_| {
+        node.tick();
+        harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "upgrade signal schedule") != null);
+    out = .fixed(&buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend, request, &out);
+    const text = out.buffered();
+    try testing.expect(std.mem.indexOf(u8, text, "\"ready\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"node_protocol_version\":\"1.5.0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"l1_block_number\":777") != null);
+    const required = "\"required_protocol_version\":\"2.0.0\"";
+    try testing.expect(std.mem.indexOf(u8, text, required) != null);
+    out = .fixed(&buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend,
+        \\{"jsonrpc":"2.0","id":2,"method":"base_upgradeReadiness"}
+    , &out);
+    try testing.expect(std.mem.indexOf(u8, out.buffered(), "metrics-only") != null);
+    while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
 }
 
 test "node: output roots from Isthmus headers" {

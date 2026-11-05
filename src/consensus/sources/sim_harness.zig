@@ -34,8 +34,28 @@ pub fn Harness(comptime Context: type, comptime handler: http.server.Handler(Con
             assert(harness.world.options.seed == seed);
         }
 
+        /// Like `init` for nodes with more concurrent clients than the default two.
+        pub fn init_connections(
+            harness: *Self,
+            context: Context,
+            seed: u64,
+            connections_max: u32,
+        ) !void {
+            assert(connections_max >= 2);
+            try harness.init_server(context, .{ .seed = seed }, connections_max);
+        }
+
         /// Like `init` with explicit world options (latency range, resets, refusals).
         pub fn init_world(harness: *Self, context: Context, options: io.sim.Options) !void {
+            try harness.init_server(context, options, 2);
+        }
+
+        fn init_server(
+            harness: *Self,
+            context: Context,
+            options: io.sim.Options,
+            connections_max: u32,
+        ) !void {
             const allocator = std.testing.allocator;
             harness.world = try io.SimWorld.init(allocator, options);
             errdefer harness.world.deinit();
@@ -50,7 +70,7 @@ pub fn Harness(comptime Context: type, comptime handler: http.server.Handler(Con
             });
             errdefer harness.client_io.deinit();
             try harness.server.init(allocator, &harness.server_io, context, .{
-                .connections_max = 2,
+                .connections_max = connections_max,
                 .recv_buffer_size = 16 * 1024,
                 .send_buffer_size = limits.body_size_max + 4096,
                 .limits = .{ .head_size_max = 2048, .body_size_max = 8 * 1024 },

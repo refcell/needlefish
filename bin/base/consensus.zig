@@ -18,6 +18,7 @@ const usage =
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
+    \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
     \\
 ;
 
@@ -35,6 +36,9 @@ pub const Flags = struct {
     /// Unsafe-block gossip, on unless `--p2p.disabled` (base/base default).
     p2p_disabled: bool = false,
     p2p: p2p.options.Options = .{},
+    /// The L1 `ProtocolVersions` contract; defaults to the chain's public one.
+    upgrade_signal_contract: ?[20]u8 = null,
+    upgrade_signal_block_tag: base.utilities.upgrade_signal.BlockTag = .finalized,
 };
 
 const p2p_args_max = 2 * p2p.options.bootnodes_max + 64;
@@ -60,6 +64,14 @@ pub fn parse_url(text: []const u8) !io.Address {
     const colon = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return error.MissingPort;
     const port = try std.fmt.parseInt(u16, rest[colon + 1 ..], 10);
     return io.Address.ip4(try parse_ip4(rest[0..colon]), port);
+}
+
+fn parse_address(text: []const u8) ![20]u8 {
+    const digits = if (std.mem.startsWith(u8, text, "0x")) text[2..] else text;
+    if (digits.len != 40) return error.InvalidAddress;
+    var address: [20]u8 = undefined;
+    _ = std.fmt.hexToBytes(&address, digits) catch return error.InvalidAddress;
+    return address;
 }
 
 fn parse_ip4(text: []const u8) ![4]u8 {
@@ -96,6 +108,12 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.rpc_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(u8, arg, "--sequencer.key-index")) {
         flags.sequencer_key_index = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, arg, "--upgrade-signal.contract")) {
+        flags.upgrade_signal_contract = try parse_address(value);
+    } else if (eql(u8, arg, "--upgrade-signal.l1-block-tag")) {
+        const BlockTag = base.utilities.upgrade_signal.BlockTag;
+        flags.upgrade_signal_block_tag = std.meta.stringToEnum(BlockTag, value) orelse
+            return error.UnknownBlockTag;
     } else if (eql(u8, arg, "--log.level")) {
         flags.log_level = std.meta.stringToEnum(log.Level, value) orelse
             return error.UnknownLogLevel;
@@ -177,6 +195,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .driver = .{ .sequencer = flags.sequencer },
         .version = base.build_options.version,
         .p2p = p2p_config,
+        .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
     });
     defer node.deinit();
     _ = try node.start();
@@ -188,6 +207,15 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         node.tick();
         try os_io.run_for_ns(10 * std.time.ns_per_ms);
     }
+}
+
+/// The upgrade-signal contract to observe: the flag, else the chain's public default.
+fn upgrade_settings(flags: *const Flags, l2_chain_id: u64) ?consensus.service.node.UpgradeSignal {
+    const upgrade_signal = base.utilities.upgrade_signal;
+    const contract = flags.upgrade_signal_contract orelse
+        upgrade_signal.contract.default_contract(l2_chain_id) orelse return null;
+    if (std.mem.allEqual(u8, &contract, 0)) return null;
+    return .{ .contract = contract, .block_tag = flags.upgrade_signal_block_tag };
 }
 
 /// The gossip setup, or null when disabled or no unsafe block signer can be known.
@@ -257,6 +285,19 @@ test "consensus: flags" {
     try std.testing.expectEqual(@as(u16, 9301), with_p2p.p2p.listen_udp);
     try std.testing.expect(with_p2p.p2p.no_discovery);
     const disabled = try parse_flags(&(required ++ [_][]const u8{"--p2p.disabled"}));
+    const upgrade = try parse_flags(&(required ++ [_][]const u8{
+        "--upgrade-signal.contract",     "0x7480afc8d99a5c645c247db5a1e4a4f440e6e095",
+        "--upgrade-signal.l1-block-tag", "safe",
+    }));
+    try std.testing.expectEqual(@as(u8, 0x74), upgrade.upgrade_signal_contract.?[0]);
+    try std.testing.expectEqual(.safe, upgrade.upgrade_signal_block_tag);
+    try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
+    try std.testing.expect(upgrade_settings(&disabled, 901) == null);
+    try std.testing.expect(upgrade_settings(&disabled, 8453) != null);
+    const bad_tag = required ++ [_][]const u8{ "--upgrade-signal.l1-block-tag", "pending" };
+    try std.testing.expectError(error.UnknownBlockTag, parse_flags(&bad_tag));
+    const bad_address = required ++ [_][]const u8{ "--upgrade-signal.contract", "0x12" };
+    try std.testing.expectError(error.InvalidAddress, parse_flags(&bad_address));
     try std.testing.expect(disabled.p2p_disabled);
     try std.testing.expectError(
         error.MissingValue,

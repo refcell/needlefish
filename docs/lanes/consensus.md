@@ -43,7 +43,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] admin_* sequencer control (active/start/stop), recover mode, resetDerivationPipeline,
     conductorEnabled, healthz
   - [x] admin_postUnsafePayload: `engine_json.decode_unsafe_envelope` → `Driver.insert_unsafe` (same rules as gossip); RPC body limit raised to 1 MiB
-  - [ ] base_* RPC
+  - [x] base_* RPC: `base_upgradeReadiness` (`rpc/base.zig`) over an upgrade-signal observer (`--upgrade-signal.contract` / `.l1-block-tag`, default contract per chain); metrics-only mode
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [x] `p2p`: `Node` embeds `p2p.Network(IO)` (`--p2p.*` flags, on by default, `--p2p.disabled`): gossiped blocks go to `Driver.insert_unsafe`, the sequencer publishes each sealed block; devnet verifier follows the sequencer's unsafe head over gossip.
   - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
@@ -68,6 +68,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
+- `base_upgradeReadiness` answers from the node's upgrade-signal observer (finalized reads every 15 min by default) instead of a fresh L1 read per query (base/base, 5 s cache), because the router is synchronous. The node only observes schedules (metrics-only), so without a target version it reports not ready, as base/base does in that mode.
 - Unsafe block signer: base/base reads the L1 SystemConfig once at startup (blocking, with retries); we poll it every 60 s without blocking startup, and until it answers validate against the fallback (chain config, flag, own sequencer key; zero when only L1 can tell, which rejects gossip until it does).
 - Deviation from base/base `batch_queue.rs`: `next_batch` advances the epoch list a second time, after `update_origin` appends the new origin (the Holocene `BatchValidator` order). Otherwise a reset point one L1 block behind the safe head's origin (always the case near genesis) leaves [reset origin, parent origin], every step fails `L1OriginMismatch`, and the reset repeats forever.
 - p2p in `base consensus` is on by default (base/base); without `--p2p.unsafe.block.signer` a verifier runs with p2p off and warns, a sequencer signs with its own key. The node key is random unless `--p2p.priv.*`. The devnet verifier dials the sequencer's enode, scraped from its startup log.
@@ -176,6 +177,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: `base_upgradeReadiness` evaluates the L1 upgrade-signal schedule with base/base's readiness predicates.
 - 2026-11-05: service: `SignerWatcher` reads the unsafe block signer from the L1 SystemConfig storage slot and updates gossip validation on change.
 - 2026-11-05: rpc: admin_postUnsafePayload decodes the posted envelope and queues it like a gossiped block.
 - 2026-11-05: derive: fix reset livelock (DST seed 48): `BatchQueue.next_batch` advances the epoch list again after appending the new origin; regression test in `batch_queue_test.zig`.
