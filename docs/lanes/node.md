@@ -8,6 +8,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
+- [ ] `txpool/validate`: verify blob proofs with `common.consensus.sidecar.Sidecar.verify_kzg`
+  (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
 - [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
 - [ ] Block executor: apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).

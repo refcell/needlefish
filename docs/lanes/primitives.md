@@ -63,6 +63,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   are EIP-55 checksummed like reth; `l1FeeScalar` is a caller-formatted decimal string.
 - flashblocks parse with `std.json` into a per-message arena (the feed is not a hot
   consensus path) and reuse the consensus lane's brotli decoder.
+- `Sidecar.verify_kzg` batch-verifies v0 blob proofs via `crypto.kzg.blob`; v1 cell proofs
+  return `CellProofsUnsupported` until the crypto lane ships cells. Tests are ReleaseSafe-only.
 
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
@@ -80,3 +82,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: predeploys and Denim BaseTime metadata deposit.
 - 2026-11-05: rpc_types JSON writers (alloy field names; checksummed addresses).
 - 2026-11-05: flashblocks types and message decoding.
+- 2026-11-05: blob sidecar KZG verification (v0).

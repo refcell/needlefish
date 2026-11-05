@@ -17,6 +17,7 @@ const primitives = @import("../primitives/root.zig");
 const rlp = @import("../rlp/root.zig");
 const tx_module = @import("tx.zig");
 const kzg = @import("../crypto/kzg/root.zig");
+const kzg_blob = kzg.blob;
 const B256 = primitives.B256;
 const Encoder = rlp.Encoder;
 const Decoder = rlp.Decoder;
@@ -115,6 +116,23 @@ pub const ValidateError = error{
     VersionedHashMismatch,
 };
 
+pub const KzgError = error{
+    /// EIP-7594 cell proofs: verification lands with the crypto lane's cell API.
+    CellProofsUnsupported,
+    /// A blob element is not canonical, or a commitment or proof is not a valid point.
+    InvalidKzgInput,
+    /// The proofs do not open the commitments to the blobs.
+    KzgProofMismatch,
+};
+
+/// Long-lived KZG state: the decoded trusted setup plus scratch (about 1.1 MiB in all;
+/// keep it in static memory or on the heap). One verifier serves one call at a time.
+pub const KzgVerifier = struct {
+    settings: *const kzg_blob.Settings,
+    workspace: *kzg_blob.Workspace,
+    batch: *kzg_blob.BatchStorage(blobs_per_tx_max),
+};
+
 pub const Sidecar = struct {
     version: WrapperVersion = .eip4844,
     blobs: BlobList = .{},
@@ -136,6 +154,34 @@ pub const Sidecar = struct {
                 return error.VersionedHashMismatch;
             }
         }
+    }
+
+    /// Verifies every blob proof in one batched pairing check. Call after `validate`.
+    pub fn verify_kzg(sidecar: Sidecar, verifier: KzgVerifier) KzgError!void {
+        if (sidecar.version != .eip4844) return error.CellProofsUnsupported;
+        const count = sidecar.blobs.count();
+        assert(count <= blobs_per_tx_max);
+        assert(sidecar.commitments.count() == count and sidecar.proofs.count() == count);
+        var blobs: [blobs_per_tx_max]*const kzg_blob.Blob = undefined;
+        var commitments: [blobs_per_tx_max]kzg_blob.Commitment = undefined;
+        var proofs: [blobs_per_tx_max]kzg_blob.Proof = undefined;
+        for (0..count) |index| {
+            blobs[index] = sidecar.blobs.get(index);
+            commitments[index] = sidecar.commitments.get(index).*;
+            proofs[index] = sidecar.proofs.get(index).*;
+        }
+        const valid = kzg_blob.verify_blob_kzg_proof_batch(
+            verifier.settings,
+            verifier.workspace,
+            verifier.batch.scratch(),
+            blobs[0..count],
+            commitments[0..count],
+            proofs[0..count],
+        ) catch |err| return switch (err) {
+            error.InvalidFieldElement, error.InvalidPoint => error.InvalidKzgInput,
+            error.ScratchTooSmall => unreachable, // Storage holds blobs_per_tx_max blobs.
+        };
+        if (!valid) return error.KzgProofMismatch;
     }
 
     fn version_length(sidecar: Sidecar) usize {
@@ -431,4 +477,68 @@ fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
 
 test "sidecar: fuzz decode" {
     try testing.fuzz({}, fuzz_decode, .{});
+}
+
+// KZG tests decode the 4096-point setup and run pairings: too slow for debug builds,
+// matching the crypto lane's `heavy_tests` gate.
+const heavy_tests = @import("builtin").mode != .debug;
+var test_kzg_storage: kzg_blob.Settings.Storage = undefined;
+var test_kzg_workspace: kzg_blob.Workspace = undefined;
+var test_kzg_batch: kzg_blob.BatchStorage(blobs_per_tx_max) = .{};
+var test_kzg_settings: ?kzg_blob.Settings = null;
+
+fn test_verifier() !KzgVerifier {
+    if (test_kzg_settings == null) {
+        test_kzg_settings = try kzg_blob.Settings.init(&test_kzg_storage);
+    }
+    return .{
+        .settings = &test_kzg_settings.?,
+        .workspace = &test_kzg_workspace,
+        .batch = &test_kzg_batch,
+    };
+}
+
+var test_blobs: [2]kzg_blob.Blob = undefined;
+var test_blob_list: [2 * (bytes_per_blob + 4)]u8 = undefined;
+
+test "sidecar: KZG verification" {
+    const v1: Sidecar = .{ .version = .eip7594 };
+    const no_verifier: KzgVerifier = undefined;
+    try testing.expectError(error.CellProofsUnsupported, v1.verify_kzg(no_verifier));
+    if (!heavy_tests) return error.SkipZigTest;
+    const verifier = try test_verifier();
+    var prng = Prng.init(0x4844);
+    var commitments: [2]kzg_blob.Commitment = undefined;
+    var proofs: [2]kzg_blob.Proof = undefined;
+    for (&test_blobs, &commitments, &proofs) |*blob, *commitment, *proof| {
+        // Small field elements are always canonical.
+        @memset(blob, 0);
+        for (0..kzg_blob.field_elements) |element| blob[element * 32 + 31] = prng.int(u8);
+        commitment.* = try kzg_blob.blob_to_kzg_commitment(
+            verifier.settings,
+            verifier.workspace,
+            blob,
+        );
+        proof.* = try kzg_blob.compute_blob_kzg_proof(
+            verifier.settings,
+            verifier.workspace,
+            blob,
+            commitment,
+        );
+    }
+    var commitment_buffer: [128]u8 = undefined;
+    var proof_buffer: [128]u8 = undefined;
+    var sidecar: Sidecar = .{
+        .blobs = BlobList.build(&test_blob_list, &test_blobs),
+        .commitments = CommitmentList.build(&commitment_buffer, &commitments),
+        .proofs = ProofList.build(&proof_buffer, &proofs),
+    };
+    try sidecar.verify_kzg(verifier);
+    const swapped = [_]kzg_blob.Proof{ proofs[1], proofs[0] };
+    sidecar.proofs = ProofList.build(&proof_buffer, &swapped);
+    try testing.expectError(error.KzgProofMismatch, sidecar.verify_kzg(verifier));
+    var bad_point: kzg_blob.Proof = @splat(0xff);
+    bad_point[0] = 0x9f;
+    sidecar.proofs = ProofList.build(&proof_buffer, &.{ proofs[0], bad_point });
+    try testing.expectError(error.InvalidKzgInput, sidecar.verify_kzg(verifier));
 }
