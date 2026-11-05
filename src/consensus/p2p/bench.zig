@@ -28,6 +28,12 @@ const payload_bytes = 128 * 1024;
 pub const cases = [_]Case{
     .{ .name = "p2p/noise XX handshake", .iterations = 100, .run = bench_handshake },
     .{
+        .name = "p2p/poly1305 std 64 KiB",
+        .iterations = 20_000,
+        .run = bench_poly1305_std,
+        .bytes_per_op = 64 * 1024,
+    },
+    .{
         .name = "p2p/noise transport seal+open 64 KiB",
         .iterations = 10_000,
         .run = bench_transport,
@@ -121,6 +127,23 @@ fn bench_handshake(iterations: u32) u64 {
     for (0..iterations) |_| {
         const transports = handshake(&prng);
         checksum +%= transports[0].handshake_hash[0];
+    }
+    return checksum;
+}
+
+fn bench_poly1305_std(iterations: u32) u64 {
+    return bench_mac(std.crypto.onetimeauth.Poly1305, iterations);
+}
+
+fn bench_mac(comptime Mac: type, iterations: u32) u64 {
+    const message = payload()[0 .. 64 * 1024];
+    var key: [32]u8 = @splat(7);
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        var tag: [16]u8 = undefined;
+        Mac.create(&tag, message, &key);
+        key[0] = tag[0];
+        checksum +%= tag[1];
     }
     return checksum;
 }

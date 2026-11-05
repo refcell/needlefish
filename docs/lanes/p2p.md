@@ -86,8 +86,10 @@ behind a small interface and switch later.
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
   (8 blocks per pass in column layout, keystream 599 -> 2260 MB/s; std Poly1305).
-- [ ] Perf: Poly1305 (~2 GB/s) now dominates half the AEAD; consider a 2^26-limb NEON
-  Poly1305 or interleaving MAC with keystream generation.
+- [x] ~~Perf: Poly1305 2^26-limb vector path~~ won't do: measured std Poly1305 at
+  4006 MB/s (64 KiB, M4 Pro); a 4-lane 26-bit version reached only 4314 MB/s because
+  LLVM scalarizes the 32x32->64 lane products. ChaCha20 (2260 MB/s) dominates the AEAD,
+  so the next AEAD win is there (`p2p/poly1305 std` bench kept).
 
 ## Decisions
 - Lives under `src/consensus/p2p/` (matches base/base `crates/consensus/*`), owned by this
@@ -249,3 +251,4 @@ behind a small interface and switch later.
 - 2026-11-05: bootnodes file parsing.
 - 2026-11-05: opp2p admin RPC; backpressure closed as won't-do.
 - 2026-11-05: transport uses io shutdown_now before close.
+- 2026-11-05: Poly1305 vector path measured (+8%) and dropped; std kept.
