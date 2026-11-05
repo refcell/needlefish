@@ -13,7 +13,10 @@ pub const apply_mask = frame.apply_mask;
 pub const accept_key = frame.accept_key;
 pub const client_key = frame.client_key;
 pub const parse_close = frame.parse_close;
+pub const client = @import("client.zig");
+pub const Client = client.Client;
 
 test {
     _ = @import("frame_test.zig");
+    _ = @import("client_test.zig");
 }
