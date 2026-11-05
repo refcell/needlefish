@@ -48,7 +48,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [x] `p2p`: `Node` embeds `p2p.Network(IO)` (`--p2p.*` flags, on by default, `--p2p.disabled`): gossiped blocks go to `Driver.insert_unsafe`, the sequencer publishes each sealed block; devnet verifier follows the sequencer's unsafe head over gossip.
   - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
   - [ ] EL sync from gossip (forkchoice to the gossiped tip when the gap exceeds the buffer; needs EL-side p2p sync)
-  - [ ] unsafe block signer from the L1 SystemConfig instead of `--p2p.unsafe.block.signer`
+  - [x] unsafe block signer from the L1 SystemConfig (`service/signer_watcher.zig`, polled every 60 s, applied to gossip validation); startup fallback: chain config, then `--p2p.unsafe.block.signer`, then the sequencer's own key
   - [ ] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
   - [x] service: L1 head watcher (latest/safe/finalized polling, verified headers)
@@ -68,6 +68,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
+- Unsafe block signer: base/base reads the L1 SystemConfig once at startup (blocking, with retries); we poll it every 60 s without blocking startup, and until it answers validate against the fallback (chain config, flag, own sequencer key; zero when only L1 can tell, which rejects gossip until it does).
 - Deviation from base/base `batch_queue.rs`: `next_batch` advances the epoch list a second time, after `update_origin` appends the new origin (the Holocene `BatchValidator` order). Otherwise a reset point one L1 block behind the safe head's origin (always the case near genesis) leaves [reset origin, parent origin], every step fails `L1OriginMismatch`, and the reset repeats forever.
 - p2p in `base consensus` is on by default (base/base); without `--p2p.unsafe.block.signer` a verifier runs with p2p off and warns, a sequencer signs with its own key. The node key is random unless `--p2p.priv.*`. The devnet verifier dials the sequencer's enode, scraped from its startup log.
 - Gossiped unsafe blocks: the block right after the unsafe head is queued, later ones wait in a 64-slot buffer (evicting the highest number when full), stale ones are dropped. Gaps the buffer cannot bridge are filled by derivation until EL sync exists. An active sequencer ignores gossip.
@@ -175,6 +176,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: `SignerWatcher` reads the unsafe block signer from the L1 SystemConfig storage slot and updates gossip validation on change.
 - 2026-11-05: rpc: admin_postUnsafePayload decodes the posted envelope and queues it like a gossiped block.
 - 2026-11-05: derive: fix reset livelock (DST seed 48): `BatchQueue.next_batch` advances the epoch list again after appending the new origin; regression test in `batch_queue_test.zig`.
 - 2026-11-05: service: `UnsafeBuffer` keeps out-of-order gossiped blocks until their parent is inserted; driver drains it every tick. Devnet verifier unsafe head equals the sequencer's.

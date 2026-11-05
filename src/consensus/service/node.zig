@@ -38,6 +38,7 @@ const snappy = @import("../p2p/gossip/snappy.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const gossip_bridge = @import("gossip_bridge.zig");
 const engine_json = @import("../sources/engine_json.zig");
+const signer_watcher = @import("signer_watcher.zig");
 
 const ProviderError = derive_errors.ProviderError;
 const BlockInfo = protocol.block.BlockInfo;
@@ -254,8 +255,13 @@ pub fn Node(comptime IO: type) type {
         publish_storage: []u8 = &.{},
         gossip_arena: std.heap.ArenaAllocator,
         gossip: GossipStats = .{},
+        /// Reads the unsafe block signer from the L1 SystemConfig (p2p only, when the rollup
+        /// config names the contract).
+        signer: ?*Signer = null,
+        signer_version: u64 = 0,
 
         pub const Network = p2p_network.Network(IO);
+        pub const Signer = signer_watcher.SignerWatcher(IO);
         pub const GossipStats = struct {
             received: u64 = 0,
             undecodable: u64 = 0,
@@ -335,10 +341,25 @@ pub fn Node(comptime IO: type) type {
                 p2p.seed,
             );
             node.network = network;
+            errdefer node.network = null;
+            const system_config = node.rollup.l1_system_config_address;
+            if (!std.mem.allEqual(u8, &system_config.bytes, 0)) {
+                const signer = try allocator.create(Signer);
+                errdefer allocator.destroy(signer);
+                const http_options = node.options.http_client;
+                const l1 = node.options.l1;
+                try signer.init(allocator, node.io, l1, http_options, system_config, .{});
+                node.signer = signer;
+            }
             assert(node.gossip_scratch.len >= snappy.gossip_size_max);
         }
 
         fn deinit_p2p(node: *Self) void {
+            if (node.signer) |signer| {
+                signer.deinit();
+                node.allocator.destroy(signer);
+                node.signer = null;
+            }
             const network = node.network orelse return;
             network.stop();
             // The bootstore file writes a final image on stop; let it finish (bounded).
@@ -466,8 +487,9 @@ pub fn Node(comptime IO: type) type {
         /// Whether any HTTP request is still in flight (drain before `deinit`).
         pub fn busy(node: *const Self) bool {
             const blobs_busy = if (node.blobs) |blobs| blobs.busy() else false;
+            const signer_busy = if (node.signer) |signer| signer.busy() else false;
             return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
-                node.engine.busy() or blobs_busy;
+                node.engine.busy() or blobs_busy or signer_busy;
         }
 
         /// One step of the node's state machines; call every few milliseconds.
@@ -479,9 +501,26 @@ pub fn Node(comptime IO: type) type {
             if (node.blobs) |blobs| blobs.tick();
             const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
             node.driver.tick(node.providers(), now_s);
-            if (node.network) |network| node.tick_gossip(network);
+            if (node.network) |network| {
+                node.tick_signer(network);
+                node.tick_gossip(network);
+            }
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
+        }
+
+        /// Applies a new L1 SystemConfig signer to gossip validation.
+        fn tick_signer(node: *Self, network: *Network) void {
+            const watcher = node.signer orelse return;
+            watcher.tick();
+            if (watcher.version == node.signer_version) return;
+            node.signer_version = watcher.version;
+            const signer = watcher.signer.?; // Proof: the version only moves with a signer.
+            network.service.gossip.set_unsafe_block_signer(signer);
+            var hex: [42]u8 = undefined;
+            node.logger.log(.info, "consensus", "unsafe block signer from L1", .{
+                .signer = std.fmt.bufPrint(&hex, "0x{x}", .{&signer.bytes}) catch unreachable,
+            });
         }
 
         /// Hands received blocks to the driver and publishes the block just sealed.
@@ -866,15 +905,22 @@ fn gossip_payload(
 
 test "node: receives gossiped unsafe blocks from a p2p peer" {
     const common_secp256k1 = @import("../../common/crypto/secp256k1/root.zig");
+    var sequencer_key: [32]u8 = @splat(0);
+    sequencer_key[31] = 5;
+    const signer: primitives.Address = .{ .bytes = try common_secp256k1.address(sequencer_key) };
+    // The node starts with an unknown signer and reads it from the L1 SystemConfig.
+    var word_text: [80]u8 = undefined;
+    const signer_hex = std.fmt.bytesToHex(signer.bytes, .lower);
+    const padding = "000000000000000000000000";
+    const word = try std.fmt.bufPrint(&word_text, "\"0x{s}{s}\"", .{ padding, &signer_hex });
     var fake: FakeRpc = .{};
+    fake.add(.{ .method = "eth_getStorageAt", .params_contain = "0x65a7ed54", .result = word });
     var harness: Harness = undefined;
     try harness.init(&fake, 0x9e);
     defer harness.deinit();
     var rollup: RollupConfig = .{ .block_time = 2, .l2_chain_id = 901 };
     rollup.upgrades.set(.ecotone, 0);
-    var sequencer_key: [32]u8 = @splat(0);
-    sequencer_key[31] = 5;
-    const signer: primitives.Address = .{ .bytes = try common_secp256k1.address(sequencer_key) };
+    rollup.l1_system_config_address = .{ .bytes = @splat(0x5c) };
     // The peer: a bare network on its own host that publishes as the sequencer.
     var peer_io: sim.SimIo = undefined;
     try sim.SimIo.init(&peer_io, testing.allocator, &harness.world, .{
@@ -926,7 +972,7 @@ test "node: receives gossiped unsafe blocks from a p2p peer" {
                 bootnode,
             }),
             .node_secret = node_secret,
-            .unsafe_block_signer = signer,
+            .unsafe_block_signer = .zero,
             .seed = 3,
         },
     });
@@ -939,6 +985,8 @@ test "node: receives gossiped unsafe blocks from a p2p peer" {
         harness.world.run_for_ns(10 * std.time.ns_per_ms);
     }
     try testing.expectEqual(@as(u32, 1), node.network.?.peer_count());
+    try testing.expect(node.signer.?.signer.?.eql(signer));
+    try testing.expect(std.mem.indexOf(u8, memory.text(), "unsafe block signer from L1") != null);
     var storage: [512]u8 = undefined;
     const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
     const now_s = peer_io.now_realtime_ns() / std.time.ns_per_s;

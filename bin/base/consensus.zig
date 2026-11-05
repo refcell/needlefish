@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .sink = log.stderr_sink(),
         .time = .{ .context = &os_io, .now_ns = now_ns },
     };
-    const p2p_config = try p2p_settings(init, &flags, &logger);
+    const p2p_config = try p2p_settings(init, &flags, &rollup, &logger);
     const node = try init.gpa.create(Node);
     defer init.gpa.destroy(node);
     try node.init(init.gpa, &os_io, &logger, &rollup, .{
@@ -190,11 +190,11 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     }
 }
 
-/// The gossip setup, or null when disabled or no unsafe block signer is known (verifiers
-/// need `--p2p.unsafe.block.signer`; a sequencer signs with its own key).
+/// The gossip setup, or null when disabled or no unsafe block signer can be known.
 fn p2p_settings(
     init: std.process.Init,
     flags: *const Flags,
+    rollup: *const consensus.protocol.rollup_config.RollupConfig,
     logger: *log.Logger,
 ) !?consensus.service.node.P2p {
     if (flags.p2p_disabled) return null;
@@ -202,9 +202,17 @@ fn p2p_settings(
         accounts.derive_dev(flags.sequencer_key_index).private_key
     else
         null;
+    // base/base order: the L1 SystemConfig (read at runtime by the node), then the built-in
+    // chain config, then the flag; a sequencer falls back to its own key.
     const own_signer = if (sequencer_key) |key| accounts.address_of(key) else null;
-    const signer = flags.p2p.unsafe_block_signer orelse own_signer orelse {
-        logger.log(.warn, "consensus", "p2p disabled: no --p2p.unsafe.block.signer", .{});
+    const chain_signer = if (base.common.chains.by_chain_id(rollup.l2_chain_id)) |chain|
+        chain.unsafe_block_signer
+    else
+        null;
+    const reads_l1 = !std.mem.allEqual(u8, &rollup.l1_system_config_address.bytes, 0);
+    const fallback = chain_signer orelse flags.p2p.unsafe_block_signer orelse own_signer;
+    const signer = fallback orelse if (reads_l1) base.common.primitives.Address.zero else {
+        logger.log(.warn, "consensus", "p2p disabled: no unsafe block signer", .{});
         return null;
     };
     var key_buffer: [256]u8 = undefined;
