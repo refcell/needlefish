@@ -13,6 +13,7 @@ pub const yamux = @import("yamux.zig");
 pub const identify = @import("identify.zig");
 pub const ping = @import("ping.zig");
 pub const connections = @import("connections.zig");
+pub const connection = @import("connection.zig");
 
 test {
     std.testing.refAllDecls(@This());
