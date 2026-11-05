@@ -7,8 +7,9 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `docs/DEVNET.md`: topology, ports, process contract (see draft below), smoke test definition.
 - [x] `base devnet init` (first cut: funded accounts, portal stub, rollup.json; genesis hashes
   patched by `base devnet rollup` after ELs start; predeploys still TODO)
-- [ ] devnet genesis: predeploys (L1Block, GasPriceOracle, fee vaults, proxies) from public
-  allocs; compute genesis hashes in-process once trie lands.
+- [x] devnet genesis: genesis hashes computed in-process (common/genesis state root + header);
+  `base devnet init` writes a correct rollup.json up front (devnet.sh still re-patches from ELs).
+- [ ] devnet genesis: predeploys (L1Block, GasPriceOracle, fee vaults, proxies) from public allocs.
 - [ ] (orig) `base devnet init` (in `bin/base`, may live in `src/batcher/devnet` or `etc`): generate L1 + L2 genesis, rollup config, JWT secret into `.devnet/` (git-ignored), fund the public dev mnemonic accounts, predeploys (L1Block, GasPriceOracle, fee vaults...) using public bytecode/allocs from base/base, a minimal L1 portal (deposit event emitter) and system config.
 - [x] `batcher/frame`: frame encode/decode, tx data parse (fuzzed).
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
@@ -84,3 +85,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: `base batcher` binary (calldata DA). Live: 20 fake L2 blocks -> 1 batch tx mined on
   anvil L1. Blobs DA rejected with a clear error until EIP-4844 signing lands.
 - 2026-11-05: safe-head stall watchdog instead of per-channel inclusion tracking (decision below).
+- 2026-11-05: in-process genesis hashes for rollup.json (anvil is no reference: it skips the
+  genesis state root).

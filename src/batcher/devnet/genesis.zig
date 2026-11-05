@@ -11,6 +11,7 @@ const Writer = std.Io.Writer;
 const primitives = @import("../../common/primitives/root.zig");
 const accounts = @import("accounts.zig");
 const portal = @import("portal.zig");
+const common_genesis = @import("../../common/genesis/root.zig");
 
 const Address = primitives.Address;
 
@@ -263,7 +264,46 @@ fn write_system_config(w: *Writer, config: *const Config) Writer.Error!void {
     });
 }
 
+/// Genesis block hashes of the generated L1 and L2 genesis files, computed in process
+/// (state trie + genesis header) so rollup.json is correct before any node starts.
+pub fn compute_anchor(allocator: std.mem.Allocator, config: *const Config) !GenesisAnchor {
+    return .{
+        .l1_hash = try genesis_hash(allocator, config, .l1),
+        .l2_hash = try genesis_hash(allocator, config, .l2),
+    };
+}
+
+const Layer = enum { l1, l2 };
+
+fn genesis_hash(allocator: std.mem.Allocator, config: *const Config, layer: Layer) ![32]u8 {
+    var allocating: Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+    switch (layer) {
+        .l1 => try write_l1_genesis(&allocating.writer, config),
+        .l2 => try write_l2_genesis(&allocating.writer, config),
+    }
+    const parsed = try common_genesis.parse(allocator, allocating.written());
+    defer parsed.deinit();
+    const genesis = &parsed.value;
+    assert(genesis.accounts.len >= accounts.funded_count);
+    const root = try genesis.compute_state_root(allocator);
+    const header = try genesis.header(allocator, root);
+    return header.hash().bytes;
+}
+
 const testing = std.testing;
+
+test "genesis: in-process anchor is deterministic and distinct per layer" {
+    const config: Config = .{ .genesis_timestamp = 1_700_000_000 };
+    const first = try compute_anchor(testing.allocator, &config);
+    const second = try compute_anchor(testing.allocator, &config);
+    try testing.expectEqualSlices(u8, &first.l1_hash, &second.l1_hash);
+    try testing.expectEqualSlices(u8, &first.l2_hash, &second.l2_hash);
+    try testing.expect(!std.mem.eql(u8, &first.l1_hash, &first.l2_hash));
+    const later: Config = .{ .genesis_timestamp = 1_700_000_001 };
+    const moved = try compute_anchor(testing.allocator, &later);
+    try testing.expect(!std.mem.eql(u8, &first.l1_hash, &moved.l1_hash));
+}
 
 fn expect_valid_json(text: []const u8) !std.json.Parsed(std.json.Value) {
     return std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});

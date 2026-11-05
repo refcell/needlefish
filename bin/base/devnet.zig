@@ -129,7 +129,7 @@ fn command_init(init: std.process.Init, flags: Flags) !u8 {
     }
     const now_s: u64 = @intCast(Io.Clock.real.now(io).toSeconds());
     const config: devnet.genesis.Config = .{ .genesis_timestamp = flags.timestamp orelse now_s };
-    const anchor: devnet.genesis.GenesisAnchor = .{ .l1_hash = @splat(0), .l2_hash = @splat(0) };
+    const anchor = try devnet.genesis.compute_anchor(init.gpa, &config);
     for (std.enums.values(devnet.init.File)) |file| {
         try write_rendered(init, out_dir, file, &config, anchor);
     }
@@ -137,9 +137,11 @@ fn command_init(init: std.process.Init, flags: Flags) !u8 {
     try io.randomSecure(&secret);
     const jwt = devnet.init.jwt_hex(secret);
     try out_dir.writeFile(io, .{ .sub_path = devnet.init.jwt_file_name, .data = &jwt });
-    std.debug.print("devnet: wrote {s} (genesis timestamp {d})\n", .{
+    std.debug.print("devnet: wrote {s} (genesis timestamp {d}, l1 0x{x}, l2 0x{x})\n", .{
         flags.out,
         config.genesis_timestamp,
+        &anchor.l1_hash,
+        &anchor.l2_hash,
     });
     return 0;
 }
