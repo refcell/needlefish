@@ -181,6 +181,29 @@ const LinuxIoUring = struct {
     }
 
     /// The remote address of a connected socket, or null if unavailable.
+    /// Opens a non-blocking UDP socket (polled with `recvfrom_now`/`sendto_now`).
+    pub fn open_socket_udp(io: *LinuxIoUring, family: Address.Family) common.SetupError!Fd {
+        _ = io;
+        return os.socket_udp(family);
+    }
+
+    pub fn bind_udp(io: *LinuxIoUring, fd: Fd, address: Address) common.SetupError!Address {
+        _ = io;
+        return os.bind(fd, address);
+    }
+
+    /// One queued datagram, or null. Never blocks.
+    pub fn recvfrom_now(io: *LinuxIoUring, fd: Fd, buffer: []u8) ?common.Datagram {
+        _ = io;
+        return os.recvfrom(fd, buffer);
+    }
+
+    /// Sends one datagram without blocking; false if it was dropped.
+    pub fn sendto_now(io: *LinuxIoUring, fd: Fd, buffer: []const u8, address: Address) bool {
+        _ = io;
+        return os.sendto(fd, buffer, address);
+    }
+
     pub fn peer_address(io: *LinuxIoUring, fd: Fd) ?Address {
         _ = io;
         return os.peer_address(fd);

@@ -8,7 +8,6 @@ const assert = std.debug.assert;
 const io_module = @import("../../utilities/io/root.zig");
 const service_module = @import("service.zig");
 const transport_module = @import("transport.zig");
-const disc = @import("disc/root.zig");
 const enr = @import("peers/enr.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
 const ssz = @import("gossip/ssz_payload.zig");
@@ -129,6 +128,7 @@ const Cluster = struct {
             .seed = index + 7,
             .links_max = 8,
             .gossip_frame_size_max = frame_size_max,
+            .discovery_listen = io_module.Address.ip4(host, 9000),
         });
         try node.transport.start();
     }
@@ -155,34 +155,10 @@ const Cluster = struct {
         cluster.world.deinit();
     }
 
-    fn node_of_host(cluster: *Cluster, address: [4]u8) ?usize {
-        for (cluster.all(), 0..) |*node, index| {
-            if (std.mem.eql(u8, &node.record.ip4().?, &address)) return index;
-        }
-        return null;
-    }
-
-    fn deliver_datagrams(cluster: *Cluster) void {
-        for (cluster.all()) |*from| {
-            while (from.service.pop_datagram()) |datagram| {
-                const to = cluster.node_of_host(datagram.endpoint.address.ip4) orelse continue;
-                const target = &cluster.storage[to];
-                if (cluster.world.partitioned(from.io.index, target.io.index)) continue;
-                const source: disc.table.Endpoint = .{
-                    .address = .{ .ip4 = from.record.ip4().? },
-                    .port = 9000,
-                };
-                const now = cluster.storage[to].io.now_realtime_ns();
-                cluster.storage[to].service.on_datagram(source, datagram.slice(), now);
-            }
-        }
-    }
-
     fn run(cluster: *Cluster, duration_ns: u64) void {
         var elapsed_ns: u64 = 0;
         while (elapsed_ns < duration_ns) : (elapsed_ns += 10 * ns_per_ms) {
             cluster.world.run_for_ns(10 * ns_per_ms);
-            cluster.deliver_datagrams();
             for (cluster.all()) |*node| node.transport.execute_commands();
         }
     }
@@ -238,6 +214,11 @@ test "p2p transport: nodes discover, connect over libp2p, and gossip a block" {
     defer cluster.deinit();
     cluster.run(8 * ns_per_s);
     for (cluster.all()) |*node| try std.testing.expect(node.transport.open_count() >= 2);
+    // Discovery ran over SimIo UDP: every node received and sent datagrams.
+    for (cluster.all()) |*node| {
+        try std.testing.expect(node.transport.stats.datagrams_received > 0);
+        try std.testing.expect(node.transport.stats.datagrams_sent > 0);
+    }
     // Identify reached the service: every connected peer reports our agent and meshsub.
     for (cluster.all()) |*node| {
         for (&node.service.connected) |*connection| {

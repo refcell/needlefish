@@ -155,6 +155,75 @@ pub fn listen(fd: fd_t, address: Address, backlog: u31) common.SetupError!Addres
     return bound.to_address() orelse error.Unexpected;
 }
 
+/// Opens a non-blocking UDP socket with close-on-exec.
+pub fn socket_udp(family: Address.Family) common.SetupError!fd_t {
+    var socket_type: u32 = std.posix.SOCK.DGRAM;
+    if (is_linux) socket_type |= std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK;
+    const rc = system.socket(family_of(family), socket_type, std.posix.IPPROTO.UDP);
+    switch (errno(rc)) {
+        .SUCCESS => {},
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        .ACCES => return error.AccessDenied,
+        else => return error.Unexpected,
+    }
+    const fd: fd_t = @intCast(rc);
+    errdefer close(fd);
+    if (is_darwin) {
+        try fcntl_set(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
+        const flags = system.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.Unexpected;
+        const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+        try fcntl_set(fd, std.posix.F.SETFL, flags | nonblock);
+    }
+    return fd;
+}
+
+/// Binds a datagram socket. Returns the bound address (ephemeral port filled).
+pub fn bind(fd: fd_t, address: Address) common.SetupError!Address {
+    var sock_addr = SockAddr.from(address);
+    switch (errno(system.bind(fd, &sock_addr.any, SockAddr.len(address)))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressNotAvailable,
+        .ACCES, .PERM => return error.AccessDenied,
+        .NOMEM, .NOBUFS => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    var bound: SockAddr = undefined;
+    var bound_len: socklen_t = @sizeOf(SockAddr);
+    switch (errno(system.getsockname(fd, &bound.any, &bound_len))) {
+        .SUCCESS => {},
+        .NOBUFS => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+    return bound.to_address() orelse error.Unexpected;
+}
+
+/// One datagram received without blocking, or null when none is queued (or on error;
+/// datagram transports tolerate loss). Longer datagrams are truncated to `buffer`.
+pub fn recvfrom(fd: fd_t, buffer: []u8) ?common.Datagram {
+    assert(buffer.len > 0);
+    var from: SockAddr = undefined;
+    var from_len: socklen_t = @sizeOf(SockAddr);
+    const flags = std.posix.MSG.DONTWAIT;
+    const rc = system.recvfrom(fd, buffer.ptr, buffer.len, flags, &from.any, &from_len);
+    if (errno(rc) != .SUCCESS) return null;
+    const length: usize = @intCast(rc);
+    const address = from.to_address() orelse return null;
+    return .{ .length = @intCast(@min(length, buffer.len)), .from = address };
+}
+
+/// Sends one datagram without blocking. False if the kernel refused it (dropped).
+pub fn sendto(fd: fd_t, buffer: []const u8, address: Address) bool {
+    assert(buffer.len > 0);
+    var to = SockAddr.from(address);
+    const flags = std.posix.MSG.DONTWAIT;
+    const rc = system.sendto(fd, buffer.ptr, buffer.len, flags, &to.any, SockAddr.len(address));
+    return errno(rc) == .SUCCESS;
+}
+
 /// The remote address of a connected socket, or null if unavailable (e.g. reset).
 pub fn peer_address(fd: fd_t) ?Address {
     var peer: SockAddr = undefined;

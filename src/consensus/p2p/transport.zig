@@ -12,7 +12,9 @@
 //! never meets a stale recv. A link still connecting closes at once (a late connect
 //! result is ignored).
 //!
-//! Discovery datagrams stay with `Service.on_datagram`/`pop_datagram` until io has UDP.
+//! Discovery: with `Config.discovery_listen` set, the transport binds a UDP socket and,
+//! on every timer tick, drains received datagrams into `Service.on_datagram` (at most
+//! `datagrams_per_tick_max`) and sends everything `Service.pop_datagram` queued.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -38,7 +40,12 @@ pub const Config = struct {
     /// Largest gossip RPC (base/base `MAX_GOSSIP_SIZE`); bounds per-connection memory.
     gossip_frame_size_max: u32 = rpc.frame_size_max_default,
     backlog: u31 = 64,
+    /// UDP address for discv5; null leaves datagrams to the caller.
+    discovery_listen: ?io_module.Address = null,
 };
+
+/// Datagrams moved each way per timer tick (bounds the work of one tick).
+const datagrams_per_tick_max = 256;
 
 const socket_buffer_bytes = 16 * 1024;
 
@@ -83,6 +90,8 @@ pub fn Transport(comptime IO: type) type {
         prng: std.Random.DefaultPrng,
         listener: IO.Fd = undefined,
         listen_address: io_module.Address = undefined,
+        udp: ?IO.Fd = null,
+        udp_address: io_module.Address = undefined,
         accept_completion: IO.Completion = .{},
         timer_completion: IO.Completion = .{},
         links: []Link,
@@ -100,6 +109,9 @@ pub fn Transport(comptime IO: type) type {
             /// Connections we closed with a go-away, and ones the remote closed that way.
             local_go_aways: u64 = 0,
             remote_go_aways: u64 = 0,
+            datagrams_received: u64 = 0,
+            datagrams_sent: u64 = 0,
+            datagrams_dropped: u64 = 0,
         };
 
         /// Allocates every link and buffer up front. `transport` must not move afterwards.
@@ -148,6 +160,12 @@ pub fn Transport(comptime IO: type) type {
                 transport.config.listen,
                 transport.config.backlog,
             );
+            if (transport.config.discovery_listen) |address| {
+                const udp = try transport.io.open_socket_udp(address.family);
+                errdefer transport.io.close_now(udp);
+                transport.udp_address = try transport.io.bind_udp(udp, address);
+                transport.udp = udp;
+            }
             transport.submit_accept();
             transport.submit_timer();
         }
@@ -160,6 +178,8 @@ pub fn Transport(comptime IO: type) type {
                 if (link.state == .open or link.state == .connecting) transport.teardown(link);
             }
             transport.io.close_now(transport.listener);
+            if (transport.udp) |udp| transport.io.close_now(udp);
+            transport.udp = null;
         }
 
         fn now_ns(transport: *const Self) u64 {
@@ -187,7 +207,9 @@ pub fn Transport(comptime IO: type) type {
             result catch {};
             if (transport.stopped) return;
             const now = transport.now_ns();
+            transport.receive_datagrams(now);
             transport.service.tick(now);
+            transport.send_datagrams();
             transport.execute_commands();
             for (transport.links) |*link| {
                 if (link.state != .open) continue;
@@ -199,6 +221,36 @@ pub fn Transport(comptime IO: type) type {
                 transport.pump(link);
             }
             transport.submit_timer();
+        }
+
+        /// Feeds queued UDP datagrams to discovery.
+        fn receive_datagrams(transport: *Self, now: u64) void {
+            const udp = transport.udp orelse return;
+            var buffer: [io_module.datagram_size_max]u8 = undefined;
+            var received: u32 = 0;
+            while (received < datagrams_per_tick_max) : (received += 1) {
+                const datagram = transport.io.recvfrom_now(udp, &buffer) orelse break;
+                transport.stats.datagrams_received += 1;
+                const from = endpoint_of(datagram.from);
+                transport.service.on_datagram(from, buffer[0..datagram.length], now);
+            }
+            assert(received <= datagrams_per_tick_max);
+        }
+
+        /// Sends every datagram discovery queued (lost ones are discv5's to retry).
+        fn send_datagrams(transport: *Self) void {
+            const udp = transport.udp orelse return;
+            var sent: u32 = 0;
+            while (sent < datagrams_per_tick_max) : (sent += 1) {
+                const datagram = transport.service.pop_datagram() orelse break;
+                const target = address_of(datagram.endpoint);
+                if (transport.io.sendto_now(udp, datagram.slice(), target)) {
+                    transport.stats.datagrams_sent += 1;
+                } else {
+                    transport.stats.datagrams_dropped += 1;
+                }
+            }
+            assert(sent <= datagrams_per_tick_max);
         }
 
         /// Runs the service's dial/disconnect commands and pumps fresh gossip output.
@@ -577,6 +629,22 @@ pub fn Transport(comptime IO: type) type {
         }
     };
 }
+
+fn endpoint_of(address: io_module.Address) disc_endpoint {
+    return switch (address.family) {
+        .ip4 => .{ .address = .{ .ip4 = address.bytes[0..4].* }, .port = address.port },
+        .ip6 => .{ .address = .{ .ip6 = address.bytes }, .port = address.port },
+    };
+}
+
+fn address_of(endpoint: disc_endpoint) io_module.Address {
+    return switch (endpoint.address) {
+        .ip4 => |bytes| io_module.Address.ip4(bytes, endpoint.port),
+        .ip6 => |bytes| io_module.Address.ip6(bytes, endpoint.port),
+    };
+}
+
+const disc_endpoint = @import("disc/table.zig").Endpoint;
 
 test {
     _ = @import("transport_test.zig");

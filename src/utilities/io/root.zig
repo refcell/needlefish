@@ -45,6 +45,8 @@ pub const kqueue = @import("kqueue.zig");
 pub const io_uring = @import("io_uring.zig");
 
 pub const Address = common.Address;
+pub const Datagram = common.Datagram;
+pub const datagram_size_max = common.datagram_size_max;
 pub const OpenMode = common.OpenMode;
 pub const Tag = common.Tag;
 pub const ResultType = common.ResultType;
@@ -77,4 +79,5 @@ test {
     _ = @import("os_test.zig");
     _ = @import("shutdown_test.zig");
     _ = @import("cancel_test.zig");
+    _ = @import("udp_test.zig");
 }

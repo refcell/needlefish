@@ -184,6 +184,15 @@ pub const Address = struct {
     }
 };
 
+/// A received datagram: its length in the caller's buffer and its sender.
+pub const Datagram = struct {
+    length: u32,
+    from: Address,
+};
+
+/// Largest datagram the UDP path carries (discv5 packets are at most 1280 bytes).
+pub const datagram_size_max = 1280;
+
 /// The kind of operation on a completion. Shared by `Operation` and `Result` for every `Fd`.
 pub const Tag = enum(u8) {
     none,

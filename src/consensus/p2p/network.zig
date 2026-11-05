@@ -139,6 +139,9 @@ pub fn Network(comptime IO: type) type {
                 .ip4 => |bytes| io_module.Address.ip4(bytes, options.listen_tcp),
                 .ip6 => |bytes| io_module.Address.ip6(bytes, options.listen_tcp),
             };
+            // discv5 over UDP on `--p2p.listen.udp`, unless `--p2p.no-discovery`.
+            const discovery_listen: ?io_module.Address =
+                if (options.no_discovery) null else listen.with_port(options.listen_udp);
             self.store = null;
             if (!options.no_bootstore) {
                 self.store = try store_module.Store.init(allocator, store_module.capacity_default);
@@ -149,6 +152,7 @@ pub fn Network(comptime IO: type) type {
                 .identity_secret = secret,
                 .seed = seed,
                 .links_max = options.peers_hi + options.max_pending_outgoing,
+                .discovery_listen = discovery_listen,
             });
         }
 
@@ -340,6 +344,18 @@ test "network: two nodes over SimIo connect through an enode bootnode" {
     secrets[1][31] = 4;
     var enode_text: [256]u8 = undefined;
     const enode = try enode_for(&enode_text, secrets[0], .{ 10, 0, 0, 1 }, 9222);
+    // Node 0 boots discovery from node 1's record; discv5 runs over SimIo UDP.
+    const node1_record = try enr.build(secrets[1], .{
+        .ip4 = .{ 10, 0, 0, 2 },
+        .tcp = 9222,
+        .udp = 9223,
+        .opstack = .{ .chain_id = 8453 },
+    });
+    var record_text: [enr.text_length_max]u8 = undefined;
+    var boot_flag: [enr.text_length_max + 16]u8 = undefined;
+    const node1_enr = try std.fmt.bufPrint(&boot_flag, "--p2p.bootnodes={s}", .{
+        enr.encode_text(&record_text, &node1_record),
+    });
     for (0..2) |index| {
         const host: [4]u8 = .{ 10, 0, 0, @intCast(index + 1) };
         try io_module.SimIo.init(&ios[index], allocator, &world, .{
@@ -348,7 +364,7 @@ test "network: two nodes over SimIo connect through an enode bootnode" {
         var listen: [32]u8 = undefined;
         const listen_flag =
             try std.fmt.bufPrint(&listen, "--p2p.listen.ip=10.0.0.{d}", .{index + 1});
-        const bootnodes = if (index == 0) "--p2p.no-discovery" else enode;
+        const bootnodes = if (index == 0) node1_enr else enode;
         const options = try options_module.parse(&.{ listen_flag, bootnodes, "--p2p.peers.hi=4" });
         const random = prngs[index].random();
         const network = &networks[index];
@@ -363,9 +379,8 @@ test "network: two nodes over SimIo connect through an enode bootnode" {
     world.run_for_ns(3 * ns_per_s);
     try testing.expectEqual(@as(u32, 1), networks[0].peer_count());
     try testing.expectEqual(@as(u32, 1), networks[1].peer_count());
-    // Datagrams are not wired to io yet, so seed node 1's table with node 0's record;
-    // the bootstore then carries it.
-    networks[1].service.add_boot_record(&networks[0].record, ios[1].now_realtime_ns());
+    // Node 1 learned node 0's record over discv5 (UDP), and the bootstore carries it.
+    try testing.expect(networks[1].transport.stats.datagrams_received > 0);
     const json = try allocator.alloc(u8, networks[1].bootstore_length_max());
     defer allocator.free(json);
     const saved = networks[1].save_bootstore(json);
