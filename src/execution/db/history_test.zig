@@ -24,6 +24,10 @@ const addresses_max = 24;
 const slots_max = 12;
 const blocks_total = 32;
 const window_blocks = 10;
+/// Changesets kept for unwinding, indexed by block number; more than any window.
+const changesets_ring = 16;
+/// Most versions one block of `random_write` workloads writes (checked by the long run).
+const block_versions_max = 512;
 
 const state_config: state_module.Config = .{
     .accounts_max = 64,
@@ -52,7 +56,12 @@ const history_config: history.Config = .{
     .paths_max = 16384,
     .small_versions_max = 8192,
     .large_versions_max = 2048,
+    .prune_per_commit = block_versions_max,
 };
+
+fn state_nodes(state: *const State) u32 {
+    return state.state_trie.accounts.node_count() + state.state_trie.storage.node_count();
+}
 
 /// Address `index`; `addresses_max` itself is never written (exclusion proofs).
 fn address_of(index: usize) Address {
@@ -168,17 +177,17 @@ const Harness = struct {
     state: State,
     overlay: Overlay,
     store: history.Store,
-    changesets: [blocks_total + 1]Changeset,
+    changesets: [changesets_ring]Changeset,
     proofs: *Proofs,
 
     /// Sets up in place: `overlay` keeps a pointer to `state`.
-    fn init(self: *Harness) !void {
+    fn init(self: *Harness, config: history.Config) !void {
         self.state = try State.init(testing.allocator, state_config);
         errdefer self.state.deinit(testing.allocator);
         try self.state.state_trie.track_changes(testing.allocator);
         self.overlay = try Overlay.init(testing.allocator, &self.state, overlay_config);
         errdefer self.overlay.deinit(testing.allocator);
-        self.store = try history.Store.init(testing.allocator, history_config);
+        self.store = try history.Store.init(testing.allocator, config);
         errdefer self.store.deinit(testing.allocator);
         for (&self.changesets) |*c| c.* = try Changeset.init(testing.allocator, changeset_config);
         self.proofs = try testing.allocator.create(Proofs);
@@ -193,9 +202,17 @@ const Harness = struct {
         self.state.deinit(testing.allocator);
     }
 
+    fn changeset(self: *Harness, number: u64) *Changeset {
+        return &self.changesets[number % changesets_ring];
+    }
+
     fn commit(self: *Harness, prng: *Prng, number: u64) !void {
-        for (0..prng.range(1, 30)) |_| try random_write(prng, &self.overlay);
-        const root = try self.overlay.commit(&self.changesets[number]);
+        try self.commit_writes(prng, number, prng.range(1, 30));
+    }
+
+    fn commit_writes(self: *Harness, prng: *Prng, number: u64, writes: u64) !void {
+        for (0..writes) |_| try random_write(prng, &self.overlay);
+        const root = try self.overlay.commit(self.changeset(number));
         try self.store.commit_block(&self.state.state_trie, number);
         try testing.expectEqual(root, try self.store.state_root_at(number));
     }
@@ -205,20 +222,41 @@ const Harness = struct {
         const depth = prng.range(1, head - oldest);
         var height = head;
         while (height > head - depth) : (height -= 1) {
-            try self.state.unwind(&self.changesets[height]);
+            try self.state.unwind(self.changeset(height));
         }
         try self.store.unwind_to(height);
         return height;
+    }
+
+    /// Checks every block of the window against the state unwound to it (the state ends at
+    /// the oldest block), then drains the prune queue and checks that exactly the nodes of
+    /// the oldest block's trie remain at or before it (deleted paths are freed).
+    fn sweep(self: *Harness) !void {
+        const window = self.store.window().?;
+        var number = window.head;
+        while (true) : (number -= 1) {
+            for (0..addresses_max + 1) |index| {
+                try expect_matches_live(&self.store, &self.state, number, index, self.proofs);
+            }
+            if (number == window.oldest) break;
+            try self.state.unwind(self.changeset(number));
+        }
+        _ = self.store.prune_step(self.store.usage().prune_queue);
+        try testing.expectEqual(@as(u32, 0), self.store.usage().prune_queue);
+        try testing.expectEqual(state_nodes(&self.state), self.store.base_node_count());
+        for (0..addresses_max + 1) |index| {
+            try expect_matches_live(&self.store, &self.state, number, index, self.proofs);
+        }
     }
 };
 
 fn run_seed(seed: u64) !void {
     var prng = Prng.init(seed);
     var harness: Harness = undefined;
-    try harness.init();
+    try harness.init(history_config);
     defer harness.deinit();
     for (0..40) |_| try random_write(&prng, &harness.overlay);
-    _ = try harness.overlay.commit(&harness.changesets[0]);
+    _ = try harness.overlay.commit(harness.changeset(0));
     try harness.store.reset(&harness.state.state_trie, 0);
     var head: u64 = 0;
     for (0..blocks_total) |_| {
@@ -232,18 +270,10 @@ fn run_seed(seed: u64) !void {
         const index = prng.below(addresses_max + 1);
         try expect_matches_live(&harness.store, &harness.state, head, index, harness.proofs);
     }
-    // Sweep: every block of the window against the state unwound to it.
     const window = harness.store.window().?;
     try testing.expectEqual(head, window.head);
     try testing.expect(window.head - window.oldest + 1 <= window_blocks);
-    var number = window.head;
-    while (true) : (number -= 1) {
-        for (0..addresses_max + 1) |index| {
-            try expect_matches_live(&harness.store, &harness.state, number, index, harness.proofs);
-        }
-        if (number == window.oldest) break;
-        try harness.state.unwind(&harness.changesets[number]);
-    }
+    try harness.sweep();
 }
 
 test "history: proofs at every block of the window match an unwound state" {
@@ -254,14 +284,14 @@ test "history: proofs at every block of the window match an unwound state" {
 test "history: window edges and errors" {
     var prng = Prng.init(0xed6e);
     var harness: Harness = undefined;
-    try harness.init();
+    try harness.init(history_config);
     defer harness.deinit();
     var proof: StateTrie.AccountProof = .{};
     const address = address_of(1);
     try testing.expectError(error.NotInitialized, harness.store.prove_account(0, address, &proof));
     try testing.expectError(error.NotInitialized, harness.store.unwind_to(0));
     for (0..20) |_| try random_write(&prng, &harness.overlay);
-    _ = try harness.overlay.commit(&harness.changesets[0]);
+    _ = try harness.overlay.commit(harness.changeset(0));
     // Start the window at block 5: earlier blocks were never recorded.
     try harness.store.reset(&harness.state.state_trie, 5);
     const store = &harness.store;
@@ -302,6 +332,7 @@ test "history: a full store refuses the block and keeps its head" {
         .small_versions_max = state.state_trie.accounts.node_count() +
             state.state_trie.storage.node_count() + 2,
         .large_versions_max = 64,
+        .prune_per_commit = 64,
     });
     defer store.deinit(testing.allocator);
     try store.reset(&state.state_trie, 0);
@@ -315,6 +346,173 @@ test "history: a full store refuses the block and keeps its head" {
     defer testing.allocator.destroy(proofs);
     proofs.* = .{};
     for (0..addresses_max + 1) |index| try expect_matches_live(&store, &state, 0, index, proofs);
+}
+
+/// Sized per the `Store` sizing rule: N trie nodes plus `window_blocks` blocks of B versions.
+fn sized_config(window: u32, prune_per_commit: u32) history.Config {
+    const nodes_max = state_config.account_nodes_max + state_config.storage_nodes_max;
+    const bound = nodes_max + window * block_versions_max;
+    return .{
+        .window_blocks = window,
+        .paths_max = bound,
+        .small_versions_max = bound,
+        .large_versions_max = bound,
+        .prune_per_commit = prune_per_commit,
+    };
+}
+
+fn start(harness: *Harness, prng: *Prng) !void {
+    for (0..40) |_| try random_write(prng, &harness.overlay);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    try harness.store.reset(&harness.state.state_trie, 0);
+}
+
+test "history: long run stays within the sizing bound and never fills" {
+    const window = 6;
+    var prng = Prng.init(0x10e6);
+    var harness: Harness = undefined;
+    try harness.init(sized_config(window, block_versions_max));
+    defer harness.deinit();
+    try start(&harness, &prng);
+    var nodes_seen: u32 = state_nodes(&harness.state);
+    var block_versions_seen: u32 = 0;
+    var head: u64 = 0;
+    // About 60 windows, with reorgs; every commit must fit (no HistoryFull).
+    for (0..360) |_| {
+        const oldest = harness.store.window().?.oldest;
+        if (head > oldest and prng.chance(1, 6)) {
+            head = try harness.reorg(&prng, head);
+        } else {
+            head += 1;
+            try harness.commit(&prng, head);
+            block_versions_seen = @max(block_versions_seen, harness.store.head_block_versions());
+        }
+        nodes_seen = @max(nodes_seen, state_nodes(&harness.state));
+        const usage = harness.store.usage();
+        // The bound of the sizing rule, with the N and B this run actually reached.
+        const bound = nodes_seen + window * block_versions_seen;
+        try testing.expect(usage.small_versions + usage.large_versions <= bound);
+        try testing.expect(usage.paths <= bound);
+        try testing.expect(usage.prune_queue <= block_versions_seen);
+        if (head % 4 == 0) {
+            const index = prng.below(addresses_max + 1);
+            try expect_matches_live(&harness.store, &harness.state, head, index, harness.proofs);
+        }
+    }
+    try testing.expect(block_versions_seen <= block_versions_max);
+    try harness.sweep();
+}
+
+test "history: prune_step with a budget of one makes progress and keeps proofs" {
+    var prng = Prng.init(0x7171);
+    var harness: Harness = undefined;
+    // No pruning on commit: the queue only shrinks through explicit steps.
+    try harness.init(sized_config(4, 0));
+    defer harness.deinit();
+    try start(&harness, &prng);
+    var head: u64 = 0;
+    while (head < 24) {
+        head += 1;
+        try harness.commit(&prng, head);
+    }
+    const queued = harness.store.usage().prune_queue;
+    try testing.expect(queued > 0);
+    const used = harness.store.usage().small_versions + harness.store.usage().large_versions;
+    var steps: u32 = 0;
+    while (harness.store.usage().prune_queue > 0) : (steps += 1) {
+        try testing.expectEqual(@as(u32, 1), harness.store.prune_step(1));
+        try testing.expectEqual(queued - steps - 1, harness.store.usage().prune_queue);
+        if (steps % 64 == 0) {
+            const index = prng.below(addresses_max + 1);
+            const oldest = harness.store.window().?.oldest;
+            _ = try harness.store.state_root_at(oldest);
+            try expect_matches_live(&harness.store, &harness.state, head, index, harness.proofs);
+        }
+    }
+    try testing.expectEqual(queued, steps);
+    try testing.expectEqual(@as(u32, 0), harness.store.prune_step(1));
+    const after = harness.store.usage().small_versions + harness.store.usage().large_versions;
+    try testing.expect(after < used);
+    try harness.sweep();
+}
+
+test "history: a deleted account frees its storage trie paths" {
+    var prng = Prng.init(0xde1e);
+    var harness: Harness = undefined;
+    try harness.init(sized_config(3, block_versions_max));
+    defer harness.deinit();
+    try start(&harness, &prng);
+    const address = address_of(addresses_max - 1);
+    const address_hash = trie.node.keccak256(&address);
+    try harness.overlay.set_account(address, .{ .nonce = 1, .balance = 7 });
+    for (0..slots_max) |slot| try harness.overlay.set_storage(address, slot, slot + 1);
+    _ = try harness.overlay.commit(harness.changeset(1));
+    try harness.store.commit_block(&harness.state.state_trie, 1);
+    try testing.expect(harness.store.contains_path(address_hash, &.{}));
+    const paths_before = harness.store.usage().paths;
+    try harness.overlay.set_account(address, null);
+    _ = try harness.overlay.commit(harness.changeset(2));
+    try harness.store.commit_block(&harness.state.state_trie, 2);
+    // Empty blocks move the window past the deletion.
+    var head: u64 = 2;
+    while (head < 6) {
+        head += 1;
+        try harness.commit_writes(&prng, head, 0);
+    }
+    _ = harness.store.prune_step(harness.store.usage().prune_queue);
+    try testing.expect(!harness.store.contains_path(address_hash, &.{}));
+    for (0..16) |nibble| {
+        const path = [1]u8{@intCast(nibble)};
+        try testing.expect(!harness.store.contains_path(address_hash, &path));
+    }
+    // At least the storage trie's root plus one node per slot are gone.
+    try testing.expect(harness.store.usage().paths + slots_max + 1 <= paths_before);
+    try testing.expectEqual(state_nodes(&harness.state), harness.store.base_node_count());
+    try harness.sweep();
+}
+
+test "history: a full store with a full window refuses the block atomically" {
+    var prng = Prng.init(0xa70e);
+    var harness: Harness = undefined;
+    const window = 3;
+    try harness.init(history_config);
+    defer harness.deinit();
+    for (0..40) |_| try random_write(&prng, &harness.overlay);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    // Tight capacity: the base nodes plus room for small blocks only.
+    const nodes = state_nodes(&harness.state);
+    harness.store.deinit(testing.allocator);
+    harness.store = try history.Store.init(testing.allocator, .{
+        .window_blocks = window,
+        .paths_max = nodes + 96,
+        .small_versions_max = nodes + 96,
+        .large_versions_max = 96,
+        .prune_per_commit = 96,
+    });
+    try harness.store.reset(&harness.state.state_trie, 0);
+    var head: u64 = 0;
+    while (head < 8) {
+        head += 1;
+        try harness.commit_writes(&prng, head, 1);
+    }
+    const before = harness.store.window().?;
+    const usage_before = harness.store.usage();
+    try testing.expectEqual(@as(u64, window), before.head - before.oldest + 1);
+    for (0..12) |index| {
+        var info: AccountInfo = .{ .nonce = 9, .balance = prng.below(1 << 40) | 1 };
+        info.nonce += index;
+        try harness.overlay.set_account(address_of(index), info);
+        for (0..6) |slot| try harness.overlay.set_storage(address_of(index), slot, 5);
+    }
+    _ = try harness.overlay.commit(harness.changeset(head + 1));
+    const result = harness.store.commit_block(&harness.state.state_trie, head + 1);
+    try testing.expectError(error.HistoryFull, result);
+    const after = harness.store.window().?;
+    try testing.expectEqual(before.oldest, after.oldest);
+    try testing.expectEqual(before.head, after.head);
+    try testing.expectEqual(usage_before.paths, harness.store.usage().paths);
+    try harness.state.unwind(harness.changeset(head + 1));
+    try harness.sweep();
 }
 
 fn check_decoders(input: []const u8) void {

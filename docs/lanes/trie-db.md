@@ -29,9 +29,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Historical proofs store (base/base `crates/execution/trie`, `BaseProofsStore`): per-block
   versioned account/storage leaves + trie node preimages for a retention window, so
   `eth_getProof` works at any block in the fault-proof window without re-execution.
-  (`db/history.zig`; in memory only, not yet journaled or fed by `Database`)
-- [ ] Window pruner: bounded work per tick, removes history older than the window; crash-safe
-  through the storage engine journal.
+  (`db/history.zig`; in memory, rebuilt by `reset` after restart; not yet fed by `Database`)
+- [x] Window pruner: bounded work per tick, removes history older than the window; crash-safe
+  by rebuild (history is in memory; `reset` at the recovered head, see Decisions).
+  (`Store.prune_step(budget)`, tombstones free deleted paths, atomic `commit_block`)
 - [x] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
   block, verified by re-executing statelessly against a sparse trie built from the witness.
   (`db/witness.zig`, `trie/sparse.zig`; verification replays reads + the block's changeset,
@@ -156,6 +157,37 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   about twice as often (each covers ~1/4 of the journal) and Busy/JournalFull clears after at
   most two back-to-back checkpoints.
 
+- History window pruner (`db/history.zig`): `commit_block` only moves the window; the block
+  that becomes the oldest appends its versions to a FIFO prune queue (versions linked through
+  `block_next`, block order kept). `prune_step(budget)` examines up to `budget` queued
+  versions; each frees the one older version it shadows (FIFO order leaves at most one), and
+  a queued tombstone is freed too, with its path when nothing newer exists (a newer version
+  just loses its `prev`; lookups below it return null, which no parent of a window block asks
+  for). Versions got a `newer` link for that. Removed nodes get tombstones (empty versions):
+  after a block's nodes are written, every rewritten node is diffed against its previous
+  version; dropped children (branch slots, a changed extension path, all children of a
+  collapsed branch) are walked in the old trie (lookups at N-1, explicit bounded stack) and
+  tombstoned unless the new trie still reaches the path (walk at N); an account leaf whose
+  account had storage and has none now buries its whole storage trie, and an empty state
+  buries the account trie. Chosen over mark-and-sweep (O(state) per cycle, and reachability
+  must hold for every block of the window, not one root) and matches base/base, which keeps
+  `removed_nodes` tombstones and drops them once they reach the earliest block. Sizing
+  invariant (documented on `Store`): N = most trie nodes of a state, B = most versions one
+  block writes including tombstones; with `prune_per_commit >= B` the queue is empty whenever
+  a block is written, so the store never holds more than N + window_blocks * B versions or
+  paths, and `HistoryFull` never happens at that size. Fallback when a block does not fit:
+  drain the whole queue (bounded by version capacity) and retry once.
+- History commit is atomic: the block is written with the non-clearing `count` walk, then
+  tombstoned; any `HistoryFull` pops the half-written block (frees its versions and the
+  paths it created) and the window is unchanged; the trie's change marks are cleared by a
+  second `drain` walk only on success, so the commit can be retried. Replaces the old
+  `count`-then-write sizing walk (still two walks per block). The oldest block only moves
+  after the write succeeds.
+- History is not journaled: it is derived data. After a restart it is rebuilt with
+  `reset(state_trie, head)` at the recovered head; proofs for blocks before that head are
+  unavailable until the window refills (one window of blocks). Journaling every node
+  version would multiply the journal volume per block for data the node can regenerate.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -192,13 +224,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   encoding, skipping clean subtries since a rehash also rehashes all ancestors);
   `StateTrie.visit_nodes` descends into the storage trie of each changed account leaf (a
   changed storage trie always changes its leaf). Untracked tries pay one branch per rehashed
-  node. `commit_block` does a `count` walk first, so `HistoryFull` stores nothing; versions
-  equal to the path's newest one are skipped (after an unwind, rehashed-back nodes repeat).
-  Two version size classes (160 B: leaves, extensions, sparse branches; 646 B: dense
-  branches). Lookup is O(versions at the path newer than N), at most the window length; fine
-  for windows in the thousands, a jump-pointer chain is the upgrade if long windows need it.
-  Paths are never freed (stale paths keep one base version): bounded by `paths_max`; the
-  window pruner item should reclaim them.
+  node. Versions equal to the path's newest one are skipped (after an unwind, rehashed-back
+  nodes repeat). Two version size classes (160 B: leaves, extensions, sparse branches; 646 B:
+  dense branches). Lookup is O(versions at the path newer than N): at most the window length
+  plus the unpruned queue; fine for windows in the thousands, a jump-pointer chain (or a
+  per-path newest-at-or-before index) is the upgrade if long windows need it (not done).
+  Tombstones cost one diff per rewritten node plus, per removed node, a reachability walk
+  from the new root (O(depth) lookups); a wiped storage trie tombstones every node in one
+  block, so B (versions per block, see sizing) must cover the largest storage trie wiped.
+  `path_index` removals leave hash map tombstones; `prune_step` rehashes it once per
+  `paths_max / 2` removals (an O(paths) spike, amortized O(1) per removal).
 
 - Execution witness (`db/witness.zig`): alloy `ExecutionWitness` shape (`state`, `codes`,
   `keys`, `headers` as byte lists). `Recorder` wraps the evm `Database` and records reads in
@@ -258,3 +293,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: execution witness + stateless `SparseState`: witness-only replay root == full
   State root (8 seeds x 4 blocks with deletes/wipes/destroys), every witness node required,
   sparse trie differential against `TrieType` with shared prefixes, fuzzed node decoder.
+- 2026-11-05: history window pruner: FIFO prune queue with `prune_step(budget)`, tombstones for
+  removed nodes so deleted subtries free their paths, atomic `commit_block`; tests: 360-block
+  run with reorgs within the N + window * B bound, budget-1 steps, freed storage trie paths,
+  base versions == trie nodes of the oldest block after a drain.
