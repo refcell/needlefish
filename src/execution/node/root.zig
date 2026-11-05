@@ -11,6 +11,7 @@ pub const block_store = @import("block_store.zig");
 pub const BlockStore = block_store.BlockStore;
 pub const chain = @import("chain.zig");
 pub const Chain = chain.Chain;
+pub const test_fixture = @import("test_fixture.zig");
 
 test {
     std.testing.refAllDecls(@This());

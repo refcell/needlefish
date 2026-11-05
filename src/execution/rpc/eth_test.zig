@@ -1,0 +1,227 @@
+//! eth namespace tests through the JSON-RPC router on a fixture node: values, blocks,
+//! receipts, raw transaction submission, calls, gas estimation, logs, and a fuzz of
+//! arbitrary request bodies (never crash, always valid JSON).
+
+const std = @import("std");
+const testing = std.testing;
+const primitives = @import("../../common/primitives/root.zig");
+const consensus = @import("../../common/consensus/root.zig");
+const json = @import("../../utilities/json/root.zig");
+const rpc = @import("../../utilities/rpc/root.zig");
+const fixture = @import("../node/test_fixture.zig");
+const eth = @import("eth.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
+
+const engine_types = @import("../engine/root.zig").types;
+const request_prefix = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"";
+const request_prefix_format = "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"";
+const address_one = "\"0x0000000000000000000000000000000000000001\"";
+const address_target = "\"0x1111111111111111111111111111111111111111\"";
+
+const Harness = struct {
+    node: *fixture.Node,
+    api: eth.Api,
+    scratch: [1 << 16]u8 = undefined,
+    out: [1 << 16]u8 = undefined,
+
+    fn create() !*Harness {
+        const harness = try testing.allocator.create(Harness);
+        errdefer testing.allocator.destroy(harness);
+        harness.node = try fixture.Node.create();
+        harness.api = .{
+            .spec = fixture.spec,
+            .chain = &harness.node.chain,
+            .pool = &harness.node.pool,
+            .scratch = &harness.scratch,
+        };
+        return harness;
+    }
+
+    fn destroy(harness: *Harness) void {
+        harness.node.destroy();
+        testing.allocator.destroy(harness);
+    }
+
+    /// Routes one request and returns the `result` (or `error`) JSON text.
+    fn request(
+        harness: *Harness,
+        comptime method: []const u8,
+        comptime params: []const u8,
+    ) ![]const u8 {
+        const body = request_prefix ++ method ++ "\",\"params\":" ++ params ++ "}";
+        var out: std.Io.Writer = .fixed(&harness.out);
+        _ = eth.Router.handle(&harness.api, body, &out);
+        const text = out.buffered();
+        try json.validate(text);
+        const prefix = "{\"jsonrpc\":\"2.0\",\"id\":1,";
+        try testing.expect(std.mem.startsWith(u8, text, prefix));
+        return text[prefix.len .. text.len - 1];
+    }
+
+    /// Builds one block on the head and makes it canonical.
+    fn mine(harness: *Harness, timestamp: u64) !primitives.B256 {
+        const node = harness.node;
+        const head: primitives.B256 = .{ .bytes = node.chain.head_hash() };
+        const hash = try fixture.build(node, head, timestamp, 0xfe);
+        const version = engine_types.forkchoice_version(fixture.spec, timestamp);
+        _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(hash), null);
+        return hash;
+    }
+};
+
+fn expect_contains(haystack: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, haystack, needle) == null) {
+        std.debug.print("missing {s} in {s}\n", .{ needle, haystack });
+        return error.TestExpectedContains;
+    }
+}
+
+test "eth: chain values and head block" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try testing.expectEqualStrings("\"result\":\"0x539\"", try h.request("eth_chainId", "[]"));
+    try testing.expectEqualStrings("\"result\":\"1337\"", try h.request("net_version", "[]"));
+    try testing.expectEqualStrings("\"result\":\"0x0\"", try h.request("eth_blockNumber", "[]"));
+    const block = try h.request("eth_getBlockByNumber", "[\"latest\",false]");
+    try expect_contains(block, "\"number\":\"0x0\"");
+    try expect_contains(block, "\"baseFeePerGas\":\"0x3b9aca00\"");
+    const missing = try h.request("eth_getBlockByNumber", "[\"0x5\",false]");
+    try testing.expectEqualStrings("\"result\":null", missing);
+    const balance = try h.request("eth_getBalance", "[" ++ address_one ++ ",\"latest\"]");
+    try expect_contains(balance, "\"0x0\"");
+    const future = try h.request("eth_getBalance", "[" ++ address_one ++ ",\"0x9\"]");
+    try expect_contains(future, "error");
+}
+
+test "eth: send raw transaction, mine, receipt, logs and nonce" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 21_000,
+        .to = .{ .call = fixture.address_of(9) },
+        .value = 77,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    var raw_buffer: [256]u8 = undefined;
+    const raw = envelope.encode_to(&raw_buffer);
+    var hex_buffer: [600]u8 = undefined;
+    const hex = try std.fmt.bufPrint(&hex_buffer, "[\"0x{x}\"]", .{raw});
+    var body_buffer: [800]u8 = undefined;
+    const send_format = request_prefix_format ++ "eth_sendRawTransaction\",\"params\":{s}}}";
+    const body = try std.fmt.bufPrint(&body_buffer, send_format, .{hex});
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, body, &out);
+    try expect_contains(out.buffered(), "\"result\":\"0x");
+    const sender = fixture.address_of(1);
+    var nonce_params: [128]u8 = undefined;
+    _ = &nonce_params;
+    try testing.expectEqual(@as(u32, 1), h.node.pool.count());
+    _ = try h.mine(12);
+    try testing.expectEqual(@as(u32, 0), h.node.pool.count());
+    try testing.expectEqualStrings("\"result\":\"0x1\"", try h.request("eth_blockNumber", "[]"));
+    const tx_hash = envelope.hash();
+    var receipt_body: [200]u8 = undefined;
+    const receipt_format = request_prefix_format ++
+        "eth_getTransactionReceipt\",\"params\":[\"0x{x}\"]}}";
+    const receipt_request = try std.fmt.bufPrint(&receipt_body, receipt_format, .{&tx_hash.bytes});
+    out = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, receipt_request, &out);
+    try json.validate(out.buffered());
+    try expect_contains(out.buffered(), "\"status\":\"0x1\"");
+    try expect_contains(out.buffered(), "\"gasUsed\":\"0x5208\"");
+    _ = sender;
+    const full = try h.request("eth_getBlockByNumber", "[\"0x1\",true]");
+    try expect_contains(full, "\"value\":\"0x4d\"");
+    try expect_contains(full, "\"maxFeePerGas\":\"0x2540be400\"");
+    const receipts = try h.request("eth_getBlockReceipts", "[\"latest\"]");
+    try expect_contains(receipts, "\"cumulativeGasUsed\":\"0x5208\"");
+    const logs = try h.request("eth_getLogs", "[{\"fromBlock\":\"0x0\",\"toBlock\":\"latest\"}]");
+    try testing.expectEqualStrings("\"result\":[]", logs);
+}
+
+test "eth: call and estimate gas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const estimate = try h.request("eth_estimateGas", "[{\"to\":" ++ address_target ++ "}]");
+    try testing.expectEqualStrings("\"result\":\"0x5208\"", estimate);
+    const output = try h.request("eth_call", "[{\"to\":" ++ address_target ++ "},\"latest\"]");
+    try testing.expectEqualStrings("\"result\":\"0x\"", output);
+}
+
+fn fuzz_body(h: *Harness, body: []const u8) !void {
+    var out: std.Io.Writer = .fixed(&h.out);
+    const outcome = eth.Router.handle(&h.api, body, &out);
+    if (outcome == .response) try json.validate(out.buffered());
+}
+
+const method_names = [_][]const u8{
+    "eth_getBalance",
+    "eth_getBlockByNumber",
+    "eth_getLogs",
+    "eth_call",
+    "eth_estimateGas",
+    "eth_feeHistory",
+    "eth_getStorageAt",
+    "eth_getTransactionReceipt",
+    "eth_sendRawTransaction",
+    "eth_getBlockByHash",
+};
+const param_pieces = [_][]const u8{
+    "\"latest\"",
+    "\"0x0\"",
+    "\"0x1\"",
+    "true",
+    "null",
+    "{}",
+    "{\"to\":" ++ address_target ++ "}",
+    address_one,
+    "{\"blockHash\":\"0x00\"}",
+    "[]",
+    "\"pending\"",
+    "{\"fromBlock\":\"earliest\",\"topics\":[null]}",
+    "\"0x02\"",
+    "1",
+};
+
+fn random_requests(h: *Harness, prng: *Prng) !void {
+    var body: [1024]u8 = undefined;
+    for (0..32) |_| {
+        var writer: std.Io.Writer = .fixed(&body);
+        const method = method_names[prng.below(method_names.len)];
+        try writer.print(request_prefix_format ++ "{s}\",\"params\":[", .{method});
+        const count = prng.below(4);
+        for (0..count) |i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll(param_pieces[prng.below(param_pieces.len)]);
+        }
+        try writer.writeAll("]}");
+        try fuzz_body(h, writer.buffered());
+    }
+}
+
+test "eth: seeded fuzz of request shapes" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var prng = Prng.init(0xe7);
+    try random_requests(h, &prng);
+}
+
+fn fuzz_eth(h: *Harness, smith: *testing.Smith) anyerror!void {
+    var bytes: [512]u8 = undefined;
+    const len = smith.slice(&bytes);
+    try fuzz_body(h, bytes[0..len]);
+    var prng = Prng.init(smith.value(u64));
+    try random_requests(h, &prng);
+}
+
+test "eth: fuzz" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try testing.fuzz(h, fuzz_eth, .{});
+}

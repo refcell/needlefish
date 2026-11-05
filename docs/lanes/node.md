@@ -17,9 +17,9 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
 - [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
-- [ ] Block executor: apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
+- [x] Block executor (L1; OP deposits pending evm): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
 - [x] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
-- [ ] `payload`: (attributes, payload ID, validation, extra data done) payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
+- [x] `payload`: (attributes, payload ID, validation, extra data done) payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
 - [ ] `engine`: (handlers/versioning/forkchoice rules done; JSON + JWT wiring pending io-net) Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
 - [ ] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
 - [ ] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth/net/web3 JSON-RPC (`src/execution/rpc/eth.zig`): values, state (head only), blocks, txs, receipts, sendRawTransaction, call/estimateGas (executor simulate), getLogs, feeHistory (zero rewards). Chain tx-hash index (bounded ring). Shared node test fixture.
 - 2026-11-05: chain backend for Engine(Chain): payload import (header checks, execution, root checks, rollback on mismatch), forkchoice canonicalization with state moves (undo rollback + re-execution, depth 256), payload builder (attributes txs + txpool, blob sidecars stripped), pool pruning. Decisions: reorged-out txs are not re-injected into the pool; L1 gas limit stays at the parent's when building.
 - 2026-11-05: executor split into begin/apply/finish (builder can skip bad txs); bounded block store ring; engine InsertResult/forkchoice gain `syncing` for unreachable state.
 - 2026-11-05: state db undo journal (bounded ring, per-block rollback) for root mismatches and reorgs. Decision: a storage wipe of pre-existing storage (impossible post-Cancun/EIP-7610) drops undo history instead of logging every slot.

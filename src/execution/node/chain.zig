@@ -36,6 +36,8 @@ pub const Config = struct {
     store: block_store.Config = .{},
     staging_bytes: u32 = 32 << 20,
     select_max: u32 = 4096,
+    /// Transactions findable by hash (most recent stored blocks).
+    tx_index_max: u32 = 1 << 16,
     /// Block-body copies of pooled blob transactions during one build.
     build_bytes: u32 = 4 << 20,
 };
@@ -89,6 +91,8 @@ pub const Record = struct {
     }
 };
 
+pub const TxLocation = struct { block_hash: Hash, index: u32 };
+
 pub const Chain = struct {
     pub const Built = BuiltPayload;
 
@@ -102,6 +106,10 @@ pub const Chain = struct {
     transactions_buffer: [][]const u8,
     build_bytes: []u8,
     build_len: usize = 0,
+    tx_index: std.AutoHashMapUnmanaged(Hash, TxLocation),
+    /// Insertion-ordered ring of indexed hashes; the oldest is dropped when full.
+    tx_ring: []Hash,
+    tx_ring_head: u64 = 0,
     /// Block whose post-state `db` holds.
     state_hash: Hash,
     genesis_hash: Hash,
@@ -130,6 +138,12 @@ pub const Chain = struct {
         const transactions_buffer = try allocator.alloc([]const u8, executor.transactions_max);
         errdefer allocator.free(transactions_buffer);
         const build_bytes = try allocator.alloc(u8, config.build_bytes);
+        errdefer allocator.free(build_bytes);
+        assert(config.tx_index_max > 0);
+        var tx_index: std.AutoHashMapUnmanaged(Hash, TxLocation) = .empty;
+        try tx_index.ensureTotalCapacity(allocator, config.tx_index_max);
+        errdefer tx_index.deinit(allocator);
+        const tx_ring = try allocator.alloc(Hash, config.tx_index_max);
         const hash = genesis.hash().bytes;
         var chain: Chain = .{
             .spec = spec,
@@ -140,6 +154,8 @@ pub const Chain = struct {
             .select_buffer = select_buffer,
             .transactions_buffer = transactions_buffer,
             .build_bytes = build_bytes,
+            .tx_index = tx_index,
+            .tx_ring = tx_ring,
             .state_hash = hash,
             .genesis_hash = hash,
             .forkchoice = .{
@@ -156,6 +172,8 @@ pub const Chain = struct {
     }
 
     pub fn deinit(chain: *Chain, allocator: std.mem.Allocator) void {
+        allocator.free(chain.tx_ring);
+        chain.tx_index.deinit(allocator);
         allocator.free(chain.build_bytes);
         allocator.free(chain.transactions_buffer);
         allocator.free(chain.select_buffer);
@@ -369,8 +387,39 @@ pub const Chain = struct {
         const bytes =
             try chain.encode_record(child, transactions, withdrawals, receipts, executed.requests);
         try chain.store.put(ref_of(child, hash), bytes);
+        for (transactions, 0..) |raw, index| chain.index_transaction(raw, hash, @intCast(index));
         chain.state_hash = hash;
         chain.db.set_block_hash(child.number, hash);
+    }
+
+    fn index_transaction(chain: *Chain, raw: []const u8, block_hash: Hash, index: u32) void {
+        const tx_hash = primitives.keccak256(raw).bytes;
+        const location: TxLocation = .{ .block_hash = block_hash, .index = index };
+        if (chain.tx_index.getPtr(tx_hash)) |existing| {
+            existing.* = location; // Re-included on another branch: point at the newest.
+            return;
+        }
+        const slot = chain.tx_ring_head % chain.tx_ring.len;
+        if (chain.tx_ring_head >= chain.tx_ring.len) {
+            _ = chain.tx_index.remove(chain.tx_ring[slot]);
+        }
+        chain.tx_ring[slot] = tx_hash;
+        chain.tx_ring_head += 1;
+        chain.tx_index.putAssumeCapacityNoClobber(tx_hash, location);
+    }
+
+    /// Where a transaction was included, if its block is canonical and still stored.
+    pub fn find_transaction(chain: *const Chain, tx_hash: Hash) ?TxLocation {
+        const location = chain.tx_index.get(tx_hash) orelse return null;
+        const stored = chain.store.ref(location.block_hash) orelse return null;
+        const canonical = chain.store.canonical_hash(stored.number) orelse return null;
+        if (!std.mem.eql(u8, &canonical, &location.block_hash)) return null;
+        return location;
+    }
+
+    /// Makes the head's post-state current (after a build left a newer block's state).
+    pub fn ensure_head_state(chain: *Chain) Error!void {
+        try chain.move_state(chain.head_hash());
     }
 
     // ---- State movement -------------------------------------------------------------

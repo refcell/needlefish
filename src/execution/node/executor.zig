@@ -224,6 +224,56 @@ pub const Executor = struct {
         };
     }
 
+    /// A message call against the current state (eth_call / eth_estimateGas).
+    pub const Call = struct {
+        from: Address = @splat(0),
+        to: ?Address = null,
+        gas: ?u64 = null,
+        value: u256 = 0,
+        data: []const u8 = &.{},
+    };
+
+    pub const Simulated = union(enum) {
+        invalid: evm.transaction.Invalid,
+        executed: struct { success: bool, gas_used: u64, output: []const u8 },
+    };
+
+    /// Runs `call` on top of the committed state in `block`'s context, with no fee
+    /// (base fee zero, gas price zero), then discards every change. The output borrows
+    /// the scratch arena until the next call.
+    pub fn simulate(executor: *Executor, block: *const BlockEnv, call: Call) Error!Simulated {
+        executor.arena.reset();
+        defer executor.abort_block();
+        var free_block = block.*;
+        free_block.base_fee = 0;
+        executor.set_block_env(&free_block);
+        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
+        const caller = try executor.state.load(call.from);
+        const tx: TxEnv = .{
+            .tx_type = .legacy,
+            .caller = call.from,
+            .gas_limit = @min(call.gas orelse block.gas_limit, block.gas_limit),
+            .gas_price = 0,
+            .to = call.to,
+            .value = call.value,
+            .data = call.data,
+            .nonce = caller.info.nonce,
+            .chain_id = executor.spec.chain_id,
+        };
+        const result = try evm.transaction.transact(executor.machine, fork, &tx);
+        const executed = switch (result) {
+            .invalid => |reason| return .{ .invalid = reason },
+            .executed => |executed| executed,
+        };
+        const output = try executor.alloc(u8, executed.output.len);
+        @memcpy(output, executed.output);
+        return .{ .executed = .{
+            .success = executed.status == .success,
+            .gas_used = executed.gas_used,
+            .output = output,
+        } };
+    }
+
     /// Drops every uncommitted change (failed block).
     pub fn abort_block(executor: *Executor) void {
         executor.state.accounts.clearRetainingCapacity();

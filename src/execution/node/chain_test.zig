@@ -15,118 +15,16 @@ const chain_module = @import("chain.zig");
 const Executor = @import("executor.zig").Executor;
 const StateDb = @import("state_db.zig").StateDb;
 
-const Chain = chain_module.Chain;
-const Engine = engine_module.Engine(Chain);
+const fixture = @import("test_fixture.zig");
 const B256 = primitives.B256;
-const spec = &chainspec.ChainSpec.presets.l1_dev;
-const eth: u256 = 1_000_000_000_000_000_000;
+const spec = fixture.spec;
 const types = engine_module.types;
-
-fn key(n: u8) [32]u8 {
-    var k: [32]u8 = @splat(0);
-    k[31] = n;
-    return k;
-}
-
-fn address_of(n: u8) primitives.Address {
-    return consensus.signature.address_from_private(key(n)).?;
-}
-
-const senders = 3;
-
-/// One node: state, executor, pool, chain and engine, all on the heap (stable pointers).
-const Node = struct {
-    db: StateDb,
-    executor: Executor,
-    pool: txpool.Pool,
-    chain: Chain,
-    engine: Engine,
-
-    fn create() !*Node {
-        const node = try testing.allocator.create(Node);
-        errdefer testing.allocator.destroy(node);
-        node.db = try StateDb.init(testing.allocator, .{
-            .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
-            .code_bytes_max = 1 << 16,
-            .codes_max = 64,
-            .undo_entries_max = 1 << 12,
-        });
-        for (0..senders) |i| {
-            try node.db.put_account(address_of(@intCast(i + 1)).bytes, eth, 0, &.{});
-        }
-        node.executor = try Executor.init(testing.allocator, spec, &node.db, .{
-            .scratch_bytes = 1 << 20,
-            .transactions_max = 64,
-            .evm = .{ .memory_bytes_max = 1 << 20, .code_arena_bytes = 1 << 20 },
-            .limits = .{
-                .accounts_max = 256,
-                .slots_max = 1024,
-                .transient_slots_max = 64,
-                .journal_entries_max = 4096,
-                .logs_max = 64,
-                .log_data_bytes_max = 4096,
-                .code_bytes_max = 1 << 16,
-            },
-        });
-        node.pool = try txpool.Pool.init(testing.allocator, .{});
-        const genesis = genesis_header(try node.db.root());
-        node.chain = try Chain.init(testing.allocator, spec, &node.db, &node.executor, &genesis, .{
-            .store = .{ .blocks_max = 256, .bytes_max = 1 << 20 },
-            .staging_bytes = 1 << 18,
-            .select_max = 64,
-            .build_bytes = 1 << 16,
-        });
-        node.chain.pool = &node.pool;
-        node.engine = Engine.init(spec, &node.chain);
-        return node;
-    }
-
-    fn destroy(node: *Node) void {
-        node.chain.deinit(testing.allocator);
-        node.pool.deinit(testing.allocator);
-        node.executor.deinit(testing.allocator);
-        node.db.deinit(testing.allocator);
-        testing.allocator.destroy(node);
-    }
-};
-
-fn genesis_header(state_root: [32]u8) consensus.Header {
-    return .{
-        .state_root = .{ .bytes = state_root },
-        .gas_limit = 30_000_000,
-        .base_fee_per_gas = 1_000_000_000,
-        .withdrawals_root = primitives.empty_root_hash,
-        .blob_gas_used = 0,
-        .excess_blob_gas = 0,
-        .parent_beacon_block_root = .zero,
-        .requests_hash = consensus.block.empty_requests_hash,
-    };
-}
-
-fn forkchoice(head: B256) types.ForkchoiceState {
-    return .{ .head_block_hash = head, .safe_block_hash = .zero, .finalized_block_hash = .zero };
-}
-
-fn attributes(timestamp: u64, recipient: u8) payload.PayloadAttributes {
-    return .{
-        .timestamp = timestamp,
-        .prev_randao = .zero,
-        .suggested_fee_recipient = .{ .bytes = @splat(recipient) },
-        .withdrawals = &.{},
-        .parent_beacon_block_root = .zero,
-    };
-}
-
-/// Builds a block on `parent` and returns its hash (the builder's head is unchanged).
-fn build(node: *Node, parent: B256, timestamp: u64, recipient: u8) !B256 {
-    var attrs = attributes(timestamp, recipient);
-    const version = types.forkchoice_version(spec, timestamp);
-    const updated = try node.engine.forkchoice_updated(version, forkchoice(parent), &attrs);
-    try testing.expectEqual(types.Status.valid, updated.payload_status.status);
-    const get_version = types.get_payload_version(spec, timestamp);
-    const built = try node.engine.get_payload(get_version, updated.payload_id.?);
-    return built.block_hash;
-}
+const Node = fixture.Node;
+const senders = fixture.senders;
+const address_of = fixture.address_of;
+const build = fixture.build;
+const submit = fixture.submit;
+const forkchoice = fixture.forkchoice;
 
 /// Imports `hash` from `from` into `to` through newPayload.
 fn import(from: *Node, to: *Node, hash: B256) !types.PayloadStatus {
@@ -146,35 +44,6 @@ fn import(from: *Node, to: *Node, hash: B256) !types.PayloadStatus {
         .execution_requests = requests[0..count],
     };
     return to.engine.new_payload(types.new_payload_version(spec, p.timestamp), &p, &params);
-}
-
-fn submit(node: *Node, from: u8, nonce: u64, value: u256, buffer: []u8) !void {
-    const tx: consensus.Eip1559 = .{
-        .chain_id = spec.chain_id,
-        .nonce = nonce,
-        .max_priority_fee_per_gas = 2,
-        .max_fee_per_gas = 10_000_000_000,
-        .gas_limit = 21_000,
-        .to = .{ .call = address_of(9) },
-        .value = value,
-        .input = &.{},
-        .access_list = .empty,
-    };
-    const envelope = try consensus.tx.sign(tx, key(from));
-    const raw = envelope.encode_to(buffer);
-    const sender = address_of(from);
-    const account = node.db.get_account(sender.bytes).?;
-    _ = try node.pool.add(.{
-        .hash = envelope.hash(),
-        .sender = sender,
-        .nonce = nonce,
-        .tx_type = 2,
-        .gas_limit = tx.gas_limit,
-        .max_fee_per_gas = tx.max_fee_per_gas,
-        .max_priority_fee_per_gas = tx.max_priority_fee_per_gas,
-        .value = value,
-        .raw = raw,
-    }, .{ .nonce = account.nonce, .balance = account.balance });
 }
 
 test "chain: build, import on a second node, pool inclusion and pruning" {
@@ -204,6 +73,12 @@ test "chain: build, import on a second node, pool inclusion and pruning" {
     try testing.expectEqual(@as(u32, 0), builder.pool.count());
     try testing.expectEqual(@as(u256, 12), follower.db.get_account(address_of(9).bytes).?.balance);
     try testing.expectEqualSlices(u8, &hash.bytes, &follower.chain.store.canonical_hash(1).?);
+    var first = record.transactions;
+    const tx_hash = primitives.keccak256(try first.bytes()).bytes;
+    const location = follower.chain.find_transaction(tx_hash).?;
+    try testing.expectEqualSlices(u8, &hash.bytes, &location.block_hash);
+    try testing.expectEqual(@as(u32, 0), location.index);
+    try testing.expect(follower.chain.find_transaction(@splat(0)) == null);
 }
 
 test "chain: tampered payload is invalid and leaves state untouched" {

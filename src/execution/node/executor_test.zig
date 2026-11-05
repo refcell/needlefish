@@ -182,6 +182,27 @@ test "executor: withdrawals credit gwei" {
     try testing.expect(f.db.get_account(@splat(0x78)) == null);
 }
 
+test "executor: simulate runs a call without committing" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const target: [20]u8 = @splat(0x55);
+    // PUSH1 0x2a PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+    const code = [_]u8{ 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3 };
+    try f.db.put_account(target, 0, 1, &code);
+    const before = try f.db.root();
+    const result = try f.executor.simulate(&block_env(1), .{ .to = target, .value = 0 });
+    try testing.expect(result.executed.success);
+    try testing.expectEqual(@as(u8, 0x2a), result.executed.output[31]);
+    try testing.expect(result.executed.gas_used > 21_000);
+    try testing.expectEqualSlices(u8, &before, &(try f.db.root()));
+    const transfer_result = try f.executor.simulate(&block_env(1), .{ .to = @splat(0x09) });
+    try testing.expect(transfer_result.executed.success);
+    try testing.expectEqual(@as(u64, 21_000), transfer_result.executed.gas_used);
+    const poor = try f.executor.simulate(&block_env(1), .{ .to = target, .value = 1 });
+    try testing.expect(poor == .invalid);
+}
+
 /// Random transfer blocks checked against a balance/nonce model.
 fn random_blocks(prng: *Prng) !void {
     var f: Fixture = undefined;
