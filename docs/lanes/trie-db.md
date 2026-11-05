@@ -80,8 +80,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (lazy buffers in `db/witness.zig`, `db/changeset.zig`, `trie/sparse.zig`; derived config in
   `Limits.witness_config`; "witness too large" in `rpc/debug.zig`; measured by
   `node/witness_memory_test.zig`)
-- [ ] Witness generation blocks the state for one unwind + re-apply per block between target
+- [x] Witness generation blocks the state for one unwind + re-apply per block between target
   and head; consider generating from the history store instead (no state disturbance).
+  (`witness_block.Generator.generate_history` / `database_witness_history`, preferred by
+  `database_witness`; `witness.HistorySource`; history walks in `history.Store`)
 - [ ] Faster `witness.Builder.build`: 4-5x the cost of applying the block (30.7 vs 8.2 ms on
   the storage-heavy block); collect proof nodes in one sorted multi-key trie walk instead of
   one proof per key, and skip the sparse replay when the caller does not need the root.
@@ -250,6 +252,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   number read up to the parent (reth), so a verifier can link each hash to the parent.
   `Generator` is bound to one `State` and owns all scratch (allocated at init); depth is
   bounded by `Config.depth_max` and by retention (`BlockUnavailable`).
+- Witness from history (`db/witness_block.zig`, `generate_history`): when the database keeps
+  history and the block's parent is in the window, the recorder wraps an evm `Database` over
+  `history.Store` at the parent (`account_at`/`storage_at` walk the versioned trie from that
+  block's root, every node checked against its parent's reference; codes from the live
+  state's code store, which never deletes; BLOCKHASH from the chain as before). The builder
+  takes a duck-typed node source (`Builder.build_from`): `StateSource` (live trie proofs and
+  `visit_siblings_in`, the old behavior) or `HistorySource` (`Store.visit_account_proof`,
+  `visit_storage_proof`, `visit_account_siblings`, `visit_storage_siblings`: the same nodes
+  in the same order, from history), so the replay, minimality, and output order are shared.
+  The changeset is folded with the `Overlay.build_changeset` rules but old values from
+  history (the overlay's base is the head state). A wiped account whose parent storage is
+  not empty would need its old slots spelled out, which the hashed history trie cannot
+  enumerate (no slot preimages): `HistoryWipeUnsupported`, and `database_witness` unwinds
+  instead (post-Cancun the evm cannot wipe an account with storage that survives, as
+  creation over storage collides). Expected post root = history root of the block. Nothing
+  of the state, head, journal, or trie change marks moves, so commits may interleave; the
+  history reference is valid only until the next head move. Chosen over an overlay on a
+  historical state: no new state provider, one generic builder. Cost per read is a
+  history walk (O(depth) lookups); fine for one block's reads.
 - Node integration of the witness (`node/witness.zig`): durable nodes use the database's
   stored changesets through an optional `Journal.witness` hook (`Durable` calls
   `Generator.database_witness`); in-memory nodes peek the newest changesets of `StateDb`'s
@@ -462,3 +483,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   1.28 MB / build 30.7 ms / verifier replay 12.7 ms; 200 evm SLOAD+SSTORE calls 1 484 nodes /
   392 KB / build 4.4 ms / stateless re-exec 1.67 ms. Recorder ~30 ns per key, codec 0.45-0.75
   GB/s. Every sample checks the verifier's root against the builder's.
+- 2026-11-05: witness from history: `debug_executionWitness` of a block whose parent is in the
+  durable history window runs over history (state, head, journal untouched; commits continue
+  between calls). Seeded workload (2 seeds, reorgs, window 4): every block's history witness
+  encodes (`witness_codec`) to the unwind witness's bytes, head witness re-executes
+  statelessly to the stored root; blocks below the window fall back to the unwind; durable
+  node test checks the source per block across a new head.

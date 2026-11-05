@@ -974,6 +974,21 @@ pub const Store = struct {
         proof: anytype,
     ) Error!?[]const u8 {
         proof.count = 0;
+        const sink: ProofSink(@TypeOf(proof)) = .{ .proof = proof };
+        return self.walk_path(owner, root, key, number, sink);
+    }
+
+    /// Walks the trie of `owner` at block `number` from `root` along `key`, calling
+    /// `sink.visit(bytes)` for the root and every node referenced by hash (the nodes of an
+    /// `eth_getProof` proof). Returns the leaf value or null when `key` is absent.
+    fn walk_path(
+        self: *const Store,
+        owner: ?Hash,
+        root: Hash,
+        key: *const Hash,
+        number: u64,
+        sink: anytype,
+    ) !?[]const u8 {
         if (std.mem.eql(u8, &root, &trie.empty_root)) return null;
         const path = trie.Nibbles.from_bytes(key);
         const nibbles = path.slice();
@@ -982,18 +997,8 @@ pub const Store = struct {
         var reference: Reference = .{ .hash = root };
         var depth: u32 = 0;
         while (depth <= path_nibbles_max + 1) : (depth += 1) {
-            const id = self.lookup(owner, nibbles[0..consumed], number) orelse
-                return error.HistoryCorrupt;
-            const bytes = self.encoding(id);
-            switch (reference) {
-                .hash => |hash| if (!std.mem.eql(u8, &trie.node.keccak256(bytes), &hash)) {
-                    return error.HistoryCorrupt;
-                },
-                .embedded => |inline_bytes| if (!std.mem.eql(u8, inline_bytes, bytes)) {
-                    return error.HistoryCorrupt;
-                },
-            }
-            if (depth == 0 or bytes.len >= 32) append_node(proof, bytes);
+            const bytes = try self.checked_node(owner, nibbles[0..consumed], number, reference);
+            if (depth == 0 or bytes.len >= 32) try sink.visit(bytes);
             const step = step_node(bytes, nibbles[consumed..]) catch return error.HistoryCorrupt;
             switch (step) {
                 .found => |value| return value,
@@ -1007,6 +1012,175 @@ pub const Store = struct {
         }
         return error.HistoryCorrupt;
     }
+
+    /// Like `TrieType.visit_siblings_in` on the trie of block `number`: calls
+    /// `sink.visit(bytes)` for every child referenced by hash, off `key`'s path, of each
+    /// branch on `key`'s path (a delete of `key` may collapse such a branch into it).
+    fn walk_siblings(
+        self: *const Store,
+        owner: ?Hash,
+        root: Hash,
+        key: *const Hash,
+        number: u64,
+        sink: anytype,
+    ) !void {
+        if (std.mem.eql(u8, &root, &trie.empty_root)) return;
+        const path = trie.Nibbles.from_bytes(key);
+        const nibbles = path.slice();
+        assert(nibbles.len == path_nibbles_max);
+        var consumed: u32 = 0;
+        var reference: Reference = .{ .hash = root };
+        var depth: u32 = 0;
+        while (depth <= path_nibbles_max + 1) : (depth += 1) {
+            const bytes = try self.checked_node(owner, nibbles[0..consumed], number, reference);
+            if (consumed < path_nibbles_max) {
+                const walked = nibbles[0 .. consumed + 1];
+                try self.visit_hashed_children(owner, walked, number, bytes, sink);
+            }
+            const step = step_node(bytes, nibbles[consumed..]) catch return error.HistoryCorrupt;
+            switch (step) {
+                .found, .absent => return,
+                .next => |next| {
+                    consumed += next.consumed;
+                    assert(consumed <= path_nibbles_max);
+                    reference = next.reference;
+                },
+            }
+        }
+        return error.HistoryCorrupt;
+    }
+
+    /// If `bytes` is a branch, visits its hashed children except the one at `path`'s last
+    /// nibble (the walked one); `path` is the branch path plus that nibble.
+    fn visit_hashed_children(
+        self: *const Store,
+        owner: ?Hash,
+        path: []const u8,
+        number: u64,
+        bytes: []const u8,
+        sink: anytype,
+    ) !void {
+        assert(path.len > 0 and path.len <= path_nibbles_max);
+        const outer = rlp.decode_item(bytes) catch return error.HistoryCorrupt;
+        if (outer.kind != .list) return error.HistoryCorrupt;
+        var items: [17]rlp.Item = undefined;
+        const count = rlp.decode_list(outer.payload, &items) catch return error.HistoryCorrupt;
+        if (count != 17) return;
+        var child_path: [path_nibbles_max]u8 = undefined;
+        @memcpy(child_path[0..path.len], path);
+        const walked = path[path.len - 1];
+        for (items[0..16], 0..) |item, nibble| {
+            if (nibble == walked) continue;
+            const reference = child_reference(item) catch return error.HistoryCorrupt;
+            const child = reference orelse continue;
+            if (child != .hash) continue;
+            child_path[path.len - 1] = @intCast(nibble);
+            const child_path_slice = child_path[0..path.len];
+            const child_bytes = try self.checked_node(owner, child_path_slice, number, child);
+            assert(child_bytes.len >= 32);
+            try sink.visit(child_bytes);
+        }
+    }
+
+    /// The node of the trie of `owner` at `path` at block `number`, checked against the
+    /// parent's `reference` (hash or inline bytes).
+    fn checked_node(
+        self: *const Store,
+        owner: ?Hash,
+        path: []const u8,
+        number: u64,
+        reference: Reference,
+    ) Error![]const u8 {
+        const id = self.lookup(owner, path, number) orelse return error.HistoryCorrupt;
+        const bytes = self.encoding(id);
+        assert(bytes.len > 0);
+        const matches = switch (reference) {
+            .hash => |hash| std.mem.eql(u8, &trie.node.keccak256(bytes), &hash),
+            .embedded => |inline_bytes| std.mem.eql(u8, inline_bytes, bytes),
+        };
+        if (!matches) return error.HistoryCorrupt;
+        return bytes;
+    }
+
+    /// The account of `address_hash` at block `number` (null when absent), without a proof.
+    pub fn account_at(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+    ) Error!?AccountState {
+        const root = try self.state_root_at(number);
+        const value = try self.walk_path(null, root, address_hash, number, NullSink{}) orelse
+            return null;
+        return decode_account(value) catch return error.HistoryCorrupt;
+    }
+
+    /// The value of `slot_hash` at block `number` in the storage trie of `address_hash`,
+    /// whose root at that block is `storage_root`; 0 when absent.
+    pub fn storage_at(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        storage_root: Hash,
+        slot_hash: *const Hash,
+    ) Error!u256 {
+        _ = try self.state_root_at(number);
+        const owner: ?Hash = address_hash.*;
+        const value = try self.walk_path(owner, storage_root, slot_hash, number, NullSink{}) orelse
+            return 0;
+        return decode_storage_value(value) catch return error.HistoryCorrupt;
+    }
+
+    /// Visits the nodes of the account proof of `address_hash` at block `number`
+    /// (`StateTrie.prove_account` order).
+    pub fn visit_account_proof(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        sink: anytype,
+    ) !void {
+        const root = try self.state_root_at(number);
+        _ = try self.walk_path(null, root, address_hash, number, sink);
+    }
+
+    /// Visits the nodes of the storage proof of `slot_hash` at block `number`; nothing when
+    /// the account is absent or has no storage (as `StateTrie.prove_storage`).
+    pub fn visit_storage_proof(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        sink: anytype,
+    ) !void {
+        const account = try self.account_at(number, address_hash) orelse return;
+        const owner: ?Hash = address_hash.*;
+        _ = try self.walk_path(owner, account.storage_root, slot_hash, number, sink);
+    }
+
+    /// Visits the hashed siblings along `address_hash`'s path in the account trie at
+    /// block `number` (`StateTrie.visit_account_siblings`).
+    pub fn visit_account_siblings(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        sink: anytype,
+    ) !void {
+        const root = try self.state_root_at(number);
+        try self.walk_siblings(null, root, address_hash, number, sink);
+    }
+
+    /// Visits the hashed siblings along `slot_hash`'s path in the account's storage trie at
+    /// block `number` (`StateTrie.visit_storage_siblings`).
+    pub fn visit_storage_siblings(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        sink: anytype,
+    ) !void {
+        const account = try self.account_at(number, address_hash) orelse return;
+        const owner: ?Hash = address_hash.*;
+        try self.walk_siblings(owner, account.storage_root, slot_hash, number, sink);
+    }
 };
 
 fn append_node(proof: anytype, bytes: []const u8) void {
@@ -1017,6 +1191,22 @@ fn append_node(proof: anytype, bytes: []const u8) void {
     proof.ends[proof.count] = start + @as(u32, @intCast(bytes.len));
     proof.count += 1;
 }
+
+/// Appends walked proof nodes to a `TrieType.Proof`.
+fn ProofSink(comptime ProofPointer: type) type {
+    return struct {
+        proof: ProofPointer,
+
+        pub fn visit(self: @This(), bytes: []const u8) error{}!void {
+            append_node(self.proof, bytes);
+        }
+    };
+}
+
+/// Ignores walked nodes (value lookups).
+const NullSink = struct {
+    pub fn visit(_: NullSink, _: []const u8) error{}!void {}
+};
 
 const Reference = union(enum) {
     hash: Hash,

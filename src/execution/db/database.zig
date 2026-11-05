@@ -938,6 +938,15 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         // History.
 
+        /// History at the head for readers (`witness_block`): null when history is not
+        /// configured, off, or not initialized. Valid until the next head move.
+        pub fn history_reader(self: *Self) ?*const history_module.Store {
+            if (!self.head_info.present) return null;
+            const store = self.history_tracking() orelse return null;
+            assert(store.window().?.head == self.head_info.number);
+            return store;
+        }
+
         /// The store when live head moves update it: ready, configured, on, and initialized.
         fn history_tracking(self: *Self) ?*history_module.Store {
             if (self.phase != .ready or self.history_off) return null;

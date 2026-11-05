@@ -5,6 +5,12 @@
 //! with only the witness: same post root as stored. The head, its root, and the journal
 //! are unchanged by the call; blocks outside the depth bound, unknown blocks, and genesis
 //! are refused.
+//!
+//! With `Config.history` on, a seeded workload with reorgs witnesses every retained block
+//! after each step both ways: from history (the state untouched) and by unwinding; the two
+//! witnesses encode (`witness_codec`, canonical order) to the same bytes. Blocks whose
+//! parent left the history window fall back to the unwind, and the database keeps
+//! committing between the calls.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +26,9 @@ const evm_backend = @import("evm_backend.zig");
 const witness = @import("witness.zig");
 const witness_block = @import("witness_block.zig");
 const evm_test = @import("witness_evm_test.zig");
+const witness_codec = @import("witness_codec.zig");
+const history = @import("history.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 const evm = @import("../evm/root.zig");
 const trie = @import("../trie/root.zig");
 
@@ -32,6 +41,10 @@ const TxEnv = evm.transaction.TxEnv;
 const sector_size = storage.sector_size;
 
 const blocks_total = 6;
+/// Block numbers the history workload reaches (array bound).
+const numbers_max = 24;
+const history_steps = 9;
+const history_window_blocks = 4;
 const txs_per_block = 4;
 const depth_max = 5;
 const senders_total = 3;
@@ -79,6 +92,20 @@ const config: database.Config = .{
     .checkpoint_staging_bytes = 128 * 1024,
 };
 
+const history_config: database.Config = blk: {
+    var result = config;
+    result.chain.blocks_max = 32;
+    result.chain.bytes_max = 96 * 1024;
+    result.history = .{
+        .window_blocks = history_window_blocks,
+        .paths_max = 4096,
+        .small_versions_max = 4096,
+        .large_versions_max = 1024,
+        .prune_per_commit = 512,
+    };
+    break :blk result;
+};
+
 const keys_config: witness.KeySet.Config = .{
     .accounts_max = 64,
     .slots_max = 256,
@@ -119,10 +146,12 @@ fn address_of(index: u8) Address {
     return address;
 }
 
-/// `rlp([1, 1, 1, 1, 1, 1, 1, 1, number])`: header-shaped, number at field 8 (< 128).
-fn header_of(number: u8) [10]u8 {
+/// `rlp([salt, 1, 1, 1, 1, 1, 1, 1, number])`: header-shaped, number at field 8 (< 128);
+/// `salt` tells sibling blocks of one number apart.
+fn header_of(number: u8, salt: u8) [10]u8 {
     assert(number < 0x80);
-    return .{ 0xc9, 1, 1, 1, 1, 1, 1, 1, 1, if (number == 0) 0x80 else number };
+    assert(salt > 0 and salt < 0x80);
+    return .{ 0xc9, salt, 1, 1, 1, 1, 1, 1, 1, if (number == 0) 0x80 else number };
 }
 
 fn write_word(buffer: []u8, word_index: u32, value: u256) void {
@@ -144,20 +173,23 @@ const Harness = struct {
     machine: evm.Evm,
     sparse: witness.SparseState,
     sparse_changeset: Changeset,
-    blocks: [blocks_total + 1]Block,
-    headers: [blocks_total + 1][10]u8,
-    hashes: [blocks_total + 1]Hash,
-    roots: [blocks_total + 1]Hash,
+    /// Per canonical block number (a reorg overwrites the replaced branch).
+    blocks: [numbers_max]Block,
+    headers: [numbers_max][10]u8,
+    hashes: [numbers_max]Hash,
+    roots: [numbers_max]Hash,
+    nonces_at: [numbers_max][senders_total]u64,
     nonces: [senders_total]u64,
+    salt: u8,
 
     /// In place: the database, overlay, generator, and evm keep pointers into it.
-    fn init(self: *Harness) !void {
+    fn init(self: *Harness, db_config: database.Config) !void {
         const allocator = testing.allocator;
         self.sim = try SimStorage.init(allocator, .{
             .size_bytes = config.engine.size_bytes(),
             .seed = 0x5eed,
         });
-        self.db = try Database.init(allocator, &self.sim, config);
+        self.db = try Database.init(allocator, &self.sim, db_config);
         self.overlay = try Overlay.init(allocator, &self.db.state, overlay_config);
         self.generator = try witness_block.Generator.init(
             allocator,
@@ -170,6 +202,7 @@ const Harness = struct {
         self.sparse = try witness.SparseState.init(allocator, sparse_config);
         self.sparse_changeset = try Changeset.init(allocator, changeset_config);
         self.nonces = @splat(0);
+        self.salt = 1;
     }
 
     fn deinit(self: *Harness) void {
@@ -217,7 +250,8 @@ const Harness = struct {
 
     /// Commits the overlay as block `number` (header-shaped bytes, hash = keccak).
     fn commit(self: *Harness, number: u8, parent_hash: Hash) !void {
-        self.headers[number] = header_of(number);
+        assert(number < numbers_max);
+        self.headers[number] = header_of(number, self.salt);
         const hash = trie.node.keccak256(&self.headers[number]);
         const input: database.BlockInput = .{
             .hash = hash,
@@ -233,7 +267,29 @@ const Harness = struct {
         const result = try self.db.execute_and_commit(&self.overlay, &input);
         self.hashes[number] = hash;
         self.roots[number] = result.state_root;
+        self.nonces_at[number] = self.nonces;
         try self.tick_until_idle();
+        try self.maintain();
+    }
+
+    /// Checkpoints before the journal fills (as `node.Durable.maintain`).
+    fn maintain(self: *Harness) !void {
+        const ring = &self.db.engine.journal;
+        const used = ring.head - ring.tail + self.db.journal_bytes_pending;
+        if (used * 2 <= ring.config.zone_size_bytes) return;
+        self.db.request_checkpoint();
+        try self.tick_until_idle();
+    }
+
+    /// Moves the head back `depth` blocks; the next `mine` starts a new branch.
+    fn reorg(self: *Harness, depth: u8) !void {
+        const head: u8 = @intCast(self.db.head_info.number);
+        assert(depth > 0 and depth < head);
+        const number = head - depth;
+        _ = try self.db.set_head(self.hashes[number]);
+        try self.tick_until_idle();
+        self.nonces = self.nonces_at[number];
+        self.salt += 1;
     }
 
     fn fill_block(self: *Harness, number: u8) void {
@@ -324,7 +380,7 @@ fn check_stateless(harness: *Harness, number: u8) !void {
 test "witness block: durable witness re-executes statelessly to the stored root" {
     const harness = try testing.allocator.create(Harness);
     defer testing.allocator.destroy(harness);
-    try harness.init();
+    try harness.init(config);
     defer harness.deinit();
     try harness.start();
     var number: u8 = 1;
@@ -342,6 +398,7 @@ test "witness block: durable witness re-executes statelessly to the stored root"
         try testing.expectEqual(head.state_root, try harness.db.state.state_root());
         try testing.expectEqual(sequence, harness.db.submitted_sequence);
         try check_stateless(harness, number);
+        try testing.expectEqual(witness_block.Source.unwind, harness.generator.source.?);
     }
 
     // Deeper than `depth_max`, unknown, and genesis blocks are refused; nothing moves.
@@ -352,4 +409,103 @@ test "witness block: durable witness re-executes statelessly to the stored root"
         try testing.expectEqual(head.state_root, try harness.db.state.state_root());
     }
     try testing.expectEqual(database.Phase.ready, harness.db.phase);
+}
+
+fn witness_history(harness: *Harness, number: u8) witness_block.Error!Hash {
+    var run: Run = .{ .harness = harness, .number = number };
+    const execute: witness_block.Execute = .{ .context = &run, .run = Run.execute };
+    const hash = harness.hashes[number];
+    return harness.generator.database_witness_history(&harness.db, hash, execute);
+}
+
+fn witness_unwind(harness: *Harness, number: u8) witness_block.Error!Hash {
+    var run: Run = .{ .harness = harness, .number = number };
+    const execute: witness_block.Execute = .{ .context = &run, .run = Run.execute };
+    const hash = harness.hashes[number];
+    return harness.generator.database_witness_unwind(&harness.db, hash, execute);
+}
+
+const Encoded = struct {
+    encoder: witness_codec.Encoder,
+    history: []u8,
+    unwind: []u8,
+};
+
+fn encode(encoded: *Encoded, out: []u8, generator: *witness_block.Generator) ![]const u8 {
+    const length = try encoded.encoder.encode(&generator.witness, out);
+    return out[0..length];
+}
+
+/// Every retained block of the head chain: from history when its parent is in the window
+/// (same bytes as the unwind), else the unwind fallback; the head never moves.
+fn check_window(harness: *Harness, encoded: *Encoded) !void {
+    const head = harness.db.head_info;
+    const sequence = harness.db.submitted_sequence;
+    const store = harness.db.history_reader().?;
+    const head_number: u8 = @intCast(head.number);
+    var number: u8 = @max(1, head_number -| (depth_max - 1));
+    while (number <= head_number) : (number += 1) {
+        if (witness_block.history_covers(store, number)) {
+            const root = try witness_of(harness, number, harness.hashes[number]);
+            try testing.expectEqual(witness_block.Source.history, harness.generator.source.?);
+            try testing.expectEqual(harness.roots[number], root);
+            const from_history = try encode(encoded, encoded.history, &harness.generator);
+            try testing.expectEqual(harness.roots[number], try witness_unwind(harness, number));
+            const from_unwind = try encode(encoded, encoded.unwind, &harness.generator);
+            try testing.expectEqualSlices(u8, from_unwind, from_history);
+            if (number == head_number) {
+                _ = try witness_history(harness, number);
+                try check_stateless(harness, number);
+            }
+        } else {
+            try testing.expectError(error.BlockUnavailable, witness_history(harness, number));
+            const root = try witness_of(harness, number, harness.hashes[number]);
+            try testing.expectEqual(witness_block.Source.unwind, harness.generator.source.?);
+            try testing.expectEqual(harness.roots[number], root);
+        }
+        try testing.expect(head.eql(harness.db.head_info));
+        try testing.expectEqual(head.state_root, try harness.db.state.state_root());
+        try testing.expectEqual(sequence, harness.db.submitted_sequence);
+    }
+}
+
+fn run_history_seed(seed: u64, encoded: *Encoded) !void {
+    const harness = try testing.allocator.create(Harness);
+    defer testing.allocator.destroy(harness);
+    try harness.init(history_config);
+    defer harness.deinit();
+    try harness.start();
+    var prng = Prng.init(seed);
+    var fallbacks: u32 = 0;
+    var reorgs: u32 = 0;
+    for (0..history_steps) |_| {
+        const head: u8 = @intCast(harness.db.head_info.number);
+        if (head >= 3 and prng.chance(1, 3)) {
+            try harness.reorg(@intCast(prng.range(1, 2)));
+            reorgs += 1;
+        }
+        try harness.mine(@intCast(harness.db.head_info.number + 1));
+        try check_window(harness, encoded);
+        const window = harness.db.history_reader().?.window().?;
+        if (window.oldest > 1) fallbacks += 1;
+    }
+    try testing.expect(fallbacks > 0);
+    try testing.expect(reorgs > 0);
+    try testing.expectEqual(@as(u64, 0), harness.db.history_drops);
+    try testing.expectEqual(database.Phase.ready, harness.db.phase);
+}
+
+test "witness block: history witness equals the unwind witness, state untouched" {
+    const allocator = testing.allocator;
+    const witness_config = generator_config.witness;
+    const encoded = try allocator.create(Encoded);
+    defer allocator.destroy(encoded);
+    encoded.encoder = try witness_codec.Encoder.init(allocator, witness_config);
+    defer encoded.encoder.deinit(allocator);
+    const bytes_max = witness_config.state_bytes_max + witness_config.code_bytes_max + (1 << 16);
+    encoded.history = try allocator.alloc(u8, bytes_max);
+    defer allocator.free(encoded.history);
+    encoded.unwind = try allocator.alloc(u8, bytes_max);
+    defer allocator.free(encoded.unwind);
+    for ([_]u64{ 0x1a, 0x2b }) |seed| try run_history_seed(seed, encoded);
 }

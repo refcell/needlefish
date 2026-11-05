@@ -22,6 +22,15 @@
 //! state must be idle for the call (the node is single-threaded: an RPC handler runs
 //! between blocks). Cost: one unwind + re-apply per block between B and the head, plus
 //! one execution of B; no copy of the state.
+//!
+//! History path (`generate_history`): when the durable database keeps history
+//! (`Config.history`) and B's parent is inside its window, the parent state is read from
+//! `history.Store` instead (account and slot values walk the versioned trie at B - 1, codes
+//! come from the state's code store, which never deletes, BLOCKHASH from the chain), and the
+//! witness nodes come from history through `witness.HistorySource`. The live state, its
+//! head, and its journal are never touched, so the database keeps accepting commits between
+//! calls and the cost does not grow with B's depth. `database_witness` prefers it and falls
+//! back to the unwind when history is off or B - 1 is outside the window.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,6 +42,8 @@ const overlay_module = @import("overlay.zig");
 const changeset_module = @import("changeset.zig");
 const chain_module = @import("chain.zig");
 const evm_backend = @import("evm_backend.zig");
+const history = @import("history.zig");
+const node = @import("../trie/root.zig").node;
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -43,17 +54,21 @@ pub const Hash = state_module.Hash;
 /// The parent plus the 256 BLOCKHASH ancestors below it.
 pub const headers_max: u32 = state_module.block_hashes_max + 1;
 
-pub const Error = witness.Error || state_module.Error || overlay_module.Error || error{
-    /// Not canonical, not retained, genesis, or deeper than `Config.depth_max`.
-    BlockUnavailable,
-    ExecutionFailed,
-    HeaderUnavailable,
-    InvalidChangeset,
-    /// The witness-only post root differs from the block's stored root.
-    WitnessMismatch,
-    /// Restoring the head failed; the state no longer matches its head.
-    StateCorrupted,
-};
+pub const Error = witness.Error || state_module.Error || overlay_module.Error || history.Error ||
+    error{
+        /// Not canonical, not retained, genesis, or deeper than `Config.depth_max`.
+        BlockUnavailable,
+        ExecutionFailed,
+        HeaderUnavailable,
+        InvalidChangeset,
+        /// The history path met a wiped account with parent storage (see
+        /// `build_history_changeset`); `database_witness` unwinds instead.
+        HistoryWipeUnsupported,
+        /// The witness-only post root differs from the block's stored root.
+        WitnessMismatch,
+        /// Restoring the head failed; the state no longer matches its head.
+        StateCorrupted,
+    };
 
 pub const ExecuteError = error{ExecutionFailed};
 
@@ -96,6 +111,9 @@ pub const Config = struct {
     response_bytes_max: u32 = std.math.maxInt(u32),
 };
 
+/// Where a witness's parent state came from.
+pub const Source = enum { unwind, history };
+
 pub const Generator = struct {
     state: *State,
     builder: witness.Builder,
@@ -110,6 +128,11 @@ pub const Generator = struct {
     changesets: [][]const u8,
     headers: [][]const u8,
     blocks: ?Blocks = null,
+    /// The history store and block the history path reads the parent state from.
+    history_store: ?*const history.Store = null,
+    history_number: u64 = 0,
+    /// How the last witness was generated (null before the first success).
+    source: ?Source = null,
     response_bytes_max: u32,
 
     pub fn init(allocator: std.mem.Allocator, state: *State, config: Config) !Generator {
@@ -162,6 +185,7 @@ pub const Generator = struct {
     /// Fills `self.witness` for `target` and returns the block's post-state root. The state
     /// is back at its block afterwards, also on error (except `StateCorrupted`).
     pub fn generate(self: *Generator, target: *const Target, execute: Execute) Error!Hash {
+        self.source = null;
         if (target.number == 0) return error.BlockUnavailable;
         if (target.changesets.len == 0) return error.BlockUnavailable;
         if (target.changesets.len > self.changesets.len) return error.BlockUnavailable;
@@ -173,7 +197,41 @@ pub const Generator = struct {
         self.reapply(target.changesets[0..unwound]) catch return error.StateCorrupted;
         const restored = self.state.state_root() catch return error.StateCorrupted;
         if (!std.mem.eql(u8, &restored, &head_root)) return error.StateCorrupted;
-        return result;
+        const root = try result;
+        self.source = .unwind;
+        return root;
+    }
+
+    /// Fills `self.witness` for block `number` from `store` without touching the state:
+    /// the parent state is history at `number - 1`, which must be in the window. Returns
+    /// the block's post-state root (the history root of `number`).
+    pub fn generate_history(
+        self: *Generator,
+        store: *const history.Store,
+        number: u64,
+        blocks: Blocks,
+        execute: Execute,
+    ) Error!Hash {
+        self.source = null;
+        if (!history_covers(store, number)) return error.BlockUnavailable;
+        const parent = number - 1;
+        const expected_root = try store.state_root_at(number);
+        self.history_store = store;
+        self.history_number = parent;
+        defer {
+            self.history_store = null;
+            self.blocks = null;
+        }
+        const source: witness.HistorySource = .{
+            .store = store,
+            .number = parent,
+            .codes = self.state,
+        };
+        const inner = self.history_database();
+        const root = try self.run(number, blocks, execute, expected_root, inner, source);
+        assert(std.mem.eql(u8, &root, &expected_root));
+        self.source = .history;
+        return root;
     }
 
     fn generate_unwound(
@@ -192,7 +250,9 @@ pub const Generator = struct {
         try self.unwind_one(changesets[changesets.len - 1]);
         unwound.* += 1;
         assert(unwound.* == changesets.len);
-        return self.run(target, execute, expected_root);
+        const source = self.builder.state_source(self.state);
+        const inner = self.parent_database();
+        return self.run(target.number, target.blocks, execute, expected_root, inner, source);
     }
 
     fn unwind_one(self: *Generator, encoded: []const u8) Error!void {
@@ -210,19 +270,35 @@ pub const Generator = struct {
         }
     }
 
-    /// Executes the block over the recorded parent state and builds the witness.
-    fn run(self: *Generator, target: *const Target, execute: Execute, expected: Hash) Error!Hash {
-        self.blocks = target.blocks;
+    /// Executes block `number` over `inner` (the parent state) wrapped in the recorder and
+    /// builds the witness from `source` (the same parent state's trie nodes).
+    fn run(
+        self: *Generator,
+        number: u64,
+        blocks: Blocks,
+        execute: Execute,
+        expected: Hash,
+        inner: evm.state.Database,
+        source: anytype,
+    ) Error!Hash {
+        assert(number > 0);
+        self.blocks = blocks;
         self.recorder.keys.clear();
-        self.recorder.inner = self.parent_database();
+        self.recorder.inner = inner;
         const evm_state = try execute.run(execute.context, self.recorder.database());
         self.overlay.discard();
         defer self.overlay.discard();
         try evm_backend.commit_evm(evm_state, &self.overlay);
-        try self.overlay.build_changeset(&self.changeset_built);
-        const headers = try self.collect_headers(target);
-        const post_root = try self.builder.build(
-            self.state,
+        // The overlay's base is the live state; on the history path it is not the parent,
+        // so old values come from history instead.
+        if (@TypeOf(source) == witness.HistorySource) {
+            try self.build_history_changeset();
+        } else {
+            try self.overlay.build_changeset(&self.changeset_built);
+        }
+        const headers = try self.collect_headers(number, blocks);
+        const post_root = try self.builder.build_from(
+            source,
             &self.recorder.keys,
             &self.changeset_built,
             headers,
@@ -233,21 +309,79 @@ pub const Generator = struct {
         return post_root;
     }
 
+    /// `Overlay.build_changeset` with old values from history at `history_number`. A wiped
+    /// account whose parent storage is not empty needs its old slots spelled out, which the
+    /// hashed history trie cannot enumerate: `HistoryWipeUnsupported` (unwind instead).
+    fn build_history_changeset(self: *Generator) Error!void {
+        const changeset = &self.changeset_built;
+        changeset.clear();
+        var accounts = self.overlay.accounts.iterator();
+        while (accounts.next()) |entry| {
+            const address = entry.key_ptr.*;
+            const account = entry.value_ptr;
+            const old_state = try self.history_account(&address);
+            const old = info_of(old_state);
+            const new = if (account.info_set) account.info else old;
+            if (!info_equal(old, new)) {
+                try changeset.add_account(.{ .address = address, .old = old, .new = new });
+            }
+            if (account.wiped) {
+                const old_root = if (old_state) |found| found.storage_root else node.empty_root;
+                if (!std.mem.eql(u8, &old_root, &node.empty_root)) {
+                    return error.HistoryWipeUnsupported;
+                }
+            }
+        }
+        var slots = self.overlay.slots.iterator();
+        while (slots.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const epoch = if (self.overlay.accounts.get(key.address)) |found| found.epoch else 0;
+            if (entry.value_ptr.epoch != epoch) continue;
+            const old = try self.history_slot(&key.address, key.slot);
+            if (old == entry.value_ptr.value) continue;
+            try changeset.add_storage(.{
+                .address = key.address,
+                .slot = key.slot,
+                .old = old,
+                .new = entry.value_ptr.value,
+            });
+        }
+        for (self.overlay.new_codes[0..self.overlay.new_codes_len]) |hash| {
+            try changeset.add_code(self.state.code_by_hash(hash) orelse return error.UnknownCode);
+        }
+        changeset.sort();
+    }
+
+    fn history_account(self: *Generator, address: *const evm.Address) Error!?history.AccountState {
+        const store = self.history_store.?;
+        return store.account_at(self.history_number, &node.keccak256(address));
+    }
+
+    fn history_slot(self: *Generator, address: *const evm.Address, slot: u256) Error!u256 {
+        const store = self.history_store.?;
+        const address_hash = node.keccak256(address);
+        const account = try store.account_at(self.history_number, &address_hash) orelse return 0;
+        var slot_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &slot_bytes, slot, .big);
+        const slot_hash = node.keccak256(&slot_bytes);
+        const storage_root = account.storage_root;
+        return store.storage_at(self.history_number, &address_hash, storage_root, &slot_hash);
+    }
+
     /// Ancestor headers from the lowest BLOCKHASH number read up to the parent, oldest
     /// first, so a stateless verifier can link every read hash to the parent.
-    fn collect_headers(self: *Generator, target: *const Target) Error![]const []const u8 {
-        const parent = target.number - 1;
+    fn collect_headers(self: *Generator, number: u64, blocks: Blocks) Error![]const []const u8 {
+        const parent = number - 1;
         var lowest = parent;
-        for (self.recorder.keys.block_numbers.slice()) |number| {
+        for (self.recorder.keys.block_numbers.slice()) |read| {
             // The evm only asks the database inside the 256-block window.
-            if (number >= target.number) return error.HeaderUnavailable;
-            lowest = @min(lowest, number);
+            if (read >= number) return error.HeaderUnavailable;
+            lowest = @min(lowest, read);
         }
         const count = parent - lowest + 1;
         if (count > self.headers.len) return error.HeaderUnavailable;
         for (self.headers[0..count], 0..) |*header, offset| {
-            const number = lowest + offset;
-            header.* = target.blocks.header(target.blocks.context, number) orelse
+            header.* = blocks.header(blocks.context, lowest + offset) orelse
                 return error.HeaderUnavailable;
         }
         assert(count >= 1);
@@ -293,10 +427,82 @@ pub const Generator = struct {
         return self.state.block_hash(number) orelse @splat(0);
     }
 
+    const history_vtable: evm.state.Database.VTable = .{
+        .basic = history_basic,
+        .code_by_hash = parent_code_by_hash,
+        .storage = history_storage,
+        .block_hash = parent_block_hash,
+    };
+
+    /// History at `history_number` as an evm `Database` (codes from the state's code store,
+    /// BLOCKHASH from the canonical chain). History errors read as `DatabaseFailure`.
+    fn history_database(self: *Generator) evm.state.Database {
+        return .{ .context = self, .vtable = &history_vtable };
+    }
+
+    fn history_basic(
+        context: *anyopaque,
+        address: evm.Address,
+    ) evm.state.Error!?evm.state.AccountInfo {
+        const self = from(context);
+        const store = self.history_store.?;
+        const address_hash = node.keccak256(&address);
+        const account = store.account_at(self.history_number, &address_hash) catch {
+            return error.DatabaseFailure;
+        } orelse return null;
+        return .{
+            .balance = account.balance,
+            .nonce = account.nonce,
+            .code_hash = account.code_hash,
+            .has_storage = !std.mem.eql(u8, &account.storage_root, &node.empty_root),
+        };
+    }
+
+    fn history_storage(context: *anyopaque, address: evm.Address, slot: u256) evm.state.Error!u256 {
+        return from(context).history_slot(&address, slot) catch error.DatabaseFailure;
+    }
+
     /// The witness of canonical block `hash` in a durable database (`DatabaseType`), whose
-    /// state this generator is bound to. Blocks outside retention are `BlockUnavailable`.
-    /// A failed restore fails the database.
+    /// state this generator is bound to: from history when its window holds the block's
+    /// parent (`generate_history`, the state is untouched), else by unwinding the state
+    /// (`database_witness_unwind`).
     pub fn database_witness(
+        self: *Generator,
+        database: anytype,
+        hash: Hash,
+        execute: Execute,
+    ) Error!Hash {
+        assert(self.state == &database.state);
+        if (history_target(database, hash) != null) {
+            return self.database_witness_history(database, hash, execute) catch |err| {
+                if (err != error.HistoryWipeUnsupported) return err;
+                return self.database_witness_unwind(database, hash, execute);
+            };
+        }
+        return self.database_witness_unwind(database, hash, execute);
+    }
+
+    /// The witness of canonical block `hash` from the database's history window only;
+    /// `BlockUnavailable` when history is off or the block's parent is outside the window.
+    pub fn database_witness_history(
+        self: *Generator,
+        database: anytype,
+        hash: Hash,
+        execute: Execute,
+    ) Error!Hash {
+        assert(self.state == &database.state);
+        const number = history_target(database, hash) orelse return error.BlockUnavailable;
+        const store = database.history_reader().?;
+        const head = database.head_info;
+        const blocks = chain_blocks(&database.chain);
+        const root = try self.generate_history(store, number, blocks, execute);
+        assert(head.eql(database.head_info));
+        return root;
+    }
+
+    /// The witness of canonical block `hash` by unwinding the state in memory (`generate`).
+    /// Blocks outside retention are `BlockUnavailable`. A failed restore fails the database.
+    pub fn database_witness_unwind(
         self: *Generator,
         database: anytype,
         hash: Hash,
@@ -359,4 +565,34 @@ fn chain_header(context: *const anyopaque, number: u64) ?[]const u8 {
     const hash = chain.canonical_hash(number) orelse return null;
     const view = chain.block(hash) orelse return null;
     return view.header;
+}
+
+/// Whether `store`'s window holds block `number` and its parent (the parent state).
+pub fn history_covers(store: *const history.Store, number: u64) bool {
+    if (number == 0) return false;
+    const window = store.window() orelse return false;
+    assert(window.oldest <= window.head);
+    return number - 1 >= window.oldest and number <= window.head;
+}
+
+/// The number of canonical block `hash` when the database's history can witness it.
+fn history_target(database: anytype, hash: Hash) ?u64 {
+    if (database.phase != .ready or !database.head_info.present) return null;
+    const store = database.history_reader() orelse return null;
+    const meta = database.chain.meta(hash) orelse return null;
+    const canonical = database.chain.canonical_hash(meta.number) orelse return null;
+    if (!std.mem.eql(u8, &canonical, &hash)) return null;
+    if (meta.number > database.head_info.number) return null;
+    if (!history_covers(store, meta.number)) return null;
+    return meta.number;
+}
+
+fn info_of(account: ?history.AccountState) ?state_module.AccountInfo {
+    const found = account orelse return null;
+    return .{ .nonce = found.nonce, .balance = found.balance, .code_hash = found.code_hash };
+}
+
+fn info_equal(a: ?state_module.AccountInfo, b: ?state_module.AccountInfo) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
 }

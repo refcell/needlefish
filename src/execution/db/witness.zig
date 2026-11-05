@@ -880,7 +880,29 @@ pub const Builder = struct {
         headers: []const []const u8,
         out: *Witness,
     ) (Error || state_module.Error)!Hash {
-        const pre_root = try state.state_root();
+        return self.build_from(self.state_source(state), reads, changeset, headers, out);
+    }
+
+    /// The live pre-state `state` as a node source (uses the builder's proof buffers).
+    pub fn state_source(self: *Builder, state: *State) StateSource {
+        return .{
+            .state = state,
+            .account_proof = self.account_proof,
+            .storage_proof = self.storage_proof,
+        };
+    }
+
+    /// `build` over any pre-state node source (`StateSource`, `HistorySource`): proofs of
+    /// every touched key, hashed siblings along deleted keys, and codes by hash.
+    pub fn build_from(
+        self: *Builder,
+        source: anytype,
+        reads: *const KeySet,
+        changeset: *const Changeset,
+        headers: []const []const u8,
+        out: *Witness,
+    ) !Hash {
+        const pre_root = try source.pre_root();
         out.clear();
         self.touched.clear();
         try self.touched.merge(reads);
@@ -889,8 +911,8 @@ pub const Builder = struct {
             try self.touched.add_slot(change.address, change.slot);
         }
         self.scratch.reset(pre_root);
-        try self.collect_proofs(state);
-        try self.collect_siblings(state, changeset);
+        try self.collect_proofs(source);
+        try self.collect_siblings(source, changeset);
         try replay(&self.scratch, reads, changeset);
         const post_root = self.scratch.state_root();
         const nodes = self.scratch.nodes;
@@ -899,7 +921,7 @@ pub const Builder = struct {
         }
         for (self.touched.codes.slice()) |hash| {
             if (std.mem.eql(u8, &hash, &node.empty_code_hash)) continue;
-            try out.codes.append(state.code_by_hash(hash) orelse return error.UnknownCode);
+            try out.codes.append(source.code_by_hash(hash) orelse return error.UnknownCode);
         }
         for (self.touched.accounts.slice()) |*address| try out.keys.append(address);
         for (self.touched.slots.slice()) |key| {
@@ -908,6 +930,7 @@ pub const Builder = struct {
             try out.keys.append(&slot);
         }
         for (headers) |header| try out.headers.append(header);
+        assert(out.keys.count == self.touched.accounts.len + self.touched.slots.len);
         return post_root;
     }
 
@@ -919,41 +942,136 @@ pub const Builder = struct {
         }
     };
 
-    fn collect_proofs(self: *Builder, state: *State) (Error || state_module.Error)!void {
+    fn collect_proofs(self: *Builder, source: anytype) !void {
         const collector: Collector = .{ .store = self.scratch.nodes };
-        const state_trie = &state.state_trie;
         for (self.touched.accounts.slice()) |*address| {
-            try state_trie.prove_account(node.keccak256(address), self.account_proof);
-            for (0..self.account_proof.count) |index| {
-                try collector.visit(self.account_proof.node_at(@intCast(index)));
-            }
+            try source.visit_account_proof(&node.keccak256(address), collector);
         }
         for (self.touched.slots.slice()) |*key| {
             const address_hash = node.keccak256(&key.address);
-            state_trie.prove_storage(address_hash, slot_hash_of(key.slot), self.storage_proof);
-            for (0..self.storage_proof.count) |index| {
-                try collector.visit(self.storage_proof.node_at(@intCast(index)));
-            }
+            try source.visit_storage_proof(&address_hash, &slot_hash_of(key.slot), collector);
         }
     }
 
-    fn collect_siblings(
-        self: *Builder,
-        state: *State,
-        changeset: *const Changeset,
-    ) (Error || state_module.Error)!void {
+    fn collect_siblings(self: *Builder, source: anytype, changeset: *const Changeset) !void {
         const collector: Collector = .{ .store = self.scratch.nodes };
-        const state_trie = &state.state_trie;
         for (changeset.account_changes()) |*change| {
             if (change.new != null) continue;
-            try state_trie.visit_account_siblings(node.keccak256(&change.address), collector);
+            try source.visit_account_siblings(&node.keccak256(&change.address), collector);
         }
         for (changeset.storage_changes()) |*change| {
             if (change.new != 0) continue;
             const address_hash = node.keccak256(&change.address);
             const slot_hash = slot_hash_of(change.slot);
-            try state_trie.visit_storage_siblings(address_hash, slot_hash, collector);
+            try source.visit_storage_siblings(&address_hash, &slot_hash, collector);
         }
+    }
+};
+
+/// Witness nodes from the live trie of a pre-state `State` (`Builder.state_source`).
+pub const StateSource = struct {
+    state: *State,
+    account_proof: *trie.StateTrie.AccountProof,
+    storage_proof: *trie.StateTrie.StorageProof,
+
+    pub fn pre_root(self: StateSource) state_module.Error!Hash {
+        return self.state.state_root();
+    }
+
+    pub fn visit_account_proof(
+        self: StateSource,
+        address_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.state.state_trie.prove_account(address_hash.*, self.account_proof);
+        assert(self.account_proof.count > 0);
+        for (0..self.account_proof.count) |index| {
+            try visitor.visit(self.account_proof.node_at(@intCast(index)));
+        }
+    }
+
+    pub fn visit_storage_proof(
+        self: StateSource,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        const state_trie = &self.state.state_trie;
+        state_trie.prove_storage(address_hash.*, slot_hash.*, self.storage_proof);
+        for (0..self.storage_proof.count) |index| {
+            try visitor.visit(self.storage_proof.node_at(@intCast(index)));
+        }
+    }
+
+    pub fn visit_account_siblings(
+        self: StateSource,
+        address_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.state.state_trie.visit_account_siblings(address_hash.*, visitor);
+    }
+
+    pub fn visit_storage_siblings(
+        self: StateSource,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.state.state_trie.visit_storage_siblings(address_hash.*, slot_hash.*, visitor);
+    }
+
+    pub fn code_by_hash(self: StateSource, hash: Hash) ?[]const u8 {
+        return self.state.code_by_hash(hash);
+    }
+};
+
+/// Witness nodes of block `number`'s state from the history store (no live trie is
+/// touched). Codes come from `codes` (a `State`'s code store, which never deletes).
+pub const HistorySource = struct {
+    store: *const history.Store,
+    number: u64,
+    codes: *const State,
+
+    pub fn pre_root(self: HistorySource) history.Error!Hash {
+        return self.store.state_root_at(self.number);
+    }
+
+    pub fn visit_account_proof(
+        self: HistorySource,
+        address_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_account_proof(self.number, address_hash, visitor);
+    }
+
+    pub fn visit_storage_proof(
+        self: HistorySource,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_storage_proof(self.number, address_hash, slot_hash, visitor);
+    }
+
+    pub fn visit_account_siblings(
+        self: HistorySource,
+        address_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_account_siblings(self.number, address_hash, visitor);
+    }
+
+    pub fn visit_storage_siblings(
+        self: HistorySource,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        visitor: anytype,
+    ) !void {
+        try self.store.visit_storage_siblings(self.number, address_hash, slot_hash, visitor);
+    }
+
+    pub fn code_by_hash(self: HistorySource, hash: Hash) ?[]const u8 {
+        return self.codes.code_by_hash(hash);
     }
 };
 
