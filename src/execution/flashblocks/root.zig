@@ -1,0 +1,24 @@
+//! `execution/flashblocks`: the flashblocks consumer. Mirrors base/base
+//! `crates/execution/flashblocks` and the subscription part of `flashblocks-node`:
+//! a WebSocket `Subscriber` feeds decoded flashblocks to the `Processor`, which validates
+//! their order, assembles `PendingBlocks`, parks early arrivals in the `Cache`, and drives
+//! a pending `state` builder.
+
+const std = @import("std");
+
+pub const validation = @import("validation.zig");
+pub const pending = @import("pending.zig");
+pub const cache = @import("cache.zig");
+pub const state = @import("state.zig");
+pub const processor = @import("processor.zig");
+pub const subscriber = @import("subscriber.zig");
+
+pub const PendingBlocks = pending.PendingBlocks;
+pub const Cache = cache.Cache;
+pub const Processor = processor.Processor;
+pub const Subscriber = subscriber.Subscriber;
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("consumer_test.zig");
+}

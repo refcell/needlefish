@@ -46,10 +46,14 @@ can drive the builder and the flashblocks consumer.
   (port `crates/builder/metering`, `execution_metering_mode.rs`).
 - [x] `builder/multiplex`: router between the canonical EL and the builder for Engine
   API calls (port `crates/builder/multiplex`).
-- [ ] `execution/flashblocks` consumer: WebSocket subscription to a flashblocks feed
+- [x] `execution/flashblocks` consumer: WebSocket subscription to a flashblocks feed
   with reconnect/backoff, ordering/validation (index, parent hash, payload id), pending
   block assembly and state builder, bounded cache keyed by block (port `processor.rs`,
   `validation.rs`, `pending_blocks.rs`, `state_builder.rs`, `cache.rs`).
+- [ ] `execution/flashblocks` executor-backed state builder: implement the `state.zig`
+  interface over the node lane's executor (re-execute pending txs on the canonical state;
+  receipts, balances, nonces, `eth_call` overrides; port `state_builder.rs`,
+  `receipt_builder.rs`) and feed `Processor.on_canonical` from the node's canonical chain.
 - [ ] `execution/flashblocks` RPC: pending-tag overrides for `eth_getBlockByNumber`,
   `eth_getTransactionReceipt`, `eth_getBalance`, `eth_call`, `eth_getTransactionCount`,
   plus the `eth_subscribe` flashblocks pubsub (port `rpc/*`).
@@ -100,6 +104,23 @@ can drive the builder and the flashblocks consumer.
   (`mark_invalid`). Accepted transactions are copied into a generator-owned buffer so pool
   eviction cannot dangle them.
 
+- `execution/flashblocks` consumer: the pending view stores what flashblocks carry (txs,
+  hashes, withdrawals, latest delta roots/gas/hash, base) in a fixed ring of `blocks_max`
+  block slots; a new block with every slot used evicts the earliest (base/base grows until
+  a canonical block trims it). Capacity errors leave the view unchanged (base/base logs and
+  keeps the previous snapshot). Execution sits behind the `state.zig` interface (`Noop` for
+  now); reorg/depth rebuilds reset it and re-execute the retained blocks.
+- The processor's canonical chain is what `on_canonical` reports; with none seen every
+  parent counts as known. Added beyond base/base: a payload id change mid-block clears the
+  pending blocks like a gap; a next block whose parent hash differs from the latest delta
+  hash restarts the pending blocks from it (reorg).
+- The cache stores re-encoded JSON in a fixed arena (`entries_max`, `bytes_max`); a full
+  cache refuses inserts like an uncacheable block.
+- The subscriber resumes with `?block_number=N&flashblock_index=I` of the last decoded
+  flashblock (base/base reconnects to the plain URL), waits one backoff delay after every
+  close (base/base reconnects at once after an upstream close), and detects stalls with a
+  ws ping per interval (`ws.Client.ping`/`pongs_received`, added to `utilities/ws`).
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -113,3 +134,6 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: builder/core flashblock generator (index 0 + cumulative-budget deltas with
   per-delta roots and block hash; final block equals a `Chain` build), seeded + fuzz tests.
 - 2026-11-05: `builder/metering` store (LRU/TTL, late arrivals) and execution metering mode.
+- 2026-11-05: `execution/flashblocks` consumer: validation, pending blocks, cache, processor,
+  state builder interface, resuming ws subscriber with backoff and keepalive; SimIo DST
+  against `builder/publish` (resets, partitions, floods) checks exactly-once assembly.
