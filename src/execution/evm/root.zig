@@ -23,6 +23,7 @@ pub const state_test = @import("state_test.zig");
 test {
     _ = @import("evm_test.zig");
     _ = @import("op_test.zig");
+    _ = @import("evm_fuzz.zig");
 }
 
 pub const Fork = fork.Fork;

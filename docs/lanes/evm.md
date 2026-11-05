@@ -33,7 +33,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `crypto.modexp.precompile_modexp_run_with_scratch(parsed, out, scratch)` with
   `scratch_limbs_needed(modulus_len)` limbs from an arena sized at startup by the block gas
   limit. The comment "wider than 8192 bits cost far more gas than any block holds" is wrong.
-- [ ] Differential fuzzing harness (random bytecode, seeded) + `std.testing.fuzz` targets.
+- [x] Differential fuzzing harness (random bytecode, seeded) + `std.testing.fuzz` targets.
+  `evm_fuzz.zig`: random programs as transactions on every fork; oracles are interpreter
+  asserts, determinism, gas bounds, no ether creation, and revert atomicity. 300k-iteration
+  ReleaseSafe soak clean. The GeneralStateTests are the differential check against the
+  reference clients (zero dependencies rules out linking another EVM).
 - [ ] Performance: benchmark snailtracer/erc20 style workloads; aim beyond revm.
 
 ## Decisions
@@ -65,6 +69,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: interpreter fuzz harness (`evm_fuzz.zig`), 300k-iteration soak clean.
 - 2026-11-05: RIP-7212 P256VERIFY under OP Fjord; Canyon/Everest irregular transitions.
 - 2026-11-05: OP Stack handler: deposits (mint, halted deposit -> revert all but mint and
   nonce, full gas), L1/operator fees in the balance check, vault routing (base fee credited to
