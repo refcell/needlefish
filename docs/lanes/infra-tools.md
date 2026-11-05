@@ -19,10 +19,10 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   timeout, receipt confirmation depth, bounded pending set (port
   `utilities/tx-manager`). Sim tests with a fake L1 that drops/reorders txs; fuzz the
   fee-bump state machine. Coordinate with batcher-devnet: it may switch to this later.
-- [ ] `infra/tx_manager` driver: JSON-RPC driver over the sans-IO core (fee suggestion via
-  `eth_maxPriorityFeePerGas`/latest base fee/`eth_blobBaseFee`, sign EIP-1559 txs with
-  `common/signer`, `eth_sendRawTransaction`, receipt + canonical-block check), gas
-  estimation, and a devnet test that sends transfers from a test-junk account.
+- [x] `infra/tx_manager` driver: JSON-RPC driver over the sans-IO core (fee suggestion,
+  local EIP-1559 signing, `eth_sendRawTransaction`, receipt + canonical-block check, gas
+  estimation). The devnet exercise is part of `load-test` below.
+- [ ] `infra/tx_manager` blob driver: EIP-4844 sends with sidecars (reuse `batcher/blobs`).
 - [ ] `infra/websocket_proxy`: fan out an upstream flashblocks websocket to many
   subscribers with per-IP/API-key rate limits, auth by key, method/filter support,
   bounded per-client send queues that drop slow clients (port `websocket-proxy/src/*`).
@@ -60,9 +60,13 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   general-purpose one; batcher-devnet may migrate later.
 - Per-send published versions are a bounded ring (`hashes_max`); the oldest is forgotten
   only on a bump, which happens only while nothing is mined, so no mined version is lost.
+- The driver reuses `batcher/rpc` (injected-transport JSON-RPC client) and `batcher/txdata`
+  signing instead of duplicating them; binaries plug in `bin/base/http_transport.zig`.
 - Deviation from base/base: "nonce too low" before any publish also resets the nonce cache
   so the next send refetches the chain nonce instead of failing the same way.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
   sans-IO manager) with unit tests, seeded + std.testing fuzz, and a faulty-L1 sim.
+- 2026-11-05: tx_manager JSON-RPC driver (sign, publish, canonical receipts, gas estimate)
+  with fake-L1 tests for ordering, drop + bump, reorged receipts, and rejections.

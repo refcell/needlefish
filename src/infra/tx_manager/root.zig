@@ -13,8 +13,10 @@ pub const errors = @import("errors.zig");
 pub const nonce = @import("nonce.zig");
 pub const send_state = @import("send_state.zig");
 pub const manager = @import("manager.zig");
+pub const driver = @import("driver.zig");
 
 pub const Manager = manager.Manager;
+pub const Driver = driver.Driver;
 pub const Config = manager.Config;
 pub const Action = manager.Action;
 pub const Completion = manager.Completion;
@@ -24,4 +26,5 @@ pub const classify = errors.classify;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("sim_test.zig");
+    _ = @import("driver_test.zig");
 }
