@@ -75,9 +75,20 @@ fallback but hot paths should be our own, optimized implementations.
   ~4 ns/gas, well under ecrecover's ~9.5 ns/gas, so it is not a gas-DoS bottleneck.
 - [x] BLS pairing perf: closed by the same analysis (pairing-2 588us / 102,900 gas =
   ~5.7 ns/gas).
-- [x] x86_64 test coverage from the arm64 host: `zig build test -Dtarget=x86_64-macos
-  -Dcpu=x86_64_v3 -frosetta -Dtest-filter=crypto` runs the suite under Rosetta (scalar
-  sha256, AVX2 keccak lanes, x86 `ct.barrier`). 255 pass, 3 heavy KZG tests skipped in Debug.
+- [x] x86_64 test coverage from the arm64 host. Baseline / v2 under Rosetta:
+  `zig build test -Dtarget=x86_64-macos -frosetta -Dtest-filter=crypto` (all pass). For
+  x86_64_v3 (AVX2) use qemu, not Rosetta: cross-build with `zig test -OReleaseSafe -target
+  x86_64-linux-musl -mcpu x86_64_v3 --dep build_options -Mroot=src/base.zig
+  -Mbuild_options=<cached options.zig> --test-filter <f> --test-no-exec -femit-bin=<bin>`
+  and run `qemu-x86_64 -cpu max <bin>` in an arm64 alpine container (`apk add qemu-x86_64`).
+- [x] x86_64_v3 cells "miscompile": FK20 proofs for 4 of 7 c-kzg blobs came out wrong only
+  under Rosetta with optimized v3 builds (Debug v3, baseline, v2, v2+avx+bmi2+adx correct;
+  ReleaseSafe and ReleaseFast gave different wrong points). Stage hashing showed every
+  FK20 stage matches when run step by step. The same x86_64_v3 ReleaseSafe/ReleaseFast
+  code run under qemu `-cpu max` passes all 124 kzg tests including the EIP-7594 vectors,
+  and arm64 passes natively. Verdict: Rosetta 2 AVX emulation bug, not a needlefish or LLVM
+  defect; no code change. The c-kzg EIP-7594 vectors are the regression test (run them under
+  qemu for x86_64_v3).
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -117,6 +128,8 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 (13.0). All stay within ~1.5x of ecrecover, so none is a block-time outlier.
 
 ## Decisions
+
+- x86_64_v3 results under Rosetta are not trusted (wrong FK20 output reproduced only there); verify AVX2 builds with qemu-x86_64 -cpu max.
 
 - Constant-time code must route every secret-derived mask or flag through `ct.barrier` (`ct.mask`, `ct.equal`, `ct.nonzero`); plain `(a & ~m) | (b & m)` is not enough, LLVM re-branches it on x86_64. Check new secret paths by emitting ReleaseFast asm for x86_64-linux and aarch64-linux.
 - Keccak permutation is generic over the lane type (`u64` or `@Vector(n, u64)`); batch width
@@ -363,3 +376,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: bn254 G2 subgroup check [x+1]Q + psi([x]Q) + psi^2([x]Q) = psi^3([2x]Q) (one 63-bit mul instead of 127-bit [6x^2]Q; old test kept as oracle): pairing-2 502 -> ~460us. Split: Miller loop (2 pairs) 247us, final exponentiation 166us (new benches).
 - 2026-11-05: fuzz campaign: p256 precompile 300K runs clean.
 - 2026-11-05: crypto suite passes on x86_64 (baseline and x86_64_v3) under Rosetta.
+- 2026-11-05: x86_64_v3 cells failure traced to Rosetta (qemu -cpu max passes all kzg tests for v3 ReleaseSafe/ReleaseFast); documented the qemu path.
