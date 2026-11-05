@@ -69,6 +69,7 @@ pub const BlockRef = struct { number: u64, hash: Hash };
 pub const SyncStatus = struct {
     current_l1: BlockRef,
     head_l1: BlockRef,
+    finalized_l1: BlockRef,
     safe_l2: BlockRef,
     finalized_l2: BlockRef,
     unsafe_l2: BlockRef,
@@ -91,6 +92,7 @@ pub fn Rollup(comptime EndpointType: type) type {
             return .{
                 .current_l1 = try block_ref(raw, "current_l1"),
                 .head_l1 = try block_ref(raw, "head_l1"),
+                .finalized_l1 = try block_ref(raw, "finalized_l1"),
                 .safe_l2 = try block_ref(raw, "safe_l2"),
                 .finalized_l2 = try block_ref(raw, "finalized_l2"),
                 .unsafe_l2 = try block_ref(raw, "unsafe_l2"),
