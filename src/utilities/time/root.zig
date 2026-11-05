@@ -131,9 +131,12 @@ pub fn Ticker(comptime IO: type, comptime Context: type) type {
             ticker.arm();
         }
 
-        /// Stops after the in-flight timeout completes; no further callbacks run.
+        /// Cancels the pending timeout; no further callbacks run. `running` clears once the
+        /// canceled timeout's completion has been delivered.
         pub fn stop(ticker: *Self) void {
+            if (!ticker.running or ticker.stop_requested) return;
             ticker.stop_requested = true;
+            ticker.io.cancel(&ticker.completion);
         }
 
         fn arm(ticker: *Self) void {
