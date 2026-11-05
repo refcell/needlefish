@@ -363,7 +363,8 @@ pub fn Transport(comptime IO: type) type {
             transport.submit_accept();
             const fd = result catch return;
             const link = transport.free_link() orelse return transport.io.close_now(fd);
-            if (!transport.service.reserve_inbound(null)) return transport.io.close_now(fd);
+            const remote = ip_of(transport.io.peer_address(fd));
+            if (!transport.service.reserve_inbound(remote)) return transport.io.close_now(fd);
             transport.stats.accepted += 1;
             transport.assert_descriptor_fresh(fd);
             link.* = .{ .transport = transport, .state = .connecting, .fd = fd };
@@ -468,7 +469,8 @@ pub fn Transport(comptime IO: type) type {
                     const direction: @import("libp2p/connections.zig").Direction =
                         if (link.outbound) .outbound else .inbound;
                     link.peer = peer;
-                    link.slot = transport.service.on_connected(peer, direction, null, now) catch {
+                    const remote = ip_of(transport.io.peer_address(link.fd));
+                    link.slot = transport.service.on_connected(peer, direction, remote, now) catch {
                         // The service already released the pending reservation.
                         return transport.teardown_quiet(link);
                     };
@@ -627,6 +629,15 @@ pub fn Transport(comptime IO: type) type {
             for (transport.links) |*link| count += @intFromBool(link.state == .open);
             return count;
         }
+    };
+}
+
+/// The IP of a socket address (the gater and IP colocation scoring key on it).
+fn ip_of(address: ?io_module.Address) ?ip.Address {
+    const value = address orelse return null;
+    return switch (value.family) {
+        .ip4 => .{ .ip4 = value.bytes[0..4].* },
+        .ip6 => .{ .ip6 = value.bytes },
     };
 }
 

@@ -10,6 +10,7 @@ const service_module = @import("service.zig");
 const transport_module = @import("transport.zig");
 const enr = @import("peers/enr.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
+const peer_id = @import("peers/peer_id.zig");
 const ssz = @import("gossip/ssz_payload.zig");
 const validity = @import("gossip/validity.zig");
 const primitives = @import("../../common/primitives/root.zig");
@@ -234,6 +235,32 @@ test "p2p transport: nodes discover, connect over libp2p, and gossip a block" {
     for (0..cluster.count) |index| {
         if (index == 2) continue;
         try std.testing.expect(cluster.received(index, 7, scratch));
+    }
+}
+
+test "p2p transport: a blocked address cannot connect inbound and is not dialed" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(2);
+    defer cluster.deinit();
+    const boot = cluster.storage[0].service;
+    const blocked = cluster.storage[3].record.ip4().?;
+    try std.testing.expect(boot.gater.block_address(.{ .ip4 = blocked }));
+    cluster.run(8 * ns_per_s);
+    const blocked_peer = peer_id.from_public_key(
+        try secp256k1.public_key(cluster.storage[3].secret),
+    );
+    try std.testing.expect(boot.slot_of(&blocked_peer) == null);
+    const address_reason = @backingInt(service_module.InboundError.blocked_address);
+    const dial_reason = @backingInt(service_module.DialError.blocked_address);
+    const stats = &boot.stats;
+    const refusals = stats.inbound_errors[address_reason] + stats.dial_errors[dial_reason];
+    try std.testing.expect(refusals > 0);
+    // Node 3 still meshes with the others, and the transport reports real peer IPs.
+    try std.testing.expect(cluster.storage[3].transport.open_count() >= 1);
+    for (&boot.connected, 0..) |*connection, slot| {
+        if (!connection.active) continue;
+        try std.testing.expect(boot.gossip.router.peer(@intCast(slot)).address != null);
     }
 }
 

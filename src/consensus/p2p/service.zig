@@ -70,10 +70,33 @@ pub const Command = union(enum) {
     disconnect: Slot,
 };
 
+/// Why a dial did not start or failed (base/base `dial_peer_error` labels).
+pub const DialError = enum(u8) {
+    invalid_enr,
+    already_connected,
+    connection_error,
+    invalid_multiaddr,
+    already_dialing,
+    threshold_reached,
+    blocked_peer,
+    blocked_address,
+    blocked_subnet,
+};
+
+/// Why an inbound connection was refused (base/base `inbound_connection_error` labels).
+pub const InboundError = enum(u8) {
+    blocked_peer,
+    blocked_address,
+    blocked_subnet,
+    invalid_ip_address,
+};
+
 pub const Stats = struct {
     dials: u64 = 0,
     dials_refused: u64 = 0,
     inbound_refused: u64 = 0,
+    dial_errors: [std.meta.fieldNames(DialError).len]u64 = @splat(0),
+    inbound_errors: [std.meta.fieldNames(InboundError).len]u64 = @splat(0),
     banned: u64 = 0,
     invalid_rpcs: u64 = 0,
 };
@@ -253,19 +276,24 @@ pub const Service = struct {
         var processed: u32 = 0;
         while (service.discovery.pop_discovered()) |record| : (processed += 1) {
             assert(processed < 1024);
-            const address = multiaddr.from_enr(record) orelse continue;
+            const address = multiaddr.from_enr(record) orelse {
+                service.count_dial_error(.invalid_enr);
+                continue;
+            };
             service.dial(&address, now_ns);
         }
     }
 
     /// Dials `address` unless the gater, limits, or an existing connection forbid it.
     pub fn dial(service: *Service, address: *const multiaddr.Multiaddr, now_ns: u64) void {
-        const peer = address.peer() orelse return;
-        if (service.slot_of(&peer) != null) return;
-        service.gater.can_connect_outbound(address, now_ns) catch {
+        service.gater.can_connect_outbound(address, now_ns) catch |err| {
             service.stats.dials_refused += 1;
+            service.count_dial_error(dial_error_of(err));
             return;
         };
+        // `can_connect_outbound` rejects addresses without a peer id.
+        const peer = address.peer().?;
+        if (service.slot_of(&peer) != null) return service.count_dial_error(.already_connected);
         const protected = service.gater.protected_peers.contains(peer);
         service.limits.begin_bypass(.outbound, protected) catch {
             service.stats.dials_refused += 1;
@@ -277,14 +305,24 @@ pub const Service = struct {
             service.gater.remove_dial(peer);
             service.limits.abort(.outbound);
             service.stats.dials_refused += 1;
+            service.count_dial_error(.connection_error);
             return;
         }
         service.gater.dialed_address(address, now_ns);
         service.stats.dials += 1;
     }
 
+    fn count_dial_error(service: *Service, reason: DialError) void {
+        service.stats.dial_errors[@backingInt(reason)] += 1;
+    }
+
+    fn count_inbound_error(service: *Service, reason: InboundError) void {
+        service.stats.inbound_errors[@backingInt(reason)] += 1;
+    }
+
     pub fn on_dial_failed(service: *Service, address: *const multiaddr.Multiaddr) void {
         const peer = address.peer() orelse return;
+        service.count_dial_error(.connection_error);
         service.gater.remove_dial(peer);
         service.limits.abort(.outbound);
     }
@@ -296,7 +334,10 @@ pub const Service = struct {
     pub fn reserve_inbound(service: *Service, address: ?ip.Address) bool {
         if (address) |value| {
             for (service.gater.blocked_addresses.slice()) |blocked| {
-                if (std.meta.eql(blocked, value)) return false;
+                if (!std.meta.eql(blocked, value)) continue;
+                service.stats.inbound_refused += 1;
+                service.count_inbound_error(.blocked_address);
+                return false;
             }
         }
         service.limits.begin(.inbound) catch {
@@ -326,8 +367,13 @@ pub const Service = struct {
             if (address) |value| {
                 service.gater.can_connect_inbound(peer, value) catch |err| {
                     service.limits.abort(direction);
+                    service.stats.inbound_refused += 1;
+                    service.count_inbound_error(inbound_error_of(err));
                     return err;
                 };
+            } else {
+                // Allowed (the transport may not know it), but counted like base/base.
+                service.count_inbound_error(.invalid_ip_address);
             }
         }
         const protected = service.gater.protected_peers.contains(peer);
@@ -471,6 +517,30 @@ pub const Service = struct {
         }
     }
 };
+
+fn dial_error_of(err: gater_module.Error) DialError {
+    return switch (err) {
+        error.InvalidMultiaddr, error.InvalidIpAddress => .invalid_multiaddr,
+        error.AlreadyDialing => .already_dialing,
+        error.ThresholdReached => .threshold_reached,
+        error.PeerBlocked => .blocked_peer,
+        error.AddressBlocked => .blocked_address,
+        error.SubnetBlocked => .blocked_subnet,
+    };
+}
+
+fn inbound_error_of(err: gater_module.Error) InboundError {
+    return switch (err) {
+        error.PeerBlocked => .blocked_peer,
+        error.AddressBlocked => .blocked_address,
+        error.SubnetBlocked => .blocked_subnet,
+        error.InvalidMultiaddr,
+        error.InvalidIpAddress,
+        error.AlreadyDialing,
+        error.ThresholdReached,
+        => .invalid_ip_address,
+    };
+}
 
 test {
     _ = @import("service_test.zig");

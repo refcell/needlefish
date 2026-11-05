@@ -41,6 +41,17 @@ const reason_labels = labels: {
     break :labels labels;
 };
 
+const dial_errors = std.meta.fieldNames(service_module.DialError);
+const dial_error_labels = type_labels(dial_errors);
+const inbound_errors = std.meta.fieldNames(service_module.InboundError);
+const inbound_error_labels = type_labels(inbound_errors);
+
+fn type_labels(comptime names: []const [:0]const u8) [names.len][1]metrics.Label {
+    var labels: [names.len][1]metrics.Label = undefined;
+    for (names, &labels) |name, *label| label.* = .{.{ .name = "type", .value = name }};
+    return labels;
+}
+
 /// Transport counters `update` reads (a copy of `Transport(IO).Stats`).
 pub const TransportStats = struct {
     accepted: u64 = 0,
@@ -56,6 +67,8 @@ pub const Metrics = struct {
     discovery_peer_count: Gauge = .{},
     banned_peers: Gauge = .{},
     dial_peer: Gauge = .{},
+    dial_peer_error: [dial_errors.len]Gauge = @splat(.{}),
+    inbound_connection_error: [inbound_errors.len]Gauge = @splat(.{}),
     unsafe_block_published: Gauge = .{},
     block_topic_subscribed: [versions.len]Gauge = @splat(.{}),
     block_topic_peers: [versions.len]Gauge = @splat(.{}),
@@ -68,7 +81,8 @@ pub const Metrics = struct {
     p2p_bytes_received: Counter = .{},
     p2p_bytes_sent: Counter = .{},
 
-    pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len;
+    pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len +
+        dial_errors.len + inbound_errors.len;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -88,6 +102,11 @@ pub const Metrics = struct {
             "Number of peers dialed by the libp2p Swarm",
             &self.dial_peer,
         );
+        try register_typed(registry, "base_node_dial_peer_error", "Number of errors when " ++
+            "dialing peers", &self.dial_peer_error, &dial_error_labels);
+        const inbound_help = "Number of inbound connection rejections by the connection gate";
+        try register_typed(registry, "base_node_inbound_connection_error", inbound_help, &self
+            .inbound_connection_error, &inbound_error_labels);
         try registry.gauge(
             "base_node_unsafe_block_published",
             "Number of NetworkPayloadEnvelope gossipped out through the libp2p Swarm",
@@ -107,6 +126,19 @@ pub const Metrics = struct {
                 .metric = .{ .gauge = gauge },
             });
         }
+        try self.register_validation(registry);
+        try registry.counter("base_node_p2p_bytes_received", "Bytes received on p2p " ++
+            "TCP connections", &self.p2p_bytes_received);
+        try registry.counter(
+            "base_node_p2p_bytes_sent",
+            "Bytes sent on p2p TCP connections",
+            &self.p2p_bytes_sent,
+        );
+        assert(registry.count - count_before == entries_count);
+    }
+
+    fn register_validation(self: *Metrics, registry: anytype) metrics.RegisterError!void {
+        const count_before = registry.count;
         try registry.counter(
             "base_node_block_validation_total",
             "Gossiped blocks validated",
@@ -133,14 +165,7 @@ pub const Metrics = struct {
                 .metric = .{ .counter = counter },
             });
         }
-        try registry.counter("base_node_p2p_bytes_received", "Bytes received on p2p " ++
-            "TCP connections", &self.p2p_bytes_received);
-        try registry.counter(
-            "base_node_p2p_bytes_sent",
-            "Bytes sent on p2p TCP connections",
-            &self.p2p_bytes_sent,
-        );
-        assert(registry.count - count_before == entries_count);
+        assert(registry.count - count_before == 2 + reasons.len + versions.len);
     }
 
     /// Copies the current service and transport state into the registry cells.
@@ -149,6 +174,12 @@ pub const Metrics = struct {
         self.discovery_peer_count.set(service.discovery.table.live_count());
         self.banned_peers.set(@intCast(service.gater.blocked_peers.slice().len));
         self.dial_peer.set(@intCast(service.stats.dials));
+        for (&self.dial_peer_error, service.stats.dial_errors) |*gauge, count| {
+            gauge.set(@intCast(count));
+        }
+        for (&self.inbound_connection_error, service.stats.inbound_errors) |*gauge, count| {
+            gauge.set(@intCast(count));
+        }
         const gossip = service.gossip;
         self.unsafe_block_published.set(@intCast(gossip.stats.published));
         const router = &gossip.router;
@@ -174,6 +205,24 @@ pub const Metrics = struct {
         assert(self.block_validation_total.get() >= self.block_validation_success.get());
     }
 };
+
+fn register_typed(
+    registry: anytype,
+    name: []const u8,
+    help: []const u8,
+    gauges: []Gauge,
+    labels: []const [1]metrics.Label,
+) metrics.RegisterError!void {
+    assert(gauges.len == labels.len and gauges.len > 0);
+    for (gauges, labels) |*gauge, *label| {
+        try registry.register(.{
+            .name = name,
+            .help = help,
+            .labels = label,
+            .metric = .{ .gauge = gauge },
+        });
+    }
+}
 
 fn register_versions(
     registry: anytype,

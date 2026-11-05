@@ -40,8 +40,10 @@ behind a small interface and switch later.
 - [x] metrics parity: `block_validation_failed{reason}` (base/base reasons incl.
   `timestamp_future`/`timestamp_past` and `invalid_base_time_schedule`), `block_version{version}`;
   validation counters count decoded envelopes only (`stats.decode_failed` separate).
-- [ ] metrics parity: `dial_peer_error{type}` and `inbound_connection_error{type}` from the
-  service/gater refusal reasons.
+- [x] metrics parity: `dial_peer_error{type}` and `inbound_connection_error{type}` from the
+  service/gater refusal reasons. Fixed with it: the transport passed a null remote address, so
+  inbound gater address/subnet blocks and IP colocation scoring never applied; it now passes
+  `io.peer_address` for accept and connect.
 - [ ] metrics parity: `peer_scores` and `gossip_peer_connection_duration_seconds` histograms,
   observed on disconnect.
 - [ ] metrics parity: `gossip_event{type}`, `block_topic_retirements_total{version}`,
@@ -293,3 +295,4 @@ behind a small interface and switch later.
 - 2026-11-05: protected peers bypass limits and score bans.
 - 2026-11-05: discv5 runs over io UDP (SimIo + kqueue/io_uring).
 - 2026-11-05: validation failure reasons and block versions as labeled metrics.
+- 2026-11-05: dial/inbound error reasons; transport now passes real peer IPs to the gater.

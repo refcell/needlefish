@@ -289,3 +289,59 @@ test "p2p service: a protected peer connects past the established limit" {
     _ = try service.on_connected(extra, .inbound, null, 0);
     try std.testing.expectEqual(@as(u32, 3), service.connected_count());
 }
+
+fn count_of(service: *const Service, reason: service_module.DialError) u64 {
+    return service.stats.dial_errors[@backingInt(reason)];
+}
+
+test "p2p service: dial and inbound refusals are counted by base/base reason" {
+    var fixture: @import("rpc_test.zig").Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const service = fixture.service;
+    var secret: [32]u8 = @splat(0);
+    secret[31] = 60;
+    const record = try enr.build(secret, .{
+        .ip4 = .{ 10, 9, 0, 1 },
+        .tcp = 9222,
+        .opstack = .{ .chain_id = chain_id },
+    });
+    const address = multiaddr.from_enr(&record).?;
+    const peer = address.peer().?;
+    // Without a peer id the gater cannot key the dial.
+    service.dial(&try multiaddr.parse("/ip4/10.9.0.1/tcp/9222"), 0);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .invalid_multiaddr));
+    // A dial already in flight, then a failed dial.
+    service.dial(&address, 0);
+    try std.testing.expectEqual(@as(u64, 1), service.stats.dials);
+    service.dial(&address, 0);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .already_dialing));
+    service.on_dial_failed(&address);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .connection_error));
+    // Blocked subnet, then blocked peer (checked first).
+    const subnet = try @import("rpc.zig").parse_subnet("10.9.0.0/16");
+    try std.testing.expect(service.gater.block_subnet(subnet));
+    service.dial(&address, 0);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .blocked_subnet));
+    try std.testing.expect(service.gater.block_peer(peer));
+    service.dial(&address, 0);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .blocked_peer));
+    // Already connected: fixture peer 1 (secret 21) is connected.
+    var connected_secret: [32]u8 = @splat(0);
+    connected_secret[31] = 21;
+    const connected_record = try enr.build(connected_secret, .{
+        .ip4 = .{ 10, 8, 0, 1 },
+        .tcp = 9222,
+        .opstack = .{ .chain_id = chain_id },
+    });
+    service.dial(&multiaddr.from_enr(&connected_record).?, 0);
+    try std.testing.expectEqual(@as(u64, 1), count_of(service, .already_connected));
+    // Inbound: a blocked address is refused before the handshake and counted.
+    const blocked: @import("peers/ip.zig").Address = .{ .ip4 = .{ 10, 7, 0, 1 } };
+    try std.testing.expect(service.gater.block_address(blocked));
+    try std.testing.expect(!service.reserve_inbound(blocked));
+    const inbound = service.stats.inbound_errors;
+    const reason = service_module.InboundError.blocked_address;
+    try std.testing.expectEqual(@as(u64, 1), inbound[@backingInt(reason)]);
+    try std.testing.expectEqual(@as(u64, 1), service.stats.inbound_refused);
+}
