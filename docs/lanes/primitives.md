@@ -50,6 +50,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `genesis.feature`: base/base `BaseFeature` registry (82 features) and the full 17-entry
   `genesis.Upgrade` (Bedrock..Zenith, base/base ordinals), `is_feature_enabled`,
   `activation_states`, `Upgrade.from_base`.
+- [ ] `blockrlp` tool over ethereum/tests BlockchainTests: decode every block `rlp` with
+  `consensus.block`, re-encode byte-identical, header hash = `blockHeader.hash`, tx roots.
+- [ ] RLPTests/RandomRLPTests: run through the strict decoder (round trip or reject).
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
