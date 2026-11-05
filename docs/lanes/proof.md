@@ -198,6 +198,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Proposer proof L1 head is the rollup node's `finalized_l1`, rejected (tick retried) when
   below the finalized L2 head's L1 origin (`SyncStatus.finalized_l2_origin`), as base/base
   `select_l1_head`.
+- Proposer native prover (`proposer/native_prover.zig`): an in-process `Prover` that runs
+  `host.native.run` per request and returns the recorded witness archive as `initData`
+  with the sampled intermediate roots; it stands in for base/base's TEE/ZK prover service
+  so `base proposer` runs end to end. Requests are proven synchronously in `request` (a
+  tick blocks for the proof); at most 8 sessions.
 - Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
   batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
   estimation, no revert data), while a game creation needs the bond as value and the
@@ -229,6 +234,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: proposer native prover (witness archive as initData), e2e replayed.
 - 2026-11-05: proposer checks the proof L1 head against the finalized L2 origin.
 - 2026-11-05: proposer config (flags + validation) and dry-run submitter.
 - 2026-11-05: `proof/proposer-txmgr`: proposer tx submitter with revert classification.

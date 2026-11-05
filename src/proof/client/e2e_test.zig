@@ -1180,3 +1180,64 @@ test "e2e: seeded random scenarios prove against the node" {
     const seeds: u64 = 12;
     for (1..seeds + 1) |seed| try prove_random(seed);
 }
+
+test "e2e: the proposer's native prover proves a request and its archive replays" {
+    const proposer = @import("../proposer/root.zig");
+    const self = try Fixture.create(.{ .blocks = 4, .interval = 2 });
+    defer self.destroy();
+    try self.put_boot(true);
+    kzg.blob.fill_roots_brp(&kzg_storage.roots_brp);
+    const settings: kzg.blob.Settings = .{
+        .g1_lagrange = &kzg_storage.g1_lagrange,
+        .roots_brp = &kzg_storage.roots_brp,
+    };
+    const options: client.Options = .{
+        .builder = builder_config,
+        .resolver = .{ .bytes_max = 1 << 20, .entries_max = 4096 },
+        .l1 = .{ .items_max = 16, .logs_max = 16, .topics_max = 64, .blob_hashes_max = 16 },
+        .l2 = .{ .items_max = 16 },
+        .blobs = .{ .blobs_max = 2, .verify = false },
+        .kzg_settings = &settings,
+        .kzg_workspace = &kzg_workspace,
+    };
+    var rollup_buffer: [8192]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&rollup_buffer);
+    var writer = json.Writer.init(&out);
+    try protocol.rollup_json.write(&writer, &self.rollup);
+    var native = try proposer.native_prover.NativeProver.init(
+        testing.allocator,
+        self.source.as_source(),
+        .{
+            .rollup_config_json = out.buffered(),
+            .chain_id = chains.devnet.chain_id,
+            .options = options,
+            .roots_brp = &host_roots_brp,
+        },
+    );
+    defer native.deinit();
+    const prover = native.prover_interface();
+    var request: proposer.interfaces.ProofRequest = .{
+        .l1_head = .{ .number = self.l1_count - 1, .hash = self.l1_hashes[self.l1_count - 1] },
+        .agreed_l2_head_hash = self.blocks[0].hash,
+        .agreed_l2_output_root = self.agreed,
+        .agreed_l2_block_number = 0,
+        .claimed_l2_output_root = self.expected,
+        .claimed_l2_block_number = 4,
+        .intermediate_block_interval = 2,
+        .proposer = @splat(0x77),
+    };
+    try prover.request(&request);
+    const status = try prover.poll(request.session());
+    const proof = status.succeeded;
+    try testing.expectEqual(self.expected, proof.output_root);
+    try testing.expectEqual(@as(usize, 2), proof.intermediate_roots.len);
+    try testing.expectEqual(self.expected, proof.intermediate_roots[1]);
+    const verdict = try host.offline.replay(testing.allocator, proof.init_data, options);
+    try testing.expect(verdict.holds);
+    try prover.delete(request.session());
+    try testing.expectError(error.NotFound, prover.poll(request.session()));
+    // A wrong claim fails the session instead of proving it.
+    request.claimed_l2_output_root = @splat(0xcc);
+    try prover.request(&request);
+    try testing.expect(try prover.poll(request.session()) == .failed);
+}
