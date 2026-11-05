@@ -307,12 +307,17 @@ const native_selectors = [_][4]u8{
     activation.selector_set_admin,
     activation.selector_activate,
     activation.selector_deactivate,
+    policy.functions[0].selector,
+    policy.functions[1].selector,
+    policy.functions[5].selector,
+    policy.functions[7].selector,
 };
 
 const native_targets = [_]Address{
     native.tx_context_address,
     native.nonce_manager_address,
     activation.address,
+    policy.address,
 };
 
 fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
@@ -417,4 +422,97 @@ test "op: ActivationRegistry decode errors and admin storage follow the upgrade"
     const current = try native_call(&h, activation.address, &query, 0);
     try testing.expectEqual(@as(u8, 0xef), current.output[31]);
     try testing.expectEqual(@as(u8, 0xbe), current.output[30]);
+}
+
+const policy = @import("native_policy.zig");
+
+fn policy_selector(tag: policy.Tag) [4]u8 {
+    return policy.functions[@backingInt(tag)].selector;
+}
+
+/// selector ++ words ++ (offset-referenced address array when `accounts` is non-null).
+fn policy_input(
+    buffer: []u8,
+    tag: policy.Tag,
+    words: []const u256,
+    accounts: ?[]const Address,
+) []const u8 {
+    buffer[0..4].* = policy_selector(tag);
+    var length: usize = 4;
+    for (words) |word| {
+        std.mem.writeInt(u256, buffer[length..][0..32], word, .big);
+        length += 32;
+    }
+    const list = accounts orelse return buffer[0..length];
+    const head = 32 * (words.len + 1);
+    std.mem.writeInt(u256, buffer[length..][0..32], head, .big);
+    std.mem.writeInt(u256, buffer[length + 32 ..][0..32], list.len, .big);
+    length += 64;
+    for (list) |account| {
+        @memset(buffer[length..][0..12], 0);
+        buffer[length + 12 ..][0..20].* = account;
+        length += 32;
+    }
+    return buffer[0..length];
+}
+
+fn address_int(account: Address) u256 {
+    return std.mem.readInt(u160, &account, .big);
+}
+
+test "op: PolicyRegistry creates allowlists behind the activation gate" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    var buffer: [4 + 32 * 70]u8 = undefined;
+    const create_words = [_]u256{ address_int(sender_address), policy.type_allowlist };
+    const create = policy_input(&buffer, .create_policy, &create_words, null);
+    const gated = try native_call(&h, policy.address, create, 0);
+    const feature = activation.feature_policy_registry;
+    const not_activated = activation_input(activation.error_feature_not_activated, feature);
+    try testing.expectEqualSlices(u8, &not_activated, gated.output);
+
+    const activate = activation_input(activation.selector_activate, feature);
+    const activated = try native_call(&h, activation.address, &activate, 0);
+    try testing.expectEqual(evm_module.Status.success, activated.status);
+    const created = try native_call(&h, policy.address, create, 0);
+    try testing.expectEqual(evm_module.Status.success, created.status);
+    const id: u64 = (1 << 56) | 2;
+    try testing.expectEqual(@as(u256, id), std.mem.readInt(u256, created.output[0..32], .big));
+    try testing.expectEqual(@as(usize, 2), created.logs.len);
+
+    const member = primitives.address_from_int(0xa11ce);
+    const update = policy_input(&buffer, .update_allowlist, &.{ id, 1 }, &.{member});
+    const updated = try native_call(&h, policy.address, update, 0);
+    try testing.expectEqual(evm_module.Status.success, updated.status);
+    const check = policy_input(&buffer, .is_authorized, &.{ id, address_int(member) }, null);
+    try testing.expectEqual(@as(u8, 1), (try native_call(&h, policy.address, check, 0)).output[31]);
+    const other = policy_input(&buffer, .is_authorized, &.{ id, 0xb0b }, null);
+    try testing.expectEqual(@as(u8, 0), (try native_call(&h, policy.address, other, 0)).output[31]);
+    const exists = policy_input(&buffer, .policy_exists, &.{policy.always_block_id}, null);
+    const builtin = try native_call(&h, policy.address, exists, 0);
+    try testing.expectEqual(@as(u8, 1), builtin.output[31]);
+
+    var many: [65]Address = @splat(member);
+    const big = policy_input(&buffer, .update_allowlist, &.{ id, 1 }, &many);
+    const too_large = try native_call_gas(&h, policy.address, big, 0, 1_000_000);
+    try testing.expectEqualSlices(u8, &policy.error_batch_size_too_large, too_large.output[0..4]);
+    try testing.expectEqual(@as(u8, 64), too_large.output[35]);
+}
+
+test "op: PolicyRegistry rejects value and reports Beryl decode failures" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    var buffer: [4 + 64]u8 = undefined;
+    const words = [_]u256{ address_int(sender_address), 2 };
+    const bad_type = policy_input(&buffer, .create_policy, &words, null);
+    const failed = try native_call(&h, policy.address, bad_type, 0);
+    const message = "type check failed for \"(address,uint8)\"";
+    const expected = policy_selector(.create_policy) ++ message.*;
+    try testing.expectEqualSlices(u8, &expected, failed.output);
+    const paid = try native_call(&h, policy.address, bad_type, 1);
+    try testing.expectEqualSlices(u8, &native.selector_non_payable, paid.output);
 }

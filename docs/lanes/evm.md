@@ -17,7 +17,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Native precompile framework (`native.zig`) and Cobalt tx-context 0x8130..aa02 and 2D
   nonce manager 0x8130..aa01 getters.
 - [x] Beryl ActivationRegistry 0x8453..01 (Cobalt value gate and state-backed admin).
-- [ ] Base native precompiles (Beryl+: policy registry, B20 factory, B20 tokens)
+- [x] Beryl PolicyRegistry V1 0x8453..02 (`native_policy.zig`, alloy-compatible decoder in
+  `native_abi.zig`).
+- [ ] PolicyRegistry V2 (Cobalt: composite policies, children arrays with tail cleanup) and
+  V3 (Denim: inverted policy ids); until then the registry is only installed before Cobalt.
+- [ ] Base native precompiles (Beryl+: B20 factory, B20 tokens)
   and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
   0x01-0x11 and P256VERIFY (0x100).
@@ -76,6 +80,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `op.Context.activation_admin` (chain config). `__initialize` keeps existing code.
 
 ## Log
+- 2026-11-05: Beryl PolicyRegistry V1 and the native ABI decoder.
 - 2026-11-05: Beryl ActivationRegistry native precompile.
 - 2026-11-05: native precompile framework; Cobalt TxContext and NonceManager getters.
 - 2026-11-05: pre-Osaka wide-modulus MODEXP via startup-sized scratch (`precompiles.Buffers`).

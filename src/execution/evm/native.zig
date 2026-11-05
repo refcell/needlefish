@@ -21,7 +21,9 @@ const state_module = @import("state.zig");
 const op = @import("op.zig");
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const activation = @import("native_activation.zig");
-const Address = primitives.Address;
+const policy = @import("native_policy.zig");
+const native_abi = @import("native_abi.zig");
+pub const Address = primitives.Address;
 const B256 = primitives.B256;
 const State = state_module.State;
 
@@ -80,11 +82,7 @@ pub const Context = struct {
     }
 
     pub fn sload(context: *Context, slot: u256) Error!u256 {
-        const account = try context.state.load(context.address);
-        const access = try context.state.storage_access(account, slot);
-        const cost: u64 = if (access.is_cold) gas.cold_sload else gas.warm_storage_read;
-        try context.charge(cost);
-        return access.slot.present;
+        return context.sload_at(context.address, slot);
     }
 
     pub fn sstore(context: *Context, slot: u256, value: u256) Error!void {
@@ -119,31 +117,36 @@ pub const Context = struct {
     pub fn revert_decode(
         context: *Context,
         selector: [4]u8,
-        comptime parameters: []const u8,
+        parameters: []const u8,
         failure: DecodeFailure,
     ) error{Revert} {
+        assert(parameters.len <= parameters_length_max);
         if (context.is_cobalt()) return context.revert_selector(selector);
-        return switch (failure) {
-            .overrun => context.revert_message(
-                selector,
+        var buffer: [4 + 160]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.writeAll(&selector) catch unreachable; // 4 bytes fit.
+        // Messages are at most 26 + parameters_length_max or 51 + 64 bytes.
+        switch (failure) {
+            .overrun => writer.writeAll(
                 "ABI decoding failed: buffer overrun while deserializing",
-            ),
-            .type_check => context.revert_message(
-                selector,
-                "type check failed for \"" ++ parameters ++ "\"",
-            ),
-        };
+            ) catch unreachable,
+            .type_check => writer.print("type check failed for \"{s}\"", .{
+                parameters,
+            }) catch unreachable,
+            .offset => |word| writer.print(
+                "type check failed for \"offset (usize)\" with data: {x}",
+                .{&word},
+            ) catch unreachable,
+        }
+        return context.revert(writer.buffered());
     }
 
-    fn revert_message(
-        context: *Context,
-        selector: [4]u8,
-        comptime message: []const u8,
-    ) error{Revert} {
-        var buffer: [4 + message.len]u8 = undefined;
-        buffer[0..4].* = selector;
-        buffer[4..].* = message[0..message.len].*;
-        return context.revert(&buffer);
+    pub fn sload_at(context: *Context, address: Address, slot: u256) Error!u256 {
+        const account = try context.state.load(address);
+        const access = try context.state.storage_access(account, slot);
+        const cost: u64 = if (access.is_cold) gas.cold_sload else gas.warm_storage_read;
+        try context.charge(cost);
+        return access.slot.present;
     }
 
     /// Revert with `selector` followed by one ABI word.
@@ -179,7 +182,9 @@ pub const marker_code = [_]u8{0xef};
 /// G_sha3, the static KECCAK256 cost.
 const keccak256_gas: u64 = 30;
 
-pub const DecodeFailure = enum { overrun, type_check };
+pub const DecodeFailure = union(enum) { overrun, type_check, offset: [32]u8 };
+/// Longest parameter tuple signature in a type-check message.
+pub const parameters_length_max = 96;
 
 /// Returns the output slice (inside `context.out`) on success.
 pub const Native = *const fn (context: *Context, input: []const u8) Error![]const u8;
@@ -196,6 +201,10 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     const active = upgrade orelse return null;
     if (!active.at_least(.beryl)) return null;
     if (std.mem.eql(u8, &address, &activation.address)) return activation.dispatch;
+    // PolicyRegistry V2 (Cobalt) and V3 (Denim) are not implemented yet.
+    if (!active.at_least(.cobalt) and std.mem.eql(u8, &address, &policy.address)) {
+        return policy.dispatch;
+    }
     if (!active.at_least(.cobalt)) return null;
     if (std.mem.eql(u8, &address, &tx_context_address)) return tx_context;
     if (std.mem.eql(u8, &address, &nonce_manager_address)) return nonce_manager;
@@ -206,7 +215,7 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
 pub fn warm_addresses(upgrade: ?op.Upgrade) []const Address {
     const active = upgrade orelse return &.{};
     if (!active.at_least(.beryl)) return &.{};
-    if (!active.at_least(.cobalt)) return &.{activation.address};
+    if (!active.at_least(.cobalt)) return &.{ activation.address, policy.address };
     return &.{ activation.address, nonce_manager_address, tx_context_address };
 }
 
@@ -377,6 +386,8 @@ test "native: selectors match their Solidity signatures" {
 
 test {
     _ = activation;
+    _ = policy;
+    _ = native_abi;
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {
