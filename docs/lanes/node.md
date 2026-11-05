@@ -19,6 +19,10 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   `KzgVerifier.cells` so v1 (EIP-7594) sidecars are verified instead of skipped.
 - [ ] txpool/evm: admit 0x79 using `common.consensus.eip8130_gas.compute` (intrinsic gas,
   `Input.worst_case` for admission/estimation, `max_payer_auth_cost` for block reservation).
+- [ ] executor: run 0x79 envelopes through the evm (note from the evm lane): build
+  `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw, .gas_limit = tx.gas_limit }`
+  (caller is ignored; the evm recovers the sender) and report `Executed.committed_phases` on
+  the receipt. Rejections come back as `Invalid.eip8130_rejected`.
 - [x] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
 - [x] Block executor (L1 + L2/OP): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).

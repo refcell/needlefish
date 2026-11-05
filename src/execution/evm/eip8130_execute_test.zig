@@ -36,6 +36,19 @@ const dev_address = blk: {
     break :blk bytes;
 };
 
+/// Hardhat account 1, the publicly known devnet key.
+const payer_key = blk: {
+    var bytes: [32]u8 = undefined;
+    const text = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+    _ = std.fmt.hexToBytes(&bytes, text) catch unreachable; // Comptime-known valid hex.
+    break :blk bytes;
+};
+const payer_address = blk: {
+    var bytes: Address = undefined;
+    _ = std.fmt.hexToBytes(&bytes, "70997970c51812dc3a010c7d01b50e0d17dc79c8") catch unreachable;
+    break :blk bytes;
+};
+
 /// slot[calldata word 0] += 1.
 const store_code = [_]u8{
     op.PUSH1, 0,        op.CALLDATALOAD, op.DUP1, op.SLOAD, op.PUSH1, 1,
@@ -46,6 +59,7 @@ const revert_code = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.REVERT };
 const Built = struct {
     signed: eip8130.Signed,
     sender_auth: [65]u8,
+    payer_auth: [65]u8,
     envelope_buffer: [1024]u8,
     envelope: []const u8,
     calls_buffer: [512]u8,
@@ -71,6 +85,14 @@ const Built = struct {
         tx.calls = eip8130.Calls.build(&built.calls_buffer, phase_lists[0..phases.len]);
         built.sender_auth = try eip8130.sign_sender(tx, dev_key);
         built.signed = .{ .tx = tx, .sender_auth = &built.sender_auth };
+        built.envelope = built.signed.encode_to(&built.envelope_buffer);
+    }
+
+    /// re-sign with `key` as the open payer (`tx.payer` must be the open marker).
+    fn sponsor(built: *Built, key: [32]u8) !void {
+        const sender = common.Address.init(dev_address);
+        built.payer_auth = try eip8130.sign_payer(built.signed.tx, sender, key);
+        built.signed.payer_auth = &built.payer_auth;
         built.envelope = built.signed.encode_to(&built.envelope_buffer);
     }
 
@@ -141,6 +163,31 @@ test "eip8130 execute: a self-paid EOA transaction runs its phases and pays fees
     try testing.expect(executed.gas_used > 2 * 22_100);
     try testing.expect(executed.gas_used < built.signed.tx.gas_limit);
     try expect_fees_conserved(&h, executed);
+}
+
+test "eip8130 execute: an open payer sponsors the fee" {
+    var h: Harness = undefined;
+    try setup(&h);
+    defer h.deinit(testing.allocator);
+    try h.database.put_account(dev_address, 0, 0, &.{});
+    try h.database.put_account(payer_address, funding, 0, &.{});
+    var built: Built = undefined;
+    const phases = [_][]const Address{&.{store_target}};
+    var sponsored = base_tx();
+    sponsored.payer = eip8130.open_payer;
+    try built.init(sponsored, &phases);
+    // Without a payer signature the sender would have to pay, and cannot.
+    try testing.expectError(error.PayerRecovery, execute.execute(.osaka, &h.evm, &built.env()));
+    try built.sponsor(payer_key);
+    const env = built.env();
+    const executed = (try transaction.transact(&h.evm, .osaka, &env)).executed;
+    try testing.expectEqual(evm_module.Status.success, executed.status);
+    try testing.expectEqual(@as(u256, 1), try h.storage(store_target, 0));
+    try testing.expectEqual(@as(u256, 0), try balance(&h, dev_address));
+    try testing.expectEqual(@as(u64, 1), (try h.state.load(dev_address)).info.nonce);
+    const paid = funding - try balance(&h, payer_address);
+    try testing.expectEqual(@as(u256, executed.gas_used) * 9, paid);
+    try testing.expectEqual(@as(u64, 0), (try h.state.load(payer_address)).info.nonce);
 }
 
 test "eip8130 execute: a reverting phase rolls back alone and is still charged" {
