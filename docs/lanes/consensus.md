@@ -42,7 +42,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] rollup.json codec (protocol) + optimism_rollupConfig
   - [x] admin_* sequencer control (active/start/stop), recover mode, resetDerivationPipeline,
     conductorEnabled, healthz
-  - [ ] admin_postUnsafePayload (payload envelope decode → insert task), base_*
+  - [x] admin_postUnsafePayload: `engine_json.decode_unsafe_envelope` → `Driver.insert_unsafe` (same rules as gossip); RPC body limit raised to 1 MiB
+  - [ ] base_* RPC
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [x] `p2p`: `Node` embeds `p2p.Network(IO)` (`--p2p.*` flags, on by default, `--p2p.disabled`): gossiped blocks go to `Driver.insert_unsafe`, the sequencer publishes each sealed block; devnet verifier follows the sequencer's unsafe head over gossip.
   - [x] unsafe payload buffer: gossiped blocks ahead of the unsafe head wait (64 slots, highest evicted) until their parent is inserted
@@ -174,6 +175,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: admin_postUnsafePayload decodes the posted envelope and queues it like a gossiped block.
 - 2026-11-05: derive: fix reset livelock (DST seed 48): `BatchQueue.next_batch` advances the epoch list again after appending the new origin; regression test in `batch_queue_test.zig`.
 - 2026-11-05: service: `UnsafeBuffer` keeps out-of-order gossiped blocks until their parent is inserted; driver drains it every tick. Devnet verifier unsafe head equals the sequencer's.
 - 2026-11-05: service: unsafe-block gossip wired into `base consensus` (p2p.Network in Node, publish on seal, insert on receive); devnet smoke green with the verifier's unsafe head tracking the sequencer over gossip.

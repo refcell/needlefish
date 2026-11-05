@@ -37,6 +37,7 @@ const enr = @import("../p2p/peers/enr.zig");
 const snappy = @import("../p2p/gossip/snappy.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const gossip_bridge = @import("gossip_bridge.zig");
+const engine_json = @import("../sources/engine_json.zig");
 
 const ProviderError = derive_errors.ProviderError;
 const BlockInfo = protocol.block.BlockInfo;
@@ -93,9 +94,10 @@ pub const Options = struct {
     driver: driver_module.Options = .{},
     rpc_server: http.server.Options = .{
         .connections_max = 16,
-        .recv_buffer_size = 64 * 1024,
+        // Room for an `admin_postUnsafePayload` envelope of up to 1 MiB.
+        .recv_buffer_size = 1024 * 1024 + 16 * 1024,
         .send_buffer_size = 64 * 1024,
-        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 48 * 1024 },
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 * 1024 },
     },
 };
 
@@ -202,6 +204,7 @@ pub fn Node(comptime IO: type) type {
             .recover_mode = admin_recover_mode,
             .set_recover_mode = admin_set_recover_mode,
             .reset_derivation_pipeline = admin_reset_derivation_pipeline,
+            .post_unsafe_payload = admin_post_unsafe_payload,
         };
         const backend_vtable: rollup_rpc.Backend.VTable = .{
             .sync_status = backend_sync_status,
@@ -665,6 +668,25 @@ pub fn Node(comptime IO: type) type {
             node.logger.log(.info, "consensus", "derivation pipeline reset requested", .{});
         }
 
+        fn admin_post_unsafe_payload(
+            context: *anyopaque,
+            envelope_json: []const u8,
+        ) admin_rpc.PostError!void {
+            const node = from_context(context);
+            defer _ = node.gossip_arena.reset(.{ .retain_with_limit = 1 << 20 });
+            const allocator = node.gossip_arena.allocator();
+            const decoded = engine_json.decode_unsafe_envelope(allocator, envelope_json, .{}) catch
+                return error.InvalidPayload;
+            const envelope: gossip_bridge.Envelope = .{
+                .payload = decoded.payload,
+                .parent_beacon_block_root = decoded.parent_beacon_block_root,
+            };
+            if (!node.driver.insert_unsafe(&envelope)) return error.NotAccepted;
+            node.logger.log(.info, "consensus", "unsafe payload posted", .{
+                .number = envelope.payload.block_number,
+            });
+        }
+
         fn backend_safe_db(context: *anyopaque) ?*const safedb.SafeDB {
             return &from_context(context).safe_db;
         }
@@ -734,6 +756,11 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
         \\{"jsonrpc":"2.0","id":3,"method":"admin_sequencerActive"}
     , &admin_out);
     try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "\"result\":false") != null);
+    admin_out = .fixed(&admin_buffer);
+    _ = rollup_rpc.NodeRouter.handle(&node.backend,
+        \\{"jsonrpc":"2.0","id":4,"method":"admin_postUnsafePayload","params":[{"executionPayload":{}}]}
+    , &admin_out);
+    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "invalid execution") != null);
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }

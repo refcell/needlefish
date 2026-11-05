@@ -134,6 +134,41 @@ test "engine json: new payload params and payload envelope round trip" {
     try testing.expectEqual(@as(usize, 0), envelope.execution_requests.?.len);
 }
 
+test "engine json: unsafe payload envelope (admin_postUnsafePayload)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const transactions = [_][]const u8{"\x7e\xaa"};
+    const payload = test_payload(&transactions);
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var writer = json.Writer.init(&out);
+    try writer.begin_object();
+    try writer.key("executionPayload");
+    try engine_json.write_payload(&writer, &payload);
+    try writer.key("parentBeaconBlockRoot");
+    try writer.data(&@as([32]u8, @splat(9)));
+    try writer.end_object();
+    const envelope = try engine_json.decode_unsafe_envelope(allocator, out.buffered(), .{});
+    try testing.expectEqual(payload.block_number, envelope.payload.block_number);
+    try testing.expect(envelope.payload.block_hash.eql(payload.block_hash));
+    try testing.expect(envelope.parent_beacon_block_root.?.eql(.init(@splat(9))));
+    out = .fixed(&buffer);
+    writer = json.Writer.init(&out);
+    try writer.begin_object();
+    try writer.key("executionPayload");
+    try engine_json.write_payload(&writer, &payload);
+    try writer.key("parentBeaconBlockRoot");
+    try writer.raw("null");
+    try writer.end_object();
+    const no_root = try engine_json.decode_unsafe_envelope(allocator, out.buffered(), .{});
+    try testing.expect(no_root.parent_beacon_block_root == null);
+    try testing.expectError(
+        error.MissingField,
+        engine_json.decode_unsafe_envelope(allocator, "{\"parentBeaconBlockRoot\":null}", .{}),
+    );
+}
+
 test "engine json: payload status and forkchoice results" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -278,6 +313,8 @@ fn decode_engine_arbitrary(input: []const u8) void {
     const allocator = fixed.allocator();
     json.validate(input) catch return;
     _ = engine_json.decode_payload_envelope(allocator, input, .{}) catch {};
+    fixed.reset();
+    _ = engine_json.decode_unsafe_envelope(allocator, input, .{}) catch {};
     fixed.reset();
     _ = engine_json.decode_forkchoice_updated(allocator, input, .{}) catch {};
     const genesis: protocol.rollup_config.ChainGenesis = .{};

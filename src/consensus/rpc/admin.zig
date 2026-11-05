@@ -3,8 +3,10 @@
 //! Served by the same router as `optimism_*`; the node exposes them through
 //! `rollup.Backend.admin`. Without it (or on a verifier) the sequencer methods fail.
 //!
-//! Not implemented yet: `admin_postUnsafePayload` (needs the payload envelope decoder on the
-//! request side), `admin_overrideLeader` and conductor methods (no conductor), and
+//! `admin_postUnsafePayload` hands the raw `OpExecutionPayloadEnvelope` JSON to the node,
+//! which decodes it and queues it like a gossiped unsafe block.
+//!
+//! Not implemented: `admin_overrideLeader` and conductor methods (no conductor), and
 //! `admin_refreshUpgradeSignal`.
 
 const std = @import("std");
@@ -21,6 +23,12 @@ const HandlerError = rpc.HandlerError;
 
 pub const StartError = error{ NotSequencer, AlreadyActive, UnsafeHeadMismatch, NotReady };
 pub const StopError = error{ NotSequencer, NotActive };
+pub const PostError = error{
+    /// The envelope is not a valid execution payload envelope.
+    InvalidPayload,
+    /// Stale, sequencing, not running yet, or no room to queue it.
+    NotAccepted,
+};
 
 pub const VTable = struct {
     sequencer_active: *const fn (context: *anyopaque) bool,
@@ -31,6 +39,8 @@ pub const VTable = struct {
     recover_mode: *const fn (context: *anyopaque) bool,
     set_recover_mode: *const fn (context: *anyopaque, mode: bool) void,
     reset_derivation_pipeline: *const fn (context: *anyopaque) void,
+    /// Queues an unsafe payload from its envelope JSON (`admin_postUnsafePayload`).
+    post_unsafe_payload: *const fn (context: *anyopaque, envelope_json: []const u8) PostError!void,
 };
 
 pub const methods = [_]rpc.Method(*const Backend){
@@ -41,6 +51,7 @@ pub const methods = [_]rpc.Method(*const Backend){
     .{ .name = "admin_recoverMode", .handler = recover_mode },
     .{ .name = "admin_setRecoverMode", .handler = set_recover_mode },
     .{ .name = "admin_resetDerivationPipeline", .handler = reset_derivation_pipeline },
+    .{ .name = "admin_postUnsafePayload", .handler = post_unsafe_payload },
     .{ .name = "healthz", .handler = healthz },
 };
 
@@ -112,6 +123,21 @@ fn reset_derivation_pipeline(backend: *const Backend, call: *Call) HandlerError!
     try call.writer.null_value();
 }
 
+fn post_unsafe_payload(backend: *const Backend, call: *Call) HandlerError!void {
+    const envelope_json = try call.params.raw();
+    try call.params.finish();
+    const vtable = try admin(backend, call);
+    assert(envelope_json.len > 0);
+    vtable.post_unsafe_payload(backend.context, envelope_json) catch |err| {
+        const message = switch (err) {
+            error.InvalidPayload => "invalid execution payload envelope",
+            error.NotAccepted => "payload not accepted (stale, sequencing, or not running)",
+        };
+        return call.fail(rpc.code.server_error, message);
+    };
+    try call.writer.null_value();
+}
+
 fn healthz(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
     assert(backend.version.len > 0);
@@ -129,6 +155,7 @@ const StubNode = struct {
     active: bool = true,
     recover: bool = false,
     resets: u32 = 0,
+    posts: u32 = 0,
     head: Hash = .{ .bytes = @splat(0xab) },
     config: protocol.rollup_config.RollupConfig = .{ .block_time = 2 },
 
@@ -139,6 +166,7 @@ const StubNode = struct {
         .recover_mode = recover_of,
         .set_recover_mode = set_recover,
         .reset_derivation_pipeline = reset,
+        .post_unsafe_payload = post,
     };
     const rollup_vtable: Backend.VTable = .{
         .sync_status = status_of,
@@ -172,6 +200,10 @@ const StubNode = struct {
     }
     fn reset(context: *anyopaque) void {
         of(context).resets += 1;
+    }
+    fn post(context: *anyopaque, envelope_json: []const u8) PostError!void {
+        if (envelope_json[0] != '{') return error.InvalidPayload;
+        of(context).posts += 1;
     }
     fn status_of(_: *anyopaque) rollup.SyncStatus {
         return .{};
@@ -233,6 +265,15 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
         \\{"jsonrpc":"2.0","id":5,"method":"admin_resetDerivationPipeline"}
     , &buffer);
     try testing.expectEqual(@as(u32, 1), node.resets);
+    const posted = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":8,"method":"admin_postUnsafePayload","params":[{"executionPayload":{}}]}
+    , &buffer);
+    try testing.expect(contains(posted, "\"result\":null"));
+    try testing.expectEqual(@as(u32, 1), node.posts);
+    const invalid = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":9,"method":"admin_postUnsafePayload","params":["0x00"]}
+    , &buffer);
+    try testing.expect(contains(invalid, "invalid execution payload envelope"));
     const health = call_text(&backend,
         \\{"jsonrpc":"2.0","id":6,"method":"healthz"}
     , &buffer);
@@ -261,16 +302,23 @@ test "admin rpc: fuzz" {
 test "admin rpc: seeded fuzz over method names and params" {
     var prng = @import("../../testing/prng.zig").Prng.init(0xad);
     const names = [_][]const u8{
-        "admin_startSequencer", "admin_stopSequencer",   "admin_setRecoverMode",
-        "admin_recoverMode",    "admin_sequencerActive", "healthz",
+        "admin_startSequencer",    "admin_stopSequencer",   "admin_setRecoverMode",
+        "admin_recoverMode",       "admin_sequencerActive", "healthz",
+        "admin_postUnsafePayload",
     };
-    const params = [_][]const u8{ "", ",\"params\":[]", ",\"params\":[true]", ",\"params\":[1]" };
+    const params = [_][]const u8{
+        "",                ",\"params\":[]",   ",\"params\":[true]",
+        ",\"params\":[1]", ",\"params\":[{}]",
+    };
     var node: StubNode = .{};
     const backend = node.backend();
     for (0..256) |_| {
         var body_buffer: [256]u8 = undefined;
         const body = try std.fmt.bufPrint(&body_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":1," ++
-            "\"method\":\"{s}\"{s}}}", .{ names[prng.below(names.len)], params[prng.below(4)] });
+            "\"method\":\"{s}\"{s}}}", .{
+            names[prng.below(names.len)],
+            params[prng.below(params.len)],
+        });
         var buffer: [1024]u8 = undefined;
         const reply = call_text(&backend, body, &buffer);
         try testing.expect(contains(reply, "\"result\"") or contains(reply, "\"error\""));

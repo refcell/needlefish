@@ -395,6 +395,38 @@ fn decode_withdrawal(raw: []const u8) Error!Withdrawal {
     return withdrawal;
 }
 
+/// `OpExecutionPayloadEnvelope` as posted to `admin_postUnsafePayload`: the payload and,
+/// from Ecotone on, the parent beacon block root. Other fields are ignored.
+pub const UnsafeEnvelope = struct {
+    payload: ExecutionPayload,
+    parent_beacon_block_root: ?B256 = null,
+};
+
+pub fn decode_unsafe_envelope(
+    allocator: Allocator,
+    raw: []const u8,
+    limits: Limits,
+) Error!UnsafeEnvelope {
+    var iterator = try object.ObjectIterator.init(raw);
+    var envelope: UnsafeEnvelope = .{ .payload = undefined };
+    var seen: object.Seen(2) = .{};
+    var count: u32 = 0;
+    while (try iterator.next()) |field| : (count += 1) {
+        assert(count <= raw.len);
+        if (std.mem.eql(u8, field.key, "executionPayload")) {
+            try seen.see(0);
+            envelope.payload = try decode_payload(allocator, field.raw, limits);
+        } else if (std.mem.eql(u8, field.key, "parentBeaconBlockRoot")) {
+            try seen.see(1);
+            if (field.value.tag != .null) {
+                envelope.parent_beacon_block_root = try object.hash(field.value);
+            }
+        }
+    }
+    try seen.require(0b1);
+    return envelope;
+}
+
 /// Decodes a getPayload V2-V5 envelope. V2 sends `executionPayload` and `blockValue`
 /// only; later versions add the beacon root, override flag, and requests. The blobs
 /// bundle is always empty on OP and ignored.
