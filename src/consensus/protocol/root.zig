@@ -14,6 +14,7 @@ pub const deposits = @import("deposits.zig");
 pub const l1_info = @import("l1_info.zig");
 pub const batch = @import("batch.zig");
 pub const batch_reader = @import("batch_reader.zig");
+pub const span_batch = @import("span_batch.zig");
 
 pub const BlockId = block.BlockId;
 pub const BlockInfo = block.BlockInfo;
@@ -29,6 +30,8 @@ pub const DepositTx = deposits.DepositTx;
 pub const L1BlockInfo = l1_info.L1BlockInfo;
 pub const SingleBatch = batch.SingleBatch;
 pub const BatchValidity = batch.Validity;
+pub const SpanBatch = span_batch.SpanBatch;
+pub const RawSpanBatch = span_batch.RawSpanBatch;
 
 test {
     std.testing.refAllDecls(@This());
