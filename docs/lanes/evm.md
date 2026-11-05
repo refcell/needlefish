@@ -98,6 +98,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   compare with revm on the same machine; profile call-frame and keccak paths.
 
 ## Decisions
+- Push loop under load: main takes about one commit a minute while a full `zig build test`
+  takes ~10 minutes on the shared machine, so a retest after every rejected push never wins.
+  The loop runs the full test and tidy once on the rebased tree; after a rejection it
+  rebases again and pushes without retesting only when no incoming commit touches a file
+  our commits change (otherwise it retests). EVM work lives in its own files, so the
+  untested merge carries no semantic overlap.
 - OP Stack: `BlockEnv.op` (rules from `common.l1_fees`) switches on OP semantics; null is plain
   Ethereum. L1Block params are read from state per non-deposit tx (`op.load_params`), so the
   L1 attributes deposit at the top of the block is visible. Deposits always use the Regolith
