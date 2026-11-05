@@ -157,6 +157,13 @@ behind a small interface and switch later.
   is reserved before the handshake (`reserve_inbound`), like libp2p's pending limit.
   Invalid RPC frames disconnect the peer; graylisted frames are dropped silently.
 
+- Transport plan (utilities/io landed, TCP only): `transport.zig` = `fn Transport(comptime
+  IO: type)` owning a listener and fixed connection slots, each running the libp2p
+  `connection.zig` pipeline, feeding `p2p.Service`. DST uses `SimIo`/`SimWorld`
+  (latency, partitions). discv5 needs UDP, which io lacks: datagrams stay behind
+  `Service.on_datagram`/`pop_datagram` until the io lane adds UDP; DST delivers them
+  in-process meanwhile.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
