@@ -1,10 +1,8 @@
 //! ECDSA secp256k1 signatures as used by Ethereum transactions and authorizations.
 //!
-//! Recovery and signing here are a correctness-first fallback built on
-//! `std.crypto.ecc.Secp256k1`. The crypto lane owns the optimized implementation;
-//! callers that need throughput go through `Recoverer` so it can be swapped in.
-//! `sign` is deterministic (RFC 6979, HMAC-SHA256) but NOT constant time: it exists
-//! for tests and the public devnet accounts only.
+//! Recovery and signing delegate to the crypto lane's `secp256k1` (GLV recovery,
+//! constant-time RFC 6979 signing). Hot paths still take a `Recoverer` so a batch or
+//! cached recoverer can be swapped in.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -12,9 +10,7 @@ const primitives = @import("../primitives/root.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 
-const Curve = std.crypto.ecc.Secp256k1;
-const Scalar = Curve.scalar.Scalar;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const secp256k1 = @import("../crypto/secp256k1/root.zig");
 
 /// Order of the secp256k1 group.
 pub const curve_order: u256 =
@@ -74,39 +70,19 @@ pub fn address_from_public_key(public_key: [64]u8) Address {
     return Address.from_slice(digest.bytes[12..32]);
 }
 
-fn hash_scalar(hash: B256) Scalar {
-    var wide: [48]u8 = @splat(0);
-    wide[16..48].* = hash.bytes;
-    return Scalar.fromBytes48(wide, .big);
-}
-
 /// Recovers the uncompressed public key that produced `signature` over `hash`.
 /// Accepts high-s; callers enforce EIP-2 where required.
 pub fn recover_public_key(hash: B256, signature: Signature) ?[64]u8 {
     if (!signature.is_in_range()) return null;
-    const r_bytes = primitives.u256_to_bytes(signature.r);
-    const x = Curve.Fe.fromBytes(r_bytes, .big) catch return null;
-    const y = Curve.recoverY(x, signature.y_parity) catch return null;
-    const point_r = Curve.fromAffineCoordinates(.{ .x = x, .y = y }) catch return null;
-    const r_scalar = Scalar.fromBytes(r_bytes, .big) catch return null;
-    const s_bytes = primitives.u256_to_bytes(signature.s);
-    const s_scalar = Scalar.fromBytes(s_bytes, .big) catch return null;
-    const r_inverse = r_scalar.invert();
-    const scalar_g = hash_scalar(hash).neg().mul(r_inverse);
-    const scalar_r = s_scalar.mul(r_inverse);
-    const point_q = Curve.mulDoubleBasePublic(
-        Curve.basePoint,
-        scalar_g.toBytes(.big),
-        point_r,
-        scalar_r.toBytes(.big),
-        .big,
-    ) catch return null;
-    const sec1 = point_q.toUncompressedSec1();
-    assert(sec1[0] == 0x04);
-    return sec1[1..65].*;
+    return secp256k1.ecrecover(
+        hash.bytes,
+        @intFromBool(signature.y_parity),
+        primitives.u256_to_bytes(signature.r),
+        primitives.u256_to_bytes(signature.s),
+    );
 }
 
-/// Default `Recoverer`: std-based fallback.
+/// Default `Recoverer`.
 pub fn recover_address(hash: B256, signature: Signature) ?Address {
     const public_key = recover_public_key(hash, signature) orelse return null;
     return address_from_public_key(public_key);
@@ -114,67 +90,28 @@ pub fn recover_address(hash: B256, signature: Signature) ?Address {
 
 /// Public key for a private key; null when the key is zero or >= n.
 pub fn public_key_from_private(private_key: [32]u8) ?[64]u8 {
-    const d = primitives.u256_from_bytes(private_key);
-    if (d == 0 or d >= curve_order) return null;
-    const point = Curve.basePoint.mul(private_key, .big) catch return null;
-    return point.toUncompressedSec1()[1..65].*;
+    return secp256k1.public_key(private_key) catch null;
 }
 
 pub fn address_from_private(private_key: [32]u8) ?Address {
     return address_from_public_key(public_key_from_private(private_key) orelse return null);
 }
 
-/// RFC 6979 nonce for secp256k1 / HMAC-SHA256. Bounded: each retry has probability
-/// below 2^-127, so 16 attempts never fail in practice; exhausting them is a bug.
-fn rfc6979_nonce(private_key: [32]u8, hash: B256) [32]u8 {
-    const h1 = hash_scalar(hash).toBytes(.big);
-    var v: [32]u8 = @splat(0x01);
-    var k: [32]u8 = @splat(0x00);
-    inline for (.{ 0x00, 0x01 }) |separator| {
-        var mac = HmacSha256.init(&k);
-        mac.update(&v);
-        mac.update(&.{separator});
-        mac.update(&private_key);
-        mac.update(&h1);
-        mac.final(&k);
-        HmacSha256.create(&v, &v, &k);
-    }
-    for (0..16) |_| {
-        HmacSha256.create(&v, &v, &k);
-        const candidate = primitives.u256_from_bytes(v);
-        if (candidate > 0 and candidate < curve_order) return v;
-        var mac = HmacSha256.init(&k);
-        mac.update(&v);
-        mac.update(&.{0x00});
-        mac.final(&k);
-        HmacSha256.create(&v, &v, &k);
-    }
-    unreachable; // Probability < 2^-2000.
-}
+pub const SignError = error{
+    InvalidPrivateKey,
+    /// R.x >= n (probability ~2^-128): Ethereum's one-bit parity cannot express it.
+    UnrepresentableSignature,
+};
 
-pub const SignError = error{InvalidPrivateKey};
-
-/// Deterministic low-s signature over a 32-byte prehash. Not constant time.
+/// Deterministic (RFC 6979) low-s signature over a 32-byte prehash. Constant time.
 pub fn sign(private_key: [32]u8, hash: B256) SignError!Signature {
-    const d = Scalar.fromBytes(private_key, .big) catch return error.InvalidPrivateKey;
-    if (d.isZero()) return error.InvalidPrivateKey;
-    const k_bytes = rfc6979_nonce(private_key, hash);
-    const point = Curve.basePoint.mul(k_bytes, .big) catch unreachable; // k in [1, n).
-    const affine = point.affineCoordinates();
-    const x_value = primitives.u256_from_bytes(affine.x.toBytes(.big));
-    // x >= n happens with probability ~2^-128; reduce like every implementation does.
-    const r_value = x_value % curve_order;
-    assert(r_value != 0);
-    const r_scalar = Scalar.fromBytes(primitives.u256_to_bytes(r_value), .big) catch unreachable;
-    const k = Scalar.fromBytes(k_bytes, .big) catch unreachable;
-    const s_scalar = k.invert().mul(hash_scalar(hash).add(r_scalar.mul(d)));
-    var s_value = primitives.u256_from_bytes(s_scalar.toBytes(.big));
-    var y_parity = affine.y.isOdd();
-    if (s_value > curve_order_half) {
-        s_value = curve_order - s_value;
-        y_parity = !y_parity;
-    }
-    const signature: Signature = .{ .y_parity = y_parity, .r = r_value, .s = s_value };
+    const raw = try secp256k1.sign(private_key, hash.bytes);
+    if (raw.recovery_id & 2 != 0) return error.UnrepresentableSignature;
+    const signature: Signature = .{
+        .y_parity = raw.recovery_id & 1 == 1,
+        .r = primitives.u256_from_bytes(raw.r),
+        .s = primitives.u256_from_bytes(raw.s),
+    };
     assert(signature.is_in_range() and signature.is_low_s());
     return signature;
 }

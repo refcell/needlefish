@@ -9,7 +9,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `consensus` tx types: legacy (EIP-155), 2930, 1559, 4844 (blob), 7702 (set code), OP deposit (0x7E). Signing hash, tx hash, encode/decode (network + EIP-2718), sender recovery (std fallback behind `Recoverer`).
 - [ ] EIP-4844 pooled/network form with sidecar (blobs, commitments, proofs; EIP-7594 wrapper version), EIP-2718 pooled tx decoding for txpool/RPC.
 - [ ] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
-- [ ] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
+- [x] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
 - [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
 - [x] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
@@ -24,8 +24,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   decoding a transaction never allocates. Decoded values borrow the input buffer.
 - RLP `Encoder` has a sink mode; tx hashes and signing hashes stream into keccak, no scratch.
 - Generic `rlp.codec` reflects over struct fields; depth follows type nesting, not data.
-- Sender recovery and the dev signer (RFC 6979, not constant time) use `std.crypto.ecc.Secp256k1`
-  as a fallback until the crypto lane ships ecrecover; hot paths take a `Recoverer` fn pointer.
+- Sender recovery and signing delegate to `common.crypto.secp256k1` (std fallback removed once
+  it landed); hot paths take a `Recoverer` fn pointer. `sign` returns
+  `UnrepresentableSignature` for recovery id bit 1 (R.x >= n), which Ethereum cannot encode.
 - EIP-1559 base fee and blob gas math live in `execution/chainspec` (node lane landed them
   first); this lane does not duplicate them.
 - Receipts support EIP-658 status only (no pre-Byzantium state root): every chain we run is
@@ -50,3 +51,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: chains (mainnet/sepolia/zeronet/devnet, L1 mainnet/sepolia/holesky/hoodi/devnet).
 - 2026-11-05: flz (FastLZ length, base/base vectors) and l1_fees (Bedrock..Jovian, operator fee).
 - 2026-11-05: genesis (JSON, alloc, state/storage roots, fork-aware header incl. Isthmus).
+- 2026-11-05: signatures now use crypto lane secp256k1 (ecrecover, constant-time sign).
