@@ -38,6 +38,27 @@ comptime {
     assert(circulant_size == cells_per_ext_blob);
 }
 
+/// Window width of the optional fixed-base prover tables (9 measured fastest: 7, 8, 10
+/// were 15-18% slower).
+pub const table_window_bits = 9;
+pub const table_windows = bls.msm.precomputed_window_count(table_window_bits);
+/// Optional prover tables: `tables[row]` holds, for each offset, the shifts
+/// [2^(9 w)] columns[row][offset] for w < 29 (about 25 MiB). With them each of the 128
+/// row MSMs is one bucket pass without doublings (`bls.msm.msm_precomputed`).
+pub const Tables = [circulant_size][field_elements_per_cell * table_windows]G1Affine;
+
+/// Fills `tables` from `columns` (about 2M doublings; once at startup).
+pub fn init_tables(columns: *const Columns, tables: *Tables) void {
+    for (tables, columns) |*table_row, *column_row| {
+        for (column_row, 0..) |point, offset| {
+            const out = table_row[offset * table_windows ..][0..table_windows];
+            bls.msm.precompute_shifts(G1, table_window_bits, point, out);
+        }
+    }
+    assert(tables[0][0].eql(columns[0][0]));
+    assert(tables[0][table_windows].eql(columns[0][1]));
+}
+
 /// Scratch for one proof computation (about 300 KiB).
 pub const Workspace = struct {
     scalars: [circulant_size][field_elements_per_cell]u256,
@@ -93,6 +114,7 @@ fn circulant_coefficients(
 pub fn compute_cell_proofs(
     roots: *const fft.Roots,
     columns: *const Columns,
+    tables: ?*const Tables,
     polynomial: *const [kzg.field_elements_per_blob]Fr,
     workspace: *Workspace,
     out: *[cells_per_ext_blob][kzg.bytes_per_proof]u8,
@@ -107,8 +129,14 @@ pub fn compute_cell_proofs(
             row[offset] = value.mul(inverse_size).to_int();
         }
     }
-    for (&workspace.points, columns, &workspace.scalars) |*point, *row, *scalars| {
-        point.* = bls.msm.msm(G1, row, scalars);
+    if (tables) |table_rows| {
+        for (&workspace.points, table_rows, &workspace.scalars) |*point, *row, *scalars| {
+            point.* = bls.msm.msm_precomputed(G1, table_window_bits, row, scalars);
+        }
+    } else {
+        for (&workspace.points, columns, &workspace.scalars) |*point, *row, *scalars| {
+            point.* = bls.msm.msm(G1, row, scalars);
+        }
     }
     fft.ifft_g1_unscaled(roots, &workspace.points);
     // The polynomial of proofs has degree < 64; its upper half is zero by construction.

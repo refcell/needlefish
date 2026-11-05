@@ -193,6 +193,15 @@ fn run_compute(fields: *Fields) !void {
     try testing.expectEqual(expected_digest, digest_of_cells(&output_cells));
     const expected_proofs = std.mem.asBytes(&stored_proofs[blob_index]);
     try testing.expectEqualSlices(u8, expected_proofs, std.mem.asBytes(&output_proofs));
+    // The fixed-base prover tables must give the same proofs.
+    try cells.compute_cells_and_kzg_proofs(
+        try cells.shared_settings_with_tables(),
+        cells.shared_workspace(),
+        stored_blob(blob_index),
+        &output_cells,
+        &output_proofs,
+    );
+    try testing.expectEqualSlices(u8, expected_proofs, std.mem.asBytes(&output_proofs));
 }
 
 /// Synthetic invalid blobs of blob.zig's vectors: 7 = all 0xff, 8 = zeros with one

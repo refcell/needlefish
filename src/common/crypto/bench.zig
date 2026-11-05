@@ -597,6 +597,11 @@ pub const cases = [_]Case{
         .run = kzg_bench.compute_cells_and_kzg_proofs,
     },
     .{
+        .name = "kzg/compute_cells_and_kzg_proofs (tables)",
+        .iterations = 5,
+        .run = kzg_bench.compute_cells_and_kzg_proofs_tables,
+    },
+    .{
         .name = "kzg/verify_cell_kzg_proof_batch (1)",
         .iterations = 100,
         .run = kzg_bench.verify_cell_kzg_proof_batch_1,

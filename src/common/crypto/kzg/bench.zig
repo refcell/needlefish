@@ -245,6 +245,33 @@ pub fn compute_cells_and_kzg_proofs(iterations: u32) u64 {
     return accumulator;
 }
 
+var prover_tables: @import("fk20.zig").Tables = undefined;
+var prover_settings: ?cells.Settings = null;
+
+/// `compute_cells_and_kzg_proofs` with the fixed-base FK20 tables attached.
+pub fn compute_cells_and_kzg_proofs_tables(iterations: u32) u64 {
+    const context = prepare();
+    const state_cells = prepare_cells();
+    if (prover_settings == null) {
+        var settings = state_cells.settings;
+        settings.attach_prover_tables(&prover_tables);
+        prover_settings = settings;
+    }
+    assert(prover_settings.?.tables != null);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        cells.compute_cells_and_kzg_proofs(
+            &prover_settings.?,
+            &state_cells.workspace,
+            &context.blobs[0],
+            &state_cells.cells,
+            &state_cells.proofs,
+        ) catch unreachable; // Canonical blob.
+        accumulator +%= state_cells.proofs[5][1];
+    }
+    return accumulator;
+}
+
 fn verify_cells(count: u32, iterations: u32) u64 {
     const state_cells = prepare_cells();
     assert(count <= cells.cells_per_ext_blob);

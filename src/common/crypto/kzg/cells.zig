@@ -72,6 +72,8 @@ pub const Settings = struct {
     tau_cell_g2: *const bls.pairing.PreparedG2,
     /// FK20 tables; null for a verifier-only `Settings` (no proof computation).
     columns: ?*const fk20.Columns,
+    /// Optional fixed-base FK20 tables (about 25 MiB): proof computation 202 -> 93 ms.
+    tables: ?*const fk20.Tables = null,
 
     pub const Storage = struct {
         roots: fft.Roots,
@@ -89,6 +91,15 @@ pub const Settings = struct {
         settings.columns = &storage.columns;
         assert(settings.columns != null);
         return settings;
+    }
+
+    /// Precomputes the FK20 prover tables into `tables` and uses them from now on.
+    /// Requires full settings (`init`); proofs are identical with or without tables.
+    pub fn attach_prover_tables(settings: *Settings, tables: *fk20.Tables) void {
+        assert(settings.columns != null);
+        fk20.init_tables(settings.columns.?, tables);
+        settings.tables = tables;
+        assert(settings.tables != null);
     }
 
     /// Settings for `compute_cells`, `verify_cell_kzg_proof_batch`, and `recover_cells`
@@ -186,7 +197,14 @@ pub fn monomial_to_proofs(
 ) void {
     assert(settings.columns != null); // Documented precondition: `Settings.init`.
     const columns = settings.columns.?;
-    fk20.compute_cell_proofs(settings.roots, columns, coefficients, &workspace.fk20, proofs);
+    fk20.compute_cell_proofs(
+        settings.roots,
+        columns,
+        settings.tables,
+        coefficients,
+        &workspace.fk20,
+        proofs,
+    );
 }
 
 /// `compute_cells_and_kzg_proofs`: the cells of the extended blob and their proofs.
@@ -235,6 +253,21 @@ pub fn shared_settings() !*const Settings {
             try Settings.init_verifier(&test_storage);
     }
     return &test_settings.?;
+}
+
+var test_tables: fk20.Tables = undefined;
+var test_settings_with_tables: ?Settings = null;
+
+/// Full settings with the FK20 prover tables attached (heavy tests only).
+pub fn shared_settings_with_tables() !*const Settings {
+    assert(heavy_tests);
+    if (test_settings_with_tables == null) {
+        var settings = (try shared_settings()).*;
+        settings.attach_prover_tables(&test_tables);
+        test_settings_with_tables = settings;
+    }
+    assert(test_settings_with_tables.?.tables != null);
+    return &test_settings_with_tables.?;
 }
 
 pub fn shared_workspace() *Workspace {

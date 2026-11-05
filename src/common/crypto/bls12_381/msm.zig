@@ -197,6 +197,63 @@ fn msm_batch_affine(comptime C: type, points: []const C.Affine, scalars: []const
     return result;
 }
 
+/// Windows of width `bits` that cover a scalar below 2^255 (Booth digits beyond are zero).
+pub fn precomputed_window_count(comptime bits: u32) u32 {
+    comptime assert(bits >= window_bits_min);
+    return (scalar_bits + bits - 1) / bits;
+}
+
+/// Fixed-base MSM over precomputed shifts: `shifted[i * W + w] = [2^(w * bits)] P_i` for
+/// W = `precomputed_window_count(bits)`. Every window then shares one batch-affine bucket
+/// pass and no doublings are needed. Scalars must be below 2^255 (field elements of Fr).
+pub fn msm_precomputed(
+    comptime C: type,
+    comptime bits: u32,
+    shifted: []const C.Affine,
+    scalars: []const u256,
+) C {
+    comptime assert(bits >= window_bits_min and bits <= window_bits_max(C));
+    const windows = precomputed_window_count(bits);
+    assert(shifted.len == scalars.len * windows);
+    if (scalars.len == 0) return C.identity;
+    const bucket_count = @as(usize, 1) << @intCast(bits - 1);
+    var state: BatchAffine(C) = .{};
+    state.reset(bucket_count);
+    for (scalars, 0..) |scalar, index| {
+        assert(scalar >> (scalar_bits - 1) == 0);
+        const row = shifted[index * windows ..][0..windows];
+        for (row, 0..) |point, window| {
+            if (point.infinity) continue;
+            const digit = digit_at(scalar, @intCast(window), bits);
+            if (digit > 0) state.add(@intCast(digit - 1), point);
+            if (digit < 0) state.add(@intCast(-digit - 1), point.neg());
+        }
+    }
+    state.flush();
+    return state.total(bucket_count);
+}
+
+/// Fills `out[w] = [2^(w * bits)] point` for every precomputed window.
+pub fn precompute_shifts(
+    comptime C: type,
+    comptime bits: u32,
+    point: C.Affine,
+    out: *[precomputed_window_count(bits)]C.Affine,
+) void {
+    const F = @TypeOf(point.x);
+    const windows = comptime precomputed_window_count(bits);
+    var jacobian: [windows]C = undefined;
+    var scratch: [windows]F = undefined;
+    var current = point.to_jacobian();
+    for (&jacobian) |*slot| {
+        slot.* = current;
+        for (0..bits) |_| current = current.double();
+    }
+    C.batch_to_affine(&jacobian, out, &scratch);
+    assert(out[0].eql(point));
+    assert(windows * bits >= scalar_bits);
+}
+
 /// One point: use the endomorphism-accelerated multiplication. MSM inputs are in the
 /// order-r subgroup (the precompiles check it), which those methods require.
 fn single_mul(comptime C: type, point: C.Affine, scalar: u256) C {
@@ -286,4 +343,62 @@ test "msm: many points with a wide window" {
     try check_msm(g1.G1, g1.generator, chunk_points_max + 3, 99, std.math.maxInt(u24));
     // Tiny scalars force bucket collisions, equal-x additions and cancellations.
     try check_msm(g1.G1, g1.generator, chunk_points_max + 40, 7, 3);
+}
+
+test "msm: precomputed fixed-base msm matches msm (seeded)" {
+    const C = g1.G1;
+    const bits = 8;
+    const windows = comptime precomputed_window_count(bits);
+    var prng = Prng.init(0x46495845);
+    var points: [70]C.Affine = undefined;
+    var scalars: [70]u256 = undefined;
+    var shifted: [70 * windows]C.Affine = undefined;
+    const base = g1.generator.to_jacobian();
+    for (0..70) |index| {
+        points[index] = if (index % 23 == 7)
+            C.Affine.identity
+        else
+            base.mul(prng.int(u64) | 1).to_affine();
+        scalars[index] = switch (index % 5) {
+            0 => 0,
+            1 => (@as(u256, 1) << 255) - 1,
+            2 => prng.int(u8),
+            else => prng.int(u256) >> 1,
+        };
+        precompute_shifts(C, bits, points[index], shifted[index * windows ..][0..windows]);
+    }
+    for ([_]usize{ 0, 1, 2, 9, 64, 70 }) |count| {
+        const expected = msm(C, points[0..count], scalars[0..count]);
+        const actual = msm_precomputed(C, bits, shifted[0 .. count * windows], scalars[0..count]);
+        try testing.expect(actual.eql(expected));
+    }
+    // Repeated points force side-bucket (equal x) additions.
+    @memset(scalars[0..64], 3);
+    for (1..64) |index| @memcpy(shifted[index * windows ..][0..windows], shifted[0..windows]);
+    const actual = msm_precomputed(C, bits, shifted[0 .. 64 * windows], scalars[0..64]);
+    try testing.expect(actual.eql(points[0].to_jacobian().mul(3 * 64)));
+}
+
+fn fuzz_precomputed(_: void, smith: *testing.Smith) anyerror!void {
+    const C = g1.G1;
+    const bits = 9;
+    const windows = comptime precomputed_window_count(bits);
+    var points: [6]C.Affine = undefined;
+    var scalars: [6]u256 = undefined;
+    var shifted: [6 * windows]C.Affine = undefined;
+    const count: usize = smith.value(u8) % 7;
+    const base = g1.generator.to_jacobian();
+    for (0..count) |index| {
+        const multiplier = smith.value(u16);
+        points[index] = base.mul(multiplier).to_affine(); // 0 gives the identity.
+        scalars[index] = smith.value(u256) >> 1;
+        precompute_shifts(C, bits, points[index], shifted[index * windows ..][0..windows]);
+    }
+    const expected = msm(C, points[0..count], scalars[0..count]);
+    const actual = msm_precomputed(C, bits, shifted[0 .. count * windows], scalars[0..count]);
+    try testing.expect(actual.eql(expected));
+}
+
+test "msm: coverage-guided fuzz of msm_precomputed vs msm" {
+    try testing.fuzz({}, fuzz_precomputed, .{});
 }
