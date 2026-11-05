@@ -15,7 +15,7 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
 - [ ] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
 - [ ] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
-- [ ] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951).
+- [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [ ] Benchmarks for each; target parity with or better than best-known C implementations.
 
 ## Decisions
@@ -69,9 +69,21 @@ fallback but hot paths should be our own, optimized implementations.
   length > u64 saturates (so gas saturates). The evm lane charges gas and applies
   `check_osaka_limits`.
 
+- P256VERIFY follows EIP-7951 (as revm's secp256r1 does): exact 160-byte input, r,s in
+  [1, n-1], qx,qy < p, on curve, (0,0) rejected, R = u1*G + u2*Q must not be the identity,
+  accept when x(R) mod n == r (checked projectively as x == r*Z^2 or (r+n)*Z^2). The hash is
+  used as an integer mod n. Failure is `null` (empty output). Gas (6900 Osaka / 3450
+  RIP-7212) is charged by the EVM lane, not here.
+- P-256 verify is variable time (public inputs): Jacobian a=-3 formulas with explicit
+  special cases (P=Q, P=-Q, identity), one interleaved wNAF pass, w=7 static affine table
+  for G (32 odd multiples) and w=5 runtime table for Q (8 odd multiples).
+- Public vectors: a curated 54-case subset (one per Wycheproof category and outcome) of
+  the go-ethereum `p256Verify.json` precompile vectors in `testdata/p256_verify_vectors.txt`.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
 - 2026-11-05: kzg: embedded public trusted setup, versioned hash, 0x0A input framing + output; pairing check plugs in once BLS12-381 lands.
 - 2026-11-05: sha256 (ARMv8 SHA2 path, 32B: 26ns vs std 33ns; 4KiB: 1455ns vs std 1643ns), ripemd160 (32B: 131ns; 4KiB: 8.6us), blake2f (12 rounds: 87ns, std compression 85ns); official/EIP-152 vectors 0-8, seeded + coverage fuzz.
 - 2026-11-05: modexp (EIP-198/2565/7883/7823) + bigint: public geth vectors (22 incl. even moduli, gas for 3 rule sets), seeded differential fuzz vs std big ints, coverage fuzz; bench (ReleaseFast, M-series): 256-bit full exp 5.6us, 2048-bit e=65537 23.6us, 2048-bit full exp 2.52ms, 4096-bit e=65537 101us, 4096-bit full exp 21.9ms, 8192-bit e=65537 428us, even 2048-bit e=65537 24.4us.
+- 2026-11-05: secp256r1 P256VERIFY (EIP-7951) on montgomery.Field; vectors, differential fuzz vs std ecdsa, coverage fuzz; bench (ReleaseFast: verify 70.9us vs std 107.7us).

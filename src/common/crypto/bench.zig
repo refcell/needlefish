@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 const keccak = @import("keccak.zig");
 const montgomery = @import("montgomery.zig");
 const modexp = @import("modexp.zig");
+const p256 = @import("p256.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const Bn254Fp = montgomery.Field(
@@ -229,6 +230,55 @@ fn bench_blake2b_128_std(iterations: u32) u64 {
     return accumulator;
 }
 
+const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// One valid P-256 signature over a fixed prehashed message, shared by both benches.
+const P256Sample = struct {
+    hash: [32]u8,
+    r: [32]u8,
+    s: [32]u8,
+    qx: [32]u8,
+    qy: [32]u8,
+    public_key: Ecdsa.PublicKey,
+
+    fn make() P256Sample {
+        const key_pair = Ecdsa.KeyPair.generateDeterministic(@splat(0x42)) catch unreachable;
+        const hash: [32]u8 = @splat(0x17);
+        const signature = key_pair.signPrehashed(hash, null) catch unreachable;
+        const sec1 = key_pair.public_key.toUncompressedSec1();
+        return .{
+            .hash = hash,
+            .r = signature.r,
+            .s = signature.s,
+            .qx = sec1[1..33].*,
+            .qy = sec1[33..65].*,
+            .public_key = key_pair.public_key,
+        };
+    }
+};
+
+fn bench_p256_verify(iterations: u32) u64 {
+    const sample = P256Sample.make();
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const valid = p256.verify(sample.hash, sample.r, sample.s, sample.qx, sample.qy);
+        assert(valid);
+        accumulator +%= @intFromBool(valid);
+    }
+    return accumulator;
+}
+
+fn bench_p256_verify_std(iterations: u32) u64 {
+    const sample = P256Sample.make();
+    const signature: Ecdsa.Signature = .{ .r = sample.r, .s = sample.s };
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        signature.verifyPrehashed(sample.hash, sample.public_key) catch unreachable;
+        accumulator +%= 1;
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
@@ -244,6 +294,8 @@ pub const cases = [_]Case{
     .{ .name = "keccak256/32B batch", .iterations = 2_000_000, .run = bench_keccak_32_batch },
     .{ .name = "keccak256/4KiB", .iterations = 50_000, .run = bench_keccak_4k },
     .{ .name = "keccak256/4KiB (std)", .iterations = 50_000, .run = bench_keccak_4k_std },
+    .{ .name = "p256/verify", .iterations = 5_000, .run = bench_p256_verify },
+    .{ .name = "p256/verify (std)", .iterations = 5_000, .run = bench_p256_verify_std },
     .{ .name = "sha256/32B", .iterations = 2_000_000, .run = bench_sha256_32 },
     .{ .name = "sha256/32B (std)", .iterations = 2_000_000, .run = bench_sha256_32_std },
     .{ .name = "sha256/4KiB", .iterations = 100_000, .run = bench_sha256_4k },

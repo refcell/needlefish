@@ -15,6 +15,8 @@ pub const kzg = @import("kzg/root.zig");
 pub const bls12_381 = @import("bls12_381/root.zig");
 pub const bigint = @import("bigint.zig");
 pub const modexp = @import("modexp.zig");
+pub const p256 = @import("p256.zig");
+pub const precompile_p256verify = p256.precompile_p256verify;
 
 test {
     std.testing.refAllDecls(@This());
