@@ -388,6 +388,7 @@ test {
     _ = policy;
     _ = native_abi;
     _ = @import("native_storage.zig");
+    _ = @import("native_b20.zig");
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {
