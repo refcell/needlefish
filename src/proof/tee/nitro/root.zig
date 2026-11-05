@@ -5,6 +5,8 @@
 const std = @import("std");
 
 pub const cbor = @import("cbor.zig");
+pub const errors = @import("errors.zig");
+pub const types = @import("types.zig");
 
 test {
     std.testing.refAllDecls(@This());
