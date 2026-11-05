@@ -126,6 +126,11 @@ const HttpCase = struct {
     /// The message without trailing pipelined junk.
     message_size: u32 = 0,
     limits: http.Limits = .{},
+    /// Chunked framing: where each chunk-size line ends on the wire, and the declared
+    /// body size through that chunk (an over-limit body fails at that line).
+    chunk_line_ends: [http_chunks_max]u32 = undefined,
+    chunk_totals: [http_chunks_max]u32 = undefined,
+    chunk_count: u32 = 0,
 
     fn no_body(case: *const HttpCase) bool {
         if (!case.response) return false;
@@ -332,6 +337,9 @@ fn emit_chunked_body(case: *HttpCase, smith: *Smith) void {
         if (chunk + 1 == http_chunks_max) size = remaining;
         size = @min(size, remaining);
         emit_chunk_size(wire, smith, size);
+        case.chunk_line_ends[chunk] = wire.length;
+        case.chunk_totals[chunk] = offset + size;
+        case.chunk_count = chunk + 1;
         wire.append(case.body[offset..][0..size]);
         wire.append("\r\n");
         offset += size;
@@ -422,10 +430,16 @@ fn http_expected(case: *const HttpCase, received: u32, eof: Eof) Outcome {
         }
         return if (eof == .at_eof) .complete else .incomplete;
     }
-    if (received < case.message_size) return .incomplete;
     if (framed and case.framing == .chunked and too_large) {
-        return .{ .failure = error.BodyTooLarge };
+        // Fails as soon as the size line that crosses the limit has arrived.
+        const count = case.chunk_count;
+        for (case.chunk_line_ends[0..count], case.chunk_totals[0..count]) |end, total| {
+            if (total <= limits.body_size_max) continue;
+            return if (received >= end) .{ .failure = error.BodyTooLarge } else .incomplete;
+        }
+        unreachable; // Proof: the totals reach body_length, which exceeds the limit.
     }
+    if (received < case.message_size) return .incomplete;
     return .complete;
 }
 
@@ -551,6 +565,51 @@ fn fuzz_http_structured(_: void, smith: *Smith) anyerror!void {
     const second = try http_feed(&case, &work_second, &prng);
     try expect(first != .incomplete);
     try expect(std.meta.eql(first, second));
+}
+
+/// A chunked request whose last chunk-size line is malformed must fail as soon as the
+/// offending byte arrives: a bad digit, a ninth digit, or more than 32 pending bytes.
+fn fuzz_http_chunk_line(_: void, smith: *Smith) anyerror!void {
+    var wire: Wire = .{};
+    wire.append("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+    for (0..draw(smith, 3)) |_| wire.append("3\r\nabc\r\n");
+    const line_start = wire.length;
+    const fail_at: u32 = switch (draw(smith, 3)) {
+        0 => bad_digit: {
+            const digits = draw(smith, 8);
+            for (0..digits) |_| wire.append_byte("0123456789abcdefABCDEF"[draw(smith, 22)]);
+            var bad: u8 = smith.value(u8);
+            const hex = if (std.fmt.charToDigit(bad, 16)) |_| true else |_| false;
+            if (hex or bad == ';' or bad == '\r') bad = 'g';
+            wire.append_byte(bad);
+            break :bad_digit wire.length;
+        },
+        1 => long_number: {
+            for (0..9) |_| wire.append_byte('1');
+            break :long_number wire.length;
+        },
+        else => long_line: {
+            wire.append("1;");
+            for (0..40) |_| wire.append_byte('x');
+            break :long_line line_start + 33;
+        },
+    };
+    var buffer: [http_wire_max]u8 = undefined;
+    var received = line_start;
+    while (received <= wire.length) : (received += 1) {
+        @memcpy(buffer[0..received], wire.bytes[0..received]);
+        const parsed = http.parse_request(buffer[0..received], .{});
+        if (received < fail_at) {
+            const result = try parsed;
+            try std.testing.expect(result == .incomplete);
+        } else {
+            try std.testing.expectError(error.InvalidChunk, parsed);
+        }
+    }
+}
+
+test "fuzz_targets_net: malformed chunk-size lines fail as soon as they arrive" {
+    try fuzz.run({}, fuzz_http_chunk_line, .{ .iterations = 512 });
 }
 
 test "fuzz_targets_net: http structured messages parse back in any chunking" {

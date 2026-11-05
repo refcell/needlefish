@@ -26,6 +26,8 @@ provably robust.
 - [x] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
 - [x] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
+- [ ] Fuzz the proof lane's decoders (preimage oracle wire format, hint parsing, MPT node
+  decoding, boot info) as `src/proof` lands: round trips plus arbitrary-input robustness.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
 - [x] Bench harness in `bench_main.zig` (filterable, ns/op, throughput) and perf tracking file `docs/PERF.md`.
@@ -159,3 +161,7 @@ provably robust.
   chunking-invariant, limits), WebSocket frames, flashblocks. Found: `FlashblockId.parse`
   accepts `1_0` and rejects `+61`, unlike base/base `u64::from_str` (reported; skipped).
   Residual: chunked bodies over the limit are rejected only once complete.
+- 2026-11-05: HTTP chunked weak spots closed (small fix in the io-net parser, reported):
+  a malformed or over-long chunk-size line now fails as soon as it arrives, and declared
+  chunk sizes over `body_size_max` fail at the crossing size line instead of after the
+  whole body. Pinned by fuzz properties; both fail on the old parser.

@@ -207,7 +207,7 @@ fn decode_chunked(buffer: []u8, offset: u32, limits: Limits) Error!?Body {
     var chunks: usize = 0;
     while (chunks <= buffer.len) : (chunks += 1) {
         const line_end = std.mem.findPos(u8, buffer, read, "\r\n") orelse {
-            if (buffer.len - read > 32) return error.InvalidChunk;
+            if (!chunk_size_pending_valid(buffer[read..])) return error.InvalidChunk;
             return null;
         };
         const size = parse_chunk_size(buffer[read..line_end]) orelse return error.InvalidChunk;
@@ -232,6 +232,26 @@ fn decode_chunked(buffer: []u8, offset: u32, limits: Limits) Error!?Body {
 
 /// Strict hex chunk size: 1-8 hex digits, optional `;extension` ignored. Rejects signs,
 /// underscores, and whitespace that lenient parsers accept (a request smuggling vector).
+/// Whether an unterminated chunk-size line can still become valid: at most
+/// `chunk_line_pending_max` bytes, and its digits so far are 1-8 hex digits (a trailing CR
+/// may be the first half of the CRLF). Lets a malformed line fail as soon as it arrives.
+fn chunk_size_pending_valid(pending: []const u8) bool {
+    if (pending.len > chunk_line_pending_max) return false;
+    const line = if (pending.len > 0 and pending[pending.len - 1] == '\r')
+        pending[0 .. pending.len - 1]
+    else
+        pending;
+    const end = std.mem.findScalar(u8, line, ';') orelse line.len;
+    if (end > 8) return false;
+    if (end < line.len and end == 0) return false; // An extension without digits.
+    for (line[0..end]) |digit| {
+        _ = std.fmt.charToDigit(digit, 16) catch return false;
+    }
+    return true;
+}
+
+const chunk_line_pending_max = 32;
+
 fn parse_chunk_size(line: []const u8) ?u32 {
     const end = std.mem.findScalar(u8, line, ';') orelse line.len;
     const digits = line[0..end];
@@ -258,7 +278,9 @@ pub fn parse_request(buffer: []u8, limits: Limits) Error!Parsed(Request) {
     for (target) |byte| if (byte <= 0x20 or byte == 0x7f) return error.InvalidRequestLine;
     const version = try parse_version(version_text);
     const kind = try body_kind(&head.headers, limits);
-    if (kind == .chunked and !chunked_complete(buffer, head.body_offset)) return .incomplete;
+    if (kind == .chunked and !chunked_complete(buffer, head.body_offset, limits)) {
+        return .incomplete;
+    }
     const body = try parse_body(buffer, head.body_offset, kind, limits) orelse return .incomplete;
     return .{ .complete = .{
         .message = .{
@@ -276,15 +298,23 @@ pub fn parse_request(buffer: []u8, limits: Limits) Error!Parsed(Request) {
 
 /// Checks, without modifying the buffer, that a chunked body has fully arrived. Decoding in
 /// place before then would corrupt framing needed by the next attempt.
-fn chunked_complete(buffer: []const u8, offset: u32) bool {
+/// Whether the chunked body is complete, or already known to fail: then "complete" lets
+/// the decoder report the error (a malformed size line, or declared sizes over the body
+/// limit) as soon as it arrives instead of after the whole body.
+fn chunked_complete(buffer: []const u8, offset: u32, limits: Limits) bool {
     var read: usize = offset;
+    var total: u64 = 0;
     var chunks: usize = 0;
     while (chunks <= buffer.len) : (chunks += 1) {
-        const line_end = std.mem.findPos(u8, buffer, read, "\r\n") orelse return false;
+        const line_end = std.mem.findPos(u8, buffer, read, "\r\n") orelse {
+            return !chunk_size_pending_valid(buffer[read..]);
+        };
         // Malformed: report complete so the decoder returns the error.
         const size = parse_chunk_size(buffer[read..line_end]) orelse return true;
         read = line_end + 2;
         if (size == 0) return buffer.len - read >= 2;
+        total += size;
+        if (total > limits.body_size_max) return true;
         if (buffer.len - read < @as(usize, size) + 2) return false;
         read += size + 2;
     }
@@ -337,7 +367,9 @@ fn parse_response_framed(
         const end: u32 = @intCast(buffer.len);
         body = .{ .body = buffer[head.body_offset..end], .end = end };
     } else {
-        if (kind == .chunked and !chunked_complete(buffer, head.body_offset)) return .incomplete;
+        if (kind == .chunked and !chunked_complete(buffer, head.body_offset, limits)) {
+            return .incomplete;
+        }
         body = try parse_body(buffer, head.body_offset, kind, limits) orelse return .incomplete;
     }
     return .{ .complete = .{
