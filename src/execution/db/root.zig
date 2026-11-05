@@ -11,6 +11,7 @@ pub const changeset = @import("changeset.zig");
 pub const state = @import("state.zig");
 pub const overlay = @import("overlay.zig");
 pub const chain = @import("chain.zig");
+pub const snapshot = @import("snapshot.zig");
 
 pub const Changeset = changeset.Changeset;
 pub const AccountInfo = changeset.AccountInfo;

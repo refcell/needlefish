@@ -52,4 +52,5 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   Changeset codec, unwind; tested with replica replay and multi-block reorgs.
 - 2026-11-05: ChainStore: block ring, canonical index, tx lookup, reorg plans; reorg test
   moves State purely from stored changesets.
+- 2026-11-05: State snapshots (stream write/load, trie rebuilt and root-checked on load).
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
