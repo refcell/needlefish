@@ -29,6 +29,8 @@ const FakeL1 = struct {
     /// Message of the current rejection.
     rejection: []const u8 = "",
     last_to: [20]u8 = @splat(0),
+    last_create: bool = false,
+    last_estimate_has_to: bool = false,
     last_blob_count: u32 = 0,
     blob_base_fee_wei: u128 = 3,
     /// Receipts report execution failure (status 0x0).
@@ -99,7 +101,10 @@ const FakeL1 = struct {
         if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
             return std.fmt.bufPrint(out, "\"0x{x}\"", .{l1.blob_base_fee_wei});
         }
-        if (std.mem.eql(u8, method, "eth_estimateGas")) return "\"0x5208\"";
+        if (std.mem.eql(u8, method, "eth_estimateGas")) {
+            l1.last_estimate_has_to = std.mem.indexOf(u8, body, "\"to\"") != null;
+            return "\"0x30d40\"";
+        }
         if (std.mem.eql(u8, method, "eth_getBlockByNumber")) {
             const tag = between(body, "\"params\":[\"", "\"").?;
             const number = if (std.mem.eql(u8, tag, "latest"))
@@ -150,7 +155,11 @@ const FakeL1 = struct {
                 .nonce = signed.tx.nonce,
                 .tip_wei = signed.tx.max_priority_fee_per_gas,
                 .fee_cap_wei = signed.tx.max_fee_per_gas,
-                .to = signed.tx.to.call.bytes,
+                .to = switch (signed.tx.to) {
+                    .call => |to| to.bytes,
+                    .create => @splat(0),
+                },
+                .create = signed.tx.to == .create,
             },
             .eip4844 => |signed| PoolView{
                 .nonce = signed.tx.nonce,
@@ -163,6 +172,7 @@ const FakeL1 = struct {
             else => return error.UnexpectedType,
         };
         l1.last_to = tx.to;
+        l1.last_create = tx.create;
         l1.last_blob_count = tx.blob_count;
         if (tx.nonce < l1.account_nonce) {
             l1.rejection = "nonce too low";
@@ -193,6 +203,7 @@ const FakeL1 = struct {
         blob_fee_cap_wei: u128 = 0,
         blob_count: u32 = 0,
         to: [20]u8,
+        create: bool = false,
     };
 
     /// The signed body of a network-form blob transaction (`0x03 || rlp([body, ...])`).
@@ -296,6 +307,21 @@ test "driver: a reverted receipt confirms with success false" {
     try testing.expect(fixture.driver.take_completion() == null);
 }
 
+test "driver: a creation omits the recipient and estimates gas without one" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var now_ms: u64 = 0;
+    const init_code = [_]u8{ 0x60, 0x00, 0x60, 0x00, 0xf3 };
+    _ = try fixture.driver.send(&fixture.client, .{ .to = null, .data = &init_code }, now_ms);
+    try testing.expect(!fixture.l1.last_estimate_has_to);
+    try fixture.run(&now_ms, 4, true);
+    try testing.expect(fixture.l1.last_create);
+    const completion = fixture.driver.take_completion().?;
+    try testing.expect(completion.outcome == .confirmed);
+    try testing.expectEqual(@as(u64, 0), completion.nonce);
+}
+
 test "driver: a dropped transaction is re-published with bumped fees" {
     var fixture: Fixture = .{};
     try fixture.init();
@@ -360,6 +386,10 @@ fn check_blob_send(sidecar_version: u1) !void {
     try blobs_codec.encode("frame-in-a-blob", blob);
     var now_ms: u64 = 0;
     const to: driver_module.Address = .{ .bytes = @splat(0xbb) };
+    try testing.expectError(error.InvalidBlobCandidate, fixture.driver.send(&fixture.client, .{
+        .to = null,
+        .blobs = &.{blob},
+    }, now_ms));
     _ = try fixture.driver.send(&fixture.client, .{ .to = to, .blobs = &.{blob} }, now_ms);
     try fixture.run(&now_ms, 1, false);
     try testing.expectEqual(@as(u32, 1), fixture.l1.last_blob_count);

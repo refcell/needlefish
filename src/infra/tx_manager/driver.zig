@@ -33,7 +33,9 @@ pub const Address = primitives.Address;
 pub const Hash = manager_module.Hash;
 
 pub const Candidate = struct {
-    to: Address,
+    /// Null creates a contract with `data` as init code (the created address is
+    /// `create_address(from, completion.nonce)`).
+    to: ?Address,
     value: u256 = 0,
     data: []const u8 = &.{},
     /// 0 asks the node (`eth_estimateGas`).
@@ -67,7 +69,7 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
 
         const Stored = struct {
             id: u64 = 0,
-            to: Address = .{ .bytes = @splat(0) },
+            to: ?Address = null,
             value: u256 = 0,
             gas_limit: u64 = 0,
             data_length: u32 = 0,
@@ -165,6 +167,7 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
         fn check_blob_candidate(driver: *const Self, candidate: Candidate) Error!void {
             assert(candidate.blobs.len > 0);
             const blobs = driver.blobs orelse return error.BlobsDisabled;
+            if (candidate.to == null) return error.InvalidBlobCandidate;
             if (candidate.blobs.len > blobs.blobs_per_send_max) return error.TooManyBlobs;
             // `blob_tx.sign` builds a plain blob carrier: no calldata, no value.
             if (candidate.data.len != 0 or candidate.value != 0) return error.InvalidBlobCandidate;
@@ -272,7 +275,7 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
                     .nonce = version.nonce,
                     .fees = fees,
                     .blob_fee_wei = version.fees.blob_fee_cap_wei,
-                    .to = stored.to,
+                    .to = stored.to.?, // Blob candidates always have a recipient.
                     .versioned_hashes = blobs.versioned_hashes(slot),
                 }, &hash_buffer, driver.config.private_key);
                 const sidecar = blobs.sidecar(slot);
@@ -336,16 +339,20 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
         }
 
         fn estimate_gas(driver: *Self, client: *rpc.Client, candidate: Candidate) Error!u64 {
+            assert(candidate.blobs.len == 0);
+            var to_buffer: [56]u8 = undefined;
+            // A creation omits `to`.
+            const to_field = if (candidate.to) |to|
+                std.fmt.bufPrint(&to_buffer, "\"to\":\"0x{x}\",", .{&to.bytes}) catch
+                    unreachable // Fixed-size content.
+            else
+                "";
             const params = std.fmt.bufPrint(
                 driver.params_buffer,
-                "[{{\"from\":\"0x{x}\",\"to\":\"0x{x}\",\"value\":\"0x{x}\",\"data\":\"0x{x}\"}}]",
-                .{
-                    &driver.config.from.bytes,
-                    &candidate.to.bytes,
-                    candidate.value,
-                    candidate.data,
-                },
+                "[{{\"from\":\"0x{x}\",{s}\"value\":\"0x{x}\",\"data\":\"0x{x}\"}}]",
+                .{ &driver.config.from.bytes, to_field, candidate.value, candidate.data },
             ) catch unreachable; // params_buffer holds twice the largest payload.
+            assert(params.len > 0);
             return rpc.quantity(u64, try client.call("eth_estimateGas", params));
         }
 

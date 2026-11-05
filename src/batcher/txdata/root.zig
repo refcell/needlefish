@@ -74,7 +74,8 @@ pub const Request = struct {
     nonce: u64,
     fees: Fees,
     gas_limit: u64,
-    to: Address,
+    /// Null creates a contract with `data` as init code.
+    to: ?Address,
     value: u256 = 0,
     data: []const u8 = &.{},
 };
@@ -93,7 +94,7 @@ pub fn sign_eip1559(request: Request, private_key: [32]u8) SignError!consensus.E
                 .max_priority_fee_per_gas = request.fees.max_priority_fee_per_gas,
                 .max_fee_per_gas = request.fees.max_fee_per_gas,
                 .gas_limit = request.gas_limit,
-                .to = .{ .call = request.to },
+                .to = if (request.to) |to| .{ .call = to } else .create,
                 .value = request.value,
                 .input = request.data,
                 .access_list = .empty,
@@ -174,6 +175,26 @@ test "txdata: signed calldata tx round trips and recovers the batcher" {
     const sender = decoded.recover_sender(signature.recover_address).?;
     try testing.expectEqualSlices(u8, &batcher.address.bytes, &sender.bytes);
     try testing.expectEqualSlices(u8, &envelope.hash().bytes, &decoded.hash().bytes);
+}
+
+test "txdata: contract creation has no recipient and round trips" {
+    const deployer = accounts.derive_dev(@backingInt(accounts.Role.deployer));
+    const init_code = [_]u8{ 0x60, 0x00, 0x60, 0x00, 0xf3 }; // RETURN(0, 0)
+    const envelope = try sign_eip1559(.{
+        .chain_id = 901,
+        .nonce = 3,
+        .fees = suggest_fees(1_000_000_000, 1_000_000),
+        .gas_limit = 100_000,
+        .to = null,
+        .data = &init_code,
+    }, deployer.private_key);
+    try testing.expect(envelope.eip1559.tx.to == .create);
+    var buffer: [256]u8 = undefined;
+    const decoded = try consensus.Envelope.decode(encode_raw(envelope, &buffer));
+    try testing.expect(decoded.eip1559.tx.to == .create);
+    try testing.expectEqualSlices(u8, &init_code, decoded.eip1559.tx.input);
+    const sender = decoded.recover_sender(signature.recover_address).?;
+    try testing.expectEqualSlices(u8, &deployer.address.bytes, &sender.bytes);
 }
 
 test {
