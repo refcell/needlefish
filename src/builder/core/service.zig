@@ -266,4 +266,5 @@ pub const Service = struct {
 
 test {
     _ = @import("service_test.zig");
+    _ = @import("cadence_test.zig");
 }

@@ -81,6 +81,12 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   through the `builder/core` service. `just devnet smoke` passed locally on that setup (51
   blocks in 10 s, all checks, BaseTime slot 0 updating), so the DST item below stays for the
   simulator rather than replacing the smoke.
+- 2026-11-05: Engine API -> builder interface: node calls Service.send_new_payload(id, parent,
+  attrs) on FCU+attrs, arms an IO timer at next_deadline_ns -> tick(now_ns), resolve(id) on
+  getPayload (never blocks; Payload borrows builder buffers until next job). Builder reads
+  Chain/StateDb, never commits. nf-node owns the handler wiring. (The first wiring, 210c4843:
+  `Chain.payload_builder` + `builder/core` `NodeBuilder(IO)`, landed before this ownership
+  change; nf-node maintains it from here, the builder lane keeps only `src/builder` helpers.)
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -113,6 +119,10 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   API (`Chain.payload_builder`, IO timers, `--builder.enabled` on `base node`); engine-level
   tests (equals a `Chain` build, early getPayload, expiry) and seeded + fuzz interleavings.
 - 2026-11-05: devnet sequencer EL on `--builder.enabled`; `just devnet smoke` passes at 200 ms.
+- 2026-11-05: `builder/core` cadence DST (`cadence_test.zig`): `Service` driven directly over
+  injected time on a Denim-at-genesis chain; one block per 200 ms slot at the schedule's
+  timestamp, no resolve past the slot end, verifier replays every block to the same hash and
+  state root; seeded + `std.testing.fuzz`. The cluster-simulator item stays open.
 - 2026-11-05: removed flashblocks, step 1: `execution/flashblocks` (consumer, RPC, pubsub),
   `builder/publish`, flashblock fuzz targets, and `BaseFeature.compact_flashblock_metadata`.
 - 2026-11-05: removed flashblocks, step 2: `common/flashblocks`, `builder/multiplex`, and the
