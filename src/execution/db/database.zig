@@ -6,7 +6,9 @@
 //! - `set_head` moves the canonical head: it plans the reorg, unwinds and applies `State` with
 //!   the stored changesets, updates the chain index, and journals a `head` entry.
 //! - `execute_and_commit` turns an executed `Overlay` into a changeset (`build_changeset`, not
-//!   `commit`), inserts the block, moves the head to it, and discards the overlay.
+//!   `commit`), inserts the block, moves the head to it, journals one `block_and_head` entry
+//!   (one journal write and one sync per block), and discards the overlay. Replay applies that
+//!   entry as a block insert followed by a head move, through the same code paths.
 //!
 //! Operations return at once with their entry sequence. Entries wait in a bounded queue and
 //! the engine writes one at a time; `durable_sequence` (and the optional `on_durable`
@@ -49,11 +51,14 @@ pub const Metadata = engine_module.Metadata;
 
 // Journal entries.
 
-pub const EntryKind = enum(u8) { block = 1, head = 2 };
+pub const EntryKind = enum(u8) { block = 1, head = 2, block_and_head = 3 };
 
+/// `block_and_head` has the `block` layout (only the tag differs): insert the block, then
+/// move the head to it.
 pub const Entry = union(EntryKind) {
     block: BlockInput,
     head: Hash,
+    block_and_head: BlockInput,
 };
 
 /// Tag, hash, parent hash, number, timestamp, and five u32 lengths.
@@ -107,11 +112,21 @@ const Reader = struct {
 
 /// Encodes a block entry into `out` (at least `block_entry_size` bytes).
 pub fn encode_block(input: *const BlockInput, out: []u8) []u8 {
+    return encode_block_kind(.block, input, out);
+}
+
+/// Encodes a block-and-head entry (the block layout with its own tag).
+pub fn encode_block_and_head(input: *const BlockInput, out: []u8) []u8 {
+    return encode_block_kind(.block_and_head, input, out);
+}
+
+fn encode_block_kind(kind: EntryKind, input: *const BlockInput, out: []u8) []u8 {
+    assert(kind == .block or kind == .block_and_head);
     const size = block_entry_size(input);
     assert(out.len >= size);
     assert(input.header.len > 0);
     var writer: Writer = .{ .buffer = out };
-    writer.int(u8, @backingInt(EntryKind.block));
+    writer.int(u8, @backingInt(kind));
     writer.bytes(&input.hash);
     writer.bytes(&input.parent_hash);
     writer.int(u64, input.number);
@@ -147,7 +162,8 @@ pub fn decode_entry(body: []const u8) DecodeError!Entry {
         if (reader.position != body.len) return error.InvalidEntry;
         return .{ .head = hash };
     }
-    if (tag != @backingInt(EntryKind.block)) return error.InvalidEntry;
+    const with_head = tag == @backingInt(EntryKind.block_and_head);
+    if (tag != @backingInt(EntryKind.block) and !with_head) return error.InvalidEntry;
     var input: BlockInput = undefined;
     input.hash = try reader.hash();
     input.parent_hash = try reader.hash();
@@ -167,6 +183,7 @@ pub fn decode_entry(body: []const u8) DecodeError!Entry {
     input.changeset = try reader.bytes(changeset_len);
     if (reader.position != body.len) return error.InvalidEntry;
     assert(block_entry_size(&input) == body.len);
+    if (with_head) return .{ .block_and_head = input };
     return .{ .block = input };
 }
 
@@ -248,8 +265,8 @@ pub const OpenError = engine_module.OpenError || error{
 };
 
 pub const Commit = struct {
-    insert_sequence: u64,
-    head_sequence: u64,
+    /// The one entry that inserts the block and moves the head to it.
+    sequence: u64,
     state_root: Hash,
 };
 
@@ -459,6 +476,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             switch (decoded) {
                 .block => |*input| try self.chain_insert(input),
                 .head => |hash| try self.move_head(hash),
+                .block_and_head => |*input| {
+                    try self.chain_insert(input);
+                    try self.move_head(input.hash);
+                },
             }
         }
 
@@ -508,6 +529,15 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (size > self.config.engine.entry_body_size_max) return error.BlockTooLarge;
             try self.check_accepting(1, journal_module.entry_size_bytes(size));
             if (self.chain.meta(input.hash) != null) return self.submitted_sequence;
+            try self.insert_check(input);
+            try self.chain_insert(input);
+            const body = encode_block(input, self.queue_slot());
+            return self.queue_push(@intCast(body.len));
+        }
+
+        /// The checks `insert_block` makes on a new block before changing anything.
+        fn insert_check(self: *Self, input: *const BlockInput) OperationError!void {
+            assert(self.chain.meta(input.hash) == null);
             if (self.chain.block_count() > 0) {
                 // The parent must stay stored: a block whose parent this very insert evicts
                 // could never become canonical.
@@ -516,9 +546,6 @@ pub fn DatabaseType(comptime Storage: type) type {
                 if (parent < try self.evictions_needed(input)) return error.UnknownParent;
             }
             self.changeset.decode(input.changeset) catch return error.InvalidChangeset;
-            try self.chain_insert(input);
-            const body = encode_block(input, self.queue_slot());
-            return self.queue_push(@intCast(body.len));
         }
 
         /// Moves the canonical head (and State) to a stored block and journals it.
@@ -535,7 +562,9 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Commits an executed block: builds its changeset from `overlay` (which must sit on
         /// this database's state at the current head), inserts the block with that changeset
-        /// (`input.changeset` is ignored), moves the head to it, and discards the overlay.
+        /// (`input.changeset` is ignored), moves the head to it, journals both as one
+        /// `block_and_head` entry, and discards the overlay. A block already stored only moves
+        /// the head (one `head` entry), like `insert_block` followed by `set_head`.
         pub fn execute_and_commit(
             self: *Self,
             overlay: *Overlay,
@@ -547,26 +576,54 @@ pub fn DatabaseType(comptime Storage: type) type {
                     return error.ParentNotHead;
                 }
             } else if (self.chain.block_count() > 0) return error.ParentNotHead;
+            const block = try self.build_block(overlay, input);
+            const size = block_entry_size(&block);
+            try self.check_accepting(1, journal_module.entry_size_bytes(size));
+            const sequence = if (self.chain.meta(block.hash) != null)
+                try self.set_head(block.hash)
+            else
+                try self.insert_and_move_head(&block);
+            overlay.discard();
+            assert(std.mem.eql(u8, &self.head_info.hash, &block.hash));
+            assert(sequence == self.submitted_sequence);
+            return .{ .sequence = sequence, .state_root = self.head_info.state_root };
+        }
+
+        /// The block `input` with the changeset built from `overlay` (in `changeset_buffer`).
+        fn build_block(
+            self: *Self,
+            overlay: *Overlay,
+            input: *const BlockInput,
+        ) OperationError!BlockInput {
             try overlay.build_changeset(&self.changeset_built);
             const changeset_size = self.changeset_built.encoded_length();
             if (changeset_size > self.changeset_buffer.len) return error.BlockTooLarge;
             var block = input.*;
             block.changeset = self.changeset_built.encode(self.changeset_buffer);
+            assert(block.changeset.len == changeset_size);
             const size = block_entry_size(&block);
             if (size > self.config.engine.entry_body_size_max) return error.BlockTooLarge;
-            // Check room for both entries first, so a full queue never leaves half a commit.
-            const journal_bytes = journal_module.entry_size_bytes(size) +
-                journal_module.entry_size_bytes(head_entry_size);
-            try self.check_accepting(2, journal_bytes);
-            const insert_sequence = try self.insert_block(&block);
-            const head_sequence = try self.set_head(block.hash);
-            overlay.discard();
-            assert(head_sequence == insert_sequence + 1);
-            return .{
-                .insert_sequence = insert_sequence,
-                .head_sequence = head_sequence,
-                .state_root = self.head_info.state_root,
+            return block;
+        }
+
+        /// Inserts a new block, moves the head to it, and journals one `block_and_head` entry.
+        /// Room was checked by the caller.
+        fn insert_and_move_head(self: *Self, block: *const BlockInput) OperationError!u64 {
+            assert(self.chain.meta(block.hash) == null);
+            try self.insert_check(block);
+            try self.chain_insert(block);
+            self.move_head(block.hash) catch |err| {
+                // The block is stored in memory: journal it alone so replay stays in step.
+                // A planning error changed nothing else; a state error failed the database.
+                if (self.phase == .ready) {
+                    const body = encode_block(block, self.queue_slot());
+                    _ = self.queue_push(@intCast(body.len));
+                }
+                return err;
             };
+            assert(std.mem.eql(u8, &self.head_info.hash, &block.hash));
+            const body = encode_block_and_head(block, self.queue_slot());
+            return self.queue_push(@intCast(body.len));
         }
 
         /// Asks for a checkpoint; it starts once the queue drains.

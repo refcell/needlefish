@@ -5,7 +5,7 @@
 //! - `cases` (run by the shared harness, fastest of 5 samples): overlay -> changeset ->
 //!   `State.apply` -> state root, in memory; changeset encode and decode throughput.
 //! - `run_commit` (its own runner, per-block percentiles): `Database.execute_and_commit`
-//!   until the head entry is durable, over `IoStorage` on the OS backend (a scratch file
+//!   until its entry is durable, over `IoStorage` on the OS backend (a scratch file
 //!   under `.zig-cache/tmp`, deleted afterwards) and over a zero-latency `SimStorage`, plus
 //!   the duration of each checkpoint of the full state.
 //!
@@ -475,7 +475,7 @@ fn CommitRunType(comptime Storage: type) type {
             assert(!self.db.head_info.present);
         }
 
-        /// Commits the overlay as the next block and waits until its head entry is durable.
+        /// Commits the overlay as the next block (one `block_and_head` entry).
         fn commit_block(self: *Self) !database.Commit {
             const number: u64 = if (self.db.head_info.present) self.db.head_info.number + 1 else 0;
             std.mem.writeInt(u64, self.header[0..8], number, .little);
@@ -499,7 +499,7 @@ fn CommitRunType(comptime Storage: type) type {
             for (0..self.shape.fill_blocks()) |fill_index| {
                 try write_fill(&self.overlay, self.shape, @intCast(fill_index));
                 const commit = try self.commit_block();
-                try self.tick_while(not_durable, commit.head_sequence);
+                try self.tick_while(not_durable, commit.sequence);
             }
             assert(self.db.state.account_table.count() == self.shape.accounts);
             assert(self.db.state.storage_table.count() == self.shape.slots());
@@ -512,7 +512,7 @@ fn CommitRunType(comptime Storage: type) type {
             const start = now_ns(io);
             const commit = try self.commit_block();
             const returned = now_ns(io);
-            try self.tick_while(not_durable, commit.head_sequence);
+            try self.tick_while(not_durable, commit.sequence);
             const durable = now_ns(io);
             assert(durable >= returned and returned >= start);
             self.cpu_ns[sample] = returned - start;

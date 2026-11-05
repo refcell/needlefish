@@ -57,8 +57,8 @@ contracts x 64 slots). Changeset of one block: 629 018 bytes.
 
 Commit loop (`run_commit`, own runner): 128 blocks in 4 rounds of 32, a timed checkpoint after
 setup and after each round (5 samples, so p99 = max). Each block waits until its head entry
-is durable before the next starts (2 journal entries, 2 fsyncs per block). Overlay writes are
-outside the clock. "cpu" = `execute_and_commit` returning; "durable" = head entry fsynced.
+is durable before the next starts (then 2 journal entries, 2 fsyncs per block). Overlay writes
+are outside the clock. "cpu" = `execute_and_commit` returning; "durable" = head entry fsynced.
 
 | Storage | cpu p50 | cpu p99 | durable p50 | durable p99 | checkpoint p50 | checkpoint max |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -70,6 +70,22 @@ superblock copies. Takeaways: commit CPU (~13 ms) is the in-memory block cost; t
 for 4k storage writes dominates (trie/state block 1k accounts alone is 2.0 ms). Durability
 adds ~7.5 ms (two full fsyncs of ~630 KB). Second run on the same machine: cpu p50 13.1-13.8
 ms, durable p50 21.0 ms, checkpoint p50 41.1 ms; sim p99 swings 18-27 ms (noise, laptop).
+
+### 2026-11-05 db: one fsync per `execute_and_commit`
+
+`execute_and_commit` now journals one `block_and_head` entry instead of a `block` entry plus a
+`head` entry: 1.0 syncs/block (was 2.0). Same command, same machine, IoStorage (kqueue, temp
+file, F_FULLFSYNC); "before" is one run on the previous commit, "after" two runs.
+
+| Run | cpu p50 | cpu p99 | durable p50 | durable p99 | durable - cpu (p50) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before (2 entries, 2 fsyncs) | 15.0 ms | 25.7 ms | 24.1 ms | 36.6 ms | 9.1 ms |
+| after, run 1 (1 entry, 1 fsync) | 13.2 ms | 25.0 ms | 17.6 ms | 34.8 ms | 4.4 ms |
+| after, run 2 | 11.2 ms | 12.8 ms | 15.3 ms | 17.6 ms | 4.1 ms |
+
+The durability cost per block halves (about 9 -> 4 ms of fsync wait). The laptop was noisier
+than the first db run (before-run cpu p50 15.0 ms vs 13.4 ms earlier), so compare the
+durable - cpu column, not absolute numbers; p99 is dominated by CPU noise in noisy runs.
 
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 

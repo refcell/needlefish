@@ -152,8 +152,7 @@ const Harness = struct {
         }
         var input = self.block_input(@splat(0), 0);
         const commit = try self.db.execute_and_commit(&self.overlay, &input);
-        try self.record(commit.insert_sequence, .{});
-        try self.record(commit.head_sequence, self.db.head_info);
+        try self.record(commit.sequence, self.db.head_info);
         self.remember(input.hash);
         try self.tick_until(idle);
         try testing.expectEqual(self.submitted, self.db.durable_sequence);
@@ -266,15 +265,33 @@ const Harness = struct {
         self.overlay.discard();
         try self.random_writes();
         var input = self.block_input(head.hash, head.number + 1);
+        if (self.prng.chance(1, 5)) return self.insert_then_set_head(&input);
         const commit = self.db.execute_and_commit(&self.overlay, &input) catch |err| switch (err) {
             // Busy, or the parent is the oldest block and this insert would evict it.
             error.Busy, error.UnknownParent => return,
             else => return err,
         };
-        try self.record(commit.insert_sequence, head);
-        try self.record(commit.head_sequence, self.db.head_info);
+        try self.record(commit.sequence, self.db.head_info);
         try testing.expectEqual(commit.state_root, self.db.head_info.state_root);
         self.remember(input.hash);
+    }
+
+    /// The standalone path: a `block` entry, then (usually) a separate `head` entry.
+    fn insert_then_set_head(self: *Harness, input: *BlockInput) !void {
+        const head = self.db.head_info;
+        const built = &self.db.changeset_built;
+        try self.overlay.build_changeset(built);
+        self.overlay.discard();
+        if (built.encoded_length() > self.db.changeset_buffer.len) return;
+        input.changeset = built.encode(self.db.changeset_buffer);
+        const sequence = self.db.insert_block(input) catch |err| switch (err) {
+            error.Busy, error.UnknownParent, error.BlockTooLarge => return,
+            else => return err,
+        };
+        try self.record(sequence, head);
+        try testing.expect(head.eql(self.db.head_info));
+        self.remember(input.hash);
+        if (self.prng.chance(2, 3)) _ = try self.try_set_head(input.hash);
     }
 
     fn step(self: *Harness) !void {
@@ -399,6 +416,7 @@ fn check_roundtrip(body: []const u8) !void {
     const encoded = switch (entry) {
         .block => |*input| database.encode_block(input, &buffer),
         .head => |*hash| database.encode_head(hash, &buffer),
+        .block_and_head => |*input| database.encode_block_and_head(input, &buffer),
     };
     try testing.expectEqualSlices(u8, body, encoded);
 }
@@ -433,16 +451,21 @@ test "database: seeded entry fuzz: valid roundtrip, mutations are rejected or ca
             .transaction_hashes = hashes[0..prng.below(5)],
             .changeset = payload[300..][0..prng.below(300)],
         };
-        const encoded = if (round % 5 == 0)
-            database.encode_head(&input.hash, &buffer)
-        else
-            database.encode_block(&input, &buffer);
+        const encoded = switch (round % 5) {
+            0 => database.encode_head(&input.hash, &buffer),
+            1 => database.encode_block_and_head(&input, &buffer),
+            else => database.encode_block(&input, &buffer),
+        };
         try check_roundtrip(encoded);
         const decoded = try database.decode_entry(encoded);
-        if (decoded == .block) {
-            try testing.expectEqual(input.number, decoded.block.number);
-            try testing.expectEqualSlices(u8, input.changeset, decoded.block.changeset);
-            input = decoded.block;
+        try testing.expectEqual(round % 5 == 1, decoded == .block_and_head);
+        switch (decoded) {
+            .block, .block_and_head => |decoded_input| {
+                try testing.expectEqual(input.number, decoded_input.number);
+                try testing.expectEqualSlices(u8, input.changeset, decoded_input.changeset);
+                input = decoded_input;
+            },
+            .head => |hash| try testing.expectEqualSlices(u8, &input.hash, &hash),
         }
         @memcpy(mutated[0..encoded.len], encoded);
         var length = encoded.len;
@@ -494,4 +517,28 @@ test "database: operations before open and on unknown blocks are refused" {
         &input,
     ));
     try testing.expect(head.eql(harness.db.head_info));
+}
+
+test "database: execute_and_commit journals one entry with one sync" {
+    var prng = Prng.init(11);
+    var sim = try sim_create(11, &prng);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 11);
+    defer harness.destroy();
+    try harness.format(11);
+    try testing.expectEqual(@as(u64, 1), harness.db.durable_sequence);
+    for (0..4) |_| {
+        const head = harness.db.head_info;
+        const syncs_before = sim.stats.syncs;
+        try harness.overlay.set_storage(address_of(1), 2, head.number + 7);
+        var input = harness.block_input(head.hash, head.number + 1);
+        const commit = try harness.db.execute_and_commit(&harness.overlay, &input);
+        try testing.expectEqual(head.number + 1, harness.db.head_info.number);
+        try testing.expectEqual(harness.db.submitted_sequence, commit.sequence);
+        try harness.record(commit.sequence, harness.db.head_info);
+        try harness.tick_until(Harness.idle);
+        try testing.expectEqual(commit.sequence, harness.db.durable_sequence);
+        try testing.expectEqual(syncs_before + 1, sim.stats.syncs);
+    }
+    try check_equal_after_reopen(harness);
 }

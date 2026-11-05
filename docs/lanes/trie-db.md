@@ -20,7 +20,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Compact node layout (packed paths, out-of-line values).
 - [ ] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
   (vs 2 ms for 1k accounts alone). Profile storage trie rehash/creation and fix.
-- [ ] One fsync per `execute_and_commit`: journal block + head as one entry (now 2 fsyncs,
+- [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
 
 ## Decisions
@@ -61,7 +61,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   previous format never validates. Journal: hash-chained entries, logical positions, clean
   end vs corrupt classification, valid prefix accepted after torn tail. Checkpoints: pulled
   producer, per-block checksums. Journal space freed only after all superblock copies durable.
-- `DatabaseType(Storage)`: one operation per journal entry (block insert or head move);
+- `DatabaseType(Storage)`: one operation per journal entry (block insert, head move, or both);
   apply in memory first, journal only on success; state moves only on head moves; the
   database (not ChainStore) drives block retention so live and checkpoint-rebuilt stores
   match; checkpoints = header + State snapshot + retained blocks, started when the journal is
@@ -91,6 +91,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   allocated at init. `update_caches(roots)` batches across tries of one pool; `StateTrie.flush`
   uses it for all dirty storage tries. `Config.hash_batched = false` keeps the old post-order
   walk as the fuzz reference. Kept because block roots got 19-24% faster (docs/PERF.md).
+- One durable round trip per `execute_and_commit`: a third entry kind, `block_and_head` (block
+  layout, own tag), replayed as `chain_insert` then `move_head`. Chosen over engine group
+  commit (several entries per journal write + sync) because it keeps one operation = one
+  entry = one sequence (TigerBeetle: one prepare per request), needs no engine change, and
+  keeps Busy accounting at one entry. `block`/`head` stay for standalone `insert_block` and
+  `set_head`. `Commit` now carries one `sequence`. If the head move fails after the in-memory
+  insert (only a planning error can, and not for a child of the head), a plain `block` entry
+  is journaled so replay stays in step. A block already stored only journals a `head` entry.
+  Group commit stays an option if standalone insert+set_head pairs ever become hot.
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -111,9 +120,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
 - 2026-11-05: IoStorage over utilities.io; engine end to end over a short-IO double, SimIo
   (16 crash seeds), and kqueue/io_uring on a real temp file.
-<<<<<<< HEAD
 - 2026-11-05: batch keccak in the trie rehash: 1k-account state block 1.98 -> 1.60 ms.
-=======
 - 2026-11-05: db benchmarks: 1k acct + 4k slot block on 100k accounts: 13 ms apply+root,
   21 ms commit until durable (kqueue + F_FULLFSYNC), 40 ms checkpoint of a 17 MB state.
->>>>>>> eedeb33 (perf(db): add block apply, changeset codec, and commit latency benchmarks)
+- 2026-11-05: one fsync per `execute_and_commit` (`block_and_head` entry): 1.0 syncs/block,
+  fsync wait per block ~9 -> ~4 ms (durable p50 24.1 -> 15.3-17.6 ms on a noisy laptop).
