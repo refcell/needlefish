@@ -237,6 +237,7 @@ pub const cases = [_]Case{
     .{ .name = "modexp/2048b full exp", .iterations = 20, .run = bench_modexp(256, 256, false) },
     .{ .name = "modexp/4096b e=65537", .iterations = 500, .run = bench_modexp(512, 3, false) },
     .{ .name = "modexp/4096b full exp", .iterations = 5, .run = bench_modexp(512, 512, false) },
+    .{ .name = "modexp/8192b e=65537", .iterations = 100, .run = bench_modexp(1024, 3, false) },
     .{ .name = "modexp/2048b even e=65537", .iterations = 500, .run = bench_modexp(256, 3, true) },
     .{ .name = "keccak256/32B", .iterations = 2_000_000, .run = bench_keccak_32 },
     .{ .name = "keccak256/32B (std)", .iterations = 2_000_000, .run = bench_keccak_32_std },

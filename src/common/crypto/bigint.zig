@@ -261,8 +261,28 @@ pub fn montgomery_mul(
     constant: Limb,
     t: []Limb,
 ) void {
-    const n = m.len;
-    assert(n > 0 and a.len == n and b.len == n and out.len == n and t.len >= n + 2);
+    switch (m.len) {
+        // Small moduli get a compile-time length so LLVM unrolls the loops.
+        inline 1...specialized_limbs_max => |count| {
+            montgomery_mul_n(count, out, a, b, m, constant, t);
+        },
+        else => montgomery_mul_n(m.len, out, a, b, m, constant, t),
+    }
+}
+
+/// Moduli up to this many limbs (512 bits) use length-specialized code.
+const specialized_limbs_max = 8;
+
+inline fn montgomery_mul_n(
+    n: usize,
+    out: []Limb,
+    a: []const Limb,
+    b: []const Limb,
+    m: []const Limb,
+    constant: Limb,
+    t: []Limb,
+) void {
+    assert(n > 0 and m.len == n and a.len == n and b.len == n and out.len == n and t.len >= n + 2);
     assert(m[0] & 1 == 1);
     const acc = t[0 .. n + 2];
     @memset(acc, 0);
@@ -292,6 +312,75 @@ pub fn montgomery_mul(
         _ = sub(out, acc[0..n], m);
     } else {
         @memcpy(out, acc[0..n]);
+    }
+}
+
+/// out = a * a * 2^(-64 n) mod m for odd m, a < m: a dedicated square (half the products of
+/// `montgomery_mul`) followed by word-by-word Montgomery reduction. `t` holds 2 * n limbs.
+/// `out` may alias `a`.
+pub fn montgomery_sqr(
+    out: []Limb,
+    a: []const Limb,
+    m: []const Limb,
+    constant: Limb,
+    t: []Limb,
+) void {
+    switch (m.len) {
+        inline 1...specialized_limbs_max => |count| montgomery_sqr_n(count, out, a, m, constant, t),
+        else => montgomery_sqr_n(m.len, out, a, m, constant, t),
+    }
+}
+
+inline fn montgomery_sqr_n(
+    n: usize,
+    out: []Limb,
+    a: []const Limb,
+    m: []const Limb,
+    constant: Limb,
+    t: []Limb,
+) void {
+    assert(n > 0 and m.len == n and a.len == n and out.len == n and t.len >= 2 * n);
+    assert(m[0] & 1 == 1);
+    const w = t[0 .. 2 * n];
+    @memset(w, 0);
+    for (0..n - 1) |i| { // off-diagonal products a[i] * a[j], j > i
+        var carry: Limb = 0;
+        for (i + 1..n) |j| {
+            const wide = @as(u128, a[i]) * a[j] + w[i + j] + carry;
+            w[i + j] = @truncate(wide);
+            carry = @intCast(wide >> 64);
+        }
+        w[i + n] = carry;
+    }
+    assert(shift_left_bits(w, w, 1) == 0);
+    var carry: Limb = 0;
+    for (0..n) |i| { // diagonal a[i]^2
+        const square = @as(u128, a[i]) * a[i];
+        const low = @as(u128, w[2 * i]) + @as(Limb, @truncate(square)) + carry;
+        w[2 * i] = @truncate(low);
+        const high = @as(u128, w[2 * i + 1]) + @as(Limb, @intCast(square >> 64)) + (low >> 64);
+        w[2 * i + 1] = @truncate(high);
+        carry = @intCast(high >> 64);
+    }
+    assert(carry == 0);
+    var pending: Limb = 0; // carry into position i + n of the next row
+    for (0..n) |i| {
+        const q = w[i] *% constant;
+        var row_carry: Limb = 0;
+        for (0..n) |j| {
+            const wide = @as(u128, q) * m[j] + w[i + j] + row_carry;
+            w[i + j] = @truncate(wide);
+            row_carry = @intCast(wide >> 64);
+        }
+        const top = @as(u128, w[i + n]) + row_carry + pending;
+        w[i + n] = @truncate(top);
+        pending = @intCast(top >> 64);
+    }
+    const result = w[n .. 2 * n];
+    if (pending != 0 or compare(result, m) != .lt) {
+        _ = sub(out, result, m);
+    } else {
+        @memcpy(out, result);
     }
 }
 
@@ -613,5 +702,30 @@ test "bigint: reduce_shifted and montgomery_mul match std big ints" {
         to_be_bytes(&got, out[0..n]);
         managed_to_bytes(&r, &want);
         try testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "bigint: montgomery_sqr equals montgomery_mul(a, a)" {
+    var prng = Prng.init(0x73717572);
+    for (0..500) |_| {
+        const n: usize = @intCast(prng.range(1, 9));
+        var m: [9]Limb = undefined;
+        for (m[0..n]) |*limb| limb.* = prng.int(u64);
+        m[0] |= 1;
+        if (prng.chance(1, 4)) m[n - 1] = std.math.maxInt(Limb);
+        if (m[n - 1] == 0) m[n - 1] = 1;
+        if (n == 1 and m[0] == 1) continue;
+        var a: [9]Limb = undefined;
+        for (a[0..n]) |*limb| limb.* = prng.int(u64);
+        if (prng.chance(1, 4)) @memset(a[0..n], std.math.maxInt(Limb));
+        // Reduce a below m by clearing the top limb until smaller.
+        while (compare(a[0..n], m[0..n]) != .lt) a[n - 1] >>= 1;
+        const constant = montgomery_constant(m[0]);
+        var scratch: [20]Limb = undefined;
+        var by_mul: [9]Limb = undefined;
+        var by_sqr: [9]Limb = undefined;
+        montgomery_mul(by_mul[0..n], a[0..n], a[0..n], m[0..n], constant, &scratch);
+        montgomery_sqr(by_sqr[0..n], a[0..n], m[0..n], constant, &scratch);
+        try testing.expectEqualSlices(Limb, by_mul[0..n], by_sqr[0..n]);
     }
 }

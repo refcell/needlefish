@@ -232,7 +232,7 @@ pub fn Modexp(comptime capacity_limbs: u32) type {
             const n = m.len;
             assert(m[0] & 1 == 1 and (n > 1 or m[0] > 1));
             var reduce_scratch: [2 * capacity_limbs + 1]Limb = undefined;
-            var t: [capacity_limbs + 2]Limb = undefined;
+            var t: [2 * capacity_limbs + 2]Limb = undefined;
             var table: [table_entries][capacity_limbs]Limb = undefined;
             const constant = bigint.montgomery_constant(m[0]);
             // Montgomery form of the base: base * R mod m, R = 2^(64 n).
@@ -242,7 +242,7 @@ pub fn Modexp(comptime capacity_limbs: u32) type {
             if (window > 1) {
                 var squared: [capacity_limbs]Limb = undefined;
                 const first = table[0][0..n];
-                bigint.montgomery_mul(squared[0..n], first, first, m, constant, &t);
+                bigint.montgomery_sqr(squared[0..n], first, m, constant, &t);
                 for (1..(@as(usize, 1) << (window - 1))) |index| {
                     const previous = table[index - 1][0..n];
                     const entry = table[index][0..n];
@@ -278,7 +278,7 @@ pub fn Modexp(comptime capacity_limbs: u32) type {
                 const top = end - 1;
                 if (!exponent.bit(top)) {
                     assert(started);
-                    bigint.montgomery_mul(acc, acc, acc, m, constant, t);
+                    bigint.montgomery_sqr(acc, acc, m, constant, t);
                     end -= 1;
                     continue;
                 }
@@ -293,7 +293,7 @@ pub fn Modexp(comptime capacity_limbs: u32) type {
                 assert(value & 1 == 1 and value < (@as(usize, 1) << window));
                 const entry = table[value >> 1][0..n];
                 if (started) {
-                    for (0..top - low + 1) |_| bigint.montgomery_mul(acc, acc, acc, m, constant, t);
+                    for (0..top - low + 1) |_| bigint.montgomery_sqr(acc, acc, m, constant, t);
                     bigint.montgomery_mul(acc, acc, entry, m, constant, t);
                 } else {
                     @memcpy(acc, entry);

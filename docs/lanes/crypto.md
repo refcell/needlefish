@@ -10,7 +10,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
 - [ ] montgomery: no-carry CIOS for moduli with spare top bits, dedicated squaring, faster inversion (bernstein-yang / binary gcd).
-- [ ] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
+- [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
+- [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
 - [ ] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
 - [ ] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
 - [ ] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
@@ -48,9 +49,29 @@ fallback but hot paths should be our own, optimized implementations.
   skipped in Debug and runs in ReleaseSafe/ReleaseFast test builds (~25 s).
 - identity (precompile 0x04) is a plain copy; no function is provided, the evm lane copies.
   `blake2f.input_rounds` exposes the round count so evm can charge gas before running F.
+- modexp: `bigint.zig` holds slice-based little-endian u64 limb helpers (no allocation),
+  `Padded` (a big-endian byte view with implicit right zero padding, so the precompile
+  input is never copied) and `Fixed(limbs_max)`. Odd modulus: CIOS Montgomery (runtime limb
+  count, length-specialized up to 8 limbs) + dedicated squaring + sliding window (1..5
+  bits chosen from exponent length). Montgomery form needs no R^2: base * R mod m comes
+  from `reduce_shifted` (Knuth-D streaming one limb at a time, n extra zero limbs). Even
+  modulus m = 2^k * q: q via Montgomery, 2^k via truncated products, joined by CRT
+  (x = x1 + q * ((x2 - x1) * q^-1 mod 2^k)).
+- modexp capacity: only the modulus is bounded (`operand_bytes_max` = 1024 bytes, 128
+  limbs, the EIP-7823 limit). Base streams through the reducer and the exponent is scanned
+  bitwise, so both may be any length (pre-Osaka). A modulus above capacity returns
+  `error.ModulusTooLarge` from `modexp_checked` (pre-Osaka callers must handle it; `modexp`
+  asserts instead). `Modexp(limbs)` is generic for a larger capacity.
+- modexp gas: pure helpers `adjusted_exponent_length`, `iteration_count`,
+  `multiplication_complexity`, `gas_cost(rules, ...)` (byzantium/berlin/osaka, saturating
+  u64) mirror revm's `modexp.rs`; `precompile_modexp_parse` returns `Padded` operands plus
+  the 32-byte exponent head; base/modulus length > u64 is `LengthOverflow`, an exponent
+  length > u64 saturates (so gas saturates). The evm lane charges gas and applies
+  `check_osaka_limits`.
 
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
 - 2026-11-05: kzg: embedded public trusted setup, versioned hash, 0x0A input framing + output; pairing check plugs in once BLS12-381 lands.
 - 2026-11-05: sha256 (ARMv8 SHA2 path, 32B: 26ns vs std 33ns; 4KiB: 1455ns vs std 1643ns), ripemd160 (32B: 131ns; 4KiB: 8.6us), blake2f (12 rounds: 87ns, std compression 85ns); official/EIP-152 vectors 0-8, seeded + coverage fuzz.
+- 2026-11-05: modexp (EIP-198/2565/7883/7823) + bigint: public geth vectors (22 incl. even moduli, gas for 3 rule sets), seeded differential fuzz vs std big ints, coverage fuzz; bench (ReleaseFast, M-series): 256-bit full exp 5.6us, 2048-bit e=65537 23.6us, 2048-bit full exp 2.52ms, 4096-bit e=65537 101us, 4096-bit full exp 21.9ms, 8192-bit e=65537 428us, even 2048-bit e=65537 24.4us.
