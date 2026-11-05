@@ -62,6 +62,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   storage-heavy blocks; record in docs/PERF.md.
 - [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
   blocks (committed small vectors); document any intended differences.
+- [ ] Witness generator memory: default limits allocate ~40-60 MB at node start even if
+  `debug_executionWitness` is never called; size from limits more tightly or allocate through
+  `utilities.lazy_alloc` (node lane pattern). Large witnesses can exceed the 1 MiB HTTP buffer.
+- [ ] Witness generation blocks the state for one unwind + re-apply per block between target
+  and head; consider generating from the history store instead (no state disturbance).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
