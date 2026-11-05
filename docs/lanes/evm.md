@@ -32,12 +32,13 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   supply cap 12 (max 2^128-1), permit nonces 13, seize policy ids 14; role/policy/pause ops,
   metered keccak), `native_b20_asset.zig`, `native_b20_stablecoin.zig`,
   `native_b20_factory.zig` (0xB20F00..00), lookup of 0xb2 addresses in `native.lookup`.
-  Done: core (`native_b20.zig`), Asset V1 (`native_b20_asset.zig`: full IB20 V1 + asset
-  extension incl. permit, eip712Domain, announce with privileged internal calls), factory
-  (`native_b20_factory.zig` at 0xB20F00..00, warmed from Beryl: createB20 for assets,
-  getB20Address, isB20, isB20Initialized). Next: Stablecoin V1 (factory currently reverts
-  empty for the stablecoin variant), then Asset/Stablecoin V2 (Cobalt) and V3 (Denim);
-  until then the V1 surface serves every fork.
+  Done (Beryl surface complete): core (`native_b20.zig`), tokens (`native_b20_token.zig`:
+  IB20 V1 for both variants, variant from the address; asset extension incl. permit,
+  eip712Domain, announce with privileged internal calls; stablecoin `currency()`, fixed 6
+  decimals, root `base.b20.stablecoin` 0x35827975..6200), factory (`native_b20_factory.zig`
+  at 0xB20F00..00, warmed from Beryl: createB20 for both variants, getB20Address, isB20,
+  isB20Initialized). Next: common/Asset/Stablecoin V2 (Cobalt: seize, UI multiplier,
+  metered permit, ...) and V3 (Denim); until then the V1 surface serves every fork.
   Decisions: token init checks and factory account reads are metered like base
   `with_account_info` (100, +2500 cold); an unset multiplier reads as WAD; permit V1 uses
   unmetered hashing and no 3000-gas recovery charge, rejects high s (k256); factory init
@@ -104,7 +105,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
-- 2026-11-05: B-20 core, Asset V1 token, and factory native precompiles.
+- 2026-11-05: B-20 core, Asset/Stablecoin V1 tokens, and factory native precompiles.
 - 2026-11-05: native string/bytes storage (`native_storage.zig`) with Cobalt tail cleanup.
 - 2026-11-05: PolicyRegistry V2/V3 (composite and inverted policies).
 - 2026-11-05: Beryl PolicyRegistry V1 and the native ABI decoder.
