@@ -356,3 +356,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: constant-time hardening (`ct.zig` value barrier) after advisor audit; verify r+n and infinity vectors added.
 - 2026-11-05: fuzz campaign (ReleaseSafe, nice 19): SEC1/verify/ecdh 200K runs, ecrecover precompile 500K runs, clean.
 - 2026-11-05: KZG `evaluate_blob` (fraction-sum barycentric, 4 lanes): batch verify (6) 3.95 -> 3.25ms.
+- 2026-11-05: bn254 G2 subgroup check [x+1]Q + psi([x]Q) + psi^2([x]Q) = psi^3([2x]Q) (one 63-bit mul instead of 127-bit [6x^2]Q; old test kept as oracle): pairing-2 502 -> ~460us. Split: Miller loop (2 pairs) 247us, final exponentiation 166us (new benches).

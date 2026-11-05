@@ -488,6 +488,31 @@ fn bench_bn254_mul(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_bn254_miller_loop_2(iterations: u32) u64 {
+    const g1_points = [2]bn254.g1.G1Affine{ bn254.g1.generator, bn254.g1.generator.neg() };
+    const g2_points = [2]bn254.g2.G2Affine{ bn254.g2.generator, bn254.g2.generator };
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const f = bn254.pairing.miller_loop(&g1_points, &g2_points);
+        accumulator +%= f.c0.c0.c0.limbs_value[0];
+        std.mem.doNotOptimizeAway(&g1_points);
+    }
+    return accumulator;
+}
+
+fn bench_bn254_final_exponentiation(iterations: u32) u64 {
+    const g1_points = [1]bn254.g1.G1Affine{bn254.g1.generator};
+    const g2_points = [1]bn254.g2.G2Affine{bn254.g2.generator};
+    var f = bn254.pairing.miller_loop(&g1_points, &g2_points);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const result = bn254.pairing.final_exponentiation(f);
+        accumulator +%= result.c0.c0.c0.limbs_value[0];
+        f = f.mul(result);
+    }
+    return accumulator;
+}
+
 fn bench_bn254_pairing_2(iterations: u32) u64 {
     comptime assert(bn254_pairing_input.len == 2 * 192);
     var input = bn254_pairing_input;
@@ -504,6 +529,12 @@ pub const cases = [_]Case{
     .{ .name = "bn254/add", .iterations = 200_000, .run = bench_bn254_add },
     .{ .name = "bn254/mul", .iterations = 20_000, .run = bench_bn254_mul },
     .{ .name = "bn254/pairing 2 pairs", .iterations = 500, .run = bench_bn254_pairing_2 },
+    .{ .name = "bn254/miller loop 2 pairs", .iterations = 1_000, .run = bench_bn254_miller_loop_2 },
+    .{
+        .name = "bn254/final exponentiation",
+        .iterations = 1_000,
+        .run = bench_bn254_final_exponentiation,
+    },
     .{ .name = "field/bn254 square", .iterations = 10_000_000, .run = bench_field_square(Bn254Fp) },
     .{
         .name = "field/bls12-381 square",
