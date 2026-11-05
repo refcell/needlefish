@@ -155,3 +155,7 @@ provably robust.
 - 2026-11-05: differential Engine API JSON fuzz (`fuzz_targets_engine.zig`): payloads
   V1-V4 both directions, payload attributes, payload status and forkchoice-updated
   between the consensus client and execution server codecs; 3/3 wire mutants caught.
+- 2026-11-05: network fuzz targets (`fuzz_targets_net.zig`): HTTP parser (structured,
+  chunking-invariant, limits), WebSocket frames, flashblocks. Found: `FlashblockId.parse`
+  accepts `1_0` and rejects `+61`, unlike base/base `u64::from_str` (reported; skipped).
+  Residual: chunked bodies over the limit are rejected only once complete.
