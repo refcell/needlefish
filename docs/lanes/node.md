@@ -19,7 +19,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   `KzgVerifier.cells` so v1 (EIP-7594) sidecars are verified instead of skipped.
 - [ ] txpool/evm: admit 0x79 using `common.consensus.eip8130_gas.compute` (intrinsic gas,
   `Input.worst_case` for admission/estimation, `max_payer_auth_cost` for block reservation).
-- [ ] executor: run 0x79 envelopes through the evm (note from the evm lane): build
+- [x] executor: run 0x79 envelopes through the evm (note from the evm lane): build
   `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw, .gas_limit = tx.gas_limit }`
   (caller is ignored; the evm recovers the sender) and report `Executed.committed_phases` on
   the receipt. Rejections come back as `Invalid.eip8130_rejected`.
@@ -78,6 +78,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: The executor runs EIP-8130 (0x79) envelopes now that the evm lane executes them: L2 with Everest active only (else TxTypeNotSupported); the TxEnv carries `eip8130 = &envelope.eip8130` (built in `apply_transaction` so the pointer outlives `transact`), the raw envelope, gas limit, and the fee fields for tip accounting; the evm recovers the sender (the sender pipeline's result is ignored). Receipts carry `committed_phases`; a pre-call rejection is InvalidTransaction. Pool admission (0x79 in `txpool/validate.zig`) is still open.
 - 2026-11-05: Fixed the canonical number index after a reorg back (reported by trie-db, "Node canonical index after a reorg back"): `mark_canonical` now drops index entries above the new head (`BlockStore.clear_canonical_above`) before writing the branch down to the first matching number. Before, A6 -> B5 -> A6 left 5 -> B5 (the walk stopped at A6 itself). Regression test plus an index-equals-ancestry check in the chain fuzz.
 - 2026-11-05: eth_createAccessList without an evm inspector: `Executor.Call.collect` reads the evm state's EIP-2929 warm marks (accounts and slots with `warm_tx == tx_id`) right after the simulated transaction (`node/access_list.zig`). Excluded: from, to, coinbase (Shanghai+), active precompiles, Base native warm contracts, contracts created by the call; slots are kept for every address (so `to` appears with its slots, as geth). Iterated until the list repeats, at most 8 runs. Deviations from geth: reverted frames' accesses are not listed (the evm un-warms them), and the request's `accessList` is not the starting point. Result `{accessList, gasUsed, error?}`, sorted by address and slot.
 - 2026-11-05: debug_executePayload(parent, attributes) builds the block with `Chain.build_block` (as a payload build, no payload id or forkchoice change; stored as a side block) and returns the witness via the new `node.witness.built_witness`, which unwinds from the state at the built block (one changeset; durable DB head is at the block too), then `ensure_head_state`. Attributes decode into the API scratch with the engine parser. debug_proofsSyncStatus reports `{earliest, latest}` of the history window (`Chain.history_window`, journal hook `history_window` on durable nodes), null/null without history.

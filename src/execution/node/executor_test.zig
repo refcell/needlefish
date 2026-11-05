@@ -325,3 +325,73 @@ test "executor: L2 deposit mints, records its nonce, and fees go to the vaults" 
     const rejected = l1.executor.execute_block(&block_env(1), &.{deposit_raw}, &.{});
     try testing.expectError(error.TxTypeNotSupported, rejected);
 }
+
+const eip8130 = consensus.tx.eip8130;
+
+/// Base devnet with every upgrade through Everest active at genesis.
+const everest_spec: chainspec.ChainSpec = blk: {
+    var result = chainspec.ChainSpec.presets.base_devnet;
+    result.upgrades = @splat(0);
+    break :blk result;
+};
+
+/// slot[0] += 1 (PUSH0 SLOAD PUSH1 1 ADD PUSH0 SSTORE STOP).
+const counter_code = [_]u8{ 0x5f, 0x54, 0x60, 0x01, 0x01, 0x5f, 0x55, 0x00 };
+
+const Eip8130Built = struct {
+    sender_auth: [65]u8,
+    phase_buffer: [256]u8,
+    calls_buffer: [512]u8,
+    envelope_buffer: [1024]u8,
+
+    /// One phase calling `target` once, signed by `key(from)`.
+    fn build(built: *Eip8130Built, from: u8, target: [20]u8, gas_limit: u64) ![]const u8 {
+        const calls = [_]eip8130.Call{.{ .to = .init(target), .value = 0, .data = &.{} }};
+        const phase = eip8130.Phase.build(&built.phase_buffer, &calls);
+        var tx: eip8130.TxEip8130 = .{
+            .chain_id = everest_spec.chain_id,
+            .gas_limit = gas_limit,
+            .max_fee_per_gas = 100,
+            .max_priority_fee_per_gas = 3,
+        };
+        tx.calls = eip8130.Calls.build(&built.calls_buffer, &.{phase});
+        built.sender_auth = try eip8130.sign_sender(tx, key(from));
+        const signed: eip8130.Signed = .{ .tx = tx, .sender_auth = &built.sender_auth };
+        return signed.encode_to(&built.envelope_buffer);
+    }
+};
+
+test "executor: EIP-8130 transactions run their phases from Everest and report them" {
+    var f: Fixture = undefined;
+    try f.init_with(&everest_spec);
+    defer f.deinit();
+    try f.db.put_account(address_of(1), eth, 0, &.{});
+    const counter: [20]u8 = @splat(0x44);
+    try f.db.put_account(counter, 0, 1, &counter_code);
+    var built: Eip8130Built = undefined;
+    const raw = try built.build(1, counter, 300_000);
+    try testing.expectEqual(@as(u8, 0x79), raw[0]);
+    const out = try f.executor.execute_block(&block_env(1), &.{raw}, &.{});
+    try testing.expectEqual(@as(usize, 1), out.receipts.len);
+    const receipt = out.receipts[0];
+    try testing.expectEqual(consensus.TxType.eip8130, receipt.tx_type);
+    try testing.expect(receipt.status);
+    try testing.expectEqual(@as(?u64, 1), receipt.committed_phases);
+    try receipt.validate_committed_phases(1);
+    try testing.expectEqual(@as(u256, 1), f.db.get_storage(counter, 0));
+    try testing.expect(f.db.get_account(address_of(1)).?.balance < eth);
+    try testing.expect(out.fees > 0);
+    // An unfunded sender is rejected before any phase runs, leaving the state alone.
+    var unfunded: Eip8130Built = undefined;
+    const poor = try unfunded.build(2, counter, 300_000);
+    const refused = f.executor.execute_block(&block_env(2), &.{poor}, &.{});
+    try testing.expectError(error.InvalidTransaction, refused);
+    try testing.expectEqual(@as(u256, 1), f.db.get_storage(counter, 0));
+    // Before Everest the type is not supported.
+    var early: Fixture = undefined;
+    try early.init_with(&chainspec.ChainSpec.presets.base_devnet);
+    defer early.deinit();
+    try early.db.put_account(address_of(1), eth, 0, &.{});
+    const rejected = early.executor.execute_block(&block_env(1), &.{raw}, &.{});
+    try testing.expectError(error.TxTypeNotSupported, rejected);
+}

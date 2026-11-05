@@ -465,11 +465,18 @@ pub const Executor = struct {
         blob_gas_used: u64,
     ) Error!Applied {
         const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
-        // The evm has no EIP-8130 (AA) execution yet.
-        if (envelope == .eip8130) return error.TxTypeNotSupported;
         const op = executor.machine.block.op;
         if (envelope == .deposit and op == null) return error.TxTypeNotSupported;
-        const tx = try executor.tx_env(envelope, raw);
+        if (envelope == .eip8130) {
+            // Base EIP-8130 account abstraction, from Everest on L2 only.
+            const context = op orelse return error.TxTypeNotSupported;
+            if (!context.upgrade.at_least(.everest)) return error.TxTypeNotSupported;
+        }
+        // `tx.eip8130` points into `envelope`, which outlives `transact` below.
+        const tx = if (envelope == .eip8130)
+            eip8130_env(&envelope.eip8130, raw)
+        else
+            try executor.tx_env(envelope, raw);
         const deposit_gas_exempt = envelope == .deposit and !op.?.upgrade.at_least(.regolith);
         if (gas_used + tx.gas_limit > block.gas_limit and !deposit_gas_exempt) {
             return error.BlockGasExceeded;
@@ -488,6 +495,7 @@ pub const Executor = struct {
             .logs_bloom = logs.bloom(),
             .logs = logs,
         };
+        if (envelope == .eip8130) receipt.committed_phases = executed.committed_phases;
         if (envelope == .deposit) {
             receipt.deposit_nonce = tx.nonce;
             if (op.?.upgrade.at_least(.canyon)) receipt.deposit_receipt_version = 1;
@@ -523,6 +531,23 @@ pub const Executor = struct {
             return error.TxTypeNotSupported;
         if (blob_gas_used + blob_gas > params.max_blob_gas()) return error.BlobGasExceeded;
         return blob_gas;
+    }
+
+    /// An EIP-8130 transaction for the evm: it authorizes and recovers the sender itself
+    /// (`caller` is ignored) and reads every field from `signed`; the fee fields are
+    /// repeated for the block's priority fee accounting.
+    fn eip8130_env(signed: *const consensus.tx.eip8130.Signed, raw: []const u8) TxEnv {
+        assert(raw.len > 0 and raw[0] == 0x79);
+        return .{
+            .tx_type = .eip8130,
+            .caller = @splat(0),
+            .gas_limit = signed.tx.gas_limit,
+            .gas_price = signed.tx.max_fee_per_gas,
+            .gas_priority_fee = signed.tx.max_priority_fee_per_gas,
+            .chain_id = signed.tx.chain_id,
+            .envelope = raw,
+            .eip8130 = signed,
+        };
     }
 
     /// Converts a decoded envelope into the evm's transaction environment.
