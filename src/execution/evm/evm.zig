@@ -368,7 +368,8 @@ pub const Evm = struct {
         const access = try evm.state.access(address);
         const checkpoint = evm.state.checkpoint();
         const account = access.account;
-        if (account.info.nonce != 0 or account.info.has_code()) {
+        const stored = account.storage_epoch == 0 and account.info.has_storage;
+        if (account.info.nonce != 0 or account.info.has_code() or stored) {
             return failed(0, .create_collision);
         }
         try evm.state.create_account(account, fork);

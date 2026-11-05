@@ -25,6 +25,9 @@ pub const AccountInfo = struct {
     code_hash: B256 = primitives.keccak_empty,
     /// Code if already known; otherwise loaded through `Database.code_by_hash`.
     code: ?[]const u8 = null,
+    /// The database holds non-empty storage for this account (storage root is not the
+    /// empty root). Needed for the EIP-7610 creation collision rule.
+    has_storage: bool = false,
 
     pub fn is_empty(info: *const AccountInfo) bool {
         return info.nonce == 0 and info.balance == 0 and
@@ -114,8 +117,9 @@ pub const Log = struct {
 pub const Limits = struct {
     accounts_max: u32 = 1 << 16,
     slots_max: u32 = 1 << 18,
-    transient_slots_max: u32 = 1 << 14,
-    journal_entries_max: u32 = 1 << 18,
+    /// TSTORE costs 100 gas, so a 2^24-gas transaction can write ~2^17 slots.
+    transient_slots_max: u32 = 1 << 18,
+    journal_entries_max: u32 = 1 << 20,
     logs_max: u32 = 1 << 14,
     /// Log data per transaction; LOG costs 8 gas per byte, so this bounds gas / 8.
     log_data_bytes_max: u32 = 64 << 20,

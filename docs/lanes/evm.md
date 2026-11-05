@@ -8,10 +8,14 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Gas schedule per fork, warm/cold access lists (EIP-2929), refunds (EIP-3529), SSTORE net metering (EIP-2200), call gas 63/64, init-code limits (EIP-3860).
 - [x] `Host`/state interface (account, storage, code, block hashes, logs, journal with revert checkpoints) — define here as a small Zig interface; trie-db lane implements the backend. Include an in-memory backend for tests.
 - [x] CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2/SELFDESTRUCT (EIP-6780) with explicit frame stack (no recursion), max depth 1024.
-- [ ] Transaction-level execution: intrinsic gas, nonce/balance checks, EIP-1559 fee handling, blob txs, EIP-7702 authorizations, access lists, coinbase/base-fee payments.
+- [x] Transaction-level execution: intrinsic gas, nonce/balance checks, EIP-1559 fee handling, blob txs, EIP-7702 authorizations, access lists, coinbase/base-fee payments.
 - [ ] OP-stack semantics: deposit tx processing (mint, no fee, gas accounting by fork, failed-deposit nonce bump), L1 cost charging to L1FeeVault, BaseFeeVault/SequencerFeeVault, operator fee (Isthmus), Base-specific changes in base/base.
 - [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas.
-- [ ] ethereum/tests GeneralStateTests runner (`just vectors`), pass rate tracked in this file.
+- [x] ethereum/tests GeneralStateTests runner (`just vectors`), pass rate tracked in this file.
+  Run: `just vectors`, extract `fixtures_general_state_tests.tgz` into `.cache/vectors/state`, then
+  `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
+  2026-11-05: 36204 / 37724 (96.0%), Cancun + Prague. All remaining failures involve the
+  bn254 precompiles (0x06-0x08), which wait on the crypto lane.
 - [ ] Differential fuzzing harness (random bytecode, seeded) + `std.testing.fuzz` targets.
 - [ ] Performance: benchmark snailtracer/erc20 style workloads; aim beyond revm.
 
@@ -30,9 +34,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Berlin+ static gas for BALANCE/EXT*/SLOAD/CALL* is the warm cost; cold adds the difference.
 - Failed CALL pre-checks (depth, balance) return the full child gas including the stipend
   (geth/revm behavior). CREATE collisions consume the child gas.
-- EIP-7610 (storage non-empty collision) is not yet checked: needs a db storage-root hint.
+- EIP-7610: `AccountInfo.has_storage` (backends set it when the storage root is non-empty)
+  makes CREATE onto an address with storage a collision.
+- Memory cap is consensus-relevant only beyond realistic gas: default 64 MiB covers 30M-gas
+  txs; the state-test runner reserves 1.5 GiB (virtual) for 1 MB x 1024-depth fixtures. The
+  node should size `memory_bytes_max` from its max tx gas.
+- Precompiles call `common.crypto` (ecrecover, sha256, ripemd160, modexp, blake2f, p256).
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: tx execution, GeneralStateTests runner (96.0%), crypto-backed precompiles,
+  EIP-7610 collisions.
 - 2026-11-05: core interpreter, gas schedule, journaled state, frame stack, CREATE/CALL
   family, EIP-7702 call delegation, identity/sha256 precompiles; end-to-end tests.

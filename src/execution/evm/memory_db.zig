@@ -60,6 +60,7 @@ pub const MemoryDatabase = struct {
     pub fn put_storage(database: *MemoryDatabase, address: Address, slot: u256, value: u256) !void {
         assert(database.accounts.contains(address));
         try database.storage.put(database.allocator, .{ .address = address, .slot = slot }, value);
+        if (value != 0) database.accounts.getPtr(address).?.has_storage = true;
     }
 
     pub fn put_block_hash(database: *MemoryDatabase, number: u64, hash: B256) !void {

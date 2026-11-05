@@ -54,7 +54,12 @@ pub fn main(init: std.process.Init) !u8 {
     defer database.deinit();
     var state = try evm.State.init(gpa, database.interface(), .{});
     defer state.deinit(gpa);
-    var machine = try evm.Evm.init(gpa, .{}, &state);
+    // Some fixtures (1 MB calldata at depth 1024) need ~1 GB of frame memory; the
+    // buffers are virtual until touched.
+    var machine = try evm.Evm.init(gpa, .{
+        .memory_bytes_max = 1536 << 20,
+        .code_arena_bytes = 1536 << 20,
+    }, &state);
     defer machine.deinit(gpa);
     var runner = state_test.Runner{
         .state = &state,
@@ -64,7 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const summary = try run_path(io, gpa, &runner, &context, args[1], options);
     const total = summary.passed + summary.failed;
-    std.debug.print("statetest: {d}/{d} passed, {d} failed, {d} skipped forks\n", .{
+    std.debug.print("statetest: passed={d} total={d} failed={d} skipped_forks={d}\n", .{
         summary.passed, total, summary.failed, summary.skipped,
     });
     return if (summary.failed == 0) 0 else 1;

@@ -8,6 +8,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const primitives = @import("primitives.zig");
 const Fork = @import("fork.zig").Fork;
+const crypto = @import("../../common/crypto/root.zig");
 const Address = primitives.Address;
 
 pub const Status = enum { success, failure, out_of_gas };
@@ -34,11 +35,15 @@ pub fn lookup(comptime fork: Fork, address: Address) ?Precompile {
         if (b != 0) return null;
     }
     const number = std.mem.readInt(u16, address[18..20], .big);
-    if (fork.at_least(.osaka) and number == 0x100) return unimplemented;
+    if (fork.at_least(.osaka) and number == 0x100) return p256verify;
     if (number == 0 or number > last_address(fork)) return null;
     return switch (number) {
+        0x01 => ecrecover,
         0x02 => sha256,
+        0x03 => ripemd160,
         0x04 => identity,
+        0x05 => modexp(modexp_rules(fork)),
+        0x09 => blake2f,
         else => unimplemented,
     };
 }
@@ -68,8 +73,82 @@ fn sha256(input: []const u8, gas_limit: u64, out: []u8) Result {
     const cost = 60 + 12 * words(input.len);
     if (charge(gas_limit, cost)) |failure| return failure;
     assert(out.len >= 32);
-    std.crypto.hash.sha2.Sha256.hash(input, out[0..32], .{});
+    out[0..32].* = crypto.sha256.sha256(input);
     return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+}
+
+fn ecrecover(input: []const u8, gas_limit: u64, out: []u8) Result {
+    const cost = 3000;
+    if (charge(gas_limit, cost)) |failure| return failure;
+    // An unrecoverable signature succeeds with empty output.
+    const word = crypto.secp256k1.precompile_ecrecover(input) orelse {
+        return .{ .status = .success, .gas_used = cost };
+    };
+    out[0..32].* = word;
+    return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+}
+
+fn ripemd160(input: []const u8, gas_limit: u64, out: []u8) Result {
+    const cost = 600 + 120 * words(input.len);
+    if (charge(gas_limit, cost)) |failure| return failure;
+    out[0..32].* = crypto.ripemd160.precompile_ripemd160(input);
+    return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+}
+
+fn blake2f(input: []const u8, gas_limit: u64, out: []u8) Result {
+    const rounds = crypto.blake2f.input_rounds(input) orelse {
+        return .{ .status = .failure, .gas_used = gas_limit };
+    };
+    if (charge(gas_limit, rounds)) |failure| return failure;
+    crypto.blake2f.precompile_blake2f(input, out[0..64]) catch {
+        return .{ .status = .failure, .gas_used = gas_limit };
+    };
+    return .{ .status = .success, .gas_used = rounds, .output_len = 64 };
+}
+
+/// EIP-7951 (Osaka) P256VERIFY: invalid signatures succeed with empty output.
+fn p256verify(input: []const u8, gas_limit: u64, out: []u8) Result {
+    const cost = 6900;
+    if (charge(gas_limit, cost)) |failure| return failure;
+    const word = crypto.precompile_p256verify(input) orelse {
+        return .{ .status = .success, .gas_used = cost };
+    };
+    out[0..32].* = word;
+    return .{ .status = .success, .gas_used = cost, .output_len = 32 };
+}
+
+const ModexpRules = crypto.modexp.Rules;
+
+fn modexp_rules(comptime fork: Fork) ModexpRules {
+    if (fork.at_least(.osaka)) return .osaka;
+    if (fork.at_least(.berlin)) return .berlin;
+    return .byzantium;
+}
+
+/// EIP-198 / EIP-2565 / EIP-7883 gas; EIP-7823 operand limits from Osaka.
+fn modexp(comptime rules: ModexpRules) Precompile {
+    return struct {
+        fn run(input: []const u8, gas_limit: u64, out: []u8) Result {
+            const parsed = crypto.modexp.precompile_modexp_parse(input) catch {
+                return .{ .status = .out_of_gas, .gas_used = gas_limit };
+            };
+            if (rules == .osaka) {
+                parsed.check_osaka_limits() catch {
+                    return .{ .status = .failure, .gas_used = gas_limit };
+                };
+            }
+            const cost = parsed.gas(rules);
+            if (charge(gas_limit, cost)) |failure| return failure;
+            const modulus_len = parsed.modulus.len;
+            if (modulus_len > out.len) return .{ .status = .failure, .gas_used = gas_limit };
+            const output = out[0..@intCast(modulus_len)];
+            // Moduli wider than 8192 bits cost far more gas than any block holds.
+            crypto.modexp.precompile_modexp_run(parsed, output) catch {
+                return .{ .status = .failure, .gas_used = gas_limit };
+            };
+            return .{ .status = .success, .gas_used = cost, .output_len = @intCast(modulus_len) };
+        }
+    }.run;
 }
 
 fn unimplemented(input: []const u8, gas_limit: u64, out: []u8) Result {
