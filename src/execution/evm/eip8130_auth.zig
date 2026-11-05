@@ -32,6 +32,9 @@ pub const Error = config.Error || error{
     ActorExpired,
     DefaultEoaRevoked,
     NestedSignatureScope,
+    StaleEpoch,
+    BadSequence,
+    SequenceSaturated,
     SenderRecovery,
     PayerRecovery,
     UnexpectedPayerAuth,
@@ -398,6 +401,86 @@ fn verify_sender(
     return .{ .account = account, .resolved = resolved };
 }
 
+/// Typehashes of the signed account-changes struct and its leaves (base `config.rs`).
+const signed_account_changes_typehash = hex32(
+    "bee0c72c3efba751405b4c241f52736439f7e1e2a804925d36ddc9a6e1aa3614",
+);
+const account_change_typehash = hex32(
+    "681f8ef00ffa856a78cc6a384ed51300e5805fdf59f4567ee51634dc39e0cb43",
+);
+
+fn hex32(comptime text: []const u8) [32]u8 {
+    var bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch unreachable; // Comptime-known valid hex.
+    return bytes;
+}
+
+/// Authorize a signed config-change batch against the in-memory batch `current` state:
+/// the channel sequence must match, and the signer must be an admin (Config scope).
+pub fn authorize_changes(
+    store: Store,
+    account: Address,
+    local_chain_id: u64,
+    change: eip8130.ConfigChange,
+    now: u64,
+    current: AccountState,
+) Error!ResolvedActor {
+    try check_channel_sequence(change, current);
+    const digest = changes_digest(account, local_chain_id, change);
+    const lookup = Lookup{
+        .store = store,
+        .account = account,
+        .now = now,
+        .account_state = current,
+    };
+    const resolved = try authenticate(lookup, digest, change.signature);
+    if (!resolved.is_granted(.config)) return error.ScopeDenied;
+    return resolved;
+}
+
+fn check_channel_sequence(change: eip8130.ConfigChange, current: AccountState) Error!void {
+    switch (change.channel) {
+        .local => {
+            const epoch: u32 = @truncate(change.sequence >> 32);
+            const sequence: u32 = @truncate(change.sequence);
+            if (epoch != current.local_epoch) return error.StaleEpoch;
+            if (sequence == eip8130.unsequenced) return;
+            if (sequence != current.local_sequence) return error.BadSequence;
+            if (sequence >= eip8130.unsequenced - 1) return error.SequenceSaturated;
+        },
+        .multichain => {
+            if (change.sequence != current.multichain_sequence) return error.BadSequence;
+            if (change.sequence == std.math.maxInt(u64)) return error.SequenceSaturated;
+        },
+    }
+}
+
+/// keccak256(TYPEHASH, account, chainId (0 on the multichain channel), sequence,
+/// keccak256(concat(keccak256(LEAF_TYPEHASH, op, keccak256(payload))))).
+pub fn changes_digest(account: Address, local_chain_id: u64, change: eip8130.ConfigChange) B256 {
+    const chain_id: u64 = if (change.channel == .local) local_chain_id else 0;
+    var packed_hasher = std.crypto.hash.sha3.Keccak256.init(.{});
+    var changes = change.changes.iterator();
+    var count: u32 = 0;
+    while (changes.next()) |item| : (count += 1) {
+        assert(count < eip8130.max_config_changes_per_tx * eip8130.max_actor_changes_per_config);
+        var leaf: [96]u8 = @splat(0);
+        leaf[0..32].* = account_change_typehash;
+        leaf[63] = @backingInt(item.change_type);
+        leaf[64..96].* = crypto.keccak256(item.payload);
+        packed_hasher.update(&crypto.keccak256(&leaf));
+    }
+    var changes_hash: [32]u8 = undefined;
+    packed_hasher.final(&changes_hash);
+    var outer: [160]u8 = @splat(0);
+    outer[0..32].* = signed_account_changes_typehash;
+    outer[44..64].* = account;
+    std.mem.writeInt(u64, outer[88..96], chain_id, .big);
+    std.mem.writeInt(u64, outer[120..128], change.sequence, .big);
+    outer[128..160].* = changes_hash;
+    return crypto.keccak256(&outer);
+}
+
 const testing = std.testing;
 const memory_db = @import("memory_db.zig");
 const state_module = @import("state.zig");
@@ -407,12 +490,6 @@ const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 /// Hardhat/anvil dev accounts 0 and 1 (publicly known keys).
 const dev_key_0 = hex32("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 const dev_key_1 = hex32("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
-
-fn hex32(comptime text: []const u8) [32]u8 {
-    var bytes: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, text) catch unreachable; // Comptime-known valid hex.
-    return bytes;
-}
 
 fn k1_address(private_key: [32]u8) !Address {
     const raw = try sign_k1(private_key, @splat(1));
@@ -658,4 +735,49 @@ test "eip8130 auth: seeded fuzz never accepts corrupted auth blobs" {
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "eip8130 auth: config changes need the channel sequence and an admin signature" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const account = try k1_address(dev_key_0);
+    const items = [1]eip8130.SignedChange{.{ .change_type = .lock, .payload = "p" }};
+    var buffer: [64]u8 = undefined;
+    var change = eip8130.ConfigChange{
+        .channel = .local,
+        .sequence = 0,
+        .changes = eip8130.SignedChanges.build(&buffer, &items),
+        .signature = &.{},
+    };
+    var auth: [85]u8 = undefined;
+    auth[0..20].* = k1_authenticator;
+    auth[20..85].* = try sign_k1(dev_key_0, changes_digest(account, 8453, change));
+    change.signature = &auth;
+    const current = try fixture.store().account_state(account);
+    const resolved = try authorize_changes(fixture.store(), account, 8453, change, 1, current);
+    try testing.expect(resolved.is_admin());
+    try testing.expectError(
+        error.AuthenticatorMismatch,
+        authorize_changes(fixture.store(), account, 10, change, 1, current),
+    );
+    var stale = change;
+    stale.sequence = 1 << 32;
+    try testing.expectError(
+        error.StaleEpoch,
+        authorize_changes(fixture.store(), account, 8453, stale, 1, current),
+    );
+    var multichain = change;
+    multichain.channel = .multichain;
+    multichain.sequence = 3;
+    try testing.expectError(
+        error.BadSequence,
+        authorize_changes(fixture.store(), account, 8453, multichain, 1, current),
+    );
+    var scoped = current;
+    scoped.default_eoa_scope = eip8130.scope_operator;
+    try testing.expectError(
+        error.ScopeDenied,
+        authorize_changes(fixture.store(), account, 8453, change, 1, scoped),
+    );
 }
