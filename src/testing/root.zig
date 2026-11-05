@@ -7,6 +7,7 @@ pub const Prng = prng.Prng;
 pub const fuzz = @import("fuzz.zig");
 pub const sim = @import("sim/root.zig");
 pub const bench = @import("bench.zig");
+pub const fuzz_targets = @import("fuzz_targets.zig");
 
 test {
     std.testing.refAllDecls(@This());

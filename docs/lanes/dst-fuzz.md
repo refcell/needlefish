@@ -13,6 +13,9 @@ provably robust.
 - [x] Tidy extensions: function length ≤ 70 lines check, assert density report.
 
 ## Decisions
+- Cross-lane fuzz targets live in `src/testing/fuzz_targets.zig` (our lane) so we never
+  edit other lanes' files to add them. They test properties (canonical round trip,
+  model equivalence, tamper resistance), not just "does not crash".
 - Swarm runs in-process (`simulator swarm FIRST COUNT`), ~1 ms/seed in ReleaseSafe.
   Failing seeds: `just sim-minimize SEED`, fix, then append to
   `sim/swarm.zig:regression_seeds`.
@@ -36,3 +39,5 @@ provably robust.
 - 2026-11-05: swarm runner + greedy minimizer + regression seed list; batcher model
   interval fixed (minimizer showed fault-free liveness relied on resubmits); CI swarm/fuzz jobs.
 - 2026-11-05: bench harness (calibrated, best-of-5, MB/s) over lane case tables; docs/PERF.md baseline.
+- 2026-11-05: fuzz audit pass 1: tx canonical round trip (+network form), channel
+  reassembly vs model, trie proof tamper + garbage. Uncovered list: re-audit as lanes land.

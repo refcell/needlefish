@@ -1,0 +1,262 @@
+//! Cross-lane fuzz targets owned by the dst-fuzz lane.
+//!
+//! Lanes keep fuzz tests next to their code; this file adds targets for public APIs
+//! that the audit found uncovered, checking properties that span modules:
+//!   - transactions: any accepted encoding is canonical (re-encodes byte-identical),
+//!     including the block-body (network) wrapping, and hashing never fails.
+//!   - channels: frame reassembly matches a reference model; rejected frames leave the
+//!     channel unchanged.
+//!   - trie proofs: a proof tampered anywhere never verifies to a different value, and
+//!     arbitrary proof bytes never crash the verifier.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Smith = std.testing.Smith;
+const fuzz = @import("fuzz.zig");
+const tx_module = @import("../common/consensus/tx.zig");
+const rlp = @import("../common/rlp/root.zig");
+const channel_module = @import("../consensus/protocol/channel.zig");
+const frame_module = @import("../consensus/protocol/frame.zig");
+const trie_module = @import("../execution/trie/trie.zig");
+const proof_module = @import("../execution/trie/proof.zig");
+const Signature = @import("../common/consensus/signature.zig").Signature;
+const BlockInfo = @import("../consensus/protocol/block.zig").BlockInfo;
+
+const Envelope = tx_module.Envelope;
+const tx_bytes_max = 2048;
+
+fn random_kind(smith: *Smith) tx_module.TxKind {
+    if (smith.value(bool)) return .create;
+    var to: tx_module.TxKind = .{ .call = undefined };
+    smith.bytes(&to.call.bytes);
+    return to;
+}
+
+/// A structurally valid envelope from fuzz input, so mutations start near valid inputs.
+fn random_envelope(smith: *Smith, input: []const u8) Envelope {
+    const signature: Signature = .{
+        .y_parity = smith.value(bool),
+        .r = smith.value(u256),
+        .s = smith.value(u256),
+    };
+    return switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => .{ .legacy = .{ .signature = signature, .tx = .{
+            .chain_id = if (smith.value(bool)) smith.value(u64) >> 2 else null,
+            .nonce = smith.value(u64),
+            .gas_price = smith.value(u128),
+            .gas_limit = smith.value(u64),
+            .to = random_kind(smith),
+            .value = smith.value(u256),
+            .input = input,
+        } } },
+        1 => .{ .eip1559 = .{ .signature = signature, .tx = .{
+            .chain_id = smith.value(u64),
+            .nonce = smith.value(u64),
+            .max_priority_fee_per_gas = smith.value(u128),
+            .max_fee_per_gas = smith.value(u128),
+            .gas_limit = smith.value(u64),
+            .to = random_kind(smith),
+            .value = smith.value(u256),
+            .input = input,
+            .access_list = .empty,
+        } } },
+        else => .{ .deposit = .{
+            .source_hash = .{ .bytes = @splat(smith.value(u8)) },
+            .from = .{ .bytes = @splat(smith.value(u8)) },
+            .to = random_kind(smith),
+            .mint = smith.value(u128),
+            .value = smith.value(u256),
+            .gas_limit = smith.value(u64),
+            .is_system_transaction = smith.value(bool),
+            .input = input,
+        } },
+    };
+}
+
+/// Accepted encodings must be canonical: decode then encode returns the same bytes.
+fn check_tx_canonical(encoded: []const u8) !void {
+    const envelope = Envelope.decode(encoded) catch return;
+    try std.testing.expectEqual(encoded.len, envelope.encoded_length());
+    var buffer: [tx_bytes_max * 2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, encoded, envelope.encode_to(&buffer));
+    _ = envelope.hash();
+
+    var network_buffer: [tx_bytes_max * 2]u8 = undefined;
+    var encoder = rlp.Encoder.init(&network_buffer);
+    envelope.encode_network(&encoder);
+    const network = encoder.written();
+    try std.testing.expectEqual(envelope.network_length(), network.len);
+    var decoder = rlp.Decoder.init(network);
+    const again = try Envelope.decode_network(&decoder);
+    try std.testing.expect(decoder.is_empty());
+    try std.testing.expectEqualSlices(u8, encoded, again.encode_to(&buffer));
+}
+
+fn fuzz_tx(_: void, smith: *Smith) anyerror!void {
+    var buffer: [tx_bytes_max]u8 = undefined;
+    if (smith.value(bool)) {
+        const len = smith.slice(&buffer);
+        return check_tx_canonical(buffer[0..len]);
+    }
+    var input_buffer: [64]u8 = undefined;
+    const input = input_buffer[0..smith.slice(&input_buffer)];
+    const envelope = random_envelope(smith, input);
+    const encoded = envelope.encode_to(&buffer);
+    // The unmodified encoding must decode: the encoder only emits canonical forms.
+    _ = try Envelope.decode(encoded);
+    try check_tx_canonical(encoded);
+    var flips: u32 = 0;
+    while (flips < 4 and !smith.eosWeightedSimple(1, 1)) : (flips += 1) {
+        encoded[smith.index(encoded.len)] = smith.value(u8);
+    }
+    const cut = smith.valueRangeAtMost(u32, 0, @intCast(encoded.len));
+    try check_tx_canonical(encoded[0..cut]);
+    try check_tx_canonical(encoded);
+}
+
+test "fuzz_targets: tx decode is canonical" {
+    try fuzz.run({}, fuzz_tx, .{ .iterations = 2048, .input_size_max = 1024 });
+}
+
+const frame_numbers = 16;
+const frame_data_max = 24;
+
+const ChannelModel = struct {
+    data: [frame_numbers][frame_data_max]u8 = undefined,
+    lengths: [frame_numbers]u8 = @splat(0),
+};
+
+fn fuzz_channel(_: void, smith: *Smith) anyerror!void {
+    const allocator = std.testing.allocator;
+    const id: frame_module.ChannelId = @splat(0x11);
+    var channel = channel_module.Channel.init(id, .{});
+    defer channel.deinit(allocator);
+    var model: ChannelModel = .{};
+    var step: u32 = 0;
+    while (step < 64 and !smith.eosWeightedSimple(15, 1)) : (step += 1) {
+        var data: [frame_data_max]u8 = undefined;
+        const len = smith.slice(&data);
+        const frame: frame_module.Frame = .{
+            .id = if (smith.boolWeighted(15, 1)) @splat(0x22) else id,
+            .number = smith.valueRangeLessThan(u16, 0, frame_numbers),
+            .data = data[0..len],
+            .is_last = smith.boolWeighted(5, 1),
+        };
+        const count_before = channel.frame_count();
+        const size_before = channel.estimated_size;
+        const l1_block: BlockInfo = .{ .number = smith.value(u8) };
+        if (channel.add_frame(allocator, frame, l1_block)) {
+            try std.testing.expect(channel.inputs.contains(frame.number));
+            @memcpy(model.data[frame.number][0..len], frame.data);
+            model.lengths[frame.number] = @intCast(len);
+        } else |err| {
+            try std.testing.expect(err != error.OutOfMemory);
+            try std.testing.expectEqual(count_before, channel.frame_count());
+            try std.testing.expectEqual(size_before, channel.estimated_size);
+        }
+        try check_channel(&channel, &model);
+    }
+}
+
+fn check_channel(channel: *const channel_module.Channel, model: *const ChannelModel) !void {
+    var size: u64 = 0;
+    var contiguous = true;
+    var number: u16 = 0;
+    while (number < frame_numbers) : (number += 1) {
+        const present = channel.inputs.contains(number);
+        if (present) size += model.lengths[number] + frame_module.Frame.size_overhead;
+        if (channel.closed and number <= channel.last_frame_number and !present) {
+            contiguous = false;
+        }
+        if (channel.closed and number > channel.last_frame_number) {
+            try std.testing.expect(!present); // Frames past the end are pruned.
+        }
+    }
+    try std.testing.expectEqual(size, channel.estimated_size);
+    try std.testing.expectEqual(channel.closed and contiguous, channel.is_ready());
+    if (!channel.is_ready()) return;
+    var out: [frame_numbers * frame_data_max]u8 = undefined;
+    const joined = channel.frame_data(&out);
+    var offset: usize = 0;
+    number = 0;
+    while (number <= channel.last_frame_number) : (number += 1) {
+        const expected = model.data[number][0..model.lengths[number]];
+        try std.testing.expectEqualSlices(u8, expected, joined[offset..][0..expected.len]);
+        offset += expected.len;
+    }
+    try std.testing.expectEqual(offset, joined.len);
+}
+
+test "fuzz_targets: channel reassembly matches model" {
+    try fuzz.run({}, fuzz_channel, .{ .iterations = 1024 });
+}
+
+const Trie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 32 });
+
+const TrieContext = struct { trie: *Trie, proof: *Trie.Proof };
+
+fn fuzz_proof(context: TrieContext, smith: *Smith) anyerror!void {
+    const trie = context.trie;
+    trie.clear();
+    var key: [3]u8 = undefined;
+    var count: u32 = 0;
+    while (count < 48 and !smith.eosWeightedSimple(7, 1)) : (count += 1) {
+        // Small alphabet: shared prefixes create extensions and branches.
+        key = .{ smith.value(u8) & 0x33, smith.value(u8) & 0x1f, smith.value(u8) };
+        var value: [32]u8 = undefined;
+        const len = @max(1, smith.slice(&value));
+        try trie.put(&key, value[0..len]);
+    }
+    if (smith.value(bool)) key[2] ^= 0x80; // Probe an exclusion proof sometimes.
+    const root = trie.root_hash();
+    trie.prove(&key, context.proof);
+    var nodes: [Trie.depth_max][]u8 = undefined;
+    const proof = context.proof;
+    for (0..proof.count) |index| {
+        nodes[index] = @constCast(proof.node_at(@intCast(index)));
+    }
+    const view: []const []const u8 = nodes[0..proof.count];
+    const expected = try proof_module.verify(root, &key, view);
+    if (trie.get(&key)) |value| {
+        try std.testing.expectEqualSlices(u8, value, expected.?);
+    } else try std.testing.expect(expected == null);
+    if (proof.count == 0) return;
+    // Tamper with one byte: verification must fail or return the honest answer.
+    const node_index = smith.index(proof.count);
+    const node = nodes[node_index];
+    const byte_index = smith.index(node.len);
+    const original = node[byte_index];
+    node[byte_index] = original ^ (smith.value(u8) | 1);
+    defer node[byte_index] = original;
+    const tampered = proof_module.verify(root, &key, view) catch return;
+    try std.testing.expect(tampered == null and expected == null or
+        (tampered != null and expected != null and std.mem.eql(u8, tampered.?, expected.?)));
+}
+
+fn fuzz_proof_garbage(_: void, smith: *Smith) anyerror!void {
+    var storage: [4][128]u8 = undefined;
+    var nodes: [4][]const u8 = undefined;
+    const count = smith.valueRangeAtMost(u32, 0, nodes.len);
+    for (nodes[0..count], storage[0..count]) |*node, *bytes| node.* = bytes[0..smith.slice(bytes)];
+    var root: [32]u8 = undefined;
+    // Root of the first node half the time, so the verifier gets past the hash check.
+    if (count > 0 and smith.value(bool)) {
+        std.crypto.hash.sha3.Keccak256.hash(nodes[0], &root, .{});
+    } else smith.bytes(&root);
+    var key: [33]u8 = undefined;
+    const key_len = smith.slice(&key);
+    _ = proof_module.verify(root, key[0..key_len], nodes[0..count]) catch {};
+}
+
+test "fuzz_targets: tampered trie proofs never lie" {
+    const allocator = std.testing.allocator;
+    var trie = try Trie.init(allocator, 1024);
+    defer trie.deinit(allocator);
+    const proof = try allocator.create(Trie.Proof);
+    defer allocator.destroy(proof);
+    try fuzz.run(TrieContext{ .trie = &trie, .proof = proof }, fuzz_proof, .{ .iterations = 512 });
+}
+
+test "fuzz_targets: trie proof verifier survives garbage" {
+    try fuzz.run({}, fuzz_proof_garbage, .{ .iterations = 2048 });
+}
