@@ -13,6 +13,7 @@ pub const transport = @import("transport.zig");
 pub const options = @import("options.zig");
 pub const network = @import("network.zig");
 pub const rpc = @import("rpc.zig");
+pub const metrics = @import("metrics.zig");
 
 test {
     std.testing.refAllDecls(@This());

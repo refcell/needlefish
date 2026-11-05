@@ -46,6 +46,13 @@ behind a small interface and switch later.
   after it is sent (2 s linger cap). Service disconnects (bans) are graceful.
 - [x] ~~`libp2p`: backpressure instead of `buffer_overflow`~~ won't do: only a peer flooding stream negotiation can fill the outbound buffers (the transport flushes after every receive), and closing that peer is the right response.
 - [x] `rpc.zig`: the 18 `opp2p_*` admin methods over `Service` for `utilities/rpc.Router` (base/base shapes; untracked fields reported as zero; blockPeer also disconnects).
+- [x] `metrics.zig`: base/base `base_node_*` gossip/discovery metrics (peer counts, per-version
+  topic peers/mesh/subscribed, connections, block validation, bytes) mirrored from `Stats`
+  by `Metrics.update` / `Network.update_metrics`; hot paths stay atomic-free.
+- [ ] RPC peer info: fill `userAgent`, `protocolVersion`, `protocols`, `addresses`, and
+  `latency` from the transport's identify and ping state (needs a per-peer info hook).
+- [ ] Perf: ChaCha20 now dominates the AEAD (2260 MB/s vs Poly1305 4006 MB/s); try 16-block
+  passes or interleaved rounds on NEON.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
@@ -252,3 +259,4 @@ behind a small interface and switch later.
 - 2026-11-05: opp2p admin RPC; backpressure closed as won't-do.
 - 2026-11-05: transport uses io shutdown_now before close.
 - 2026-11-05: Poly1305 vector path measured (+8%) and dropped; std kept.
+- 2026-11-05: p2p Prometheus metrics.

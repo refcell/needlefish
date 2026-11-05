@@ -14,14 +14,14 @@ const Prng = @import("../../testing/prng.zig").Prng;
 const Service = service_module.Service;
 const testing = std.testing;
 
-const Fixture = struct {
+pub const Fixture = struct {
     rollup: rollup_config.RollupConfig,
     prng: Prng,
     service: *Service,
     peers: [2]peer_id.PeerId,
     buffer: [16 * 1024]u8 = undefined,
 
-    fn init(fixture: *Fixture) !void {
+    pub fn init(fixture: *Fixture) !void {
         fixture.rollup = .{ .l2_chain_id = 8453 };
         fixture.rollup.upgrades.set(.ecotone, 0);
         fixture.prng = Prng.init(9);
@@ -55,11 +55,11 @@ const Fixture = struct {
         }
     }
 
-    fn deinit(fixture: *Fixture) void {
+    pub fn deinit(fixture: *Fixture) void {
         fixture.service.destroy(testing.allocator);
     }
 
-    fn call(fixture: *Fixture, body: []const u8) []const u8 {
+    pub fn call(fixture: *Fixture, body: []const u8) []const u8 {
         var out: std.Io.Writer = .fixed(&fixture.buffer);
         _ = p2p_rpc.Router.handle(fixture.service, body, &out);
         return out.buffered();

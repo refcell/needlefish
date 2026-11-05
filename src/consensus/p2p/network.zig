@@ -3,6 +3,7 @@
 //! and signs the local ENR, and seeds bootnodes (the chain's public list by default,
 //! base/base behavior). ENR bootnodes seed discovery; enode bootnodes are dialed directly.
 
+const metrics_module = @import("metrics.zig");
 const std = @import("std");
 const assert = std.debug.assert;
 const io_module = @import("../../utilities/io/root.zig");
@@ -255,6 +256,19 @@ pub fn Network(comptime IO: type) type {
 
         pub fn peer_count(self: *const Self) u32 {
             return self.service.connected_count();
+        }
+
+        /// Copies service and transport state into `metrics` (call before each scrape).
+        pub fn update_metrics(self: *const Self, metrics: *metrics_module.Metrics) void {
+            const stats = self.transport.stats;
+            metrics.update(self.service, .{
+                .accepted = stats.accepted,
+                .dialed = stats.dialed,
+                .dial_failures = stats.dial_failures,
+                .closed = stats.closed,
+                .bytes_received = stats.bytes_received,
+                .bytes_sent = stats.bytes_sent,
+            });
         }
     };
 }

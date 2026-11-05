@@ -53,6 +53,7 @@ pub const Stats = struct {
     rejected: u64 = 0,
     ignored: u64 = 0,
     accepted_dropped: u64 = 0,
+    published: u64 = 0,
 };
 
 pub const BlockGossip = struct {
@@ -240,7 +241,9 @@ pub const BlockGossip = struct {
         );
         // Remember our own block so echoes of it count as duplicates at this height.
         gossip.validator.seen.insert(payload.block_number, payload.block_hash);
-        return gossip.router.publish(topic, message, now_ns);
+        const id = try gossip.router.publish(topic, message, now_ns);
+        gossip.stats.published += 1;
+        return id;
     }
 
     pub fn heartbeat(gossip: *BlockGossip, now_ns: u64) void {
