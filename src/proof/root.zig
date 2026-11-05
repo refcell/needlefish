@@ -13,6 +13,7 @@ pub const host = @import("host/root.zig");
 pub const contracts = @import("contracts/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const proposer = @import("proposer/root.zig");
+pub const challenger = @import("challenger/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
