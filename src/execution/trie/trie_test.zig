@@ -271,3 +271,72 @@ test "trie: fuzz put, delete, and incremental root" {
     defer fresh.deinit(testing.allocator);
     try testing.fuzz(FuzzContext{ .trie = &trie, .fresh = &fresh }, fuzz_operations, .{});
 }
+
+const TrieSerial = trie_module.TrieType(.{
+    .key_bytes_max = 32,
+    .value_size_max = 128,
+    .hash_batched = false,
+});
+
+/// Applies one random put or delete to root `which` of both tries.
+fn apply_random_operation(
+    prng: *Prng,
+    batched: *Trie,
+    serial: *TrieSerial,
+    roots_batched: []Trie.NodeIndex,
+    roots_serial: []TrieSerial.NodeIndex,
+    key_space: u64,
+) !void {
+    const which = prng.below(roots_batched.len);
+    const entry = random_entry(prng, key_space);
+    // Short and long values mix embedded (< 32 byte) and hashed nodes in one level.
+    const value_len = if (prng.chance(1, 2)) prng.range(1, 4) else entry.value_len;
+    const value = entry.value[0..value_len];
+    if (prng.chance(1, 3)) {
+        const removed = batched.delete_in(&roots_batched[which], &entry.key);
+        try testing.expectEqual(removed, serial.delete_in(&roots_serial[which], &entry.key));
+    } else {
+        try batched.put_in(&roots_batched[which], &entry.key, value);
+        try serial.put_in(&roots_serial[which], &entry.key, value);
+    }
+}
+
+test "trie: seeded differential of batched against serial hashing, multi-root" {
+    var prng = Prng.init(0xba7c4);
+    var batched = try Trie.init(testing.allocator, 8192);
+    defer batched.deinit(testing.allocator);
+    var serial = try TrieSerial.init(testing.allocator, 8192);
+    defer serial.deinit(testing.allocator);
+    var round: u32 = 0;
+    while (round < 40) : (round += 1) {
+        batched.clear();
+        serial.clear();
+        var roots_batched: [5]Trie.NodeIndex = @splat(Trie.none);
+        var roots_serial: [5]TrieSerial.NodeIndex = @splat(TrieSerial.none);
+        const root_count = prng.range(1, roots_batched.len);
+        const key_space: u64 = if (prng.chance(1, 2)) 0 else prng.range(1, 300);
+        const operations = prng.range(1, 1200);
+        var operation: u32 = 0;
+        while (operation < operations) : (operation += 1) {
+            try apply_random_operation(
+                &prng,
+                &batched,
+                &serial,
+                roots_batched[0..root_count],
+                roots_serial[0..root_count],
+                key_space,
+            );
+            if (!prng.chance(1, 64)) continue;
+            // Rehash all roots in one batched pass, or one root at a time.
+            if (prng.chance(1, 2)) batched.update_caches(roots_batched[0..root_count]);
+            for (roots_batched[0..root_count], roots_serial[0..root_count]) |a, b| {
+                try testing.expectEqual(serial.root_hash_of(b), batched.root_hash_of(a));
+            }
+        }
+        batched.update_caches(roots_batched[0..root_count]);
+        for (roots_batched[0..root_count], roots_serial[0..root_count]) |a, b| {
+            try testing.expectEqual(serial.root_hash_of(b), batched.root_hash_of(a));
+        }
+        try testing.expectEqual(serial.node_count(), batched.node_count());
+    }
+}

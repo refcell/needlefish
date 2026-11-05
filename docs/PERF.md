@@ -33,6 +33,16 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | trie/ordered root 200x200B | 70 763 | tx/receipt root shape |
 | trie/state block 1k accounts | 2 013 084 | StateTrie, 100k accounts |
 
+## 2026-11-05 trie batch keccak (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+Dirty nodes are rehashed level by level (deepest first) and equal-length encodings go through
+`keccak256_batch` (2 lanes on NEON). Same machine, same session, interleaved runs.
+
+| Case | before ns/op | after ns/op | Change |
+| --- | ---: | ---: | --- |
+| trie/block 1k puts+root on 100k | 1 730 830 | 1 308 295 | -24% (after runs 1.31-1.41 ms) |
+| trie/state block 1k accounts | 1 977 875 | 1 602 292 | -19% (after runs 1.60-1.65 ms) |
+
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 | Case | ns/op | MB/s | Notes |

@@ -15,8 +15,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
 - [x] Real storage backend over `utilities.io` (io_uring/kqueue): `db/storage/io_storage.zig`.
 - [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
-- [ ] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
-  `update_cache`; compact node layout (packed paths, out-of-line values).
+- [x] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
+  `update_cache`.
+- [ ] Compact node layout (packed paths, out-of-line values).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -76,6 +77,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   retried without re-testing only when B..origin/main touches none of trie/db/evm/common/
   build.zig/base.zig (tidy still runs); anything else re-tests.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
+- Batched rehash: `TrieType` collects dirty nodes with their depth (explicit stack), hashes
+  deepest level first, sorts each level by encoding length, and feeds equal-length encodings of
+  32+ bytes to `keccak256_batch` (leftovers hash singly). Scratch is one `u64` per pool node,
+  allocated at init. `update_caches(roots)` batches across tries of one pool; `StateTrie.flush`
+  uses it for all dirty storage tries. `Config.hash_batched = false` keeps the old post-order
+  walk as the fuzz reference. Kept because block roots got 19-24% faster (docs/PERF.md).
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -96,3 +103,4 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
 - 2026-11-05: IoStorage over utilities.io; engine end to end over a short-IO double, SimIo
   (16 crash seeds), and kqueue/io_uring on a real temp file.
+- 2026-11-05: batch keccak in the trie rehash: 1k-account state block 1.98 -> 1.60 ms.

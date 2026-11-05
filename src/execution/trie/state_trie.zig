@@ -74,6 +74,8 @@ pub const StateTrie = struct {
     accounts_max: u32,
     dirty: []Hash,
     dirty_len: u32 = 0,
+    /// Storage roots of dirty accounts, rehashed together so their nodes share hash batches.
+    storage_roots: []StorageTrie.NodeIndex,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateTrie {
         assert(config.accounts_max > 0);
@@ -86,16 +88,20 @@ pub const StateTrie = struct {
         try entries.ensureTotalCapacity(allocator, config.accounts_max);
         errdefer entries.deinit(allocator);
         const dirty = try allocator.alloc(Hash, config.dirty_accounts_max);
+        errdefer allocator.free(dirty);
+        const storage_roots = try allocator.alloc(StorageTrie.NodeIndex, config.dirty_accounts_max);
         return .{
             .accounts = accounts,
             .storage = storage,
             .entries = entries,
             .accounts_max = config.accounts_max,
             .dirty = dirty,
+            .storage_roots = storage_roots,
         };
     }
 
     pub fn deinit(self: *StateTrie, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage_roots);
         allocator.free(self.dirty);
         self.entries.deinit(allocator);
         self.storage.deinit(allocator);
@@ -202,10 +208,26 @@ pub const StateTrie = struct {
         return std.mem.order(u8, &a, &b) == .lt;
     }
 
+    /// Rehashes the storage tries of the sorted `dirty` accounts in one batched pass.
+    fn update_storage_caches(self: *StateTrie, dirty: []const Hash) void {
+        assert(dirty.len <= self.storage_roots.len);
+        var count: u32 = 0;
+        for (dirty, 0..) |address_hash, index| {
+            if (index > 0 and std.mem.eql(u8, &dirty[index - 1], &address_hash)) continue;
+            const entry = self.entries.getPtr(address_hash) orelse continue;
+            if (entry.storage_root == StorageTrie.none) continue;
+            self.storage_roots[count] = entry.storage_root;
+            count += 1;
+        }
+        assert(count <= dirty.len);
+        self.storage.update_caches(self.storage_roots[0..count]);
+    }
+
     /// Applies every dirty account to the account trie without hashing the account trie.
     pub fn flush(self: *StateTrie) Error!void {
         const dirty = self.dirty[0..self.dirty_len];
         std.mem.sort(Hash, dirty, {}, hash_less_than);
+        self.update_storage_caches(dirty);
         for (dirty, 0..) |address_hash, index| {
             if (index > 0 and std.mem.eql(u8, &dirty[index - 1], &address_hash)) continue;
             const entry = self.entries.getPtr(address_hash) orelse {

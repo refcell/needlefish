@@ -13,6 +13,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const node = @import("node.zig");
+const rlp = @import("rlp.zig");
+const keccak = @import("../../common/crypto/keccak.zig");
 const nibbles_module = @import("nibbles.zig");
 const Nibbles = nibbles_module.Nibbles;
 const RlpNode = node.RlpNode;
@@ -21,6 +23,10 @@ const Hash = node.Hash;
 pub const Config = struct {
     key_bytes_max: u32 = 32,
     value_size_max: u32 = 128,
+    /// Rehash dirty nodes level by level with `keccak256_batch` (deepest level first). When
+    /// false, a post-order walk hashes one node at a time; that path is the reference the
+    /// batched one is fuzzed against.
+    hash_batched: bool = true,
 };
 
 pub const Error = error{TrieFull};
@@ -104,17 +110,29 @@ pub fn TrieType(comptime config: Config) type {
         free_head: NodeIndex,
         free_count: u32,
         root: NodeIndex = none,
+        /// Scratch for the batched rehash: one `key << 32 | index` entry per dirty node, keyed
+        /// first by depth, then by encoding length. Empty when hashing is not batched.
+        order: []u64,
 
         pub fn init(allocator: std.mem.Allocator, node_count_max: u32) !Self {
             assert(node_count_max >= nodes_per_insert_max);
             assert(node_count_max < none);
             const nodes = try allocator.alloc(Node, node_count_max);
-            var self: Self = .{ .nodes = nodes, .free_head = none, .free_count = 0 };
+            errdefer allocator.free(nodes);
+            const order_len: u32 = if (config.hash_batched) node_count_max else 0;
+            const order = try allocator.alloc(u64, order_len);
+            var self: Self = .{
+                .nodes = nodes,
+                .free_head = none,
+                .free_count = 0,
+                .order = order,
+            };
             self.clear();
             return self;
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.order);
             allocator.free(self.nodes);
             self.* = undefined;
         }
@@ -464,8 +482,21 @@ pub fn TrieType(comptime config: Config) type {
 
         pub fn root_hash_of(self: *Self, root: NodeIndex) Hash {
             if (root == none) return node.empty_root;
-            self.update_cache(root);
+            self.update_caches(&.{root});
             return self.nodes[root].cached.root_hash();
+        }
+
+        /// Fills every dirty cache below `roots`, distinct roots of tries in this pool, so
+        /// their dirty nodes share hash batches. Later `root_hash_of` calls are then free.
+        pub fn update_caches(self: *Self, roots: []const NodeIndex) void {
+            if (config.hash_batched) {
+                self.update_caches_batched(roots);
+            } else {
+                for (roots) |root| {
+                    if (root != none) self.update_cache(root);
+                }
+            }
+            for (roots) |root| assert(root == none or self.nodes[root].cached.len > 0);
         }
 
         /// Frees every node of the trie rooted at `root` and empties it.
@@ -525,6 +556,136 @@ pub fn TrieType(comptime config: Config) type {
                 current.cached = self.encode_ref(current);
                 assert(current.cached.len > 0);
                 stack_len -= 1;
+            }
+        }
+
+        /// Rehashes every dirty node below `roots`, deepest level first: a node depends only
+        /// on its children, which sit one level deeper, so a level's nodes are independent.
+        fn update_caches_batched(self: *Self, roots: []const NodeIndex) void {
+            const count = self.collect_dirty(roots);
+            const order = self.order[0..count];
+            std.sort.pdq(u64, order, {}, std.sort.asc(u64));
+            var end: usize = count;
+            var levels: u32 = 0;
+            while (end > 0) : (levels += 1) {
+                assert(levels <= depth_max);
+                const depth = order[end - 1] >> 32;
+                var start = end - 1;
+                while (start > 0 and order[start - 1] >> 32 == depth) start -= 1;
+                self.hash_level(order[start..end]);
+                end = start;
+            }
+        }
+
+        /// Writes `depth << 32 | index` into `order` for every dirty node below `roots`.
+        fn collect_dirty(self: *Self, roots: []const NodeIndex) u32 {
+            var stack: [depth_max * 16]u64 = undefined;
+            var count: u32 = 0;
+            for (roots) |root| {
+                if (root == none or self.nodes[root].cached.len > 0) continue;
+                stack[0] = root;
+                var stack_len: u32 = 1;
+                while (stack_len > 0) {
+                    stack_len -= 1;
+                    const entry = stack[stack_len];
+                    const index: NodeIndex = @truncate(entry);
+                    const child_depth = (entry >> 32) + 1;
+                    assert(child_depth <= depth_max);
+                    assert(count < self.order.len);
+                    self.order[count] = entry;
+                    count += 1;
+                    const current = &self.nodes[index];
+                    assert(current.cached.len == 0);
+                    const children: []const NodeIndex = switch (current.kind) {
+                        .free => unreachable, // Reachable nodes are never on the free list.
+                        .leaf => &.{},
+                        .extension => (&current.child)[0..1],
+                        .branch => &current.children,
+                    };
+                    for (children) |child| {
+                        if (child == none or self.nodes[child].cached.len > 0) continue;
+                        assert(stack_len < stack.len);
+                        stack[stack_len] = child_depth << 32 | child;
+                        stack_len += 1;
+                    }
+                }
+            }
+            assert(count <= self.nodes.len);
+            return count;
+        }
+
+        /// Hashes one level. Sorting by encoding length puts equal-length encodings next to
+        /// each other, the input shape `keccak256_batch` requires.
+        fn hash_level(self: *Self, level: []u64) void {
+            assert(level.len > 0);
+            for (level) |*entry| {
+                const index: NodeIndex = @truncate(entry.*);
+                const length = self.encoded_length(&self.nodes[index]);
+                assert(length > 0 and length <= node_bytes_max);
+                entry.* = length << 32 | index;
+            }
+            std.sort.pdq(u64, level, {}, std.sort.asc(u64));
+            var start: usize = 0;
+            while (start < level.len) {
+                const length = level[start] >> 32;
+                var end = start + 1;
+                while (end < level.len and level[end] >> 32 == length) end += 1;
+                self.hash_run(level[start..end], length);
+                start = end;
+            }
+        }
+
+        /// Hashes nodes whose encodings are all `length` bytes, `batch_width` at a time.
+        fn hash_run(self: *Self, run: []const u64, length: u64) void {
+            assert(run.len > 0);
+            var start: usize = 0;
+            if (length >= 32) {
+                var buffers: [keccak.batch_width][node_bytes_max]u8 = undefined;
+                var inputs: [keccak.batch_width][]const u8 = undefined;
+                var digests: [keccak.batch_width]keccak.Digest = undefined;
+                while (run.len - start >= keccak.batch_width) : (start += keccak.batch_width) {
+                    for (&inputs, &buffers, run[start..][0..keccak.batch_width]) |*input, *b, e| {
+                        const index: NodeIndex = @truncate(e);
+                        input.* = self.encode_full(&self.nodes[index], b);
+                        assert(input.len == length);
+                    }
+                    keccak.keccak256_batch(&inputs, &digests);
+                    for (digests, run[start..][0..keccak.batch_width]) |digest, entry| {
+                        const index: NodeIndex = @truncate(entry);
+                        self.nodes[index].cached = RlpNode.from_hash(digest);
+                    }
+                }
+            }
+            for (run[start..]) |entry| {
+                const current = &self.nodes[@as(NodeIndex, @truncate(entry))];
+                current.cached = self.encode_ref(current);
+                assert(current.cached.len > 0);
+                assert(current.cached.is_hash() == (length >= 32));
+            }
+        }
+
+        /// Length of the full encoding of a node whose children are all clean.
+        fn encoded_length(self: *const Self, current: *const Node) u64 {
+            switch (current.kind) {
+                .free => unreachable, // Reachable nodes are never on the free list.
+                .leaf => return node.leaf_length(current.path_slice(), current.value_slice()),
+                .extension => {
+                    const child = &self.nodes[current.child].cached;
+                    assert(child.len > 0);
+                    return node.extension_length(current.path_slice(), child);
+                },
+                .branch => {
+                    var payload: u64 = rlp.string_encoded_length(current.value_slice());
+                    for (current.children) |child| {
+                        if (child == none) {
+                            payload += 1;
+                        } else {
+                            assert(self.nodes[child].cached.len > 0);
+                            payload += self.nodes[child].cached.len;
+                        }
+                    }
+                    return rlp.header_length(payload) + payload;
+                },
             }
         }
 
