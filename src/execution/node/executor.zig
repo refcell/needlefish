@@ -235,11 +235,7 @@ pub const Executor = struct {
         withdrawals: ?[]const payload.Withdrawal,
     ) Error!Executed {
         errdefer executor.abort_block();
-        if (withdrawals) |list| try executor.apply_withdrawals(building.fork, list);
-        const requests = if (executor.spec.mode == .l1)
-            try executor.post_block_requests(building.fork)
-        else
-            &.{};
+        const requests = try executor.finish_changes(building.fork, withdrawals);
         const receipts = building.receipts[0..building.count];
         const receipts_root_hash = try executor.receipts_root(receipts);
         try executor.db.commit(executor.state);
@@ -253,6 +249,41 @@ pub const Executor = struct {
             .requests = requests,
             .fees = building.fees,
         };
+    }
+
+    /// The post-transaction state changes of a block: withdrawals and (L1) requests.
+    fn finish_changes(
+        executor: *Executor,
+        fork: evm.Fork,
+        withdrawals: ?[]const payload.Withdrawal,
+    ) Error![]const []const u8 {
+        if (withdrawals) |list| try executor.apply_withdrawals(fork, list);
+        if (executor.spec.mode != .l1) return &.{};
+        return executor.post_block_requests(fork);
+    }
+
+    /// Runs a block like `execute_block` but commits nothing: the block's changes stay in
+    /// the evm `state` (read through whatever database it was last `reset` to) for the
+    /// caller to fold (execution witness). The caller ends with `abort_block`. Senders are
+    /// recovered inline.
+    pub fn execute_uncommitted(
+        executor: *Executor,
+        block: *const BlockEnv,
+        transactions: []const []const u8,
+        withdrawals: ?[]const payload.Withdrawal,
+    ) Error!void {
+        executor.invalid_index = null;
+        assert(executor.known_sender == null);
+        if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        var building = try executor.begin_block(block);
+        errdefer executor.abort_block();
+        for (transactions, 0..) |raw, index| {
+            executor.invalid_index = @intCast(index);
+            try executor.apply(&building, raw);
+        }
+        executor.invalid_index = null;
+        _ = try executor.finish_changes(building.fork, withdrawals);
+        assert(building.count == transactions.len);
     }
 
     /// A message call against the current state (eth_call / eth_estimateGas).

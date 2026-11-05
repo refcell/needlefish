@@ -3,6 +3,10 @@
 //! embedded as lists and typed ones as byte strings, ommers are always empty, and the
 //! withdrawals list is present from Shanghai on. Encodings go through the API's bounded
 //! scratch.
+//!
+//! `debug_executionWitness(block)` (base/base, alloy `ExecutionWitness`): the pre-state trie
+//! nodes, codes, touched keys, and ancestor headers a stateless client needs to re-execute
+//! the block, as `{state, codes, keys, headers}` hex arrays (`node/witness.zig`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -10,6 +14,8 @@ const rlp = @import("../../common/rlp/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
+const json = @import("../../utilities/json/root.zig");
+const ByteList = @import("../db/witness.zig").ByteList;
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -90,4 +96,31 @@ pub fn get_raw_transaction(api: *eth.Api, call: *Call) HandlerError!void {
         if (index == location.index) return call.writer.data(raw);
     }
     unreachable; // The index points into the canonical block.
+}
+
+pub fn execution_witness(api: *eth.Api, call: *Call) HandlerError!void {
+    const hash = try eth.resolve_block(api, call, try call.params.raw());
+    try call.params.finish();
+    const generator = api.witness orelse
+        return call.fail(rpc.code.server_error, "execution witness unavailable");
+    node.witness.execution_witness(api.chain, generator, hash) catch |err| {
+        return call.fail(rpc.code.server_error, @errorName(err));
+    };
+    const built = &generator.witness;
+    const w = call.writer;
+    try w.begin_object();
+    try write_list(w, "state", &built.state);
+    try write_list(w, "codes", &built.codes);
+    try write_list(w, "keys", &built.keys);
+    try write_list(w, "headers", &built.headers);
+    try w.end_object();
+}
+
+fn write_list(w: *json.Writer, name: []const u8, list: *const ByteList) HandlerError!void {
+    assert(list.count <= list.ends.len);
+    try w.key(name);
+    try w.begin_array();
+    var index: u32 = 0;
+    while (index < list.count) : (index += 1) try w.data(list.get(index));
+    try w.end_array();
 }

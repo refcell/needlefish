@@ -48,8 +48,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   restore the head. Bounded scratch; refuses blocks outside retention.
   (`db/witness_block.zig`: `Generator.generate` / `database_witness`; in-memory unwind of
   stored changesets instead of `set_head`, see Decisions)
-- [ ] `debug_executionWitness(block)` handler in `rpc/debug.zig` (small additive integration
+- [x] `debug_executionWitness(block)` handler in `rpc/debug.zig` (small additive integration
   edit in the rpc lane) returning `{state, codes, keys, headers}` as hex arrays.
+  (`node/witness.zig` + `Journal.witness` hook, `Executor.execute_uncommitted`,
+  `StateDb.recent_changesets`, `Api.witness`, `Limits.witness`)
 - [ ] Feed the history store from the durable database: every head move (apply/unwind) updates
   `history.Store`; rebuilt with `reset` at open; `Database.proof_at(block, address, slots)`
   for `eth_getProof` with a block tag inside the window.
@@ -223,6 +225,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   number read up to the parent (reth), so a verifier can link each hash to the parent.
   `Generator` is bound to one `State` and owns all scratch (allocated at init); depth is
   bounded by `Config.depth_max` and by retention (`BlockUnavailable`).
+- Node integration of the witness (`node/witness.zig`): durable nodes use the database's
+  stored changesets through an optional `Journal.witness` hook (`Durable` calls
+  `Generator.database_witness`); in-memory nodes peek the newest changesets of `StateDb`'s
+  undo ring (`recent_changesets`, ring unchanged). The block executor is the node's own
+  `Executor`: its evm `State` is `reset` to the recorded parent database,
+  `execute_uncommitted` runs the block (system calls, txs, withdrawals, requests) without
+  committing, and afterwards `abort_block` + `reset` back to `StateDb.database()`. No
+  second executor, so no extra executor memory. The RPC writes the generator's witness
+  (one bounded buffer set, `Limits.witness`, default on; null disables the method).
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -342,3 +353,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   evm blocks through `execute_and_commit`, witnesses the last 5, re-executes each over
   `SparseState.database()` to the stored root, head/root/journal unchanged, deeper/unknown/
   genesis refused.
+- 2026-11-05: `debug_executionWitness` wired: rpc test decodes the JSON witness of 3 fixture
+  blocks, rebuilds a `SparseState`, re-executes with the node executor statelessly to the
+  header root, head and root unchanged; durable node test witnesses 3 blocks after a side
+  branch with no journal entries, side block and genesis refused, node keeps building.

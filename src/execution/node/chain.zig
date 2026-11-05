@@ -21,6 +21,7 @@ const ordered = @import("../trie/ordered.zig");
 const executor_module = @import("executor.zig");
 const block_store = @import("block_store.zig");
 const StateDb = @import("state_db.zig").StateDb;
+const witness_block = @import("../db/witness_block.zig");
 
 const Hash = [32]u8;
 const B256 = primitives.B256;
@@ -120,6 +121,14 @@ pub const Journal = struct {
     context: *anyopaque,
     commit_block: *const fn (context: *anyopaque, block: *const JournalBlock) JournalError!void,
     move_head: *const fn (context: *anyopaque, hash: Hash) JournalError!void,
+    /// Execution witness of a stored canonical block, with the state moved in memory only
+    /// (`node/witness.zig`); null when the journal cannot produce one.
+    witness: ?*const fn (
+        context: *anyopaque,
+        generator: *witness_block.Generator,
+        hash: Hash,
+        execute: witness_block.Execute,
+    ) witness_block.Error!Hash = null,
 };
 
 /// Builder DA limits set by the batcher (`miner_setMaxDASize`); 0 means no limit. Sizes
@@ -840,7 +849,7 @@ fn consensus_withdrawal(w: payload.Withdrawal) consensus.Withdrawal {
     };
 }
 
-fn convert_withdrawals(
+pub fn convert_withdrawals(
     list: consensus.block.Withdrawals,
     out: *[withdrawals_max]payload.Withdrawal,
 ) []const payload.Withdrawal {

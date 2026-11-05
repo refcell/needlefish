@@ -132,6 +132,39 @@ pub const Limits = struct {
         .staging_bytes = 8 << 20,
     },
     beacon: beacon_module.Config = .{ .slots_max = 256, .bytes_max = 32 << 20 },
+    /// `debug_executionWitness` buffers (null disables it); `overlay` and `changeset` are
+    /// derived from the `state` block limits.
+    witness: ?db_module.witness_block.Config = .{
+        .builder = .{
+            .sparse = .{
+                .nodes_max = 1 << 14,
+                .node_bytes_max = 4 << 20,
+                .codes_max = 512,
+                .code_bytes_max = 8 << 20,
+                .headers_max = db_module.witness_block.headers_max,
+                .trie_nodes_max = 1 << 16,
+                .storage_tries_max = 1024,
+            },
+            .keys = .{
+                .accounts_max = 1 << 12,
+                .slots_max = 1 << 14,
+                .codes_max = 512,
+                .block_numbers_max = db_module.witness_block.headers_max,
+            },
+        },
+        .witness = .{
+            .state_nodes_max = 1 << 14,
+            .state_bytes_max = 4 << 20,
+            .codes_max = 512,
+            .code_bytes_max = 8 << 20,
+            .keys_max = (1 << 12) + (1 << 14),
+            .headers_max = db_module.witness_block.headers_max,
+            .header_bytes_max = 512 << 10,
+        },
+        .overlay = undefined,
+        .changeset = undefined,
+        .depth_max = 1024,
+    },
     http: http.server.Options = .{
         // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
         .connections_max = 16,
@@ -397,6 +430,8 @@ pub fn Service(comptime IO: type) type {
                 service.api.kzg = service.kzg.?.verifier();
             }
             errdefer if (service.kzg) |memory| lazy.destroy(allocator, memory);
+            try service.init_witness();
+            errdefer service.deinit_witness();
             try service.http_server.init(allocator, service.io, service, limits.http);
             errdefer service.http_server.deinit();
             try service.init_authrpc();
@@ -428,6 +463,36 @@ pub fn Service(comptime IO: type) type {
             try server.init(service.allocator, service.io, service, limits.authrpc_http);
         }
 
+        /// The execution witness generator, bound to the node's state.
+        fn init_witness(service: *Self) !void {
+            const limits = &service.options.limits;
+            var config = limits.witness orelse return;
+            config.overlay = .{
+                .accounts_max = limits.state.block_accounts_max,
+                .slots_max = limits.state.block_slots_max,
+                .codes_max = limits.state.block_codes_max,
+            };
+            config.changeset = .{
+                .accounts_max = limits.state.block_accounts_max,
+                .storage_max = limits.state.block_slots_max,
+                .codes_max = limits.state.block_codes_max,
+                .code_bytes_max = limits.state.block_code_bytes_max,
+            };
+            const allocator = service.allocator;
+            const generator = try allocator.create(db_module.witness_block.Generator);
+            errdefer allocator.destroy(generator);
+            generator.* = try .init(allocator, service.db.state, config);
+            service.api.witness = generator;
+            assert(generator.state == service.chain.db.state);
+        }
+
+        fn deinit_witness(service: *Self) void {
+            const generator = service.api.witness orelse return;
+            generator.deinit(service.allocator);
+            service.allocator.destroy(generator);
+            service.api.witness = null;
+        }
+
         fn deinit_authrpc(service: *Self) void {
             if (service.auth_server) |*server| server.deinit();
             if (service.engine_api) |*api| api.deinit(service.allocator);
@@ -438,6 +503,7 @@ pub fn Service(comptime IO: type) type {
             if (service.beacon) |*beacon| beacon.deinit(service.allocator);
             service.deinit_authrpc();
             service.http_server.deinit();
+            service.deinit_witness();
             lazy.free(service.allocator, service.api.scratch);
             if (service.kzg) |memory| lazy.destroy(service.allocator, memory);
             service.deinit_state();

@@ -273,6 +273,21 @@ pub const StateDb = struct {
         return db.undo_bytes[record.offset..][0..record.len];
     }
 
+    /// The encoded changesets of the newest `count` commits, newest first, into `out`;
+    /// null when fewer are saved or `out` is too short. The ring is not changed.
+    pub fn recent_changesets(db: *const StateDb, count: u32, out: [][]const u8) ?[][]const u8 {
+        if (count == 0 or count > db.undo_count or count > out.len) return null;
+        const records: u32 = @intCast(db.undo_records.len);
+        const newest = db.newest_index();
+        for (out[0..count], 0..) |*slot, age| {
+            const index = (newest + records - @as(u32, @intCast(age))) % records;
+            const record = db.undo_records[index];
+            slot.* = db.undo_bytes[record.offset..][0..record.len];
+        }
+        assert(out[0].ptr == db.last_changeset().?.ptr);
+        return out[0..count];
+    }
+
     fn newest_index(db: *const StateDb) u32 {
         assert(db.undo_count > 0);
         const records: u32 = @intCast(db.undo_records.len);

@@ -34,6 +34,8 @@ pub const Api = struct {
     kzg: ?consensus.sidecar.KzgVerifier = null,
     /// Decoding space for raw transactions and call data (bounded request size).
     scratch: []u8,
+    /// `debug_executionWitness` buffers, bound to the chain's state; null disables it.
+    witness: ?*node.witness.Generator = null,
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods;
@@ -69,6 +71,7 @@ const core_methods = [_]rpc.Method(*Api){
     .{ .name = "debug_getRawBlock", .handler = debug.get_raw_block },
     .{ .name = "debug_getRawReceipts", .handler = debug.get_raw_receipts },
     .{ .name = "debug_getRawTransaction", .handler = debug.get_raw_transaction },
+    .{ .name = "debug_executionWitness", .handler = debug.execution_witness },
 };
 
 pub const Router = rpc.Router(*Api, &methods);
@@ -740,4 +743,5 @@ fn block_logs(
 
 test {
     _ = @import("eth_test.zig");
+    _ = @import("debug_test.zig");
 }

@@ -13,6 +13,7 @@ const SimStorage = @import("../db/storage/sim_storage.zig").SimStorage;
 const Prng = @import("../../testing/prng.zig").Prng;
 const fixture = @import("test_fixture.zig");
 const durable_module = @import("durable.zig");
+const witness_module = @import("witness.zig");
 const StateDb = @import("state_db.zig").StateDb;
 
 const Durable = durable_module.Durable(SimStorage);
@@ -202,6 +203,72 @@ test "durable: a reorg moves the shared state through stored changesets" {
     try h.crash_and_reopen();
     try testing.expectEqual(@as(u256, 5), h.node.?.db.get_account(target).?.balance);
     _ = b1;
+}
+
+const witness_config: db_module.witness_block.Config = .{
+    .builder = .{
+        .sparse = .{
+            .nodes_max = 512,
+            .node_bytes_max = 1 << 17,
+            .codes_max = 16,
+            .code_bytes_max = 1 << 16,
+            .headers_max = 16,
+            .trie_nodes_max = 2048,
+            .storage_tries_max = 32,
+        },
+        .keys = .{ .accounts_max = 64, .slots_max = 256, .codes_max = 16, .block_numbers_max = 16 },
+    },
+    .witness = .{
+        .state_nodes_max = 512,
+        .state_bytes_max = 1 << 17,
+        .codes_max = 16,
+        .code_bytes_max = 1 << 16,
+        .keys_max = 64 + 256,
+        .headers_max = 16,
+        .header_bytes_max = 1 << 14,
+    },
+    .overlay = .{ .accounts_max = 256, .slots_max = 1024, .codes_max = 64 },
+    .changeset = config.changeset,
+    .depth_max = 8,
+};
+
+test "durable: execution witness moves the state in memory only and restores the head" {
+    const h = try Harness.create(3);
+    defer h.destroy();
+    var buffers: [3][256]u8 = undefined;
+    var hashes: [4]B256 = undefined;
+    hashes[0] = h.head();
+    for (1..4) |number| {
+        try fixture.submit(h.node.?, 1, number - 1, 5, &buffers[number - 1]);
+        hashes[number] = try h.build_head(hashes[number - 1], 12 * number, 0xfe);
+    }
+    // A side block at height 3, then back to the main tip.
+    const side = try h.build_head(hashes[2], 36, 0xfd);
+    _ = try h.build_head(hashes[3], 48, 0xfe);
+    const node = h.node.?;
+    var generator = try db_module.witness_block.Generator.init(
+        testing.allocator,
+        h.durable.state(),
+        witness_config,
+    );
+    defer generator.deinit(testing.allocator);
+    const head = h.durable.database.head_info;
+    const sequence = h.durable.database.submitted_sequence;
+    for (hashes[1..]) |hash| {
+        try witness_module.execution_witness(&node.chain, &generator, hash.bytes);
+        try testing.expect(generator.witness.state.count > 0);
+        try testing.expect(head.eql(h.durable.database.head_info));
+        try testing.expectEqual(head.state_root, try node.db.root());
+        try testing.expectEqual(sequence, h.durable.database.submitted_sequence);
+    }
+    const refused = [_]B256{ side, hashes[0] };
+    for (refused) |hash| {
+        const result = witness_module.execution_witness(&node.chain, &generator, hash.bytes);
+        try testing.expectError(error.BlockUnavailable, result);
+        try testing.expectEqual(head.state_root, try node.db.root());
+    }
+    // The node keeps building on the restored head.
+    _ = try h.build_head(h.head(), 60, 0xfe);
 }
 
 fn fuzz_scenario(seed: u64) !void {

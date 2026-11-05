@@ -212,7 +212,28 @@ pub fn Durable(comptime Storage: type) type {
         }
 
         pub fn journal(self: *Self) chain_module.Journal {
-            return .{ .context = self, .commit_block = commit_block, .move_head = move_head };
+            return .{
+                .context = self,
+                .commit_block = commit_block,
+                .move_head = move_head,
+                .witness = witness,
+            };
+        }
+
+        /// The database's state moves to the block's parent in memory (no journal entry)
+        /// and back; see `db.witness_block`.
+        fn witness(
+            context: *anyopaque,
+            generator: *db_module.witness_block.Generator,
+            hash: Hash,
+            execute: db_module.witness_block.Execute,
+        ) db_module.witness_block.Error!Hash {
+            const self = from(context);
+            assert(self.phase == .ready);
+            const head = self.database.head_info;
+            const root = try generator.database_witness(&self.database, hash, execute);
+            assert(head.eql(self.database.head_info));
+            return root;
         }
 
         fn from(context: *anyopaque) *Self {
