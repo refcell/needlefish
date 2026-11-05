@@ -646,9 +646,8 @@ test "validity: seeded fuzz of the BaseTime schedule check" {
 }
 
 test "validity: block hash of a real Base mainnet block (30000000)" {
-    // Header fields of Base mainnet block 30000000 from the public base/base fixture
-    // `crates/execution/flashblocks-node/benches/fixtures/base_mainnet_blocks.json`; its
-    // 1006 transactions are represented by the published transactions root.
+    // Header fields of public Base mainnet block 30000000; its 1006 transactions are
+    // represented by the published transactions root.
     var config: RollupConfig = .{ .l2_chain_id = 8453, .block_time = 2 };
     config.upgrades = .base_mainnet;
     var bloom: [256]u8 = undefined;

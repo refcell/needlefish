@@ -2,7 +2,7 @@
 //!
 //! Mirrors base/base `RingBuffer`: storage is fixed at comptime, pushing at capacity evicts
 //! the oldest entry, and positions must be non-decreasing so `entries_after` can binary
-//! search (asserted here, not just documented). Used for flashblock/payload history where
+//! search (asserted here, not just documented). Used for payload history where
 //! subscribers ask for "everything after position N".
 
 const std = @import("std");

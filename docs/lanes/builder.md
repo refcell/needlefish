@@ -44,6 +44,8 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 ## Decisions
 - 2026-11-05: Flashblocks dropped by the project owner; superseded flashblocks
   decisions are in git history (`git log -- docs/lanes/flashblocks-builder.md`).
+- 2026-11-05: `compact_flashblock_metadata` dropped from both feature enums (genesis and
+  rollup config): base/base reads it only in the flashblocks payload path.
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -72,3 +74,5 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   the producer's canonical JSON; seeded + fuzz request shapes.
 - 2026-11-05: lane repointed from flashblocks-builder to builder (no flashblocks, native
   200 ms blocks).
+- 2026-11-05: removed flashblocks, step 1: `execution/flashblocks` (consumer, RPC, pubsub),
+  `builder/publish`, flashblock fuzz targets, and `BaseFeature.compact_flashblock_metadata`.

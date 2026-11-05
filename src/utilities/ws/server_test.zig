@@ -338,7 +338,7 @@ test "ws: request target is exposed, oversized targets are rejected" {
     var harness: Harness = undefined;
     try harness.init(11, .{ .connections_max = 4, .message_size_max = 256 });
     defer harness.deinit();
-    harness.clients[0].options.target = "/ws?block_number=5&flashblock_index=2";
+    harness.clients[0].options.target = "/ws?block_number=5&index=2";
     harness.clients[0].connect();
     var rounds: u32 = 0;
     while (!harness.subscribers[0].opened and rounds < 5000) : (rounds += 1) {
@@ -347,7 +347,7 @@ test "ws: request target is exposed, oversized targets are rejected" {
     try std.testing.expect(harness.subscribers[0].opened);
     const id: server_module.ConnectionId = .{ .index = 0, .generation = 1 };
     const target = harness.server.request_target(id).?;
-    try std.testing.expectEqualStrings("/ws?block_number=5&flashblock_index=2", target);
+    try std.testing.expectEqualStrings("/ws?block_number=5&index=2", target);
     try std.testing.expectEqual(@as(?[]const u8, null), harness.server.request_target(.{
         .index = 0,
         .generation = 2,

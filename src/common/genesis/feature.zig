@@ -163,8 +163,6 @@ pub const BaseFeature = enum(u8) {
     repriced_p256_precompile,
     /// Configure the Osaka per-transaction gas limit cap in Base EVM environments.
     transaction_gas_limit_cap,
-    /// Omit receipt and balance metadata from published flashblocks.
-    compact_flashblock_metadata,
     /// Request V5 payload envelopes from the execution engine.
     engine_api_v5,
     /// Resolve dynamic B20 token addresses to their native precompile implementations.
@@ -306,7 +304,6 @@ const activation_table = [BaseFeature.count]Upgrade{
     .jovian, // jovian_upgrade_transactions
     .azul, // repriced_p256_precompile
     .azul, // transaction_gas_limit_cap
-    .azul, // compact_flashblock_metadata
     .azul, // engine_api_v5
     .beryl, // token_precompiles
     .beryl, // activation_registry
@@ -338,7 +335,7 @@ const activation_table = [BaseFeature.count]Upgrade{
 };
 
 comptime {
-    assert(BaseFeature.count == 82);
+    assert(BaseFeature.count == 81);
     assert(Upgrade.count == 17);
     // The registry is grouped by upgrade in activation order.
     for (activation_table[1..], activation_table[0 .. activation_table.len - 1]) |next, prior| {

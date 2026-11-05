@@ -9,10 +9,10 @@ balance-monitor,health,optimism-rpc}`. Out of scope for now: `zk-*`, `snark-e2e`
 `challenger-e2e`, `fee-jobs`, `sidecrush`, `shadow-metrics` (add later if valuable).
 
 Reuse, do not duplicate: HTTP/WS/JSON-RPC/metrics/health/retry/balance_monitor from
-`src/utilities`, tx types and signing from `src/common`, flashblocks types from
-`src/common/flashblocks`. Small additive edits in those modules are fine (a `pub`, a
-hook); larger changes go through the owning lane. All IO through `src/utilities/io` so
-every tool runs in the simulator. Bounded queues, static allocation after startup.
+`src/utilities`, tx types and signing from `src/common`. Small additive edits in those
+modules are fine (a `pub`, a hook); larger changes go through the owning lane. All IO
+through `src/utilities/io` so every tool runs in the simulator. Bounded queues, static
+allocation after startup.
 
 ## Backlog
 - [x] `infra/tx_manager` core: nonce tracking, fee bumping (EIP-1559 + blob fee), resubmit on
@@ -23,11 +23,8 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   local EIP-1559 signing, `eth_sendRawTransaction`, receipt + canonical-block check, gas
   estimation). The devnet exercise is part of `load-test` below.
 - [ ] `infra/tx_manager` blob driver: EIP-4844 sends with sidecars (reuse `batcher/blobs`).
-- [ ] `infra/websocket_proxy`: fan out an upstream flashblocks websocket to many
-  subscribers with per-IP/API-key rate limits, auth by key, method/filter support,
-  bounded per-client send queues that drop slow clients (port `websocket-proxy/src/*`).
-  Sim test: 1 upstream, N clients, one slow client is dropped, others see every message
-  in order. Fuzz the filter/auth parsers.
+- [x] `infra/websocket_proxy`: dropped; it only fanned out the flashblocks feed, and
+  needlefish has no flashblocks (AGENTS.md rule 10).
 - [x] `infra/roxy`: HTTP JSON-RPC server scaffold with health endpoint, then a
   load-balancing RPC proxy over N upstreams with health checks, retry, and method
   allowlist (port `roxy`, extend toward base/base's intent). Sim test with a failing

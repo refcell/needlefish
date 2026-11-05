@@ -1,4 +1,4 @@
-//! WebSocket client on the completion-based IO (RFC 6455), e.g. for a flashblocks feed.
+//! WebSocket client on the completion-based IO (RFC 6455), e.g. for a subscription feed.
 //!
 //! TCP connect plus the HTTP upgrade handshake; everything after that is the shared frame
 //! engine in `stream.zig` (concurrent recv/send, ping replies, fragments, close handshake,

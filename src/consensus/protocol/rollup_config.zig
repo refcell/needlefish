@@ -107,7 +107,6 @@ pub const Feature = enum {
     jovian_upgrade_transactions,
     repriced_p256_precompile,
     transaction_gas_limit_cap,
-    compact_flashblock_metadata,
     engine_api_v5,
     subsecond_blocks,
     extended_sequencer_drift,
