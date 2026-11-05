@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const chainspec = @import("chainspec/root.zig");
 pub const txpool = @import("txpool/root.zig");
+pub const payload = @import("payload/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
