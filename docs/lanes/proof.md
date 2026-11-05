@@ -85,7 +85,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   `/readyz` = a tick made progress within 5 poll intervals, `/metrics` with pipeline and
   collector counters); `--health.addr/--health.port` (8080, 0 off), `--metrics.enabled`,
   `--metrics.addr/--metrics.port` (7300), all serving the same handler.
-- [ ] `proposer` admin JSON-RPC (base/base `admin_addr`: start/stop proposing, status).
+- [x] `proposer` admin JSON-RPC: `proposer/admin.zig` (`admin_startProposer`,
+  `admin_stopProposer`, `admin_proposerRunning`, -32000 on a redundant start/stop);
+  `--rpc.enable-admin --rpc.addr 127.0.0.1 --rpc.port 8545`; stopped skips ticks, a start
+  begins a fresh session (`Pipeline.reset`).
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
@@ -294,6 +297,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: proposer admin JSON-RPC (start/stop/running).
 - 2026-11-05: proposer health/readiness/metrics endpoints.
 - 2026-11-05: submission fee bumping at the same nonce; on in proposer and challenger.
 - 2026-11-05: native backend e2e (compressed range proven, archive replayed).

@@ -23,6 +23,8 @@ const Chain = proposer.rpc_chain.RpcChain(Endpoint);
 const Submitter = proposer.tx_submitter.TxSubmitter(Endpoint);
 const Exporter = proposer.exporter.Exporter;
 const Server = http.Server(io.IO, *Exporter, Exporter.handle);
+const Admin = proposer.admin.Admin;
+const AdminServer = http.Server(io.IO, *Admin, Admin.handle_http);
 
 const usage =
     \\usage: base proposer --prover-rpc <url|native> --l1-eth-rpc <url> --l2-eth-rpc <url>
@@ -32,6 +34,7 @@ const usage =
     \\         [--rollup-config <file>] [--l1-genesis <file>] [--ticks-max <n>]
     \\         [--health.addr 0.0.0.0] [--health.port 8080 (0: off)]
     \\         [--metrics.enabled] [--metrics.addr 0.0.0.0] [--metrics.port 7300]
+    \\         [--rpc.enable-admin] [--rpc.addr 127.0.0.1] [--rpc.port 8545]
     \\
 ;
 
@@ -141,14 +144,24 @@ fn run(init: std.process.Init, service: *Service, config: *const proposer.config
     defer allocator.destroy(endpoints);
     try endpoints.open(allocator, &service.os_io, config);
     defer endpoints.close(allocator, &service.os_io);
-    return tick_loop(service, config, &dry_run, &endpoints.exporter);
+    return tick_loop(service, config, &dry_run, endpoints);
 }
 
 /// The health/readiness/metrics servers (`proposer.exporter`): the health port, and the
-/// metrics port when `--metrics.enabled` and different.
+/// metrics port when `--metrics.enabled` and different; and the admin JSON-RPC
+/// (`proposer.admin`) when `--rpc.enable-admin`.
 const Endpoints = struct {
     exporter: Exporter,
     servers: [2]?*Server = .{ null, null },
+    admin: Admin = .{},
+    admin_server: ?*AdminServer = null,
+
+    const server_options: http.server.Options = .{
+        .connections_max = 8,
+        .recv_buffer_size = 16 * 1024,
+        .send_buffer_size = 16 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
+    };
 
     fn now_ns(context: *anyopaque) u64 {
         const os_io: *io.IO = @ptrCast(@alignCast(context));
@@ -162,6 +175,8 @@ const Endpoints = struct {
         config: *const proposer.config.Config,
     ) !void {
         endpoints.servers = .{ null, null };
+        endpoints.admin = .{};
+        endpoints.admin_server = null;
         try endpoints.exporter.init(.{ .context = os_io, .now_ns = now_ns }, .{
             .version = "needlefish",
             .poll_interval_ns = config.poll_interval_ms * std.time.ns_per_ms,
@@ -176,28 +191,39 @@ const Endpoints = struct {
             if (!on) continue;
             const server = try allocator.create(Server);
             errdefer allocator.destroy(server);
-            try server.init(allocator, os_io, &endpoints.exporter, .{
-                .connections_max = 8,
-                .recv_buffer_size = 16 * 1024,
-                .send_buffer_size = 16 * 1024,
-                .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
-            });
+            try server.init(allocator, os_io, &endpoints.exporter, server_options);
             slot.* = server;
             const bound = try server.listen(at);
             std.debug.print("proposer: serving health and metrics on port {d}\n", .{bound.port});
         }
+        if (!config.rpc_enable_admin) return;
+        const admin_server = try allocator.create(AdminServer);
+        errdefer allocator.destroy(admin_server);
+        try admin_server.init(allocator, os_io, &endpoints.admin, server_options);
+        endpoints.admin_server = admin_server;
+        const bound = try admin_server.listen(io.Address.ip4(config.rpc_addr, config.rpc_port));
+        std.debug.print("proposer: serving the admin JSON-RPC on port {d}\n", .{bound.port});
+    }
+
+    fn stopped(endpoints: *const Endpoints) bool {
+        for (endpoints.servers) |slot| {
+            if (slot) |server| if (!server.stopped()) return false;
+        }
+        const admin_server = endpoints.admin_server orelse return true;
+        return admin_server.stopped();
     }
 
     fn close(endpoints: *Endpoints, allocator: std.mem.Allocator, os_io: *io.IO) void {
         for (endpoints.servers) |slot| if (slot) |server| server.stop();
+        if (endpoints.admin_server) |admin_server| admin_server.stop();
         var rounds: u32 = 0;
-        while (rounds < 1000) : (rounds += 1) {
-            var stopped = true;
-            for (endpoints.servers) |slot| {
-                if (slot) |server| stopped = stopped and server.stopped();
-            }
-            if (stopped) break;
+        while (rounds < 1000 and !endpoints.stopped()) : (rounds += 1) {
             os_io.run_for_ns(std.time.ns_per_ms) catch break;
+        }
+        if (endpoints.admin_server) |admin_server| {
+            admin_server.deinit();
+            allocator.destroy(admin_server);
+            endpoints.admin_server = null;
         }
         for (&endpoints.servers) |*slot| if (slot.*) |server| {
             server.deinit();
@@ -347,15 +373,19 @@ fn tick_loop(
     service: *Service,
     config: *const proposer.config.Config,
     dry_run: *const proposer.dry_run.DryRun,
-    exporter: *Exporter,
+    endpoints: *Endpoints,
 ) !u8 {
     const interval_ns = config.poll_interval_ms * std.time.ns_per_ms;
     const start_ns = service.os_io.now_monotonic_ns();
     var ticks: u64 = 0;
     while (config.ticks_max == null or ticks < config.ticks_max.?) : (ticks += 1) {
-        service.pipeline.tick(service.os_io.now_monotonic_ns() - start_ns);
+        // A start after an admin stop begins a fresh session; stopped, nothing ticks.
+        if (endpoints.admin.take_start()) service.pipeline.reset();
+        if (endpoints.admin.running) {
+            service.pipeline.tick(service.os_io.now_monotonic_ns() - start_ns);
+        }
         const stats = service.pipeline.stats;
-        exporter.observe(stats, service.pipeline.collector.stats);
+        endpoints.exporter.observe(stats, service.pipeline.collector.stats);
         std.debug.print("proposer: tick {d}: {d} skipped, {d} restarts, {d} dry-run sends\n", .{
             stats.ticks,
             stats.skipped,
