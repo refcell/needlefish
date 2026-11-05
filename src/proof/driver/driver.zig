@@ -116,7 +116,7 @@ pub const Driver = struct {
         const outcome = self.builder.build_block(parent, parent_hash, &attributes) catch |err| {
             const feature = .deposits_only_on_invalid_payload;
             const retry = self.rollup.is_feature_active(feature, attributes.timestamp);
-            if (!retry or err == error.StateUnavailable or err == error.HintFailed) return err;
+            if (!retry or !deposit_only_retryable(err)) return err;
             try self.pipeline.signal(self.l1, self.l2, .flush_channel);
             const transactions = prepared.attributes.transactions;
             attributes.transactions = transactions[0..keep_deposits(transactions)];
@@ -194,6 +194,33 @@ fn engine_attributes(
         .eip1559_params = attributes.eip1559_params,
         .min_base_fee = attributes.min_base_fee,
     };
+}
+
+/// Whether a failed block is replaced by its deposits (Holocene). Only block-validity
+/// failures qualify (base/base `ExecutorError::is_deposit_only_retryable`); a missing
+/// preimage, a hint failure or an exhausted configured bound would turn a valid block into
+/// a wrong deposit-only one, so those fail the proof instead.
+pub fn deposit_only_retryable(err: executor.builder.Error) bool {
+    return switch (err) {
+        error.InvalidTransaction,
+        error.BlockGasExceeded,
+        error.BlobGasExceeded,
+        error.TxTypeNotSupported,
+        => true,
+        else => false,
+    };
+}
+
+test "driver: only block-validity failures retry with deposits only" {
+    try std.testing.expect(deposit_only_retryable(error.InvalidTransaction));
+    try std.testing.expect(deposit_only_retryable(error.BlockGasExceeded));
+    try std.testing.expect(deposit_only_retryable(error.TxTypeNotSupported));
+    try std.testing.expect(!deposit_only_retryable(error.StateUnavailable));
+    try std.testing.expect(!deposit_only_retryable(error.HintFailed));
+    try std.testing.expect(!deposit_only_retryable(error.TooManyTransactions));
+    try std.testing.expect(!deposit_only_retryable(error.ScratchFull));
+    try std.testing.expect(!deposit_only_retryable(error.CodeArenaFull));
+    try std.testing.expect(!deposit_only_retryable(error.InvalidAttributes));
 }
 
 test "driver: deposit-only filtering keeps deposits in order" {

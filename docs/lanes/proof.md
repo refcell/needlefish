@@ -112,12 +112,16 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   `debug_executePayload`, which the needlefish node lacks); on a dishonest chain the client
   fails with a missing preimage instead of proving a wrong state. Blobs and single
   preimages are `NotFound` until the beacon client exists.
+- Holocene deposit-only retry only on block-validity errors (invalid tx, block/blob gas
+  exceeded, unsupported type), as base/base; resource bounds, missing preimages and hint
+  failures fail the proof, since a retry would replace a valid block with a wrong one.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: driver: deposit-only retry limited to block-validity errors (soundness).
 - 2026-11-05: host: RPC-backed source over the node's debug endpoints (SimIo HTTP test).
 - 2026-11-05: `base proof replay <archive>`: offline client run over a recorded archive.
 - 2026-11-05: host: canonical preimage archive for record/replay (strict decoder, fuzz).
