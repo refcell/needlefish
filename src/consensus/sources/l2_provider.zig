@@ -1,6 +1,6 @@
 //! A non-blocking, caching L2 chain provider over JSON-RPC: `l2_block_info_by_number`,
-//! `l2_block_info_by_hash` and `system_config_by_l2_hash`, the L2 contract of the derivation
-//! pipeline (attributes builder, batch validation, reset walk-back).
+//! `l2_block_info_by_hash`, `l2_block_info_by_label` and `system_config_by_l2_hash`: the L2
+//! contract of the derivation pipeline (attributes builder, batch validation, reset walk-back).
 //! Mirrors base/base `crates/consensus/providers/src/l2_chain_provider.rs`.
 //!
 //! Same discipline as `l1_provider.zig`: a miss enqueues one fetch
@@ -45,14 +45,25 @@ pub const Options = struct {
     jwt_secret: ?jwt.Secret = null,
 };
 
-pub const Request = struct {
-    by_number: bool,
-    number: u64 = 0,
-    hash: B256 = .zero,
+/// Labeled L2 heads (`eth_getBlockByNumber` tags).
+pub const Label = enum(u8) { latest, safe, finalized };
+
+pub const Request = union(enum) {
+    number: u64,
+    hash: B256,
+    label: Label,
 
     pub fn eql(a: Request, b: Request) bool {
-        if (a.by_number != b.by_number) return false;
-        return if (a.by_number) a.number == b.number else a.hash.eql(b.hash);
+        return switch (a) {
+            .number => |number| b == .number and b.number == number,
+            .hash => |hash| b == .hash and b.hash.eql(hash),
+            .label => |label| b == .label and b.label == label,
+        };
+    }
+
+    /// Number and label results move on reorgs, so they expire.
+    fn expires(request: Request) bool {
+        return request != .hash;
     }
 };
 
@@ -64,9 +75,10 @@ pub const Stats = struct {
 };
 
 const BlockEntry = struct { used: u64 = 0, block: l2_block.L2Block = undefined };
-const NumberEntry = struct {
+/// A number- or label-keyed result pointing at a hash-keyed block.
+const KeyEntry = struct {
     used: u64 = 0,
-    number: u64 = 0,
+    key: Request = .{ .number = 0 },
     hash: B256 = .zero,
     fetched_ns: u64 = 0,
 };
@@ -98,7 +110,7 @@ pub fn L2Provider(comptime IO: type) type {
         queue_count: u32 = 0,
         in_flight: ?Request = null,
         blocks: []BlockEntry,
-        numbers: []NumberEntry,
+        numbers: []KeyEntry,
         missing: [missing_max]Request = undefined,
         missing_count: u32 = 0,
         clock: u64 = 0,
@@ -120,7 +132,7 @@ pub fn L2Provider(comptime IO: type) type {
             errdefer client.deinit();
             const blocks = try allocator.alloc(BlockEntry, options.cache_entries);
             errdefer allocator.free(blocks);
-            const numbers = try allocator.alloc(NumberEntry, options.cache_entries);
+            const numbers = try allocator.alloc(KeyEntry, options.cache_entries);
             @memset(blocks, .{});
             @memset(numbers, .{});
             provider.* = .{
@@ -161,9 +173,21 @@ pub fn L2Provider(comptime IO: type) type {
         // L2 chain-provider contract.
 
         pub fn l2_block_info_by_number(provider: *Self, number: u64) ProviderError!L2BlockInfo {
+            const info = try provider.keyed(.{ .number = number });
+            assert(info.block_info.number == number);
+            return info;
+        }
+
+        /// The labeled head (`latest`, `safe`, `finalized`) as the execution engine sees it.
+        pub fn l2_block_info_by_label(provider: *Self, label: Label) ProviderError!L2BlockInfo {
+            return provider.keyed(.{ .label = label });
+        }
+
+        fn keyed(provider: *Self, key: Request) ProviderError!L2BlockInfo {
+            assert(key.expires());
             const now_ns = provider.io.now_monotonic_ns();
             for (provider.numbers) |*entry| {
-                if (entry.used == 0 or entry.number != number) continue;
+                if (entry.used == 0 or !entry.key.eql(key)) continue;
                 if (now_ns -| entry.fetched_ns >= provider.options.block_by_number_ttl_ns) {
                     entry.used = 0;
                     continue;
@@ -173,20 +197,29 @@ pub fn L2Provider(comptime IO: type) type {
                     continue;
                 };
                 entry.used = provider.touch();
-                assert(block.block.info.block_info.number == number);
                 return block.block.info;
             }
-            return provider.miss(.{ .by_number = true, .number = number });
+            return provider.miss(key);
         }
 
         pub fn l2_block_info_by_hash(provider: *Self, hash: B256) ProviderError!L2BlockInfo {
             if (provider.block_entry(hash)) |entry| return entry.block.info;
-            return provider.miss(.{ .by_number = false, .hash = hash });
+            return provider.miss(.{ .hash = hash });
         }
 
         pub fn system_config_by_l2_hash(provider: *Self, hash: B256) ProviderError!SystemConfig {
             if (provider.block_entry(hash)) |entry| return entry.block.system_config;
-            return provider.miss(.{ .by_number = false, .hash = hash });
+            return provider.miss(.{ .hash = hash });
+        }
+
+        /// The slot already holding `key`, else the least recently used one.
+        fn key_slot(provider: *Self, key: Request) *KeyEntry {
+            for (provider.numbers) |*entry| {
+                if (entry.used != 0 and entry.key.eql(key)) return entry;
+            }
+            const entry = victim(KeyEntry, provider.numbers);
+            assert(entry.used == 0 or !entry.key.eql(key));
+            return entry;
         }
 
         fn block_entry(provider: *Self, hash: B256) ?*BlockEntry {
@@ -240,10 +273,10 @@ pub fn L2Provider(comptime IO: type) type {
                 provider.queue_count -= 1;
                 provider.in_flight = request;
                 provider.stats.requests += 1;
-                const method = if (request.by_number)
-                    "eth_getBlockByNumber"
+                const method = if (request == .hash)
+                    "eth_getBlockByHash"
                 else
-                    "eth_getBlockByHash";
+                    "eth_getBlockByNumber";
                 const in_flight = &provider.in_flight.?;
                 const client = &provider.client;
                 if (provider.options.jwt_secret) |secret| {
@@ -261,9 +294,11 @@ pub fn L2Provider(comptime IO: type) type {
         }
 
         fn write_params(request: *const Request, writer: *json.Writer) json.Writer.WriteError!void {
-            if (request.by_number) {
-                try writer.quantity(request.number);
-            } else try writer.data(&request.hash.bytes);
+            switch (request.*) {
+                .number => |number| try writer.quantity(number),
+                .hash => |hash| try writer.data(&hash.bytes),
+                .label => |label| try writer.string(@tagName(label)),
+            }
             try writer.boolean(true);
         }
 
@@ -308,17 +343,20 @@ pub fn L2Provider(comptime IO: type) type {
         fn complete(provider: *Self, request: Request, raw: []const u8) !void {
             const block = try l2_block.decode_with_system_config(raw, provider.rollup);
             const info = block.info.block_info;
-            if (request.by_number and info.number != request.number) return error.BlockMismatch;
-            if (!request.by_number and !info.hash.eql(request.hash)) return error.BlockMismatch;
+            switch (request) {
+                .number => |number| if (info.number != number) return error.BlockMismatch,
+                .hash => |hash| if (!info.hash.eql(hash)) return error.BlockMismatch,
+                .label => {},
+            }
             if (provider.block_entry(info.hash) == null) {
                 const entry = victim(BlockEntry, provider.blocks);
                 entry.* = .{ .used = provider.touch(), .block = block };
             }
-            if (request.by_number) {
-                const entry = victim(NumberEntry, provider.numbers);
+            if (request.expires()) {
+                const entry = provider.key_slot(request);
                 entry.* = .{
                     .used = provider.touch(),
-                    .number = info.number,
+                    .key = request,
                     .hash = info.hash,
                     .fetched_ns = provider.io.now_monotonic_ns(),
                 };

@@ -72,6 +72,7 @@ const Fixture = struct {
         const by_number = "eth_getBlockByNumber";
         fake.add(.{ .method = by_number, .params_contain = "\"0x7\"", .result = fixture.block });
         fake.add(.{ .method = by_number, .params_contain = "\"0x8\"", .result = "{\"bad\":1}" });
+        fake.add(.{ .method = by_number, .params_contain = "\"safe\"", .result = fixture.block });
         fake.add(.{
             .method = "eth_getBlockByHash",
             .params_contain = &fixture.hash_hex,
@@ -118,6 +119,12 @@ test "l2 provider: misses fetch, completions fill info and system config" {
     try testing.expectEqual(protocol.l2_system_config.encode_scalar(2, 3), config.scalar);
     try testing.expect(config.batcher_address.eql(.init(@splat(0xba))));
     try testing.expect(std.mem.startsWith(u8, fixture.fake.authorization(), "Bearer ey"));
+    try testing.expectError(error.NotAvailable, provider.l2_block_info_by_label(.safe));
+    fixture.harness.run();
+    try testing.expectEqual(info, try provider.l2_block_info_by_label(.safe));
+    try testing.expectError(error.NotAvailable, provider.l2_block_info_by_label(.finalized));
+    fixture.harness.run();
+    try testing.expectError(error.NotFound, provider.l2_block_info_by_label(.finalized));
 }
 
 test "l2 provider: null once as NotFound, malformed dropped, by-number expiry" {
