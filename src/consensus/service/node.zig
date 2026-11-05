@@ -45,6 +45,7 @@ const gossip_bridge = @import("gossip_bridge.zig");
 const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
 const checkpoint = @import("checkpoint.zig");
+const metrics_module = @import("metrics.zig");
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -93,6 +94,8 @@ pub const Options = struct {
     l2: Address,
     jwt_secret: jwt.Secret,
     rpc_address: Address,
+    /// Prometheus `GET /metrics` (`--metrics.enabled`); not served when null.
+    metrics_address: ?Address = null,
     sequencer: bool = false,
     version: []const u8 = "needlefish",
     /// How often the engine's labeled L2 heads are re-read.
@@ -117,6 +120,12 @@ pub const Options = struct {
         .recv_buffer_size = 1024 * 1024 + 16 * 1024,
         .send_buffer_size = 64 * 1024,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 * 1024 },
+    },
+    metrics_server: http.server.Options = .{
+        .connections_max = 4,
+        .recv_buffer_size = 16 * 1024,
+        .send_buffer_size = 32 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 4 * 1024 },
     },
 };
 
@@ -302,8 +311,12 @@ pub fn Node(comptime IO: type) type {
         /// Persists the safe and finalized heads when `checkpoint_path` is set.
         checkpoints: ?*Checkpoints = null,
         checkpoints_logged: bool = false,
+        metrics: metrics_module.Metrics = .{},
+        metrics_server: ?MetricsServer = null,
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
+        pub const MetricsServer = http.Server(IO, *Metrics, Metrics.handle);
+        const Metrics = metrics_module.Metrics;
         pub const Network = p2p_network.Network(IO);
         pub const Signer = signer_watcher.SignerWatcher(IO);
         pub const Upgrade = upgrade_signal.Observer(IO, *Self);
@@ -364,11 +377,43 @@ pub fn Node(comptime IO: type) type {
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
             errdefer node.rpc_server.deinit();
+            try node.init_metrics();
+            errdefer node.deinit_metrics();
             if (options.upgrade_signal) |config| try node.init_upgrade(&config);
             errdefer node.deinit_upgrade();
             if (options.checkpoint_path) |path| try node.init_checkpoints(path);
             errdefer node.deinit_checkpoints();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_metrics(node: *Self) !void {
+            assert(node.metrics_server == null);
+            try node.metrics.register();
+            if (node.options.metrics_address == null) return;
+            node.metrics_server = @as(MetricsServer, undefined);
+            const server = &node.metrics_server.?;
+            errdefer node.metrics_server = null;
+            const options = node.options.metrics_server;
+            try server.init(node.allocator, node.io, &node.metrics, options);
+            assert(node.metrics.registry.count > 0);
+        }
+
+        fn deinit_metrics(node: *Self) void {
+            if (node.metrics_server) |*server| server.deinit();
+            node.metrics_server = null;
+        }
+
+        fn record_metrics(node: *Self) void {
+            const l1_head = node.watcher.head(.latest) orelse protocol.block.BlockInfo{};
+            const sample: metrics_module.Sample = .{
+                .sync_state = node.driver.sync_state(),
+                .l1_head = l1_head.number,
+                .queue_depth = node.driver.queue.len(),
+                .stats = node.driver.stats,
+                .peers = if (node.network) |network| network.peer_count() else 0,
+            };
+            node.metrics.record(&sample);
+            assert(node.metrics.registry.count > 0);
         }
 
         fn init_checkpoints(node: *Self, path: []const u8) !void {
@@ -575,6 +620,7 @@ pub fn Node(comptime IO: type) type {
             node.deinit_upgrade();
             node.deinit_checkpoints();
             node.gossip_arena.deinit();
+            node.deinit_metrics();
             node.rpc_server.deinit();
             node.driver.deinit();
             node.deinit_sources();
@@ -587,6 +633,10 @@ pub fn Node(comptime IO: type) type {
             const address = try node.rpc_server.listen(node.options.rpc_address);
             node.logger.log(.info, "consensus", "rpc listening", .{ .port = address.port });
             assert(address.family == node.options.rpc_address.family);
+            if (node.metrics_server) |*server| {
+                const bound = try server.listen(node.options.metrics_address.?);
+                node.logger.log(.info, "consensus", "metrics listening", .{ .port = bound.port });
+            }
             if (node.network) |network| try node.start_p2p(network);
             if (node.upgrade) |observer| observer.start();
             if (node.checkpoints) |store| store.start();
@@ -644,6 +694,7 @@ pub fn Node(comptime IO: type) type {
                 node.tick_gossip(network);
             }
             node.tick_checkpoints();
+            node.record_metrics();
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
         }
@@ -1018,6 +1069,15 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     }
     try testing.expect(answered);
     try testing.expectEqual(@as(u64, 1), node.message_passer.stats.requests);
+    var metrics_buffer: [8192]u8 = undefined;
+    var metrics_out: std.Io.Writer = .fixed(&metrics_buffer);
+    try node.metrics.registry.write_prometheus(&metrics_out);
+    var expected_buffer: [64]u8 = undefined;
+    const metered_unsafe = node.driver.sync_state().unsafe_head.block_info.number;
+    const expected = try std.fmt.bufPrint(&expected_buffer, "label=\"unsafe\"}} {d}\n", .{
+        metered_unsafe,
+    });
+    try testing.expect(std.mem.indexOf(u8, metrics_out.buffered(), expected) != null);
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }

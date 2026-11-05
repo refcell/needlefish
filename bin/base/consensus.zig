@@ -20,6 +20,7 @@ const usage =
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
     \\         [--checkpoint.path FILE]
+    \\         [--metrics.enabled [--metrics.addr IP] [--metrics.port P]]
     \\
 ;
 
@@ -31,6 +32,10 @@ pub const Flags = struct {
     l2_jwt: ?[]const u8 = null,
     rpc_addr: [4]u8 = .{ 127, 0, 0, 1 },
     rpc_port: u16 = 7545,
+    /// Prometheus endpoint (base/base defaults: disabled, 0.0.0.0:9090).
+    metrics_enabled: bool = false,
+    metrics_addr: [4]u8 = .{ 0, 0, 0, 0 },
+    metrics_port: u16 = base.consensus.service.metrics.default_port,
     sequencer: bool = false,
     sequencer_key_index: u32 = 0,
     log_level: log.Level = .info,
@@ -91,6 +96,10 @@ fn apply_switch(flags: *Flags, arg: []const u8) bool {
         flags.sequencer = true;
         return true;
     }
+    if (std.mem.eql(u8, arg, "--metrics.enabled")) {
+        flags.metrics_enabled = true;
+        return true;
+    }
     return false;
 }
 
@@ -110,6 +119,10 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.rpc_addr = try parse_ip4(value);
     } else if (eql(u8, arg, "--rpc.port")) {
         flags.rpc_port = try std.fmt.parseInt(u16, value, 10);
+    } else if (eql(u8, arg, "--metrics.addr")) {
+        flags.metrics_addr = try parse_ip4(value);
+    } else if (eql(u8, arg, "--metrics.port")) {
+        flags.metrics_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(u8, arg, "--sequencer.key-index")) {
         flags.sequencer_key_index = try std.fmt.parseInt(u32, value, 10);
     } else if (eql(u8, arg, "--checkpoint.path")) {
@@ -204,6 +217,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .p2p = p2p_config,
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
         .checkpoint_path = flags.checkpoint_path,
+        .metrics_address = if (flags.metrics_enabled)
+            io.Address.ip4(flags.metrics_addr, flags.metrics_port)
+        else
+            null,
     });
     defer node.deinit();
     _ = try node.start();
@@ -303,6 +320,14 @@ test "consensus: flags" {
     const with_checkpoint = required ++ [_][]const u8{ "--checkpoint.path", "ckpt.bin" };
     const checkpointed = try parse_flags(&with_checkpoint);
     try std.testing.expectEqualStrings("ckpt.bin", checkpointed.checkpoint_path.?);
+    try std.testing.expect(!checkpointed.metrics_enabled);
+    const with_metrics = required ++ [_][]const u8{
+        "--metrics.enabled", "--metrics.addr", "127.0.0.1", "--metrics.port", "9191",
+    };
+    const metered = try parse_flags(&with_metrics);
+    try std.testing.expect(metered.metrics_enabled);
+    try std.testing.expectEqual(@as(u16, 9191), metered.metrics_port);
+    try std.testing.expectEqual(@as(u8, 127), metered.metrics_addr[0]);
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
     try std.testing.expect(upgrade_settings(&disabled, 8453) != null);

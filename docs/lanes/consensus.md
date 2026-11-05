@@ -65,7 +65,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] `--p2p.bootnodes-file` / `--p2p.bootstore` file IO in the binary (done in `p2p.Network`
     through the io layer; the binary forwards every `--p2p.*` flag)
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
-  - [ ] Prometheus metrics endpoint (`--metrics.enabled/addr/port`) with base/base metric
+  - [x] Prometheus metrics endpoint (`--metrics.enabled/addr/port`) with base/base metric
     names (heads, derivation, engine queue, sequencer, p2p)
   - [ ] follow mode (base/base `service/follow`): follow a remote CL's safe/finalized heads
     over RPC instead of deriving
@@ -89,6 +89,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Metrics: base/base names where they map (`base_node_block_labels{label}`, `base_node_engine_task_queue_depth`, `base_node_engine_reset_count`); driver counters are `base_node_*_total`, sampled from monotonic driver stats each tick.
 - `ProviderError.Pruned` is critical for derivation (it cannot go below a pruned body). The
   node holds the driver until the checkpoint file is read, so startup sees the checkpoints.
 - Checkpoints: base/base stores them in redb under its data dir by default; we write one
@@ -209,6 +210,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: Prometheus /metrics (--metrics.enabled/addr/port): block labels, queue depth, driver counters.
 - 2026-11-05: rpc: admin_overrideLeader, admin_refreshUpgradeSignal, dev_taskQueueLength; backlog extended.
 - 2026-11-05: engine: startup recovers pruned safe/finalized heads from checkpoints or the earliest unpruned block.
 - 2026-11-05: service: durable safe/finalized checkpoints behind `--checkpoint.path`.

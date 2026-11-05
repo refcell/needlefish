@@ -8,6 +8,7 @@ pub const gossip_bridge = @import("gossip_bridge.zig");
 pub const unsafe_buffer = @import("unsafe_buffer.zig");
 pub const signer_watcher = @import("signer_watcher.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const metrics = @import("metrics.zig");
 pub const Node = node.Node;
 
 test {
@@ -18,4 +19,5 @@ test {
     _ = unsafe_buffer;
     _ = signer_watcher;
     _ = checkpoint;
+    _ = metrics;
 }
