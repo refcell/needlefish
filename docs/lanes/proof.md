@@ -80,12 +80,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   failures return `NotFound` and set the provider's `failure`; the program driver aborts
   when it is set after a pipeline step. The L1 provider recovers senders only for
   transactions to the batch inbox (`recover_to`); others keep a zero `from`.
+- L2 provider: by-number lookups walk headers back from a head the program advances
+  with `set_head`; blocks the program built are kept in a 64-entry ring (`remember`)
+  so block info / system config never depend on the host knowing a block the program
+  derived differently. Full safe blocks (span batch checks) still come from the oracle.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: program: L1 blob provider (field-element reassembly, KZG check) and L2
+  chain provider (deposit-derived block info and system config).
 - 2026-11-05: program: typed hints and the oracle-backed L1 chain provider (headers,
   by-number walk, ordered-trie transactions/receipts); shared `test_oracle.zig`.
 - 2026-11-05: `proof/program` started: `boot.zig` (local keys 1-11, trust checks).
