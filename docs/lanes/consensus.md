@@ -15,14 +15,14 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
   - [x] batch validity rules (singular, span, Holocene)
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
-- [ ] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
+- [x] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
   - [x] channel bank / assembler / provider (Holocene switch)
   - [x] channel reader (decode owned batches)
   - [x] batch stream, batch queue, batch validator, batch provider
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
-  - [ ] attributes queue, pipeline core (step, reset, signals)
+  - [x] attributes queue, pipeline core (step, reset, signals)
 - [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [ ] engine task queue: insert unsafe, consolidate, build/seal, finalize, synchronize
@@ -78,7 +78,16 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   yet" until the backend has the EL proof. rollup.json reading is lenient
   (unknown fields such as `chain_op_config` skipped; integers as numbers or hex quantities).
 
+- Pipeline: `derive.pipeline.Pipeline` owns every stage and binds them per call with
+  providers `chain` (L1), `blobs`, `l2` (safe chain + `system_config_by_l2_hash`). Prepared
+  attributes sit in a bounded ring (`prepared_max` = 16, base/base: unbounded); a full ring
+  fails `step` with temporary `PreparedAttributesFull`. The driver answers
+  `HoloceneActivation` with an activation signal and other reset errors with a reset.
+  The attributes queue only checks the batch parent hash, as base/base.
+
+
 ## Log
+- 2026-11-05: derive: attributes queue, pipeline core (step, signals, reset walk-back), e2e + fuzz.
 - 2026-11-05: protocol: rollup.json codec; rpc: optimism_rollupConfig.
 - 2026-11-05: rpc: optimism_{outputAtBlock,safeHeadAtL1Block,syncStatus,version}.
 - 2026-11-05: engine: resumable starting-forkchoice finder (reorg walk, safe walk), fuzzed.

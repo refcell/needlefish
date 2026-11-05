@@ -22,7 +22,7 @@ const SystemConfig = protocol.SystemConfig;
 const ProviderError = errors.ProviderError;
 
 pub const blocks_max = 64;
-pub const system_configs_max = 16;
+pub const system_configs_max = 64;
 pub const l2_blocks_max = 64;
 
 pub const SystemConfigEntry = struct { l2_hash: Hash, config: SystemConfig };

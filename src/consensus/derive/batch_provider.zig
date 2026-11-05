@@ -127,4 +127,37 @@ pub const BatchProvider = struct {
             .unset => false,
         };
     }
+
+    /// Binds the provider to its upstream and `l2` provider so the attributes queue can
+    /// read singular batches from it.
+    pub fn upstream(
+        provider: *BatchProvider,
+        prev: anytype,
+        l2: anytype,
+    ) Upstream(@TypeOf(prev), @TypeOf(l2)) {
+        return .{ .provider = provider, .prev = prev, .l2 = l2 };
+    }
 };
+
+/// The batch provider seen as a stage by the attributes queue.
+pub fn Upstream(comptime Prev: type, comptime L2: type) type {
+    return struct {
+        provider: *BatchProvider,
+        prev: Prev,
+        l2: L2,
+
+        const Self = @This();
+
+        pub fn next_batch(self: Self, parent: L2BlockInfo) Error!SingleBatch {
+            return self.provider.next_batch(self.prev, self.l2, parent);
+        }
+
+        pub fn is_last_in_span(self: Self) bool {
+            return self.provider.is_last_in_span(self.prev);
+        }
+
+        pub fn origin(self: Self) ?BlockInfo {
+            return self.prev.origin();
+        }
+    };
+}

@@ -27,6 +27,8 @@ pub const Error = ProviderError || error{
     NotEnoughData,
     MissingL1Data,
     ChannelReaderEmpty,
+    /// The pipeline's prepared attributes queue is full; the driver must drain it.
+    PreparedAttributesFull,
     // Reset.
     ReorgDetected,
     HoloceneActivation,
@@ -58,6 +60,7 @@ pub fn kind(err: Error) Kind {
         error.NotEnoughData,
         error.MissingL1Data,
         error.ChannelReaderEmpty,
+        error.PreparedAttributesFull,
         => .temporary,
         error.ReorgDetected,
         error.HoloceneActivation,
