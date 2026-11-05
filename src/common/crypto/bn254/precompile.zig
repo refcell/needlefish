@@ -240,3 +240,52 @@ fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
 test "bn254 precompile: coverage-guided fuzz never crashes" {
     try testing.fuzz({}, fuzz_one, .{});
 }
+
+fn reduce_r(value: u512) u256 {
+    return @intCast(value % fp.r);
+}
+
+/// [scalar]G1 by plain double-and-add, independent of the GLV path behind 0x07.
+fn generator_multiple(scalar: u256) [g1_length]u8 {
+    return encode_g1(G1.from_affine(g1.generator).mul_reference(scalar));
+}
+
+fn encode_g2(point: G2Affine) [g2_length]u8 {
+    var out: [g2_length]u8 = @splat(0);
+    if (point.is_infinity) return out;
+    out[0..32].* = point.x.c1.to_bytes_be();
+    out[32..64].* = point.x.c0.to_bytes_be();
+    out[64..96].* = point.y.c1.to_bytes_be();
+    out[96..128].* = point.y.c0.to_bytes_be();
+    return out;
+}
+
+/// Valid points from fuzzed scalars: checks add, mul, and pairing against group laws.
+fn fuzz_algebra(_: void, smith: *testing.Smith) anyerror!void {
+    const a = smith.value(u256);
+    const b = smith.value(u256);
+    const c = smith.value(u256);
+    const a_reduced = reduce_r(a);
+    const point_a = generator_multiple(a);
+    const point_b = generator_multiple(b);
+    const sum = try precompile_bn254_add(&(point_a ++ point_b));
+    const expected_sum = generator_multiple(reduce_r(@as(u512, a_reduced) + reduce_r(b)));
+    try testing.expectEqualSlices(u8, &expected_sum, &sum);
+    var scalar_bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &scalar_bytes, c, .big);
+    const product = try precompile_bn254_mul(&(point_a ++ scalar_bytes));
+    const expected_product = generator_multiple(reduce_r(@as(u512, a_reduced) * c));
+    try testing.expectEqualSlices(u8, &expected_product, &product);
+    // e(aG, Q) e(-aG, Q) = 1; a single pair is 1 only if aG or Q is the identity.
+    const q = encode_g2(g2.G2.from_affine(g2.generator).mul(b).to_affine());
+    const negated = generator_multiple(if (a_reduced == 0) 0 else fp.r - a_reduced);
+    const balanced = try precompile_bn254_pairing(&(point_a ++ q ++ negated ++ q));
+    try testing.expectEqual(@as(u8, 1), balanced[31]);
+    const single = try precompile_bn254_pairing(&(point_a ++ q));
+    const trivial = a_reduced == 0 or reduce_r(b) == 0;
+    try testing.expectEqual(@as(u8, @intFromBool(trivial)), single[31]);
+}
+
+test "bn254 precompile: coverage-guided fuzz of add, mul, pairing vs group laws" {
+    try testing.fuzz({}, fuzz_algebra, .{});
+}

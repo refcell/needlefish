@@ -396,3 +396,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: cells verify fuzz 20K runs clean (123 coverage points).
 - 2026-11-05: cells recovery fuzz 20K runs clean (1380 unique runs, 140 coverage points).
 - 2026-11-05: BLS precompile fuzz 200K runs clean (171 coverage points); bn254/BLS precompile fuzz tests renamed with curve prefixes so each can be filtered alone.
+- 2026-11-05: bn254 precompile raw fuzz 200K runs clean but shallow (31 unique runs, 103 coverage points); added a structured target (valid points from fuzzed scalars; add, mul vs mul_reference, pairing bilinearity incl. G2 = [b]G2).
