@@ -22,7 +22,7 @@ allocation after startup.
 - [x] `infra/tx_manager` driver: JSON-RPC driver over the sans-IO core (fee suggestion,
   local EIP-1559 signing, `eth_sendRawTransaction`, receipt + canonical-block check, gas
   estimation). The devnet exercise is part of `load-test` below.
-- [ ] `infra/tx_manager` blob driver: EIP-4844 sends with sidecars (reuse `batcher/blobs`).
+- [x] `infra/tx_manager` blob driver: EIP-4844 sends with sidecars (reuse `batcher/blobs`).
 - [x] `infra/websocket_proxy`: dropped; it only fanned out the flashblocks feed, and
   needlefish has no flashblocks (AGENTS.md rule 10).
 - [x] `infra/roxy`: HTTP JSON-RPC server scaffold with health endpoint, then a
@@ -62,6 +62,11 @@ allocation after startup.
 - `balance-monitor` is a standalone tool (base/base only has the library layer): `/metrics`,
   `/`, `/healthz`, plus `/readyz` (503 once reads are older than N poll intervals). Flags use
   `utilities/cli` with `BASE_BALANCE_MONITOR_*` env fallback.
+- tx_manager blob mode is part of the same `Driver` (`blobs_per_send_max > 0`), not a second
+  driver: nonce, bump, and receipt logic stay shared. Commitments/proofs are computed once
+  per send (`BlobStore`); bumps re-sign fees only. Blob candidates are plain carriers (no
+  calldata, no value, gas 21000) because `batcher/txdata/blob.sign` builds that shape.
+  Sidecar v1 (cell proofs) is the default, as L1 mempools require it since Osaka.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
   address; deploying a token is future work), open-loop pacer with 2x catch-up, one
   tx_manager driver per sender, latency via reservoir sampling. Default senders are dev
@@ -101,3 +106,5 @@ allocation after startup.
 - 2026-11-05: `infra/roxy` + `base roxy`: deferred http responses, allowlist, method
   extractor, upstream pool (all fuzzed), proxy with retries/ejection; SimIo tests with 3 fake
   upstreams; smoke-tested against a local HTTP upstream (incl. a 200 KB response).
+- 2026-11-05: tx_manager blob mode (EIP-4844 sidecars v0/v1, `eth_blobBaseFee`, blob fee
+  bumps) with fake-L1 tests that decode the network form.

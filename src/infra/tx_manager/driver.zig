@@ -9,8 +9,12 @@
 //!
 //! The transport is injected (`batcher.rpc.Transport`), so tests and the simulator run
 //! the driver against a fake L1. Candidate payloads are copied into memory allocated at
-//! init; no allocation happens after that. Blob transactions need sidecars and are not
-//! sent by this driver; the manager's blob fee logic is ready for a blob driver.
+//! init; no allocation happens after that.
+//!
+//! Blob mode (`blobs_per_send_max > 0`): a candidate with blobs is sent as an EIP-4844
+//! transaction in its network form with a sidecar. Commitments and proofs are computed
+//! once at `send`; bumps re-sign only the fees (blob fee cap at least doubles, as the
+//! manager's fee logic enforces). Blob fees come from `eth_blobBaseFee`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +24,10 @@ const txdata = @import("../../batcher/txdata/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const manager_module = @import("manager.zig");
 const errors = @import("errors.zig");
+const blob_store = @import("blob_store.zig");
+const blob_tx = @import("../../batcher/txdata/blob.zig");
+
+pub const Blob = blob_store.Blob;
 
 pub const Address = primitives.Address;
 pub const Hash = manager_module.Hash;
@@ -30,6 +38,9 @@ pub const Candidate = struct {
     data: []const u8 = &.{},
     /// 0 asks the node (`eth_estimateGas`).
     gas_limit: u64 = 0,
+    /// Non-empty: an EIP-4844 send (needs blob mode; `data` empty, `value` zero, gas 21000).
+    /// Blobs are copied.
+    blobs: []const *const Blob = &.{},
 };
 
 pub const Config = struct {
@@ -38,11 +49,16 @@ pub const Config = struct {
     /// Sender address of `private_key`.
     from: Address,
     data_bytes_max: u32 = 128 * 1024,
+    /// 0 disables blob sends (and the KZG setup they need).
+    blobs_per_send_max: u8 = 0,
+    /// 1 (EIP-7594 cell proofs) is what L1 mempools accept since Osaka.
+    sidecar_version: u1 = 1,
     manager: manager_module.Config = .{},
 };
 
 pub const Error = rpc.Error || rpc.DecodeError || manager_module.SubmitError ||
-    error{ DataTooLarge, GasEstimateTooLow };
+    error{ DataTooLarge, GasEstimateTooLow, BlobsDisabled, InvalidBlobCandidate } ||
+    blob_store.StoreError;
 
 pub fn Driver(comptime limits: manager_module.Limits) type {
     return struct {
@@ -63,28 +79,43 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
         data_memory: []u8,
         raw_buffer: []u8,
         params_buffer: []u8,
+        blobs: ?blob_store.BlobStore,
         suggestion: ?manager_module.Suggestion = null,
         tip_number: u64 = 0,
         rpc_failures: u64 = 0,
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
             assert(config.data_bytes_max > 0);
+            assert(config.blobs_per_send_max <= blob_store.blobs_per_send_limit);
             const data_memory = try allocator.alloc(u8, limits.sends_max * config.data_bytes_max);
             errdefer allocator.free(data_memory);
-            // A signed EIP-1559 transaction is its payload plus a few hundred bytes.
-            const raw_buffer = try allocator.alloc(u8, config.data_bytes_max + 512);
+            // A signed transaction is its payload (or sidecar) plus a few hundred bytes.
+            const blob_bytes = @as(usize, config.blobs_per_send_max) *
+                blob_store.network_bytes_per_blob(config.sidecar_version);
+            const raw_bytes = @max(config.data_bytes_max, blob_bytes) + 512;
+            const raw_buffer = try allocator.alloc(u8, raw_bytes);
             errdefer allocator.free(raw_buffer);
             const params_buffer = try allocator.alloc(u8, 2 * raw_buffer.len + 512);
+            errdefer allocator.free(params_buffer);
+            var blobs: ?blob_store.BlobStore = null;
+            if (config.blobs_per_send_max > 0) blobs = try blob_store.BlobStore.init(
+                allocator,
+                limits.sends_max,
+                config.blobs_per_send_max,
+                config.sidecar_version,
+            );
             return .{
                 .manager = try Manager.init(config.manager),
                 .config = config,
                 .data_memory = data_memory,
                 .raw_buffer = raw_buffer,
                 .params_buffer = params_buffer,
+                .blobs = blobs,
             };
         }
 
         pub fn deinit(driver: *Self, allocator: std.mem.Allocator) void {
+            if (driver.blobs) |*blobs| blobs.deinit(allocator);
             allocator.free(driver.params_buffer);
             allocator.free(driver.raw_buffer);
             allocator.free(driver.data_memory);
@@ -99,16 +130,21 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             now_ms: u64,
         ) Error!u64 {
             if (candidate.data.len > driver.config.data_bytes_max) return error.DataTooLarge;
+            const is_blob = candidate.blobs.len > 0;
+            if (is_blob) try driver.check_blob_candidate(candidate);
             if (!driver.manager.has_capacity()) return error.PendingFull;
             if (driver.suggestion == null) try driver.refresh(client);
             if (!driver.manager.nonce.known()) driver.drain(client, now_ms);
-            const gas_limit = if (candidate.gas_limit != 0)
+            const gas_limit = if (is_blob)
+                21_000
+            else if (candidate.gas_limit != 0)
                 candidate.gas_limit
             else
                 try driver.estimate_gas(client, candidate);
             if (gas_limit < 21_000) return error.GasEstimateTooLow;
-            const id = try driver.manager.submit(now_ms, driver.suggestion.?, false);
             const index = driver.free_index().?; // Capacity was checked above.
+            if (is_blob) try driver.blobs.?.store(@intCast(index), candidate.blobs);
+            const id = try driver.manager.submit(now_ms, driver.suggestion.?, is_blob);
             driver.stored[index] = .{
                 .id = id,
                 .to = candidate.to,
@@ -126,9 +162,21 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             driver.drain(client, now_ms);
         }
 
+        fn check_blob_candidate(driver: *const Self, candidate: Candidate) Error!void {
+            assert(candidate.blobs.len > 0);
+            const blobs = driver.blobs orelse return error.BlobsDisabled;
+            if (candidate.blobs.len > blobs.blobs_per_send_max) return error.TooManyBlobs;
+            // `blob_tx.sign` builds a plain blob carrier: no calldata, no value.
+            if (candidate.data.len != 0 or candidate.value != 0) return error.InvalidBlobCandidate;
+            if (candidate.gas_limit != 0 and candidate.gas_limit != 21_000) {
+                return error.InvalidBlobCandidate;
+            }
+        }
+
         pub fn take_completion(driver: *Self) ?manager_module.Completion {
             const completion = driver.manager.take_completion() orelse return null;
             const index = driver.index_of(completion.id).?;
+            if (driver.blobs) |*blobs| blobs.clear(@intCast(index));
             driver.stored[index] = .{};
             assert(driver.index_of(completion.id) == null);
             return completion;
@@ -153,8 +201,16 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             const base_fee = try rpc.quantity(u128, try rpc.field(head, "baseFeePerGas"));
             const number = try rpc.quantity(u64, try rpc.field(head, "number"));
             const tip = try rpc.quantity(u128, try client.call("eth_maxPriorityFeePerGas", "[]"));
+            const blob_base_fee: u128 = if (driver.blobs == null)
+                0
+            else
+                try rpc.quantity(u128, try client.call("eth_blobBaseFee", "[]"));
             driver.tip_number = @max(driver.tip_number, number);
-            driver.suggestion = .{ .tip_wei = tip, .base_fee_wei = base_fee };
+            driver.suggestion = .{
+                .tip_wei = tip,
+                .base_fee_wei = base_fee,
+                .blob_base_fee_wei = blob_base_fee,
+            };
             assert(driver.suggestion != null);
         }
 
@@ -177,35 +233,64 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
             version: manager_module.Action.Publish,
             now_ms: u64,
         ) void {
-            assert(!version.is_blob);
             const index = driver.index_of(version.id).?;
-            const stored = driver.stored[index];
-            const envelope = txdata.sign_eip1559(.{
-                .chain_id = driver.config.chain_id,
-                .nonce = version.nonce,
-                .fees = .{
-                    .max_fee_per_gas = version.fees.fee_cap_wei,
-                    .max_priority_fee_per_gas = version.fees.tip_wei,
-                },
-                .gas_limit = stored.gas_limit,
-                .to = stored.to,
-                .value = stored.value,
-                .data = driver.data_of(index)[0..stored.data_length],
-            }, driver.config.private_key) catch {
+            const signed = driver.sign(version, index) catch {
                 // Signing a well-formed request with a valid key cannot fail; report the
                 // attempt as an RPC failure so the manager retries it.
                 return driver.manager.on_publish(version.id, @splat(0), .rpc, now_ms);
             };
-            const raw = txdata.encode_raw(envelope, driver.raw_buffer);
-            const hash = envelope.hash().bytes;
-            const params = std.fmt.bufPrint(driver.params_buffer, "[\"0x{x}\"]", .{raw}) catch
-                unreachable; // params_buffer holds twice the largest raw transaction.
+            const buffer = driver.params_buffer;
+            // params_buffer holds twice the largest raw transaction.
+            const params = std.fmt.bufPrint(buffer, "[\"0x{x}\"]", .{signed.raw}) catch unreachable;
             const sent = client.call("eth_sendRawTransaction", params);
             const result: ?errors.PublishError = if (sent) |_| null else |err| switch (err) {
                 error.RpcError => errors.classify(client.last_error()),
                 else => .rpc,
             };
-            driver.manager.on_publish(version.id, hash, result, now_ms);
+            driver.manager.on_publish(version.id, signed.hash, result, now_ms);
+        }
+
+        const Signed = struct { raw: []const u8, hash: Hash };
+
+        fn sign(
+            driver: *Self,
+            version: manager_module.Action.Publish,
+            index: usize,
+        ) txdata.SignError!Signed {
+            const stored = driver.stored[index];
+            const fees: txdata.Fees = .{
+                .max_fee_per_gas = version.fees.fee_cap_wei,
+                .max_priority_fee_per_gas = version.fees.tip_wei,
+            };
+            if (version.is_blob) {
+                assert(version.fees.blob_fee_cap_wei > 0);
+                const blobs = &driver.blobs.?;
+                const slot: u32 = @intCast(index);
+                var hash_buffer: [33 * blob_store.blobs_per_send_limit]u8 = undefined;
+                const envelope = try blob_tx.sign(.{
+                    .chain_id = driver.config.chain_id,
+                    .nonce = version.nonce,
+                    .fees = fees,
+                    .blob_fee_wei = version.fees.blob_fee_cap_wei,
+                    .to = stored.to,
+                    .versioned_hashes = blobs.versioned_hashes(slot),
+                }, &hash_buffer, driver.config.private_key);
+                const sidecar = blobs.sidecar(slot);
+                const raw = blob_tx.encode_network(envelope, sidecar, driver.raw_buffer);
+                return .{ .raw = raw, .hash = envelope.hash().bytes };
+            }
+            assert(version.fees.blob_fee_cap_wei == 0);
+            const envelope = try txdata.sign_eip1559(.{
+                .chain_id = driver.config.chain_id,
+                .nonce = version.nonce,
+                .fees = fees,
+                .gas_limit = stored.gas_limit,
+                .to = stored.to,
+                .value = stored.value,
+                .data = driver.data_of(index)[0..stored.data_length],
+            }, driver.config.private_key);
+            const raw = txdata.encode_raw(envelope, driver.raw_buffer);
+            return .{ .raw = raw, .hash = envelope.hash().bytes };
         }
 
         fn query_receipt(driver: *Self, client: *rpc.Client, id: u64, hash: Hash) void {

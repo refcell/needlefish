@@ -9,6 +9,8 @@ const consensus = @import("../../common/consensus/root.zig");
 const accounts = @import("../../batcher/devnet/accounts.zig");
 const driver_module = @import("driver.zig");
 const fees = @import("fees.zig");
+const rlp = @import("../../common/rlp/root.zig");
+const blobs_codec = @import("../../batcher/blobs/root.zig");
 
 const Hash = driver_module.Hash;
 const Driver = driver_module.Driver(.{ .sends_max = 4, .hashes_max = 4 });
@@ -27,8 +29,15 @@ const FakeL1 = struct {
     /// Message of the current rejection.
     rejection: []const u8 = "",
     last_to: [20]u8 = @splat(0),
+    last_blob_count: u32 = 0,
+    blob_base_fee_wei: u128 = 3,
 
-    const PoolTx = struct { hash: Hash, tip_wei: u128, fee_cap_wei: u128 };
+    const PoolTx = struct {
+        hash: Hash,
+        tip_wei: u128,
+        fee_cap_wei: u128,
+        blob_fee_cap_wei: u128 = 0,
+    };
     const Mined = struct { hash: Hash, block_number: u64, fork: u8 };
 
     fn transport(l1: *FakeL1) rpc.Transport {
@@ -85,6 +94,9 @@ const FakeL1 = struct {
             return std.fmt.bufPrint(out, "\"0x{x}\"", .{l1.account_nonce});
         }
         if (std.mem.eql(u8, method, "eth_maxPriorityFeePerGas")) return "\"0x2\"";
+        if (std.mem.eql(u8, method, "eth_blobBaseFee")) {
+            return std.fmt.bufPrint(out, "\"0x{x}\"", .{l1.blob_base_fee_wei});
+        }
         if (std.mem.eql(u8, method, "eth_estimateGas")) return "\"0x5208\"";
         if (std.mem.eql(u8, method, "eth_getBlockByNumber")) {
             const tag = between(body, "\"params\":[\"", "\"").?;
@@ -122,11 +134,32 @@ const FakeL1 = struct {
             return error.Rejected;
         }
         const hex = between(body, "\"params\":[\"0x", "\"").?;
+        // Only a prefix is decoded: a blob transaction's body precedes its sidecar.
         var raw: [1024]u8 = undefined;
-        const bytes = try std.fmt.hexToBytes(&raw, hex);
-        const envelope = try consensus.tx.Envelope.decode(bytes);
-        const tx = envelope.eip1559.tx;
-        l1.last_to = tx.to.call.bytes;
+        const bytes = try std.fmt.hexToBytes(&raw, hex[0..@min(hex.len, 2 * raw.len)]);
+        const envelope = if (bytes[0] == 0x03)
+            try decode_network(bytes)
+        else
+            try consensus.tx.Envelope.decode(bytes);
+        const tx = switch (envelope) {
+            .eip1559 => |signed| PoolView{
+                .nonce = signed.tx.nonce,
+                .tip_wei = signed.tx.max_priority_fee_per_gas,
+                .fee_cap_wei = signed.tx.max_fee_per_gas,
+                .to = signed.tx.to.call.bytes,
+            },
+            .eip4844 => |signed| PoolView{
+                .nonce = signed.tx.nonce,
+                .tip_wei = signed.tx.max_priority_fee_per_gas,
+                .fee_cap_wei = signed.tx.max_fee_per_gas,
+                .blob_fee_cap_wei = signed.tx.max_fee_per_blob_gas,
+                .blob_count = @intCast(signed.tx.blob_versioned_hashes.count()),
+                .to = signed.tx.to.bytes,
+            },
+            else => return error.UnexpectedType,
+        };
+        l1.last_to = tx.to;
+        l1.last_blob_count = tx.blob_count;
         if (tx.nonce < l1.account_nonce) {
             l1.rejection = "nonce too low";
             return error.Rejected;
@@ -134,18 +167,46 @@ const FakeL1 = struct {
         assert(tx.nonce < nonces_max);
         const hash = envelope.hash().bytes;
         if (l1.pool[tx.nonce]) |old| {
-            const tip_ok = tx.max_priority_fee_per_gas >= fees.threshold(old.tip_wei, false);
-            const cap_ok = tx.max_fee_per_gas >= fees.threshold(old.fee_cap_wei, false);
-            assert(tip_ok and cap_ok);
+            const tip_ok = tx.tip_wei >= fees.threshold(old.tip_wei, false);
+            const cap_ok = tx.fee_cap_wei >= fees.threshold(old.fee_cap_wei, false);
+            const blob_ok = old.blob_fee_cap_wei == 0 or
+                tx.blob_fee_cap_wei >= fees.threshold(old.blob_fee_cap_wei, true);
+            assert(tip_ok and cap_ok and blob_ok);
         }
         l1.pool[tx.nonce] = .{
             .hash = hash,
-            .tip_wei = tx.max_priority_fee_per_gas,
-            .fee_cap_wei = tx.max_fee_per_gas,
+            .tip_wei = tx.tip_wei,
+            .fee_cap_wei = tx.fee_cap_wei,
+            .blob_fee_cap_wei = tx.blob_fee_cap_wei,
         };
         return "\"0x00\"";
     }
+
+    const PoolView = struct {
+        nonce: u64,
+        tip_wei: u128,
+        fee_cap_wei: u128,
+        blob_fee_cap_wei: u128 = 0,
+        blob_count: u32 = 0,
+        to: [20]u8,
+    };
+
+    /// The signed body of a network-form blob transaction (`0x03 || rlp([body, ...])`).
+    fn decode_network(prefix: []const u8) !consensus.tx.Envelope {
+        assert(prefix[0] == 0x03);
+        const list_prefix = prefix[1];
+        if (list_prefix <= 0xf7) return error.UnexpectedType; // A sidecar is long.
+        const outer_header_length: usize = 1 + list_prefix - 0xf7;
+        var outer = rlp.Decoder.init(prefix[1 + outer_header_length ..]);
+        const body = try outer.raw();
+        const typed = &decoded_network_scratch;
+        typed[0] = 0x03;
+        @memcpy(typed[1..][0..body.len], body);
+        return consensus.tx.Envelope.decode(typed[0 .. body.len + 1]);
+    }
 };
+
+var decoded_network_scratch: [1024]u8 = undefined;
 
 fn between(text: []const u8, start: []const u8, end: []const u8) ?[]const u8 {
     const begin = (std.mem.indexOf(u8, text, start) orelse return null) + start.len;
@@ -159,8 +220,12 @@ const Fixture = struct {
     driver: Driver = undefined,
 
     fn init(fixture: *Fixture) !void {
+        try fixture.init_with(0, 0);
+    }
+
+    fn init_with(fixture: *Fixture, blobs_per_send_max: u8, sidecar_version: u1) !void {
         fixture.client = try rpc.Client.init(testing.allocator, fixture.l1.transport(), .{
-            .request_bytes_max = 64 * 1024,
+            .request_bytes_max = 512 * 1024,
             .response_bytes_max = 4096,
             .parse_bytes_max = 64 * 1024,
         });
@@ -170,6 +235,8 @@ const Fixture = struct {
             .private_key = sender.private_key,
             .from = sender.address,
             .data_bytes_max = 256,
+            .blobs_per_send_max = blobs_per_send_max,
+            .sidecar_version = sidecar_version,
             .manager = .{
                 .num_confirmations = 2,
                 .resubmission_timeout_ms = 3_000,
@@ -264,4 +331,51 @@ test "driver: rejection messages are classified" {
         .to = .{ .bytes = @splat(2) },
         .data = &@as([257]u8, @splat(0)),
     }, now_ms));
+}
+
+fn check_blob_send(sidecar_version: u1) !void {
+    var fixture: Fixture = .{};
+    try fixture.init_with(1, sidecar_version);
+    defer fixture.deinit();
+    const blob = try testing.allocator.create(blobs_codec.Blob);
+    defer testing.allocator.destroy(blob);
+    try blobs_codec.encode("frame-in-a-blob", blob);
+    var now_ms: u64 = 0;
+    const to: driver_module.Address = .{ .bytes = @splat(0xbb) };
+    _ = try fixture.driver.send(&fixture.client, .{ .to = to, .blobs = &.{blob} }, now_ms);
+    try fixture.run(&now_ms, 1, false);
+    try testing.expectEqual(@as(u32, 1), fixture.l1.last_blob_count);
+    const first = fixture.l1.pool[0].?;
+    try testing.expect(first.blob_fee_cap_wei >= 2 * fixture.l1.blob_base_fee_wei);
+    // Dropped: the re-publish keeps the sidecar and at least doubles the blob fee cap.
+    fixture.l1.pool[0] = null;
+    try fixture.run(&now_ms, 4, false);
+    const second = fixture.l1.pool[0].?;
+    try testing.expect(second.blob_fee_cap_wei >= 2 * first.blob_fee_cap_wei);
+    try fixture.run(&now_ms, 4, true);
+    const completion = fixture.driver.take_completion().?;
+    try testing.expectEqualSlices(u8, &second.hash, &completion.outcome.confirmed.hash);
+    try testing.expectEqual(@as(u8, 0), fixture.driver.blobs.?.count(0));
+}
+
+test "driver: blob sends carry a v0 sidecar and bump the blob fee" {
+    try check_blob_send(0);
+}
+
+test "driver: blob sends carry a v1 (cell proof) sidecar" {
+    try check_blob_send(1);
+}
+
+test "driver: blob candidates are validated" {
+    var fixture: Fixture = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const blob = try testing.allocator.create(blobs_codec.Blob);
+    defer testing.allocator.destroy(blob);
+    @memset(blob, 0);
+    const to: driver_module.Address = .{ .bytes = @splat(1) };
+    try testing.expectError(error.BlobsDisabled, fixture.driver.send(&fixture.client, .{
+        .to = to,
+        .blobs = &.{blob},
+    }, 0));
 }
