@@ -99,16 +99,38 @@ pub const Driver = struct {
         if (driver.proof_manager.is_ignored(candidate.proxy)) return;
         if (driver.proof_manager.has_pending_proof(candidate.proxy)) return;
         switch (candidate.category) {
-            .invalid_tee_proposal => try driver.process_invalid_proposal(candidate, .challenge, true, now_ns),
-            .fraudulent_zk_challenge => |index| try driver.process_fraudulent_zk_challenge(candidate, index, now_ns),
-            .invalid_zk_proposal => try driver.process_invalid_proposal(candidate, .nullify, false, now_ns),
-            .invalid_dual_proposal => try driver.process_invalid_proposal(candidate, .nullify, true, now_ns),
+            .invalid_tee_proposal => try driver.process_invalid_proposal(
+                candidate,
+                .challenge,
+                true,
+                now_ns,
+            ),
+            .fraudulent_zk_challenge => |index| try driver.process_fraudulent_zk_challenge(
+                candidate,
+                index,
+                now_ns,
+            ),
+            .invalid_zk_proposal => try driver.process_invalid_proposal(
+                candidate,
+                .nullify,
+                false,
+                now_ns,
+            ),
+            .invalid_dual_proposal => try driver.process_invalid_proposal(
+                candidate,
+                .nullify,
+                true,
+                now_ns,
+            ),
         }
     }
 
     /// Validates every intermediate root; null when the game cannot be judged yet (blocks
     /// not available, transient read errors).
-    fn validate_game(driver: *Driver, candidate: *const CandidateGame) !?validator.ValidationResult {
+    fn validate_game(
+        driver: *Driver,
+        candidate: *const CandidateGame,
+    ) !?validator.ValidationResult {
         const roots = try driver.world.chain.intermediate_roots(candidate.proxy, &driver.roots);
         const result = validator.validate_intermediate_roots(driver.world.chain, .{
             .starting_block_number = candidate.starting_block_number,
@@ -152,7 +174,10 @@ pub const Driver = struct {
         challenged_index: u64,
         now_ns: u64,
     ) !void {
-        const on_chain_root = try driver.world.chain.intermediate_root(candidate.proxy, challenged_index);
+        const on_chain_root = try driver.world.chain.intermediate_root(
+            candidate.proxy,
+            challenged_index,
+        );
         const block = try candidate.checkpoint_start_block(challenged_index + 1);
         const validation = validator.validate_claimed_root_at_block(
             driver.world.chain,

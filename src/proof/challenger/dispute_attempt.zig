@@ -332,7 +332,10 @@ pub const DisputeAttempt = struct {
                         attempt.proof_length = @intCast(proof.len);
                     },
                     .zk => {
-                        const proof = zk_dispute_proof_bytes(&attempt.proof_bytes, result) catch |err|
+                        const proof = zk_dispute_proof_bytes(
+                            &attempt.proof_bytes,
+                            result,
+                        ) catch |err|
                             return .{ .wait = .{ .zk_decode_error = err } };
                         attempt.proof_length = @intCast(proof.len);
                     },
@@ -420,7 +423,11 @@ pub const DisputeAttempt = struct {
         } } };
     }
 
-    fn terminal_submit_action(attempt: *const DisputeAttempt, err: SubmitError, is_tee: bool) ?Action {
+    fn terminal_submit_action(
+        attempt: *const DisputeAttempt,
+        err: SubmitError,
+        is_tee: bool,
+    ) ?Action {
         assert(attempt.phase == .ready);
         const revert = switch (err) {
             .known_revert => |revert| revert,
@@ -444,7 +451,10 @@ pub const DisputeAttempt = struct {
         const count = attempt.phase.reproving;
         if (result) |session| {
             attempt.phase = .{ .awaiting = .{ .session = session, .started_at_ns = now_ns } };
-            return .{ .wait = .{ .reprove_started = .{ .session = session, .retry_count = count } } };
+            return .{ .wait = .{ .reprove_started = .{
+                .session = session,
+                .retry_count = count,
+            } } };
         }
         attempt.increment_retry();
         attempt.phase = .needs_retry;

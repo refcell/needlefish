@@ -148,7 +148,10 @@ pub const World = struct {
         world.prng = .init(seed);
         world.faults = .{};
         world.game_count = 0;
-        world.anchor = .{ .anchor_game = @splat(0), .anchor_root = .{ .root = @splat(0), .l2_block_number = 0 } };
+        world.anchor = .{
+            .anchor_game = @splat(0),
+            .anchor_root = .{ .root = @splat(0), .l2_block_number = 0 },
+        };
         world.anchor_state_registry = @splat(0xa5);
         world.delayed_weth = @splat(0x3e);
         world.weth_delay_s = 60;
@@ -232,7 +235,8 @@ pub const World = struct {
             .proof_count = @as(u32, @intFromBool(spec.tee)) + @intFromBool(spec.zk),
         };
         for (game.roots[0..count], 0..) |*root, root_index| {
-            root.* = world.honest_root(spec.starting_block + world.intervals.intermediate_block * (root_index + 1));
+            const offset = world.intervals.intermediate_block * (root_index + 1);
+            root.* = world.honest_root(spec.starting_block + offset);
             if (spec.corrupt_index != null and spec.corrupt_index.? == root_index) root[0] ^= 0xff;
         }
         game.info.root_claim = game.roots[count - 1];
@@ -307,25 +311,36 @@ pub const World = struct {
         if (std.mem.eql(u8, head, &aggregate_verifier.resolve)) {
             return if (world.resolve_game(game)) null else .tx_reverted;
         }
-        if (std.mem.eql(u8, head, &aggregate_verifier.claim_credit)) return world.claim_credit(game);
+        if (std.mem.eql(u8, head, &aggregate_verifier.claim_credit)) {
+            return world.claim_credit(game);
+        }
         const call = aggregate_verifier.decode_dispute(calldata) orelse return .tx_reverted;
         return world.dispute(game, call);
     }
 
-    fn dispute(world: *World, game: *Game, call: aggregate_verifier.DisputeCall) ?chain.SubmitError {
+    fn dispute(
+        world: *World,
+        game: *Game,
+        call: aggregate_verifier.DisputeCall,
+    ) ?chain.SubmitError {
         if (game.status != .in_progress) return .tx_reverted;
         if (call.intermediate_root_index >= game.root_count or call.proof_bytes.len == 0) {
             world.stats.bad_disputes += 1;
             return .execution_reverted;
         }
         const index: u32 = @intCast(call.intermediate_root_index);
-        const block = game.info.starting_block_number + game.info.intervals.intermediate_block * (index + 1);
+        const offset = game.info.intervals.intermediate_block * (index + 1);
+        const block = game.info.starting_block_number + offset;
         // A sound verifier only accepts proofs of the honest root.
         if (!std.mem.eql(u8, &call.intermediate_root_to_prove, &world.honest_root(block))) {
             world.stats.bad_disputes += 1;
             return .{ .known_revert = .invalid_proof };
         }
-        const claimed_matches = std.mem.eql(u8, &game.roots[index], &call.intermediate_root_to_prove);
+        const claimed_matches = std.mem.eql(
+            u8,
+            &game.roots[index],
+            &call.intermediate_root_to_prove,
+        );
         const zk_proof = call.proof_bytes[0] == aggregate_verifier.proof_type_zk;
         if (game.countered_index > 0) {
             // Only a ZK nullification of the challenged (and right) root refutes a challenge.
@@ -342,7 +357,13 @@ pub const World = struct {
         return world.apply_dispute(game, call.kind, zk_proof, index);
     }
 
-    fn apply_dispute(world: *World, game: *Game, kind: aggregate_verifier.DisputeKind, zk_proof: bool, index: u32) ?chain.SubmitError {
+    fn apply_dispute(
+        world: *World,
+        game: *Game,
+        kind: aggregate_verifier.DisputeKind,
+        zk_proof: bool,
+        index: u32,
+    ) ?chain.SubmitError {
         switch (kind) {
             .nullify => {
                 const prover = if (zk_proof) &game.zk_prover else &game.tee_prover;
@@ -387,12 +408,16 @@ pub const World = struct {
     }
 
     fn set_anchor_state(world: *World, calldata: []const u8) ?chain.SubmitError {
-        const decoder = contracts.abi.Decoder.call(calldata, contracts.anchor_state_registry.set_anchor_state) catch
+        const decoder = contracts.abi.Decoder.call(
+            calldata,
+            contracts.anchor_state_registry.set_anchor_state,
+        ) catch
             return .tx_reverted;
         const address = decoder.address(0) catch return .tx_reverted;
         const game = world.find_game(address) orelse return .tx_reverted;
         if (!world.finalized(game) or game.status != .defender_wins) return .tx_reverted;
-        if (game.info.l2_block_number <= world.anchor.anchor_root.l2_block_number) return .tx_reverted;
+        const anchor_block = world.anchor.anchor_root.l2_block_number;
+        if (game.info.l2_block_number <= anchor_block) return .tx_reverted;
         world.anchor = .{ .anchor_game = game.proxy, .anchor_root = .{
             .root = game.info.root_claim,
             .l2_block_number = game.info.l2_block_number,
@@ -402,7 +427,8 @@ pub const World = struct {
     }
 
     fn finalized(world: *const World, game: *const Game) bool {
-        return game.status != .in_progress and world.now_s >= game.resolved_at_s + world.finality_delay_s;
+        if (game.status == .in_progress) return false;
+        return world.now_s >= game.resolved_at_s + world.finality_delay_s;
     }
 
     /// Transactions sent but not mined yet.
@@ -464,7 +490,11 @@ fn view_game_info(context: *anyopaque, address: Address) chain.ReadError!chain.G
     return game.info;
 }
 
-fn view_intermediate_roots(context: *anyopaque, address: Address, out: []Hash) chain.ReadError![]Hash {
+fn view_intermediate_roots(
+    context: *anyopaque,
+    address: Address,
+    out: []Hash,
+) chain.ReadError![]Hash {
     const game = try game_or_fail(cast(context), address);
     if (game.root_count > out.len) return error.ChainUnavailable;
     @memcpy(out[0..game.root_count], game.roots[0..game.root_count]);
@@ -484,7 +514,11 @@ fn view_anchor_snapshot(context: *anyopaque) chain.ReadError!chain.AnchorSnapsho
     return world.anchor;
 }
 
-fn view_implementation_intervals(context: *anyopaque, kind: u32, start: u64) chain.ReadError!chain.Intervals {
+fn view_implementation_intervals(
+    context: *anyopaque,
+    kind: u32,
+    start: u64,
+) chain.ReadError!chain.Intervals {
     _ = kind;
     _ = start;
     const world = cast(context);
@@ -492,7 +526,12 @@ fn view_implementation_intervals(context: *anyopaque, kind: u32, start: u64) cha
     return world.intervals;
 }
 
-fn view_factory_game(context: *anyopaque, kind: u32, claim: Hash, extra_data: []const u8) chain.ReadError!?Address {
+fn view_factory_game(
+    context: *anyopaque,
+    kind: u32,
+    claim: Hash,
+    extra_data: []const u8,
+) chain.ReadError!?Address {
     const world = cast(context);
     try read(world);
     var buffer: [contracts.dispute_game_factory.extra_data_bytes_max]u8 = undefined;
@@ -515,14 +554,22 @@ fn view_anchor_registry_of(context: *anyopaque, address: Address) chain.ReadErro
     return world.anchor_state_registry;
 }
 
-fn view_is_game_finalized(context: *anyopaque, registry: Address, address: Address) chain.ReadError!bool {
+fn view_is_game_finalized(
+    context: *anyopaque,
+    registry: Address,
+    address: Address,
+) chain.ReadError!bool {
     const world = cast(context);
     assert(std.mem.eql(u8, &registry, &world.anchor_state_registry));
     const game = try game_or_fail(world, address);
     return world.finalized(game);
 }
 
-fn view_anchor_preflight(context: *anyopaque, registry: Address, address: Address) chain.ReadError!chain.Preflight {
+fn view_anchor_preflight(
+    context: *anyopaque,
+    registry: Address,
+    address: Address,
+) chain.ReadError!chain.Preflight {
     const world = cast(context);
     assert(std.mem.eql(u8, &registry, &world.anchor_state_registry));
     _ = try game_or_fail(world, address);
@@ -556,7 +603,12 @@ fn view_weth_delay_seconds(context: *anyopaque, weth: Address) chain.ReadError!u
     return world.weth_delay_s;
 }
 
-fn view_withdrawal(context: *anyopaque, weth: Address, owner: Address, guy: Address) chain.ReadError!chain.Withdrawal {
+fn view_withdrawal(
+    context: *anyopaque,
+    weth: Address,
+    owner: Address,
+    guy: Address,
+) chain.ReadError!chain.Withdrawal {
     const world = cast(context);
     assert(std.mem.eql(u8, &weth, &world.delayed_weth));
     const game = try game_or_fail(world, owner);
@@ -597,7 +649,12 @@ const view_vtable: chain.ChainView.VTable = .{
     .l2_header = view_l2_header,
 };
 
-fn prover_request(context: *anyopaque, game: Address, index: u64, request: chain.ProofRequest) chain.ProverError!chain.SessionId {
+fn prover_request(
+    context: *anyopaque,
+    game: Address,
+    index: u64,
+    request: chain.ProofRequest,
+) chain.ProverError!chain.SessionId {
     _ = game;
     _ = index;
     const world = cast(context);
@@ -609,7 +666,10 @@ fn prover_request(context: *anyopaque, game: Address, index: u64, request: chain
     };
     world.jobs[world.job_count] = .{
         .kind = if (request == .tee) .tee else .zk,
-        .ready_at_s = world.now_s + world.latency(world.faults.proof_latency_s_min, world.faults.proof_latency_s_max),
+        .ready_at_s = world.now_s + world.latency(
+            world.faults.proof_latency_s_min,
+            world.faults.proof_latency_s_max,
+        ),
         .failed = world.fault(world.faults.proof_failure),
         .output_root = world.honest_root(claimed_block),
     };
@@ -653,7 +713,10 @@ fn submitter_send(context: *anyopaque, tx: chain.Tx) chain.SendResult {
         .ticket = world.tx_count,
         .to = tx.to,
         .length = @intCast(tx.calldata.len),
-        .mine_at_s = world.now_s + world.latency(world.faults.tx_latency_s_min, world.faults.tx_latency_s_max),
+        .mine_at_s = world.now_s + world.latency(
+            world.faults.tx_latency_s_min,
+            world.faults.tx_latency_s_max,
+        ),
         .status = .pending,
         .calldata = undefined,
     };
@@ -671,4 +734,7 @@ fn submitter_status(context: *anyopaque, ticket: chain.Ticket) chain.TxStatus {
     return tx.status;
 }
 
-const submitter_vtable: chain.Submitter.VTable = .{ .send = submitter_send, .status = submitter_status };
+const submitter_vtable: chain.Submitter.VTable = .{
+    .send = submitter_send,
+    .status = submitter_status,
+};

@@ -37,7 +37,10 @@ test "challenger anchor: updates to the next defender win once finalized" {
     world.advance(611);
     anchor_updater.poll(world.effects(), 0);
     try testing.expectEqual(game.proxy, world.anchor.anchor_game);
-    try testing.expectEqual(@as(?@TypeOf(anchor_updater.cached_next_game.?), null), anchor_updater.cached_next_game);
+    try testing.expectEqual(
+        @as(?@TypeOf(anchor_updater.cached_next_game.?), null),
+        anchor_updater.cached_next_game,
+    );
     try testing.expectEqual(@as(u64, 1), anchor_updater.stats.updates_mined);
 }
 
@@ -45,17 +48,26 @@ test "challenger anchor: the next game builds on the current anchor game" {
     const world = try world_fixture();
     defer testing.allocator.destroy(world);
     const first = world.add_game(.{ .starting_block = 0, .parent = world.anchor_state_registry });
-    world.anchor = .{ .anchor_game = first.proxy, .anchor_root = .{ .root = first.info.root_claim, .l2_block_number = 4 } };
+    world.anchor = .{
+        .anchor_game = first.proxy,
+        .anchor_root = .{ .root = first.info.root_claim, .l2_block_number = 4 },
+    };
     // A sibling with a wrong root and the honest successor.
     _ = world.add_game(.{ .starting_block = 4, .parent = first.proxy, .corrupt_index = 0 });
     const next = world.add_game(.{ .starting_block = 4, .parent = first.proxy });
     var anchor_updater = try testing.allocator.create(anchor.AnchorUpdater);
     defer testing.allocator.destroy(anchor_updater);
     anchor_updater.* = updater(world);
-    try testing.expectEqual(next.proxy, anchor_updater.next_game(world.effects().chain, world.anchor).?);
+    try testing.expectEqual(
+        next.proxy,
+        anchor_updater.next_game(world.effects().chain, world.anchor).?,
+    );
     // An unavailable checkpoint block means no next game yet.
     world.l2_head = 5;
-    try testing.expectEqual(@as(?chain.Address, null), anchor_updater.next_game(world.effects().chain, world.anchor));
+    try testing.expectEqual(
+        @as(?chain.Address, null),
+        anchor_updater.next_game(world.effects().chain, world.anchor),
+    );
 }
 
 test "challenger anchor: a challenger win clears the cached next game" {

@@ -28,12 +28,30 @@ fn scan_indices(scanner: *Scanner, world: *fake_world.World, out: []u64) ![]u64 
 test "challenger scanner: classify every prover state" {
     const tee: chain.Address = @splat(1);
     const zk: chain.Address = @splat(2);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_tee_proposal, scanner_module.classify(tee, zero, 0).?);
-    try testing.expectEqual(@as(?scanner_module.GameCategory, null), scanner_module.classify(tee, zero, 1));
-    try testing.expectEqual(scanner_module.GameCategory.invalid_dual_proposal, scanner_module.classify(tee, zk, 0).?);
-    try testing.expectEqual(@as(u64, 2), scanner_module.classify(tee, zk, 3).?.fraudulent_zk_challenge);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_zk_proposal, scanner_module.classify(zero, zk, 0).?);
-    try testing.expectEqual(@as(?scanner_module.GameCategory, null), scanner_module.classify(zero, zk, 2));
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_tee_proposal,
+        scanner_module.classify(tee, zero, 0).?,
+    );
+    try testing.expectEqual(
+        @as(?scanner_module.GameCategory, null),
+        scanner_module.classify(tee, zero, 1),
+    );
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_dual_proposal,
+        scanner_module.classify(tee, zk, 0).?,
+    );
+    try testing.expectEqual(
+        @as(u64, 2),
+        scanner_module.classify(tee, zk, 3).?.fraudulent_zk_challenge,
+    );
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_zk_proposal,
+        scanner_module.classify(zero, zk, 0).?,
+    );
+    try testing.expectEqual(
+        @as(?scanner_module.GameCategory, null),
+        scanner_module.classify(zero, zk, 2),
+    );
 }
 
 test "challenger scanner: happy path keeps in-progress games of every type" {
@@ -49,11 +67,20 @@ test "challenger scanner: happy path keeps in-progress games of every type" {
     const result = try scanner.scan(world.effects().chain, &candidates);
     try testing.expectEqual(@as(usize, 4), result.candidates.len);
     const expected_indices = [_]u64{ 0, 1, 3, 4 };
-    for (result.candidates, expected_indices) |candidate, index| try testing.expectEqual(index, candidate.index);
+    for (
+        result.candidates,
+        expected_indices,
+    ) |candidate, index| try testing.expectEqual(index, candidate.index);
     try testing.expectEqual(@as(u32, 99), result.candidates[1].game_type);
     try testing.expectEqual(@as(u64, 94), result.candidates[0].l2_block_number);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_dual_proposal, result.candidates[2].category);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_tee_proposal, result.candidates[3].category);
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_dual_proposal,
+        result.candidates[2].category,
+    );
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_tee_proposal,
+        result.candidates[3].category,
+    );
     try testing.expectEqual(@as(u64, 2), result.candidates[0].intermediate_block_interval);
 }
 
@@ -65,7 +92,11 @@ test "challenger scanner: empty factory and anchor lower bound" {
     try testing.expectEqual(@as(usize, 0), (try scan_indices(&scanner, world, &indices)).len);
     for (0..100) |index| _ = world.add_game(.{ .starting_block = index * 10 });
     world.anchor.anchor_game = fake_world.game_address(96);
-    try testing.expectEqualSlices(u64, &.{ 97, 98, 99 }, try scan_indices(&scanner, world, &indices));
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 97, 98, 99 },
+        try scan_indices(&scanner, world, &indices),
+    );
     // A bounded scan evaluates the oldest post-anchor games first.
     world.anchor.anchor_game = zero;
     var bounded: Scanner = .init(3);
@@ -137,8 +168,14 @@ test "challenger scanner: categories of challenged, ZK, dual and nullified games
     const result = try scanner.scan(world.effects().chain, &candidates);
     try testing.expectEqual(@as(usize, 3), result.candidates.len);
     try testing.expectEqual(@as(u64, 1), result.candidates[0].category.fraudulent_zk_challenge);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_zk_proposal, result.candidates[1].category);
-    try testing.expectEqual(scanner_module.GameCategory.invalid_dual_proposal, result.candidates[2].category);
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_zk_proposal,
+        result.candidates[1].category,
+    );
+    try testing.expectEqual(
+        scanner_module.GameCategory.invalid_dual_proposal,
+        result.candidates[2].category,
+    );
 }
 
 test "challenger scanner: old post-anchor games are revisited after late transitions" {

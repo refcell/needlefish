@@ -94,7 +94,11 @@ pub const Scanner = struct {
     }
 
     /// Evaluates the games after the anchor into `out`, in index order.
-    pub fn scan(scanner: *Scanner, view: chain.ChainView, out: []CandidateGame) chain.ReadError!ScanResult {
+    pub fn scan(
+        scanner: *Scanner,
+        view: chain.ChainView,
+        out: []CandidateGame,
+    ) chain.ReadError!ScanResult {
         assert(out.len > 0);
         const game_count = try view.game_count();
         var result: ScanResult = .{

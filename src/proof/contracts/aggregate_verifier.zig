@@ -244,7 +244,14 @@ const testing = std.testing;
 const fuzz = @import("../../testing/fuzz.zig");
 
 test "aggregate verifier: fork-aware interval ABI gates on 0.3.0" {
-    const legacy = [_][]const u8{ "0.1.0", "0.1.99", "0.2.0", "0.2.99", "0.2.0-beta.1", "0.1.0-rc.1" };
+    const legacy = [_][]const u8{
+        "0.1.0",
+        "0.1.99",
+        "0.2.0",
+        "0.2.99",
+        "0.2.0-beta.1",
+        "0.1.0-rc.1",
+    };
     for (legacy) |text| try testing.expect(!supports_fork_aware_intervals(text));
     const fork_aware = [_][]const u8{
         "0.3.0", "0.10.0", "1.0.0", "0.3.0+deadbeef", "",     "unversioned",

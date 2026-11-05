@@ -120,7 +120,8 @@ pub const BondManager = struct {
             manager.stats.read_errors += 1;
             return null;
         };
-        const zk_claims = !chain.is_zero(state.zk_prover) and manager.is_claim_address(state.zk_prover);
+        const zk_claims = !chain.is_zero(state.zk_prover) and
+            manager.is_claim_address(state.zk_prover);
         if (!manager.is_claim_address(state.bond_recipient) and !zk_claims) return null;
         if (state.resolved_at == 0) {
             return if (state.game_over) .{ .game = game.proxy, .step = .resolve } else null;
@@ -146,7 +147,10 @@ pub const BondManager = struct {
             if (!ready) return;
         }
         var buffer: [4]u8 = undefined;
-        const function = if (action.step == .resolve) aggregate_verifier.resolve else aggregate_verifier.claim_credit;
+        const function = if (action.step == .resolve)
+            aggregate_verifier.resolve
+        else
+            aggregate_verifier.claim_credit;
         // Four bytes always fit a selector-only call.
         const calldata = aggregate_verifier.encode_getter(&buffer, function) catch unreachable;
         switch (world.submitter.send(.{ .to = action.game, .calldata = calldata })) {

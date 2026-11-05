@@ -33,7 +33,7 @@ test "challenger validator: claimed root at a block" {
     try testing.expectEqual(crypto.keccak256(raw), with_hash.block_hash);
 }
 
-test "challenger validator: intermediate roots valid, invalid, and final valid with intermediate invalid" {
+test "challenger validator: intermediate roots, final valid with intermediate invalid" {
     const world = try world_fixture();
     defer testing.allocator.destroy(world);
     const view = world.effects().chain;
@@ -65,25 +65,30 @@ test "challenger validator: missing block, count mismatch, range and overflow" {
     defer testing.allocator.destroy(world);
     const view = world.effects().chain;
     world.l2_head = 99;
-    try testing.expectError(error.BlockNotAvailable, validator.validate_claimed_root_at_block(view, 100, @splat(0)));
+    try testing.expectError(
+        error.BlockNotAvailable,
+        validator.validate_claimed_root_at_block(view, 100, @splat(0)),
+    );
     const zero: Hash = @splat(0);
     for ([_][]const Hash{ &.{zero}, &.{ zero, zero, zero } }) |roots| {
-        try testing.expectError(error.CheckpointCountMismatch, validator.validate_intermediate_roots(view, .{
+        const mismatch = validator.validate_intermediate_roots(view, .{
             .starting_block_number = 90,
             .l2_block_number = 100,
             .intermediate_block_interval = 5,
             .claimed_root = zero,
             .intermediate_roots = roots,
-        }));
+        });
+        try testing.expectError(error.CheckpointCountMismatch, mismatch);
     }
     for ([_][2]u64{ .{ 100, 100 }, .{ 200, 100 } }) |range| {
-        try testing.expectError(error.InvalidBlockRange, validator.validate_intermediate_roots(view, .{
+        const range_result = validator.validate_intermediate_roots(view, .{
             .starting_block_number = range[0],
             .l2_block_number = range[1],
             .intermediate_block_interval = 10,
             .claimed_root = zero,
             .intermediate_roots = &.{},
-        }));
+        });
+        try testing.expectError(error.InvalidBlockRange, range_result);
     }
     const max = std.math.maxInt(u64);
     const none = try validator.validate_intermediate_roots(view, .{

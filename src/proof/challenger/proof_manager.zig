@@ -68,7 +68,11 @@ pub const ProofManager = struct {
     calldata: [calldata_bytes_max]u8,
 
     /// Initializes in place: the slot table is large.
-    pub fn init(manager: *ProofManager, max_proof_duration_ns: u64, tee_submit_retry_limit: u32) void {
+    pub fn init(
+        manager: *ProofManager,
+        max_proof_duration_ns: u64,
+        tee_submit_retry_limit: u32,
+    ) void {
         assert(max_proof_duration_ns > 0);
         manager.limits = .{
             .max_proof_duration_ns = max_proof_duration_ns,
@@ -142,7 +146,13 @@ pub const ProofManager = struct {
         const session = world.prover.request(candidate.proxy, target.invalid_index, .{
             .tee = request,
         }) catch return false;
-        const attempt: DisputeAttempt = .awaiting_tee(session, target, zk_fallback, manager.limits, now_ns);
+        const attempt: DisputeAttempt = .awaiting_tee(
+            session,
+            target,
+            zk_fallback,
+            manager.limits,
+            now_ns,
+        );
         manager.insert(candidate.proxy, &attempt);
         assert(manager.has_pending_proof(candidate.proxy));
         return true;
@@ -163,7 +173,14 @@ pub const ProofManager = struct {
         const session = try world.prover.request(candidate.proxy, target.invalid_index, .{
             .zk = request,
         });
-        const attempt: DisputeAttempt = .awaiting_zk(session, target, request, intent, manager.limits, now_ns);
+        const attempt: DisputeAttempt = .awaiting_zk(
+            session,
+            target,
+            request,
+            intent,
+            manager.limits,
+            now_ns,
+        );
         manager.insert(candidate.proxy, &attempt);
         assert(manager.has_pending_proof(candidate.proxy));
     }
@@ -320,7 +337,11 @@ pub const ProofManager = struct {
 
 fn chain_state(view: chain.ChainView, game: Address) chain.ReadError!dispute_attempt.ChainState {
     const state = try view.game_state(game);
-    return .{ .status = state.status, .tee_prover = state.tee_prover, .zk_prover = state.zk_prover };
+    return .{
+        .status = state.status,
+        .tee_prover = state.tee_prover,
+        .zk_prover = state.zk_prover,
+    };
 }
 
 /// The ZK request proving checkpoint `invalid_index` of a game.

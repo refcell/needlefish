@@ -36,7 +36,11 @@ fn request() chain.ZkRequest {
 }
 
 fn limits() attempt_module.AttemptLimits {
-    return .{ .max_proof_duration_ns = 10 * second, .tee_submit_retry_limit = 1, .max_proof_retries = 2 };
+    return .{
+        .max_proof_duration_ns = 10 * second,
+        .tee_submit_retry_limit = 1,
+        .max_proof_retries = 2,
+    };
 }
 
 fn target() attempt_module.DisputeTarget {
@@ -73,8 +77,16 @@ fn chain_state() Event {
     return chain_event(.in_progress, @splat(1), @splat(0));
 }
 
-fn chain_event(status: chain.GameStatus, tee_prover: chain.Address, zk_prover: chain.Address) Event {
-    return .{ .chain_state = .{ .status = status, .tee_prover = tee_prover, .zk_prover = zk_prover } };
+fn chain_event(
+    status: chain.GameStatus,
+    tee_prover: chain.Address,
+    zk_prover: chain.Address,
+) Event {
+    return .{ .chain_state = .{
+        .status = status,
+        .tee_prover = tee_prover,
+        .zk_prover = zk_prover,
+    } };
 }
 
 const submit_failure: Event = .{ .submitted = .other };
@@ -144,18 +156,53 @@ test "challenger dispute attempt: tick sequences follow needs without inspecting
     const cases = [_]Case{
         .{ zk(start), start, &.{response(.running)}, &.{ .poll, .idle } },
         .{ zk(start), start, &.{success(true)}, &.{ .poll, .idle } },
-        .{ tee(start, true), start, &.{ success(true), chain_state(), submit_failure }, &.{ .poll, .chain, .submit, .idle } },
-        .{ zk(start), start, &.{ success(false), chain_state(), submit_failure }, &.{ .poll, .chain, .submit, .idle } },
-        .{ zk(start), start, &.{ response(.failed), chain_state(), reprove_next }, &.{ .poll, .chain, .reprove, .idle } },
-        .{ tee(start, true), start, &.{ response(.failed), chain_state(), reprove_next }, &.{ .poll, .chain, .reprove, .idle } },
-        .{ retry, start, &.{ chain_state(), reprove_next }, &.{ .chain, .reprove, .idle } },
-        .{ zk(start), start, &.{ response(.failed), chain_state(), reprove_error }, &.{ .poll, .chain, .reprove, .idle } },
-        .{ ready, start, &.{ chain_state(), submit_failure }, &.{ .chain, .submit, .idle } },
-        .{ zk(start), start + 11 * second, &.{ chain_state(), reprove_next }, &.{ .timeout, .reprove, .idle } },
         .{
             tee(start, true),
             start,
-            &.{ success(true), chain_state(), .{ .submitted = .{ .known_revert = .invalid_proof } }, reprove_next },
+            &.{ success(true), chain_state(), submit_failure },
+            &.{ .poll, .chain, .submit, .idle },
+        },
+        .{
+            zk(start),
+            start,
+            &.{ success(false), chain_state(), submit_failure },
+            &.{ .poll, .chain, .submit, .idle },
+        },
+        .{
+            zk(start),
+            start,
+            &.{ response(.failed), chain_state(), reprove_next },
+            &.{ .poll, .chain, .reprove, .idle },
+        },
+        .{
+            tee(start, true),
+            start,
+            &.{ response(.failed), chain_state(), reprove_next },
+            &.{ .poll, .chain, .reprove, .idle },
+        },
+        .{ retry, start, &.{ chain_state(), reprove_next }, &.{ .chain, .reprove, .idle } },
+        .{
+            zk(start),
+            start,
+            &.{ response(.failed), chain_state(), reprove_error },
+            &.{ .poll, .chain, .reprove, .idle },
+        },
+        .{ ready, start, &.{ chain_state(), submit_failure }, &.{ .chain, .submit, .idle } },
+        .{
+            zk(start),
+            start + 11 * second,
+            &.{ chain_state(), reprove_next },
+            &.{ .timeout, .reprove, .idle },
+        },
+        .{
+            tee(start, true),
+            start,
+            &.{
+                success(true),
+                chain_state(),
+                .{ .submitted = .{ .known_revert = .invalid_proof } },
+                reprove_next,
+            },
             &.{ .poll, .chain, .submit, .reprove, .idle },
         },
     };
@@ -198,7 +245,11 @@ test "challenger dispute attempt: idle ticks resume only with a new now" {
         _ = try drive_tick(&attempt, start, case[1]);
         for (0..2) |_| try (try drive_tick(&attempt, start, &.{})).expect(&.{.idle});
         const trace = try drive_tick(&attempt, start + second, &.{});
-        if (case[2] == .idle) try trace.expect(&.{.idle}) else try trace.expect(&.{ case[2], .transport_error });
+        if (case[2] == .idle) {
+            try trace.expect(&.{.idle});
+        } else {
+            try trace.expect(&.{ case[2], .transport_error });
+        }
     }
 }
 
@@ -366,7 +417,7 @@ test "challenger dispute attempt: chain state gates ready and retry for each sou
     for (cases) |case| {
         for (provers, 0..) |pair, index| {
             for ([_]bool{ false, true }) |ready| {
-                for ([_]chain.GameStatus{ .in_progress, .challenger_wins, .defender_wins }) |status| {
+                for (std.enums.values(chain.GameStatus)) |status| {
                     const state: attempt_module.ChainState =
                         .{ .status = status, .tee_prover = pair[0], .zk_prover = pair[1] };
                     try expect_chain_gate(case[0], case[1], case[2][index], state, ready);
@@ -446,7 +497,13 @@ fn expect_tee_limit(fallback: bool, limit: u32) !void {
     attempt_limits.tee_submit_retry_limit = limit;
     const zk_fallback: ?attempt_module.ZkFallback =
         if (fallback) .{ .request = request(), .intent = .challenge } else null;
-    var attempt: DisputeAttempt = .awaiting_tee(session_tee, target(), zk_fallback, attempt_limits, now);
+    var attempt: DisputeAttempt = .awaiting_tee(
+        session_tee,
+        target(),
+        zk_fallback,
+        attempt_limits,
+        now,
+    );
     _ = attempt.apply(success(true), now);
     var count: u32 = 1;
     while (count <= limit) : (count += 1) {
@@ -543,7 +600,10 @@ fn expect_out_of_order(phase: PhaseKind, event_kind: EventKind) !void {
             try testing.expectEqualSlices(u8, &zk_proof, submit.proof_bytes);
         },
         .needs_retry => {
-            try testing.expectEqual(@as(u32, 1), attempt.apply(chain_state(), start).reprove.retry_count);
+            try testing.expectEqual(
+                @as(u32, 1),
+                attempt.apply(chain_state(), start).reprove.retry_count,
+            );
         },
         .reproving, .done => {},
     }

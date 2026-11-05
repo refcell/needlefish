@@ -154,7 +154,12 @@ pub const ChainView = struct {
     pub fn weth_delay_seconds(view: ChainView, weth: Address) ReadError!u64 {
         return view.vtable.weth_delay_seconds(view.context, weth);
     }
-    pub fn withdrawal(view: ChainView, weth: Address, owner: Address, guy: Address) ReadError!Withdrawal {
+    pub fn withdrawal(
+        view: ChainView,
+        weth: Address,
+        owner: Address,
+        guy: Address,
+    ) ReadError!Withdrawal {
         return view.vtable.withdrawal(view.context, weth, owner, guy);
     }
     pub fn l1_block_number(view: ChainView, hash: Hash) ReadError!u64 {
@@ -223,7 +228,12 @@ pub const Prover = struct {
         poll: *const fn (*anyopaque, SessionId) ProverError!ProverStatus,
     };
 
-    pub fn request(prover: Prover, game: Address, index: u64, proof: ProofRequest) ProverError!SessionId {
+    pub fn request(
+        prover: Prover,
+        game: Address,
+        index: u64,
+        proof: ProofRequest,
+    ) ProverError!SessionId {
         return prover.vtable.request(prover.context, game, index, proof);
     }
     pub fn poll(prover: Prover, session: SessionId) ProverError!ProverStatus {

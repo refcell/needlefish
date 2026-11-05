@@ -82,7 +82,11 @@ pub const AnchorUpdater = struct {
     }
 
     /// The factory game proposing the honest roots that extend `anchor`, if it exists.
-    pub fn next_game(updater: *AnchorUpdater, view: chain.ChainView, anchor: chain.AnchorSnapshot) ?Address {
+    pub fn next_game(
+        updater: *AnchorUpdater,
+        view: chain.ChainView,
+        anchor: chain.AnchorSnapshot,
+    ) ?Address {
         const start = anchor.anchor_root.l2_block_number;
         const raw_intervals = view.implementation_intervals(updater.game_type, start) catch
             return null;
@@ -134,7 +138,10 @@ pub const AnchorUpdater = struct {
         }
         var buffer: [64]u8 = undefined;
         // 36 bytes: selector and one address.
-        const calldata = contracts.anchor_state_registry.encode_set_anchor_state(&buffer, game) catch
+        const calldata = contracts.anchor_state_registry.encode_set_anchor_state(
+            &buffer,
+            game,
+        ) catch
             unreachable;
         updater.stats.updates_sent += 1;
         switch (world.submitter.send(.{ .to = registry, .calldata = calldata })) {
