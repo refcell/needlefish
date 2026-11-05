@@ -22,18 +22,8 @@ pub const config_update_version_0 = B256.zero;
 /// Default DA footprint gas scalar applied when an update sets zero.
 pub const da_footprint_gas_scalar_default: u16 = 400;
 
-/// A minimal L1 log view; the primitives lane will own the full receipt types.
-pub const Log = struct {
-    address: Address,
-    topics: []const B256,
-    data: []const u8,
-};
-
-/// A minimal L1 receipt view: status and logs.
-pub const Receipt = struct {
-    success: bool,
-    logs: []const Log,
-};
+pub const Log = @import("log.zig").Log;
+pub const Receipt = @import("log.zig").Receipt;
 
 pub const UpdateKind = enum(u64) {
     batcher = 0,

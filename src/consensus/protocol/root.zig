@@ -8,6 +8,8 @@ pub const frame = @import("frame.zig");
 pub const channel = @import("channel.zig");
 pub const rollup_config = @import("rollup_config.zig");
 pub const system_config = @import("system_config.zig");
+pub const log = @import("log.zig");
+pub const deposits = @import("deposits.zig");
 
 pub const BlockId = block.BlockId;
 pub const BlockInfo = block.BlockInfo;
@@ -19,6 +21,7 @@ pub const RollupConfig = rollup_config.RollupConfig;
 pub const Upgrade = rollup_config.Upgrade;
 pub const Feature = rollup_config.Feature;
 pub const SystemConfig = system_config.SystemConfig;
+pub const DepositTx = deposits.DepositTx;
 
 test {
     std.testing.refAllDecls(@This());

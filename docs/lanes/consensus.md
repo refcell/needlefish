@@ -9,7 +9,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] local RLP decoder (until primitives lane lands one) + singular batches
   - [ ] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
   - [x] rollup config + hardfork activation, system config + L1 log updates
-  - [ ] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), user deposits
+  - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
+  - [ ] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian)
   - [ ] batch validity rules (singular, span, Holocene)
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
 - [ ] `derive`: pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
@@ -29,9 +30,12 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   because this lane's backlog owns them; JSON (serde) parsing comes with `bin/consensus`.
   Execution-only Base features (Beryl/Cobalt/Everest/Zenith precompiles) are omitted from
   `Feature`; the runtime upgrade override registry is not ported yet.
+- `DepositTx` lives in `protocol/deposits.zig` until the primitives lane lands OP deposit
+  tx types; switch to theirs then.
 - Invalid system config logs are skipped (base/base collects them as non-fatal errors).
 - Zig 0.17 has no array `**` operator: use `@splat`.
 
 ## Log
+- 2026-11-05: user deposits, deposit tx 2718 encoding (base/base vectors), source hashes.
 - 2026-11-05: rollup config (upgrades, features, Denim schedule), system config updates.
 - 2026-11-05: protocol frames, channels, block info with seeded + std fuzz tests.
