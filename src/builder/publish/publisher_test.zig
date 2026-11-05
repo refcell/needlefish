@@ -189,15 +189,20 @@ const Harness = struct {
     subscribers: [subscribers_max]Subscriber,
     prng: Prng,
     ring_covers_outages: bool,
+    reset_ppm: u32,
     stopping: bool = false,
     published_positions: [published_max]Position = undefined,
     published_offsets: [published_max + 1]u32 = undefined,
     published_bytes: []u8,
     published_count: u32 = 0,
 
-    fn init(harness: *Harness, seed: u64, ring_covers_outages: bool) !void {
+    const Config = struct { ring_covers_outages: bool, reset_ppm: u32 = 300 };
+
+    fn init(harness: *Harness, seed: u64, config: Config) !void {
+        const ring_covers_outages = config.ring_covers_outages;
         harness.prng = Prng.init(seed);
         harness.ring_covers_outages = ring_covers_outages;
+        harness.reset_ppm = config.reset_ppm;
         harness.stopping = false;
         harness.published_count = 0;
         harness.published_offsets[0] = 0;
@@ -205,20 +210,23 @@ const Harness = struct {
         errdefer testing.allocator.free(harness.published_bytes);
         harness.world = try io.SimWorld.init(testing.allocator, .{
             .seed = seed,
-            .reset_ppm = if (ring_covers_outages) 0 else 300,
+            .reset_ppm = config.reset_ppm,
             .pipe_size_bytes = 32 * 1024,
         });
         const server_host = Address.ip4(.{ 10, 0, 0, 1 }, 0);
         try SimIo.init(&harness.server_io, testing.allocator, &harness.world, .{
             .host = server_host,
         });
-        try harness.publisher.init(testing.allocator, &harness.server_io, .{
+        const ring_entries_max: u32 = if (ring_covers_outages) published_max else 12;
+        var options: publisher_module.Options = .{
             .connections_max = subscribers_max + 1,
-            .send_buffer_size = 16 * 1024,
             .payload_size_max = message_size_max,
-            .ring_entries_max = if (ring_covers_outages) published_max else 12,
-            .ring_bytes_max = if (ring_covers_outages) published_max * 2048 else 12 * 2048,
-        });
+            .ring_entries_max = ring_entries_max,
+            .ring_bytes_max = ring_entries_max * 2048,
+        };
+        // The smallest send buffer a full replay fits in: lag disconnects come early.
+        options.send_buffer_size = @intCast(options.replay_bytes_max());
+        try harness.publisher.init(testing.allocator, &harness.server_io, options);
         harness.bound = try harness.publisher.listen(server_host.with_port(7111));
         for (&harness.subscribers, &harness.client_ios, 0..) |*subscriber, *client_io, index| {
             const host = Address.ip4(.{ 10, 0, 1, @intCast(index + 1) }, 0);
@@ -321,9 +329,10 @@ const Harness = struct {
     }
 };
 
-fn run_simulation(seed: u64, ring_covers_outages: bool) !void {
+/// Returns how many times subscribers reconnected.
+fn run_simulation(seed: u64, ring_covers_outages: bool) !u32 {
     var harness: Harness = undefined;
-    try harness.init(seed, ring_covers_outages);
+    try harness.init(seed, .{ .ring_covers_outages = ring_covers_outages });
     defer harness.deinit();
     for (&harness.subscribers) |*subscriber| subscriber.connect();
     var position = at(100, 0);
@@ -364,26 +373,33 @@ fn run_simulation(seed: u64, ring_covers_outages: bool) !void {
             try testing.expectEqual(harness.published_count, subscriber.received);
         }
     }
+    var reconnects: u32 = 0;
+    for (&harness.subscribers) |*subscriber| reconnects += subscriber.connections - 1;
+    return reconnects;
 }
 
 test "publisher: simulated subscribers survive resets, partitions, and floods" {
     var prng = Prng.init(0xf1a5_b10c);
+    var reconnects_full_ring: u32 = 0;
     for (0..6) |_| {
         const seed = prng.int(u64);
-        run_simulation(seed, true) catch |err| {
+        reconnects_full_ring += run_simulation(seed, true) catch |err| {
             std.debug.print("publisher sim seed {d} (full ring) failed\n", .{seed});
             return err;
         };
-        run_simulation(seed, false) catch |err| {
+        _ = run_simulation(seed, false) catch |err| {
             std.debug.print("publisher sim seed {d} (small ring) failed\n", .{seed});
             return err;
         };
     }
+    // Resets and partitions happened, so exactly-once delivery was checked across
+    // reconnects, not only on a quiet network.
+    try testing.expect(reconnects_full_ring > 0);
 }
 
 test "publisher: replay on resume and eviction of a stalled subscriber" {
     var harness: Harness = undefined;
-    try harness.init(42, true);
+    try harness.init(42, .{ .ring_covers_outages = false, .reset_ppm = 0 });
     defer harness.deinit();
     var position = at(7, 0);
     for (0..5) |_| try harness.publish_next(&position);
@@ -396,14 +412,21 @@ test "publisher: replay on resume and eviction of a stalled subscriber" {
     try testing.expectEqual(@as(u32, 3), subscriber.received);
     try testing.expectEqual(@as(u64, 3), harness.publisher.metrics.replay_messages_sent.get());
     try testing.expectEqual(@as(i64, 1), harness.publisher.metrics.connections_active.get());
-    // Stall it with a partition and flood: it is dropped as lagging, then catches up.
+    // Stall it with a partition and flood past its send buffer: it is dropped as lagging,
+    // reconnects, and resumes from the ring (with a gap: it fell further behind than the
+    // ring reaches, as a lagged base/base subscriber does).
     harness.world.partition(harness.server_io.index, harness.client_ios[0].index);
-    for (0..40) |_| try harness.publish_next(&position);
-    try testing.expect(harness.publisher.metrics.lagged.get() >= 1);
+    for (0..150) |_| try harness.publish_next(&position);
+    try testing.expect(harness.publisher.metrics.lagged_disconnects.get() >= 1);
     harness.world.heal_all();
     rounds = 0;
-    while (subscriber.received < 43 and rounds < 20_000) : (rounds += 1) harness.step();
+    const newest = harness.published_positions[harness.published_count - 1];
+    while (rounds < 20_000) : (rounds += 1) {
+        if (subscriber.last) |last| if (std.meta.eql(last, newest)) break;
+        harness.step();
+    }
     if (subscriber.failure) |err| return err;
-    try testing.expectEqual(@as(u32, 43), subscriber.received);
+    try testing.expectEqual(newest, subscriber.last.?);
     try testing.expect(subscriber.connections >= 2);
+    try testing.expect(subscriber.received < harness.published_count);
 }

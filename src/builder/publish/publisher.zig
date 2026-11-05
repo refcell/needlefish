@@ -29,17 +29,39 @@ pub const Address = ws.server.Address;
 
 pub const Options = struct {
     connections_max: u32 = 64,
-    /// Bytes queued per subscriber before it counts as lagging and is disconnected.
+    /// Bytes queued per subscriber before it counts as lagging and is disconnected. Must
+    /// hold a full replay plus one live message (`validate`), because replay queues the
+    /// whole backlog at once inside `on_open`.
     send_buffer_size: u32 = 4 << 20,
     /// Largest encoded flashblock; also sizes the encode buffer.
     payload_size_max: u32 = 1 << 20,
     /// base/base `DEFAULT_RING_BUFFER_CAPACITY`.
     ring_entries_max: u32 = 16,
-    ring_bytes_max: u32 = 16 << 20,
+    ring_bytes_max: u32 = 2 << 20,
     /// Subscribers only send control frames; their data messages are ignored.
     inbound_message_size_max: u32 = 4096,
     backlog: u31 = 128,
+
+    pub fn validate(options: Options) error{InvalidOptions}!void {
+        if (options.connections_max == 0 or options.ring_entries_max == 0) {
+            return error.InvalidOptions;
+        }
+        if (options.payload_size_max == 0) return error.InvalidOptions;
+        if (options.payload_size_max > options.ring_bytes_max) return error.InvalidOptions;
+        if (options.send_buffer_size < replay_bytes_max(options)) return error.InvalidOptions;
+    }
+
+    /// The most a new subscriber can have queued: the upgrade response, every ringed
+    /// message, and one live message, each with a frame header.
+    pub fn replay_bytes_max(options: Options) u64 {
+        const frames: u64 = @as(u64, options.ring_entries_max) + 1;
+        return handshake_response_size_max + frames * ws.frame.header_size_max +
+            options.ring_bytes_max + options.payload_size_max;
+    }
 };
+
+/// The 101 response the ws server queues before `on_open` (fixed text plus the key).
+const handshake_response_size_max = 256;
 
 /// base/base `PublishingMetrics` (prefix `base_builder_`).
 pub const Metrics = struct {
@@ -47,7 +69,9 @@ pub const Metrics = struct {
     replay_messages_sent: metrics.Counter = .{},
     replay_stale_position: metrics.Counter = .{},
     connections_active: metrics.Gauge = .{},
-    lagged: metrics.Counter = .{},
+    /// Subscribers disconnected for lagging. base/base's `ws_lagged_count` counts skipped
+    /// messages instead; a disconnected subscriber skips nothing here (it resumes).
+    lagged_disconnects: metrics.Counter = .{},
     send_errors: metrics.Counter = .{},
     handshake_errors: metrics.Counter = .{},
     payload_size_bytes: metrics.Histogram = .init(&payload_size_buckets),
@@ -75,9 +99,9 @@ pub const Metrics = struct {
             &m.connections_active,
         );
         try registry.counter(
-            "base_builder_ws_lagged_count",
+            "base_builder_ws_lagged_disconnect_count",
             "Total subscribers disconnected for lagging",
-            &m.lagged,
+            &m.lagged_disconnects,
         );
         try registry.counter(
             "base_builder_ws_send_error_count",
@@ -137,7 +161,7 @@ pub fn Publisher(comptime IO: type) type {
             io: *IO,
             options: Options,
         ) !void {
-            assert(options.payload_size_max > 0);
+            try options.validate();
             assert(options.payload_size_max <= options.ring_bytes_max);
             var ring = try Ring.init(allocator, options.ring_entries_max, options.ring_bytes_max);
             errdefer ring.deinit(allocator);
@@ -213,7 +237,7 @@ pub fn Publisher(comptime IO: type) type {
             const dropped = publisher.server.slow_consumers_dropped - dropped_before;
             assert(delivered + dropped == open);
             publisher.metrics.messages_sent.add(delivered);
-            publisher.metrics.lagged.add(dropped);
+            publisher.metrics.lagged_disconnects.add(dropped);
             publisher.metrics.payload_size_bytes.observe(@floatFromInt(json.len));
         }
 
@@ -241,13 +265,9 @@ pub fn Publisher(comptime IO: type) type {
             assert(index <= ring.len());
             while (index < ring.len()) : (index += 1) {
                 const entry = ring.get(index);
-                server.send(id, .text, entry.payload) catch {
-                    // The backlog exceeds the send buffer: drop the subscriber, as a
-                    // timed-out replay send does in base/base.
-                    publisher.metrics.send_errors.increment();
-                    server.close(id, .policy_violation);
-                    return;
-                };
+                // `Options.validate` sizes the send buffer for the whole ring plus the
+                // upgrade response, and the stream was opened just now.
+                server.send(id, .text, entry.payload) catch unreachable;
                 publisher.metrics.replay_messages_sent.increment();
             }
         }

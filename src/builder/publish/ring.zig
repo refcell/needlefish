@@ -141,10 +141,10 @@ pub const Ring = struct {
         }
         const next = ring.slot(0).offset;
         // A later payload sits at or after the oldest one, unless it wrapped to offset 0.
-        const distance = if (next >= oldest.offset)
+        const distance: u32 = if (next >= oldest.offset)
             next - oldest.offset
         else
-            @as(u32, @intCast(ring.arena.len)) - oldest.offset + next;
+            @intCast(ring.arena.len - oldest.offset + next);
         assert(distance <= ring.span_bytes);
         ring.span_bytes -= distance;
     }
@@ -153,7 +153,7 @@ pub const Ring = struct {
     /// and advances the span over them. Each iteration either returns or evicts one entry,
     /// so it runs at most `entries_max + 1` times.
     fn reserve(ring: *Ring, length: u32, evicted: *u32) u32 {
-        const arena_bytes: u32 = @intCast(ring.arena.len);
+        const arena_bytes: u64 = ring.arena.len;
         for (0..ring.slots.len + 1) |_| {
             if (ring.count == ring.slots.len) {
                 ring.evict_oldest();
@@ -164,26 +164,28 @@ pub const Ring = struct {
                 ring.span_bytes = length;
                 return 0;
             }
-            const begin = ring.slot(0).offset;
-            assert(ring.span_bytes <= arena_bytes);
-            if (begin + ring.span_bytes <= arena_bytes) {
+            // u64: offset plus span can exceed u32 for arenas over 2 GiB.
+            const begin: u64 = ring.slot(0).offset;
+            const span: u64 = ring.span_bytes;
+            assert(span <= arena_bytes);
+            if (begin + span <= arena_bytes) {
                 // Not wrapped: free space is [tail, arena_bytes) and [0, begin).
-                const tail = begin + ring.span_bytes;
+                const tail = begin + span;
                 if (arena_bytes - tail >= length) {
                     ring.span_bytes += length;
-                    return tail;
+                    return @intCast(tail);
                 }
                 if (begin >= length) {
-                    ring.span_bytes += arena_bytes - tail + length;
+                    ring.span_bytes = @intCast(span + (arena_bytes - tail) + length);
                     return 0;
                 }
             } else {
                 // Wrapped: free space is [tail, begin).
-                const tail = begin + ring.span_bytes - arena_bytes;
+                const tail = begin + span - arena_bytes;
                 assert(tail <= begin);
                 if (begin - tail >= length) {
                     ring.span_bytes += length;
-                    return tail;
+                    return @intCast(tail);
                 }
             }
             ring.evict_oldest();

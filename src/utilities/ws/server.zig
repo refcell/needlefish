@@ -42,7 +42,8 @@ pub fn Handlers(comptime ServerType: type, comptime Context: type) type {
 
 const handshake_head_size_max = 8 * 1024;
 const accept_backoff_ns = 10 * std.time.ns_per_ms;
-pub const request_target_size_max = 256;
+/// Longer upgrade targets are rejected with 400 rather than accepted without one.
+pub const request_target_size_max = 2048;
 
 pub fn Server(comptime IO: type, comptime Context: type) type {
     return struct {
@@ -178,10 +179,10 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
         }
 
         /// The upgrade request's target (e.g. `/ws?block_number=1`), or null for a stale
-        /// id or a target longer than `request_target_size_max`. Valid from `on_open` on.
+        /// id. Valid from `on_open` on.
         pub fn request_target(server: *Self, id: ConnectionId) ?[]const u8 {
             const connection = server.lookup(id) orelse return null;
-            if (connection.target_length == 0) return null;
+            if (connection.target_length == 0) return null; // Still handshaking.
             assert(connection.target_length <= request_target_size_max);
             return connection.target[0..connection.target_length];
         }
@@ -253,6 +254,7 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
             for (server.connections) |*connection| {
                 if (connection.stream.state != .idle) continue;
                 connection.generation +%= 1;
+                connection.target_length = 0;
                 connection.stream.start(fd);
                 return;
             }
@@ -305,11 +307,10 @@ pub fn Server(comptime IO: type, comptime Context: type) type {
                 ) catch unreachable; // The response has a fixed size.
                 // Copy the target before `consume` shifts the receive buffer under it.
                 const target = complete.message.target;
-                connection.target_length = 0;
-                if (target.len <= request_target_size_max) {
-                    @memcpy(connection.target[0..target.len], target);
-                    connection.target_length = @intCast(target.len);
-                }
+                if (target.len > request_target_size_max) return reject(stream);
+                assert(target.len > 0); // The request-line parser rejects empty targets.
+                @memcpy(connection.target[0..target.len], target);
+                connection.target_length = @intCast(target.len);
                 stream.consume(@intCast(complete.consumed));
                 stream.send_raw(bytes) catch unreachable; // The send buffer starts empty.
                 stream.open();
