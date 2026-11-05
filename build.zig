@@ -98,6 +98,14 @@ fn add_vector_tools(
         .description = "Run transaction tests: zig build txtest -- <file-or-dir>",
     });
 
+    // ethereum/tests BlockchainTests block RLP through the strict block decoder.
+    _ = add_tool(b, base, target, optimize, .{
+        .name = "blockrlp",
+        .path = "src/common/consensus/block_test_main.zig",
+        .step = "blockrlp",
+        .description = "Check block RLP: zig build blockrlp -- <file-or-dir>",
+    });
+
     // base/base genesis parity (files from `just vectors`).
     _ = add_tool(b, base, target, optimize, .{
         .name = "genesischeck",

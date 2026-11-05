@@ -7,6 +7,7 @@ pub const signature = @import("signature.zig");
 pub const tx_fields = @import("tx_fields.zig");
 pub const tx = @import("tx.zig");
 pub const tx_vectors = @import("tx_vectors.zig");
+pub const block_vectors = @import("block_vectors.zig");
 pub const hashing = @import("hashing.zig");
 pub const header = @import("header.zig");
 pub const receipt = @import("receipt.zig");

@@ -50,8 +50,10 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `genesis.feature`: base/base `BaseFeature` registry (82 features) and the full 17-entry
   `genesis.Upgrade` (Bedrock..Zenith, base/base ordinals), `is_feature_enabled`,
   `activation_states`, `Upgrade.from_base`.
-- [ ] `blockrlp` tool over ethereum/tests BlockchainTests: decode every block `rlp` with
-  `consensus.block`, re-encode byte-identical, header hash = `blockHeader.hash`, tx roots.
+- [x] `zig build blockrlp -- <dir>` over ethereum/tests BlockchainTests: strict block decode,
+  byte-identical re-encode, header hash, transactions/ommers/withdrawals roots, genesis RLP.
+  `BlockchainTests/`: 3370 valid ok, 0 failures. `fixtures_blockchain_tests.tgz` (1.3 GiB
+  extracted, 2998 Prague files): 77758 valid ok, 0 failures. Curated vectors committed.
 - [ ] RLPTests/RandomRLPTests: run through the strict decoder (round trip or reject).
 
 ## Decisions
@@ -155,3 +157,5 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: ethereum/tests GenesisTests vectors (genesis block RLP parity).
 - 2026-11-05: `genesis.feature` BaseFeature registry.
 - 2026-11-05: ethereum/tests keyaddrtest vectors (seed -> key -> address).
+
+- 2026-11-05: `blockrlp` BlockchainTests runner, 0 failures over 81k blocks.
