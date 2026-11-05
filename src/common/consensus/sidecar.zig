@@ -180,6 +180,7 @@ pub const Sidecar = struct {
         ) catch |err| return switch (err) {
             error.InvalidFieldElement, error.InvalidPoint => error.InvalidKzgInput,
             error.ScratchTooSmall => unreachable, // Storage holds blobs_per_tx_max blobs.
+            error.InvalidInputLength => unreachable, // All three slices hold `count` items.
         };
         if (!valid) return error.KzgProofMismatch;
     }

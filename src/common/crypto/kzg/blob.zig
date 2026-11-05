@@ -34,7 +34,7 @@ pub const Error = error{
     InvalidPoint,
 };
 
-pub const BatchError = Error || error{ScratchTooSmall};
+pub const BatchError = Error || error{ ScratchTooSmall, InvalidInputLength };
 
 /// Domain separation tags (consensus-specs `FIAT_SHAMIR_PROTOCOL_DOMAIN` and
 /// `RANDOM_CHALLENGE_KZG_BATCH_DOMAIN`).
@@ -375,8 +375,11 @@ pub fn verify_blob_kzg_proof_batch(
     commitments: []const Commitment,
     proofs: []const Proof,
 ) BatchError!bool {
-    assert(blobs.len == commitments.len and blobs.len == proofs.len);
+    if (blobs.len != commitments.len or blobs.len != proofs.len) {
+        return error.InvalidInputLength;
+    }
     const count = blobs.len;
+    assert(commitments.len == count and proofs.len == count);
     if (count == 0) return true;
     if (scratch.zs.len < count or scratch.ys.len < count) return error.ScratchTooSmall;
     if (scratch.points.len < 2 * count + 1 or scratch.scalars.len < 2 * count + 1) {
@@ -790,6 +793,23 @@ test "blob: batch edge cases" {
         &blobs,
         &commitments,
         &commitments,
+    ));
+    // Mismatched lengths are rejected, empty or not, before any work.
+    try testing.expectError(error.InvalidInputLength, verify_blob_kzg_proof_batch(
+        settings,
+        &test_workspace,
+        storage.scratch(),
+        &.{},
+        commitments[0..1],
+        &.{},
+    ));
+    try testing.expectError(error.InvalidInputLength, verify_blob_kzg_proof_batch(
+        settings,
+        &test_workspace,
+        storage.scratch(),
+        blobs[0..2],
+        commitments[0..2],
+        commitments[0..1],
     ));
     if (!heavy_tests) return;
     // The zero polynomial has the identity as commitment and proof, in a batch of 2.

@@ -242,3 +242,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: KZG blob API (blob_to_kzg_commitment, compute_kzg_proof, compute/verify_blob_kzg_proof, batch) with c-kzg vectors, round trips, fuzz; bench (ReleaseFast, Apple M-series, loaded host): commitment 26 ms, compute_blob_kzg_proof 27 ms, verify_blob_kzg_proof 1.1 ms, batch of 6 verify 3.9 ms (0.65 ms/blob).
 - 2026-11-05: bls prepared G2 lines: pairing-2 588->493us; KZG checks use comptime-prepared lines for G2 and [tau]G2: point evaluation 0.76->0.65ms, verify_blob_kzg_proof 1.0ms.
 - 2026-11-05: montgomery lazy reduction (mul_wide/reduce_wide/add_unreduced, needs 4p < R); bn254 Fp2 mul uses it: pairing 2 pairs 559->494us. Tried on BLS12-381 Fp2 (6 limbs): slower (586->612us), not adopted.
+- 2026-11-05: review of KZG blob API, prepared lines, MSM (Booth + batch-affine), GLV/GLS: no consensus defects; fixed batch length mismatch to return InvalidInputLength instead of asserting.
