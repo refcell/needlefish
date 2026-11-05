@@ -14,6 +14,8 @@ const state_module = @import("state.zig");
 const evm_module = @import("evm.zig");
 const precompiles = @import("precompiles.zig");
 const Fork = @import("fork.zig").Fork;
+const eip8130_execute = @import("eip8130_execute.zig");
+const eip8130 = @import("../../common/consensus/eip8130.zig");
 const op = @import("op.zig");
 const native = @import("native.zig");
 const Address = primitives.Address;
@@ -26,6 +28,8 @@ pub const TxType = enum(u8) {
     eip1559 = 2,
     eip4844 = 3,
     eip7702 = 4,
+    /// Base EIP-8130 account abstraction (Everest); runs in `eip8130_execute`.
+    eip8130 = 0x79,
     deposit = 0x7e,
 };
 
@@ -66,6 +70,8 @@ pub const TxEnv = struct {
     mint: u128 = 0,
     /// Deposit: legacy system-transaction flag, rejected since Regolith.
     is_system_transaction: bool = false,
+    /// EIP-8130: the signed transaction; `envelope` must carry its EIP-2718 encoding.
+    eip8130: ?*const eip8130.Signed = null,
 };
 
 pub const Invalid = enum {
@@ -91,6 +97,8 @@ pub const Invalid = enum {
     authorization_empty,
     authorization_create,
     deposit_system_transaction,
+    /// EIP-8130 pre-call rejection (authorization, nonce, intrinsic gas, fees, payer).
+    eip8130_rejected,
 };
 
 pub const Executed = struct {
@@ -102,6 +110,8 @@ pub const Executed = struct {
     output: []const u8,
     created: ?Address,
     logs: []const state_module.Log,
+    /// EIP-8130: call phases committed (reported on the receipt).
+    committed_phases: u64 = 0,
 };
 
 pub const Result = union(enum) {
@@ -156,6 +166,7 @@ fn type_supported(comptime fork: Fork, tx_type: TxType) bool {
         .eip1559 => fork.at_least(.london),
         .eip4844 => fork.at_least(.cancun),
         .eip7702 => fork.at_least(.prague),
+        .eip8130 => false, // Never validated here: dispatched to `eip8130_execute`.
         .deposit => true, // Gated on `BlockEnv.op` in `transact_deposit`.
     };
 }
@@ -237,6 +248,18 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     if (!fork.at_least(.berlin)) return;
     _ = try evm.state.access(tx.caller);
     if (tx.to) |to| _ = try evm.state.access(to);
+    try warm_system_addresses(fork, evm);
+    for (tx.access_list) |item| {
+        const access = try evm.state.access(item.address);
+        for (item.storage_keys) |key| {
+            _ = try evm.state.storage_access(access.account, primitives.b256_to_u256(key));
+        }
+    }
+}
+
+/// The coinbase (EIP-3651), the precompiles, and the implemented native singletons.
+pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!void {
+    if (!fork.at_least(.berlin)) return;
     if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
     const op_upgrade = evm.op_upgrade();
     var number: u64 = 1;
@@ -247,12 +270,6 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     const p256 = primitives.address_from_int(0x100);
     if (precompiles.is_precompile(fork, op_upgrade, p256)) _ = try evm.state.access(p256);
     for (native.warm_addresses(op_upgrade)) |address| _ = try evm.state.access(address);
-    for (tx.access_list) |item| {
-        const access = try evm.state.access(item.address);
-        for (item.storage_keys) |key| {
-            _ = try evm.state.storage_access(access.account, primitives.b256_to_u256(key));
-        }
-    }
 }
 
 /// EIP-7702: apply valid authorizations. Returns the refund for existing authorities.
@@ -299,6 +316,7 @@ const checkpoint_zero = state_module.Checkpoint{
 
 pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
     if (tx.tx_type == .deposit) return transact_deposit(fork, evm, tx);
+    if (tx.tx_type == .eip8130) return eip8130_execute.transact(fork, evm, tx);
     if (validate_env(fork, evm, tx)) |invalid| return .{ .invalid = invalid };
     evm.state.begin_transaction();
     var fees_storage: op.Fees = undefined;

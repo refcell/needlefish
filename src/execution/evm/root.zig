@@ -24,6 +24,7 @@ pub const eip8130_auth = @import("eip8130_auth.zig");
 pub const eip8130_apply = @import("eip8130_apply.zig");
 pub const eip8130_tx = @import("eip8130_tx.zig");
 pub const eip8130_nonce = @import("eip8130_nonce.zig");
+pub const eip8130_execute = @import("eip8130_execute.zig");
 pub const bench = @import("bench.zig");
 pub const state_test = @import("state_test.zig");
 
