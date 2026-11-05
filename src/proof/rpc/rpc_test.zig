@@ -54,7 +54,8 @@ const Canned = struct {
                     "\"head_l1\":{\"hash\":" ++ hash_a ++ ",\"number\":4}," ++
                     "\"finalized_l1\":{\"hash\":" ++ hash_a ++ ",\"number\":2}," ++
                     "\"safe_l2\":{\"hash\":" ++ hash_a ++ ",\"number\":10}," ++
-                    "\"finalized_l2\":{\"hash\":" ++ hash_a ++ ",\"number\":8}," ++
+                    "\"finalized_l2\":{\"hash\":" ++ hash_a ++ ",\"number\":8," ++
+                    "\"l1origin\":{\"hash\":" ++ hash_a ++ ",\"number\":2}}," ++
                     "\"unsafe_l2\":{\"hash\":" ++ hash_a ++ ",\"number\":11}}",
             },
         };
@@ -161,6 +162,7 @@ test "rpc: typed execution and rollup calls over HTTP" {
     try testing.expectEqual(@as(u64, 10), status.safe_l2.number);
     try testing.expectEqual(@as(u64, 2), status.finalized_l1.number);
     try testing.expectEqual(@as(u64, 8), status.finalized_l2.number);
+    try testing.expectEqual(@as(u64, 2), status.finalized_l2_origin);
     const output = try rollup.output_at_block(12);
     try testing.expectEqual(@as(u8, 0xaa), output.output_root[0]);
     // The node answered for block 12; asking for another block is a mismatch.

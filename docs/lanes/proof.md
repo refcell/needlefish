@@ -187,9 +187,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   cached next target (base/base `try_recover_and_plan`), so an L1 reorg of the newest games
   is noticed only once the finalized head passes the next target (or a submission fails);
   the DST keeps the finalized head growing after its last reorg for that reason.
-- Proposer proof L1 head is the rollup node's `finalized_l1` (added to the rpc
-  `SyncStatus`); the base/base check that it is not below the finalized L2 block's L1
-  origin waits for the adapter (the `SyncStatus` type has no L1 origin).
+- Proposer proof L1 head is the rollup node's `finalized_l1`, rejected (tick retried) when
+  below the finalized L2 head's L1 origin (`SyncStatus.finalized_l2_origin`), as base/base
+  `select_l1_head`.
 - Proposer submitter is its own small JSON-RPC sender, not the batcher `TxManager`: the
   batcher's manager is built around inbox payloads (fixed `to`, no value, no gas
   estimation, no revert data), while a game creation needs the bond as value and the
@@ -201,6 +201,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: proposer checks the proof L1 head against the finalized L2 origin.
 - 2026-11-05: proposer config (flags + validation) and dry-run submitter.
 - 2026-11-05: `proof/proposer-txmgr`: proposer tx submitter with revert classification.
 - 2026-11-05: `proof/proposer-adapters`: RPC `Chain` for the proposer, canned-RPC tests.

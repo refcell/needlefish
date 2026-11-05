@@ -174,7 +174,11 @@ pub const Dispatcher = struct {
         intervals: Intervals,
         sync_status: SyncStatus,
     ) error{ Unavailable, BlockNotFound, TargetNotFinalized }!ProofRequest {
-        const l1_head = try select_l1_head(target_block, sync_status);
+        const l1_head = select_l1_head(target_block, sync_status) catch |err| switch (err) {
+            error.TargetNotFinalized => return error.TargetNotFinalized,
+            // The node's status mixes two views; retried on the next tick.
+            error.L1HeadBelowOrigin => return error.Unavailable,
+        };
         const claimed = try dispatcher.chain.output_at_block(target_block);
         const agreed = try dispatcher.chain.output_at_block(cursor.block);
         // The agreed root is the cursor's (recovered or previously claimed) root; a
@@ -194,14 +198,17 @@ pub const Dispatcher = struct {
 };
 
 /// The L1 head a proof for `target_block` derives from: the finalized L1 head, valid only
-/// for targets at or below the finalized L2 head.
+/// for targets at or below the finalized L2 head, and only when it is not below that
+/// head's L1 origin (a node status mixing two views; base/base `select_l1_head`).
 pub fn select_l1_head(
     target_block: u64,
     sync_status: SyncStatus,
-) error{TargetNotFinalized}!BlockRef {
+) error{ TargetNotFinalized, L1HeadBelowOrigin }!BlockRef {
     if (target_block > sync_status.finalized_l2.number) return error.TargetNotFinalized;
     assert(target_block <= sync_status.finalized_l2.number);
-    return sync_status.finalized_l1;
+    const l1_head = sync_status.finalized_l1;
+    if (l1_head.number < sync_status.finalized_l2_origin) return error.L1HeadBelowOrigin;
+    return l1_head;
 }
 
 const testing = std.testing;
@@ -220,4 +227,8 @@ test "proposer dispatcher: l1 head selection requires a finalized target" {
     try testing.expectError(error.TargetNotFinalized, select_l1_head(101, status));
     status.finalized_l2.number = 200;
     try testing.expectEqual(@as(u64, 5), (try select_l1_head(101, status)).number);
+    status.finalized_l2_origin = 5;
+    try testing.expectEqual(@as(u64, 5), (try select_l1_head(101, status)).number);
+    status.finalized_l2_origin = 6;
+    try testing.expectError(error.L1HeadBelowOrigin, select_l1_head(101, status));
 }

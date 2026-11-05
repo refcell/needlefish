@@ -73,6 +73,8 @@ pub const SyncStatus = struct {
     safe_l2: BlockRef,
     finalized_l2: BlockRef,
     unsafe_l2: BlockRef,
+    /// L1 origin number of the finalized L2 head (`finalized_l2.l1origin`).
+    finalized_l2_origin: u64 = 0,
 };
 
 pub const OutputAtBlock = struct {
@@ -96,6 +98,9 @@ pub fn Rollup(comptime EndpointType: type) type {
                 .safe_l2 = try block_ref(raw, "safe_l2"),
                 .finalized_l2 = try block_ref(raw, "finalized_l2"),
                 .unsafe_l2 = try block_ref(raw, "unsafe_l2"),
+                .finalized_l2_origin = try endpoint_module.parse_number(
+                    try member(raw, &.{ "finalized_l2", "l1origin", "number" }),
+                ),
             };
         }
 
