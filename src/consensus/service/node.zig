@@ -48,6 +48,7 @@ const checkpoint = @import("checkpoint.zig");
 const metrics_module = @import("metrics.zig");
 const follow = @import("follow.zig");
 const conductor_module = @import("conductor.zig");
+const ws_rpc_module = @import("ws_rpc.zig");
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -101,6 +102,8 @@ pub const Options = struct {
     follow_source: ?Address = null,
     /// Sequencer conductor (`--conductor.rpc`): commits sealed payloads, gates starting.
     conductor: ?Address = null,
+    /// WebSocket JSON-RPC with head subscriptions (`--rpc.ws-enabled`); off when null.
+    ws_address: ?Address = null,
     /// Prometheus `GET /metrics` (`--metrics.enabled`); not served when null.
     metrics_address: ?Address = null,
     sequencer: bool = false,
@@ -324,12 +327,14 @@ pub fn Node(comptime IO: type) type {
         metrics_server: ?MetricsServer = null,
         follower: ?*Follower = null,
         conductor: ?*Conductor = null,
+        ws_rpc: ?*WsRpc = null,
         /// Source labels waiting for the local blocks they are checked against.
         follow_labels: ?follow.Labels = null,
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
         pub const Follower = follow.Follower(IO);
         pub const Conductor = conductor_module.Conductor(IO);
+        pub const WsRpc = ws_rpc_module.WsRpc(IO);
         pub const MetricsServer = http.Server(IO, *Metrics, Metrics.handle);
         const Metrics = metrics_module.Metrics;
         pub const Network = p2p_network.Network(IO);
@@ -404,7 +409,29 @@ pub fn Node(comptime IO: type) type {
             errdefer node.deinit_follower();
             if (options.conductor) |address| try node.init_conductor(address);
             errdefer node.deinit_conductor();
+            if (options.ws_address != null) try node.init_ws_rpc();
+            errdefer node.deinit_ws_rpc();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_ws_rpc(node: *Self) !void {
+            assert(node.ws_rpc == null);
+            const ws_rpc = try node.allocator.create(WsRpc);
+            errdefer node.allocator.destroy(ws_rpc);
+            try ws_rpc.init(node.allocator, node.io, &node.backend);
+            node.ws_rpc = ws_rpc;
+        }
+
+        fn deinit_ws_rpc(node: *Self) void {
+            const ws_rpc = node.ws_rpc orelse return;
+            ws_rpc.stop();
+            var rounds: u32 = 0;
+            while (!ws_rpc.stopped() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
+            ws_rpc.deinit();
+            node.allocator.destroy(ws_rpc);
+            node.ws_rpc = null;
         }
 
         fn init_conductor(node: *Self, address: Address) !void {
@@ -760,6 +787,7 @@ pub fn Node(comptime IO: type) type {
             node.deinit_checkpoints();
             node.deinit_follower();
             node.deinit_conductor();
+            node.deinit_ws_rpc();
             node.gossip_arena.deinit();
             node.deinit_metrics();
             node.rpc_server.deinit();
@@ -774,6 +802,10 @@ pub fn Node(comptime IO: type) type {
             const address = try node.rpc_server.listen(node.options.rpc_address);
             node.logger.log(.info, "consensus", "rpc listening", .{ .port = address.port });
             assert(address.family == node.options.rpc_address.family);
+            if (node.ws_rpc) |ws_rpc| {
+                const bound = try ws_rpc.listen(node.options.ws_address.?);
+                node.logger.log(.info, "consensus", "ws rpc listening", .{ .port = bound.port });
+            }
             if (node.metrics_server) |*server| {
                 const bound = try server.listen(node.options.metrics_address.?);
                 node.logger.log(.info, "consensus", "metrics listening", .{ .port = bound.port });
@@ -840,6 +872,10 @@ pub fn Node(comptime IO: type) type {
             node.tick_checkpoints();
             node.tick_follow();
             if (node.conductor) |conductor| conductor.tick();
+            if (node.ws_rpc) |ws_rpc| ws_rpc.publish(.{
+                .sync_state = node.driver.sync_state(),
+                .queue_size = node.driver.queue.len(),
+            });
             node.record_metrics();
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
@@ -1299,6 +1335,7 @@ test "node: conductor gates the sequencer start and commits seals" {
         .l1 = harness.address,
         .l2 = harness.address,
         .conductor = harness.address,
+        .ws_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7546),
         .sequencer = true,
         .driver = .{ .sequencer = true, .sequencer_stopped = true },
         .jwt_secret = .{ .bytes = @splat(7) },
@@ -1307,6 +1344,7 @@ test "node: conductor gates the sequencer start and commits seals" {
     });
     defer node.deinit();
     try testing.expect(node.driver.queue.context.committer != null);
+    try testing.expect(node.ws_rpc != null);
     try testing.expect(!node.driver.sequencer_active);
     const head = node.driver.sync_state().unsafe_head.block_info.hash;
     // Leadership unknown before the first poll, then false: starting is refused.
