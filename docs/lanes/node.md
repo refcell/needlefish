@@ -17,7 +17,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   (v0 sidecars; needs a long-lived `KzgVerifier`, ~1.1 MiB, from the primitives lane).
 - [ ] Blob sidecar KZG proof verification once crypto exposes it; sidecar storage for the beacon blob API.
 - [x] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
-- [x] Block executor (L1; OP deposits pending evm): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
+- [x] Block executor (L1 + L2/OP): apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
 - [x] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
 - [x] `payload`: (attributes, payload ID, validation, extra data done) payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
 - [x] `engine`: Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: executor OP mode: BlockEnv.op from the upgrade schedule, deposits (mint, deposit nonce/receipt version), Regolith deposit gas accounting, Jovian DA footprint as blob gas used, Canyon create2 deployer (base/base timestamp-2 heuristic) and Everest nonce-manager transitions, no EIP-7685 requests on L2, L2 envelopes passed for L1 fees. Decision: Denim BaseTime predeploy transition skipped (not in the evm's Transition set yet).
 - 2026-11-05: Engine API JSON (rpc/engine_json + rpc/engine): fcU V1-3, newPayload V1-4, getPayload V1-4 (OP envelope with parentBeaconBlockRoot), exchangeCapabilities, getClientVersionV1; authrpc also serves eth_*. JWT-checked authrpc server in Service; `--authrpc.port/--authrpc.jwtsecret` in `base node`. Builder/follower JSON agreement test. Raised the rpc Router comptime branch quota (io-net lane, integration fix).
 - 2026-11-05: `base node` binary (flags per etc/devnet/devnet.sh): --dev-l1 mines and serves beacon API; smoke-tested with curl. Decisions: state in memory, --datadir created but unused; devnet-sized default limits (~485 MB RSS ReleaseSafe); past slots since genesis are mined back-to-back at startup.
 - 2026-11-05: node/service: Service(IO) owns the whole node, eth HTTP server, dev-L1 slot miner (one block per slot through the Engine API, head=safe=finalized) and beacon API; blob sidecars captured from the pool before FCU prunes them. SimIo e2e tests.

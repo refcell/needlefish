@@ -30,13 +30,17 @@ const Fixture = struct {
     executor: Executor,
 
     fn init(fixture: *Fixture) !void {
+        try fixture.init_with(spec);
+    }
+
+    fn init_with(fixture: *Fixture, chain_spec: *const chainspec.ChainSpec) !void {
         fixture.db = try StateDb.init(testing.allocator, .{
             .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 4096 },
             .code_bytes_max = 1 << 16,
             .codes_max = 64,
         });
         errdefer fixture.db.deinit(testing.allocator);
-        fixture.executor = try Executor.init(testing.allocator, spec, &fixture.db, .{
+        fixture.executor = try Executor.init(testing.allocator, chain_spec, &fixture.db, .{
             .scratch_bytes = 1 << 20,
             .transactions_max = 64,
             .evm = .{ .memory_bytes_max = 1 << 20, .code_arena_bytes = 1 << 20 },
@@ -265,4 +269,59 @@ fn fuzz_executor(_: void, smith: *testing.Smith) anyerror!void {
 
 test "executor: fuzz" {
     try testing.fuzz({}, fuzz_executor, .{});
+}
+
+test "executor: L2 deposit mints, records its nonce, and fees go to the vaults" {
+    const l2 = &chainspec.ChainSpec.presets.base_devnet;
+    var f: Fixture = undefined;
+    try f.init_with(l2);
+    defer f.deinit();
+    try f.db.put_account(address_of(1), eth, 0, &.{});
+    const depositor: [20]u8 = @splat(0xde);
+    const deposit: consensus.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(1) },
+        .from = .{ .bytes = depositor },
+        .to = .{ .call = .{ .bytes = @splat(0x33) } },
+        .mint = 5000,
+        .value = 1000,
+        .gas_limit = 100_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var deposit_buffer: [256]u8 = undefined;
+    const deposit_raw = deposit.encode_to(&deposit_buffer);
+    const tx: consensus.Eip1559 = .{
+        .chain_id = l2.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 3,
+        .max_fee_per_gas = 100,
+        .gas_limit = 21_000,
+        .to = .{ .call = .{ .bytes = @splat(0x22) } },
+        .value = 1,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    var tx_buffer: [256]u8 = undefined;
+    const tx_raw = (try consensus.tx.sign(tx, key(1))).encode_to(&tx_buffer);
+    const out = try f.executor.execute_block(&block_env(1), &.{ deposit_raw, tx_raw }, &.{});
+    try testing.expectEqual(@as(usize, 2), out.receipts.len);
+    const receipt = out.receipts[0];
+    try testing.expectEqual(consensus.TxType.deposit, receipt.tx_type);
+    try testing.expectEqual(@as(?u64, 0), receipt.deposit_nonce);
+    try testing.expectEqual(@as(?u64, 1), receipt.deposit_receipt_version);
+    try testing.expectEqual(@as(u256, 4000), f.db.get_account(depositor).?.balance);
+    try testing.expectEqual(@as(u64, 1), f.db.get_account(depositor).?.nonce);
+    try testing.expectEqual(@as(u256, 1000), f.db.get_account(@splat(0x33)).?.balance);
+    // Base fee goes to the base fee vault (not burnt); the tip to the fee recipient.
+    const vault = evm.op.base_fee_vault;
+    try testing.expectEqual(@as(u256, 21_000 * 10), f.db.get_account(vault).?.balance);
+    try testing.expectEqual(@as(u256, 21_000 * 3), f.db.get_account(@splat(0xcb)).?.balance);
+    try testing.expectEqual(@as(u256, 21_000 * 3), out.fees);
+    try testing.expectEqual(@as(usize, 0), out.requests.len);
+    // An L1 executor rejects the same deposit.
+    var l1: Fixture = undefined;
+    try l1.init();
+    defer l1.deinit();
+    const rejected = l1.executor.execute_block(&block_env(1), &.{deposit_raw}, &.{});
+    try testing.expectError(error.TxTypeNotSupported, rejected);
 }

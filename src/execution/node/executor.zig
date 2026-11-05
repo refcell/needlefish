@@ -3,8 +3,10 @@
 //! withdrawals (gwei credits), Prague execution requests (EIP-7002 / EIP-7251 system
 //! calls), receipts, logs bloom, blob gas and the post-state root.
 //!
-//! L1 (Ethereum) semantics only for now: OP deposit transactions and L1 fee charging
-//! wait on the evm lane's OP Stack item, so L2 blocks with deposits are rejected.
+//! In L2 mode the evm runs with the block's OP context (L1 data and operator fees, fee
+//! vaults, deposits), and the executor adds the OP block rules: transition-block state
+//! changes, deposit receipts, Regolith deposit gas accounting, the Jovian DA footprint
+//! (reported as blob gas used), and no EIP-7685 requests.
 //! Memory: one scratch arena sized at init and reset per block; no other allocation.
 
 const std = @import("std");
@@ -17,6 +19,7 @@ const ordered = @import("../trie/ordered.zig");
 const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
 const StateDb = @import("state_db.zig").StateDb;
+const op_rules = @import("executor_op.zig");
 
 const Address = [20]u8;
 const Hash = [32]u8;
@@ -171,6 +174,7 @@ pub const Executor = struct {
         errdefer executor.abort_block();
         executor.set_block_env(block);
         try executor.pre_block_calls(fork, block);
+        try op_rules.apply_transitions(executor.state, executor.spec, block.timestamp);
         return .{
             .block = block,
             .fork = fork,
@@ -208,7 +212,10 @@ pub const Executor = struct {
     ) Error!Executed {
         errdefer executor.abort_block();
         if (withdrawals) |list| try executor.apply_withdrawals(building.fork, list);
-        const requests = try executor.post_block_requests(building.fork);
+        const requests = if (executor.spec.mode == .l1)
+            try executor.post_block_requests(building.fork)
+        else
+            &.{};
         const receipts = building.receipts[0..building.count];
         const receipts_root_hash = try executor.receipts_root(receipts);
         try executor.db.commit(executor.state);
@@ -295,6 +302,7 @@ pub const Executor = struct {
             .base_fee = block.base_fee,
             .prevrandao = block.prev_randao,
             .blob_base_fee = blob_base_fee,
+            .op = op_rules.context(executor.spec, block.timestamp),
         };
     }
 
@@ -314,37 +322,68 @@ pub const Executor = struct {
     ) Error!Applied {
         const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
         // The evm has no EIP-8130 (AA) execution yet.
-        if (envelope == .deposit or envelope == .eip8130) return error.TxTypeNotSupported;
-        const tx = try executor.tx_env(envelope);
-        if (gas_used + tx.gas_limit > block.gas_limit) return error.BlockGasExceeded;
-        const blob_gas = @as(u64, tx.blob_hashes.len) * gas_per_blob;
-        if (blob_gas > 0) {
-            const params = executor.spec.blob_params_at(block.timestamp) orelse
-                return error.TxTypeNotSupported;
-            if (blob_gas_used + blob_gas > params.max_blob_gas()) return error.BlobGasExceeded;
+        if (envelope == .eip8130) return error.TxTypeNotSupported;
+        const op = executor.machine.block.op;
+        if (envelope == .deposit and op == null) return error.TxTypeNotSupported;
+        const tx = try executor.tx_env(envelope, raw);
+        const deposit_gas_exempt = envelope == .deposit and !op.?.upgrade.at_least(.regolith);
+        if (gas_used + tx.gas_limit > block.gas_limit and !deposit_gas_exempt) {
+            return error.BlockGasExceeded;
         }
+        const blob_gas = try executor.blob_gas_of(block, &tx, raw, blob_gas_used);
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         const executed = switch (result) {
             .invalid => return error.InvalidTransaction,
             .executed => |executed| executed,
         };
         const logs = try executor.encode_logs(executed.logs);
+        var receipt: Receipt = .{
+            .tx_type = envelope.tx_type(),
+            .status = executed.status == .success,
+            .cumulative_gas_used = 0,
+            .logs_bloom = logs.bloom(),
+            .logs = logs,
+        };
+        if (envelope == .deposit) {
+            receipt.deposit_nonce = tx.nonce;
+            if (op.?.upgrade.at_least(.canyon)) receipt.deposit_receipt_version = 1;
+        }
+        const tip = if (envelope == .deposit) 0 else priority_fee(&tx, block.base_fee);
         return .{
-            .receipt = .{
-                .tx_type = envelope.tx_type(),
-                .status = executed.status == .success,
-                .cumulative_gas_used = 0,
-                .logs_bloom = logs.bloom(),
-                .logs = logs,
-            },
+            .receipt = receipt,
             .gas_used = executed.gas_used,
             .blob_gas_used = blob_gas,
-            .fees = @as(u256, executed.gas_used) * priority_fee(&tx, block.base_fee),
+            .fees = @as(u256, executed.gas_used) * tip,
         };
     }
 
+    /// Blob gas (L1) or, from Jovian, the DA footprint (L2, non-deposits), checked
+    /// against the block's remaining budget.
+    fn blob_gas_of(
+        executor: *Executor,
+        block: *const BlockEnv,
+        tx: *const TxEnv,
+        raw: []const u8,
+        blob_gas_used: u64,
+    ) Error!u64 {
+        const op = executor.machine.block.op;
+        if (op) |context| {
+            if (tx.tx_type == .deposit or !context.upgrade.at_least(.jovian)) return 0;
+            const footprint = try op_rules.da_footprint(executor.state, raw);
+            if (blob_gas_used +| footprint > block.gas_limit) return error.BlobGasExceeded;
+            return footprint;
+        }
+        const blob_gas = @as(u64, tx.blob_hashes.len) * gas_per_blob;
+        if (blob_gas == 0) return 0;
+        const params = executor.spec.blob_params_at(block.timestamp) orelse
+            return error.TxTypeNotSupported;
+        if (blob_gas_used + blob_gas > params.max_blob_gas()) return error.BlobGasExceeded;
+        return blob_gas;
+    }
+
     /// Converts a decoded envelope into the evm's transaction environment.
-    fn tx_env(executor: *Executor, envelope: Envelope) Error!TxEnv {
+    fn tx_env(executor: *Executor, envelope: Envelope, raw: []const u8) Error!TxEnv {
+        if (envelope == .deposit) return executor.deposit_env(envelope.deposit);
         const sender = envelope.recover_sender(executor.recoverer) orelse
             return error.InvalidTransaction;
         var tx: TxEnv = .{
@@ -358,6 +397,7 @@ pub const Executor = struct {
             .nonce = envelope.nonce().?,
             .chain_id = envelope.chain_id(),
             .access_list = try executor.access_list(envelope.access_list()),
+            .envelope = if (executor.spec.mode == .l2) raw else &.{},
         };
         if (envelope != .legacy and envelope != .eip2930) {
             tx.gas_priority_fee = envelope.max_priority_fee_per_gas();
@@ -373,6 +413,23 @@ pub const Executor = struct {
             else => {},
         }
         return tx;
+    }
+
+    /// A deposit runs as its `from` with no fee; `nonce` carries the depositor's nonce
+    /// before execution (the receipt's deposit nonce; deposits skip nonce checks).
+    fn deposit_env(executor: *Executor, deposit: consensus.Deposit) Error!TxEnv {
+        const account = try executor.state.load(deposit.from.bytes);
+        return .{
+            .tx_type = .deposit,
+            .caller = deposit.from.bytes,
+            .gas_limit = deposit.gas_limit,
+            .to = if (deposit.to.to()) |to| to.bytes else null,
+            .value = deposit.value,
+            .data = deposit.input,
+            .nonce = account.info.nonce,
+            .mint = deposit.mint,
+            .is_system_transaction = deposit.is_system_transaction,
+        };
     }
 
     fn access_list(

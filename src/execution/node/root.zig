@@ -6,6 +6,7 @@ const std = @import("std");
 pub const state_db = @import("state_db.zig");
 pub const StateDb = state_db.StateDb;
 pub const executor = @import("executor.zig");
+pub const executor_op = @import("executor_op.zig");
 pub const Executor = executor.Executor;
 pub const block_store = @import("block_store.zig");
 pub const BlockStore = block_store.BlockStore;
