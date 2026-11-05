@@ -249,8 +249,7 @@ var prover_tables: @import("fk20.zig").Tables = undefined;
 var prover_settings: ?cells.Settings = null;
 
 /// `compute_cells_and_kzg_proofs` with the fixed-base FK20 tables attached.
-pub fn compute_cells_and_kzg_proofs_tables(iterations: u32) u64 {
-    const context = prepare();
+fn settings_with_tables() *const cells.Settings {
     const state_cells = prepare_cells();
     if (prover_settings == null) {
         var settings = state_cells.settings;
@@ -258,6 +257,13 @@ pub fn compute_cells_and_kzg_proofs_tables(iterations: u32) u64 {
         prover_settings = settings;
     }
     assert(prover_settings.?.tables != null);
+    return &prover_settings.?;
+}
+
+pub fn compute_cells_and_kzg_proofs_tables(iterations: u32) u64 {
+    const context = prepare();
+    const state_cells = prepare_cells();
+    _ = settings_with_tables();
     var accumulator: u64 = 0;
     for (0..iterations) |_| {
         cells.compute_cells_and_kzg_proofs(
@@ -300,7 +306,17 @@ pub fn verify_cell_kzg_proof_batch_128(iterations: u32) u64 {
 }
 
 pub fn recover_cells_and_kzg_proofs(iterations: u32) u64 {
+    return recover_with(&prepare_cells().settings, iterations);
+}
+
+/// Recovery with the FK20 prover tables attached.
+pub fn recover_cells_and_kzg_proofs_tables(iterations: u32) u64 {
+    return recover_with(settings_with_tables(), iterations);
+}
+
+fn recover_with(settings: *const cells.Settings, iterations: u32) u64 {
     const state_cells = prepare_cells();
+    assert(settings.columns != null);
     // Every other cell: the worst case for recovery (64 cells present).
     var indices: [cells.cells_per_ext_blob / 2]u64 = undefined;
     var present: [cells.cells_per_ext_blob / 2]cells.Cell = undefined;
@@ -311,7 +327,7 @@ pub fn recover_cells_and_kzg_proofs(iterations: u32) u64 {
     var accumulator: u64 = 0;
     for (0..iterations) |_| {
         cells.recover_cells_and_kzg_proofs(
-            &state_cells.settings,
+            settings,
             &state_cells.workspace,
             &indices,
             &present,

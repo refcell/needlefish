@@ -97,6 +97,8 @@ fallback but hot paths should be our own, optimized implementations.
   one batch-affine bucket pass without doublings. compute_cells_and_kzg_proofs 202 -> 93 ms
   (window 7/8/10: 108/108/109 ms). Proofs checked against every c-kzg EIP-7594 vector with
   and without tables; seeded + coverage-guided differential vs `msm`. Batcher should attach.
+- [x] recover_cells_and_kzg_proofs with the prover tables (FK20 is the proof half):
+  193 -> 98 ms for 64 present cells (new bench `... (64, tables)`).
 - [x] Wycheproof vectors (C2SP, Apache-2.0) in `wycheproof_tests.zig`: secp256k1 ECDSA P1363
   SHA-256 (234 tests), secp256r1 ECDSA P1363 SHA-256 (241, EIP-7951 semantics), secp256k1
   ECDH on raw points (495, incl. 21 invalid-curve / invalid-point rejections). Converted by
@@ -405,3 +407,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: BLS group-law fuzz 20K runs clean (385 coverage points vs 171 raw).
 - 2026-11-05: montgomery and safegcd differential fuzz 300K runs each, clean (mostly branch-free code: 87 / 70 coverage points).
 - 2026-11-05: second fuzz pass complete (sha256/ripemd160/blake2f/keccak 300K, kzg verify/framing 20K, all clean); fuzz item closed.
+- 2026-11-05: recovery with prover tables 193 -> 98 ms.

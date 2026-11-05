@@ -616,6 +616,11 @@ pub const cases = [_]Case{
         .iterations = 5,
         .run = kzg_bench.recover_cells_and_kzg_proofs,
     },
+    .{
+        .name = "kzg/recover_cells_and_kzg_proofs (64, tables)",
+        .iterations = 5,
+        .run = kzg_bench.recover_cells_and_kzg_proofs_tables,
+    },
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
     .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },
