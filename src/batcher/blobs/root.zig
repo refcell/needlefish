@@ -9,6 +9,7 @@
 //! and a 24-bit big-endian payload length.
 
 const std = @import("std");
+pub const kzg = @import("kzg.zig");
 const assert = std.debug.assert;
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -210,4 +211,8 @@ fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
 
 test "blobs: fuzz decode is canonical" {
     try testing.fuzz({}, fuzz_decode, .{});
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

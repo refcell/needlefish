@@ -20,7 +20,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/channel`: channel manager (double-buffered channels, backpressure, reorg detect,
   duration close); batches decode back via consensus SingleBatch.
 - [x] `batcher/txdata`: EIP-1559 calldata tx building + signing, gas, fee bumps.
-- [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
+- [x] `batcher/blobs/kzg`: KZG prover (blob commitment + blob proof), verified by the pairing check.
+- [ ] `batcher/txdata`: EIP-4844 blob txs (sign, sidecar network form, blob fees); txmgr blob mode.
 - [x] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
 - [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
 - [x] `batcher/source`: EIP-7702 (type 4) transactions.
@@ -88,3 +89,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: in-process genesis hashes for rollup.json (anvil is no reference: it skips the
   genesis state root).
 - 2026-11-05: block source handles EIP-7702 txs (authorization list rebuilt, hash-checked).
+- 2026-11-05: KZG prover for blobs; setup Lagrange points permuted to bit-reversed order like
+  c-kzg's loader (the file is in natural order).
