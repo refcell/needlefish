@@ -196,3 +196,76 @@ test "upgrade_signal: block tag poll intervals" {
     try std.testing.expectEqual(@as(u64, 384 * s), BlockTag.safe.poll_interval_ns());
     try std.testing.expectEqual(@as(u64, 12 * s), BlockTag.latest.poll_interval_ns());
 }
+
+const Updates = struct {
+    count: u32 = 0,
+    everest: ?u64 = null,
+    delta: ?u64 = null,
+
+    fn on_update(updates: *Updates, schedule: *const upgrade_signal.Schedule) void {
+        updates.count += 1;
+        updates.delta = schedule.activation("delta");
+        updates.everest = schedule.activation("everest");
+    }
+};
+
+test "upgrade_signal: observer polls, detects changes, and keeps the last schedule" {
+    var harness: Harness = undefined;
+    try harness.init(63, .latest);
+    defer harness.deinit();
+    var updates: Updates = .{};
+    const SimObserver = upgrade_signal.Observer(io.SimIo, *Updates);
+    var observer: SimObserver = undefined;
+    const bound = harness.server.address;
+    try observer.init(std.testing.allocator, &harness.node_io, bound, contract_address, .{
+        .layer = .consensus,
+        .reader = .{ .block_tag = .latest },
+    }, &updates, Updates.on_update);
+    defer {
+        observer.stop();
+        var rounds: u32 = 0;
+        while (!observer.stopped() and rounds < 1000) : (rounds += 1) {
+            harness.world.run_for_ns(std.time.ns_per_ms);
+        }
+        observer.deinit();
+    }
+    var registry: @import("../metrics/root.zig").Registry(128) = .{};
+    try observer.register(&registry);
+    const m = &observer.metrics;
+    const s = std.time.ns_per_s;
+
+    observer.start();
+    harness.world.run_for_ns(s); // First read is immediate.
+    try std.testing.expectEqual(@as(u32, 1), updates.count);
+    try std.testing.expectEqual(@as(?u64, 1_800_000_000), updates.delta);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), m.activation_timestamp[1].get());
+    try std.testing.expectEqual(@as(i64, 777), m.last_l1_read_block[0].get());
+    try std.testing.expectEqual(@as(i64, 1_002_003), m.expected_protocol_version[0].get());
+
+    harness.world.run_for_ns(12 * s); // Unchanged: no update callback.
+    try std.testing.expectEqual(@as(u32, 1), updates.count);
+    harness.l1.schedule[2] = 1_850_000_000;
+    harness.world.run_for_ns(12 * s);
+    try std.testing.expectEqual(@as(u32, 2), updates.count);
+    try std.testing.expectEqual(@as(?u64, 1_850_000_000), updates.delta);
+    try std.testing.expectEqual(@as(u64, 1), m.signal_updates_total[2].get());
+    try std.testing.expectEqual(@as(u64, 0), m.signal_updates_total[1].get());
+
+    harness.l1.fail_call = true; // Failures count and keep the last schedule.
+    harness.world.run_for_ns(12 * s);
+    try std.testing.expectEqual(@as(u64, 1), m.l1_read_errors_total[0].get());
+    try std.testing.expectEqual(@as(?u64, 1_850_000_000), observer.last.activation("delta"));
+    harness.l1.fail_call = false;
+    harness.l1.schedule_count = 0;
+    harness.world.run_for_ns(12 * s);
+    try std.testing.expectEqual(@as(u64, 1), m.empty_schedule_reads_total.get());
+    try std.testing.expectEqual(@as(u32, 2), updates.count);
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try registry.write_prometheus(&out);
+    const text = out.buffered();
+    const line = "base_upgrade_signal_activation_timestamp" ++
+        "{layer=\"cl\",upgrade=\"canyon\"} 1700000000";
+    try std.testing.expect(std.mem.find(u8, text, line) != null);
+}

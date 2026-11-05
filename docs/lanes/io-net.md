@@ -24,8 +24,8 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `upgrade_signal` core: packed versions, `ProtocolVersions` ABI (strict), upgrade IDs,
   default contracts, IO `Reader` pinned to one L1 block. Applying schedules (modes, chain spec
   / rollup config) is left to execution/consensus, which own those types.
-- [ ] `upgrade_signal` observer: live polling on the tag interval + startup retry policy +
-  metrics (`base_upgrade_signal_*`), once a consumer lane needs it.
+- [x] `upgrade_signal` observer: live polling on the tag interval, change detection, metrics
+  (`base_upgrade_signal_*`). Startup retry policy is the applying lane's (use `retry`).
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -97,3 +97,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: balance_monitor: own rpc.Client + Ticker, immediate first poll, publish every success (`updates` as watch version), skip polls while a read is in flight; `Ticker.stop` now cancels its pending timeout.
 - 2026-11-05: json.find_path (raw value at an object key path); l1_head: `cap_head` + `Calculator(IO)` (outputAtBlock -> finalized -> capped block hash), SimIo-tested against a fake node.
 - 2026-11-05: upgrade_signal core (version, contract ABI with comptime keccak selectors, Reader: block by tag -> eth_call x2 at blockHash); decode fails closed (canonical offset, length <= 256, zero-padded uint64).
+- 2026-11-05: upgrade_signal Observer: immediate + tag-interval single-attempt polls, keeps last schedule on failure, on_update on first/changed, per-upgrade labeled metrics.

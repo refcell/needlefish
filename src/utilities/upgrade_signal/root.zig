@@ -12,10 +12,13 @@ pub const reader = @import("reader.zig");
 pub const Reader = reader.Reader;
 pub const Schedule = reader.Schedule;
 pub const BlockTag = reader.BlockTag;
+pub const observer = @import("observer.zig");
+pub const Observer = observer.Observer;
 
 test {
     _ = version;
     _ = contract;
     _ = reader;
+    _ = observer;
     _ = @import("tests.zig");
 }
