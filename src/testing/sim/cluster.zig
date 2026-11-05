@@ -14,6 +14,7 @@
 //!   - safe head <= unsafe head <= sequencer head
 //!   - safe head never decreases within one incarnation of a verifier
 //!   - no reorgs and no equivocations (the model is honest)
+//!   - every L1 batcher transaction decodes with the real protocol codecs (codec.zig)
 //!   - batcher confirmed <= L1-included <= sequencer head
 
 const std = @import("std");
@@ -21,6 +22,7 @@ const assert = std.debug.assert;
 const Prng = @import("../prng.zig").Prng;
 const network_module = @import("network.zig");
 const nodes = @import("nodes.zig");
+const codec = @import("codec.zig");
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
@@ -84,6 +86,12 @@ pub const Config = struct {
         return config.production_end_ns / config.l2_block_time_ns + 1;
     }
 
+    /// Batcher submissions over the whole run: one per submit interval, doubled for the
+    /// immediate submission after each batcher restart.
+    pub fn tx_count_max(config: Config) u32 {
+        return @intCast(2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16);
+    }
+
     pub fn l1_block_count_max(config: Config) u64 {
         return config.settle_end_ns / config.l1_block_time_ns + 1;
     }
@@ -119,6 +127,7 @@ pub const Cluster = struct {
     l1: nodes.L1,
     sequencer: nodes.Sequencer,
     batcher: nodes.Batcher,
+    tx_pool: codec.TxPool,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
     restart_ns: [network_module.node_count_max]?u64 = @splat(null),
@@ -143,6 +152,8 @@ pub const Cluster = struct {
         errdefer sequencer_chain.deinit(allocator);
         var batcher = try nodes.Batcher.init(allocator, config.l1_block_count_max());
         errdefer batcher.deinit(allocator);
+        var tx_pool = try codec.TxPool.init(allocator, config.tx_count_max());
+        errdefer tx_pool.deinit(allocator);
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
         var initialized: u8 = 0;
         errdefer for (verifiers[0..initialized]) |*v| v.deinit(allocator);
@@ -167,6 +178,7 @@ pub const Cluster = struct {
                 .next_block_ns = config.l2_block_time_ns,
             },
             .batcher = batcher,
+            .tx_pool = tx_pool,
             .verifiers = verifiers,
         };
     }
@@ -174,6 +186,7 @@ pub const Cluster = struct {
     pub fn deinit(cluster: *Cluster, allocator: std.mem.Allocator) void {
         for (cluster.verifiers[0..cluster.config.verifier_count]) |*v| v.deinit(allocator);
         cluster.batcher.deinit(allocator);
+        cluster.tx_pool.deinit(allocator);
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
         cluster.network.deinit(allocator);
@@ -189,6 +202,7 @@ pub const Cluster = struct {
             .prng = &cluster.prng_network,
             .network = &cluster.network,
             .verifier_count = cluster.config.verifier_count,
+            .tx_pool = &cluster.tx_pool,
         };
     }
 
@@ -352,6 +366,7 @@ pub const Cluster = struct {
             cluster.safe_floor[index] = v.safe_head;
             if (v.reorgs != 0) return cluster.fail("unexpected reorg", v.id);
             if (v.equivocations != 0) return cluster.fail("equivocation", v.id);
+            if (v.invalid_batches != 0) return cluster.fail("undecodable batch", v.id);
             // Heads only: earlier blocks were checked when they were heads, and parent
             // hashes chain them, so a head match implies the whole prefix matches.
             if (v.chain.hashes[v.unsafe_head] != sequencer.chain.hashes[v.unsafe_head]) {
@@ -454,6 +469,26 @@ test "cluster: checkers catch an equivocating sequencer" {
     }
     // The forged block can lose the race to the honest one; most seeds must still detect.
     try std.testing.expect(detected >= 4);
+}
+
+test "cluster: checkers catch a batcher posting corrupt tx data" {
+    // The verifiers decode L1 data with the real protocol codecs; a corrupted channel
+    // must fail decoding (zlib checksum, frame bounds) and trip the checker.
+    var seed: u64 = 0;
+    while (seed < 4) : (seed += 1) {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 300 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        cluster.batcher.corrupt_tx = 2;
+        cluster.log_failures = false;
+        try std.testing.expectError(error.SafetyViolation, cluster.run());
+    }
 }
 
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {

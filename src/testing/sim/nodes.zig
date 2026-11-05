@@ -16,8 +16,9 @@ const assert = std.debug.assert;
 const Prng = @import("../prng.zig").Prng;
 const network_module = @import("network.zig");
 const NodeId = network_module.NodeId;
+const codec = @import("codec.zig");
 
-pub const batch_blocks_max = 8;
+pub const batch_blocks_max = codec.blocks_max;
 pub const l1_batches_max = 4;
 pub const sync_blocks_max = 16;
 pub const l1_request_burst = 4;
@@ -40,10 +41,10 @@ pub fn block_hash(parent_hash: u64, number: u64, payload: u64) u64 {
     return std.hash.Wyhash.hash(0, std.mem.asBytes(&words));
 }
 
+/// One batcher transaction on L1: an index into the shared `codec.TxPool`. Nodes learn
+/// its blocks only by decoding the bytes with the real protocol codecs.
 pub const Batch = struct {
-    number_first: u64,
-    count: u8,
-    payloads: [batch_blocks_max]u64,
+    tx_index: u32,
 };
 
 pub const L1Block = struct {
@@ -74,6 +75,7 @@ pub const Env = struct {
     prng: *Prng,
     network: *Net,
     verifier_count: u8,
+    tx_pool: *codec.TxPool,
 
     pub fn send(env: *const Env, from: NodeId, to: NodeId, message: Message) void {
         env.network.send(env.prng, env.global_ns, from, to, message);
@@ -258,7 +260,7 @@ pub const L1 = struct {
     pub fn on_message(l1: *L1, env: *const Env, from: NodeId, message: Message) void {
         switch (message) {
             .batch_submit => |batch| {
-                assert(batch.count > 0);
+                assert(batch.tx_index < env.tx_pool.count);
                 if (l1.mempool_count == l1_mempool_max) return; // Full: batcher retries.
                 l1.mempool[l1.mempool_count] = batch;
                 l1.mempool_count += 1;
@@ -361,7 +363,7 @@ pub const L1Follower = struct {
 
 /// The block numbers `batch` adds on top of `head`, or null when it does not connect
 /// (gap) or is fully known (duplicate). Derivation ignores such batches.
-pub fn batch_extension(head: u64, batch: Batch) ?struct { first: u64, last: u64 } {
+pub fn batch_extension(head: u64, batch: codec.Blocks) ?struct { first: u64, last: u64 } {
     assert(batch.count > 0 and batch.count <= batch_blocks_max);
     assert(batch.number_first > 0);
     if (batch.number_first > head + 1) return null;
@@ -372,6 +374,8 @@ pub fn batch_extension(head: u64, batch: Batch) ?struct { first: u64, last: u64 
 
 pub const Batcher = struct {
     follower: L1Follower,
+    encoder: codec.Encoder,
+    decoder: codec.Decoder,
     /// Confirmed head after each processed L1 block, for rewinds on L1 reorgs.
     confirmed_at: []u64,
     /// Highest L2 block included contiguously on L1.
@@ -380,6 +384,9 @@ pub const Batcher = struct {
     submitted: u64 = 0,
     progress_ns: u64 = 0,
     next_submit_ns: u64 = 0,
+    /// Byzantine mode for checker tests: corrupt the tx data of this submission. Honest
+    /// runs leave it null.
+    corrupt_tx: ?u32 = null,
 
     // Several blocks per batch, at most two batches per L1 block: L1 includes four.
     pub const submit_interval_ns: u64 = 6 * std.time.ns_per_s;
@@ -389,12 +396,23 @@ pub const Batcher = struct {
         var follower = try L1Follower.init(allocator, l1_block_count_max);
         errdefer follower.deinit(allocator);
         const confirmed_at = try allocator.alloc(u64, l1_block_count_max + 1);
+        errdefer allocator.free(confirmed_at);
         @memset(confirmed_at, 0);
-        return .{ .follower = follower, .confirmed_at = confirmed_at };
+        var encoder = try codec.Encoder.init(allocator, 0x6261_7463_6865_7200);
+        errdefer encoder.deinit(allocator);
+        const decoder = try codec.Decoder.init(allocator);
+        return .{
+            .follower = follower,
+            .encoder = encoder,
+            .decoder = decoder,
+            .confirmed_at = confirmed_at,
+        };
     }
 
     pub fn deinit(batcher: *Batcher, allocator: std.mem.Allocator) void {
         batcher.follower.deinit(allocator);
+        batcher.encoder.deinit(allocator);
+        batcher.decoder.deinit(allocator);
         allocator.free(batcher.confirmed_at);
         batcher.* = undefined;
     }
@@ -413,16 +431,21 @@ pub const Batcher = struct {
         }
         if (batcher.submitted - batcher.confirmed >= pipeline_blocks_max) return;
         if (batcher.submitted >= sequencer.head) return;
-        var batch: Batch = .{
-            .number_first = batcher.submitted + 1,
-            .count = @intCast(@min(batch_blocks_max, sequencer.head - batcher.submitted)),
-            .payloads = undefined,
-        };
-        for (batch.payloads[0..batch.count], 0..) |*payload, offset| {
-            payload.* = sequencer.chain.payloads[batch.number_first + offset];
+        const count: u8 = @intCast(@min(batch_blocks_max, sequencer.head - batcher.submitted));
+        const data = batcher.encoder.encode(
+            sequencer.chain.hashes,
+            sequencer.chain.payloads,
+            batcher.submitted + 1,
+            count,
+        );
+        // A full pool ends submissions; the liveness checker reports the stall.
+        const tx_index = env.tx_pool.append(data) orelse return;
+        if (batcher.corrupt_tx == tx_index) {
+            const stored = env.tx_pool.get_mutable(tx_index);
+            stored[stored.len / 2] ^= 0x5a;
         }
-        batcher.submitted += batch.count;
-        env.send(node_batcher, node_l1, .{ .batch_submit = batch });
+        batcher.submitted += count;
+        env.send(node_batcher, node_l1, .{ .batch_submit = .{ .tx_index = tx_index } });
     }
 
     pub fn on_message(batcher: *Batcher, env: *const Env, from: NodeId, message: Message) void {
@@ -438,7 +461,9 @@ pub const Batcher = struct {
         }
         if (!accepted.process) return;
         for (block.batches[0..block.batch_count]) |batch| {
-            if (batch_extension(batcher.confirmed, batch)) |extension| {
+            const blocks = batcher.decoder.decode(env.tx_pool.get(batch.tx_index)) orelse
+                continue;
+            if (batch_extension(batcher.confirmed, blocks)) |extension| {
                 batcher.confirmed = extension.last;
                 batcher.progress_ns = env.now_ns;
             }
@@ -451,9 +476,12 @@ pub const Batcher = struct {
         batcher.follower.reset(1);
         batcher.* = .{
             .follower = batcher.follower,
+            .encoder = batcher.encoder,
+            .decoder = batcher.decoder,
             .confirmed_at = batcher.confirmed_at,
             .next_submit_ns = env.now_ns,
             .progress_ns = env.now_ns,
+            .corrupt_tx = batcher.corrupt_tx,
         };
     }
 };
@@ -474,6 +502,7 @@ pub const Verifier = struct {
     safe_head: u64 = 0,
     unsafe_head: u64 = 0,
     follower: L1Follower,
+    decoder: codec.Decoder,
     /// Safe head after each processed L1 block (durable), for rewinds on L1 reorgs.
     safe_at: []u64,
     /// Last two durable checkpoints. A disk fault loses the latest write.
@@ -484,6 +513,8 @@ pub const Verifier = struct {
     /// Safety counters; any non-zero value is an invariant violation in an honest run.
     reorgs: u64 = 0,
     equivocations: u64 = 0,
+    /// L1 transactions that failed to decode; the honest batcher never writes one.
+    invalid_batches: u64 = 0,
 
     pub const sync_timeout_ns: u64 = 500 * std.time.ns_per_ms;
 
@@ -499,13 +530,22 @@ pub const Verifier = struct {
         var follower = try L1Follower.init(allocator, l1_block_count_max);
         errdefer follower.deinit(allocator);
         const safe_at = try allocator.alloc(u64, l1_block_count_max + 1);
+        errdefer allocator.free(safe_at);
         @memset(safe_at, 0);
-        return .{ .id = id, .chain = chain, .follower = follower, .safe_at = safe_at };
+        const decoder = try codec.Decoder.init(allocator);
+        return .{
+            .id = id,
+            .chain = chain,
+            .follower = follower,
+            .decoder = decoder,
+            .safe_at = safe_at,
+        };
     }
 
     pub fn deinit(verifier: *Verifier, allocator: std.mem.Allocator) void {
         verifier.chain.deinit(allocator);
         verifier.follower.deinit(allocator);
+        verifier.decoder.deinit(allocator);
         allocator.free(verifier.safe_at);
         verifier.* = undefined;
     }
@@ -536,7 +576,14 @@ pub const Verifier = struct {
                     verifier.unsafe_head = @max(verifier.unsafe_head, verifier.safe_head);
                 }
                 if (!accepted.process) return;
-                for (block.batches[0..block.batch_count]) |batch| verifier.derive(batch);
+                for (block.batches[0..block.batch_count]) |batch| {
+                    const data = env.tx_pool.get(batch.tx_index);
+                    if (verifier.decoder.decode(data)) |blocks| {
+                        verifier.derive(blocks);
+                    } else {
+                        verifier.invalid_batches += 1;
+                    }
+                }
                 verifier.safe_at[block.number] = verifier.safe_head;
                 verifier.checkpoint_previous = verifier.checkpoint;
                 verifier.checkpoint = .{
@@ -583,7 +630,7 @@ pub const Verifier = struct {
         } });
     }
 
-    fn derive(verifier: *Verifier, batch: Batch) void {
+    fn derive(verifier: *Verifier, batch: codec.Blocks) void {
         assert(verifier.safe_head <= verifier.unsafe_head);
         const extension = batch_extension(verifier.safe_head, batch) orelse return;
         var number = extension.first;

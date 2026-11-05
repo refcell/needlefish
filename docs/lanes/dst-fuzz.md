@@ -7,6 +7,14 @@ provably robust.
 - [ ] Simulator harness (`zig build sim -- seed`): cluster of simulated nodes (L1, sequencer, batcher, verifiers) on `SimIo`; fault injection (latency, drop, reorder, duplicate, partition, crash/restart, disk faults, clock skew); invariant checkers (verifier safe head == sequencer chain, no divergent state roots, monotonic heads, liveness after faults heal). Grows as components land — start with what exists, add components as lanes ship.
 - [x] Swarm testing: randomized config per seed; `just sim-swarm N`; failing seeds minimized and added as regression tests.
 - [x] Fuzz infrastructure: shared helpers over `std.testing.fuzz` + seeded deterministic fuzz runs in `zig build test`; a `just fuzz` corpus dir under `.cache/`.
+- [x] Sim: real L1 data path. Batcher model encodes through `batcher/channel` Manager
+  (singular batches, zlib, frame tx data); verifiers and batcher decode with
+  `consensus/protocol` (frames, Channel, decompress, BatchReader, SingleBatch).
+- [ ] Sim: multi-frame channels spread over L1 blocks via the derive lane's channel bank
+  (timeouts, frame loss, reorged frames) once `derive` lands it.
+- [ ] Sim: swap model nodes for real components behind `utilities.io` SimIo as lanes land.
+- [ ] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
+  oversize frames) once the channel bank exists.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
 - [x] Bench harness in `bench_main.zig` (filterable, ns/op, throughput) and perf tracking file `docs/PERF.md`.
@@ -40,6 +48,11 @@ provably robust.
 - Fuzz bodies take `*std.testing.Smith`; `testing.fuzz.run` drives them both coverage-guided
   and from seeded `Prng` bytes on every `zig build test` (failure prints seed + iteration).
 
+- Sim L1 data path uses one frame per channel so decoding stays stateless per L1 tx and
+  the follower keeps owning reorg rewinds; multi-frame waits for the real channel bank.
+  L1 carries indices into an append-only tx pool (no rewrite, so stale messages stay
+  valid). Cost: ~6.5 ms/seed ReleaseSafe (was 1-4 ms).
+
 ## Log
 - 2026-11-05: simulator v1 (sim/network, model nodes, cluster, swarm config, safety +
   liveness checks; mutation-tested), `testing.fuzz` helpers (Smith seeded + coverage).
@@ -58,3 +71,5 @@ provably robust.
   test (equivocating sequencer must trip checkers), coverage-guided fuzz over cluster configs.
 - 2026-11-05: bls12-381 g1/g2 canonical-encoding fuzz; `just test-times` (per-test wall
   time); flagged 73 s p2p test to coordinator.
+- 2026-11-05: sim runs real batcher/protocol codecs on the L1 data path; checker for
+  undecodable batches; corrupt-batcher negative test (mutation-checked).
