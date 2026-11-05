@@ -41,6 +41,14 @@ pub const Flags = struct {
     private_key: ?[32]u8 = null,
     /// Stop after this many poll intervals (smoke tests); runs forever when null.
     ticks_max: ?u64 = null,
+    /// Liveness, readiness and metrics (`exporter.zig`) on `--health.addr`/`--health.port`
+    /// (base/base defaults; port 0 disables), and on the metrics port when
+    /// `--metrics.enabled`; both serve the same endpoints.
+    health_addr: [4]u8 = @splat(0),
+    health_port: u16 = 8080,
+    metrics_enabled: bool = false,
+    metrics_addr: [4]u8 = @splat(0),
+    metrics_port: u16 = 7300,
 
     pub fn claim_addresses(flags: *const Flags) []const Address {
         assert(flags.bond_claim_count <= bond.claim_addresses_max);
@@ -80,6 +88,11 @@ const Flag = enum {
     bond_claim_addresses,
     private_key,
     ticks_max,
+    health_addr,
+    health_port,
+    metrics_enabled,
+    metrics_addr,
+    metrics_port,
 };
 
 fn flag_of(name: []const u8) Error!Flag {
@@ -87,27 +100,40 @@ fn flag_of(name: []const u8) Error!Flag {
     var buffer: [64]u8 = undefined;
     if (name.len - 2 > buffer.len) return error.UnknownFlag;
     const field = buffer[0 .. name.len - 2];
-    for (name[2..], field) |char, *out| out.* = if (char == '-') '_' else char;
+    for (name[2..], field) |char, *out| out.* = if (char == '-' or char == '.') '_' else char;
     return std.meta.stringToEnum(Flag, field) orelse error.UnknownFlag;
 }
 
-/// Parses flag/value pairs and validates them as base/base does.
+/// Parses flag/value pairs (`--metrics.enabled` takes no value) and validates them as
+/// base/base does.
 pub fn parse(args: []const []const u8) Error!Flags {
     var flags: Flags = .{};
     var index: usize = 0;
-    while (index < args.len) : (index += 2) {
+    while (index < args.len) {
         const flag = try flag_of(args[index]);
+        if (flag == .metrics_enabled) {
+            flags.metrics_enabled = true;
+            index += 1;
+            continue;
+        }
         if (index + 1 == args.len) return error.MissingValue;
         try set(&flags, flag, args[index + 1]);
+        index += 2;
     }
-    assert(index >= args.len);
+    assert(index == args.len);
     try validate(&flags);
     return flags;
 }
 
 fn set(flags: *Flags, flag: Flag, value: []const u8) Error!void {
     const duration = proposer_config.parse_duration_ms;
+    assert(flag != .metrics_enabled);
     switch (flag) {
+        .metrics_enabled => unreachable,
+        .health_addr => flags.health_addr = try ip4(value),
+        .metrics_addr => flags.metrics_addr = try ip4(value),
+        .health_port => flags.health_port = try unsigned(u16, value),
+        .metrics_port => flags.metrics_port = try unsigned(u16, value),
         .l1_eth_rpc => flags.l1_eth_rpc = value,
         .l2_eth_rpc => flags.l2_eth_rpc = value,
         .zk_rpc_url => flags.zk_rpc_url = value,
@@ -128,6 +154,10 @@ fn set(flags: *Flags, flag: Flag, value: []const u8) Error!void {
         .private_key => flags.private_key = try fixed(32, value),
         .ticks_max => flags.ticks_max = try unsigned(u64, value),
     }
+}
+
+fn ip4(value: []const u8) Error![4]u8 {
+    return proposer_config.parse_ip4(value) catch error.InvalidValue;
 }
 
 /// A comma-separated address list (clap `value_delimiter = ','`).
@@ -192,6 +222,17 @@ test "challenger flags: defaults, lists and validation" {
     try testing.expectEqual(@as(u8, 2), listed.claim_addresses()[1][19]);
     try testing.expectError(error.MissingFlag, parse(base_args[0..10]));
     try testing.expectError(error.UnknownFlag, parse(&.{ "--nope", "1" }));
+    try testing.expectEqual(@as(u16, 8080), flags.health_port);
+    try testing.expect(!flags.metrics_enabled);
+    const served = try parse(&(base_args ++ [_][]const u8{
+        "--metrics.enabled", "--metrics.port", "9300", "--health.addr", "127.0.0.1",
+    }));
+    try testing.expect(served.metrics_enabled);
+    try testing.expectEqual(@as(u16, 9300), served.metrics_port);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, served.health_addr);
+    try testing.expectError(error.InvalidValue, parse(&(base_args ++ [_][]const u8{
+        "--health.port", "70000",
+    })));
     try testing.expectError(error.ZeroPollInterval, parse(&(base_args ++ [_][]const u8{
         "--poll-interval", "0s",
     })));

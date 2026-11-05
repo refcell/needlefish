@@ -19,6 +19,8 @@ const driver_module = @import("driver.zig");
 const proof_manager = @import("proof_manager.zig");
 const bond = @import("bond.zig");
 const fake_world = @import("fake_world.zig");
+const exporter_module = @import("exporter.zig");
+const telemetry = @import("../telemetry/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const second = std.time.ns_per_s;
@@ -172,15 +174,28 @@ fn run(seed: u64, totals: *Totals) !void {
         .prng = .init(seed ^ 0x5eed),
         .parent = world.anchor_state_registry,
     };
+    var clock: telemetry.FakeClock = .{};
+    var exporter: exporter_module.Exporter = undefined;
+    try exporter.init(clock.clock(), .{ .version = "sim", .poll_interval_ns = 5 * second });
     var now_s: u64 = 0;
     while (now_s < duration_s) : (now_s += 1) {
+        clock.now_ns = now_s * second;
         world.l2_head = @max(world.l2_head, 8 + now_s / 7);
         world.advance(now_s);
         if (now_s < propose_until_s and now_s % proposal_interval_s == 0) sim.propose();
         sim.act();
         driver.tick(now_s * second);
+        exporter_module.observe(&exporter, driver);
         try sim.check_bounds();
     }
+    // The metrics follow the driver.
+    try testing.expectEqual(driver.stats.steps, exporter.counter("steps"));
+    try testing.expectEqual(driver.bond_manager.stats.scans, exporter.counter("bond_scans"));
+    try testing.expectEqual(
+        driver.anchor_updater.stats.updates_mined,
+        exporter.counter("anchor_updates_mined"),
+    );
+    try testing.expect(exporter.progress_ns != null);
     for (world.games[0..world.game_count]) |*game| try check_game(game, totals);
     try testing.expect(world.stats.anchor_updates > 0);
     totals.withdrawals += world.stats.withdrawals;

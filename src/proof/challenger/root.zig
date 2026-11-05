@@ -15,6 +15,7 @@ pub const driver = @import("driver.zig");
 pub const rpc_chain = @import("rpc_chain.zig");
 pub const tx_submitter = @import("tx_submitter.zig");
 pub const flags = @import("flags.zig");
+pub const exporter = @import("exporter.zig");
 
 pub const Config = config.Config;
 pub const Driver = driver.Driver;

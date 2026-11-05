@@ -193,7 +193,7 @@ fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
     }
 }
 
-fn parse_ip4(text: []const u8) Error![4]u8 {
+pub fn parse_ip4(text: []const u8) Error![4]u8 {
     var bytes: [4]u8 = undefined;
     var parts = std.mem.splitScalar(u8, text, '.');
     for (&bytes) |*byte| {
