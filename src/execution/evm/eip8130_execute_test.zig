@@ -10,6 +10,7 @@ const op = @import("opcode.zig");
 const native = @import("native.zig");
 const nonce = @import("eip8130_nonce.zig");
 const execute = @import("eip8130_execute.zig");
+const simulate = @import("eip8130_simulate.zig");
 const Harness = @import("evm_test.zig").Harness;
 const eip8130 = @import("../../common/consensus/eip8130.zig");
 const common = @import("../../common/primitives/root.zig");
@@ -55,6 +56,28 @@ const store_code = [_]u8{
     op.ADD,   op.SWAP1, op.SSTORE,       op.STOP,
 };
 const revert_code = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.REVERT };
+const forward_target = primitives.address_from_int(0xf0e3a2d);
+/// CALL(gas(), store_target, 0, 0, 0, 0, 0), reverting if the inner call failed.
+const push3: u8 = op.PUSH1 + 2;
+const forward_code = [_]u8{
+    op.PUSH1, 0, // retLength
+    op.PUSH1, 0, // retOffset
+    op.PUSH1, 0, // argsLength
+    op.PUSH1, 0, // argsOffset
+    op.PUSH1, 0, // value
+    push3,    0x05,
+    0x10,      0x7e, // store_target
+    op.GAS,    op.CALL,
+    op.ISZERO, op.PUSH1,
+    21,        op.JUMPI,
+    op.STOP,   op.JUMPDEST,
+    op.PUSH1,  0,
+    op.PUSH1,  0,
+    op.REVERT,
+};
+comptime {
+    std.debug.assert(forward_code[21] == op.JUMPDEST);
+}
 
 const Built = struct {
     signed: eip8130.Signed,
@@ -126,6 +149,7 @@ fn setup(h: *Harness) !void {
     try h.database.put_account(dev_address, funding, 0, &.{});
     try h.database.put_account(store_target, 0, 1, &store_code);
     try h.database.put_account(revert_target, 0, 1, &revert_code);
+    try h.database.put_account(forward_target, 0, 1, &forward_code);
 }
 
 fn balance(h: *Harness, address: Address) !u256 {
@@ -345,4 +369,56 @@ fn fuzz_execute(_: void, input: []const u8) anyerror!void {
             try testing.expectEqual(all, executed.status == .success);
         },
     }
+}
+
+test "eip8130 simulate: call mode measures without committing" {
+    var h: Harness = undefined;
+    try setup(&h);
+    defer h.deinit(testing.allocator);
+    var built: Built = undefined;
+    const phases = [_][]const Address{&.{ store_target, revert_target }};
+    try built.init(base_tx(), &phases);
+    const env = built.env();
+    const request = simulate.Request{ .from = dev_address, .mode = .call };
+    const reverted = try simulate.simulate(.osaka, &h.evm, &env, request);
+    try testing.expect(reverted.reverted);
+    try testing.expectEqual(@as(u64, 0), reverted.committed_phases);
+
+    const ok_phases = [_][]const Address{&.{store_target}};
+    try built.init(base_tx(), &ok_phases);
+    const ok_env = built.env();
+    const simulated = try simulate.simulate(.osaka, &h.evm, &ok_env, request);
+    try testing.expect(!simulated.reverted);
+    try testing.expectEqual(@as(u256, 0), try h.storage(store_target, 0));
+    try testing.expectEqual(funding, try balance(&h, dev_address));
+    try testing.expectEqual(@as(u64, 0), (try h.state.load(dev_address)).info.nonce);
+    // No refund here, so the measured gas is exactly what inclusion bills.
+    const executed = (try transaction.transact(&h.evm, .osaka, &ok_env)).executed;
+    try testing.expectEqual(executed.gas_used, simulated.gas);
+}
+
+test "eip8130 simulate: the estimate covers EIP-150 forwarding" {
+    var h: Harness = undefined;
+    try setup(&h);
+    defer h.deinit(testing.allocator);
+    var built: Built = undefined;
+    const phases = [_][]const Address{&.{forward_target}};
+    try built.init(base_tx(), &phases);
+    const env = built.env();
+    const request = simulate.Request{ .from = dev_address, .mode = .estimate };
+    const estimate = try simulate.simulate(.osaka, &h.evm, &env, request);
+    try testing.expect(!estimate.reverted);
+    const measured = try simulate.simulate(.osaka, &h.evm, &env, .{
+        .from = dev_address,
+        .mode = .call,
+    });
+    try testing.expect(estimate.gas >= measured.gas);
+
+    var tight = base_tx();
+    tight.gas_limit = estimate.gas;
+    try built.init(tight, &phases);
+    const tight_env = built.env();
+    const executed = (try transaction.transact(&h.evm, .osaka, &tight_env)).executed;
+    try testing.expectEqual(evm_module.Status.success, executed.status);
+    try testing.expectEqual(@as(u256, 1), try h.storage(store_target, 0));
 }

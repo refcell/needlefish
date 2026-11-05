@@ -153,7 +153,8 @@ pub fn execute(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) Error!transacti
     const fees = op.Fees.compute(params, context.rules(), tx.envelope, max_gas);
     const prepaid = try prepay(evm, &outcome, &fees);
     try warm_pre_call_accounts(fork, evm, &outcome);
-    const calls = try execute_calls(fork, evm, signed, &outcome);
+    const pool = outcome.execution_gas_available;
+    const calls = try execute_calls(fork, evm, signed, &outcome, pool);
     const gas_used = try settle(evm, &outcome, &calls, prepaid, &fees, tx.envelope);
     const logs = evm.state.transaction_logs();
     evm.state.finalize_transaction(fork);
@@ -287,7 +288,7 @@ fn consume_nonce(
 
 /// TxContext transient slots 0-2. A zero field would read back as "unset" and fall back
 /// to tx.origin, so it is rejected.
-fn set_context(state: *State, sender: Address, payer: Address, actor_id: B256) Error!void {
+pub fn set_context(state: *State, sender: Address, payer: Address, actor_id: B256) Error!void {
     const zero_address = primitives.address_zero;
     if (std.mem.eql(u8, &sender, &zero_address)) return error.InvalidContextIdentity;
     if (std.mem.eql(u8, &payer, &zero_address)) return error.InvalidContextIdentity;
@@ -326,13 +327,15 @@ fn warm_pre_call_accounts(comptime fork: Fork, evm: *Evm, outcome: *const Outcom
     assert(evm.state.is_warm(outcome.sender));
 }
 
-fn execute_calls(
+/// Run the phases from one pool of `pool` gas (at most the execution gas available).
+pub fn execute_calls(
     comptime fork: Fork,
     evm: *Evm,
     signed: *const eip8130.Signed,
     outcome: *const Outcome,
+    pool: u64,
 ) Error!CallsResult {
-    const pool = outcome.execution_gas_available;
+    assert(pool <= outcome.execution_gas_available);
     var remaining = pool;
     var result = CallsResult{};
     var phases = signed.tx.calls.iterator();

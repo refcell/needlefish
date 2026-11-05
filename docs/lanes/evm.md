@@ -100,9 +100,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   fees, atomic call phases from one gas pool with the policy gate, settlement to the four
   recipients, `Executed.committed_phases` for the receipt. Keystore (full config changes and
   non-k1 actors) turns on at Zenith; Everest runs `authorize_without_keystore`.
-  Left: `simulate`/gas estimation (`Eip8130Executor::simulate`); sponsored-payer and
-  keystore end-to-end tests; the node lane must map consensus 0x79 envelopes to
-  `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw }`.
+  `eip8130_simulate.zig` covers `eth_call`/`eth_estimateGas` (unsigned, from the request's
+  `from`; estimate binary-searches the call pool for EIP-150 forwarding).
+  Left: keystore (Zenith) end-to-end tests; the node lane must map consensus 0x79
+  envelopes to `TxEnv{ .tx_type = .eip8130, .eip8130 = &signed, .envelope = raw }` and
+  wire RPC estimation to `eip8130_simulate.simulate`.
 - [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
   compare with revm on the same machine; profile call-frame and keccak paths.
 
