@@ -79,8 +79,12 @@ test "publisher: fuzz resume query" {
 
 const Publisher = publisher_module.Publisher(SimIo);
 
-/// A flashblock whose diff carries a filler transaction, so payload sizes vary.
-fn make_flashblock(position: Position, filler: []const u8) flashblocks.Flashblock {
+/// A flashblock whose diff carries a filler transaction, so payload sizes vary. The
+/// transaction list is caller-owned: the flashblock borrows it, so it must outlive use.
+fn make_flashblock(
+    position: Position,
+    transactions: *const [1][]const u8,
+) flashblocks.Flashblock {
     return .{
         .payload_id = @splat(@truncate(position.block_number)),
         .index = position.flashblock_index,
@@ -91,7 +95,7 @@ fn make_flashblock(position: Position, filler: []const u8) flashblocks.Flashbloc
             .logs_bloom = .zero,
             .gas_used = position.flashblock_index,
             .block_hash = .zero,
-            .transactions = &.{filler},
+            .transactions = transactions,
             .withdrawals = &.{},
             .withdrawals_root = .zero,
         },
@@ -298,7 +302,8 @@ const Harness = struct {
         var filler: [1024]u8 = undefined;
         const filler_length = harness.prng.below(filler.len);
         harness.prng.fill(filler[0..filler_length]);
-        const flashblock = make_flashblock(position.*, filler[0..filler_length]);
+        const transactions = [1][]const u8{filler[0..filler_length]};
+        const flashblock = make_flashblock(position.*, &transactions);
         const sequence = harness.published_count;
         const start = harness.published_offsets[sequence];
         const json = try flashblocks.encode_json(flashblock, harness.published_bytes[start..]);
