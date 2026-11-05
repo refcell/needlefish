@@ -58,6 +58,9 @@ pub const ChainSpec = struct {
     upgrades: UpgradeSchedule = @splat(null),
     /// L1 params, and L2 params before Canyon.
     base_fee_params: BaseFeeParams,
+    /// L2 legacy (pre-Denim) block interval in seconds; anchors the Denim timestamp
+    /// schedule (base/base `block_time`).
+    block_time_seconds: u64 = 2,
     /// L2 params from Canyon on (ignored in L1 mode).
     base_fee_params_canyon: BaseFeeParams,
     /// Default block gas limit for locally built blocks.
@@ -80,6 +83,14 @@ pub const ChainSpec = struct {
         if (spec.mode != .l2) return false;
         const at = spec.upgrades[@backingInt(upgrade)] orelse return false;
         return timestamp >= at;
+    }
+
+    /// Subsecond blocks (Denim) let a child share its parent's timestamp in seconds when
+    /// both are subsecond blocks; otherwise timestamps strictly increase.
+    pub fn timestamp_follows(spec: *const ChainSpec, parent: u64, child: u64) bool {
+        if (child > parent) return true;
+        if (child < parent or spec.mode != .l2) return false;
+        return spec.is_upgrade_active(.denim, parent) and spec.is_upgrade_active(.denim, child);
     }
 
     pub fn is_ethereum_fork_active(

@@ -21,6 +21,7 @@ const engine = @import("../engine/root.zig");
 const ordered = @import("../trie/ordered.zig");
 const executor_module = @import("executor.zig");
 const block_store = @import("block_store.zig");
+const base_time = @import("base_time.zig");
 const StateDb = @import("state_db.zig").StateDb;
 const witness_block = @import("../db/witness_block.zig");
 const db_database = @import("../db/database.zig");
@@ -200,6 +201,7 @@ pub const Chain = struct {
     genesis_hash: Hash,
     /// Genesis time: forks at or before it are not part of the EIP-2124 fork id.
     genesis_timestamp: u64,
+    genesis_number: u64,
     forkchoice: engine.ForkchoiceState,
     builds: [builds_max]Built = undefined,
     builds_len: u32 = 0,
@@ -248,6 +250,7 @@ pub const Chain = struct {
             .state_hash = hash,
             .genesis_hash = hash,
             .genesis_timestamp = genesis.timestamp,
+            .genesis_number = genesis.number,
             .forkchoice = .{
                 .head_block_hash = .{ .bytes = hash },
                 .safe_block_hash = .zero,
@@ -303,6 +306,9 @@ pub const Chain = struct {
         };
         const parent = chain.header(p.parent_hash.bytes) orelse return .syncing;
         if (chain.check_header(&parent, &imported)) |reason| return .{ .invalid = reason };
+        if (chain.check_subsecond(&imported, p.transactions)) |reason| {
+            return .{ .invalid = reason };
+        }
         chain.move_state(p.parent_hash.bytes) catch return .syncing;
         const withdrawals = p.withdrawals;
         const env = env_of(&imported);
@@ -395,6 +401,45 @@ pub const Chain = struct {
     }
 
     // ---- Import ---------------------------------------------------------------------
+
+    /// The chain's Denim timestamp schedule, when Denim is scheduled on an L2.
+    pub fn denim_schedule(chain: *const Chain) ?base_time.Schedule {
+        if (chain.spec.mode != .l2) return null;
+        const activation = chain.spec.upgrades[@backingInt(chainspec.Upgrade.denim)] orelse
+            return null;
+        assert(chain.spec.block_time_seconds > 0);
+        return .{
+            .genesis_block_number = chain.genesis_number,
+            .genesis_timestamp = chain.genesis_timestamp,
+            .legacy_interval_seconds = chain.spec.block_time_seconds,
+            .denim_activation_timestamp = activation,
+        };
+    }
+
+    /// Denim subsecond blocks: the header timestamp is the schedule's (selected by block
+    /// number, so a block cannot dodge it by claiming an earlier time), and the BaseTime
+    /// deposit at index 1 carries the schedule's millisecond part. base/base checks the
+    /// millisecond part as a 200 ms step from the parent's stored part after execution;
+    /// with every ancestor on the schedule the two agree.
+    pub fn check_subsecond(
+        chain: *const Chain,
+        child: *const Header,
+        transactions: []const []const u8,
+    ) ?[]const u8 {
+        const schedule = chain.denim_schedule() orelse return null;
+        if (child.number == schedule.genesis_block_number) return null;
+        if (!schedule.subsecond_at(child.number)) return null;
+        const expected = schedule.parts(child.number);
+        if (child.timestamp != expected.seconds) return "timestamp off the subsecond schedule";
+        const second: ?consensus.Envelope = if (transactions.len > 1)
+            consensus.Envelope.decode(transactions[1]) catch return "invalid BaseTime deposit"
+        else
+            null;
+        const millis_part = consensus.base_time.extract(second, child.number) catch
+            return "invalid BaseTime deposit";
+        if (millis_part != expected.millis_part) return "BaseTime millisecond part off schedule";
+        return null;
+    }
 
     /// Consensus checks of `child` against `parent` that do not need execution.
     fn check_header(chain: *const Chain, parent: *const Header, child: *const Header) ?[]const u8 {

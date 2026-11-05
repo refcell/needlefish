@@ -88,7 +88,7 @@ pub fn Engine(comptime Backend: type) type {
             assert(parent.hash.eql(p.parent_hash));
             const reason: ?[]const u8 = if (p.block_number != parent.number + 1)
                 "invalid block number"
-            else if (p.timestamp <= parent.timestamp)
+            else if (!engine.spec.timestamp_follows(parent.timestamp, p.timestamp))
                 "timestamp not after parent"
             else
                 null;
@@ -134,7 +134,9 @@ pub fn Engine(comptime Backend: type) type {
                 error.UnsupportedFork => error.UnsupportedFork,
                 else => error.InvalidPayloadAttributes,
             };
-            if (attrs.timestamp <= head.timestamp) return error.InvalidPayloadAttributes;
+            if (!engine.spec.timestamp_follows(head.timestamp, attrs.timestamp)) {
+                return error.InvalidPayloadAttributes;
+            }
             const id = switch (engine.spec.mode) {
                 .l1 => attrs.payload_id_l1(head.hash),
                 .l2 => attrs.payload_id(head.hash, version),

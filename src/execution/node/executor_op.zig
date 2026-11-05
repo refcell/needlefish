@@ -7,6 +7,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const evm = @import("../evm/root.zig");
 const chainspec = @import("../chainspec/root.zig");
+const base_time = @import("base_time.zig");
 
 const Upgrade = chainspec.Upgrade;
 
@@ -44,17 +45,21 @@ pub fn context(spec: *const chainspec.ChainSpec, timestamp: u64) ?evm.op.Context
 
 /// Irregular state changes before the first transaction: the Canyon create2 deployer
 /// on the first Canyon block (base/base's "active now but not at `timestamp - 2`"
-/// heuristic), and the Everest system-account stub on every Everest block (idempotent).
+/// heuristic), the Denim BaseTime predeploy install on every Denim block (idempotent),
+/// and the Everest system-account stub on every Everest block (idempotent).
 pub fn apply_transitions(
     state: *evm.State,
     spec: *const chainspec.ChainSpec,
     timestamp: u64,
-) evm.state.Error!void {
+) base_time.TransitionError!void {
     if (spec.mode != .l2) return;
     const canyon_now = spec.is_upgrade_active(.canyon, timestamp);
     const canyon_before = spec.is_upgrade_active(.canyon, timestamp -| 2);
     if (canyon_now and !canyon_before) {
         try evm.op.apply_transition(state, .canyon_create2_deployer);
+    }
+    if (spec.is_upgrade_active(.denim, timestamp)) {
+        try base_time.ensure_predeploy(state);
     }
     if (spec.is_upgrade_active(.everest, timestamp)) {
         try evm.op.apply_transition(state, .everest_nonce_manager);

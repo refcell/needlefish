@@ -261,3 +261,135 @@ fn fuzz_chain(_: void, smith: *testing.Smith) anyerror!void {
 test "chain: fuzz" {
     try testing.fuzz({}, fuzz_chain, .{});
 }
+
+/// Base devnet with Denim (subsecond blocks) active at genesis.
+const denim_spec: chainspec.ChainSpec = blk: {
+    var result = chainspec.ChainSpec.presets.base_devnet;
+    for (0..@backingInt(chainspec.Upgrade.denim) + 1) |index| result.upgrades[index] = 0;
+    break :blk result;
+};
+
+const DenimBlock = struct {
+    calldata: [2][consensus.base_time.calldata_length]u8 = undefined,
+    encoded: [2][256]u8 = undefined,
+    transactions: [2][]const u8 = undefined,
+
+    /// A stand-in L1-info deposit, then (when `with_base_time`) the BaseTime deposit
+    /// carrying `millis_part`.
+    fn build(
+        block: *DenimBlock,
+        node: *Node,
+        parent: B256,
+        number: u64,
+        timestamp: u64,
+        millis_part: u16,
+        with_base_time: bool,
+    ) !B256 {
+        block.calldata[0] = consensus.base_time.encode_calldata(0);
+        block.calldata[1] = consensus.base_time.encode_calldata(millis_part);
+        var info = consensus.base_time.deposit(number, &block.calldata[0]);
+        info.source_hash = .{ .bytes = @splat(@truncate(number)) };
+        info.to = .{ .call = address_of(9) };
+        const metadata = consensus.base_time.deposit(number, &block.calldata[1]);
+        const info_envelope: consensus.Envelope = .{ .deposit = info };
+        const metadata_envelope: consensus.Envelope = .{ .deposit = metadata };
+        block.transactions[0] = info_envelope.encode_to(&block.encoded[0]);
+        block.transactions[1] = metadata_envelope.encode_to(&block.encoded[1]);
+        var attrs = fixture.attributes_l2(timestamp, 0xfe);
+        attrs.transactions = block.transactions[0..if (with_base_time) 2 else 1];
+        attrs.no_tx_pool = true;
+        const version = types.forkchoice_version(node.spec, timestamp);
+        const updated = try node.engine.forkchoice_updated(version, forkchoice(parent), &attrs);
+        try testing.expectEqual(types.Status.valid, updated.payload_status.status);
+        const get_version = types.get_payload_version(node.spec, timestamp);
+        return (try node.engine.get_payload(get_version, updated.payload_id.?)).block_hash;
+    }
+};
+
+test "chain: Denim 200 ms blocks share seconds, follow the schedule, carry BaseTime" {
+    const builder = try Node.create_for(&denim_spec);
+    defer builder.destroy();
+    const follower = try Node.create_for(&denim_spec);
+    defer follower.destroy();
+    const schedule = builder.chain.denim_schedule().?;
+    var head: B256 = .{ .bytes = builder.chain.genesis_hash };
+    var block: DenimBlock = .{};
+    for (1..7) |n| {
+        const number: u64 = n;
+        const parts = schedule.parts(number);
+        try testing.expectEqual(number / 5, parts.seconds);
+        const hash = try block.build(builder, head, number, parts.seconds, parts.millis_part, true);
+        try testing.expectEqual(types.Status.valid, (try import(builder, follower, hash)).status);
+        const v = types.forkchoice_version(&denim_spec, parts.seconds);
+        _ = try builder.engine.forkchoice_updated(v, forkchoice(hash), null);
+        _ = try follower.engine.forkchoice_updated(v, forkchoice(hash), null);
+        head = hash;
+    }
+    try testing.expectEqual(try builder.db.root(), try follower.db.root());
+    // Block 7 is at 1.4 s: a wrong second, a wrong millisecond part, or no BaseTime
+    // deposit is invalid on import.
+    const cases = [_]struct { timestamp: u64, millis: u16, with: bool, reason: []const u8 }{
+        .{ .timestamp = 2, .millis = 400, .with = true, .reason = "timestamp off" },
+        .{ .timestamp = 1, .millis = 600, .with = true, .reason = "millisecond part" },
+        .{ .timestamp = 1, .millis = 400, .with = false, .reason = "invalid BaseTime" },
+    };
+    for (cases) |case| {
+        const hash = try block.build(builder, head, 7, case.timestamp, case.millis, case.with);
+        const status = try import(builder, follower, hash);
+        try testing.expectEqual(types.Status.invalid, status.status);
+        const message = status.validation_error orelse return error.TestUnexpectedResult;
+        try testing.expect(std.mem.indexOf(u8, message, case.reason) != null);
+    }
+    const good = try block.build(builder, head, 7, 1, 400, true);
+    try testing.expectEqual(types.Status.valid, (try import(builder, follower, good)).status);
+}
+
+test "chain: equal timestamps are rejected before Denim" {
+    const l2 = &chainspec.ChainSpec.presets.base_devnet;
+    const node = try Node.create_for(l2);
+    defer node.destroy();
+    try testing.expect(!l2.timestamp_follows(4, 4));
+    try testing.expect(denim_spec.timestamp_follows(4, 4));
+    try testing.expect(!denim_spec.timestamp_follows(5, 4));
+    const genesis: B256 = .{ .bytes = node.chain.genesis_hash };
+    const first = try build(node, genesis, 2, 0xfe);
+    const version = types.forkchoice_version(l2, 2);
+    _ = try node.engine.forkchoice_updated(version, forkchoice(first), null);
+    var attrs = fixture.attributes_l2(2, 0xfe);
+    const result = node.engine.forkchoice_updated(version, forkchoice(first), &attrs);
+    try testing.expectError(error.InvalidPayloadAttributes, result);
+}
+
+fn subsecond_scenario(node: *Node, seed: u64) !void {
+    var prng = Prng.init(seed);
+    var bytes: [128]u8 = undefined;
+    const length = prng.below(bytes.len);
+    prng.fill(bytes[0..length]);
+    if (length > 0 and prng.chance(1, 2)) bytes[0] = 0x7e;
+    const number = 1 + prng.below(64);
+    const parts = node.chain.denim_schedule().?.parts(number);
+    var header = fixture.genesis_header(@splat(0));
+    header.number = number;
+    header.timestamp = if (prng.chance(1, 2)) parts.seconds else prng.int(u64);
+    const transactions = [_][]const u8{ &.{}, bytes[0..length] };
+    const count = prng.below(3);
+    const reason = node.chain.check_subsecond(&header, transactions[0..count]);
+    // Random bytes never form the exact BaseTime deposit for this block.
+    try testing.expect(reason != null);
+}
+
+test "chain: seeded fuzz of the subsecond import checks" {
+    const node = try Node.create_for(&denim_spec);
+    defer node.destroy();
+    for (0..512) |seed| try subsecond_scenario(node, seed);
+}
+
+fn fuzz_subsecond(node: *Node, smith: *testing.Smith) anyerror!void {
+    try subsecond_scenario(node, smith.value(u64));
+}
+
+test "chain: fuzz subsecond import checks" {
+    const node = try Node.create_for(&denim_spec);
+    defer node.destroy();
+    try testing.fuzz(node, fuzz_subsecond, .{});
+}

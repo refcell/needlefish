@@ -9,6 +9,7 @@ const chainspec = @import("../chainspec/root.zig");
 const evm = @import("../evm/root.zig");
 const executor_module = @import("executor.zig");
 const state_db = @import("state_db.zig");
+const test_fixture = @import("test_fixture.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const Executor = executor_module.Executor;
@@ -40,6 +41,7 @@ const Fixture = struct {
             .codes_max = 64,
         });
         errdefer fixture.db.deinit(testing.allocator);
+        try test_fixture.put_base_time_proxy(&fixture.db, chain_spec);
         fixture.executor = try Executor.init(testing.allocator, chain_spec, &fixture.db, .{
             .scratch_bytes = 1 << 20,
             .transactions_max = 64,
@@ -488,4 +490,57 @@ test "executor: parallel storage rehash commits the serial root and shuts down c
     const parallel = try storage_heavy_root(2, 2);
     try testing.expectEqualSlices(u8, &serial, &parallel);
     try testing.expect(!std.mem.eql(u8, &serial, &(try storage_heavy_root(0, 1))));
+}
+
+const base_time = @import("base_time.zig");
+
+test "executor: Denim installs the BaseTime implementation once, behind the proxy" {
+    var f: Fixture = undefined;
+    try f.init_with(&everest_spec);
+    defer f.deinit();
+    const proxy = base_time.proxy_address;
+    try testing.expectEqual(@as(u256, 0), f.db.get_storage(proxy, base_time.implementation_slot));
+    _ = try f.executor.execute_block(&block_env(1), &.{}, &.{});
+    const linked = base_time.address_word(base_time.implementation_address);
+    try testing.expectEqual(linked, f.db.get_storage(proxy, base_time.implementation_slot));
+    const implementation = f.db.get_account(base_time.implementation_address).?;
+    const code_hash = base_time.implementation_code_hash;
+    try testing.expectEqualSlices(u8, &code_hash, &implementation.code_hash);
+    // A later block keeps a governance-changed link.
+    try f.db.put_storage(proxy, base_time.implementation_slot, 0x1234);
+    _ = try f.executor.execute_block(&block_env(2), &.{}, &.{});
+    const kept = f.db.get_storage(proxy, base_time.implementation_slot);
+    try testing.expectEqual(@as(u256, 0x1234), kept);
+    // Before Denim nothing is installed.
+    var early: Fixture = undefined;
+    try early.init_with(&chainspec.ChainSpec.presets.base_devnet);
+    defer early.deinit();
+    _ = try early.executor.execute_block(&block_env(1), &.{}, &.{});
+    try testing.expect(early.db.get_account(base_time.implementation_address) == null);
+}
+
+test "executor: a Denim block without the BaseTime proxy or its admin is rejected" {
+    var bare_spec = everest_spec;
+    bare_spec.upgrades[@backingInt(chainspec.Upgrade.denim)] = 1;
+    bare_spec.upgrades[@backingInt(chainspec.Upgrade.everest)] = 1;
+    var f: Fixture = undefined;
+    try f.init_with(&bare_spec);
+    defer f.deinit();
+    try testing.expectError(
+        error.BaseTimeMissingProxy,
+        f.executor.execute_block(&block_env(1), &.{}, &.{}),
+    );
+    try f.db.put_account(base_time.proxy_address, 1, 0, &.{});
+    try testing.expectError(
+        error.BaseTimeCodelessProxy,
+        f.executor.execute_block(&block_env(1), &.{}, &.{}),
+    );
+    try f.db.put_account(base_time.proxy_address, 0, 1, &base_time.test_proxy_code);
+    try testing.expectError(
+        error.BaseTimeUnexpectedProxyAdmin,
+        f.executor.execute_block(&block_env(1), &.{}, &.{}),
+    );
+    const admin = base_time.address_word(base_time.proxy_admin);
+    try f.db.put_storage(base_time.proxy_address, base_time.admin_slot, admin);
+    _ = try f.executor.execute_block(&block_env(1), &.{}, &.{});
 }

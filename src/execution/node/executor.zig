@@ -21,6 +21,7 @@ const chainspec = @import("../chainspec/root.zig");
 const payload = @import("../payload/root.zig");
 const StateDb = @import("state_db.zig").StateDb;
 const op_rules = @import("executor_op.zig");
+const base_time = @import("base_time.zig");
 const senders_module = @import("senders.zig");
 
 const Address = [20]u8;
@@ -99,7 +100,7 @@ pub const Backend = struct {
     }
 };
 
-pub const Error = evm.evm.Error || BackendError || error{
+pub const Error = evm.evm.Error || BackendError || base_time.TransitionError || error{
     ScratchFull,
     TooManyTransactions,
     InvalidTransaction,

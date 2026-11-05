@@ -12,6 +12,7 @@ const engine_module = @import("../engine/root.zig");
 const chain_module = @import("chain.zig");
 const Executor = @import("executor.zig").Executor;
 const state_db_module = @import("state_db.zig");
+const base_time = @import("base_time.zig");
 const StateDb = state_db_module.StateDb;
 const db_module = @import("../db/root.zig");
 
@@ -83,6 +84,7 @@ pub const Node = struct {
                 try node.db.put_account(address_of(@intCast(i + 1)).bytes, eth, 0, &.{});
             }
         }
+        if (shared == null) try put_base_time_proxy(&node.db, chain_spec);
         node.executor = try Executor.init(testing.allocator, chain_spec, &node.db, .{
             .scratch_bytes = 1 << 20,
             .transactions_max = 64,
@@ -121,6 +123,16 @@ pub const Node = struct {
         testing.allocator.destroy(node);
     }
 };
+
+/// Allocates the BaseTime proxy (code and canonical admin) as real Base genesis does,
+/// when Denim is active at genesis.
+pub fn put_base_time_proxy(db: *StateDb, chain_spec: *const chainspec.ChainSpec) !void {
+    if (chain_spec.mode != .l2 or !chain_spec.is_upgrade_active(.denim, 0)) return;
+    const proxy = base_time.proxy_address;
+    try db.put_account(proxy, 0, 0, &base_time.test_proxy_code);
+    const admin = base_time.address_word(base_time.proxy_admin);
+    try db.put_storage(proxy, base_time.admin_slot, admin);
+}
 
 pub fn genesis_header(state_root: [32]u8) consensus.Header {
     return .{
