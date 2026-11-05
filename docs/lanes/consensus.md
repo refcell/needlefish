@@ -26,7 +26,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [ ] engine task queue: insert unsafe, consolidate, build/seal, finalize, synchronize
-  - [ ] starting forkchoice discovery (find_starting_forkchoice), EL sync
+  - [x] starting forkchoice discovery (resumable find_starting_forkchoice)
+  - [ ] EL sync mode, checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
@@ -71,6 +72,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   and the queue's batch list are allocator-bounded only, as in base/base.
 
 ## Log
+- 2026-11-05: engine: resumable starting-forkchoice finder (reorg walk, safe walk), fuzzed.
 - 2026-11-05: derive: channel reader, batch stream/queue/validator/provider (ported tests, fuzz).
 - 2026-11-05: engine: sync state + forkchoice state, L2 finalizer (bounded, fuzzed).
 - 2026-11-05: safedb: safe head updates, reset semantics, lookup, record codec, fuzz.
