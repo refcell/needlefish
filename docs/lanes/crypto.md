@@ -64,6 +64,24 @@ fallback but hot paths should be our own, optimized implementations.
 | modexp 2048 b e=65537 / full exp | 25718 / 2538656 | - |
 | Fp mul bn254 / bls12-381; inverse | 20 / 26; 1217 / 1832 | - |
 
+## Precompile time per gas (2026-11-05, M4 Pro, ReleaseFast, loaded host)
+
+| precompile | gas | time | ns/gas |
+| --- | --- | --- | --- |
+| ecrecover (0x01) | 3000 | 28.5 us | 9.5 |
+| p256verify, RIP-7212 pricing (Fjord..pre-Azul) | 3450 | 47.7 us | 13.8 |
+| p256verify, EIP-7951 pricing (Osaka/Azul) | 6900 | 47.7 us | 6.9 |
+| bn254 add (0x06) | 150 | 1.72 us | 11.5 |
+| bn254 mul (0x07) | 6000 | 12.2 us | 2.0 |
+| bn254 pairing, 2 pairs (0x08) | 113000 | 494 us | 4.4 |
+| bls12-381 pairing, 2 pairs (0x0f) | 102900 | 588 us | 5.7 |
+| bls12-381 map_fp_to_g1 (0x10) | 5500 | 34 us | 6.2 |
+| kzg point evaluation (0x0a) | 50000 | 650 us | 13.0 |
+
+ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: bn254 add (11.5, dominated by
+input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point evaluation
+(13.0). All stay within ~1.5x of ecrecover, so none is a block-time outlier.
+
 ## Decisions
 - Keccak permutation is generic over the lane type (`u64` or `@Vector(n, u64)`); batch width
   is 2 on NEON (LLVM emits EOR3/BCAX/XAR/RAX1), 4 on AVX2, 8 on AVX-512. Unrolling the
