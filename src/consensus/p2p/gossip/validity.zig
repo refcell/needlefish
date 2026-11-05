@@ -10,14 +10,12 @@
 //!   4. version rules: v3/v4 need zero blob gas used (until Jovian's DA footprint), zero
 //!      excess blob gas, and a parent beacon block root; v4 carries a withdrawals root by
 //!      construction; v2+ withdrawals must be empty (base/base caps the SSZ list at 0)
-//!   5. at most 5 distinct blocks per height, and a block already seen is ignored
+//!   5. Denim schedule (`BaseTimeUpdateTx::validate_block_timestamp`): once sub-second
+//!      blocks are active, the timestamp seconds match the schedule and transaction 1 is
+//!      the BaseTime metadata deposit carrying the scheduled millisecond part
+//!   6. at most 5 distinct blocks per height, and a block already seen is ignored
 //!
 //! Every failure is a gossipsub Reject except an already seen block, which is Ignore.
-//!
-//! Not ported: base/base also checks the Denim sub-second timestamp schedule
-//! (`BaseTimeUpdateTx::validate_block_timestamp`), which needs the Base time-update
-//! transaction decoder; the consensus lane owns that and must add the check before
-//! sub-second blocks activate.
 //!
 //! Deviations: transactions decode with `common/consensus` `Envelope`, which matches
 //! `BaseTxEnvelope` except that it cannot decode EIP-8130 (type 0x79) yet, so those are
@@ -34,6 +32,7 @@ const common_block = @import("../../../common/consensus/block.zig");
 const ordered = @import("../../../execution/trie/ordered.zig");
 const Nibbles = @import("../../../execution/trie/nibbles.zig").Nibbles;
 const rollup_config = @import("../../protocol/rollup_config.zig");
+const base_time = consensus_types.base_time;
 const block = @import("block.zig");
 const ssz = @import("ssz_payload.zig");
 
@@ -68,6 +67,8 @@ pub const Error = error{
     ExcessBlobGas,
     /// v3+ payload without a parent beacon block root.
     ParentBeaconRoot,
+    /// A sub-second block's timestamp or BaseTime deposit does not match the Denim schedule.
+    BaseTimeSchedule,
     /// Five distinct blocks were already accepted at this height.
     TooManyBlocks,
     /// This block was already accepted.
@@ -248,6 +249,32 @@ pub fn check_version_fields(
     assert(block.has_parent_beacon_root(envelope.version));
 }
 
+/// The Denim sub-second schedule check (base/base `validate_block_timestamp`). Passes
+/// before Denim or on chains without a schedule.
+pub fn check_base_time(
+    config: *const RollupConfig,
+    payload: *const ssz.ExecutionPayload,
+) Error!void {
+    const schedule = config.denim_timestamp_schedule() orelse return;
+    const blocks = payload.block_number -| schedule.genesis_block_number;
+    if (blocks < schedule.denim_activation_block_number()) return;
+    const expected_ms = schedule.block_timestamp_ms(payload.block_number);
+    const expected_millis_part: u16 = @intCast(expected_ms % 1_000);
+    const second: ?consensus_types.Envelope = if (payload.transactions.count < 2)
+        null
+    else
+        consensus_types.Envelope.decode(payload.transactions.get(1)) catch
+            return error.BaseTimeSchedule;
+    base_time.validate_block_timestamp(
+        second,
+        payload.block_number,
+        payload.timestamp,
+        expected_ms / 1_000,
+        expected_millis_part,
+    ) catch return error.BaseTimeSchedule;
+    assert(expected_millis_part < 1_000);
+}
+
 /// Stateful validator: rollup config, current unsafe block signer, seen-hash table.
 /// About 170 KiB; keep it in long-lived memory.
 pub const Validator = struct {
@@ -273,6 +300,7 @@ pub const Validator = struct {
         );
         if (!computed.eql(payload.block_hash)) return error.BlockHash;
         try check_version_fields(validator.config, envelope);
+        try check_base_time(validator.config, payload);
         try validator.seen.check(payload.block_number, payload.block_hash);
         validator.seen.insert(payload.block_number, payload.block_hash);
         assert(validator.seen.len > 0 or seen_heights_max == 1);
@@ -476,6 +504,93 @@ test "validity: v3/v4 blob gas, excess blob gas, and beacon root rules" {
     // A v1 payload after Isthmus cannot carry the requests hash contiguously.
     value = context.payload(.v1, 5);
     try testing.expectError(error.BlockHash, block_hash(&context.config, &value, null));
+}
+
+/// Payload at `number` with transactions [L1 info stand-in, BaseTime deposit(millis)].
+fn base_time_payload(
+    storage: *[1024]u8,
+    number: u64,
+    timestamp: u64,
+    millis_part: ?u16,
+) ssz.ExecutionPayload {
+    const first: consensus_types.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(1) },
+        .from = .zero,
+        .to = .create,
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = "l1info",
+    } };
+    var calldata: [base_time.calldata_length]u8 = undefined;
+    var items: [2][]const u8 = undefined;
+    items[0] = first.encode_to(storage[512..768]);
+    var count: usize = 1;
+    if (millis_part) |millis| {
+        calldata = base_time.encode_calldata(millis);
+        const second: consensus_types.Envelope = .{
+            .deposit = base_time.deposit(number, &calldata),
+        };
+        items[1] = second.encode_to(storage[768..]);
+        count = 2;
+    }
+    return .{
+        .version = .v3,
+        .block_number = number,
+        .timestamp = timestamp,
+        .transactions = ssz.Transactions.encode(storage[0..512], items[0..count]),
+    };
+}
+
+fn base_time_config() RollupConfig {
+    var config: RollupConfig = .{ .l2_chain_id = chain_id_test, .block_time = 2 };
+    config.genesis.l2_time = 1_000;
+    config.upgrades.set(.denim, 1_010); // Activation block 5 at 1010 s; then 200 ms blocks.
+    return config;
+}
+
+test "validity: Denim BaseTime schedule" {
+    const config = base_time_config();
+    var storage: [1024]u8 = undefined;
+    // Block 6 is 200 ms after the activation block: 1010 s + 200 ms.
+    try check_base_time(&config, &base_time_payload(&storage, 6, 1_010, 200));
+    try check_base_time(&config, &base_time_payload(&storage, 10, 1_011, 0));
+    const wrong_millis = base_time_payload(&storage, 6, 1_010, 400);
+    try testing.expectError(error.BaseTimeSchedule, check_base_time(&config, &wrong_millis));
+    const wrong_seconds = base_time_payload(&storage, 6, 1_011, 200);
+    try testing.expectError(error.BaseTimeSchedule, check_base_time(&config, &wrong_seconds));
+    const missing = base_time_payload(&storage, 6, 1_010, null);
+    try testing.expectError(error.BaseTimeSchedule, check_base_time(&config, &missing));
+    // Wrong block number in the deposit source hash.
+    var shifted = base_time_payload(&storage, 7, 1_010, 200);
+    shifted.block_number = 6;
+    try testing.expectError(error.BaseTimeSchedule, check_base_time(&config, &shifted));
+    // Before activation, and on chains without Denim, nothing is checked.
+    try check_base_time(&config, &base_time_payload(&storage, 4, 9, null));
+    const plain: RollupConfig = .{ .l2_chain_id = chain_id_test, .block_time = 2 };
+    try check_base_time(&plain, &base_time_payload(&storage, 6, 1, null));
+}
+
+test "validity: seeded fuzz of the BaseTime schedule check" {
+    const config = base_time_config();
+    var storage: [1024]u8 = undefined;
+    var prng = Prng.init(0xba5e);
+    const random = prng.random();
+    for (0..500) |_| {
+        const number = random.uintLessThan(u64, 64);
+        const timestamp = 990 + random.uintLessThan(u64, 40);
+        const millis: ?u16 = if (random.boolean()) 200 * random.uintLessThan(u16, 5) else null;
+        const payload = base_time_payload(&storage, number, timestamp, millis);
+        const result = check_base_time(&config, &payload);
+        const expected_ms = config.l2_block_timestamp_ms(number);
+        const matches = timestamp == expected_ms / 1_000 and
+            millis != null and millis.? == expected_ms % 1_000;
+        if (number < 5 or matches) try result else try testing.expectError(
+            error.BaseTimeSchedule,
+            result,
+        );
+    }
 }
 
 test "validity: at most five blocks per height" {

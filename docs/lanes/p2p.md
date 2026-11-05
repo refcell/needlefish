@@ -69,9 +69,10 @@ behind a small interface and switch later.
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
   signer, block validity rules (port `block_validity.rs`: timestamp window, seen hashes
   per height limits, v3/v4 field rules).
-- [ ] `gossip`: Denim sub-second timestamp check (`BaseTimeUpdateTx::
-  validate_block_timestamp`) once consensus has the Base time-update tx decoder; a real
-  Base block as a block-hash vector; EIP-8130 (0x79) tx decoding in validity.
+- [x] `gossip`: Denim sub-second timestamp check (`validity.check_base_time`, via
+  `common/consensus/base_time` and the rollup Denim schedule), before the seen table.
+- [ ] `gossip`: a real Base block as a block-hash vector; EIP-8130 (0x79) tx decoding in
+  validity (once `common/consensus` decodes 0x79).
 - [x] `Service` (`service.zig`): IO-free state machine tying disc + gater + connection
   limits + block gossip; dials every valid discovered record, bans peers under -100 for
   1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
@@ -263,3 +264,4 @@ behind a small interface and switch later.
 - 2026-11-05: p2p Prometheus metrics.
 - 2026-11-05: RPC peer info from identify and ping.
 - 2026-11-05: ChaCha20 16-block passes (+8% seal+open).
+- 2026-11-05: Denim BaseTime schedule check in block gossip validity.
