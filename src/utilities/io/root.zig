@@ -25,6 +25,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Initializes the production backend for tests. When io_uring is unavailable (sandboxed
+/// CI), the test is skipped, unless built with `-Drequire-io-uring=true`, which turns the
+/// skip into a failure so Linux CI cannot silently lose io_uring coverage.
+pub fn init_for_test() !IO {
+    if (builtin.os.tag != .linux) return IO.init();
+    return IO.init(.{}) catch |err| switch (err) {
+        error.IoUringUnavailable => {
+            if (@import("build_options").require_io_uring) return err;
+            return error.SkipZigTest;
+        },
+        else => err,
+    };
+}
+
 pub const common = @import("common.zig");
 pub const sim = @import("sim.zig");
 pub const kqueue = @import("kqueue.zig");

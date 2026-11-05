@@ -298,14 +298,9 @@ const Status = struct {
 };
 
 test "ws: client and server over the OS backend" {
-    const builtin = @import("builtin");
     const OsHub = HubFor(io.IO);
     const OsSubscriber = SubscriberFor(io.IO);
-    var os_io = if (builtin.os.tag != .linux) try io.IO.init() else io.IO.init(.{}) catch |err|
-        switch (err) {
-            error.IoUringUnavailable => return error.SkipZigTest,
-            else => return err,
-        };
+    var os_io = try io.init_for_test();
     defer os_io.deinit();
     var hub: OsHub = .{};
     var server: OsHub.WsServer = undefined;

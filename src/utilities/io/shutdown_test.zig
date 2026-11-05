@@ -2,7 +2,6 @@
 //! with 0, and the peer's recv sees end of stream.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const root = @import("root.zig");
 const common = @import("common.zig");
@@ -106,11 +105,7 @@ test "io: shutdown_now wakes pending recv on SimIo" {
 }
 
 test "io: shutdown_now wakes pending recv on the OS backend" {
-    var io = if (builtin.os.tag != .linux) try root.IO.init() else root.IO.init(.{}) catch |err|
-        switch (err) {
-            error.IoUringUnavailable => return error.SkipZigTest,
-            else => return err,
-        };
+    var io = try root.init_for_test();
     defer io.deinit();
     try run(root.IO, &io, Address.loopback(0));
 }

@@ -29,7 +29,7 @@ test filter='':
 test-linux:
     docker run --rm --security-opt seccomp=unconfined --security-opt label=disable -v "$PWD":/src -w /src \
       alpine:3.20 sh -c 'apk add --no-cache curl xz >/dev/null && \
-      etc/scripts/install-zig.sh /tmp/zig && /tmp/zig/zig build test'
+      etc/scripts/install-zig.sh /tmp/zig && /tmp/zig/zig build test -Drequire-io-uring=true'
 
 # Coverage-guided fuzzing of all fuzz tests
 fuzz:

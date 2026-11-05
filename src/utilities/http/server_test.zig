@@ -1,7 +1,6 @@
 //! HTTP server + client end-to-end tests over SimIo and over the production backend.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const io = @import("../io/root.zig");
 const parser = @import("parser.zig");
@@ -236,10 +235,7 @@ test "http: server rejects malformed request with 400 and closes" {
 }
 
 test "http: server and client over the OS backend" {
-    var os_io = if (builtin.os.tag == .linux)
-        io.IO.init(.{}) catch return error.SkipZigTest
-    else
-        try io.IO.init();
+    var os_io = try io.init_for_test();
     defer os_io.deinit();
     var echo: Echo = .{};
     const OsServer = server_module.Server(io.IO, *Echo, Echo.handle);

@@ -25,7 +25,7 @@ jobs:
       - name: tidy
         run: bash etc/scripts/tidy.sh
       - name: test
-        run: zig build test --summary all
+        run: zig build test --summary all -Drequire-io-uring=true
       - name: test release-safe
         run: zig build test -Doptimize=ReleaseSafe
       - name: simulator swarm (fixed seeds)

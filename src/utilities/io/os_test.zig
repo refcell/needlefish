@@ -2,7 +2,6 @@
 //! a loopback TCP echo, timeouts, and file write/fsync/read through real syscalls.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const root = @import("root.zig");
 const common = @import("common.zig");
@@ -12,12 +11,7 @@ const Completion = IO.Completion;
 const Address = common.Address;
 
 fn init_io() !IO {
-    if (builtin.os.tag != .linux) return IO.init();
-    // CI sandboxes may forbid io_uring; the SimIo suite still covers the API there.
-    return IO.init(.{}) catch |err| switch (err) {
-        error.IoUringUnavailable => error.SkipZigTest,
-        else => err,
-    };
+    return root.init_for_test();
 }
 
 const Loopback = struct {

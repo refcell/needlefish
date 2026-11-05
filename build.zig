@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "git_rev", git_rev orelse "unknown");
     const slow_tests = b.option(bool, "slow-tests", "Also run large simulation tests") orelse false;
     options.addOption(bool, "slow_tests", slow_tests);
+    const require_io_uring = b.option(
+        bool,
+        "require-io-uring",
+        "Fail (instead of skip) OS IO tests when io_uring is unavailable",
+    ) orelse false;
+    options.addOption(bool, "require_io_uring", require_io_uring);
 
     const base = b.addModule("base", .{
         .root_source_file = b.path("src/base.zig"),

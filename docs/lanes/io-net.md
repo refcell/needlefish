@@ -12,7 +12,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [x] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
-- [ ] Linux CI coverage for io_uring (`just test-linux`).
+- [x] Linux CI coverage for io_uring (`just test-linux`).
 - [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
   server can stop with an accept in flight and a client can abandon a request on timeout.
 - [x] `http`: per-connection idle/read timeouts on the server; request timeout on client.
@@ -75,3 +75,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: ws: shared Stream engine, Server(IO, Context) with connection ids, broadcast, slow-consumer drop, 400 on non-upgrade; client refactored onto Stream. Tests: client<->server on SimIo (13-byte segments) and kqueue.
 - 2026-11-05: http: server idle/io timeouts and client request timeout via tick() + shutdown_now; SimIo tests.
 - 2026-11-05: test-linux (io_uring, Docker): 1040/1047 pass incl. ws/shutdown; fixed a timing-flaky file test (waits for each callback instead of a fixed 1 ms).
+- 2026-11-05: `-Drequire-io-uring=true` (CI ubuntu + `just test-linux`) turns io_uring-unavailable skips into failures; shared `io.init_for_test()`. test-linux green with it.
