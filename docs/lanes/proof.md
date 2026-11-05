@@ -121,10 +121,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   `--jobs-max`, `--proof-bytes-max`) and `base prover-worker` (native backend over
   `RpcSource`, `--l1-beacon`, compressed/sp1/cluster jobs); `base proposer --prover-rpc
   <url>` talks to it. Smoke: service answers JSON-RPC, worker polls it idle.
-- [ ] `proof/proposer-native-proof-type`: the proposer's `ProposerProver` requests TEE
-  (AWS Nitro) proofs as base/base does, which the native worker does not prove; add a
-  native proof kind (or a compressed request mode) so proposer -> service -> native worker
-  runs end to end.
+- [x] `proof/proposer-native-proof-type`: `prover_service/proposer_native.zig` sends
+  `compressed` range jobs (session label `zk/sp1/compressed`), takes the worker's archive
+  as `initData` and reads intermediate roots from the proposer's chain view (re-checked by
+  the collector); `base proposer --prover-proof-type compressed`. Found and fixed on the
+  way: the collector capped `initData` at 4 KiB, so native archives never reached the
+  submitter (now 4 MiB).
 - [ ] `proof/prover-service-native-e2e`: native backend proving a real range end to end
   (SimIo node RPC + `RpcSource`), proof bytes replayed with `base proof replay`.
 
@@ -285,6 +287,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: proposer compressed mode through native workers; initData cap fix.
 - 2026-11-05: challenger prover-service client, `base challenger --zk-rpc-url`.
 - 2026-11-05: `base challenger` (flags, JSON-RPC view and submitter, driver loop).
 - 2026-11-05: `base prover-service` / `base prover-worker`; empty L1 genesis fix.

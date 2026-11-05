@@ -138,6 +138,7 @@ fn run(init: std.process.Init, service: *Service, config: *const proposer.config
 
 const RemoteClient = proof.prover_service.client.Client(io.IO);
 const RemoteProver = proof.prover_service.client.ProposerProver(io.IO);
+const CompressedProver = proof.prover_service.proposer_native.NativeProposerProver(io.IO);
 
 /// The proposer's prover: in-process native (`--prover-rpc native`, with optional beacon
 /// blobs) or a prover service over JSON-RPC.
@@ -153,6 +154,8 @@ const Provers = struct {
     remote_endpoint: Endpoint = undefined,
     remote_client: RemoteClient = undefined,
     remote: RemoteProver = undefined,
+    /// Large (the root buffer): allocated only in compressed mode.
+    compressed: ?*CompressedProver = null,
 
     fn open(
         provers: *Provers,
@@ -172,6 +175,13 @@ const Provers = struct {
         provers.remote_endpoint = .init(allocator, &provers.remote_http, service.pump(), 300_000);
         errdefer provers.remote_endpoint.deinit();
         provers.remote_client = try .init(allocator, &provers.remote_endpoint, .{});
+        errdefer provers.remote_client.deinit(allocator);
+        if (config.prover_proof_type == .compressed) {
+            const compressed = try allocator.create(CompressedProver);
+            compressed.* = .{ .client = &provers.remote_client, .chain = service.chain.chain() };
+            provers.compressed = compressed;
+            return compressed.prover();
+        }
         provers.remote = .{ .client = &provers.remote_client };
         return provers.remote.prover();
     }
@@ -223,6 +233,7 @@ const Provers = struct {
     fn close(provers: *Provers, allocator: std.mem.Allocator) void {
         switch (provers.mode) {
             .remote => {
+                if (provers.compressed) |compressed| allocator.destroy(compressed);
                 provers.remote_client.deinit(allocator);
                 provers.remote_endpoint.deinit();
                 provers.remote_http.deinit();
