@@ -102,12 +102,16 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   checked against the requested hash before storing. Precompile, account-proof and
   starting-output hints are rejected: the Zig program runs precompiles natively and
   gets state from the payload witness plus `l2-state-node`/`l2-code`.
+- Offline replay uses one canonical archive file (`host/archive.zig`, "NFPA": sorted
+  keys, LE lengths, strict decoder) instead of a disk KV store; the CLI reads and writes
+  it through `utilities.io`.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host: canonical preimage archive for record/replay (strict decoder, fuzz).
 - 2026-11-05: `proof/e2e` landed: real derive + execute of 3 L2 blocks through the host.
 - 2026-11-05: host: hint handler over a chain `Source` (headers, list tries, blobs,
   code/state nodes, payload witness); providers served from an empty store in tests.
