@@ -151,3 +151,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: `txtest` TransactionTests runner, 0 failures.
 - 2026-11-05: ethereum/tests GenesisTests vectors (genesis block RLP parity).
 - 2026-11-05: `genesis.feature` BaseFeature registry.
+- 2026-11-05: ethereum/tests keyaddrtest vectors (seed -> key -> address).

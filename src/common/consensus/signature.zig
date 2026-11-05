@@ -157,3 +157,20 @@ test "signature: legacy v" {
     try testing.expect(decode_legacy_v(29) == null);
     try testing.expect(decode_legacy_v(std.math.maxInt(u256)) == null);
 }
+
+test "signature: ethereum/tests keyaddrtest vectors" {
+    // BasicTests/keyaddrtest.json: brain-wallet key = keccak256(seed), key -> address.
+    // `sig_of_emptystring` is not checked: the vector does not say which digest was signed.
+    const text = @embedFile("testdata/keyaddrtest.json");
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    for (parsed.value.array.items) |vector| {
+        const object = vector.object;
+        const key = try primitives.hex.decode_array(32, object.get("key").?.string);
+        const seed = object.get("seed").?.string;
+        try testing.expectEqualSlices(u8, &primitives.keccak256(seed).bytes, &key);
+        const expected = try Address.from_hex(object.get("addr").?.string);
+        try testing.expect(address_from_private(key).?.eql(expected));
+    }
+}
