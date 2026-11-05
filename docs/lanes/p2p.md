@@ -41,9 +41,15 @@ behind a small interface and switch later.
   over SimIo UDP only (ENR bootnodes, no enode), gossip randomized Ecotone (v3) and Isthmus
   (v4) blocks both ways, and every received block round-trips through the consensus
   `gossip_bridge` (decode -> engine envelope -> encode) to the published block hash.
-- [ ] Bootstore persistence through `utilities.io` (base/base `BootStoreFile`, 60 s sync):
-  `Network` reads `--p2p.bootstore` at start, writes the merged store (space-padded JSON +
-  fsync) every 60 s and on stop. DST: `SimIo.crash` mid-run, restart, records reload.
+- [x] Bootstore persistence through `utilities.io` (base/base `BootStoreFile`, 60 s sync):
+  `peers/store_file.zig` (`StoreFile(IO, Owner, hooks)`: read once, then write + fsync every
+  60 s and on stop; shorter images are space-padded since io has no truncate/rename; seeded
+  crash fuzz: a reload always equals the last fsynced image). `Network` uses it for
+  `--p2p.bootstore`; `Network.busy()` must be false before `deinit` (the node's
+  `deinit_p2p` now drains it). Interop DST: both nodes restart, node 0 has no bootnode for
+  node 1, and reconnects from its file alone (fails with the file off).
+  Decision: no default path (base/base uses `~/.base/<chain>/bootstore.json`); the store is
+  memory-only unless `--p2p.bootstore` is given, so library code never derives home paths.
 - [ ] `--p2p.bootnodes-file` read through `utilities.io` at start (today only parsed when the
   caller hands over the contents; the binary never does).
 - [ ] Identify peerstore (base/base `max_identify_peerstore_peers` = 1024): LRU of identify
@@ -346,3 +352,4 @@ behind a small interface and switch later.
 - 2026-11-05: discv5 unverifiable-ENR handling (table poisoning guard + NAT verification ping).
 - 2026-11-05: chaos seed sweep DST.
 - 2026-11-05: in-process p2p<->consensus interop test; backlog extended (bootstore/bootnodes-file persistence via io, identify peerstore).
+- 2026-11-05: bootstore file persistence through utilities.io (StoreFile + crash fuzz + restart DST).

@@ -341,6 +341,11 @@ pub fn Node(comptime IO: type) type {
         fn deinit_p2p(node: *Self) void {
             const network = node.network orelse return;
             network.stop();
+            // The bootstore file writes a final image on stop; let it finish (bounded).
+            var rounds: u32 = 0;
+            while (network.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
             network.deinit(node.allocator);
             node.allocator.destroy(network);
             node.allocator.free(node.gossip_scratch);

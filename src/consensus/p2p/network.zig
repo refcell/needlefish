@@ -15,6 +15,7 @@ const enr = @import("peers/enr.zig");
 const ip = @import("peers/ip.zig");
 const node_key = @import("peers/node_key.zig");
 const store_module = @import("peers/store.zig");
+const store_file_module = @import("peers/store_file.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
 const block = @import("gossip/block.zig");
 const router_module = @import("gossip/router.zig");
@@ -24,6 +25,8 @@ const rollup_config = @import("../protocol/rollup_config.zig");
 const Service = service_module.Service;
 const Options = options_module.Options;
 const ns_per_s = std.time.ns_per_s;
+/// base/base syncs the bootstore file every 60 s (discv5 driver `store_interval`).
+pub const bootstore_sync_interval_ns = 60 * ns_per_s;
 
 pub const Error = error{ NoUnsafeBlockSigner, InvalidNodeKey, InvalidBootnode };
 
@@ -116,6 +119,15 @@ pub fn Network(comptime IO: type) type {
         record: enr.Record,
         /// Known peers persisted across restarts (base/base bootstore), unless disabled.
         store: ?store_module.Store = null,
+        /// The `--p2p.bootstore` file behind `store`, synced through the IO layer.
+        bootstore_file: ?BootstoreFile = null,
+        /// Bootstore file contents that were not valid bootstore JSON (treated as empty).
+        bootstore_invalid: u64 = 0,
+
+        pub const BootstoreFile = store_file_module.StoreFile(IO, Self, .{
+            .loaded = on_bootstore_loaded,
+            .produce = save_bootstore,
+        });
 
         /// `self` must not move afterwards. `seed` feeds per-connection noise keys and must
         /// come from OS entropy in production.
@@ -147,6 +159,17 @@ pub fn Network(comptime IO: type) type {
                 self.store = try store_module.Store.init(allocator, store_module.capacity_default);
             }
             errdefer if (self.store) |*store| store.deinit(allocator);
+            self.bootstore_file = null;
+            self.bootstore_invalid = 0;
+            if (self.store != null) {
+                if (options.bootstore) |path| {
+                    self.bootstore_file = @as(BootstoreFile, undefined);
+                    const capacity = self.bootstore_length_max();
+                    const interval = bootstore_sync_interval_ns;
+                    try self.bootstore_file.?.init(allocator, io, self, path, capacity, interval);
+                }
+            }
+            errdefer if (self.bootstore_file) |*file| file.deinit(allocator);
             try self.transport.init(allocator, io, self.service, .{
                 .listen = listen,
                 .identity_secret = secret,
@@ -160,6 +183,7 @@ pub fn Network(comptime IO: type) type {
         /// counted in the return value.
         pub fn start(self: *Self) !u32 {
             try self.transport.start();
+            if (self.bootstore_file) |*file| file.start();
             const now = self.transport.io.now_realtime_ns();
             const configured = self.options.bootnode_slice();
             const chain_id = self.service.config.rollup.l2_chain_id;
@@ -184,12 +208,22 @@ pub fn Network(comptime IO: type) type {
             return invalid;
         }
 
+        /// Stops the transport and writes a final bootstore image.
         pub fn stop(self: *Self) void {
+            if (self.bootstore_file) |*file| file.stop();
             self.transport.stop();
+        }
+
+        /// True while the bootstore file still has an operation or its timer outstanding;
+        /// run the IO loop until false before `deinit`.
+        pub fn busy(self: *const Self) bool {
+            const file = if (self.bootstore_file) |*value| value else return false;
+            return file.busy();
         }
 
         /// Frees memory after `stop` once the IO loop has drained the completions.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.bootstore_file) |*file| file.deinit(allocator);
             if (self.store) |*store| store.deinit(allocator);
             self.transport.deinit();
             self.service.destroy(allocator);
@@ -235,6 +269,16 @@ pub fn Network(comptime IO: type) type {
             }
             assert(seeded <= store.count);
             return seeded;
+        }
+
+        fn on_bootstore_loaded(self: *Self, contents: []const u8) void {
+            assert(self.store != null);
+            if (std.mem.trim(u8, contents, " \t\r\n").len == 0) return; // A new file.
+            _ = self.load_bootstore(contents) catch {
+                self.bootstore_invalid += 1;
+                return;
+            };
+            assert(self.store.?.count > 0 or contents.len > 0);
         }
 
         /// Bytes `save_bootstore` needs at most.

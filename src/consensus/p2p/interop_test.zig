@@ -37,6 +37,7 @@ const Pair = struct {
     secrets: [2]secp256k1.SecretKey,
     rollup: rollup_config.RollupConfig,
     sequencer_key: [32]u8,
+    signer: primitives.Address,
     scratch: []u8,
     /// `Options` borrows its argument strings, so they live as long as the networks.
     boot_flags: [2][enr.text_length_max + 16]u8,
@@ -44,6 +45,12 @@ const Pair = struct {
 
     /// Each node boots discovery from the other's ENR only: no enode, no manual dial.
     fn init(pair: *Pair, upgrade: rollup_config.Upgrade) !void {
+        return pair.init_flags(upgrade, .{ .boot_other = true }, .{ .boot_other = true });
+    }
+
+    const Flags = struct { boot_other: bool, bootstore: bool = false };
+
+    fn init_flags(pair: *Pair, upgrade: rollup_config.Upgrade, a: Flags, b: Flags) !void {
         const allocator = testing.allocator;
         pair.rollup = .{ .l2_chain_id = chain_id, .block_time = 2 };
         pair.rollup.upgrades.set(upgrade, 0);
@@ -56,20 +63,23 @@ const Pair = struct {
         pair.world = try io_module.SimWorld.init(allocator, .{ .seed = 0x1e70 });
         errdefer pair.world.deinit();
         pair.scratch = try allocator.alloc(u8, 10 << 20);
-        const signer: primitives.Address = .{
-            .bytes = try common_secp256k1.address(pair.sequencer_key),
-        };
-        for (0..2) |index| try pair.init_node(index, signer);
-        for (&pair.networks) |*network| try testing.expectEqual(@as(u32, 0), try network.start());
+        pair.signer = .{ .bytes = try common_secp256k1.address(pair.sequencer_key) };
+        for (0..2) |index| {
+            const host: [4]u8 = .{ 10, 0, 0, @intCast(index + 1) };
+            try io_module.SimIo.init(&pair.ios[index], allocator, &pair.world, .{
+                .host = io_module.Address.ip4(host, 0),
+            });
+        }
+        try pair.init_network(0, a);
+        try pair.init_network(1, b);
+        for (&pair.networks) |*network| _ = try network.start();
     }
 
-    fn init_node(pair: *Pair, index: usize, signer: primitives.Address) !void {
+    /// Without `boot_other` the node falls back to the chain's default bootnodes, which
+    /// are unreachable in the simulation.
+    fn init_network(pair: *Pair, index: usize, flags: Flags) !void {
         assert(index < 2);
         const allocator = testing.allocator;
-        const host: [4]u8 = .{ 10, 0, 0, @intCast(index + 1) };
-        try io_module.SimIo.init(&pair.ios[index], allocator, &pair.world, .{
-            .host = io_module.Address.ip4(host, 0),
-        });
         const other = 1 - index;
         const other_record = try enr.build(pair.secrets[other], .{
             .ip4 = .{ 10, 0, 0, @intCast(other + 1) },
@@ -85,14 +95,26 @@ const Pair = struct {
         const listen_flag = try std.fmt.bufPrint(&pair.listen_flags[index], listen_text, .{
             index + 1,
         });
-        const options = try options_module.parse(&.{ listen_flag, bootnodes });
+        var arguments: [3][]const u8 = undefined;
+        var count: usize = 0;
+        arguments[count] = listen_flag;
+        count += 1;
+        if (flags.boot_other) {
+            arguments[count] = bootnodes;
+            count += 1;
+        }
+        if (flags.bootstore) {
+            arguments[count] = "--p2p.bootstore=bootstore.json";
+            count += 1;
+        }
+        const options = try options_module.parse(arguments[0..count]);
         try pair.networks[index].init(
             allocator,
             &pair.ios[index],
             &pair.rollup,
             options,
             pair.secrets[index],
-            signer,
+            pair.signer,
             pair.prngs[index].random(),
             index,
         );
@@ -100,13 +122,35 @@ const Pair = struct {
 
     fn deinit(pair: *Pair) void {
         for (&pair.networks) |*network| network.stop();
-        pair.world.run_for_ns(100 * ns_per_ms);
+        pair.drain(&pair.networks[0]);
+        pair.drain(&pair.networks[1]);
         for (&pair.networks, &pair.ios) |*network, *io| {
             network.deinit(testing.allocator);
             io.deinit();
         }
         testing.allocator.free(pair.scratch);
         pair.world.deinit();
+    }
+
+    /// Runs the IO loop until a stopped network has no operations outstanding.
+    fn drain(pair: *Pair, network: *Network) void {
+        assert(network.transport.stopped);
+        pair.world.run_for_ns(100 * ns_per_ms);
+        var rounds: u32 = 0;
+        while (network.busy()) : (rounds += 1) {
+            assert(rounds < 10_000); // A stopped network drains in bounded time.
+            pair.world.run_for_ns(10 * ns_per_ms);
+        }
+    }
+
+    /// Stops node `index`, drains, and starts a fresh network on the same host and disk.
+    fn restart(pair: *Pair, index: usize, flags: Flags) !void {
+        const network = &pair.networks[index];
+        network.stop();
+        pair.drain(network);
+        network.deinit(testing.allocator);
+        try pair.init_network(index, flags);
+        _ = try network.start();
     }
 
     fn run(pair: *Pair, duration_ns: u64) void {
@@ -209,4 +253,32 @@ test "p2p interop: two networks gossip Ecotone (v3) blocks through the consensus
 
 test "p2p interop: two networks gossip Isthmus (v4) blocks through the consensus bridge" {
     try expect_interop(.isthmus, 0x157);
+}
+
+test "p2p interop: a restarted node finds its peer again from the bootstore file alone" {
+    const pair = try testing.allocator.create(Pair);
+    defer testing.allocator.destroy(pair);
+    // Node 0 boots from node 1 and keeps a bootstore; node 1 knows nobody.
+    const persistent: Pair.Flags = .{ .boot_other = true, .bootstore = true };
+    try pair.init_flags(.ecotone, persistent, .{ .boot_other = false });
+    defer pair.deinit();
+    pair.run(5 * ns_per_s);
+    try testing.expectEqual(@as(u32, 1), pair.networks[0].peer_count());
+    pair.run(61 * ns_per_s);
+    const file = &pair.networks[0].bootstore_file.?;
+    try testing.expect(file.stats.saves >= 1);
+    try testing.expectEqual(@as(u64, 1), file.stats.loads);
+    // Restart both: node 1 forgets everything, and node 0 has no bootnode for node 1, so
+    // only the file can lead them back together.
+    try pair.restart(1, .{ .boot_other = false });
+    try pair.restart(0, .{ .boot_other = false, .bootstore = true });
+    try testing.expectEqual(@as(u32, 0), pair.networks[0].peer_count());
+    pair.run(5 * ns_per_s);
+    const restarted = &pair.networks[0];
+    try testing.expectEqual(@as(u64, 1), restarted.bootstore_file.?.stats.loads);
+    try testing.expectEqual(@as(u64, 0), restarted.bootstore_invalid);
+    try testing.expect(restarted.store.?.count >= 1);
+    try testing.expectEqual(@as(u32, 1), restarted.peer_count());
+    var prng = Prng.init(7);
+    try pair.exchange(1, 1, prng.random());
 }
