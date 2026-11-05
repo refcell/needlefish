@@ -108,21 +108,28 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
 
-## Bench snapshot (2026-11-05, Apple M4 Pro, ReleaseFast, host load ~24, ns/op)
+## Bench snapshot (2026-11-05, Apple M4 Pro, ReleaseFast, loaded host, ns/op)
 
 | op | ours | std |
 | --- | --- | --- |
-| keccak256 32 B / batch per msg / 4 KiB | 147 / 74 / 4367 | 150 / - / 4829 |
-| sha256 32 B / 4 KiB | 26 / 1427 | 29 / 1450 |
-| ripemd160 32 B / blake2f 12 rounds | 135 / 86 | - / 84 (blake2b 128 B) |
-| secp256k1 ecrecover / sign / pubkey | 28577 / 11212 / 9336 | verify 62509 / 74249 / 71221 |
-| p256 verify | 52890 | 88463 |
-| bn254 add / mul / pairing 2 pairs | 1716 / 12236 / 552420 | - |
-| bls12-381 g1 mul (glv) / g2 mul / pairing-2 | 41308 / 200005 / 687248 | - |
-| bls12-381 map_fp_to_g1 / g1 msm-64 | 41217 / 1232222 | - |
-| kzg point evaluation | 787632 | - |
-| modexp 2048 b e=65537 / full exp | 25718 / 2538656 | - |
-| Fp mul bn254 / bls12-381; inverse | 20 / 26; 1217 / 1832 | - |
+| keccak256 32 B / batch per msg / 4 KiB | 145 / 79 / 4398 | 151 / - / 4493 |
+| sha256 32 B / 4 KiB | 26 / 1425 | 29 / 1432 |
+| ripemd160 32 B / blake2f 12 rounds | 129 / 86 | - / 84 (blake2b 128 B) |
+| secp256k1 ecrecover / verify / ecdh | 28460 / 24097 / 29647 | - / 66576 / 72340 |
+| secp256k1 sign / public_key | 11312 / 9067 | 75353 / 65436 |
+| p256 verify | 46772 | 88517 |
+| bn254 add / mul / pairing 2 pairs | 1743 / 12445 / 449549 | - |
+| bn254 miller loop 2 pairs / final exponentiation | 242869 / 161996 | - |
+| bls12-381 g1 mul glv / g2 mul gls | 42408 / 81554 | - |
+| bls12-381 pairing-2 / prepared | 615185 / 515549 | - |
+| bls12-381 map_fp_to_g1 / g1 msm-64 / msm-4096 | 32291 / 1261758 / 36794833 | - |
+| kzg point evaluation / verify_blob_kzg_proof / batch (6) | 648774 / 919928 / 3202884 | - |
+| kzg blob_to_kzg_commitment / compute_blob_kzg_proof | 26496416 / 26763917 | - |
+| kzg cells+proofs / with tables | 190657333 / 96489000 | - |
+| kzg recover (64) / with tables | 209739583 / 101476208 | - |
+| kzg verify_cell_kzg_proof_batch 1 / 128 | 1988135 / 12153528 | - |
+| modexp 2048 b e=65537 / full exp / 4096 b full exp | 18483 / 1955274 / 15798438 | - |
+| Fp mul bn254 / bls12-381; inverse | 18 / 26; 1217 / 1833 | - |
 
 ## Precompile time per gas (2026-11-05, M4 Pro, ReleaseFast, loaded host)
 
@@ -408,3 +415,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: montgomery and safegcd differential fuzz 300K runs each, clean (mostly branch-free code: 87 / 70 coverage points).
 - 2026-11-05: second fuzz pass complete (sha256/ripemd160/blake2f/keccak 300K, kzg verify/framing 20K, all clean); fuzz item closed.
 - 2026-11-05: recovery with prover tables 193 -> 98 ms.
+- 2026-11-05: bench snapshot table refreshed (full crypto bench run).
