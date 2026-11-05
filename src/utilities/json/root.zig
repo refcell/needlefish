@@ -589,6 +589,34 @@ pub fn write_string_escaped(out: *std.Io.Writer, value: []const u8) std.Io.Write
     try out.writeByte('"');
 }
 
+/// Returns the raw text of the value reached by following object `keys` from the document
+/// root (e.g. `&.{ "blockRef", "l1origin", "number" }`), or null if a key is missing or an
+/// intermediate value is not an object. The first matching key wins; keys containing escapes
+/// never match. Only the path and the returned value are validated, not the whole document.
+pub fn find_path(input: []const u8, keys: []const []const u8) Error!?[]const u8 {
+    assert(keys.len <= depth_max);
+    var scanner = Scanner.init(input);
+    for (keys) |wanted| {
+        const container = try scanner.next();
+        if (container.tag != .object_begin) return null;
+        // Each member consumes at least one byte, so input length bounds the loop.
+        var members: u32 = 0;
+        while (true) : (members += 1) {
+            assert(members <= input.len);
+            const key = try scanner.next();
+            if (key.tag == .object_end) return null;
+            assert(key.tag == .string and key.key);
+            if (!key.escaped and std.mem.eql(u8, key.bytes, wanted)) break;
+            try scanner.skip(try scanner.next());
+        }
+    }
+    scanner.skip_whitespace();
+    const start = scanner.index;
+    try scanner.skip(try scanner.next());
+    assert(scanner.index > start);
+    return input[start..scanner.index];
+}
+
 /// Scans a whole document, returning an error if it is not well formed.
 pub fn validate(input: []const u8) Error!void {
     var scanner = Scanner.init(input);

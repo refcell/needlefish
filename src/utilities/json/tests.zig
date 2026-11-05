@@ -285,6 +285,35 @@ fn scan_arbitrary(input: []const u8) !void {
     try expect(count <= input.len + 1);
 }
 
+test "json: find_path" {
+    const doc =
+        \\{"version":"0x0","blockRef":{"hash":"0xab","l1origin":{"number":19,"x":[1,{"y":2}]}},
+        \\ "number" : 7 , "obj": {"k": null}, "esc\\u0041": 1}
+    ;
+    const find = json.find_path;
+    try expectEqualStrings("19", (try find(doc, &.{ "blockRef", "l1origin", "number" })).?);
+    try expectEqualStrings("7", (try find(doc, &.{"number"})).?);
+    try expectEqualStrings("\"0xab\"", (try find(doc, &.{ "blockRef", "hash" })).?);
+    try expectEqualStrings("[1,{\"y\":2}]", (try find(doc, &.{ "blockRef", "l1origin", "x" })).?);
+    try expectEqualStrings("{\"k\": null}", (try find(doc, &.{"obj"})).?);
+    try expectEqualStrings(doc, (try find(doc, &.{})).?);
+    try expect((try find(doc, &.{"missing"})) == null);
+    try expect((try find(doc, &.{ "number", "deeper" })) == null); // Not an object.
+    try expect((try find(doc, &.{"escA"})) == null); // Escaped keys never match.
+    try expect((try find("[1]", &.{"a"})) == null);
+    try std.testing.expectError(error.UnexpectedEnd, find("{\"a\":", &.{"a"}));
+    try std.testing.expectError(error.UnexpectedCharacter, find("{a:1}", &.{"a"}));
+}
+
+/// A found value is itself a well-formed document.
+fn find_arbitrary(input: []const u8) !void {
+    const keys = [_][]const u8{ "a", "b" };
+    for (0..keys.len + 1) |depth| {
+        const found = json.find_path(input, keys[0..depth]) catch continue orelse continue;
+        try json.validate(found);
+    }
+}
+
 test "json: seeded arbitrary bytes" {
     var prng = Prng.init(0x15011);
     const alphabet = "{}[]:,\"\\ 0123456789-+.eEtrufalsn\x00\xc3\xa9u";
@@ -293,6 +322,7 @@ test "json: seeded arbitrary bytes" {
         const size = prng.below(input.len);
         for (input[0..size]) |*byte| byte.* = alphabet[prng.below(alphabet.len)];
         try scan_arbitrary(input[0..size]);
+        try find_arbitrary(input[0..size]);
     }
 }
 
@@ -301,6 +331,7 @@ fn fuzz_scan(context: void, smith: *std.testing.Smith) anyerror!void {
     var input: [512]u8 = undefined;
     const size = smith.slice(&input);
     try scan_arbitrary(input[0..size]);
+    try find_arbitrary(input[0..size]);
 }
 
 test "json: fuzz scanner" {

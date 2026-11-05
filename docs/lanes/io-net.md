@@ -20,7 +20,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `http`: expose the peer address to handlers (`ResponseBuilder.peer`, from a sync
   `peer_address(fd)` on every IO backend) so `trusted_proxy` can be wired in.
 - [x] `balance_monitor`: periodic balance polling over `rpc.Client` with `tick()`.
-- [ ] `l1_head`: shared L1 head helpers for proof services (check proof lane first).
+- [x] `l1_head`: shared L1 head helpers for proof services (`json.find_path` added for it).
 
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
@@ -90,3 +90,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: trusted_proxy: CIDR matching (v4/v6, mapped v4), right-to-left XFF scan across header occurrences, peer fallback; fuzzed.
 - 2026-11-05: `io.peer_address(fd)` (getpeername; SimIo records host+ephemeral port per side); http handlers read `response.peer`; resolve with `trusted_proxy.Config.client_ip(response.peer, request.headers.slice())`.
 - 2026-11-05: balance_monitor: own rpc.Client + Ticker, immediate first poll, publish every success (`updates` as watch version), skip polls while a read is in flight; `Ticker.stop` now cancels its pending timeout.
+- 2026-11-05: json.find_path (raw value at an object key path); l1_head: `cap_head` + `Calculator(IO)` (outputAtBlock -> finalized -> capped block hash), SimIo-tested against a fake node.

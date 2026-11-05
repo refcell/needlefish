@@ -18,6 +18,7 @@ pub const health = @import("health/root.zig");
 pub const ws = @import("ws/root.zig");
 pub const trusted_proxy = @import("trusted_proxy/root.zig");
 pub const balance_monitor = @import("balance_monitor/root.zig");
+pub const l1_head = @import("l1_head/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
