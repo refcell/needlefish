@@ -102,7 +102,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [ ] `proof/submission` fee bumping: resubmit a stuck transaction at the same nonce with
   bumped fees (base/base `TxManager`); today a dropped transaction is retried by the
   caller with a fresh nonce.
-- [ ] `bin/base challenger`: CLI/config wiring, real IO loop calling `Driver.tick`.
+- [x] `bin/base challenger`: `challenger/flags.zig` (base/base `cli.rs` names, defaults,
+  comma-separated bond claim addresses, `from_cli` checks; fuzzed), JSON-RPC chain view and
+  submitter, `Driver.tick` on the IO clock. Disputes wait for the prover client below
+  (requests are refused until then). Smoke against a dev L1 without contracts.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
   holds exactly the preimages the client read; `native.run(.., witness)`; `proof run
   --out` writes it; e2e replays the witness alone with hints ignored.
@@ -278,6 +281,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: `base challenger` (flags, JSON-RPC view and submitter, driver loop).
 - 2026-11-05: `base prover-service` / `base prover-worker`; empty L1 genesis fix.
 - 2026-11-05: `base proposer --prover-rpc <url>` and `--l1-beacon`.
 - 2026-11-05: `base proposer` (native prover, dry-run, JSON-RPC submitter).
