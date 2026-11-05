@@ -27,7 +27,7 @@ test filter='':
 
 # Run the test suite inside a Linux container (exercises io_uring)
 test-linux:
-    docker run --rm --security-opt seccomp=unconfined -v "$PWD":/src -w /src \
+    docker run --rm --security-opt seccomp=unconfined --security-opt label=disable -v "$PWD":/src -w /src \
       alpine:3.20 sh -c 'apk add --no-cache curl xz >/dev/null && \
       etc/scripts/install-zig.sh /tmp/zig && /tmp/zig/zig build test'
 
