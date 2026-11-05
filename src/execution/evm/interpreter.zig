@@ -295,13 +295,13 @@ fn memory_op(comptime opcode: u8, f: *Frame) ?Exit {
         op.MLOAD => {
             const offset = s.peek(0);
             const range = memory_range(f, offset.*, 32) orelse return .out_of_gas;
-            offset.* = std.mem.readInt(u256, f.memory.word(range.offset), .big);
+            offset.* = primitives.word_from_be(f.memory.word(range.offset));
         },
         op.MSTORE => {
             const offset = s.pop();
             const value = s.pop();
             const range = memory_range(f, offset, 32) orelse return .out_of_gas;
-            std.mem.writeInt(u256, f.memory.word(range.offset), value, .big);
+            primitives.word_to_be(f.memory.word(range.offset), value);
         },
         op.MSTORE8 => {
             const offset = s.pop();
@@ -371,7 +371,7 @@ fn push(comptime size: u8, f: *Frame) void {
     } else blk: {
         var buffer: [32]u8 = @splat(0);
         buffer[32 - size ..].* = immediate.*;
-        break :blk std.mem.readInt(u256, &buffer, .big);
+        break :blk primitives.word_from_be(&buffer);
     };
     f.stack.push(value);
     f.pc += size;
@@ -414,7 +414,7 @@ fn environment(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?
         op.CALLDATALOAD => {
             var word: [32]u8 = undefined;
             memory_module.copy_padded(&word, f.input, s.peek(0).*);
-            s.peek(0).* = std.mem.readInt(u256, &word, .big);
+            s.peek(0).* = primitives.word_from_be(&word);
         },
         op.CALLDATASIZE => s.push(f.input.len),
         op.CALLDATACOPY => {

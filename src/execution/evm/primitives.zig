@@ -30,13 +30,45 @@ pub fn keccak256(bytes: []const u8) B256 {
 }
 
 pub fn b256_to_u256(word: B256) u256 {
-    return std.mem.readInt(u256, &word, .big);
+    return word_from_be(&word);
 }
 
 pub fn u256_to_b256(value: u256) B256 {
     var out: B256 = undefined;
-    std.mem.writeInt(u256, &out, value, .big);
+    word_to_be(&out, value);
     return out;
+}
+
+/// Big-endian 32 bytes to a word as four 64-bit loads. `std.mem.readInt(u256, .., .big)`
+/// lowers to 32 single-byte loads and shifts on aarch64; this is the MLOAD hot path.
+pub inline fn word_from_be(bytes: *const [32]u8) u256 {
+    const high_high: u256 = std.mem.readInt(u64, bytes[0..8], .big);
+    const high_low: u256 = std.mem.readInt(u64, bytes[8..16], .big);
+    const low_high: u256 = std.mem.readInt(u64, bytes[16..24], .big);
+    const low_low: u256 = std.mem.readInt(u64, bytes[24..32], .big);
+    return high_high << 192 | high_low << 128 | low_high << 64 | low_low;
+}
+
+/// Inverse of `word_from_be` (MSTORE hot path).
+pub inline fn word_to_be(bytes: *[32]u8, value: u256) void {
+    std.mem.writeInt(u64, bytes[0..8], @truncate(value >> 192), .big);
+    std.mem.writeInt(u64, bytes[8..16], @truncate(value >> 128), .big);
+    std.mem.writeInt(u64, bytes[16..24], @truncate(value >> 64), .big);
+    std.mem.writeInt(u64, bytes[24..32], @truncate(value), .big);
+}
+
+test "primitives: word big-endian conversions match std.mem" {
+    var prng = std.Random.DefaultPrng.init(0x3e3e);
+    var iteration: u32 = 0;
+    while (iteration < 1000) : (iteration += 1) {
+        var bytes: [32]u8 = undefined;
+        prng.random().bytes(&bytes);
+        const value = word_from_be(&bytes);
+        try std.testing.expectEqual(std.mem.readInt(u256, &bytes, .big), value);
+        var out: [32]u8 = undefined;
+        word_to_be(&out, value);
+        try std.testing.expectEqualSlices(u8, &bytes, &out);
+    }
 }
 
 pub fn address_to_u256(address: Address) u256 {

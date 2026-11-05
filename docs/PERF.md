@@ -457,11 +457,16 @@ the shared machine at load average ~35, so treat it as a ceiling:
 |---|---|---|
 | evm: snailtracer | 50 479 625 | before `uint.zig`: LLVM's generic u256 division |
 | evm: snailtracer | 27 078 208 | ~6.1 Ggas/s with Knuth division over 32-bit limbs |
+| evm: snailtracer | 21 813 084 | ~7.6 Ggas/s with 64-bit-limb MLOAD/MSTORE/PUSH loads |
 
 u256 division microbench (same machine): LLVM's lowering of `u256 / u256` costs ~500 ns
 (u64-sized divisor) and ~230 ns (wide divisor), against ~3 ns for a u256 multiply. DIV, MOD,
 SDIV, SMOD, ADDMOD, and MULMOD now go through `src/execution/evm/uint.zig` (Knuth D on 32-bit
 limbs, every step a hardware 64-bit divide), differentially fuzzed against the builtins.
+
+`std.mem.readInt(u256, .., .big)` lowered to 32 byte loads plus shifts; `word_from_be` /
+`word_to_be` (four byte-swapped 64-bit loads or stores) took MLOAD/MSTORE from ~26% to a
+minor share of snailtracer samples.
 
 revm comparison (revm ee9ab3f, `revme bench snailtracer -w 2 -m 6 -s 10`, back to back with
 ours at load average ~24): revm 31.3-45.8 ms per call (criterion intervals of two runs);
