@@ -96,18 +96,40 @@ pub const Receipt = struct {
     deposit_nonce: ?u64 = null,
     /// Deposits only, from Canyon (requires `deposit_nonce`).
     deposit_receipt_version: ?u64 = null,
+    /// EIP-8130 only (required): how many call phases committed, in order.
+    committed_phases: ?u64 = null,
+
+    pub const CommittedPhasesError = error{ ExceedsPhaseCount, StatusMismatch };
+
+    /// base/base: `committed_phases <= phase_count`, and status is success exactly when
+    /// every phase committed.
+    pub fn validate_committed_phases(
+        receipt: Receipt,
+        phase_count: u64,
+    ) CommittedPhasesError!void {
+        assert(receipt.tx_type == .eip8130);
+        const committed = receipt.committed_phases.?;
+        if (committed > phase_count) return error.ExceedsPhaseCount;
+        if (receipt.status != (committed == phase_count)) return error.StatusMismatch;
+    }
+
+    pub fn phase_committed(receipt: Receipt, index: u64) bool {
+        return index < (receipt.committed_phases orelse 0);
+    }
 
     fn payload_length(receipt: Receipt) usize {
         var total = 1 + rlp.int_length(receipt.cumulative_gas_used) +
             rlp.length(receipt.logs_bloom) + rlp.length(receipt.logs);
         if (receipt.deposit_nonce) |nonce| total += rlp.int_length(nonce);
         if (receipt.deposit_receipt_version) |version| total += rlp.int_length(version);
+        if (receipt.committed_phases) |phases| total += rlp.int_length(phases);
         return total;
     }
 
     fn assert_valid(receipt: Receipt) void {
         if (receipt.tx_type != .deposit) assert(receipt.deposit_nonce == null);
         if (receipt.deposit_receipt_version != null) assert(receipt.deposit_nonce != null);
+        assert((receipt.tx_type == .eip8130) == (receipt.committed_phases != null));
     }
 
     /// Length of the EIP-2718 encoding.
@@ -127,6 +149,7 @@ pub const Receipt = struct {
         rlp.encode(encoder, receipt.logs);
         if (receipt.deposit_nonce) |nonce| encoder.int(nonce);
         if (receipt.deposit_receipt_version) |version| encoder.int(version);
+        if (receipt.committed_phases) |phases| encoder.int(phases);
         assert(encoder.position - start == receipt.encoded_length());
     }
 
@@ -160,6 +183,7 @@ pub const Receipt = struct {
             receipt.deposit_nonce = try items.int(u64);
             if (!items.is_empty()) receipt.deposit_receipt_version = try items.int(u64);
         }
+        if (tx_type == .eip8130) receipt.committed_phases = try items.int(u64);
         try items.finish();
         receipt.assert_valid();
         return receipt;
@@ -241,7 +265,9 @@ test "receipt: seeded fuzz round trip with bloom" {
     var log_buffer: [2048]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var network: [4096]u8 = undefined;
-    const types = [_]TxType{ .legacy, .eip2930, .eip1559, .eip4844, .eip7702, .deposit };
+    const types = [_]TxType{
+        .legacy, .eip2930, .eip1559, .eip4844, .eip7702, .eip8130, .deposit,
+    };
     for (0..200) |_| {
         var topics_buffer: [4 * 33]u8 = undefined;
         var topics: [4]B256 = undefined;
@@ -266,6 +292,7 @@ test "receipt: seeded fuzz round trip with bloom" {
             receipt.deposit_nonce = prng.int(u64);
             if (prng.chance(1, 2)) receipt.deposit_receipt_version = 1;
         }
+        if (receipt.tx_type == .eip8130) receipt.committed_phases = prng.below(4);
         const encoded = receipt.encode_to(&buffer);
         const decoded = try Receipt.decode(encoded);
         try testing.expect(decoded.logs_bloom.eql(decoded.logs.bloom()));
@@ -288,4 +315,35 @@ fn fuzz_receipt(_: void, smith: *testing.Smith) anyerror!void {
 
 test "receipt: fuzz decode is canonical" {
     try testing.fuzz({}, fuzz_receipt, .{});
+}
+
+test "receipt: EIP-8130 committed phases" {
+    var buffer: [512]u8 = undefined;
+    const receipt: Receipt = .{
+        .tx_type = .eip8130,
+        .status = false,
+        .cumulative_gas_used = 21_000,
+        .committed_phases = 1,
+    };
+    const encoded = receipt.encode_to(&buffer);
+    try testing.expectEqual(@as(u8, 0x79), encoded[0]);
+    // committed_phases is the last list item.
+    try testing.expectEqual(@as(u8, 0x01), encoded[encoded.len - 1]);
+    const decoded = try Receipt.decode(encoded);
+    try testing.expectEqual(@as(?u64, 1), decoded.committed_phases);
+    try decoded.validate_committed_phases(2);
+    try testing.expect(decoded.phase_committed(0) and !decoded.phase_committed(1));
+    try testing.expectError(error.ExceedsPhaseCount, decoded.validate_committed_phases(0));
+    try testing.expectError(error.StatusMismatch, decoded.validate_committed_phases(1));
+    // The field is required for 0x79 receipts.
+    var short: [512]u8 = undefined;
+    var encoder = rlp.Encoder.init(&short);
+    encoder.raw(&.{0x79});
+    const payload_length = 1 + 3 + rlp.length(Bloom.zero) + 1;
+    encoder.list_header(payload_length);
+    encoder.boolean(true);
+    encoder.int(@as(u64, 21_000));
+    rlp.encode(&encoder, Bloom.zero);
+    encoder.list_header(0);
+    try testing.expectError(error.UnexpectedEnd, Receipt.decode(encoder.written()));
 }

@@ -8,7 +8,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `rlp`: zero-alloc encoder into caller buffer + streaming decoder over slices, length precompute, strict canonical decoding. Fuzz decode/encode round trip, ethereum RLP vectors.
 - [x] `consensus` tx types: legacy (EIP-155), 2930, 1559, 4844 (blob), 7702 (set code), OP deposit (0x7E). Signing hash, tx hash, encode/decode (network + EIP-2718), sender recovery (std fallback behind `Recoverer`).
 - [x] EIP-4844 pooled/network form with sidecar (blobs, commitments, proofs; EIP-7594 wrapper version), EIP-2718 pooled tx decoding for txpool/RPC.
-- [ ] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
+- [x] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
 - [x] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
 - [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
@@ -46,8 +46,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   waits on the crypto lane (only point evaluation exists); txpool must call it once it lands.
 - EIP-8130 (`consensus/eip8130*.zig`) mirrors base/base encoding, signing hashes (0x79 sender,
   0x7a payer, 0x7901 replay id), raw-k1 recovery (low s), static/timestamp/structural checks.
-  base/base ships no golden vectors; tests pin a hand-checked byte layout. `Envelope` wiring
-  is a separate step because other lanes switch exhaustively over it.
+  base/base ships no golden vectors; tests pin a hand-checked byte layout. `Envelope` and
+  `Receipt` (`committed_phases`) carry 0x79; span batches, txpool and the node executor reject
+  it (tiny edits in their lanes) until span-batch 8130 data and AA execution are ported.
 - `.cache/push.sh` reruns the full suite after a race only when the new upstream commits touch
   `src/common/` or build files; otherwise it compiles and tidies (disjoint merge).
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
@@ -63,3 +64,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: signatures now use crypto lane secp256k1 (ecrecover, constant-time sign).
 - 2026-11-05: pooled EIP-4844 network form (v0 sidecar, EIP-7594 v1 cell proofs), `PooledTx`.
 - 2026-11-05: EIP-8130 tx type (encode/decode, hashes, sender/payer recovery, validation).
+- 2026-11-05: 0x79 wired into `TxType`/`Envelope`/`Receipt`; other lanes reject it for now.

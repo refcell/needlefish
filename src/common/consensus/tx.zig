@@ -12,6 +12,7 @@ const primitives = @import("../primitives/root.zig");
 const rlp = @import("../rlp/root.zig");
 const fields = @import("tx_fields.zig");
 const signature_module = @import("signature.zig");
+pub const eip8130 = @import("eip8130.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const Encoder = rlp.Encoder;
@@ -29,6 +30,8 @@ pub const TxType = enum(u8) {
     eip1559 = 0x02,
     eip4844 = 0x03,
     eip7702 = 0x04,
+    /// Base account abstraction (Everest).
+    eip8130 = 0x79,
     deposit = 0x7e,
 };
 
@@ -262,6 +265,7 @@ pub const Envelope = union(TxType) {
     eip1559: Signed(Eip1559),
     eip4844: Signed(Eip4844),
     eip7702: Signed(Eip7702),
+    eip8130: eip8130.Signed,
     deposit: Deposit,
 
     pub fn tx_type(envelope: Envelope) TxType {
@@ -273,6 +277,7 @@ pub const Envelope = union(TxType) {
         return switch (envelope) {
             .legacy => |signed| rlp.list_length(legacy_payload_length(signed.tx, signed.signature)),
             .deposit => |tx| 1 + rlp.list_length(typed_payload_length(tx, null)),
+            .eip8130 => |signed| signed.encoded_length(),
             inline else => |signed| 1 + rlp.list_length(
                 typed_payload_length(signed.tx, signed.signature),
             ),
@@ -285,6 +290,7 @@ pub const Envelope = union(TxType) {
         switch (envelope) {
             .legacy => |signed| encode_legacy(encoder, signed.tx, signed.signature),
             .deposit => |tx| encode_typed(encoder, .deposit, tx, null),
+            .eip8130 => |signed| signed.encode(encoder),
             inline else => |signed| encode_typed(
                 encoder,
                 tx_type_of(@TypeOf(signed.tx)),
@@ -325,6 +331,7 @@ pub const Envelope = union(TxType) {
             .eip1559 => .{ .eip1559 = try decode_typed(Eip1559, payload) },
             .eip4844 => .{ .eip4844 = try decode_typed(Eip4844, payload) },
             .eip7702 => .{ .eip7702 = try decode_typed(Eip7702, payload) },
+            .eip8130 => .{ .eip8130 = try eip8130.Signed.decode_payload(payload) },
             .deposit => .{ .deposit = try rlp.decode_exact(Deposit, payload) },
         };
     }
@@ -353,6 +360,7 @@ pub const Envelope = union(TxType) {
         switch (envelope) {
             .legacy => |signed| encode_legacy(&encoder, signed.tx, null),
             .deposit => return null,
+            .eip8130 => |signed| return signed.tx.sender_signature_hash(),
             inline else => |signed| {
                 encode_typed(&encoder, tx_type_of(@TypeOf(signed.tx)), signed.tx, null);
             },
@@ -360,16 +368,21 @@ pub const Envelope = union(TxType) {
         return sink.final();
     }
 
+    /// The secp256k1 signature; null for deposits and EIP-8130 (auth blobs).
     pub fn signature(envelope: Envelope) ?Signature {
         return switch (envelope) {
-            .deposit => null,
+            .deposit, .eip8130 => null,
             inline else => |signed| signed.signature,
         };
     }
 
     /// The sender. Rejects high-s signatures (EIP-2). Deposits report `from`.
     pub fn recover_sender(envelope: Envelope, recoverer: Recoverer) ?Address {
-        if (envelope == .deposit) return envelope.deposit.from;
+        switch (envelope) {
+            .deposit => |tx| return tx.from,
+            .eip8130 => |signed| return signed.recover_sender(recoverer),
+            else => {},
+        }
         const sig = envelope.signature().?;
         if (!sig.is_low_s()) return null;
         return recoverer(envelope.signing_hash().?, sig);
@@ -386,6 +399,7 @@ pub const Envelope = union(TxType) {
     pub fn nonce(envelope: Envelope) ?u64 {
         return switch (envelope) {
             .deposit => null,
+            .eip8130 => |signed| signed.tx.nonce_sequence,
             inline else => |signed| signed.tx.nonce,
         };
     }
@@ -400,6 +414,7 @@ pub const Envelope = union(TxType) {
     pub fn value(envelope: Envelope) u256 {
         return switch (envelope) {
             .deposit => |tx| tx.value,
+            .eip8130 => 0,
             inline else => |signed| signed.tx.value,
         };
     }
@@ -407,6 +422,7 @@ pub const Envelope = union(TxType) {
     pub fn input(envelope: Envelope) []const u8 {
         return switch (envelope) {
             .deposit => |tx| tx.input,
+            .eip8130 => &.{},
             inline else => |signed| signed.tx.input,
         };
     }
@@ -416,13 +432,15 @@ pub const Envelope = union(TxType) {
             .deposit => |tx| tx.to,
             .eip4844 => |signed| .{ .call = signed.tx.to },
             .eip7702 => |signed| .{ .call = signed.tx.to },
+            // As base/base: calls live in phases; the top-level kind is a call to zero.
+            .eip8130 => .{ .call = Address.zero },
             inline else => |signed| signed.tx.to,
         };
     }
 
     pub fn access_list(envelope: Envelope) AccessList {
         return switch (envelope) {
-            .legacy, .deposit => AccessList.empty,
+            .legacy, .deposit, .eip8130 => AccessList.empty,
             inline else => |signed| signed.tx.access_list,
         };
     }
@@ -478,7 +496,7 @@ pub fn sign(
     var envelope = @unionInit(Envelope, @tagName(tx_type_of(T)), .{ .tx = tx, .signature = zero });
     const sig = try signature_module.sign(private_key, envelope.signing_hash().?);
     switch (envelope) {
-        .deposit => unreachable,
+        .deposit, .eip8130 => unreachable, // tx_type_of rejects both at comptime.
         inline else => |*signed| signed.signature = sig,
     }
     return envelope;

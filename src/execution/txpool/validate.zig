@@ -147,7 +147,8 @@ fn check_type(
     timestamp: u64,
 ) ValidateError!void {
     switch (envelope) {
-        .deposit => return error.TxTypeNotSupported,
+        // EIP-8130 needs AA execution and Everest gating; not supported yet.
+        .deposit, .eip8130 => return error.TxTypeNotSupported,
         .eip4844 => if (spec.blob_params_at(timestamp) == null) return error.TxTypeNotSupported,
         .eip7702 => |signed| {
             if (!spec.is_ethereum_fork_active(.prague, timestamp)) return error.TxTypeNotSupported;

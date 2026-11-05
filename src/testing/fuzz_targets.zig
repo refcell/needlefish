@@ -97,7 +97,8 @@ fn check_tx_canonical(encoded: []const u8) !void {
 /// Iterators trust validation done at decode time (`catch unreachable`): walk them all.
 fn check_tx_lists(envelope: Envelope) !void {
     const access_list: tx_module.AccessList = switch (envelope) {
-        .legacy, .deposit => return,
+        // EIP-8130 nested lists are walked by `consensus/eip8130_test.zig` fuzzing.
+        .legacy, .deposit, .eip8130 => return,
         inline else => |signed| signed.tx.access_list,
     };
     var addresses: u32 = 0;

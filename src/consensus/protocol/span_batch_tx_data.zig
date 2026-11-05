@@ -251,7 +251,9 @@ pub const TxData = union(enum) {
             } },
             // Base has no blob transactions: its envelope decoder rejects type 0x03.
             .eip4844 => return error.InvalidTransactionData,
-            .deposit => return error.InvalidTransactionType,
+            // EIP-8130 span batch data (base/base `SpanBatchEip8130TransactionData`) is
+            // not ported yet.
+            .deposit, .eip8130 => return error.InvalidTransactionType,
         };
         assert(tx_data.tx_type() == @backingInt(envelope.tx_type()));
         return tx_data;

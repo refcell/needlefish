@@ -214,7 +214,8 @@ pub const Executor = struct {
         blob_gas_used: u64,
     ) Error!Applied {
         const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
-        if (envelope == .deposit) return error.TxTypeNotSupported;
+        // The evm has no EIP-8130 (AA) execution yet.
+        if (envelope == .deposit or envelope == .eip8130) return error.TxTypeNotSupported;
         const tx = try executor.tx_env(envelope);
         if (gas_used + tx.gas_limit > block.gas_limit) return error.BlockGasExceeded;
         const blob_gas = @as(u64, tx.blob_hashes.len) * gas_per_blob;

@@ -277,3 +277,27 @@ fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
 test "eip8130: fuzz decode" {
     try testing.fuzz({}, fuzz_decode, .{});
 }
+
+test "eip8130: envelope integration" {
+    const Envelope = @import("tx.zig").Envelope;
+    const rlp = @import("../rlp/root.zig");
+    const tx: TxEip8130 = .{ .chain_id = 8453, .nonce_sequence = 3, .gas_limit = 50_000 };
+    const auth = try eip8130.sign_sender(tx, key_0);
+    const envelope: Envelope = .{ .eip8130 = .{ .tx = tx, .sender_auth = &auth } };
+    var buffer: [512]u8 = undefined;
+    const encoded = envelope.encode_to(&buffer);
+    const decoded = try Envelope.decode(encoded);
+    try testing.expect(decoded == .eip8130);
+    try testing.expect(decoded.hash().eql(envelope.eip8130.hash()));
+    try testing.expect(decoded.recover_sender(signature.recover_address).?.eql(address_0));
+    try testing.expectEqual(@as(?u64, 3), decoded.nonce());
+    try testing.expectEqual(@as(?u64, 8453), decoded.chain_id());
+    try testing.expect(decoded.signature() == null);
+    try testing.expect(decoded.signing_hash().?.eql(tx.sender_signature_hash()));
+    var network: [512]u8 = undefined;
+    var encoder = rlp.Encoder.init(&network);
+    envelope.encode_network(&encoder);
+    var decoder = rlp.Decoder.init(encoder.written());
+    const again = try Envelope.decode_network(&decoder);
+    try testing.expect(again.hash().eql(envelope.hash()));
+}
