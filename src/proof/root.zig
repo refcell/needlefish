@@ -4,6 +4,7 @@
 const std = @import("std");
 
 pub const preimage = @import("preimage/root.zig");
+pub const mpt = @import("mpt/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

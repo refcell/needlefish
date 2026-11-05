@@ -7,6 +7,7 @@ pub const key = @import("key.zig");
 pub const channel = @import("channel.zig");
 pub const oracle = @import("oracle.zig");
 pub const hint = @import("hint.zig");
+pub const in_process = @import("in_process.zig");
 
 pub const Key = key.Key;
 pub const KeyType = key.KeyType;
@@ -21,6 +22,7 @@ pub const HintWriter = hint.HintWriter;
 pub const HintReader = hint.HintReader;
 pub const Router = hint.Router;
 pub const Hint = hint.Hint;
+pub const InProcess = in_process.InProcess;
 
 test {
     std.testing.refAllDecls(@This());

@@ -19,7 +19,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   sha256, blob, precompile), hint encoding, oracle/hint reader-writer over a bidirectional
   channel (port `key.rs`, `hint.rs`, `oracle.rs`, `native_channel.rs`). In-memory pipe
   channel for tests; seeded + `std.testing.fuzz` round trips of keys and frames.
-- [ ] `proof/mpt`: oracle-backed trie node (blinded/leaf/extension/branch), lazy open,
+- [x] `proof/mpt`: oracle-backed trie node (blinded/leaf/extension/branch), lazy open,
   get/insert/delete with root recomputation, list walker for tx/receipt tries (port
   `node.rs`, `list_walker.rs`). Differential test against `src/execution/trie` roots;
   fuzz insert/delete sequences.
@@ -57,6 +57,15 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   rejected; the hint host still acknowledges so the client never deadlocks.
 - Generic `<type> 0x<hex>` hint text parse/encode lives in `preimage/hint.zig`; the typed
   `HintType` enum lands with `proof/program`.
+- `proof/mpt` does not port the Rust `TrieNode` tree: `execution/trie/sparse.zig`
+  (`SparseTrie`) already is a lazily-opened, blinded-subtrie trie with exact root
+  recomputation. `proof/mpt` adds `OracleResolver` (keccak preimages via the oracle,
+  hash-verified, cached in a fixed arena), a lenient generic node decoder, and the list
+  walker. The walker decodes each leaf key back to its index (canonical, unique,
+  contiguous `0..n`) instead of relying on DFS order plus the Rust index-0 swap.
 
 ## Log
+- 2026-11-05: `proof/mpt` landed (oracle resolver, node decode, list walker, differential
+  tests vs `execution/trie`). The differential fuzz found a `SparseTrie` crash (branch
+  collapsing into a witness extension with an unloaded child); fixed in `sparse.zig`.
 - 2026-11-05: `proof/preimage` landed (key, channel/duplex, oracle, hint + fuzz).
