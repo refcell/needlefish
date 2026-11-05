@@ -20,6 +20,7 @@ pub const trusted_proxy = @import("trusted_proxy/root.zig");
 pub const balance_monitor = @import("balance_monitor/root.zig");
 pub const l1_head = @import("l1_head/root.zig");
 pub const upgrade_signal = @import("upgrade_signal/root.zig");
+pub const lazy_alloc = @import("lazy_alloc/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

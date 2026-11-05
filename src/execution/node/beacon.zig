@@ -9,6 +9,7 @@
 //! proofs are zero: nothing on a dev chain verifies them.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const rlp = @import("../../common/rlp/root.zig");
 const json = @import("../../utilities/json/root.zig");
@@ -50,7 +51,7 @@ pub const Beacon = struct {
             .bytes_max = config.bytes_max,
         });
         errdefer store.deinit(allocator);
-        const pending = try allocator.alloc(u8, entry_size * blobs_per_block_max);
+        const pending = try lazy.alloc(allocator, u8, entry_size * blobs_per_block_max);
         return .{
             .genesis_time = genesis_time,
             .seconds_per_slot = seconds_per_slot,
@@ -60,7 +61,7 @@ pub const Beacon = struct {
     }
 
     pub fn deinit(beacon: *Beacon, allocator: std.mem.Allocator) void {
-        allocator.free(beacon.pending);
+        lazy.free(allocator, beacon.pending);
         beacon.store.deinit(allocator);
         beacon.* = undefined;
     }

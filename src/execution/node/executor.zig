@@ -10,6 +10,7 @@
 //! Memory: one scratch arena sized at init and reset per block; no other allocation.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const evm = @import("../evm/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
@@ -121,8 +122,8 @@ pub const Executor = struct {
         machine.* = try evm.Evm.init(allocator, evm_config, state);
         errdefer machine.deinit(allocator);
         assert(config.recovery_threads <= senders_module.threads_max);
-        const scratch = try allocator.alloc(u8, config.scratch_bytes);
-        errdefer allocator.free(scratch);
+        const scratch = try lazy.alloc(allocator, u8, config.scratch_bytes);
+        errdefer lazy.free(allocator, scratch);
         const senders = try allocator.alloc(?primitives.Address, config.transactions_max);
         return .{
             .spec = spec,
@@ -140,7 +141,7 @@ pub const Executor = struct {
 
     pub fn deinit(executor: *Executor, allocator: std.mem.Allocator) void {
         allocator.free(executor.senders);
-        allocator.free(executor.scratch);
+        lazy.free(allocator, executor.scratch);
         executor.machine.deinit(allocator);
         allocator.destroy(executor.machine);
         executor.state.deinit(allocator);

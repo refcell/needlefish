@@ -7,6 +7,7 @@
 //! [request...]])` with transactions and receipts as EIP-2718 byte strings.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
@@ -178,14 +179,14 @@ pub const Chain = struct {
         }
         var store = try block_store.BlockStore.init(allocator, config.store);
         errdefer store.deinit(allocator);
-        const staging = try allocator.alloc(u8, config.staging_bytes);
-        errdefer allocator.free(staging);
+        const staging = try lazy.alloc(allocator, u8, config.staging_bytes);
+        errdefer lazy.free(allocator, staging);
         const select_buffer = try allocator.alloc(*const txpool.Tx, config.select_max);
         errdefer allocator.free(select_buffer);
         const transactions_buffer = try allocator.alloc([]const u8, executor.transactions_max);
         errdefer allocator.free(transactions_buffer);
-        const build_bytes = try allocator.alloc(u8, config.build_bytes);
-        errdefer allocator.free(build_bytes);
+        const build_bytes = try lazy.alloc(allocator, u8, config.build_bytes);
+        errdefer lazy.free(allocator, build_bytes);
         assert(config.tx_index_max > 0);
         var tx_index: std.AutoHashMapUnmanaged(Hash, TxLocation) = .empty;
         try tx_index.ensureTotalCapacity(allocator, config.tx_index_max);
@@ -221,10 +222,10 @@ pub const Chain = struct {
     pub fn deinit(chain: *Chain, allocator: std.mem.Allocator) void {
         allocator.free(chain.tx_ring);
         chain.tx_index.deinit(allocator);
-        allocator.free(chain.build_bytes);
+        lazy.free(allocator, chain.build_bytes);
         allocator.free(chain.transactions_buffer);
         allocator.free(chain.select_buffer);
-        allocator.free(chain.staging);
+        lazy.free(allocator, chain.staging);
         chain.store.deinit(allocator);
         chain.* = undefined;
     }

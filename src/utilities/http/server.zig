@@ -14,6 +14,7 @@
 //! timers, so nothing is left in flight after `stop`.
 
 const std = @import("std");
+const lazy_alloc = @import("../lazy_alloc/root.zig");
 const assert = std.debug.assert;
 
 const io_common = @import("../io/common.zig");
@@ -186,8 +187,8 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
             assert(options.recv_buffer_size >= limits.head_size_max + limits.body_size_max);
             const per_connection = options.recv_buffer_size + options.send_buffer_size;
             const memory_size = @as(usize, per_connection) * options.connections_max;
-            const memory = try allocator.alloc(u8, memory_size);
-            errdefer allocator.free(memory);
+            const memory = try lazy_alloc.alloc(allocator, u8, memory_size);
+            errdefer lazy_alloc.free(allocator, memory);
             const connections = try allocator.alloc(Connection, options.connections_max);
             for (connections, 0..) |*connection, index| {
                 const base = memory[index * per_connection ..][0..per_connection];
@@ -214,7 +215,7 @@ pub fn Server(comptime IO: type, comptime Context: type, comptime handler: Handl
         pub fn deinit(server: *Self) void {
             assert(server.connections.len > 0);
             server.allocator.free(server.connections);
-            server.allocator.free(server.memory);
+            lazy_alloc.free(server.allocator, server.memory);
             server.* = undefined;
         }
 

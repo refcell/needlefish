@@ -12,6 +12,7 @@
 //! block, and are not undoable.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const evm = @import("../evm/root.zig");
 const state_trie = @import("../trie/state_trie.zig");
@@ -101,8 +102,8 @@ pub const StateDb = struct {
             .code_bytes_max = config.block_code_bytes_max,
         });
         errdefer changeset.deinit(allocator);
-        const undo_bytes = try allocator.alloc(u8, config.undo_bytes_max);
-        errdefer allocator.free(undo_bytes);
+        const undo_bytes = try lazy.alloc(allocator, u8, config.undo_bytes_max);
+        errdefer lazy.free(allocator, undo_bytes);
         const undo_records = try allocator.alloc(UndoRecord, config.undo_blocks_max);
         return .{
             .state = state,
@@ -116,7 +117,7 @@ pub const StateDb = struct {
 
     pub fn deinit(db: *StateDb, allocator: std.mem.Allocator) void {
         allocator.free(db.undo_records);
-        allocator.free(db.undo_bytes);
+        lazy.free(allocator, db.undo_bytes);
         db.changeset.deinit(allocator);
         db.overlay.deinit(allocator);
         if (db.owns_state) {

@@ -4,6 +4,7 @@
 //! so memory is fixed at init. Persistent storage replaces this with the db lane.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 
 const Hash = [32]u8;
@@ -48,8 +49,8 @@ pub const BlockStore = struct {
         var by_hash: std.AutoHashMapUnmanaged(Hash, u64) = .empty;
         try by_hash.ensureTotalCapacity(allocator, config.blocks_max);
         errdefer by_hash.deinit(allocator);
-        const bytes = try allocator.alloc(u8, @intCast(config.bytes_max));
-        errdefer allocator.free(bytes);
+        const bytes = try lazy.alloc(allocator, u8, @intCast(config.bytes_max));
+        errdefer lazy.free(allocator, bytes);
         const canonical = try allocator.alloc(Hash, config.blocks_max);
         errdefer allocator.free(canonical);
         const canonical_numbers = try allocator.alloc(?u64, config.blocks_max);
@@ -66,7 +67,7 @@ pub const BlockStore = struct {
     pub fn deinit(store: *BlockStore, allocator: std.mem.Allocator) void {
         allocator.free(store.canonical_numbers);
         allocator.free(store.canonical);
-        allocator.free(store.bytes);
+        lazy.free(allocator, store.bytes);
         store.by_hash.deinit(allocator);
         allocator.free(store.entries);
         store.* = undefined;

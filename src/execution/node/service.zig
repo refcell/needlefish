@@ -7,6 +7,7 @@
 //! path a consensus client uses, then immediately made head, safe and finalized.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const genesis_types = @import("../../common/genesis/root.zig");
@@ -49,8 +50,8 @@ const KzgMemory = struct {
     cells: kzg_cells.Cells,
 
     fn create(allocator: std.mem.Allocator) !*KzgMemory {
-        const memory = try allocator.create(KzgMemory);
-        errdefer allocator.destroy(memory);
+        const memory = try lazy.create(allocator, KzgMemory);
+        errdefer lazy.destroy(allocator, memory);
         memory.settings = try kzg_blob.Settings.init(&memory.storage);
         memory.batch = .{};
         memory.cell_settings = try kzg_cells.Settings.init_verifier(&memory.cell_storage);
@@ -388,14 +389,14 @@ pub fn Service(comptime IO: type) type {
                 .spec = &service.spec,
                 .chain = &service.chain,
                 .pool = &service.pool,
-                .scratch = try allocator.alloc(u8, limits.rpc_scratch_bytes),
+                .scratch = try lazy.alloc(allocator, u8, limits.rpc_scratch_bytes),
             };
-            errdefer allocator.free(service.api.scratch);
+            errdefer lazy.free(allocator, service.api.scratch);
             if (service.options.verify_blob_proofs and service.spec.mode == .l1) {
                 service.kzg = try KzgMemory.create(allocator);
                 service.api.kzg = service.kzg.?.verifier();
             }
-            errdefer if (service.kzg) |memory| allocator.destroy(memory);
+            errdefer if (service.kzg) |memory| lazy.destroy(allocator, memory);
             try service.http_server.init(allocator, service.io, service, limits.http);
             errdefer service.http_server.deinit();
             try service.init_authrpc();
@@ -437,8 +438,8 @@ pub fn Service(comptime IO: type) type {
             if (service.beacon) |*beacon| beacon.deinit(service.allocator);
             service.deinit_authrpc();
             service.http_server.deinit();
-            service.allocator.free(service.api.scratch);
-            if (service.kzg) |memory| service.allocator.destroy(memory);
+            lazy.free(service.allocator, service.api.scratch);
+            if (service.kzg) |memory| lazy.destroy(service.allocator, memory);
             service.deinit_state();
             service.* = undefined;
         }

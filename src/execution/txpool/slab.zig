@@ -3,6 +3,7 @@
 //! smallest class that fits it, so a 120 byte transfer does not pin a 1 MiB blob slot.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 
 pub const Class = struct {
@@ -52,7 +53,8 @@ pub const Slab = struct {
             previous = class.size_bytes;
             slab.sizes[i] = class.size_bytes;
             slab.counts[i] = class.count;
-            slab.memory[i] = try allocator.alloc(u8, @as(usize, class.size_bytes) * class.count);
+            const size_bytes = @as(usize, class.size_bytes) * class.count;
+            slab.memory[i] = try lazy.alloc(allocator, u8, size_bytes);
             slab.free[i] = try allocator.alloc(u32, class.count);
             for (slab.free[i], 0..) |*slot, j| slot.* = class.count - 1 - @as(u32, @intCast(j));
             slab.free_len[i] = class.count;
@@ -62,7 +64,7 @@ pub const Slab = struct {
 
     pub fn deinit(slab: *Slab, allocator: std.mem.Allocator) void {
         for (0..slab.class_count) |i| {
-            if (slab.memory[i].len > 0) allocator.free(slab.memory[i]);
+            if (slab.memory[i].len > 0) lazy.free(allocator, slab.memory[i]);
             if (slab.free[i].len > 0) allocator.free(slab.free[i]);
         }
         slab.* = undefined;

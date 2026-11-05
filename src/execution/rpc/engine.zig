@@ -3,6 +3,7 @@
 //! consensus clients query the execution client through the engine endpoint.
 
 const std = @import("std");
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const json = @import("../../utilities/json/root.zig");
@@ -44,8 +45,8 @@ pub const EngineApi = struct {
         limits: Limits,
     ) !EngineApi {
         assert(limits.transactions_max > 0);
-        const bytes = try allocator.alloc(u8, limits.bytes);
-        errdefer allocator.free(bytes);
+        const bytes = try lazy.alloc(allocator, u8, limits.bytes);
+        errdefer lazy.free(allocator, bytes);
         const transactions = try allocator.alloc([]const u8, limits.transactions_max);
         errdefer allocator.free(transactions);
         const withdrawals = try allocator.alloc(payload.Withdrawal, limits.withdrawals_max);
@@ -69,7 +70,7 @@ pub const EngineApi = struct {
         allocator.free(api.space.hashes);
         allocator.free(api.space.withdrawals);
         allocator.free(api.space.transactions);
-        allocator.free(api.space.bytes);
+        lazy.free(allocator, api.space.bytes);
         api.* = undefined;
     }
 };
