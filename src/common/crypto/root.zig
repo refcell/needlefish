@@ -9,6 +9,7 @@ pub const keccak256 = keccak.keccak256;
 pub const sha256 = @import("sha256.zig");
 pub const ripemd160 = @import("ripemd160.zig");
 pub const blake2f = @import("blake2f.zig");
+pub const secp256k1 = @import("secp256k1/root.zig");
 pub const bench = @import("bench.zig");
 pub const montgomery = @import("montgomery.zig");
 pub const kzg = @import("kzg/root.zig");

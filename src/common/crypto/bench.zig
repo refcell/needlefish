@@ -6,6 +6,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const keccak = @import("keccak.zig");
+const secp256k1 = @import("secp256k1/root.zig");
 const montgomery = @import("montgomery.zig");
 const modexp = @import("modexp.zig");
 const p256 = @import("p256.zig");
@@ -279,6 +280,96 @@ fn bench_p256_verify_std(iterations: u32) u64 {
     return accumulator;
 }
 
+/// Public dev mnemonic account 0 key: deterministic, publicly known.
+const bench_private_key: [32]u8 = .{
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94,
+    0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+};
+
+fn bench_ecrecover(iterations: u32) u64 {
+    var hash: [32]u8 = @splat(0x42);
+    var accumulator: u64 = 0;
+    // Distinct hashes per signature so no work is shared between iterations.
+    const signature = secp256k1.sign(bench_private_key, hash) catch unreachable;
+    for (0..iterations) |index| {
+        hash[0] = @truncate(index);
+        const recovered = secp256k1.ecrecover_address(
+            hash,
+            @truncate(signature.recovery_id),
+            signature.r,
+            signature.s,
+        );
+        accumulator +%= if (recovered) |address| address[0] else 1;
+    }
+    return accumulator;
+}
+
+fn bench_sign(iterations: u32) u64 {
+    var hash: [32]u8 = @splat(0x24);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const signature = secp256k1.sign(bench_private_key, hash) catch unreachable;
+        hash[0] = signature.s[0];
+        accumulator +%= signature.r[31];
+    }
+    return accumulator;
+}
+
+fn bench_public_key(iterations: u32) u64 {
+    var private_key = bench_private_key;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const public = secp256k1.public_key(private_key) catch unreachable;
+        private_key[31] = public[63] | 1;
+        accumulator +%= public[0];
+    }
+    return accumulator;
+}
+
+const StdEcdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+
+fn bench_public_key_std(iterations: u32) u64 {
+    var private_key = bench_private_key;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const public = std.crypto.ecc.Secp256k1.basePoint.mul(private_key, .big) catch unreachable;
+        const encoded = public.toUncompressedSec1();
+        private_key[31] = encoded[64] | 1;
+        accumulator +%= encoded[1];
+    }
+    return accumulator;
+}
+
+fn bench_sign_std(iterations: u32) u64 {
+    const key_pair = StdEcdsa.KeyPair.fromSecretKey(
+        StdEcdsa.SecretKey.fromBytes(bench_private_key) catch unreachable,
+    ) catch unreachable;
+    var hash: [32]u8 = @splat(0x24);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const signature = key_pair.signPrehashed(hash, null) catch unreachable;
+        hash[0] = signature.s[0];
+        accumulator +%= signature.r[31];
+    }
+    return accumulator;
+}
+
+/// std has no public key recovery; ECDSA verification (u1 G + u2 Q plus checks)
+/// is the closest equivalent workload.
+fn bench_verify_std(iterations: u32) u64 {
+    const key_pair = StdEcdsa.KeyPair.fromSecretKey(
+        StdEcdsa.SecretKey.fromBytes(bench_private_key) catch unreachable,
+    ) catch unreachable;
+    const hash: [32]u8 = @splat(0x42);
+    const signature = key_pair.signPrehashed(hash, null) catch unreachable;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        signature.verifyPrehashed(hash, key_pair.public_key) catch unreachable;
+        accumulator +%= 1;
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
@@ -304,6 +395,12 @@ pub const cases = [_]Case{
     .{ .name = "ripemd160/4KiB", .iterations = 50_000, .run = bench_ripemd160_4k },
     .{ .name = "blake2f/12 rounds", .iterations = 1_000_000, .run = bench_blake2f_12 },
     .{ .name = "blake2b/128B (std)", .iterations = 1_000_000, .run = bench_blake2b_128_std },
+    .{ .name = "secp256k1/ecrecover", .iterations = 20_000, .run = bench_ecrecover },
+    .{ .name = "secp256k1/verify (std)", .iterations = 5_000, .run = bench_verify_std },
+    .{ .name = "secp256k1/sign", .iterations = 20_000, .run = bench_sign },
+    .{ .name = "secp256k1/sign (std)", .iterations = 5_000, .run = bench_sign_std },
+    .{ .name = "secp256k1/public_key", .iterations = 20_000, .run = bench_public_key },
+    .{ .name = "secp256k1/public_key (std)", .iterations = 5_000, .run = bench_public_key_std },
 };
 
 /// Runs every case whose name contains `filter` (all when null).
