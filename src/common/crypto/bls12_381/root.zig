@@ -16,6 +16,7 @@ pub const G1 = g1.G1;
 pub const G1Affine = g1.Affine;
 pub const G2 = g2.G2;
 pub const G2Affine = g2.Affine;
+pub const pairing = @import("pairing.zig");
 
 test {
     std.testing.refAllDecls(@This());
