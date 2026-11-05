@@ -22,6 +22,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
 - [x] Compact node layout (packed paths, per-kind body, cached refs out of line).
+- [ ] Historical proofs store (base/base `crates/execution/trie`, `BaseProofsStore`): per-block
+  versioned account/storage leaves + trie node preimages for a retention window, so
+  `eth_getProof` works at any block in the fault-proof window without re-execution.
+- [ ] Window pruner: bounded work per tick, removes history older than the window; crash-safe
+  through the storage engine journal.
+- [ ] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
+  block, verified by re-executing statelessly against a sparse trie built from the witness.
+- [ ] Differential tests: historical proof at block N == proof from a State unwound to N;
+  witness-only re-execution root == stored root (base/base `witness_differential`).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
