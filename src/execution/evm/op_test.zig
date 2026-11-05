@@ -657,6 +657,8 @@ fn token_setup(h: *Harness) !void {
     try h.database.put_storage(token_address, role_slot(0, sender_address), 1);
     try h.database.put_storage(token_address, b20.root + 8, 1);
     try h.database.put_storage(token_address, role_slot(b20.role_mint, sender_address), 1);
+    try h.database.put_storage(token_address, role_slot(b20.role_seize, sender_address), 1);
+    try h.database.put_storage(token_address, b20.root + 14, policy.always_block_id);
     try h.database.put_account(stablecoin_address, 0, 0, &native.marker_code);
     try h.database.put_storage(stablecoin_address, b20.slot_supply_cap, 1_000_000);
     try h.database.put_storage(stablecoin_address, role_slot(b20.role_mint, sender_address), 1);
@@ -820,6 +822,7 @@ fn fuzz_token(h: *Harness, smith: *testing.Smith) anyerror!void {
     const floor = 21_000 + calldata_gas(input) * 10 / 4;
     const gas_limit = floor + prng.below(120_000);
     const value: u256 = if (prng.chance(1, 16)) 1 else 0;
+    h.evm.block.op.?.upgrade = if (prng.chance(1, 2)) .beryl else .cobalt;
     const token = if (prng.chance(1, 2)) token_address else stablecoin_address;
     const executed = try native_call_gas(h, token, input, value, gas_limit);
     try testing.expect(executed.gas_used <= gas_limit);
@@ -1059,4 +1062,72 @@ test "op: B-20 factory creates stablecoins with a currency and fixed decimals" {
     input = b20_asset.selector_of(.multiplier);
     const asset_only = try native_call(&h, token, &input, 0);
     try testing.expectEqualSlices(u8, &input, asset_only.output);
+}
+
+test "op: B-20 V2 gates selectors by fork and seizes from non-exempt accounts" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    const early = try token_call(&h, .seize_role, &.{});
+    try testing.expectEqualSlices(u8, &b20_asset.selector_of(.seize_role), early.output);
+    h.evm.block.op.?.upgrade = .cobalt;
+    try testing.expectEqual(b20.role_seize, output_int(try token_call(&h, .seize_role, &.{})));
+    const max = output_int(try token_call(&h, .max_ui_multiplier, &.{}));
+    try testing.expectEqual(@as(u256, std.math.maxInt(u128)), max);
+    const erc165: u256 = 0x01ffc9a7 << 224;
+    const supported = try token_call(&h, .supports_interface, &.{erc165});
+    try testing.expectEqual(@as(u256, 1), output_int(supported));
+    const unpadded = try token_call(&h, .supports_interface, &.{erc165 | 1});
+    try testing.expect(unpadded.status == .revert);
+
+    _ = try token_call(&h, .mint, &.{ address_int(holder), 600 });
+    const memo: u256 = 0x6d656d6f;
+    const seized = try token_call(&h, .seize_with_memo, &.{
+        address_int(holder), address_int(sender_address), 100, memo,
+    });
+    try testing.expect(seized.status == .success);
+    try testing.expectEqual(@as(usize, 3), seized.logs.len);
+    const left = output_int(try token_call(&h, .balance_of, &.{address_int(holder)}));
+    try testing.expectEqual(@as(u256, 500), left);
+    const same = try token_call(&h, .seize_with_memo, &.{
+        address_int(holder), address_int(holder), 1, memo,
+    });
+    try testing.expect(same.status == .revert);
+    try testing.expectEqualSlices(u8, &b20.error_invalid_receiver, same.output[0..4]);
+}
+
+test "op: B-20 V2 schedules, matures, and cancels UI multiplier updates" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op.?.upgrade = .cobalt;
+    h.evm.block.timestamp = 1000;
+    const operator = role_slot(b20_asset.role_operator, sender_address);
+    try h.database.put_storage(token_address, operator, 1);
+    h.state.reset(h.database.interface());
+    const wad = b20_asset.wad;
+    const past = try token_call(&h, .update_ui_multiplier, &.{ 2 * wad, 1000 });
+    try testing.expect(past.status == .revert);
+    const scheduled = try token_call(&h, .update_ui_multiplier, &.{ 2 * wad, 2000 });
+    try testing.expect(scheduled.status == .success);
+    try testing.expectEqual(wad, output_int(try token_call(&h, .ui_multiplier, &.{})));
+    try testing.expectEqual(2 * wad, output_int(try token_call(&h, .new_ui_multiplier, &.{})));
+    try testing.expectEqual(@as(u256, 2000), output_int(try token_call(&h, .effective_at, &.{})));
+    const again = try token_call(&h, .update_ui_multiplier, &.{ 3 * wad, 3000 });
+    try testing.expect(again.status == .revert);
+    const cancelled = try token_call(&h, .cancel_ui_multiplier_update, &.{});
+    try testing.expectEqual(@as(usize, 1), cancelled.logs.len);
+    try testing.expectEqual(@as(u256, 0), output_int(try token_call(&h, .effective_at, &.{})));
+
+    _ = try token_call(&h, .update_ui_multiplier, &.{ 2 * wad, 2000 });
+    h.evm.block.timestamp = 2000;
+    try testing.expectEqual(2 * wad, output_int(try token_call(&h, .ui_multiplier, &.{})));
+    const scaled = output_int(try token_call(&h, .to_ui_amount, &.{10}));
+    try testing.expectEqual(@as(u256, 20), scaled);
+    const late = try token_call(&h, .cancel_ui_multiplier_update, &.{});
+    try testing.expect(late.status == .revert);
+    const set = try token_call(&h, .update_multiplier, &.{3 * wad});
+    try testing.expectEqual(@as(usize, 2), set.logs.len);
+    try testing.expectEqual(3 * wad, output_int(try token_call(&h, .multiplier, &.{})));
+    try testing.expectEqual(@as(u256, 0), output_int(try token_call(&h, .effective_at, &.{})));
 }

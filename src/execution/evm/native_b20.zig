@@ -110,7 +110,8 @@ pub const PolicyScope = enum {
     }
 };
 
-pub const PausableFeature = enum(u8) { transfer = 0, mint = 1, burn = 2 };
+/// SEIZE exists from V2 (Cobalt).
+pub const PausableFeature = enum(u8) { transfer = 0, mint = 1, burn = 2, seize = 3 };
 
 pub const error_unauthorized_account = [4]u8{ 0xe2, 0x51, 0x7d, 0x3f };
 pub const error_contract_paused = [4]u8{ 0xfd, 0x8c, 0x42, 0x45 };
@@ -122,6 +123,7 @@ pub const error_invalid_approver = [4]u8{ 0x8b, 0xc1, 0x46, 0xc4 };
 pub const error_invalid_spender = [4]u8{ 0x4e, 0x15, 0xef, 0xda };
 pub const error_policy_forbids = [4]u8{ 0xa4, 0x3f, 0xec, 0x12 };
 pub const error_account_not_blocked = [4]u8{ 0x64, 0xa5, 0xcb, 0x46 };
+pub const error_account_not_seizable = [4]u8{ 0x91, 0xdb, 0xbc, 0x8d };
 
 pub const event_transfer: B256 = primitives.hex_to_b256(
     "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
@@ -252,6 +254,31 @@ pub fn ensure_policy(context: *Context, scope: PolicyScope, account: Address) Er
     return revert_words(context, error_policy_forbids, &.{ word(scope.id()), word(id) });
 }
 
+/// seizeWithMemo: the account must fail the seize-exempt policy.
+pub fn ensure_seizable(context: *Context, account: Address) Error!void {
+    const id = try policy_id(context, .seize_exempt);
+    if (!try policy.is_authorized(context, id, account)) return;
+    return context.revert_word(error_account_not_seizable, address_word(account));
+}
+
+/// Authorization against an already-read policy id.
+fn ensure_policy_id(context: *Context, scope: PolicyScope, id: u64, account: Address) Error!void {
+    if (try policy.is_authorized(context, id, account)) return;
+    return revert_words(context, error_policy_forbids, &.{ word(scope.id()), word(id) });
+}
+
+pub const TransferPolicies = struct { sender: u64, receiver: u64, executor: u64 };
+
+/// V2: the three transfer policy ids from one read of the packed slot.
+pub fn transfer_policies(context: *Context) Error!TransferPolicies {
+    const packed_ids = try context.sload(slot_transfer_policies);
+    return .{
+        .sender = @truncate(packed_ids),
+        .receiver = @truncate(packed_ids >> 64),
+        .executor = @truncate(packed_ids >> 128),
+    };
+}
+
 /// burnBlocked: the account must fail the transfer-sender policy.
 pub fn ensure_blocked(context: *Context, account: Address) Error!void {
     const id = try policy_id(context, .transfer_sender);
@@ -293,6 +320,11 @@ pub fn transfer_inner(
         try ensure_policy(context, .transfer_sender, from);
         try ensure_policy(context, .transfer_receiver, to);
     }
+    try move_balance(context, from, to, amount);
+}
+
+/// Debit `from`, credit `to`, emit Transfer.
+pub fn move_balance(context: *Context, from: Address, to: Address, amount: u256) Error!void {
     const from_balance = try balance_of(context, from);
     if (from_balance < amount) {
         return revert_insufficient_balance(context, from, from_balance, amount);
@@ -303,6 +335,53 @@ pub fn transfer_inner(
     if (sum[1] != 0) return overflow(context);
     try context.sstore(balance_slot(to), sum[0]);
     try emit_transfer(context, from, to, amount);
+}
+
+/// V2 transfer: pause, zero checks, then one policy read (skipped when privileged).
+pub fn transfer_v2(context: *Context, to: Address, amount: u256, privileged: bool) Error!void {
+    try ensure_not_paused(context, .transfer);
+    const from = context.caller;
+    if (is_zero(to)) return context.revert_word(error_invalid_receiver, address_word(to));
+    if (is_zero(from)) return context.revert_word(error_invalid_sender, address_word(from));
+    if (!privileged) {
+        const policies = try transfer_policies(context);
+        try ensure_policy_id(context, .transfer_sender, policies.sender, from);
+        try ensure_policy_id(context, .transfer_receiver, policies.receiver, to);
+    }
+    try move_balance(context, from, to, amount);
+}
+
+/// V2 transferFrom: zero checks, allowance, one policy read, executor, sender, receiver.
+pub fn transfer_from_v2(
+    context: *Context,
+    from: Address,
+    to: Address,
+    amount: u256,
+    privileged: bool,
+) Error!void {
+    try ensure_not_paused(context, .transfer);
+    if (is_zero(to)) return context.revert_word(error_invalid_receiver, address_word(to));
+    if (is_zero(from)) return context.revert_word(error_invalid_sender, address_word(from));
+    const caller = context.caller;
+    const allowance = try context.sload(allowance_slot(from, caller));
+    const is_infinite = allowance == std.math.maxInt(u256);
+    if (!is_infinite and allowance < amount) {
+        return revert_words(context, error_insufficient_allowance, &.{
+            address_word(caller),
+            word(allowance),
+            word(amount),
+        });
+    }
+    if (!privileged) {
+        const policies = try transfer_policies(context);
+        if (!same(caller, from)) {
+            try ensure_policy_id(context, .transfer_executor, policies.executor, caller);
+        }
+        try ensure_policy_id(context, .transfer_sender, policies.sender, from);
+        try ensure_policy_id(context, .transfer_receiver, policies.receiver, to);
+    }
+    try move_balance(context, from, to, amount);
+    if (!is_infinite) try context.sstore(allowance_slot(from, caller), allowance - amount);
 }
 
 /// ERC-20 transferFrom: allowance (unlimited at 2^256-1), executor policy, movement.

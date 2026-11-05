@@ -41,7 +41,31 @@ pub const role_operator: u256 =
 pub const wad: u256 = 1_000_000_000_000_000_000;
 pub const decimals_min: u8 = 6;
 pub const decimals_max: u8 = 18;
-const enumeration_max: u8 = @backingInt(b20.PausableFeature.burn);
+/// V1 surfaces end at Beryl; V2 (Cobalt) adds seize, the UI multiplier, and metering.
+pub const Version = enum(u8) { v1 = 1, v2 = 2 };
+
+pub fn version_of(context: *const Context) Version {
+    return if (context.upgrade.at_least(.cobalt)) .v2 else .v1;
+}
+
+fn enumeration_max(version: Version) u8 {
+    const last: b20.PausableFeature = if (version == .v1) .burn else .seize;
+    return @backingInt(last);
+}
+
+const slot_pending: u256 = asset_root + 4;
+pub const ui_multiplier_max: u256 = std.math.maxInt(u128);
+const interface_erc165 = [4]u8{ 0x01, 0xff, 0xc9, 0xa7 };
+const interfaces_erc8056 = [4][4]u8{
+    .{ 0xa6, 0x0b, 0xf1, 0x3d },
+    .{ 0x4b, 0xd2, 0x76, 0x48 },
+    .{ 0xd8, 0x90, 0xfd, 0x71 },
+    .{ 0x57, 0x85, 0x4f, 0xc3 },
+};
+const error_effective_at_in_past = [4]u8{ 0x14, 0x11, 0x9c, 0xf6 };
+const error_effective_at_too_far = [4]u8{ 0x1c, 0xe2, 0x14, 0xfa };
+const error_update_does_not_exist = [4]u8{ 0xa7, 0xd6, 0xa5, 0xca };
+const error_update_exists = [4]u8{ 0x44, 0x81, 0xa6, 0x8e };
 
 const error_empty_feature_set = [4]u8{ 0x48, 0x61, 0xff, 0x45 };
 const error_invalid_supply_cap = [4]u8{ 0x0a, 0x37, 0x80, 0xce };
@@ -64,6 +88,11 @@ fn topic(comptime hex: []const u8) B256 {
     return comptime primitives.hex_to_b256(hex);
 }
 
+const event_seized = topic("a9aec5d8b86e2fa2fd6ac3af62f2622e3dfdab1967d4cbbb56a5df7d74cb887c");
+const event_ui_multiplier_update_cancelled =
+    topic("883856335ba5f60c18b9817c4505d3c7d3f6223dcf39516b30c508c46a5e1cad");
+const event_ui_multiplier_updated =
+    topic("2205df4534432b2f60654a3fdb48737ffdaf3e9edb1a498bd985bc026b15b055");
 const event_memo = topic("6989f5818dcfd11f8cd53b27c94cec33dae1589735f03e639cba54553a1825e8");
 const event_burned_blocked =
     topic("0b552e96653fd6842da37c477005d3b5c08a8c7d3631b1f43787b2dc9a1006a3");
@@ -100,6 +129,7 @@ const Function = struct {
     selector: [4]u8,
     parameters: []const u8,
     kinds: []const abi.Kind,
+    since: Version = .v1,
 };
 
 pub fn selector_of(tag: Tag) [4]u8 {
@@ -109,8 +139,9 @@ pub fn selector_of(tag: Tag) [4]u8 {
     unreachable; // Every tag has a table entry.
 }
 
-fn find(selector: [4]u8, variant: native.B20Variant) ?*const Function {
+fn find(selector: [4]u8, variant: native.B20Variant, version: Version) ?*const Function {
     for (&functions) |*function| {
+        if (@backingInt(function.since) > @backingInt(version)) continue;
         if (!available(function.tag, variant)) continue;
         if (std.mem.eql(u8, &function.selector, &selector)) return function;
     }
@@ -136,6 +167,17 @@ fn available(tag: Tag, variant: native.B20Variant) bool {
         .extra_metadata,
         .update_extra_metadata,
         .announce,
+        .max_ui_multiplier,
+        .ui_multiplier,
+        .new_ui_multiplier,
+        .effective_at,
+        .balance_of_ui,
+        .total_supply_ui,
+        .to_ui_amount,
+        .from_ui_amount,
+        .update_ui_multiplier,
+        .cancel_ui_multiplier_update,
+        .supports_interface,
         => variant == .asset,
         .currency => variant == .stablecoin,
         else => true,
@@ -153,7 +195,7 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
 /// Decode and run one call; factory init calls use `privileged = true`.
 pub fn route(context: *Context, input: []const u8, privileged: bool) Error![]const u8 {
     const selector = native.selector_of(input);
-    const function = find(selector, variant_of(context)) orelse
+    const function = find(selector, variant_of(context), version_of(context)) orelse
         return context.revert_unknown(selector);
     if (function.tag != .announce) return execute(context, function, input, privileged);
     const arguments = try decode(context, function, input);
@@ -166,7 +208,8 @@ fn decode(context: *Context, function: *const Function, input: []const u8) Error
     assert(std.mem.eql(u8, input[0..4], &function.selector));
     var failure: native.DecodeFailure = .overrun;
     const kinds = function.kinds;
-    return abi.decode_arguments(input[4..], kinds, enumeration_max, &failure) orelse
+    const maximum = enumeration_max(version_of(context));
+    return abi.decode_arguments(input[4..], kinds, maximum, &failure) orelse
         return context.revert_decode(function.selector, function.parameters, failure);
 }
 
@@ -211,7 +254,7 @@ fn announce(context: *Context, arguments: *const Arguments, privileged: bool) Er
 
 fn internal_call(context: *Context, call: []const u8, privileged: bool) Error!void {
     if (call.len < 4) return revert_with_bytes(context, error_internal_call_malformed, call);
-    const function = find(call[0..4].*, .asset) orelse
+    const function = find(call[0..4].*, .asset, version_of(context)) orelse
         return revert_with_bytes(context, error_internal_call_failed, call);
     if (function.tag == .announce) return context.revert_selector(error_announcement_in_progress);
     _ = execute(context, function, call, privileged) catch |err| switch (err) {
@@ -285,6 +328,10 @@ fn constant(tag: Tag) ?u256 {
         .transfer_executor_policy => b20.PolicyScope.transfer_executor.id(),
         .mint_receiver_policy => b20.PolicyScope.mint_receiver.id(),
         .wad_precision => wad,
+        .seize_role => b20.role_seize,
+        .seize_exempt_policy => b20.PolicyScope.seize_exempt.id(),
+        .seize_receiver_policy => b20.PolicyScope.seize_receiver.id(),
+        .max_ui_multiplier => ui_multiplier_max,
         else => null,
     };
 }
@@ -341,15 +388,28 @@ fn view_extension(context: *Context, tag: Tag, arguments: *const Arguments) Erro
         .currency => return write_string(context, try load_string(context, stablecoin_root)),
         .domain_separator => return native.write_word(context, try domain_separator(context)),
         .eip712_domain => return try eip712_domain(context),
-        .to_scaled_balance => {
+        .to_scaled_balance, .to_ui_amount => {
             return write_u256(context, try to_scaled(context, arguments.uint256(0)));
         },
-        .to_raw_balance => {
+        .ui_multiplier => return write_u256(context, try multiplier(context)),
+        .new_ui_multiplier => return write_u256(context, try new_ui_multiplier(context)),
+        .effective_at => return write_u256(context, (try pending(context)).effective_at),
+        .total_supply_ui => {
+            const supply = try context.sload(b20.slot_total_supply);
+            return write_u256(context, try to_scaled(context, supply));
+        },
+        .supports_interface => {
+            const id = arguments.words[0][0..4].*;
+            var supported = std.mem.eql(u8, &id, &interface_erc165);
+            for (interfaces_erc8056) |known| supported = supported or std.mem.eql(u8, &id, &known);
+            return write_bool(context, supported);
+        },
+        .to_raw_balance, .from_ui_amount => {
             const product = std.math.mul(u256, arguments.uint256(0), wad) catch
                 return b20.overflow(context);
             return write_u256(context, product / try multiplier(context));
         },
-        .scaled_balance_of => {
+        .scaled_balance_of, .balance_of_ui => {
             const balance = try b20.balance_of(context, arguments.address(0));
             return write_u256(context, try to_scaled(context, balance));
         },
@@ -381,10 +441,38 @@ fn decimals(context: *Context) Error!u8 {
     return if (value == 0) decimals_min else value;
 }
 
-/// The multiplier; an unset (zero) slot reads as WAD.
-fn multiplier(context: *Context) Error!u256 {
+/// The stored multiplier; an unset (zero) slot reads as WAD.
+fn stored_multiplier(context: *Context) Error!u256 {
     const value = try context.sload(slot_multiplier);
     return if (value == 0) wad else value;
+}
+
+const Pending = struct { multiplier: u128, effective_at: u64 };
+
+/// The scheduled UI multiplier (slot 4: u128 multiplier, u64 effective-at at byte 16).
+fn pending(context: *Context) Error!Pending {
+    const value = try context.sload(slot_pending);
+    return .{ .multiplier = @truncate(value), .effective_at = @truncate(value >> 128) };
+}
+
+/// V2: a matured pending multiplier wins over the stored one (base reads the slot twice).
+fn multiplier(context: *Context) Error!u256 {
+    if (version_of(context) == .v1) return stored_multiplier(context);
+    const effective_at = (try pending(context)).effective_at;
+    if (effective_at != 0 and context.timestamp >= effective_at) {
+        const matured = (try pending(context)).multiplier;
+        assert(matured != 0);
+        return matured;
+    }
+    return stored_multiplier(context);
+}
+
+fn new_ui_multiplier(context: *Context) Error!u256 {
+    const scheduled = try pending(context);
+    if (scheduled.effective_at > context.timestamp) {
+        return (try pending(context)).multiplier;
+    }
+    return multiplier(context);
 }
 
 fn to_scaled(context: *Context, balance: u256) Error!u256 {
@@ -397,7 +485,8 @@ fn paused_features(context: *Context) Error![]const u8 {
     const flags = try b20.paused(context);
     var count: u8 = 0;
     const out = context.out;
-    for (0..3) |feature| {
+    const count_max: u8 = if (version_of(context) == .v1) 3 else 4;
+    for (0..count_max) |feature| {
         if (flags & (@as(u256, 1) << @intCast(feature)) == 0) continue;
         out[64 + 32 * @as(usize, count) ..][0..32].* = word(feature);
         count += 1;
@@ -410,6 +499,7 @@ fn paused_features(context: *Context) Error![]const u8 {
 fn supported_scope(context: *Context, id: u256) Error!b20.PolicyScope {
     const scope = b20.PolicyScope.from_id(id) orelse
         return context.revert_word(error_unsupported_policy_type, word(id));
+    if (version_of(context) == .v2) return scope;
     return switch (scope) {
         .seize_exempt, .seize_receiver => {
             return context.revert_word(error_unsupported_policy_type, word(id));
@@ -434,16 +524,26 @@ fn movement(
     const caller = context.caller;
     switch (tag) {
         .transfer, .transfer_with_memo => {
-            try b20.ensure_not_paused(context, .transfer);
             const to = arguments.address(0);
-            try b20.transfer_inner(context, caller, to, arguments.uint256(1), privileged);
+            const amount = arguments.uint256(1);
+            if (version_of(context) == .v1) {
+                try b20.ensure_not_paused(context, .transfer);
+                try b20.transfer_inner(context, caller, to, amount, privileged);
+            } else {
+                try b20.transfer_v2(context, to, amount, privileged);
+            }
             if (tag == .transfer_with_memo) try emit_memo(context, arguments.words[2]);
             return write_bool(context, true);
         },
         .transfer_from, .transfer_from_with_memo => {
             const from = arguments.address(0);
             const to = arguments.address(1);
-            try b20.transfer_from(context, from, to, arguments.uint256(2), privileged);
+            const amount = arguments.uint256(2);
+            if (version_of(context) == .v1) {
+                try b20.transfer_from(context, from, to, amount, privileged);
+            } else {
+                try b20.transfer_from_v2(context, from, to, amount, privileged);
+            }
             if (tag == .transfer_from_with_memo) try emit_memo(context, arguments.words[3]);
             return write_bool(context, true);
         },
@@ -466,9 +566,30 @@ fn movement(
             try burn_blocked(context, from, arguments.uint256(1), privileged);
         },
         .batch_mint => try batch_mint(context, arguments, privileged),
+        .seize_with_memo => try seize(context, arguments),
         else => return null,
     }
     return &.{};
+}
+
+/// seizeWithMemo(from, to, amount, memo): SEIZE_ROLE moves funds off a non-exempt account.
+fn seize(context: *Context, arguments: *const Arguments) Error!void {
+    try b20.ensure_not_paused(context, .seize);
+    try b20.ensure_role(context, context.caller, b20.role_seize);
+    const from = arguments.address(0);
+    const to = arguments.address(1);
+    const amount = arguments.uint256(2);
+    const invalid_receiver = b20.is_zero(to) or std.mem.eql(u8, &from, &to);
+    if (b20.is_zero(to)) return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    if (b20.is_zero(from)) return context.revert_word(b20.error_invalid_sender, address_word(from));
+    if (invalid_receiver) return context.revert_word(b20.error_invalid_receiver, address_word(to));
+    try b20.ensure_seizable(context, from);
+    try b20.ensure_policy(context, .seize_receiver, to);
+    try b20.move_balance(context, from, to, amount);
+    try emit_memo(context, arguments.words[3]);
+    const caller = address_word(context.caller);
+    const topics = [4]B256{ event_seized, caller, address_word(from), address_word(to) };
+    try context.emit(&topics, &word(amount));
 }
 
 fn mint_guarded(context: *Context, to: Address, amount: u256, privileged: bool) Error!void {
@@ -567,6 +688,11 @@ fn administration(
         },
         .permit => try permit(context, arguments),
         .update_multiplier => try update_multiplier(context, arguments.uint256(0), privileged),
+        .update_ui_multiplier => {
+            const value = arguments.uint256(0);
+            try update_ui_multiplier(context, value, arguments.uint256(1), privileged);
+        },
+        .cancel_ui_multiplier_update => try cancel_ui_multiplier_update(context, privileged),
         .update_extra_metadata => {
             if (!privileged) try b20.ensure_role(context, caller, b20.role_metadata);
             try update_extra_metadata(context, arguments.bytes(0), arguments.bytes(1));
@@ -690,7 +816,7 @@ fn update_policy(context: *Context, scope_id: u256, id: u64, privileged: bool) E
     const scope = try supported_scope(context, scope_id);
     const version = policy.version_of(context);
     // Stablecoins read the old id before the existence check (gas on the revert path).
-    const stablecoin = variant_of(context) == .stablecoin;
+    const stablecoin = variant_of(context) == .stablecoin and version_of(context) == .v1;
     const old_first = if (stablecoin) try b20.policy_id(context, scope) else 0;
     if (!try policy.policy_exists(context, version, id)) {
         return context.revert_word(error_policy_not_found, word(id));
@@ -706,9 +832,91 @@ fn update_policy(context: *Context, scope_id: u256, id: u64, privileged: bool) E
 
 fn update_multiplier(context: *Context, value: u256, privileged: bool) Error!void {
     if (!privileged) try b20.ensure_role(context, context.caller, role_operator);
+    if (version_of(context) == .v2) return update_multiplier_v2(context, value);
     if (value == 0) return context.revert_selector(error_invalid_multiplier);
     try context.sstore(slot_multiplier, value);
     try context.emit(&.{event_multiplier_updated}, &word(value));
+}
+
+/// V2: set now, dropping any schedule (a live one is reported cancelled).
+fn update_multiplier_v2(context: *Context, value: u256) Error!void {
+    if (value == 0 or value > ui_multiplier_max) {
+        return context.revert_selector(error_invalid_multiplier);
+    }
+    const scheduled_multiplier = (try pending(context)).multiplier;
+    const scheduled = try pending(context);
+    const live = scheduled.effective_at > context.timestamp;
+    const old = try multiplier(context);
+    try context.sstore(slot_multiplier, value);
+    if (scheduled.effective_at != 0) try clear_pending(context);
+    if (live) try emit_cancelled(context, scheduled_multiplier, scheduled.effective_at);
+    try context.emit(&.{event_multiplier_updated}, &word(value));
+    try emit_ui_updated(context, old, value, context.timestamp);
+}
+
+fn clear_pending(context: *Context) Error!void {
+    const value = try context.sload(slot_pending);
+    const lanes_mask = (@as(u256, 1) << 192) - 1;
+    try context.sstore(slot_pending, value & ~lanes_mask);
+}
+
+fn emit_cancelled(context: *Context, value: u128, effective_at: u64) Error!void {
+    var data: [64]u8 = undefined;
+    data[0..32].* = word(value);
+    data[32..64].* = word(effective_at);
+    try context.emit(&.{event_ui_multiplier_update_cancelled}, &data);
+}
+
+fn emit_ui_updated(context: *Context, old: u256, new: u256, effective_at: u256) Error!void {
+    var data: [96]u8 = undefined;
+    data[0..32].* = word(old);
+    data[32..64].* = word(new);
+    data[64..96].* = word(effective_at);
+    try context.emit(&.{event_ui_multiplier_updated}, &data);
+}
+
+/// updateUIMultiplier(newMultiplier, effectiveAt): schedule a future multiplier.
+fn update_ui_multiplier(
+    context: *Context,
+    value: u256,
+    effective_at: u256,
+    privileged: bool,
+) Error!void {
+    if (!privileged) try b20.ensure_role(context, context.caller, role_operator);
+    if (value == 0 or value > ui_multiplier_max) {
+        return context.revert_selector(error_invalid_multiplier);
+    }
+    if (effective_at <= context.timestamp) {
+        return context.revert_word(error_effective_at_in_past, word(effective_at));
+    }
+    if (effective_at > std.math.maxInt(u64)) {
+        return context.revert_word(error_effective_at_too_far, word(effective_at));
+    }
+    const scheduled_at = (try pending(context)).effective_at;
+    if (scheduled_at > context.timestamp) {
+        return context.revert_word(error_update_exists, word(scheduled_at));
+    }
+    if (scheduled_at != 0) {
+        const matured = (try pending(context)).multiplier;
+        try context.sstore(slot_multiplier, matured);
+    }
+    const old = try stored_multiplier(context);
+    const current = try context.sload(slot_pending);
+    const lanes_mask = (@as(u256, 1) << 192) - 1;
+    const lanes = value | (effective_at << 128);
+    try context.sstore(slot_pending, (current & ~lanes_mask) | lanes);
+    try emit_ui_updated(context, old, value, effective_at);
+}
+
+fn cancel_ui_multiplier_update(context: *Context, privileged: bool) Error!void {
+    if (!privileged) try b20.ensure_role(context, context.caller, role_operator);
+    const scheduled_multiplier = (try pending(context)).multiplier;
+    const scheduled = try pending(context);
+    if (scheduled.effective_at <= context.timestamp) {
+        return context.revert_selector(error_update_does_not_exist);
+    }
+    try clear_pending(context);
+    try emit_cancelled(context, scheduled_multiplier, scheduled.effective_at);
 }
 
 fn update_extra_metadata(context: *Context, key: []const u8, value: []const u8) Error!void {
@@ -742,15 +950,26 @@ fn keccak(bytes: []const u8) [32]u8 {
 }
 
 /// keccak256(abi.encode(DOMAIN_TYPEHASH, keccak(name), keccak("1"), chainId, address)).
+/// V2 meters each keccak (30 + 6 per word), V1 hashes for free.
+fn metered_keccak(context: *Context, bytes: []const u8) Error![32]u8 {
+    if (version_of(context) == .v2) {
+        const words: u64 = @intCast(std.math.divCeil(usize, bytes.len, 32) catch unreachable);
+        try context.charge(30 + 6 * words);
+    }
+    return keccak(bytes);
+}
+
 fn domain_separator(context: *Context) Error![32]u8 {
     const name = try load_string(context, b20.slot_name);
-    return keccak_words(&.{
-        word(domain_typehash),
-        keccak(name),
-        keccak("1"),
-        word(context.chain_id),
-        address_word(context.address),
-    });
+    const name_hash = try metered_keccak(context, name);
+    const version_hash = try metered_keccak(context, "1");
+    var encoded: [5 * 32]u8 = undefined;
+    encoded[0..32].* = word(domain_typehash);
+    encoded[32..64].* = name_hash;
+    encoded[64..96].* = version_hash;
+    encoded[96..128].* = word(context.chain_id);
+    encoded[128..160].* = address_word(context.address);
+    return metered_keccak(context, &encoded);
 }
 
 fn eip712_domain(context: *Context) Error![]const u8 {
@@ -778,6 +997,8 @@ fn eip712_domain(context: *Context) Error![]const u8 {
     return out[0 .. length + 32];
 }
 
+const recover_gas: u64 = 3000;
+
 fn permit(context: *Context, arguments: *const Arguments) Error!void {
     const owner = arguments.address(0);
     const deadline = arguments.uint256(3);
@@ -787,19 +1008,21 @@ fn permit(context: *Context, arguments: *const Arguments) Error!void {
     const separator = try domain_separator(context);
     const nonce_slot = b20.nonce_slot(owner);
     const nonce = try context.sload(nonce_slot);
-    const struct_hash = keccak_words(&.{
-        word(permit_typehash),
-        arguments.words[0].*,
-        arguments.words[1].*,
-        arguments.words[2].*,
-        word(nonce),
-        arguments.words[3].*,
-    });
+    var encoded: [6 * 32]u8 = undefined;
+    encoded[0..32].* = word(permit_typehash);
+    encoded[32..64].* = arguments.words[0].*;
+    encoded[64..96].* = arguments.words[1].*;
+    encoded[96..128].* = arguments.words[2].*;
+    encoded[128..160].* = word(nonce);
+    encoded[160..192].* = arguments.words[3].*;
+    const struct_hash = try metered_keccak(context, &encoded);
     var message: [66]u8 = undefined;
     message[0..2].* = .{ 0x19, 0x01 };
     message[2..34].* = separator;
     message[34..66].* = struct_hash;
-    const recovered = recover(keccak(&message), arguments) orelse primitives.address_zero;
+    const signing_hash = try metered_keccak(context, &message);
+    if (version_of(context) == .v2) try context.charge(recover_gas);
+    const recovered = recover(signing_hash, arguments) orelse primitives.address_zero;
     if (b20.is_zero(recovered) or !std.mem.eql(u8, &recovered, &owner)) {
         return b20.revert_words(context, error_invalid_signer, &.{
             address_word(recovered),
@@ -883,6 +1106,21 @@ pub const Tag = enum {
     update_extra_metadata,
     announce,
     currency,
+    seize_role,
+    seize_exempt_policy,
+    seize_receiver_policy,
+    seize_with_memo,
+    max_ui_multiplier,
+    ui_multiplier,
+    new_ui_multiplier,
+    effective_at,
+    balance_of_ui,
+    total_supply_ui,
+    to_ui_amount,
+    from_ui_amount,
+    update_ui_multiplier,
+    cancel_ui_multiplier_update,
+    supports_interface,
 };
 
 pub const functions = [_]Function{
@@ -1263,5 +1501,110 @@ pub const functions = [_]Function{
         .selector = .{ 0xe5, 0xa6, 0xb1, 0x0f },
         .parameters = "()",
         .kinds = &.{},
+    },
+    .{
+        .tag = .seize_role,
+        .selector = .{ 0x3c, 0x7e, 0x9b, 0xa5 },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .seize_exempt_policy,
+        .selector = .{ 0xfe, 0xb3, 0x46, 0xec },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .seize_receiver_policy,
+        .selector = .{ 0xb3, 0x1d, 0xa2, 0x7f },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .seize_with_memo,
+        .selector = .{ 0xf9, 0x16, 0xd8, 0x1b },
+        .parameters = "(address,address,uint256,bytes32)",
+        .kinds = &.{ .address, .address, .uint256, .bytes32 },
+        .since = .v2,
+    },
+    .{
+        .tag = .max_ui_multiplier,
+        .selector = .{ 0x78, 0x5c, 0x0c, 0xf0 },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .ui_multiplier,
+        .selector = .{ 0xa6, 0x0b, 0xf1, 0x3d },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .new_ui_multiplier,
+        .selector = .{ 0xdc, 0x76, 0x70, 0x07 },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .effective_at,
+        .selector = .{ 0x97, 0xa4, 0x06, 0x4f },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .balance_of_ui,
+        .selector = .{ 0x43, 0x7a, 0x99, 0x58 },
+        .parameters = "(address)",
+        .kinds = &.{.address},
+        .since = .v2,
+    },
+    .{
+        .tag = .total_supply_ui,
+        .selector = .{ 0x9b, 0xea, 0x64, 0x29 },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .to_ui_amount,
+        .selector = .{ 0x32, 0x48, 0xd4, 0xff },
+        .parameters = "(uint256)",
+        .kinds = &.{.uint256},
+        .since = .v2,
+    },
+    .{
+        .tag = .from_ui_amount,
+        .selector = .{ 0x65, 0xcd, 0x9b, 0x3c },
+        .parameters = "(uint256)",
+        .kinds = &.{.uint256},
+        .since = .v2,
+    },
+    .{
+        .tag = .update_ui_multiplier,
+        .selector = .{ 0x62, 0x8e, 0x60, 0x0f },
+        .parameters = "(uint256,uint256)",
+        .kinds = &.{ .uint256, .uint256 },
+        .since = .v2,
+    },
+    .{
+        .tag = .cancel_ui_multiplier_update,
+        .selector = .{ 0x2c, 0x97, 0xa0, 0xf0 },
+        .parameters = "()",
+        .kinds = &.{},
+        .since = .v2,
+    },
+    .{
+        .tag = .supports_interface,
+        .selector = .{ 0x01, 0xff, 0xc9, 0xa7 },
+        .parameters = "(bytes4)",
+        .kinds = &.{.bytes4},
+        .since = .v2,
     },
 };
