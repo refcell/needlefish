@@ -17,6 +17,7 @@ pub const challenger = @import("challenger/root.zig");
 pub const submission = @import("submission/root.zig");
 pub const prover_service = @import("prover_service/root.zig");
 pub const telemetry = @import("telemetry/root.zig");
+pub const tee = @import("tee/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
