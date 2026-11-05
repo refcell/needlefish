@@ -48,7 +48,7 @@ Dirty nodes are rehashed level by level (deepest first) and equal-length encodin
 | Case | ns/op | MB/s | Notes |
 | --- | ---: | ---: | --- |
 | p2p/noise XX handshake | 757 468 | | ~1 300 handshakes/s per core; secp256k1 sign+verify dominate |
-| p2p/noise transport seal+open 64 KiB | 92 351 | 710 | 8-block column ChaCha20 + std Poly1305 (std AEAD: 338 MB/s) |
+| p2p/noise transport seal+open 64 KiB | 83 000 | 785 | 16-block ChaCha20 passes (8-block tail) + std Poly1305; 8-block only: 729 MB/s; std AEAD: 338 MB/s |
 | p2p/poly1305 std 64 KiB | 16 361 | 4006 | std; a 4-lane 26-bit variant gave +8%, not kept |
 | p2p/snappy compress 128 KiB | 77 974 | 1 681 | semi-compressible payload |
 | p2p/snappy decompress 128 KiB | 20 618 | 6 357 | |

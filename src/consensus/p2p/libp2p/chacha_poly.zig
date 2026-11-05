@@ -15,15 +15,18 @@ pub const key_length = 32;
 pub const nonce_length = 12;
 pub const tag_length = 16;
 
+/// Blocks per pass: 16 for long runs (fills the register file better on NEON), 8 for the
+/// tail so short messages do not pay for 1 KiB of keystream.
+const lanes_wide = 16;
 const lanes = 8;
-const Word = @Vector(lanes, u32);
 const Quad = @Vector(4, u32);
 const chunk_bytes = 64 * lanes;
+const chunk_wide_bytes = 64 * lanes_wide;
 const constants = [4]u32{ 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
 
 comptime {
-    assert(chunk_bytes == 512);
-    assert(lanes % 4 == 0);
+    assert(chunk_bytes == 512 and chunk_wide_bytes == 1024);
+    assert(lanes % 4 == 0 and lanes_wide % 4 == 0);
 }
 
 const Keystream = struct {
@@ -42,6 +45,7 @@ const Keystream = struct {
     }
 
     inline fn quarter_round(
+        comptime Word: type,
         x: *[16]Word,
         comptime a: usize,
         comptime b: usize,
@@ -58,37 +62,44 @@ const Keystream = struct {
         x[b] = std.math.rotl(Word, x[b] ^ x[c], 7);
     }
 
-    /// Keystream blocks `counter .. counter + lanes` into `output`.
-    fn blocks(keystream: *const Keystream, counter: u32, output: *[chunk_bytes]u8) void {
+    /// Keystream blocks `counter .. counter + n` into `output`.
+    fn blocks(
+        keystream: *const Keystream,
+        comptime n: usize,
+        counter: u32,
+        output: *[64 * n]u8,
+    ) void {
+        const Word = @Vector(n, u32);
         var x: [16]Word = undefined;
         inline for (0..4) |index| x[index] = @splat(constants[index]);
         inline for (0..8) |index| x[4 + index] = @splat(keystream.key[index]);
-        x[12] = @as(Word, @splat(counter)) +% std.simd.iota(u32, lanes);
+        x[12] = @as(Word, @splat(counter)) +% std.simd.iota(u32, n);
         inline for (0..3) |index| x[13 + index] = @splat(keystream.nonce[index]);
         const initial = x;
         var round: u32 = 0;
         while (round < 10) : (round += 1) {
-            quarter_round(&x, 0, 4, 8, 12);
-            quarter_round(&x, 1, 5, 9, 13);
-            quarter_round(&x, 2, 6, 10, 14);
-            quarter_round(&x, 3, 7, 11, 15);
-            quarter_round(&x, 0, 5, 10, 15);
-            quarter_round(&x, 1, 6, 11, 12);
-            quarter_round(&x, 2, 7, 8, 13);
-            quarter_round(&x, 3, 4, 9, 14);
+            quarter_round(Word, &x, 0, 4, 8, 12);
+            quarter_round(Word, &x, 1, 5, 9, 13);
+            quarter_round(Word, &x, 2, 6, 10, 14);
+            quarter_round(Word, &x, 3, 7, 11, 15);
+            quarter_round(Word, &x, 0, 5, 10, 15);
+            quarter_round(Word, &x, 1, 6, 11, 12);
+            quarter_round(Word, &x, 2, 7, 8, 13);
+            quarter_round(Word, &x, 3, 4, 9, 14);
         }
         inline for (0..16) |index| x[index] +%= initial[index];
-        inline for (0..lanes / 4) |half| {
-            inline for (0..4) |group| transpose(&x, half, group, output);
+        inline for (0..n / 4) |half| {
+            inline for (0..4) |group| transpose(n, &x, half, group, output);
         }
     }
 
     /// Writes words `4*group .. 4*group+3` of blocks `4*half .. 4*half+3`.
     inline fn transpose(
-        x: *const [16]Word,
+        comptime n: usize,
+        x: *const [16]@Vector(n, u32),
         comptime half: usize,
         comptime group: usize,
-        output: *[chunk_bytes]u8,
+        output: *[64 * n]u8,
     ) void {
         const select = comptime blk: {
             var mask: [4]i32 = undefined;
@@ -129,10 +140,18 @@ pub fn chacha20_xor(
     assert(input.len / 64 <= std.math.maxInt(u32) - counter);
     const keystream = Keystream.init(key, nonce);
     var block_counter = counter;
-    var stream: [chunk_bytes]u8 = undefined;
     var offset: usize = 0;
+    while (input.len - offset >= chunk_wide_bytes) : (offset += chunk_wide_bytes) {
+        var wide: [chunk_wide_bytes]u8 = undefined;
+        keystream.blocks(lanes_wide, block_counter, &wide);
+        block_counter +%= lanes_wide;
+        const plain: @Vector(chunk_wide_bytes, u8) = input[offset..][0..chunk_wide_bytes].*;
+        const pad: @Vector(chunk_wide_bytes, u8) = wide;
+        output[offset..][0..chunk_wide_bytes].* = plain ^ pad;
+    }
+    var stream: [chunk_bytes]u8 = undefined;
     while (offset < input.len) : (offset += chunk_bytes) {
-        keystream.blocks(block_counter, &stream);
+        keystream.blocks(lanes, block_counter, &stream);
         block_counter +%= lanes;
         const length = @min(chunk_bytes, input.len - offset);
         if (length == chunk_bytes) {
@@ -259,7 +278,10 @@ test "chacha_poly: matches std at chunk boundaries and random lengths" {
     defer testing.allocator.free(buffer);
     var prng = Prng.init(0x6368_6163);
     const random = prng.random();
-    const edges = [_]usize{ 0, 1, 63, 64, 65, 511, 512, 513, 1023, 1024, 1025, 65535 };
+    const edges = [_]usize{
+        0,    1,    63,   64,   65,   511,  512,  513,   1023,
+        1024, 1025, 1536, 1537, 2047, 2048, 2049, 65535,
+    };
     for (edges) |length| try check_against_std(random, buffer, length);
     for (0..64) |_| try check_against_std(random, buffer, random.uintLessThan(usize, 70_000));
 }

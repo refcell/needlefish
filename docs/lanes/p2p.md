@@ -52,8 +52,8 @@ behind a small interface and switch later.
 - [x] RPC peer info: `Service.on_identified`/`on_ping` (fed by the transport) keep bounded
   per-peer agent, protocol version, 8 protocols, 4 listen addresses, latency (ns, like
   op-node); `opp2p_self` reports base/base's agent `base`, protocol list, local multiaddr.
-- [ ] Perf: ChaCha20 now dominates the AEAD (2260 MB/s vs Poly1305 4006 MB/s); try 16-block
-  passes or interleaved rounds on NEON.
+- [x] Perf: ChaCha20 16-block passes for full 1 KiB chunks (8-block tail): noise seal+open
+  729 -> 785 MB/s on M4 Pro. Measured 4/12/32-block passes too: 458/363/740 MB/s.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
 - [x] `gossip`: gossipsub v1.1 (hand-written protobuf RPC codec, mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
@@ -262,3 +262,4 @@ behind a small interface and switch later.
 - 2026-11-05: Poly1305 vector path measured (+8%) and dropped; std kept.
 - 2026-11-05: p2p Prometheus metrics.
 - 2026-11-05: RPC peer info from identify and ping.
+- 2026-11-05: ChaCha20 16-block passes (+8% seal+open).
