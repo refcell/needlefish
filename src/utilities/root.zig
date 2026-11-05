@@ -16,6 +16,7 @@ pub const ring_buffer = @import("ring_buffer/root.zig");
 pub const retry = @import("retry/root.zig");
 pub const health = @import("health/root.zig");
 pub const ws = @import("ws/root.zig");
+pub const trusted_proxy = @import("trusted_proxy/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

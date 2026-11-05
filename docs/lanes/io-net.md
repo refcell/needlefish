@@ -17,6 +17,12 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   server can stop with an accept in flight and a client can abandon a request on timeout.
 - [x] `http`: per-connection idle/read timeouts on the server; request timeout on client.
 
+- [x] `trusted_proxy`: client IP via trusted forwarding proxies (base/base `trusted-proxy`).
+- [ ] `http`: expose the peer address to handlers (needs a sync `peer_address(fd)` on every
+  IO backend; SimIo must record client addresses) so `trusted_proxy` can be wired in.
+- [ ] `balance_monitor`: periodic balance polling over `rpc.Client` with `tick()`.
+- [ ] `l1_head`: shared L1 head helpers for proof services (check proof lane first).
+
 ## Decisions
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
   `io.op(*Ctx, ctx, callback, &completion, args...)`, callback
@@ -82,3 +88,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: `-Drequire-io-uring=true` (CI ubuntu + `just test-linux`) turns io_uring-unavailable skips into failures; shared `io.init_for_test()`. test-linux green with it.
 - 2026-11-05: io: `cancel` on io_uring/kqueue/SimIo; tests for timeout/accept/recv cancel and completion reuse, green on io_uring in Docker.
 - 2026-11-05: http/ws servers: `stop()` cancels the in-flight accept and closes the listener from its callback (no io_uring accept outliving the server), shuts down idle keep-alive connections. ws `deinit` asserts `stopped()`; http `deinit` stays lenient because execution/node deinits without stopping (it tears the IO down together).
+- 2026-11-05: trusted_proxy: CIDR matching (v4/v6, mapped v4), right-to-left XFF scan across header occurrences, peer fallback; fuzzed.
