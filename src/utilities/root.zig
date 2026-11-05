@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const io = @import("io/root.zig");
 pub const time = @import("time/root.zig");
+pub const json = @import("json/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
