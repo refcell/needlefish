@@ -89,6 +89,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   delegation indicator, `IAccountConfiguration` logs); (5) validate/fee/payer/dispatch
   (`validate.rs`, `fee.rs`, `dispatch.rs`) and nonce-manager integration; (6) wire 0x79
   into `transaction.zig` from Everest with receipts.
+  Done: (1) `eip8130_config.zig` (packed ActorConfig/AccountState words, slot derivation,
+  journaled unmetered `Store`); (2)+(3) `eip8130_auth.zig` (scopes, resolved actors,
+  k1/P-256/WebAuthn/delegate dispatch with the canonical-ABI WebAuthn guard and low-s
+  P-256, one-hop delegation without recursion, sender/payer `verify`, config-change
+  `authorize_changes` with channel sequences and the changes digest).
 - [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
   compare with revm on the same machine; profile call-frame and keccak paths.
 
