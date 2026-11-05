@@ -40,7 +40,8 @@ pub const Api = struct {
     filters: ?*filters_module.Filters = null,
 };
 
-pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods;
+pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
+    @import("txpool.zig").methods;
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 

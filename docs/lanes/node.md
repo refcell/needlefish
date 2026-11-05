@@ -38,7 +38,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] rpc: eth_call / estimateGas at older blocks (an evm `Database` over
   `db.history.Store` proofs, read-only).
 - [x] rpc: `debug_executionWitness` (proof hosts) from `db.witness` (landed by the trie-db lane: `node/witness.zig`).
-- [ ] txpool_content / txpool_inspect.
+- [x] txpool_content / txpool_contentFrom / txpool_inspect.
 
 ## Decisions
 - chainspec is self-contained (no dependency on `common/chains`, which has not landed):
@@ -65,6 +65,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: txpool_content/contentFrom/inspect (reth shapes: EIP-55 sender keys sorted ascending like reth's BTreeMap, decimal nonce keys; inspect gas price is the fee cap). Pool gained a read API (`sorted_senders`, `sender_transactions`); the sorted index list lives at the tail of the RPC scratch. Oversized listings fail with the router's response-size error rather than truncating.
 - 2026-11-05: historical state via `--proofs-history[.window N]` (base/base flag names; off by default, window 256). Decisions: the window is in memory only (rebuilt at the restored head after restart, as `db.history` documents); `Chain.sync_history` commits head+1, unwinds on a move back into the window, and resets the window on any other move (cross-branch reorg, durable multi-block move, full store), counted in `history_resets`; RPC serves a block only when it is canonical and the window's root at its number equals the header's, so a stale branch is never answered. Sizing: every live trie node plus `window * history_versions_per_block` (1024) versions; dense branches a quarter. Code reads use the head code store (content addressed, never deleted).
 - 2026-11-05: merged with the trie-db lane's durable history (`Database` `Config.history`, `Journal.proof`): `Chain.proof_at` is the one historical entry point (journal window on durable nodes, the chain-level window otherwise); `--proofs-history` sets `limits.durable.history` when `--datadir` is given and the in-memory chain window otherwise. State reads (balance/nonce/code/storage) and eth_getProof share it via `rpc/state_view.zig`.
 - 2026-11-05: batcher-devnet lane added `GET /eth/v1/beacon/blobs/{slot}?versioned_hashes=...` to the dev L1 beacon (4983c5f); the consensus blob provider uses it by default. Keep this endpoint when restructuring `node/beacon.zig`.

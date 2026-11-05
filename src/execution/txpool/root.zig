@@ -204,6 +204,67 @@ pub const Pool = struct {
         return nonce;
     }
 
+    /// Most senders the pool tracks at once (the size `sorted_senders` needs).
+    pub fn sender_capacity(pool: *const Pool) u32 {
+        return @intCast(pool.senders.len);
+    }
+
+    /// Writes the live senders' indexes into `out`, by ascending address (deterministic
+    /// listings for txpool_content/inspect), and returns how many there are.
+    pub fn sorted_senders(pool: *const Pool, out: []u32) u32 {
+        assert(out.len >= pool.senders.len);
+        var live: u32 = 0;
+        var iterator = pool.by_sender.valueIterator();
+        while (iterator.next()) |index| {
+            assert(pool.senders[index.*].count > 0);
+            out[live] = index.*;
+            live += 1;
+        }
+        assert(live == pool.by_sender.count());
+        std.sort.pdq(u32, out[0..live], pool, sender_less);
+        return live;
+    }
+
+    fn sender_less(pool: *const Pool, a: u32, b: u32) bool {
+        const left = &pool.senders[a].address.bytes;
+        const right = &pool.senders[b].address.bytes;
+        return std.mem.order(u8, left, right) == .lt;
+    }
+
+    pub fn sender_address(pool: *const Pool, sender: u32) Address {
+        assert(sender < pool.senders.len);
+        assert(pool.senders[sender].count > 0);
+        return pool.senders[sender].address;
+    }
+
+    /// A sender's transactions by ascending nonce, each with its pending flag.
+    pub fn sender_transactions(pool: *const Pool, sender: u32) SenderTransactions {
+        assert(sender < pool.senders.len);
+        const entry = &pool.senders[sender];
+        return .{ .pool = pool, .cursor = entry.head, .remaining = entry.count };
+    }
+
+    pub const SenderTransactions = struct {
+        pool: *const Pool,
+        cursor: u32,
+        remaining: u32,
+
+        pub const Item = struct { tx: *const Tx, pending: bool };
+
+        pub fn next(iterator: *SenderTransactions) ?Item {
+            if (iterator.cursor == none) {
+                assert(iterator.remaining == 0);
+                return null;
+            }
+            assert(iterator.remaining > 0);
+            iterator.remaining -= 1;
+            const entry = &iterator.pool.entries[iterator.cursor];
+            assert(iterator.pool.entry_live[iterator.cursor]);
+            iterator.cursor = entry.next;
+            return .{ .tx = &entry.tx, .pending = entry.pending };
+        }
+    };
+
     pub fn add(pool: *Pool, tx: Tx, account: Account) AddError!AddOutcome {
         try pool.check_stateless(&tx);
         if (tx.nonce < account.nonce) return error.NonceTooLow;

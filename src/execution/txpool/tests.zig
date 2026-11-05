@@ -91,6 +91,36 @@ pub fn verify(pool: *const Pool) !void {
     try testing.expectEqual(entries, pool.by_hash.count());
     try testing.expectEqual(entries, pool.count());
     try testing.expectEqual(pool.bytes.free_count() + entries, 64 + 8);
+    try verify_listing(pool);
+}
+
+/// The listing API (txpool_content/inspect) sees every entry once, senders by ascending
+/// address and each sender's transactions by ascending nonce.
+fn verify_listing(pool: *const Pool) !void {
+    var order: [64]u32 = undefined;
+    try testing.expect(pool.sender_capacity() <= order.len);
+    const count = pool.sorted_senders(order[0..pool.sender_capacity()]);
+    try testing.expectEqual(pool.by_sender.count(), count);
+    var listed: u32 = 0;
+    var pending: u32 = 0;
+    for (order[0..count], 0..) |sender, position| {
+        if (position > 0) {
+            const previous = pool.sender_address(order[position - 1]).bytes;
+            const current = pool.sender_address(sender).bytes;
+            try testing.expect(std.mem.order(u8, &previous, &current) == .lt);
+        }
+        var iterator = pool.sender_transactions(sender);
+        var previous_nonce: ?u64 = null;
+        while (iterator.next()) |item| {
+            if (previous_nonce) |nonce| try testing.expect(item.tx.nonce > nonce);
+            previous_nonce = item.tx.nonce;
+            try testing.expectEqual(pool.is_pending(item.tx.hash), item.pending);
+            if (item.pending) pending += 1;
+            listed += 1;
+        }
+    }
+    try testing.expectEqual(pool.count(), listed);
+    try testing.expectEqual(pool.pending_count, pending);
 }
 
 test "txpool: pending, queued, gap fill" {

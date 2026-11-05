@@ -433,6 +433,90 @@ test "eth: call and estimate gas" {
     try testing.expectEqualStrings("\"result\":\"0x\"", output);
 }
 
+fn count_of(haystack: []const u8, needle: []const u8) usize {
+    return std.mem.count(u8, haystack, needle);
+}
+
+test "eth: txpool content, contentFrom and inspect list pending and queued by sender" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try testing.expectEqualStrings(
+        "\"result\":{\"pending\":{},\"queued\":{}}",
+        try h.request("txpool_content", "[]"),
+    );
+    var buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 1, &buffer);
+    try fixture.submit(h.node, 1, 1, 2, &buffer);
+    try fixture.submit(h.node, 1, 5, 3, &buffer); // Nonce gap: queued.
+    try fixture.submit(h.node, 2, 0, 4, &buffer);
+    const text = try h.request("txpool_content", "[]");
+    try testing.expectEqual(@as(usize, 4), count_of(text, "\"from\""));
+    const one = primitives.checksum(fixture.address_of(1), null);
+    const two = primitives.checksum(fixture.address_of(2), null);
+    const queued_at = std.mem.indexOf(u8, text, "\"queued\"").?;
+    const one_at = std.mem.indexOf(u8, text, &one).?;
+    const two_at = std.mem.indexOf(u8, text, &two).?;
+    try testing.expect(one_at < queued_at and two_at < queued_at);
+    const one_bytes = fixture.address_of(1).bytes;
+    const two_bytes = fixture.address_of(2).bytes;
+    const one_first = std.mem.order(u8, &one_bytes, &two_bytes) == .lt;
+    try testing.expectEqual(one_first, one_at < two_at);
+    try expect_contains(text[queued_at..], "\"5\":{");
+    try expect_contains(text[0..queued_at], "\"1\":{");
+    const lines = try h.request("txpool_inspect", "[]");
+    const receiver = primitives.checksum(fixture.address_of(9), null);
+    var expected: [128]u8 = undefined;
+    const line_format = "\"{s}: 3 wei + 21000 gas \u{00d7} 10000000000 wei\"";
+    const line = try std.fmt.bufPrint(&expected, line_format, .{&receiver});
+    try expect_contains(lines, line);
+    try testing.expectEqual(@as(usize, 4), count_of(lines, " wei + "));
+    var body: [256]u8 = undefined;
+    const from_format = request_prefix_format ++ "txpool_contentFrom\",\"params\":[\"{s}\"]}}";
+    const from = try h.request_runtime(try std.fmt.bufPrint(&body, from_format, .{&two}));
+    try expect_contains(from, "\"result\":{\"pending\":{\"0\":{");
+    try expect_contains(from, "\"queued\":{}}");
+    const unknown = "[\"0x00000000000000000000000000000000000000ff\"]";
+    try testing.expectEqualStrings(
+        "\"result\":{\"pending\":{},\"queued\":{}}",
+        try h.request("txpool_contentFrom", unknown),
+    );
+}
+
+fn txpool_scenario(seed: u64) !void {
+    var prng = Prng.init(seed);
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    const count = prng.range(0, 24);
+    for (0..count) |_| {
+        const from: u8 = @intCast(1 + prng.below(fixture.senders));
+        const nonce = prng.below(20);
+        const value: u256 = prng.range(1, 1000);
+        fixture.submit(h.node, from, nonce, value, &buffer) catch {}; // Rejections are fine.
+    }
+    const pool_count = h.node.pool.count();
+    const content = try h.request("txpool_content", "[]");
+    try testing.expectEqual(@as(usize, pool_count), count_of(content, "\"from\""));
+    // `content` points into the harness output: check it before the next request.
+    const pending = h.node.pool.pending_count;
+    const queued_at = std.mem.indexOf(u8, content, "\"queued\"").?;
+    try testing.expectEqual(@as(usize, pending), count_of(content[0..queued_at], "\"from\""));
+    const lines = try h.request("txpool_inspect", "[]");
+    try testing.expectEqual(@as(usize, pool_count), count_of(lines, " wei + "));
+}
+
+test "eth: txpool listings seeded fuzz" {
+    for (0..12) |seed| try txpool_scenario(seed + 500);
+}
+
+fn fuzz_txpool(_: void, smith: *testing.Smith) anyerror!void {
+    try txpool_scenario(smith.value(u64));
+}
+
+test "eth: txpool listings fuzz" {
+    try testing.fuzz({}, fuzz_txpool, .{});
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);
@@ -466,6 +550,9 @@ const method_names = [_][]const u8{
     "eth_getFilterChanges",
     "eth_getFilterLogs",
     "eth_uninstallFilter",
+    "txpool_content",
+    "txpool_contentFrom",
+    "txpool_inspect",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",
