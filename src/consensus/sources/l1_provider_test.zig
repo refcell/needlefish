@@ -165,3 +165,28 @@ test "l1 provider: by-number results expire, the queue stays bounded" {
     harness.run();
     try testing.expectEqual(@as(u32, 7), fake.requests);
 }
+
+test "l1 provider: drives the derive data source" {
+    const derive = @import("../derive/root.zig");
+    const protocol = @import("../protocol/root.zig");
+    var fake: FakeRpc = .{};
+    var chain: Chain = .{};
+    try chain.init(&fake);
+    var harness: Harness = undefined;
+    var provider: Provider = undefined;
+    try setup(&harness, &provider, &fake, .{ .batch_inbox = fixtures.inbox });
+    defer harness.deinit();
+    defer provider.deinit();
+    const rollup: protocol.RollupConfig = .{ .batch_inbox_address = fixtures.inbox };
+    var source = derive.sources.DataSource.init(testing.allocator, &rollup);
+    defer source.deinit();
+    var blobs_unused = derive.test_chain.TestChain.init(0, 0, 12);
+    const block: protocol.BlockInfo = .{ .hash = chain.header, .number = 100 };
+    const batcher = fixtures.dev_address;
+    const unused = &blobs_unused;
+    try testing.expectError(error.NotAvailable, source.next(&provider, unused, block, batcher));
+    harness.run();
+    try testing.expectEqualStrings("legacy", try source.next(&provider, unused, block, batcher));
+    const second = try source.next(&provider, unused, block, batcher);
+    try testing.expectEqualStrings("frame data", second);
+}

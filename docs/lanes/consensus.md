@@ -14,7 +14,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
   - [x] batch validity rules (singular, span, Holocene)
-- [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
+- [x] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
+  - [ ] L2 chain provider (`l2_block_info_by_number`, system config by L2 hash) for the
+    attributes builder, and engine `getPayloadBodies`/`exchangeCapabilities` if needed.
 - [x] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
@@ -68,6 +70,23 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   Upgrade deployment bytecode is embedded hex copied verbatim from base/base and decoded
   when an activation block is built. `PayloadAttributes` reuses the execution lane's
   `Withdrawal` and converts to its engine type with `engine()`.
+- Sources verify instead of trusting the RPC: every header must hash to its block hash;
+  senders of txs to the batch inbox are recovered from the rebuilt EIP-2718 envelope
+  (mismatch with the RPC `from` rejects the block); the envelope must hash to the tx
+  `hash`. Unless `trust_rpc` (base/base default true, ours false), transactions and
+  receipts roots must match the header, so unknown L1 tx types are rejected in strict mode.
+- `L1Provider`: one request in flight, bounded de-duplicated queue (overflow drops; the
+  caller's retry re-enqueues), fixed LRU caches with one arena per slot. By-number results
+  live for a short TTL (2 s) because numbers move on reorgs (base/base never caches them);
+  `null` results surface once as `NotFound`; failed/unverifiable fetches are dropped.
+- `BlobProvider`: base/base's `/eth/v1/beacon/blobs/{slot}?versioned_hashes=` endpoint by
+  default (blob_sidecars optional); blobs matched by recomputed KZG commitment (sidecars:
+  commitment hash + `verify_blob_kzg_proof`). The verifier is a type parameter so tests use
+  a cheap fake; production passes `KzgVerifier` with caller-owned setup/workspace. 404 →
+  `BlobsUnavailable` once.
+- `EngineClient`: FCU V2/V3, newPayload V2-V4, getPayload V2-V5 (base/base versions), one
+  request in flight, callback-based `Response` union, fresh JWT per request from IO time.
+  Reuses execution-lane `ExecutionPayload`/`PayloadAttributes`/`ForkchoiceState` types.
 
 - Decoded batches own an arena (`OwnedBatch`) holding a copy of their bytes, so they outlive
   the channel's decompressed buffer.
@@ -89,6 +108,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 
 
 ## Log
+- 2026-11-05: sources: L1 JSON decoders, caching L1 provider, beacon blob provider, engine
+  client with L2 block info.
 - 2026-11-05: sequencer: non-blocking L1 origin selector, fuzzed.
 - 2026-11-05: derive: attributes queue, pipeline core (step, signals, reset walk-back), e2e + fuzz.
 - 2026-11-05: protocol: rollup.json codec; rpc: optimism_rollupConfig.
