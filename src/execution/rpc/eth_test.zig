@@ -549,6 +549,105 @@ test "eth: EIP-8130 transactions pool by nonce channel and are mined in order" {
     try expect_contains(try send_raw(h, first), "error");
 }
 
+/// slot0 += 1, LOG0 and return the new value.
+const counter_hex = "0x5f5460010180" ++ "5f555f5260205fa060205ff3";
+const counter_at = "\"0x0000000000000000000000000000000000000055\"";
+const reverter_at = "\"0x0000000000000000000000000000000000000056\"";
+
+test "eth: eth_simulateV1 carries state across calls and blocks with overrides" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const head_root = try h.node.db.root();
+    const word = "0x000000000000000000000000000000000000000000000000000000000000000";
+    const counter_call = "{\"to\":" ++ counter_at ++ "}";
+    const params = "[{\"blockStateCalls\":[" ++
+        "{\"stateOverrides\":{" ++ counter_at ++ ":{\"code\":\"" ++ counter_hex ++ "\"}," ++
+        reverter_at ++ ":{\"code\":\"0x5f5ffd\"}}," ++
+        "\"calls\":[" ++ counter_call ++ "," ++ counter_call ++ ",{\"to\":" ++ reverter_at ++
+        "}]}," ++
+        "{\"blockOverrides\":{\"time\":\"0x1000\"},\"stateOverrides\":{" ++ counter_at ++
+        ":{\"stateDiff\":{\"" ++ word ++ "0\":\"0x" ++ "000000000000000000000000000000" ++
+        "000000000000000000000000000000000a\"}}},\"calls\":[" ++ counter_call ++ "]}," ++
+        "{\"stateOverrides\":{" ++ counter_at ++ ":{\"state\":{}}},\"calls\":[" ++ counter_call ++
+        "]}" ++
+        "]},\"latest\"]";
+    const text = try h.request("eth_simulateV1", params);
+    try expect_contains(text, "\"returnData\":\"" ++ word ++ "1\"");
+    try expect_contains(text, "\"returnData\":\"" ++ word ++ "2\"");
+    try expect_contains(text, "\"returnData\":\"0x" ++ "00000000000000000000000000000000" ++
+        "0000000000000000000000000000000b\"");
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"returnData\":\"" ++ word ++ "1\""));
+    try expect_contains(text, "\"logIndex\":\"0x1\"");
+    try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"}");
+    try expect_contains(text, "\"number\":\"0x2\",\"timestamp\":\"0x1000\"");
+    try expect_contains(text, "\"number\":\"0x3\",\"timestamp\":\"0x100c\"");
+    // Nothing was committed.
+    try testing.expectEqual(head_root, try h.node.db.root());
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_getCode", "[" ++
+        counter_at ++ ",\"latest\"]"));
+}
+
+test "eth: eth_simulateV1 limits and rejections" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const gas = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"gasLimit\":\"0x7530\"}," ++
+        "\"calls\":[{\"to\":" ++ address_target ++ ",\"gas\":\"0xc350\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", gas), "\"code\":-38015");
+    const backwards = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", backwards), "\"code\":-38020");
+    const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
+    try expect_contains(try h.request("eth_simulateV1", validation), "not supported");
+    const fee = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x1\"}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", fee), "unsupported block override");
+    try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
+    const empty = try h.request("eth_simulateV1", "[{\"blockStateCalls\":[]}]");
+    try testing.expectEqualStrings("\"result\":[]", empty);
+}
+
+fn simulate_scenario(seed: u64) !void {
+    var prng = Prng.init(seed);
+    const h = try Harness.create();
+    defer h.destroy();
+    const head_root = try h.node.db.root();
+    var body: [4096]u8 = undefined;
+    const pieces = [_][]const u8{
+        "{\"calls\":[{\"to\":" ++ counter_at ++ "}]}",
+        "{\"stateOverrides\":{" ++ counter_at ++ ":{\"code\":\"" ++ counter_hex ++ "\"}}}",
+        "{\"blockOverrides\":{\"time\":\"0x5\"}}",
+        "{\"blockOverrides\":{\"gasLimit\":\"0x0\"},\"calls\":[{}]}",
+        "{\"stateOverrides\":{" ++ counter_at ++ ":{\"balance\":\"0x10\",\"state\":{}}}}",
+        "{\"calls\":[{\"to\":" ++ counter_at ++ ",\"value\":\"0x1\"}]}",
+        "{\"calls\":[{\"from\":" ++ address_one ++ ",\"to\":" ++ reverter_at ++ "}]}",
+        "{\"bogus\":1}",
+    };
+    var w: std.Io.Writer = .fixed(&body);
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_simulateV1\",\"params\":[{");
+    try w.writeAll("\"blockStateCalls\":[");
+    const count = prng.below(6);
+    for (0..count) |index| {
+        if (index > 0) try w.writeAll(",");
+        try w.writeAll(pieces[prng.below(pieces.len)]);
+    }
+    try w.writeAll("]}]}");
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, w.buffered(), &out);
+    try json.validate(out.buffered());
+    try testing.expectEqual(head_root, try h.node.db.root());
+    try testing.expectEqual(@as(usize, 0), h.node.executor.state.accounts.count());
+}
+
+test "eth: seeded fuzz of eth_simulateV1 requests" {
+    for (0..48) |seed| try simulate_scenario(seed + 0x5171);
+}
+
+fn fuzz_simulate(_: void, smith: *testing.Smith) anyerror!void {
+    try simulate_scenario(smith.value(u64));
+}
+
+test "eth: fuzz eth_simulateV1" {
+    try testing.fuzz({}, fuzz_simulate, .{});
+}
+
 test "eth: call and estimate gas" {
     const h = try Harness.create();
     defer h.destroy();
@@ -788,6 +887,7 @@ const method_names = [_][]const u8{
     "debug_executePayload",
     "debug_proofsSyncStatus",
     "eth_createAccessList",
+    "eth_simulateV1",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

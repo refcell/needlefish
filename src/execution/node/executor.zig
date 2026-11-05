@@ -378,6 +378,68 @@ pub const Executor = struct {
         return executor.simulate(block, call);
     }
 
+    /// A multi-call simulation (`eth_simulateV1`): state changes carry over between
+    /// calls and blocks and are discarded by `session_end`.
+    pub const Session = struct {
+        saved: evm.state.Database,
+    };
+
+    pub const SessionCall = union(enum) {
+        invalid: evm.transaction.Invalid,
+        executed: struct {
+            status: evm.evm.Status,
+            gas_used: u64,
+            /// Valid until the next session call.
+            output: []const u8,
+            logs: []const evm.state.Log,
+        },
+    };
+
+    /// Starts a session over `database` (null: the executor's own committed state).
+    pub fn session_begin(executor: *Executor, database: ?evm.state.Database) Session {
+        executor.abort_block();
+        executor.arena.reset();
+        const session: Session = .{ .saved = executor.state.database };
+        if (database) |other| executor.state.database = other;
+        return session;
+    }
+
+    /// Discards every change of the session and restores the executor's database.
+    pub fn session_end(executor: *Executor, session: Session) void {
+        executor.abort_block();
+        executor.state.database = session.saved;
+        assert(executor.state.accounts.count() == 0);
+    }
+
+    /// Runs `call` in `block` (fee-free: gas price zero) without discarding its changes.
+    pub fn session_call(executor: *Executor, block: *const BlockEnv, call: Call) Error!SessionCall {
+        executor.set_block_env(block);
+        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
+        const caller = try executor.state.load(call.from);
+        const tx: TxEnv = .{
+            .tx_type = .legacy,
+            .caller = call.from,
+            .gas_limit = call.gas orelse block.gas_limit,
+            .gas_price = 0,
+            .to = call.to,
+            .value = call.value,
+            .data = call.data,
+            .nonce = caller.info.nonce,
+            .chain_id = executor.spec.chain_id,
+            .access_list = call.access_list,
+        };
+        const result = try evm.transaction.transact(executor.machine, fork, &tx);
+        return switch (result) {
+            .invalid => |reason| .{ .invalid = reason },
+            .executed => |executed| .{ .executed = .{
+                .status = executed.status,
+                .gas_used = executed.gas_used,
+                .output = executed.output,
+                .logs = executed.logs,
+            } },
+        };
+    }
+
     /// Runs `call` on top of the committed state in `block`'s context, with no fee
     /// (base fee zero, gas price zero), then discards every change. The output borrows
     /// the scratch arena until the next call.

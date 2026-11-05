@@ -40,7 +40,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
-- [ ] rpc: eth_simulateV1.
+- [x] rpc: eth_simulateV1 (multi-block, state/block overrides, fee-free; see Log).
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
@@ -78,6 +78,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_simulateV1 over a new executor session API (`session_begin/call/end`: state carries across calls and blocks, discarded at the end; works on head or a history-window block). Supported: block overrides number/time/gasLimit/feeRecipient/prevRandao (defaults parent+1, time+12; must increase, -38020/-38021), state overrides balance/nonce/code/state (fresh storage incarnation)/stateDiff, calls default to remaining block gas (-38015 past it), per-call returnData/logs/gasUsed/status/error (3 revert with data, -32015 halt). Decisions: calls are fee-free (gas price and base fee 0, as geth without validation); `validation: true` and baseFeePerGas overrides are rejected, traceTransfers ignored, blocks carry no hash/roots. Bounds: 16 blocks, 256 calls/block, 64 overridden accounts, 256 slots each.
 - 2026-11-05: 0x79 pool admission (`txpool/eip8130.zig`). Decision: no separate 2D-nonce pool (base/base's ~10k lines); each nonce channel is a pool "sender" lane: key 0 = the sender (account nonce), 2D keys = `keccak("8130-lane"||sender||key)[12..]` (channel nonce from nonce manager storage), nonce-free = one lane per tx hash. Lane balance = payer's. Stateless checks: Everest, static rules, validity window at the next block time, gas limit vs worst-case intrinsic gas (`Input.worst_case`, first use assumed for sequence 0). Keystore/payer authorization is left to execution (the builder skips evm rejections). `Chain.lane_account` reads lane state for `eth_sendRawTransaction`; `prune_pool` refreshes the lane of included 0x79 txs. txpool_content lists 2D lanes under their lane address.
 - 2026-11-05: The executor runs EIP-8130 (0x79) envelopes now that the evm lane executes them: L2 with Everest active only (else TxTypeNotSupported); the TxEnv carries `eip8130 = &envelope.eip8130` (built in `apply_transaction` so the pointer outlives `transact`), the raw envelope, gas limit, and the fee fields for tip accounting; the evm recovers the sender (the sender pipeline's result is ignored). Receipts carry `committed_phases`; a pre-call rejection is InvalidTransaction. Pool admission (0x79 in `txpool/validate.zig`) is still open.
 - 2026-11-05: Fixed the canonical number index after a reorg back (reported by trie-db, "Node canonical index after a reorg back"): `mark_canonical` now drops index entries above the new head (`BlockStore.clear_canonical_above`) before writing the branch down to the first matching number. Before, A6 -> B5 -> A6 left 5 -> B5 (the walk stopped at A6 itself). Regression test plus an index-equals-ancestry check in the chain fuzz.

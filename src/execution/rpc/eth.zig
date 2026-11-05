@@ -42,7 +42,7 @@ pub const Api = struct {
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
     @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
-    @import("access_list.zig").methods;
+    @import("access_list.zig").methods ++ @import("simulate.zig").methods;
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
@@ -539,7 +539,7 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Calls ------------------------------------------------------------------------
 
-fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.Call {
+pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.Call {
     var result: node.executor.Executor.Call = .{};
     var scanner = json.Scanner.init(raw);
     if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
@@ -597,7 +597,7 @@ pub fn proof_tail_offset(api: *Api) ?usize {
     return start - base;
 }
 
-fn view_header(api: *Api, view: state_view.View) consensus.Header {
+pub fn view_header(api: *Api, view: state_view.View) consensus.Header {
     return switch (view) {
         .head => head_header(api),
         .historical => |block| api.chain.header(block.hash).?, // Resolved, so stored.
@@ -839,6 +839,7 @@ pub fn block_logs(
 test {
     _ = @import("eth_config.zig");
     _ = @import("access_list.zig");
+    _ = @import("simulate.zig");
     _ = @import("eth_test.zig");
     _ = @import("debug_test.zig");
     _ = @import("debug_http_test.zig");
