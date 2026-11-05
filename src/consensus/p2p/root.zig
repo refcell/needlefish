@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const gossip = @import("gossip/root.zig");
 pub const peers = @import("peers/root.zig");
+pub const disc = @import("disc/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
