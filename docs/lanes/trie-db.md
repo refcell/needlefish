@@ -13,7 +13,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `trie/bench.zig`; commit latency waits on the storage engine)
 - [x] Durable database facade (`db/database.zig`): journal block/head entries, state moves
   only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
-- [ ] Real storage backend over `utilities.io` (io_uring/kqueue) once io lands.
+- [x] Real storage backend over `utilities.io` (io_uring/kqueue): `db/storage/io_storage.zig`.
 - [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
 - [ ] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`; compact node layout (packed paths, out-of-line values).
@@ -61,6 +61,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   database (not ChainStore) drives block retention so live and checkpoint-rebuilt stores
   match; checkpoints = header + State snapshot + retained blocks, started when the journal is
   half full and the queue is empty. Genesis = first `execute_and_commit` after format.
+- `IoStorageType(IO)` (`db/storage/io_storage.zig`): Storage over `utilities.io` on a
+  caller-owned fd (the binary opens/creates the file via `io.open_file`). Bounded IO completion
+  pool (`operations_max`), overflow waits in an intrusive FIFO; short reads/writes resubmit
+  the rest; EOF reads zero-fill (sparse/short file); read errors retry then zero-fill (engine
+  checksums catch it); write errors retry then panic; fsync errors panic (fsyncgate). IO
+  callbacks only queue; storage callbacks run from `tick()`, which calls non-blocking
+  `io.tick()`. With `SimIo` the caller advances time (`io.run_for_ns`) before `tick()`.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -79,3 +86,5 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: durable database facade over the storage engine; crash-recovery tests
   (24 seeds x 4 crashes) recover a head/root between last acked and last submitted op.
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
+- 2026-11-05: IoStorage over utilities.io; engine end to end over a short-IO double, SimIo
+  (16 crash seeds), and kqueue/io_uring on a real temp file.

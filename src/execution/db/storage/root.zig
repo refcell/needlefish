@@ -13,9 +13,11 @@ pub const superblock = @import("superblock.zig");
 pub const journal = @import("journal.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const engine = @import("engine.zig");
+pub const io_storage = @import("io_storage.zig");
 
 pub const sector_size = storage.sector_size;
 pub const SimStorage = sim_storage.SimStorage;
+pub const IoStorageType = io_storage.IoStorageType;
 pub const EngineType = engine.EngineType;
 pub const Config = engine.Config;
 pub const Consumer = engine.Consumer;
@@ -27,4 +29,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("journal_test.zig");
     _ = @import("engine_test.zig");
+    _ = @import("io_storage_test.zig");
 }
