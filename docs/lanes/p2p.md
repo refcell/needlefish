@@ -41,11 +41,14 @@ behind a small interface and switch later.
   outbound mesh quota (D_out = 2), IWANT retransmission limit.
 - [ ] `gossip`: IDONTWANT (v1.2) and peer exchange on PRUNE (both off in base/base's
   libp2p config; low priority).
-- [ ] `gossip`: snappy block-format codec (own implementation, fuzzed round trip) [done],
+- [x] `gossip`: snappy block-format codec (own implementation, fuzzed round trip),
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
   signer, block validity rules (port `block_validity.rs`: timestamp window, seen hashes
   per height limits, v3/v4 field rules).
+- [ ] `gossip`: Denim sub-second timestamp check (`BaseTimeUpdateTx::
+  validate_block_timestamp`) once consensus has the Base time-update tx decoder; a real
+  Base block as a block-hash vector; EIP-8130 (0x79) tx decoding in validity.
 - [ ] `Service`: one state machine tying disc + libp2p + gossip; publish signed unsafe
   blocks (sequencer), deliver validated blocks to consensus; DST of a 5-node cluster
   gossiping blocks with partitions/latency.
@@ -125,6 +128,17 @@ behind a small interface and switch later.
 - Connection limits mirror base/base `ConnectionLimitsConfig`: pending in 5 / out 16,
   established 30, per peer 1.
 
+- Block gossip (worker): message id = sha256(domain || topic_len u64 LE || topic ||
+  data)[0..20] with domain 1 + decompressed data, or 0 + raw data when snappy fails or
+  declares > 10 MiB (base/base golden vector passes). Withdrawals decoded up to 16 then
+  rejected by validity (base/base rejects at decode; same outcome). v byte accepts
+  0/1, 27/28, 35..255 like alloy; high-s accepted. EIP-4844 txs rejected; 0x79 txs not
+  decoded yet. Seen table: 1000 heights x 5 hashes, lowest height dropped when full.
+  Reuses `common/crypto` secp256k1 recovery, `RollupConfig`, header and trie code.
+- discv5 bans: 256 node ids; banned nodes are evicted, their packets, handshakes and
+  records ignored until expiry; re-banning keeps the later expiry. The Service will ban
+  gossip peers scoring under -100 for 1 h every 15 s (base/base `PeerMonitoring`).
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -143,3 +157,6 @@ behind a small interface and switch later.
 - 2026-11-05: `libp2p` multistream-select, noise XX, yamux (worker, 736304d..eb8d70c).
 - 2026-11-05: `libp2p` identify, ping, connection limits.
 - 2026-11-05: p2p benchmarks (handshake, transport, snappy, rpc, seen, router).
+- 2026-11-05: `gossip` SSZ payloads v1-v4, block topics/ids/envelopes, validity (worker,
+  06d1ae2..8e11d37).
+- 2026-11-05: `disc` node bans.
