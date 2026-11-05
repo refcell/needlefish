@@ -32,7 +32,7 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   load-balancing RPC proxy over N upstreams with health checks, retry, and method
   allowlist (port `roxy`, extend toward base/base's intent). Sim test with a failing
   upstream.
-- [ ] `infra/load_test`: seeded workload generator (funded dev accounts from the
+- [x] `infra/load_test`: seeded workload generator (funded dev accounts from the
   public test-junk mnemonic, transfer/ERC-20/calldata payload mixes, key stream),
   open-loop rate runner, latency/inclusion metrics, report (port `load-tests/src/*`).
   `bin/base load-test` against the devnet; deterministic in sim with a fixed seed.
@@ -65,6 +65,10 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
 - `balance-monitor` is a standalone tool (base/base only has the library layer): `/metrics`,
   `/`, `/healthz`, plus `/readyz` (503 once reads are older than N poll intervals). Flags use
   `utilities/cli` with `BASE_BALANCE_MONITOR_*` env fallback.
+- load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
+  address; deploying a token is future work), open-loop pacer with 2x catch-up, one
+  tx_manager driver per sender, latency via reservoir sampling. Default senders are dev
+  accounts 2,3,4,8,9 so the devnet's role accounts (0,1,5,6,7) keep their nonces.
 - Deviation from base/base: "nonce too low" before any publish also resets the nonce cache
   so the next send refetches the chain nonce instead of failing the same way.
 
@@ -74,5 +78,8 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
 - 2026-11-05: tx_manager JSON-RPC driver (sign, publish, canonical receipts, gas estimate)
   with fake-L1 tests for ordering, drop + bump, reorged receipts, and rejections.
 - 2026-11-05: `base balance-monitor` (exporter + sim tests); smoke-tested against
-  `base node --dev-l1`. Seen there, node lane's: `miner: block failed err=InternalError` on a
-  fresh `devnet init` L1 genesis.
+  `base node --dev-l1` (needs a fresh `devnet init --force` genesis; a stale genesis
+  timestamp makes the dev miner fail every block, as `etc/devnet/devnet.sh` notes).
+- 2026-11-05: load_test (pacer, workload, metrics, runner + fake-chain sim) and
+  `base load-test`; against `base node --dev-l1` (1 s blocks, 5 tx/s): 49/49 confirmed,
+  p50 1085 ms.
