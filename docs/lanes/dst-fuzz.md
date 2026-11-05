@@ -206,3 +206,7 @@ provably robust.
   nonce counter, so a lost nonce is never refilled): 62/600 seeds fail liveness.
   Disabling only `needs_reset` survives: the service's safe-head stall reset and the
   contiguous `pending` nonce also repair a gap.
+- 2026-11-05: model-based native precompile calldata fuzz (`fuzz_targets_abi.zig`):
+  random tuples over every `native_abi.Kind` encoded by a reference ABI encoder; round
+  trip, trailing bytes, truncation (overrun or identical), one invalid value fails the
+  type check, arbitrary calldata stays in bounds. 3/3 mutants caught.
