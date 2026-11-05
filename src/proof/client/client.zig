@@ -109,6 +109,42 @@ pub fn spec_for(chain_id: u64) ?*const chainspec.ChainSpec {
     return null;
 }
 
+/// The execution spec of a custom chain from its rollup config: each upgrade activates at
+/// the earliest of its own time and the times of the upgrades that imply it (the OP
+/// cascade), fee parameters from `chain_op_config`, gas limit from the genesis system
+/// config.
+pub fn custom_spec(boot: *const program.BootInfo) error{UnknownChainSpec}!chainspec.ChainSpec {
+    assert(boot.custom);
+    const rollup = &boot.rollup_config;
+    var spec: chainspec.ChainSpec = .{
+        .chain_id = boot.chain_id,
+        .mode = .l2,
+        .base_fee_params = .init(boot.chain_op.denominator, boot.chain_op.elasticity),
+        .base_fee_params_canyon = .init(boot.chain_op.denominator_canyon, boot.chain_op.elasticity),
+        .gas_limit = if (rollup.genesis.system_config) |config| config.gas_limit else 0,
+    };
+    if (spec.gas_limit == 0) return error.UnknownChainSpec;
+    const names = @typeInfo(chainspec.Upgrade).@"enum".field_names;
+    inline for (names, 0..) |name, index| {
+        const upgrade = @field(protocol.Upgrade, name);
+        spec.upgrades[index] = cascade_activation(rollup, upgrade);
+    }
+    spec.validate() catch return error.UnknownChainSpec;
+    assert(spec.mode == .l2);
+    return spec;
+}
+
+fn cascade_activation(rollup: *const protocol.RollupConfig, upgrade: protocol.Upgrade) ?u64 {
+    var earliest: ?u64 = null;
+    var current: ?protocol.Upgrade = upgrade;
+    for (0..protocol.Upgrade.count) |_| {
+        const step = current orelse break;
+        if (rollup.upgrades.get(step)) |at| earliest = @min(earliest orelse at, at);
+        current = step.implied_by();
+    } else unreachable; // Proof: implied_by strictly increases the enum value.
+    return earliest;
+}
+
 /// The L1 blob fee schedule of an L1 fork config.
 pub fn blob_schedule_of(
     config: *const chains.L1Config,
@@ -130,6 +166,7 @@ pub const Client = struct {
     rollup: protocol.RollupConfig,
     bpo: [2]L1BlobSchedule.Entry,
     blob_schedule: L1BlobSchedule,
+    custom_spec: chainspec.ChainSpec = undefined,
     resolver: mpt.OracleResolver,
     l1: program.L1ChainProvider,
     blobs: program.L1BlobProvider,
@@ -151,9 +188,12 @@ pub const Client = struct {
         safe_hash: Hash,
         options: Options,
     ) Error!void {
-        const spec = spec_for(boot.chain_id) orelse return error.UnknownChainSpec;
+        const spec = if (boot.custom) custom: {
+            self.custom_spec = try custom_spec(boot);
+            break :custom &self.custom_spec;
+        } else spec_for(boot.chain_id) orelse return error.UnknownChainSpec;
         self.rollup = boot.rollup_config;
-        self.blob_schedule = blob_schedule_of(boot.l1_config, &self.bpo);
+        self.blob_schedule = blob_schedule_of(&boot.l1_config, &self.bpo);
         self.resolver = try .init(allocator, io.oracle, options.resolver);
         errdefer self.resolver.deinit(allocator);
         const rollup = &self.rollup;
@@ -218,3 +258,22 @@ pub const Client = struct {
         };
     }
 };
+
+test "client: a custom chain's spec follows the OP upgrade cascade" {
+    var boot: program.BootInfo = undefined;
+    boot.custom = true;
+    boot.chain_id = 901;
+    boot.chain_op = .{};
+    boot.rollup_config = .{ .l2_chain_id = 901 };
+    boot.rollup_config.genesis.system_config = .{ .gas_limit = 30_000_000 };
+    boot.rollup_config.upgrades.set(.holocene, 100);
+    boot.rollup_config.upgrades.set(.isthmus, 50);
+    const spec = try custom_spec(&boot);
+    const at = &spec.upgrades;
+    try std.testing.expectEqual(@as(?u64, 50), at[@backingInt(chainspec.Upgrade.regolith)]);
+    try std.testing.expectEqual(@as(?u64, 50), at[@backingInt(chainspec.Upgrade.holocene)]);
+    try std.testing.expectEqual(@as(?u64, null), at[@backingInt(chainspec.Upgrade.jovian)]);
+    try std.testing.expect(spec.is_upgrade_active(.ecotone, 60));
+    boot.rollup_config.genesis.system_config = null;
+    try std.testing.expectError(error.UnknownChainSpec, custom_spec(&boot));
+}

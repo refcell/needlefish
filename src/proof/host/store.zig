@@ -134,6 +134,7 @@ pub const Store = struct {
         try store.put_u64(.l2_claim_block_number, boot.claimed_l2_block_number);
         try store.put_u64(.l2_chain_id, boot.chain_id);
         try store.put(LocalKey.l2_rollup_config.key(), boot.rollup_config_json);
+        try store.put(LocalKey.l1_config.key(), boot.l1_config_json);
         const proposer: []const u8 = if (boot.proposer) |*address| address else "";
         try store.put(LocalKey.proposer.key(), proposer);
         try store.put_u64(.intermediate_block_interval, boot.intermediate_block_interval);
@@ -161,6 +162,8 @@ pub const BootValues = struct {
     claimed_l2_block_number: u64,
     chain_id: u64,
     rollup_config_json: []const u8,
+    /// Custom L1 chains only: a geth chain config JSON object.
+    l1_config_json: []const u8 = "",
     proposer: ?[20]u8 = null,
     intermediate_block_interval: u64 = 1,
     l1_head_number: ?u64 = null,

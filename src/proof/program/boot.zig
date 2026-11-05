@@ -6,9 +6,13 @@
 //! proposer 20 bytes, the rollup config JSON. Optional keys the host does not have are
 //! served as empty preimages (the wire has no "not found"; see the lane decisions).
 //!
-//! Trust: the rollup config comes from the host, so outside the devnet its identity
-//! fields (chain ids, genesis, inbox, deposit and system config contracts, block time)
-//! must equal the built-in chain config; only upgrade timestamps come from the host.
+//! Trust: the rollup config comes from the host, so for a known chain (outside the
+//! devnet) its identity fields (chain ids, genesis, inbox, deposit and system config
+//! contracts, block time) must equal the built-in chain config; only upgrade timestamps
+//! come from the host. An unknown L2 chain id is a custom chain (base/base `BootInfo`):
+//! the rollup config is taken from the host as is, and an unknown L1 chain's config comes
+//! from the `l1_config` key (a geth chain config JSON object). Whoever picks a custom
+//! chain's boot values vouches for them, exactly as for the claim itself.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +24,7 @@ const protocol = @import("../../consensus/protocol/root.zig");
 const Hash = [32]u8;
 const Address = [20]u8;
 const RollupConfig = protocol.RollupConfig;
+const json = @import("../../utilities/json/root.zig");
 
 pub const LocalKey = enum(u64) {
     l1_head = 1,
@@ -48,6 +53,18 @@ pub const Error = preimage.oracle.ReadError || error{
     RollupConfigInvalid,
     RollupConfigMismatch,
     MissingL1ChainConfig,
+    L1ConfigInvalid,
+};
+
+/// Largest L1 config JSON accepted.
+pub const l1_config_bytes_max: u32 = 16 * 1024;
+
+/// L2 EIP-1559 parameters (rollup config `chain_op_config`); the Base mainnet values
+/// when absent.
+pub const ChainOpConfig = struct {
+    elasticity: u64 = 6,
+    denominator: u64 = 50,
+    denominator_canyon: u64 = 250,
 };
 
 pub const BootInfo = struct {
@@ -57,7 +74,10 @@ pub const BootInfo = struct {
     claimed_l2_block_number: u64,
     chain_id: u64,
     rollup_config: RollupConfig,
-    l1_config: *const chains.L1Config,
+    l1_config: chains.L1Config,
+    chain_op: ChainOpConfig,
+    /// The L2 chain is not built in: the rollup config is the host's.
+    custom: bool,
     proposer: Address,
     intermediate_block_interval: u64,
     l1_head_number: u64,
@@ -74,14 +94,7 @@ pub const BootInfo = struct {
         info.claimed_l2_block_number = try read_u64(oracle, .l2_claim_block_number) orelse
             return error.InvalidBootValue;
         info.chain_id = try read_u64(oracle, .l2_chain_id) orelse return error.InvalidBootValue;
-        const chain = chains.by_chain_id(info.chain_id) orelse return error.UnknownChainId;
-        const text = try oracle.get(LocalKey.l2_rollup_config.key(), scratch);
-        info.rollup_config = protocol.rollup_json.parse(text) catch {
-            return error.RollupConfigInvalid;
-        };
-        try check_rollup_config(&info.rollup_config, chain);
-        info.l1_config = chains.l1_by_chain_id(info.rollup_config.l1_chain_id) orelse
-            return error.MissingL1ChainConfig;
+        try load_chain(oracle, &info, scratch);
         info.proposer = @splat(0);
         const proposer = try oracle.get(LocalKey.proposer.key(), scratch);
         if (proposer.len == 20) {
@@ -97,6 +110,75 @@ pub const BootInfo = struct {
         return info;
     }
 };
+
+/// The rollup config, its chain op config, and the L1 config.
+fn load_chain(oracle: preimage.OracleReader, info: *BootInfo, scratch: []u8) Error!void {
+    const text = try oracle.get(LocalKey.l2_rollup_config.key(), scratch);
+    info.rollup_config = protocol.rollup_json.parse(text) catch {
+        return error.RollupConfigInvalid;
+    };
+    if (info.rollup_config.l2_chain_id != info.chain_id) return error.RollupConfigMismatch;
+    info.chain_op = parse_chain_op(text) catch return error.RollupConfigInvalid;
+    info.custom = chains.by_chain_id(info.chain_id) == null;
+    if (chains.by_chain_id(info.chain_id)) |chain| {
+        try check_rollup_config(&info.rollup_config, chain);
+    }
+    if (chains.l1_by_chain_id(info.rollup_config.l1_chain_id)) |known| {
+        info.l1_config = known.*;
+        return;
+    }
+    if (!info.custom) return error.MissingL1ChainConfig;
+    var buffer: [l1_config_bytes_max]u8 = undefined;
+    const l1_text = try oracle.get(LocalKey.l1_config.key(), &buffer);
+    if (l1_text.len == 0) return error.MissingL1ChainConfig;
+    info.l1_config = parse_l1_config(l1_text) catch return error.L1ConfigInvalid;
+    if (info.l1_config.chain_id != info.rollup_config.l1_chain_id) {
+        return error.L1ConfigInvalid;
+    }
+}
+
+fn find_u64(text: []const u8, path: []const []const u8) !?u64 {
+    const raw = try json.find_path(text, path) orelse return null;
+    if (std.mem.eql(u8, raw, "null")) return null;
+    return try std.fmt.parseInt(u64, raw, 10);
+}
+
+/// `chain_op_config` of a rollup config JSON (missing fields keep their defaults).
+pub fn parse_chain_op(text: []const u8) !ChainOpConfig {
+    var config: ChainOpConfig = .{};
+    const fields = .{
+        .{ "eip1559Elasticity", &config.elasticity },
+        .{ "eip1559Denominator", &config.denominator },
+        .{ "eip1559DenominatorCanyon", &config.denominator_canyon },
+    };
+    inline for (fields) |field| {
+        if (try find_u64(text, &.{ "chain_op_config", field[0] })) |value| field[1].* = value;
+    }
+    if (config.elasticity == 0 or config.denominator == 0) return error.InvalidChainOp;
+    if (config.denominator_canyon == 0) return error.InvalidChainOp;
+    return config;
+}
+
+/// An L1 config from a geth chain config JSON object (`chainId`, `shanghaiTime`, ...).
+pub fn parse_l1_config(text: []const u8) !chains.L1Config {
+    const chain_id = try find_u64(text, &.{"chainId"}) orelse return error.MissingChainId;
+    var config: chains.L1Config = .{
+        .chain_id = chain_id,
+        .shanghai = try find_u64(text, &.{"shanghaiTime"}),
+        .cancun = try find_u64(text, &.{"cancunTime"}),
+        .prague = try find_u64(text, &.{"pragueTime"}),
+        .osaka = try find_u64(text, &.{"osakaTime"}),
+        .bpo1 = try find_u64(text, &.{"bpo1Time"}),
+        .bpo2 = try find_u64(text, &.{"bpo2Time"}),
+    };
+    if (try json.find_path(text, &.{"depositContractAddress"})) |raw| {
+        if (raw.len < 2 or raw[0] != '"') return error.InvalidAddress;
+        const bytes = try json.parse_fixed(20, raw[1 .. raw.len - 1]);
+        config.deposit_contract_address = .{ .bytes = bytes };
+    }
+    assert(config.chain_id == chain_id);
+    return config;
+}
 
 /// An 8-byte big-endian local value, or null when served empty.
 fn read_u64(oracle: preimage.OracleReader, local: LocalKey) Error!?u64 {
@@ -124,7 +206,6 @@ fn check_rollup_config(config: *const RollupConfig, chain: *const chains.ChainCo
 }
 
 const testing = std.testing;
-const json = @import("../../utilities/json/root.zig");
 
 const BootStore = preimage.MemoryStore(16, 16 * 1024);
 
@@ -201,4 +282,62 @@ test "boot: zero interval and a malformed integer are rejected" {
     try short.put(LocalKey.l2_claim_block_number.key(), &.{ 1, 2, 3 });
     try fill_store(&short, &config, &json_buffer);
     try testing.expectError(error.InvalidBootValue, load_from(&short));
+}
+
+test "boot: a custom chain takes the host's rollup and L1 configs" {
+    var store: BootStore = .{};
+    var json_buffer: [8192]u8 = undefined;
+    var config = devnet_config();
+    config.l2_chain_id = 901;
+    config.l1_chain_id = 900;
+    try fill_store(&store, &config, &json_buffer);
+    var empty: BootStore = store;
+    try empty.put(LocalKey.l1_config.key(), "");
+    try testing.expectError(error.MissingL1ChainConfig, load_from(&empty));
+    var wrong: BootStore = store;
+    try wrong.put(LocalKey.l1_config.key(), "{\"chainId\":1,\"cancunTime\":0}");
+    try testing.expectError(error.L1ConfigInvalid, load_from(&wrong));
+    try store.put(
+        LocalKey.l1_config.key(),
+        "{\"chainId\":900,\"shanghaiTime\":0,\"cancunTime\":0,\"pragueTime\":null}",
+    );
+    const info = try load_from(&store);
+    try testing.expect(info.custom);
+    try testing.expectEqual(@as(u64, 900), info.l1_config.chain_id);
+    try testing.expectEqual(@as(?u64, 0), info.l1_config.cancun);
+    try testing.expectEqual(@as(?u64, null), info.l1_config.prague);
+    try testing.expectEqual(@as(u64, 50), info.chain_op.denominator);
+}
+
+test "boot: chain op config and L1 config parsing" {
+    const text =
+        \\{"chain_op_config":{"eip1559Elasticity":10,"eip1559Denominator":40,
+        \\"eip1559DenominatorCanyon":200}}
+    ;
+    const op = try parse_chain_op(text);
+    try testing.expectEqual(@as(u64, 10), op.elasticity);
+    try testing.expectEqual(@as(u64, 200), op.denominator_canyon);
+    const zero = "{\"chain_op_config\":{\"eip1559Elasticity\":0}}";
+    try testing.expectError(error.InvalidChainOp, parse_chain_op(zero));
+    const l1 = try parse_l1_config(
+        \\{"chainId":5,"depositContractAddress":"0x00000000000000000000000000000000000000aa"}
+    );
+    try testing.expectEqual(@as(u8, 0xaa), l1.deposit_contract_address.?.bytes[19]);
+    try testing.expectError(error.MissingChainId, parse_l1_config("{}"));
+}
+
+const fuzz = @import("../../testing/fuzz.zig");
+
+fn fuzz_parse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var text: [256]u8 = undefined;
+    const length = smith.slice(&text);
+    // Arbitrary JSON-ish text parses or fails cleanly.
+    if (parse_chain_op(text[0..length])) |op| {
+        try testing.expect(op.elasticity > 0 and op.denominator > 0);
+    } else |_| {}
+    _ = parse_l1_config(text[0..length]) catch {};
+}
+
+test "boot: fuzz config parsing" {
+    try fuzz.run({}, fuzz_parse, .{ .iterations = 1024 });
 }

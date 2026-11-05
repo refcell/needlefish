@@ -48,9 +48,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `bin/base proof`: `replay <archive>` (offline) and `run` (native mode against
   L1/L2 execution RPCs; boot values from `--agreed`/`--claimed` headers, output roots
   from state root + withdrawals root; `--out` records the archive).
-- [ ] `proof/devnet-proof`: run `base proof run` against a live local devnet (node
-  `--dev-l1` + L2 node + consensus + batcher) in a script under `etc/`, then replay the
-  archive; fix whatever the real chain exposes.
+- [x] `proof/devnet-proof`: `etc/proof/devnet-proof.sh [blocks]` proves the verifier's
+  safe head on the running devnet, replays the archive, and checks a wrong claim fails.
+  First live run: agreed 100 -> claimed 140 holds (791 preimages, 40 s).
+- [ ] `proof/host-speed`: the RPC source pumps IO in 1 ms slices per call (40 s for 40
+  blocks, mostly idle): drive IO until completion without sleeping, and prefetch block
+  bodies with headers.
 - [ ] `proof/rpc` + `proof/contracts`: typed L1/L2/rollup clients with caching, ABI
   bindings for DisputeGameFactory, AnchorStateRegistry, DelayedWETH (port `rpc/`,
   `contracts/`). ABI encode/decode fuzz tests.
@@ -119,12 +122,17 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Holocene deposit-only retry only on block-validity errors (invalid tx, block/blob gas
   exceeded, unsupported type), as base/base; resource bounds, missing preimages and hint
   failures fail the proof, since a retry would replace a valid block with a wrong one.
+- Custom chains (base/base `BootInfo`): an unknown L2 chain id takes the host's rollup
+  config as is, and an unknown L1 its config from boot key 7 (geth chain config JSON);
+  the execution spec comes from the rollup config (OP cascade, `chain_op_config`, genesis
+  gas limit). Known chains keep the identity check.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: custom chains in boot/client; first live devnet proof holds and replays.
 - 2026-11-05: `base proof run`: native mode over RPC, records a replayable archive.
 - 2026-11-05: driver: deposit-only retry limited to block-validity errors (soundness).
 - 2026-11-05: host: RPC-backed source over the node's debug endpoints (SimIo HTTP test).
