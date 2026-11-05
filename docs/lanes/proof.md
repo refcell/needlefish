@@ -40,7 +40,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/e2e-2`: extend the e2e: epoch change across L1 blocks, span batches, blob
   batches (l1-blob through the host), a Holocene deposit-only retry (invalid user tx in a
   batch).
-- [ ] `proof/e2e-3`: e2e intermediate output roots (boot key 9); a host witness for the
+- [x] `proof/e2e-3`: e2e intermediate output roots (boot key 9); a host witness for the
   attempted payload, so a deposit-only retry can follow valid user txs that read state.
 - [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
   canonical archive, offline replay, JSON-RPC source, beacon blobs (`beacon_blobs.zig`
@@ -110,8 +110,22 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   The driver empties the providers' resolver between steps when it is half full.
 - Client: claimed block below the safe head is `InvalidClaimedBlock`; equal returns the
   agreed root (trace extension); otherwise derive until the target or L1 exhaustion and
-  compare the tip's output root with the claim. Intermediate output roots (boot key 9)
-  are loaded but not yet checked.
+  compare the tip's output root with the claim.
+- Intermediate output roots (boot key 9): in base/base only the TEE/ZK provers use them
+  (`execute_with_intermediates` + `IntermediateRootSampler`, committed in the proof
+  journal); the fault-proof client never checks them. The Zig client samples them the
+  same way when `Options.intermediate` is set (`program/intermediate_roots.zig`, bounded
+  at 8192 roots); an empty or non-dividing range reports an error from `finish` and does
+  not affect the claim. Boot checks the schedule block (key 11) is at or above the claim,
+  and the claim at or above L2 genesis. Proposer (key 8) is loaded only. Not ported:
+  `ScheduleId::pin` (no journal consumer yet) and the boot's Zenith/Everest/zero-time
+  rejections.
+- Attempted-payload witness: a deposit-only retry after valid user txs needs the witness
+  of executing the attempted attributes (the transfers read state the deposit-only block
+  does not). The e2e source serves it for attributes with user txs (built on the node as
+  a side block of the valid prefix, `debug_executePayload` style); the RPC source still
+  asks for the canonical child's witness, so such a block fails there with a missing
+  preimage (sound, not complete).
 - Host handler: chain data comes from a `Source` vtable (map-backed in tests; RPC later),
   checked against the requested hash before storing. Precompile, account-proof and
   starting-output hints are rejected: the Zig program runs precompiles natively and
@@ -137,6 +151,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/e2e-3` landed: intermediate output roots sampled at boot key 9 (e2e:
+  every block, the full range, a non-dividing interval, the trace extension); boot rejects
+  a schedule block below the claim; a deposit-only retry after valid transfers proven from
+  the attempted payload's witness (and failing without it).
 - 2026-11-05: host beacon blobs: blocking adapter over the consensus blob provider;
   `proof run --l1-beacon`; devnet script passes the beacon.
 - 2026-11-05: `proof/rpc`: blocking endpoint + typed L1/L2/rollup calls; host source on it.

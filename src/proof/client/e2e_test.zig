@@ -5,8 +5,9 @@
 //! handler, which serves every preimage from an in-memory chain source.
 //!
 //! Scenarios vary the shape: L2 blocks across an L1 epoch change, one span batch instead
-//! of singular batches, frames in an EIP-4844 blob instead of calldata, and a batch whose
-//! last block fails to execute (Holocene: replaced by its deposit-only block).
+//! of singular batches, frames in an EIP-4844 blob instead of calldata, a batch whose
+//! last block fails to execute (Holocene: replaced by its deposit-only block), and the
+//! intermediate output roots sampled at the boot's interval (key 9).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,6 +32,8 @@ const db_module = @import("../../execution/db/root.zig");
 const fixture = @import("../../execution/node/test_fixture.zig");
 const node_witness = @import("../../execution/node/witness.zig");
 const engine_types = @import("../../execution/engine/root.zig").types;
+const engine_json = @import("../../execution/rpc/engine_json.zig");
+const payload = @import("../../execution/payload/root.zig");
 const channel_manager = @import("../../batcher/channel/manager.zig");
 const batcher_source = @import("../../batcher/source/root.zig");
 const txdata = @import("../../batcher/txdata/root.zig");
@@ -124,10 +127,23 @@ const Scenario = struct {
     epoch_zero_blocks: u32 = l2_blocks,
     batch: enum { singular, span } = .singular,
     data: enum { calldata, blob } = .calldata,
-    /// The last block's batch carries a transaction execution rejects (fee cap below the
-    /// base fee), so
-    /// the node builds that block from its deposits only.
-    invalid_last: bool = false,
+    /// The last block's batch carries a transaction execution rejects, so the node builds
+    /// that block from its deposits only (Holocene).
+    invalid: enum {
+        none,
+        /// First in the batch: a fee cap below the base fee, rejected before any state
+        /// read, so the deposit-only block's witness suffices.
+        fee_cap_first,
+        /// Last, after two transfers that read and write state: a nonce gap from the
+        /// first transfer's sender. The client executes the transfers before the failure,
+        /// so it needs the witness of the attempted payload.
+        nonce_gap_last,
+    } = .none,
+    /// The source serves the attempted payload's witness for a nonce-gap block; false
+    /// serves only the node's deposit-only block's (a host keyed by the canonical child).
+    attempted_witness: bool = true,
+    /// Boot key 9: blocks between two intermediate output roots.
+    interval: u64 = 1,
 
     fn epoch_change(scenario: Scenario) bool {
         assert(scenario.epoch_zero_blocks >= 1);
@@ -146,6 +162,10 @@ const MapSource = struct {
     preimages: std.AutoHashMapUnmanaged(Hash, []const u8) = .empty,
     /// Witness byte strings of the node-built child, keyed by parent hash.
     witnesses: std.AutoHashMapUnmanaged(Hash, List) = .empty,
+    /// Witnesses of attempted payloads that fail to execute (user transactions the node
+    /// left out), keyed by parent hash; served for attributes with user transactions.
+    attempted: std.AutoHashMapUnmanaged(Hash, List) = .empty,
+    attempted_requests: u32 = 0,
     /// Blobs by versioned hash.
     blobs: std.AutoHashMapUnmanaged(Hash, host.handler.Blob) = .empty,
     witness_requests: u32 = 0,
@@ -159,6 +179,7 @@ const MapSource = struct {
         source.receipt_lists.deinit(allocator);
         source.preimages.deinit(allocator);
         source.witnesses.deinit(allocator);
+        source.attempted.deinit(allocator);
         source.blobs.deinit(allocator);
         source.arena.deinit();
     }
@@ -223,7 +244,35 @@ const MapSource = struct {
         const source = get(context);
         if (attributes.len == 0 or attributes[0] != '{') return error.SourceFailed;
         source.witness_requests += 1;
+        if (source.attempted.get(parent)) |items| {
+            if (try has_user_transactions(attributes)) {
+                source.attempted_requests += 1;
+                return items;
+            }
+        }
         return source.witnesses.get(parent) orelse error.NotFound;
+    }
+
+    /// True when the attributes JSON carries a non-deposit transaction.
+    fn has_user_transactions(attributes: []const u8) SourceError!bool {
+        var bytes: [1 << 14]u8 = undefined;
+        var transaction_slots: [64][]const u8 = undefined;
+        var withdrawals: [4]payload.Withdrawal = undefined;
+        var hashes: [4]B256 = undefined;
+        var space: engine_json.Space = .{
+            .bytes = &bytes,
+            .transactions = &transaction_slots,
+            .withdrawals = &withdrawals,
+            .hashes = &hashes,
+        };
+        const parsed = engine_json.parse_attributes(attributes, &space) catch
+            return error.SourceFailed;
+        const list = parsed.transactions orelse return false;
+        for (list) |transaction| {
+            if (transaction.len == 0) return error.SourceFailed;
+            if (transaction[0] != 0x7e) return true;
+        }
+        return false;
     }
 
     const vtable: host.handler.Source.VTable = .{
@@ -313,6 +362,7 @@ const Fixture = struct {
     agreed: Hash,
     expected: Hash,
     rollup_json: [8192]u8,
+    sampler: program.IntermediateRootSampler,
 
     fn create(scenario: Scenario) !*Fixture {
         const allocator = testing.allocator;
@@ -472,19 +522,19 @@ const Fixture = struct {
     }
 
     /// The batched user transactions of block `number`: two transfers, plus (when the
-    /// last block is invalid) a transfer whose fee cap is below the base fee. Derivation
-    /// accepts it; execution rejects it before reading state (as revm's environment
-    /// check does), so the parent's witness of the deposit-only block still suffices.
+    /// last block is invalid) one execution rejects and derivation accepts: a fee cap
+    /// below the base fee first (rejected before reading state, as revm's environment
+    /// check does), or a nonce gap after the transfers.
     fn user_transactions(self: *Fixture, number: usize) !List {
-        const invalid = self.scenario.invalid_last and number == l2_blocks;
+        const invalid = if (number == l2_blocks) self.scenario.invalid else .none;
         const arena = self.source.arena.allocator();
-        const user = try arena.alloc([]const u8, if (invalid) 3 else 2);
-        // The invalid transaction goes first: the transfers after it would read state the
-        // deposit-only block's witness does not hold.
-        const first: usize = if (invalid) 1 else 0;
-        if (invalid) user[0] = try self.transfer_paying(3, 0, 1);
+        const user = try arena.alloc([]const u8, if (invalid == .none) 2 else 3);
+        const first: usize = if (invalid == .fee_cap_first) 1 else 0;
+        if (invalid == .fee_cap_first) user[0] = try self.transfer_paying(3, 0, 1);
         user[first] = try self.transfer(1, number - 1);
         user[first + 1] = try self.transfer(2, number - 1);
+        // Sender 1's next nonce is `number`; `number + 1` leaves a gap.
+        if (invalid == .nonce_gap_last) user[2] = try self.transfer(1, number + 1);
         assert(user.len >= 2);
         return user;
     }
@@ -512,6 +562,9 @@ const Fixture = struct {
         }
         @memcpy(all[deposits..], user[0..executed]);
         var engine_attributes = attributes.engine();
+        if (self.scenario.invalid == .nonce_gap_last and number == l2_blocks) {
+            try self.add_attempted_witness(parent.hash, engine_attributes, user);
+        }
         engine_attributes.transactions = all;
         const hash = try self.execute(parent.hash, &engine_attributes);
         const header = self.node.chain.header(hash).?;
@@ -580,29 +633,62 @@ const Fixture = struct {
         return built.block_hash.bytes;
     }
 
+    /// The witness of the attempted payload of a nonce-gap block, which fails at its last
+    /// transaction: everything executing it reads before the failure. Built on the node
+    /// as a side block of the deposits and the valid prefix (the gap transaction's sender
+    /// is the first transfer's, so the failure reads nothing more), then the node's state
+    /// returns to its head. Witnessing the attempt also covers the deposit-only retry.
+    fn add_attempted_witness(
+        self: *Fixture,
+        parent: Hash,
+        attributes: payload.PayloadAttributes,
+        user: List,
+    ) !void {
+        assert(user.len == 3);
+        const deposits = attributes.transactions.?;
+        assert(deposits.len >= 1);
+        const arena = self.source.arena.allocator();
+        const prefix = try std.mem.concat(arena, []const u8, &.{ deposits, user[0..2] });
+        var attempted = attributes;
+        attempted.transactions = prefix;
+        const chain = &self.node.chain;
+        const hash = try chain.build_block(parent, &attempted);
+        if (self.scenario.attempted_witness) {
+            try node_witness.built_witness(chain, &self.generator, hash);
+            try self.source.attempted.put(testing.allocator, parent, try self.witness_items());
+        }
+        try chain.ensure_head_state();
+        try testing.expectEqual(parent, chain.head_hash());
+    }
+
+    /// The generator's last witness as byte strings, each also a keccak preimage.
+    fn witness_items(self: *Fixture) !List {
+        const arena = self.source.arena.allocator();
+        const witness = &self.generator.witness;
+        const lists = [_]*const db_module.witness.ByteList{
+            &witness.state, &witness.codes, &witness.keys,
+        };
+        var total: usize = 0;
+        for (lists) |list| total += list.count;
+        const items = try arena.alloc([]const u8, total);
+        var index: usize = 0;
+        for (lists) |list| {
+            for (0..list.count) |i| {
+                items[index] = try arena.dupe(u8, list.get(@intCast(i)));
+                try self.source.add_preimage(items[index]);
+                index += 1;
+            }
+        }
+        assert(index == total);
+        return items;
+    }
+
     /// Records each block's execution witness for the host's payload-witness hint.
     fn add_witnesses(self: *Fixture) !void {
-        const arena = self.source.arena.allocator();
         for (self.blocks[1..]) |block| {
             try node_witness.execution_witness(&self.node.chain, &self.generator, block.hash);
-            const witness = &self.generator.witness;
-            const lists = [_]*const db_module.witness.ByteList{
-                &witness.state, &witness.codes, &witness.keys,
-            };
-            var total: usize = 0;
-            for (lists) |list| total += list.count;
-            const items = try arena.alloc([]const u8, total);
-            var index: usize = 0;
-            for (lists) |list| {
-                for (0..list.count) |i| {
-                    items[index] = try arena.dupe(u8, list.get(@intCast(i)));
-                    try self.source.add_preimage(items[index]);
-                    index += 1;
-                }
-            }
-            assert(index == total);
             const parent = block.info.block_info.parent_hash.bytes;
-            try self.source.witnesses.put(testing.allocator, parent, items);
+            try self.source.witnesses.put(testing.allocator, parent, try self.witness_items());
         }
     }
 
@@ -788,9 +874,20 @@ const Fixture = struct {
     }
 
     fn put_boot(self: *Fixture, claim_matches: bool) !void {
+        try self.put_boot_claim(l2_blocks, claim_matches);
+    }
+
+    /// Boot values claiming the node's output root at `number` (the trace extension
+    /// when 0, the agreed block).
+    fn put_boot_at(self: *Fixture, number: u64) !void {
+        try self.put_boot_claim(number, true);
+    }
+
+    fn put_boot_claim(self: *Fixture, number: u64, claim_matches: bool) !void {
+        assert(number <= l2_blocks);
         self.agreed, const encoded = try self.output_root_of(self.blocks[0].hash);
         try testing.expectEqual(self.agreed, try self.store.put_keccak(&encoded));
-        self.expected, _ = try self.output_root_of(self.blocks[l2_blocks].hash);
+        self.expected, _ = try self.output_root_of(self.blocks[@intCast(number)].hash);
         var out: std.Io.Writer = .fixed(&self.rollup_json);
         var writer = json.Writer.init(&out);
         try protocol.rollup_json.write(&writer, &self.rollup);
@@ -798,9 +895,10 @@ const Fixture = struct {
             .l1_head = self.l1_hashes[self.l1_count - 1],
             .agreed_l2_output_root = self.agreed,
             .claimed_l2_output_root = if (claim_matches) self.expected else @splat(0xcc),
-            .claimed_l2_block_number = l2_blocks,
+            .claimed_l2_block_number = number,
             .chain_id = chains.devnet.chain_id,
             .rollup_config_json = out.buffered(),
+            .intermediate_block_interval = self.scenario.interval,
         });
     }
 
@@ -828,6 +926,7 @@ const Fixture = struct {
             .blobs = .{ .blobs_max = 2, .verify = false },
             .kzg_settings = &settings,
             .kzg_workspace = &kzg_workspace,
+            .intermediate = &self.sampler,
         }) catch |err| {
             const last = self.handler.last_error;
             std.debug.print("client failed: {t}, host error: {?}\n", .{ err, last });
@@ -904,7 +1003,7 @@ test "e2e: batches framed in an EIP-4844 blob through the host" {
 }
 
 test "e2e: Holocene replaces a block that fails to execute with its deposits only" {
-    const self = try prove(.{ .invalid_last = true });
+    const self = try prove(.{ .invalid = .fee_cap_first });
     defer self.destroy();
     const last = self.blocks[l2_blocks];
     // The batch carried three user transactions; the proven block has only the deposit.
@@ -912,4 +1011,66 @@ test "e2e: Holocene replaces a block that fails to execute with its deposits onl
     try testing.expectEqual(@as(usize, 1), last.all.len);
     const node_header = self.node.chain.header(last.hash).?;
     try testing.expectEqual(@as(u64, l2_blocks), node_header.number);
+}
+
+test "e2e: a deposit-only retry after valid transfers uses the attempted payload's witness" {
+    const self = try prove(.{ .invalid = .nonce_gap_last });
+    defer self.destroy();
+    const last = self.blocks[l2_blocks];
+    // Two transfers, then the nonce gap; the proven block has only the deposit.
+    try testing.expectEqual(@as(usize, 3), last.user.len);
+    try testing.expectEqual(@as(usize, 1), last.all.len);
+    try testing.expectEqual(@as(u32, 1), self.source.attempted_requests);
+}
+
+test "e2e: without the attempted payload's witness the retry block cannot be proven" {
+    const self = try Fixture.create(.{ .invalid = .nonce_gap_last, .attempted_witness = false });
+    defer self.destroy();
+    try self.put_boot(true);
+    // The transfers read sender state the deposit-only block's witness lacks; a missing
+    // preimage fails the proof instead of triggering the deposit-only retry.
+    try testing.expectError(error.StateUnavailable, self.run());
+    try testing.expectEqual(@as(u32, 0), self.source.attempted_requests);
+}
+
+/// The output roots of node blocks `1..=l2_blocks`.
+fn node_roots(self: *Fixture) ![l2_blocks]Hash {
+    var roots: [l2_blocks]Hash = undefined;
+    for (&roots, self.blocks[1..]) |*root, block| root.*, _ = try self.output_root_of(block.hash);
+    return roots;
+}
+
+test "e2e: intermediate output roots at every block and at an interval of the range" {
+    for ([_]u64{ 1, 3 }) |interval| {
+        const self = try prove(.{ .interval = interval });
+        defer self.destroy();
+        const expected = try node_roots(self);
+        const roots = try self.sampler.finish();
+        try testing.expectEqual(l2_blocks / interval, roots.len);
+        for (roots, 1..) |root, index| {
+            try testing.expectEqual(expected[index * interval - 1], root);
+        }
+        // The last sampled root is the claim's.
+        try testing.expectEqual(self.expected, roots[roots.len - 1]);
+    }
+}
+
+test "e2e: an interval that does not divide the range has no intermediate roots" {
+    const self = try prove(.{ .interval = 2 });
+    defer self.destroy();
+    // The claim still holds; only the sampled roots are unavailable (base/base's provers
+    // refuse such a range).
+    try testing.expectError(error.PartialInterval, self.sampler.finish());
+    try testing.expectEqual(@as(u64, l2_blocks), self.sampler.blocks);
+    try testing.expectEqual(@as(u32, 1), self.sampler.count);
+}
+
+test "e2e: a claim at the agreed block derives nothing and samples no roots" {
+    const self = try Fixture.create(.{ .interval = 3 });
+    defer self.destroy();
+    try self.put_boot_at(0);
+    const outcome, const holds = try self.run();
+    try testing.expectEqual(@as(u64, 0), outcome.block_number);
+    try testing.expect(holds);
+    try testing.expectError(error.EmptyRange, self.sampler.finish());
 }
