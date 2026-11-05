@@ -293,7 +293,11 @@ pub const StateDb = struct {
             const key = keccak256(&kv.key_ptr.address);
             const slot_hash = slot_key(kv.key_ptr.slot);
             const previous = db.trie.get_storage(key, slot_hash);
-            db.undo_push(.{ .slot = .{ .key = key, .slot_hash = slot_hash, .previous = previous } });
+            db.undo_push(.{ .slot = .{
+                .key = key,
+                .slot_hash = slot_hash,
+                .previous = previous,
+            } });
             try db.trie.set_storage(key, slot_hash, kv.value_ptr.present);
         }
     }
