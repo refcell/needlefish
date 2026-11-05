@@ -21,8 +21,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - `HashBuilder` borrows the latest leaf value (no copy) until the next call.
 - Proof format matches geth `eth_getProof`: root plus hashed nodes; embedded nodes stay inline.
 - Public TrieTests JSON vectors committed under `trie/testdata/` (small, public).
+- One trie pool hosts many roots (`*_in` APIs): all storage tries share a pool sized at init.
+- `StateTrie` takes hashed keys; writes mark accounts dirty, `root()` rehashes dirty storage
+  tries and applies dirty accounts sorted. Single-threaded for now; parallel subtrie hashing
+  only once benchmarks show hashing dominates block time.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
   all ethereum/tests TrieTests vectors pass.
+- 2026-11-05: StateTrie (account + shared-pool storage tries, dirty-set incremental root,
+  account/storage proofs), differential-tested against HashBuilder.

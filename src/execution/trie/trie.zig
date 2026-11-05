@@ -184,10 +184,15 @@ pub fn TrieType(comptime config: Config) type {
         }
 
         pub fn get(self: *const Self, key: []const u8) ?[]const u8 {
+            return self.get_in(self.root, key);
+        }
+
+        /// Looks up `key` in the trie rooted at `root`, one of many roots sharing this pool.
+        pub fn get_in(self: *const Self, root: NodeIndex, key: []const u8) ?[]const u8 {
             assert(key.len <= config.key_bytes_max);
             const path = Nibbles.from_bytes(key);
             var rest: []const u8 = path.slice();
-            var index = self.root;
+            var index = root;
             var depth: u32 = 0;
             while (index != none) : (depth += 1) {
                 assert(depth <= depth_max);
@@ -218,12 +223,21 @@ pub fn TrieType(comptime config: Config) type {
 
         /// Inserts or replaces `key`. Fails without changing the trie if the pool is too full.
         pub fn put(self: *Self, key: []const u8, value: []const u8) Error!void {
+            return self.put_in(&self.root, key, value);
+        }
+
+        pub fn put_in(
+            self: *Self,
+            root: *NodeIndex,
+            key: []const u8,
+            value: []const u8,
+        ) Error!void {
             assert(key.len <= config.key_bytes_max);
             assert(value.len > 0 and value.len <= config.value_size_max);
             if (self.free_count < nodes_per_insert_max) return error.TrieFull;
             const path = Nibbles.from_bytes(key);
             var rest: []const u8 = path.slice();
-            var slot: *NodeIndex = &self.root;
+            var slot: *NodeIndex = root;
             var depth: u32 = 0;
             while (true) : (depth += 1) {
                 assert(depth <= depth_max);
@@ -330,12 +344,16 @@ pub fn TrieType(comptime config: Config) type {
 
         /// Removes `key`. Returns whether it was present.
         pub fn delete(self: *Self, key: []const u8) bool {
+            return self.delete_in(&self.root, key);
+        }
+
+        pub fn delete_in(self: *Self, root: *NodeIndex, key: []const u8) bool {
             assert(key.len <= config.key_bytes_max);
             const path = Nibbles.from_bytes(key);
             var rest: []const u8 = path.slice();
             var stack: [depth_max]*NodeIndex = undefined;
             var stack_len: u32 = 0;
-            var slot: *NodeIndex = &self.root;
+            var slot: *NodeIndex = root;
             while (true) {
                 assert(stack_len < depth_max);
                 if (slot.* == none) return false;
@@ -441,9 +459,44 @@ pub fn TrieType(comptime config: Config) type {
 
         /// Root hash of the trie. Rehashes only nodes changed since the previous call.
         pub fn root_hash(self: *Self) Hash {
-            if (self.root == none) return node.empty_root;
-            self.update_cache(self.root);
-            return self.nodes[self.root].cached.root_hash();
+            return self.root_hash_of(self.root);
+        }
+
+        pub fn root_hash_of(self: *Self, root: NodeIndex) Hash {
+            if (root == none) return node.empty_root;
+            self.update_cache(root);
+            return self.nodes[root].cached.root_hash();
+        }
+
+        /// Frees every node of the trie rooted at `root` and empties it.
+        pub fn free_tree(self: *Self, root: *NodeIndex) void {
+            if (root.* == none) return;
+            var stack: [depth_max * 16]NodeIndex = undefined;
+            stack[0] = root.*;
+            var stack_len: u32 = 1;
+            var freed: u64 = 0;
+            while (stack_len > 0) : (freed += 1) {
+                assert(freed < self.nodes.len);
+                stack_len -= 1;
+                const index = stack[stack_len];
+                const current = &self.nodes[index];
+                switch (current.kind) {
+                    .free => unreachable, // Reachable nodes are never on the free list.
+                    .leaf => {},
+                    .extension => {
+                        stack[stack_len] = current.child;
+                        stack_len += 1;
+                    },
+                    .branch => for (current.children) |child| {
+                        if (child == none) continue;
+                        assert(stack_len < stack.len);
+                        stack[stack_len] = child;
+                        stack_len += 1;
+                    },
+                }
+                self.release(index);
+            }
+            root.* = none;
         }
 
         const Frame = struct { index: NodeIndex, next_child: u8 };
@@ -572,12 +625,16 @@ pub fn TrieType(comptime config: Config) type {
 
         /// Fills `proof` for `key`, which may be absent (an exclusion proof).
         pub fn prove(self: *Self, key: []const u8, proof: *Proof) void {
+            self.prove_in(self.root, key, proof);
+        }
+
+        pub fn prove_in(self: *Self, root: NodeIndex, key: []const u8, proof: *Proof) void {
             assert(key.len <= config.key_bytes_max);
             proof.count = 0;
-            _ = self.root_hash();
+            _ = self.root_hash_of(root);
             const path = Nibbles.from_bytes(key);
             var rest: []const u8 = path.slice();
-            var index = self.root;
+            var index = root;
             var depth: u32 = 0;
             while (index != none) : (depth += 1) {
                 assert(depth <= depth_max);

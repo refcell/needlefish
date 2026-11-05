@@ -6,6 +6,7 @@
 //! - `trie`: mutable in-memory trie with cached hashes and `eth_getProof` proofs.
 //! - `proof`: proof verification.
 //! - `ordered`: transactions, receipts, and withdrawals roots.
+//! - `state_trie`: account and storage tries with an incremental state root.
 
 const std = @import("std");
 
@@ -16,6 +17,7 @@ pub const hash_builder = @import("hash_builder.zig");
 pub const trie = @import("trie.zig");
 pub const proof = @import("proof.zig");
 pub const ordered = @import("ordered.zig");
+pub const state_trie = @import("state_trie.zig");
 
 pub const Nibbles = nibbles.Nibbles;
 pub const Hash = node.Hash;
@@ -26,8 +28,11 @@ pub const HashBuilderType = hash_builder.HashBuilderType;
 pub const TrieType = trie.TrieType;
 pub const verify_proof = proof.verify;
 pub const ordered_trie_root = ordered.ordered_trie_root;
+pub const StateTrie = state_trie.StateTrie;
+pub const Account = state_trie.Account;
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("trie_test.zig");
+    _ = @import("state_trie_test.zig");
 }
