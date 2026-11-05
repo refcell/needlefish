@@ -181,15 +181,33 @@ pub const StateTrie = struct {
         slot_hash: Hash,
         value: u256,
     ) Error!void {
+        return self.set_storage_slots(address_hash, &.{slot_hash}, &.{value});
+    }
+
+    /// Sets several storage slots of one account (zero deletes), with one account lookup.
+    /// Same result as `set_storage` per slot, in order. The account must exist.
+    pub fn set_storage_slots(
+        self: *StateTrie,
+        address_hash: Hash,
+        slot_hashes: []const Hash,
+        values: []const u256,
+    ) Error!void {
+        assert(slot_hashes.len == values.len);
+        assert(slot_hashes.len > 0);
         const entry = self.entries.getPtr(address_hash) orelse return error.UnknownAccount;
-        if (value == 0) {
-            _ = self.storage.delete_in(&entry.storage_root, &slot_hash);
-        } else {
-            var buffer: [33]u8 = undefined;
-            const encoded = encode_storage_value(value, &buffer);
-            try self.storage.put_in(&entry.storage_root, &slot_hash, encoded);
+        // Marked first: if a later slot fails with `TrieFull`, the earlier slots are already
+        // written and must still be rehashed. A flush here leaves `entry` valid.
+        try self.mark_dirty(address_hash, entry);
+        for (slot_hashes, values) |*slot_hash, value| {
+            if (value == 0) {
+                _ = self.storage.delete_in(&entry.storage_root, slot_hash);
+            } else {
+                var buffer: [33]u8 = undefined;
+                const encoded = encode_storage_value(value, &buffer);
+                try self.storage.put_in(&entry.storage_root, slot_hash, encoded);
+            }
         }
-        return self.mark_dirty(address_hash, entry);
+        assert(entry.dirty);
     }
 
     /// Clears every storage slot of the account (self-destruct, or re-creation).
@@ -226,7 +244,8 @@ pub const StateTrie = struct {
     /// Applies every dirty account to the account trie without hashing the account trie.
     pub fn flush(self: *StateTrie) Error!void {
         const dirty = self.dirty[0..self.dirty_len];
-        std.mem.sort(Hash, dirty, {}, hash_less_than);
+        // Duplicates are equal bytes, so an unstable sort is exact.
+        std.sort.pdq(Hash, dirty, {}, hash_less_than);
         self.update_storage_caches(dirty);
         for (dirty, 0..) |address_hash, index| {
             if (index > 0 and std.mem.eql(u8, &dirty[index - 1], &address_hash)) continue;

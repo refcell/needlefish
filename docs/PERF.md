@@ -87,6 +87,53 @@ The durability cost per block halves (about 9 -> 4 ms of fsync wait). The laptop
 than the first db run (before-run cpu p50 15.0 ms vs 13.4 ms earlier), so compare the
 durable - cpu column, not absolute numbers; p99 is dominated by CPU noise in noisy runs.
 
+### 2026-11-05 db: storage-heavy block apply+root
+
+Where `db/block 1k acct+4k slot apply+root` spent its time (temporary phase timers in the bench,
+averages over ~1 500 blocks, ReleaseFast, loaded machine; not committed):
+
+| Phase | before µs | after µs | What changed |
+| --- | ---: | ---: | --- |
+| overlay writes (bench's EVM stand-in) | 910 | 960 | nothing |
+| `build_changeset` | 1 720 | 540 | sort was ~1 600 µs, now ~310 µs |
+| `State.apply` | 2 660 | 1 900 | one address hash + lookup per slot run; batched keys |
+| `StateTrie.flush` (storage rehash + account puts) | 2 960 | 3 160 | nothing (noise) |
+| account trie root | 1 720 | 1 820 | nothing (noise) |
+
+Fixes (all bit-identical; tests unchanged plus a sort-vs-reference test and a
+`set_storage_slots` differential test):
+- `Changeset.sort`: `std.mem.sort` (block sort) on 128-224 byte entries with a byte-wise
+  `std.mem.order` compare took ~2 ms for 4k slots. Now pdqsort over `address[0..4] << 32 |
+  index` words (most compares are one integer compare; ties compare `u160` address + slot
+  through pointers), then an in-place cycle permutation (each entry moves once). Keys are
+  unique, so the unstable sort gives the canonical order. +8 bytes per changeset entry.
+- `State.apply`: the address keccak ran once per storage slot (4k extra hashes); now once per
+  run of one address's slots. Slot and account keys go through `keccak256_batch` in pairs.
+  `StateTrie.set_storage_slots` writes a run with one `entries` lookup.
+- The dirty-account sort in `StateTrie.flush` is pdqsort (exact: duplicates are equal bytes).
+
+Tried and dropped: an in-place counting sort by depth instead of pdqsort in the batched rehash
+(collect order 230 -> 140 µs but the per-level length sort got slower by the same amount).
+
+Interleaved runs of the before and after binaries (5 each, median; `db/` and `trie/state`):
+
+| Case | before | after | Change |
+| --- | ---: | ---: | --- |
+| db/block 1k acct+4k slot apply+root | 10.34 ms | 7.93 ms | -23% (runs 9.4-10.5 vs 7.75-8.23) |
+| db/commit sim cpu p50 (2 runs) | 10.1-10.5 ms | 7.8-8.3 ms | |
+| db/commit os cpu p50 / durable p50 (2 runs) | 10.3-10.9 / 14.1-15.0 ms | 7.6-7.9 / 12.0 ms | |
+| db/changeset decode | 2 921 MB/s | 3 142 MB/s | +8% (faster `check_sorted` compare) |
+| trie/state block 1k accounts | 1.50-1.66 ms | 1.46-1.60 ms | noise |
+
+What remains is mostly trie work this block shape really has. The block dirties 2 056 accounts
+(1k written + ~1k contracts whose storage root changed) vs 1 000 in trie/state, and its
+account-trie part (puts 750 µs + root 1 820 µs = ~1.25 µs per account) runs at the trie/state
+rate. The 4k slot writes touch ~1k storage tries and dirty 9 822 storage nodes; their batched
+rehash takes ~2 360 µs (collect 300, depth sort 230, level hashing 1 810), mostly keccak.
+Storage writes in `apply` are ~420 ns per slot (two hash-table updates plus a trie descent,
+cache-miss bound). Next step if this matters: hash dirty storage tries on worker threads
+(lane backlog).
+
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `TrieType` nodes keep only what their kind needs: a packed path (2 nibbles per byte, stored in

@@ -17,8 +17,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Checkpoint fallback / redundancy so one rotten checkpoint block is not data loss.
 - [x] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`.
-- [ ] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
+- [x] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
   (vs 2 ms for 1k accounts alone). Profile storage trie rehash/creation and fix.
+  (10.3 -> 7.9 ms; the rest is real trie work, docs/PERF.md)
+- [ ] Parallel storage-trie rehash: in a storage-heavy block, hashing dirty storage tries
+  (~2.4 ms) and the account trie (~1.8 ms) is now over half the block. Split the dirty storage
+  roots across worker threads (one pool, disjoint subtries).
 - [x] One fsync per `execute_and_commit`: journal block + head as one entry (was 2 fsyncs,
   ~7.5 ms durability cost per block).
 - [x] Compact node layout (packed paths, per-kind body, cached refs out of line).
@@ -120,6 +124,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   is journaled so replay stays in step. A block already stored only journals a `head` entry.
   Group commit stays an option if standalone insert+set_head pairs ever become hot.
 
+- Storage-heavy block (profiled with phase timers, not committed): the cost was changeset
+  sorting (~2 ms: block sort copying 128+ byte entries, byte-wise compare) and `State.apply`
+  hashing each storage slot's address again. Fixed with an index sort (pdqsort over
+  `address prefix << 32 | index`, in-place cycle permutation; keys are unique, so the order is
+  unchanged), one address hash and one `entries` lookup per run of slots
+  (`StateTrie.set_storage_slots`, marks the account dirty before writing so a mid-run
+  `TrieFull` still rehashes earlier slots), and batched slot/account key hashing. Changesets
+  take 8 more bytes per entry. Storage tries were never created or destroyed per block, so
+  nothing to fix there.
+
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
   all ethereum/tests TrieTests vectors pass.
@@ -146,3 +160,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   fsync wait per block ~9 -> ~4 ms (durable p50 24.1 -> 15.3-17.6 ms on a noisy laptop).
 - 2026-11-05: compact trie node layout: 284 -> 186 B/node (accounts), 204 -> 106 B (storage);
   100k bench trie 393 -> 257 live B/entry; get 173 -> 166 ns, other benches within noise.
+- 2026-11-05: storage-heavy block apply+root 10.3 -> 7.9 ms (changeset index sort, one
+  address hash per slot run, batched key hashing); remaining gap is 2x dirty accounts plus
+  storage rehash (docs/PERF.md).

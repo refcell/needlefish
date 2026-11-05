@@ -17,12 +17,14 @@ const assert = std.debug.assert;
 
 const changeset_module = @import("changeset.zig");
 const trie = @import("../trie/root.zig");
+const keccak = @import("../../common/crypto/keccak.zig");
 const node = trie.node;
 
 pub const Address = changeset_module.Address;
 pub const Hash = changeset_module.Hash;
 pub const AccountInfo = changeset_module.AccountInfo;
 pub const Changeset = changeset_module.Changeset;
+const StorageChange = changeset_module.StorageChange;
 
 pub const Config = struct {
     accounts_max: u32,
@@ -44,13 +46,40 @@ const CodeRef = struct { offset: u32, len: u32 };
 
 const BlockHashEntry = struct { number: u64, hash: Hash, valid: bool };
 
+/// Slots of one account written to the trie per account lookup in `State.apply`.
+const slots_chunk_max = 64;
+
 /// How many recent block hashes BLOCKHASH can see.
 pub const block_hashes_max = 256;
 
-fn slot_key_hash(slot: u256) Hash {
-    var bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &bytes, slot, .big);
-    return node.keccak256(&bytes);
+/// keccak256 of each key; a full chunk of `keccak.batch_width` keys of one length goes through
+/// the SIMD batch (about half the cost per key on NEON), a shorter tail is hashed singly.
+fn hash_keys(comptime length: usize, keys: []const [length]u8, out: []Hash) void {
+    assert(keys.len == out.len);
+    assert(keys.len <= keccak.batch_width);
+    if (keys.len == keccak.batch_width) {
+        var inputs: [keccak.batch_width][]const u8 = undefined;
+        for (&inputs, keys) |*input, *key| input.* = key;
+        keccak.keccak256_batch(&inputs, out[0..keccak.batch_width]);
+    } else {
+        for (keys, out) |*key, *hash| hash.* = node.keccak256(key);
+    }
+}
+
+fn hash_addresses(changes: []const changeset_module.AccountChange, out: []Hash) void {
+    assert(changes.len <= keccak.batch_width);
+    var keys: [keccak.batch_width]Address = undefined;
+    for (keys[0..changes.len], changes) |*key, *change| key.* = change.address;
+    hash_keys(20, keys[0..changes.len], out);
+}
+
+fn hash_slots(changes: []const StorageChange, out: []Hash) void {
+    assert(changes.len <= keccak.batch_width);
+    var keys: [keccak.batch_width][32]u8 = undefined;
+    for (keys[0..changes.len], changes) |*key, *change| {
+        std.mem.writeInt(u256, key, change.slot, .big);
+    }
+    hash_keys(32, keys[0..changes.len], out);
 }
 
 fn trie_account(info: AccountInfo) trie.Account {
@@ -189,30 +218,64 @@ pub const State = struct {
     /// exists in the trie), then removed accounts.
     fn apply_direction(self: *State, changeset: *const Changeset, forward: bool) Error!void {
         try self.check_capacity(changeset);
-        for (changeset.account_changes()) |*change| {
-            const target = if (forward) change.new else change.old;
-            const info = target orelse continue;
-            self.account_table.putAssumeCapacity(change.address, info);
-            try self.state_trie.set_account(node.keccak256(&change.address), trie_account(info));
-        }
-        for (changeset.storage_changes()) |*change| {
-            const target = if (forward) change.new else change.old;
-            const key: SlotKey = .{ .address = change.address, .slot = change.slot };
-            if (target == 0) {
-                _ = self.storage_table.remove(key);
-            } else {
-                // Nonzero storage only lives under an account that exists at this point.
-                assert(self.account_table.contains(change.address));
-                self.storage_table.putAssumeCapacity(key, target);
+        const accounts = changeset.account_changes();
+        var address_hashes: [keccak.batch_width]Hash = undefined;
+        var start: usize = 0;
+        while (start < accounts.len) : (start += keccak.batch_width) {
+            const chunk = accounts[start..@min(accounts.len, start + keccak.batch_width)];
+            hash_addresses(chunk, address_hashes[0..chunk.len]);
+            for (chunk, address_hashes[0..chunk.len]) |*change, address_hash| {
+                const target = if (forward) change.new else change.old;
+                const info = target orelse continue;
+                self.account_table.putAssumeCapacity(change.address, info);
+                try self.state_trie.set_account(address_hash, trie_account(info));
             }
-            const address_hash = node.keccak256(&change.address);
-            try self.state_trie.set_storage(address_hash, slot_key_hash(change.slot), target);
         }
-        for (changeset.account_changes()) |*change| {
+        try self.apply_storage(changeset.storage_changes(), forward);
+        for (accounts) |*change| {
             const target = if (forward) change.new else change.old;
             if (target != null) continue;
             _ = self.account_table.remove(change.address);
             try self.state_trie.delete_account(node.keccak256(&change.address));
+        }
+    }
+
+    /// Storage changes are sorted by address: each run of one address's slots is hashed
+    /// (address once, slot keys `keccak.batch_width` at a time) and written to the trie with
+    /// one account lookup per `slots_chunk_max` slots.
+    fn apply_storage(self: *State, changes: []const StorageChange, forward: bool) Error!void {
+        var slot_hashes: [slots_chunk_max]Hash = undefined;
+        var values: [slots_chunk_max]u256 = undefined;
+        var start: usize = 0;
+        while (start < changes.len) {
+            const address = &changes[start].address;
+            var end = start + 1;
+            while (end < changes.len and end - start < slots_chunk_max and
+                std.mem.eql(u8, &changes[end].address, address)) end += 1;
+            const run = changes[start..end];
+            for (run, values[0..run.len]) |*change, *value| {
+                value.* = if (forward) change.new else change.old;
+                const key: SlotKey = .{ .address = change.address, .slot = change.slot };
+                if (value.* == 0) {
+                    _ = self.storage_table.remove(key);
+                } else {
+                    // Nonzero storage only lives under an account that exists at this point.
+                    assert(self.account_table.contains(change.address));
+                    self.storage_table.putAssumeCapacity(key, value.*);
+                }
+            }
+            var hashed: usize = 0;
+            while (hashed < run.len) : (hashed += keccak.batch_width) {
+                const chunk_end = @min(run.len, hashed + keccak.batch_width);
+                hash_slots(run[hashed..chunk_end], slot_hashes[hashed..chunk_end]);
+            }
+            const address_hash = node.keccak256(address);
+            try self.state_trie.set_storage_slots(
+                address_hash,
+                slot_hashes[0..run.len],
+                values[0..run.len],
+            );
+            start = end;
         }
     }
 };

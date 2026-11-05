@@ -204,3 +204,36 @@ test "state trie: storage requires an existing account" {
     try trie.set_account(index_hash('a', 2), .{});
     try testing.expectError(error.AccountsFull, trie.set_account(index_hash('a', 3), .{}));
 }
+
+test "state trie: set_storage_slots matches per-slot writes" {
+    var prng = Prng.init(0x5107);
+    const config: state.Config = .{
+        .accounts_max = 4,
+        .account_nodes_max = 64,
+        .storage_nodes_max = 4 * slots_max * 3,
+        .dirty_accounts_max = 2,
+    };
+    var single = try state.StateTrie.init(testing.allocator, config);
+    defer single.deinit(testing.allocator);
+    var batched = try state.StateTrie.init(testing.allocator, config);
+    defer batched.deinit(testing.allocator);
+    for (0..4) |index| {
+        try single.set_account(index_hash('a', index), .{ .nonce = index });
+        try batched.set_account(index_hash('a', index), .{ .nonce = index });
+    }
+    var slot_hashes: [8]Hash = undefined;
+    var values: [8]u256 = undefined;
+    for (0..300) |_| {
+        const address_hash = index_hash('a', prng.below(4));
+        const count = 1 + prng.below(slot_hashes.len);
+        // Repeated slots and zeros (deletes) inside one call: later writes win.
+        for (slot_hashes[0..count], values[0..count]) |*slot_hash, *value| {
+            slot_hash.* = index_hash('s', prng.below(slots_max));
+            value.* = if (prng.chance(1, 3)) 0 else prng.int(u256);
+            try single.set_storage(address_hash, slot_hash.*, value.*);
+        }
+        try batched.set_storage_slots(address_hash, slot_hashes[0..count], values[0..count]);
+        if (prng.chance(1, 10)) try testing.expectEqual(try single.root(), try batched.root());
+    }
+    try testing.expectEqual(try single.root(), try batched.root());
+}

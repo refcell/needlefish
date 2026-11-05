@@ -32,13 +32,19 @@ pub const AccountInfo = struct {
     }
 };
 
+/// The address as a big-endian integer: integer order is byte order, in a few word compares
+/// (a byte-wise `std.mem.order` made changeset sorting ~2 ms per 4k slots).
+fn address_key(address: *const Address) u160 {
+    return std.mem.readInt(u160, address, .big);
+}
+
 pub const AccountChange = struct {
     address: Address,
     old: ?AccountInfo,
     new: ?AccountInfo,
 
-    fn less_than(_: void, a: AccountChange, b: AccountChange) bool {
-        return std.mem.order(u8, &a.address, &b.address) == .lt;
+    fn less_than(a: *const AccountChange, b: *const AccountChange) bool {
+        return address_key(&a.address) < address_key(&b.address);
     }
 };
 
@@ -48,12 +54,11 @@ pub const StorageChange = struct {
     old: u256,
     new: u256,
 
-    fn less_than(_: void, a: StorageChange, b: StorageChange) bool {
-        return switch (std.mem.order(u8, &a.address, &b.address)) {
-            .lt => true,
-            .gt => false,
-            .eq => a.slot < b.slot,
-        };
+    fn less_than(a: *const StorageChange, b: *const StorageChange) bool {
+        const a_key = address_key(&a.address);
+        const b_key = address_key(&b.address);
+        if (a_key != b_key) return a_key < b_key;
+        return a.slot < b.slot;
     }
 };
 
@@ -83,6 +88,8 @@ pub const Changeset = struct {
     code_bytes_len: u32 = 0,
     code_ends: []u32,
     codes_len: u32 = 0,
+    /// Sort scratch: one index per entry of the larger of `accounts` and `storage`.
+    order: []u64,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Changeset {
         const accounts = try allocator.alloc(AccountChange, config.accounts_max);
@@ -92,15 +99,19 @@ pub const Changeset = struct {
         const code_bytes = try allocator.alloc(u8, config.code_bytes_max);
         errdefer allocator.free(code_bytes);
         const code_ends = try allocator.alloc(u32, config.codes_max);
+        errdefer allocator.free(code_ends);
+        const order = try allocator.alloc(u64, @max(config.accounts_max, config.storage_max));
         return .{
             .accounts = accounts,
             .storage = storage,
             .code_bytes = code_bytes,
             .code_ends = code_ends,
+            .order = order,
         };
     }
 
     pub fn deinit(self: *Changeset, allocator: std.mem.Allocator) void {
+        allocator.free(self.order);
         allocator.free(self.code_ends);
         allocator.free(self.code_bytes);
         allocator.free(self.storage);
@@ -152,17 +163,18 @@ pub const Changeset = struct {
         self.codes_len += 1;
     }
 
-    /// Sorts entries into canonical order. Duplicate keys are a caller bug.
+    /// Sorts entries into canonical order. Duplicate keys are a caller bug, so an unstable
+    /// sort gives the same order as a stable one.
     pub fn sort(self: *Changeset) void {
         const accounts = self.accounts[0..self.accounts_len];
-        std.mem.sort(AccountChange, accounts, {}, AccountChange.less_than);
+        sort_entries(AccountChange, accounts, self.order[0..accounts.len]);
         const storage = self.storage[0..self.storage_len];
-        std.mem.sort(StorageChange, storage, {}, StorageChange.less_than);
+        sort_entries(StorageChange, storage, self.order[0..storage.len]);
         for (1..@max(1, accounts.len)) |i| {
-            assert(AccountChange.less_than({}, accounts[i - 1], accounts[i]));
+            assert(AccountChange.less_than(&accounts[i - 1], &accounts[i]));
         }
         for (1..@max(1, storage.len)) |i| {
-            assert(StorageChange.less_than({}, storage[i - 1], storage[i]));
+            assert(StorageChange.less_than(&storage[i - 1], &storage[i]));
         }
     }
 
@@ -254,18 +266,60 @@ pub const Changeset = struct {
     fn check_sorted(self: *const Changeset) Error!void {
         const accounts = self.account_changes();
         for (1..@max(1, accounts.len)) |i| {
-            if (!AccountChange.less_than({}, accounts[i - 1], accounts[i])) {
+            if (!AccountChange.less_than(&accounts[i - 1], &accounts[i])) {
                 return error.InvalidChangeset;
             }
         }
         const storage = self.storage_changes();
         for (1..@max(1, storage.len)) |i| {
-            if (!StorageChange.less_than({}, storage[i - 1], storage[i])) {
+            if (!StorageChange.less_than(&storage[i - 1], &storage[i])) {
                 return error.InvalidChangeset;
             }
         }
     }
 };
+
+/// Sorts `items` by `T.less_than` through an index array, then permutes `items` in place.
+/// Entries are 128+ bytes: sorting them directly copied entries on every compare and swap
+/// (~2 ms for 4k slots). Each order word is `address[0..4] << 32 | index`, so most compares
+/// are one integer compare (the prefix is the most significant part of the key) and only
+/// equal prefixes look at the entries.
+fn sort_entries(comptime T: type, items: []T, order: []u64) void {
+    assert(order.len == items.len);
+    assert(items.len <= std.math.maxInt(u32));
+    for (order, items, 0..) |*word, *item, position| {
+        const prefix: u64 = std.mem.readInt(u32, item.address[0..4], .big);
+        word.* = prefix << 32 | position;
+    }
+    const Context = struct {
+        items: []const T,
+        fn less_than(context: @This(), a: u64, b: u64) bool {
+            if (a >> 32 != b >> 32) return a >> 32 < b >> 32;
+            const a_item = &context.items[@as(u32, @truncate(a))];
+            return T.less_than(a_item, &context.items[@as(u32, @truncate(b))]);
+        }
+    };
+    std.sort.pdq(u64, order, Context{ .items = items }, Context.less_than);
+    // Follow each cycle of the permutation: position k receives items[order[k]]. A finished
+    // position is marked by index(order[k]) == k, so every entry moves at most once.
+    var moves: u64 = 0;
+    for (0..items.len) |start| {
+        if (@as(u32, @truncate(order[start])) == start) continue;
+        const saved = items[start];
+        var target: usize = start;
+        while (true) : (moves += 1) {
+            assert(moves <= items.len);
+            const source: usize = @as(u32, @truncate(order[target]));
+            order[target] = target;
+            if (source == start) {
+                items[target] = saved;
+                break;
+            }
+            items[target] = items[source];
+            target = source;
+        }
+    }
+}
 
 const Writer = struct {
     buffer: []u8,
@@ -395,6 +449,40 @@ test "changeset: seeded encode/decode roundtrip is canonical" {
         if (encoded.len > header_bytes) {
             const cut = prng.below(encoded.len);
             try testing.expectError(error.InvalidChangeset, b.decode(encoded[0..cut]));
+        }
+    }
+}
+
+fn reference_less_than(_: void, a: StorageChange, b: StorageChange) bool {
+    return switch (std.mem.order(u8, &a.address, &b.address)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.slot < b.slot,
+    };
+}
+
+test "changeset: sort matches a byte-wise stable sort" {
+    var prng = Prng.init(0x50e7);
+    var changeset = try Changeset.init(testing.allocator, test_config);
+    defer changeset.deinit(testing.allocator);
+    var expected: [test_config.storage_max]StorageChange = undefined;
+    for (0..100) |_| {
+        changeset.clear();
+        const count = prng.below(test_config.storage_max + 1);
+        for (0..count) |index| {
+            // Few distinct prefixes and tails, so the prefix compare ties often.
+            var address: Address = @splat(0);
+            address[prng.below(2) * 3] = @intCast(prng.below(3));
+            address[19] = @intCast(prng.below(3));
+            const slot = @as(u256, prng.below(4)) << 200 | index;
+            try changeset.add_storage(.{ .address = address, .slot = slot, .old = 0, .new = 1 });
+        }
+        @memcpy(expected[0..count], changeset.storage_changes());
+        std.mem.sort(StorageChange, expected[0..count], {}, reference_less_than);
+        changeset.sort();
+        for (expected[0..count], changeset.storage_changes()) |want, got| {
+            try testing.expectEqualSlices(u8, &want.address, &got.address);
+            try testing.expectEqual(want.slot, got.slot);
         }
     }
 }
