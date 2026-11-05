@@ -7,13 +7,19 @@ const Io = std.Io;
 const base = @import("base");
 
 const proof = base.proof;
+const proof_run = @import("proof_run.zig");
 const kzg = base.common.crypto.kzg;
 
 const usage =
     \\usage: base proof replay <archive>
+    \\       base proof run --l1 <url> --l2 <url> --rollup-config <file>
+    \\                      --agreed <n> --claimed <n> [--l1-head <n>]
+    \\                      [--claim-root <hex>] [--out <archive>]
     \\
-    \\  replay   run the fault-proof client over a recorded preimage archive;
-    \\           exit 0 if the claimed output root holds, 1 if it does not
+    \\  replay   run the fault-proof client over a recorded preimage archive
+    \\  run      prove a claim against L1/L2 execution RPCs (native mode) and
+    \\           optionally record the preimages into an archive
+    \\  both exit 0 if the claimed output root holds, 1 if it does not
     \\
 ;
 
@@ -31,6 +37,16 @@ pub fn parse(args: []const []const u8) error{InvalidArguments}!Command {
 }
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+    if (args.len > 0 and std.mem.eql(u8, args[0], "run")) {
+        const flags = proof_run.parse(args[1..]) catch |err| {
+            std.debug.print("proof: {t}\n{s}", .{ err, usage });
+            return 2;
+        };
+        return proof_run.main(init, flags) catch |err| {
+            std.debug.print("proof: run failed: {t}\n", .{err});
+            return 2;
+        };
+    }
     const command = parse(args) catch {
         std.debug.print("{s}", .{usage});
         return 2;
@@ -71,4 +87,8 @@ test "proof: argument parsing" {
     try std.testing.expectEqualStrings("run.nfpa", replay.replay);
     try std.testing.expectError(error.InvalidArguments, parse(&.{"replay"}));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "record", "x" }));
+}
+
+test {
+    _ = proof_run;
 }
