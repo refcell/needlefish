@@ -20,7 +20,9 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/frame`: frame encode/decode, tx data parse (fuzzed).
 - [x] `batcher/blobs`: EIP-4844 blob codec (fuzzed).
 - [x] `batcher/comp`: zlib (std flate) channel compressor; stored-block brotli encoder.
-- [ ] `batcher/comp`: real brotli compressor (LZ77 + prefix codes), checked with `brotli -d`.
+- [x] `batcher/comp`: brotli encoder (greedy LZ77, one compressed meta-block, Huffman codes;
+  stored fallback when incompressible). `base batcher` defaults to brotli like base/base;
+  `--compression zlib` remains. Verified with the reference `brotli -d` and live on anvil.
 - [x] `batcher/batch`: singular batches (channel manager). Span batch encoding skipped: Base's
   Denim upgrade makes derivation singular-only (see consensus span_batch.zig).
 - [x] `base devnet batches`: L1 batch inspector (channels -> batches via derivation code); smoke
@@ -106,3 +108,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: blob DA end to end; anvil (c-kzg) accepted and mined our type-3 tx with sidecar.
 - 2026-11-05: `base devnet batches` inspector; live: 20 batches decoded from an anvil L1.
 - 2026-11-05: multi-blob transactions (default 6 per tx in blob mode).
+- 2026-11-05: brotli compressor; text compresses to ~31% (reference q5: ~23%).

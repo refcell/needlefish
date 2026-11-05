@@ -10,7 +10,8 @@ const batcher = base.batcher;
 const usage =
     \\usage: base batcher --rollup-config FILE --l1 URL --l2 URL [--rollup-rpc URL]
     \\         [--key-index N | --private-key HEX] [--max-channel-duration L1_BLOCKS]
-    \\         [--poll-interval-ms MS] [--metrics.port P] [--data-availability calldata]
+    \\         [--poll-interval-ms MS] [--metrics.port P] [--data-availability calldata|blobs]
+    \\         [--compression brotli|zlib]
     \\
 ;
 
@@ -24,6 +25,8 @@ const Flags = struct {
     max_channel_duration: u64 = 2,
     poll_interval_ms: u64 = 1000,
     data_availability: batcher.txmgr.DataAvailability = .calldata,
+    /// base/base batches with brotli (Fjord is active from genesis on the devnet).
+    compression: batcher.comp.Algorithm = .brotli,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -59,6 +62,9 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--compression")) {
+            flags.compression = std.meta.stringToEnum(batcher.comp.Algorithm, value) orelse
+                return error.UnknownCompression;
         } else return error.UnknownFlag;
     }
     if (i != args.len) return error.MissingValue;
@@ -92,7 +98,11 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     };
     var service = try batcher.service.Service.init(init.gpa, .{
         .channels = .{
-            .channel = .{ .frame_size_max = payload_max - 1, .input_bytes_max = 4 << 20 },
+            .channel = .{
+                .frame_size_max = payload_max - 1,
+                .input_bytes_max = 4 << 20,
+                .algorithm = flags.compression,
+            },
             .max_channel_duration_l1_blocks = flags.max_channel_duration,
         },
         .txs = .{
@@ -176,6 +186,9 @@ test "batcher: flags" {
     try std.testing.expectEqual(@as(u32, 3), flags.key_index);
     const blobs = [_][]const u8{ "--data-availability", "blobs" };
     try std.testing.expectEqual(.blobs, (try parse_flags(&blobs)).data_availability);
+    try std.testing.expectEqual(.brotli, (try parse_flags(&blobs)).compression);
+    const zlib = [_][]const u8{ "--compression", "zlib" };
+    try std.testing.expectEqual(.zlib, (try parse_flags(&zlib)).compression);
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
     try std.testing.expectError(error.UnknownDataAvailability, parse_flags(&bad));
     try std.testing.expectError(error.MissingValue, parse_flags(&.{"--l1"}));

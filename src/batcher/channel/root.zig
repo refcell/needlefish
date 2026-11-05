@@ -68,6 +68,8 @@ pub const ChannelOut = struct {
     batch_count: u32,
     state: enum { open, closed, done },
     zlib: *comp.Zlib,
+    /// Brotli channels only.
+    brotli: ?*comp.brotli.Encoder,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, id: ChannelId) !ChannelOut {
         config.validate();
@@ -76,7 +78,10 @@ pub const ChannelOut = struct {
         const output = try allocator.alloc(u8, @intCast(config.output_bytes_max()));
         errdefer allocator.free(output);
         const zlib = try allocator.create(comp.Zlib);
+        errdefer allocator.destroy(zlib);
         zlib.* = .{};
+        const use_brotli = config.algorithm == .brotli;
+        const brotli = if (use_brotli) try create_brotli(allocator, config) else null;
         var channel: ChannelOut = .{
             .config = config,
             .id = undefined,
@@ -89,6 +94,7 @@ pub const ChannelOut = struct {
             .batch_count = 0,
             .state = .open,
             .zlib = zlib,
+            .brotli = brotli,
         };
         channel.reset(id);
         return channel;
@@ -98,7 +104,18 @@ pub const ChannelOut = struct {
         allocator.free(channel.input);
         allocator.free(channel.output);
         allocator.destroy(channel.zlib);
+        if (channel.brotli) |brotli| {
+            brotli.deinit(allocator);
+            allocator.destroy(brotli);
+        }
         channel.* = undefined;
+    }
+
+    fn create_brotli(allocator: std.mem.Allocator, config: Config) !*comp.brotli.Encoder {
+        const brotli = try allocator.create(comp.brotli.Encoder);
+        errdefer allocator.destroy(brotli);
+        brotli.* = try .init(allocator, config.input_bytes_max);
+        return brotli;
     }
 
     /// Reopens the channel under a new id, reusing all buffers.
@@ -144,7 +161,7 @@ pub const ChannelOut = struct {
         const input = channel.input[0..channel.input_length];
         const encoded = switch (channel.config.algorithm) {
             .zlib => channel.zlib.compress(input, channel.output),
-            .brotli => comp.brotli_compress_stored(input, channel.output),
+            .brotli => comp.brotli_compress(channel.brotli.?, input, channel.output),
         } catch unreachable; // Output buffer is sized by the algorithm's bound.
         assert(encoded.len > 0);
         channel.output_length = @intCast(encoded.len);
@@ -275,13 +292,17 @@ test "channel: seeded fuzz round trip through consensus channel" {
         defer testing.allocator.free(data);
         const decoded = switch (config.algorithm) {
             .zlib => try comp.zlib_decompress(data, window, plain),
-            // Version byte + 3 bytes of stream/meta-block header, then raw input.
-            .brotli => data[4..][0..@min(input.len, data.len - 4)],
+            .brotli => try brotli_decode(data),
         };
-        if (config.algorithm == .zlib or input.len <= 65536) {
-            try testing.expectEqualSlices(u8, input, decoded);
-        }
+        defer if (config.algorithm == .brotli) testing.allocator.free(decoded);
+        try testing.expectEqualSlices(u8, input, decoded);
     }
+}
+
+fn brotli_decode(data: []const u8) ![]u8 {
+    const consensus_brotli = @import("../../consensus/protocol/brotli.zig");
+    try testing.expectEqual(comp.brotli_channel_version, data[0]);
+    return consensus_brotli.decompress(testing.allocator, data[1..], 1 << 20);
 }
 
 test {

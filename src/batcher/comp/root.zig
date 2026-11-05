@@ -14,6 +14,8 @@ const assert = std.debug.assert;
 const flate = std.compress.flate;
 const Prng = @import("../../testing/prng.zig").Prng;
 
+pub const brotli = @import("brotli.zig");
+
 pub const Algorithm = enum { zlib, brotli };
 
 /// Channel version byte that selects brotli.
@@ -101,6 +103,19 @@ pub fn brotli_bound(input_length: u64) u64 {
     return 1 + 1 + blocks * 4 + input_length + 1;
 }
 
+/// Encodes `input` as a brotli channel (version byte, then a brotli stream), compressed
+/// when that fits in `out`, else as stored meta-blocks (fits within `brotli_bound`).
+pub fn brotli_compress(encoder: *brotli.Encoder, input: []const u8, out: []u8) Error![]u8 {
+    if (out.len < 2) return error.OutputTooSmall;
+    // Incompressible input can expand past the stored form; cap the attempt there.
+    const stored_length: usize = @intCast(@min(out.len, brotli_bound(input.len)));
+    if (encoder.compress(input, out[1..stored_length])) |stream| {
+        out[0] = brotli_channel_version;
+        assert(stream.len + 1 <= stored_length);
+        return out[0 .. stream.len + 1];
+    } else |_| return brotli_compress_stored(input, out);
+}
+
 /// Encodes `input` as a brotli channel: version byte, then a brotli stream with
 /// window bits 16 and uncompressed meta-blocks.
 pub fn brotli_compress_stored(input: []const u8, out: []u8) Error![]u8 {
@@ -132,6 +147,10 @@ pub fn brotli_compress_stored(input: []const u8, out: []u8) Error![]u8 {
 }
 
 const testing = std.testing;
+
+test {
+    _ = brotli;
+}
 
 test "comp: zlib round trip" {
     const zlib = try testing.allocator.create(Zlib);
