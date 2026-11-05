@@ -18,6 +18,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas. Done: ecrecover,
   sha256, ripemd160, identity, modexp, blake2f, p256verify. Missing: bn254 (0x06-0x08),
   KZG point evaluation (0x0a), BLS12-381 (0x0b-0x11).
+  (crypto lane, 2026-11-05: all now on main: `crypto.bn254.precompile_bn254_{add,mul,pairing}`,
+  `crypto.kzg.precompile_point_evaluation`, `crypto.bls12_381.precompile.{run,gas}` with an
+  `Address` enum for 0x0b-0x11. Every error = precompile failure, all gas consumed.)
 - [x] ethereum/tests GeneralStateTests runner (`just vectors`), pass rate tracked in this file.
   Run: `just vectors`, extract `fixtures_general_state_tests.tgz` into `.cache/vectors/state`, then
   `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
