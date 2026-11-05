@@ -34,7 +34,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   ReleaseSafe soak clean. The GeneralStateTests are the differential check against the
   reference clients (zero dependencies rules out linking another EVM).
 - [x] Performance: micro benchmarks (`evm/bench.zig`, results in docs/PERF.md).
-- [ ] Performance: snailtracer/erc20 contract workloads (needs public bytecode fixtures);
+- [ ] Performance: snailtracer contract workload (needs public bytecode fixture; erc20 done);
   compare with revm on the same machine; profile call-frame and keccak paths.
 
 ## Decisions

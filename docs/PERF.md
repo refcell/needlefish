@@ -77,6 +77,7 @@ op against a freshly reset state (Prague rules).
 | evm/storage_loop_200 | 7591.6 | ~38 ns per cold SSTORE + warm SLOAD pair |
 | evm/call_loop_200_staticcall | 23448.3 | ~117 ns per call frame push/pop |
 | evm/value_transfer_tx | 701.5 | validate, buy gas, warm, settle, state reset |
+| evm/erc20_transfer_tx | 1442.9 | 2 cold slots read+written, 2 keccak, LOG3 (~51k gas) |
 
 ## Test suite time
 

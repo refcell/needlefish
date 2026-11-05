@@ -71,6 +71,65 @@ const call_code = [_]u8{
     0x02, 0x57, 0x00,
 };
 
+/// ERC-20 `transfer(to, amount)` with Solidity storage layout (balances at slot 0):
+/// checks the sender balance, debits, credits, emits `Transfer`. Hand assembled.
+const erc20_code = [_]u8{
+    0x33, 0x60, 0x00, 0x52, // mem[0] = caller
+    0x60, 0x00, 0x60, 0x20, 0x52, // mem[32] = 0 (mapping slot)
+    0x60, 0x40, 0x60, 0x00, 0x20, // from_slot = keccak256(mem[0..64])
+    0x80, 0x54, // from_balance
+    0x60, 0x24, 0x35, // amount = calldata[36..68]
+    0x81, 0x81, 0x11, // amount > from_balance
+    0x60, 0x5d, 0x57, // -> revert
+    0x80, 0x82, 0x03, // from_balance - amount
+    0x83, 0x55, // SSTORE(from_slot)
+    0x60, 0x04, 0x35, 0x60, 0x00, 0x52, // mem[0] = to
+    0x60, 0x40, 0x60, 0x00, 0x20, // to_slot
+    0x80, 0x54, 0x82, 0x01, 0x90, 0x55, // SSTORE(to_slot, to_balance + amount)
+    0x60, 0x00, 0x52, // mem[0] = amount
+    0x60, 0x04, 0x35, 0x33, // topics: to, from
+    0x7f, // PUSH32 keccak256("Transfer(address,address,uint256)")
+    0xdd,
+    0xf2,
+    0x52,
+    0xad,
+    0x1b,
+    0xe2,
+    0xc8,
+    0x9b,
+    0x69,
+    0xc2,
+    0xb0,
+    0x68,
+    0xfc,
+    0x37,
+    0x8d,
+    0xaa,
+    0x95,
+    0x2b,
+    0xa7,
+    0xf1,
+    0x63,
+    0xc4,
+    0xa1,
+    0x16,
+    0x28,
+    0xf5,
+    0x5a,
+    0x4d,
+    0xf5,
+    0x23,
+    0xb3,
+    0xef,
+    0x60, 0x20, 0x60, 0x00, 0xa3, // LOG3(mem[0..32])
+    0x00,
+    0x5b, 0x60, 0x00, 0x80, 0xfd, // revert(0, 0)
+};
+
+comptime {
+    assert(erc20_code[0x5d] == 0x5b);
+}
+
 var harness_storage: Harness = undefined;
 var harness_ready = false;
 
@@ -138,6 +197,44 @@ fn transfer(iterations: u32) u64 {
     return gas_used;
 }
 
+/// One ERC-20 transfer transaction: two cold slots read and written plus a log.
+fn erc20_transfer(iterations: u32) u64 {
+    const h = harness();
+    const token = contract;
+    const recipient = primitives.address_from_int(0x2ec1);
+    h.database.put_account(caller, 1 << 80, 0, &.{}) catch @panic("bench: put caller");
+    h.database.put_account(token, 0, 1, &erc20_code) catch @panic("bench: put token");
+    var key: [64]u8 = @splat(0);
+    key[12..32].* = caller;
+    const slot = std.mem.readInt(u256, &keccak256(&key), .big);
+    h.database.put_storage(token, slot, 1 << 64) catch @panic("bench: put balance");
+    var data: [68]u8 = @splat(0);
+    data[0..4].* = .{ 0xa9, 0x05, 0x9c, 0xbb }; // transfer(address,uint256)
+    data[16..36].* = recipient;
+    data[67] = 1;
+    h.evm.block = .{ .base_fee = 7, .gas_limit = gas_limit };
+    const tx = transaction.TxEnv{
+        .tx_type = .eip1559,
+        .caller = caller,
+        .gas_limit = 100_000,
+        .gas_price = 10,
+        .gas_priority_fee = 1,
+        .to = token,
+        .data = &data,
+    };
+    var gas_used: u64 = 0;
+    var iteration: u32 = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        h.state.reset(h.database.interface());
+        const result = transaction.transact(&h.evm, fork, &tx) catch @panic("bench: transact");
+        assert(result.executed.status == .success);
+        assert(result.executed.logs.len == 1);
+        gas_used += result.executed.gas_used;
+    }
+    return gas_used;
+}
+
+const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const Case = @import("../../testing/bench.zig").Case;
 
 pub const cases = [_]Case{
@@ -150,6 +247,8 @@ pub const cases = [_]Case{
     // ~530k gas: 200 STATICCALLs with a cold first access.
     .{ .name = "evm: call loop (200 staticcall)", .iterations = 500, .run = calls },
     .{ .name = "evm: value transfer transaction", .iterations = 10_000, .run = transfer },
+    // ~51k gas: the common token transfer path end to end.
+    .{ .name = "evm: erc20 transfer transaction", .iterations = 10_000, .run = erc20_transfer },
 };
 
 test "evm bench: cases execute successfully" {
