@@ -22,6 +22,7 @@ const usage =
     \\         [--checkpoint.path FILE]
     \\         [--metrics.enabled [--metrics.addr IP] [--metrics.port P]]
     \\         [--source-l2-rpc URL]   follow mode: insert blocks from a source node
+    \\         [--conductor.rpc URL] [--sequencer.stopped]
     \\
 ;
 
@@ -32,6 +33,9 @@ pub const Flags = struct {
     l2: ?io.Address = null,
     /// Follow mode (base/base `follow --source-l2-rpc`): no derivation.
     source_l2_rpc: ?io.Address = null,
+    /// op-conductor (base/base `--conductor.rpc`).
+    conductor_rpc: ?io.Address = null,
+    sequencer_stopped: bool = false,
     l2_jwt: ?[]const u8 = null,
     rpc_addr: [4]u8 = .{ 127, 0, 0, 1 },
     rpc_port: u16 = 7545,
@@ -99,6 +103,10 @@ fn apply_switch(flags: *Flags, arg: []const u8) bool {
         flags.sequencer = true;
         return true;
     }
+    if (std.mem.eql(u8, arg, "--sequencer.stopped")) {
+        flags.sequencer_stopped = true;
+        return true;
+    }
     if (std.mem.eql(u8, arg, "--metrics.enabled")) {
         flags.metrics_enabled = true;
         return true;
@@ -116,6 +124,8 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.l1_beacon = try parse_url(value);
     } else if (eql(u8, arg, "--l2")) {
         flags.l2 = try parse_url(value);
+    } else if (eql(u8, arg, "--conductor.rpc")) {
+        flags.conductor_rpc = try parse_url(value);
     } else if (eql(u8, arg, "--source-l2-rpc")) {
         flags.source_l2_rpc = try parse_url(value);
     } else if (eql(u8, arg, "--l2-jwt")) {
@@ -218,7 +228,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .jwt_secret = secret,
         .rpc_address = io.Address.ip4(flags.rpc_addr, flags.rpc_port),
         .sequencer = flags.sequencer,
-        .driver = .{ .sequencer = flags.sequencer },
+        .driver = .{ .sequencer = flags.sequencer, .sequencer_stopped = flags.sequencer_stopped },
+        .conductor = flags.conductor_rpc,
         .version = base.build_options.version,
         .p2p = p2p_config,
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
@@ -340,6 +351,11 @@ test "consensus: flags" {
     try std.testing.expectEqual(@as(u16, 8545), following.source_l2_rpc.?.port);
     const follow_sequencer = follow_args ++ [_][]const u8{"--sequencer"};
     try std.testing.expectError(error.FollowSequencer, parse_flags(&follow_sequencer));
+    const conducted = try parse_flags(&(required ++ [_][]const u8{
+        "--sequencer", "--sequencer.stopped", "--conductor.rpc", "http://10.0.0.8:8547",
+    }));
+    try std.testing.expect(conducted.sequencer_stopped);
+    try std.testing.expectEqual(@as(u16, 8547), conducted.conductor_rpc.?.port);
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
     try std.testing.expect(upgrade_settings(&disabled, 8453) != null);

@@ -330,7 +330,8 @@ pub const EngineTaskQueue = struct {
     fn own_seal_envelope(slot: *Slot) void {
         if (slot.task != .seal) return;
         const seal = &slot.task.seal;
-        if (seal.phase != .insert or seal.envelope_owned) return;
+        const fetched = seal.phase == .insert or seal.phase == .commit;
+        if (!fetched or seal.envelope_owned) return;
         const copy = copy_envelope(slot.arena.allocator(), &seal.envelope) catch {
             // Fetch the payload again rather than insert from borrowed memory.
             seal.restart();

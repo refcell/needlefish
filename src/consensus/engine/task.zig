@@ -157,8 +157,23 @@ pub fn severity(err: Error) Severity {
 }
 
 /// Read-only configuration shared by every task.
+/// Commits a sealed unsafe payload to an external authority before it is inserted (the
+/// sequencer conductor's `conductor_commitUnsafePayload`). Non-blocking like the engine
+/// client: `NotAvailable` until the commit of this payload has succeeded; failures are
+/// retried by the committer.
+pub const Committer = struct {
+    context: *anyopaque,
+    commit: *const fn (
+        context: *anyopaque,
+        payload: *const ExecutionPayload,
+        parent_beacon_block_root: ?B256,
+    ) error{NotAvailable}!void,
+};
+
 pub const Context = struct {
     rollup: *const RollupConfig,
+    /// Sequencer conductor; unsafe seals wait for its commit when set.
+    committer: ?Committer = null,
     /// EIP-1559 parameters substituted for all-zero Holocene `eip1559Params`.
     fee_params_canyon: FeeParams = attributes_match.fee_params_canyon_default,
 };

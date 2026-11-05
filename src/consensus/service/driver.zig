@@ -44,6 +44,9 @@ const UnsafeBuffer = @import("unsafe_buffer.zig").UnsafeBuffer;
 
 pub const Options = struct {
     sequencer: bool = false,
+    /// Start a sequencer inactive, for `admin_startSequencer` (base/base `--sequencer.stopped`;
+    /// a conductor starts its leader this way).
+    sequencer_stopped: bool = false,
     /// Build blocks without transaction pool transactions (base/base recovery mode).
     recovery_mode: bool = false,
     queue: task_queue.Options = .{},
@@ -202,7 +205,7 @@ pub const Driver = struct {
             .selector = .init(rollup),
             .builder = .init(allocator, rollup, blob_schedule),
             .unsafe_buffer = unsafe_buffer,
-            .sequencer_active = options.sequencer,
+            .sequencer_active = options.sequencer and !options.sequencer_stopped,
         };
         assert(driver.phase == .starting);
     }

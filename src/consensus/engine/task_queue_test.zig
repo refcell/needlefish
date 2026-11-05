@@ -481,6 +481,58 @@ test "seal: fetches, imports, and canonicalizes the payload" {
     try expect_failure(step_until_done(&queue, &mock), error.UnexpectedPayloadVersion, .temporary);
 }
 
+const FakeCommitter = struct {
+    withheld: u32,
+    calls: u32 = 0,
+    committed: ?primitives.B256 = null,
+    new_payload_calls_at_commit: u32 = 0,
+    mock: *const MockEngine,
+
+    fn commit(
+        context: *anyopaque,
+        payload: *const task.ExecutionPayload,
+        root: ?primitives.B256,
+    ) error{NotAvailable}!void {
+        const committer: *FakeCommitter = @ptrCast(@alignCast(context));
+        _ = root;
+        committer.calls += 1;
+        if (committer.calls <= committer.withheld) return error.NotAvailable;
+        committer.committed = payload.block_hash;
+        committer.new_payload_calls_at_commit = committer.mock.new_payload_calls;
+    }
+
+    fn interface(committer: *FakeCommitter) task.Committer {
+        return .{ .context = committer, .commit = commit };
+    }
+};
+
+test "seal: an unsafe payload is committed to the conductor before it is inserted" {
+    var chain: Chain = undefined;
+    chain.init();
+    var mock: MockEngine = .{ .latency = 1 };
+    mock.payload = .{ .payload = chain.fixtures[11].payload(), .block_value = 0 };
+    var committer: FakeCommitter = .{ .withheld = 3, .mock = &mock };
+    const context: task.Context = .{
+        .rollup = &rollup_default,
+        .committer = committer.interface(),
+    };
+    var queue = try EngineTaskQueue.init(testing.allocator, context, state_at(10, 5, 0), .{
+        .capacity = 8,
+    });
+    defer queue.deinit(testing.allocator);
+    const attributes = chain.fixtures[11].attributes(info(10));
+    try queue.enqueue(.{ .seal = .{ .payload_id = @splat(1), .attributes = &attributes } });
+    const result = step_until_done(&queue, &mock);
+    try testing.expect(result.completed.seal.eql(info(11)));
+    try testing.expectEqual(@as(u32, 4), committer.calls);
+    try testing.expect(committer.committed.?.eql(info(11).block_info.hash));
+    try testing.expectEqual(@as(u32, 0), committer.new_payload_calls_at_commit);
+    try testing.expect(mock.new_payload_calls >= 1);
+    // The payload was copied out of the client while the commit was pending.
+    const sealed = queue.take_sealed().?;
+    try testing.expect(sealed.payload.block_hash.eql(info(11).block_info.hash));
+}
+
 test "seal: deposits-only payload rejected by the engine is critical" {
     var chain: Chain = undefined;
     chain.init();

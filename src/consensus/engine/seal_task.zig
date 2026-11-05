@@ -30,7 +30,7 @@ pub const SealTask = struct {
     /// Borrowed from the owner (queue slot or consolidate task).
     attributes: *const AttributesWithParent,
     safety: Safety,
-    phase: enum { get_payload, insert, fallback_build } = .get_payload,
+    phase: enum { get_payload, commit, insert, fallback_build } = .get_payload,
     /// Building the Holocene deposits-only replacement.
     fallback: bool = false,
     /// The fetched payload; its slices borrow the client until the owner copies them
@@ -87,12 +87,22 @@ pub const SealTask = struct {
         engine_state: *EngineState,
         client: anytype,
     ) Error!L2BlockInfo {
-        for (0..5) |_| {
+        for (0..7) |_| {
             switch (seal.phase) {
                 .get_payload => {
                     try seal.get_payload(context, client);
                     seal.envelope_owned = false;
                     seal.insert = .{ .envelope = &seal.envelope, .safety = seal.safety };
+                    const commit = context.committer != null and seal.safety == .unsafe_payload;
+                    seal.phase = if (commit) .commit else .insert;
+                },
+                .commit => {
+                    // base/base `SealState::Sealed`: the conductor must accept the payload
+                    // before it is inserted (and gossiped).
+                    const committer = context.committer.?;
+                    const payload = &seal.envelope.payload;
+                    const root = seal.envelope.parent_beacon_block_root;
+                    try committer.commit(committer.context, payload, root);
                     seal.phase = .insert;
                 },
                 .insert => {
@@ -112,7 +122,9 @@ pub const SealTask = struct {
                 },
             }
         }
-        unreachable; // Proof: get_payload -> insert -> fallback_build -> get_payload -> insert.
+        // Proof: get_payload -> commit -> insert -> fallback_build -> get_payload -> commit ->
+        // insert is the longest path; a second fallback is `DepositOnlyPayloadFailed`.
+        unreachable;
     }
 
     fn start_fallback(seal: *SealTask, context: *const task.Context, cause: Error) Error!void {

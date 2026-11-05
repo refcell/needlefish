@@ -47,6 +47,7 @@ const signer_watcher = @import("signer_watcher.zig");
 const checkpoint = @import("checkpoint.zig");
 const metrics_module = @import("metrics.zig");
 const follow = @import("follow.zig");
+const conductor_module = @import("conductor.zig");
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -98,6 +99,8 @@ pub const Options = struct {
     /// Follow mode (`--source-l2-rpc`): insert blocks from this source node's execution RPC
     /// instead of deriving them.
     follow_source: ?Address = null,
+    /// Sequencer conductor (`--conductor.rpc`): commits sealed payloads, gates starting.
+    conductor: ?Address = null,
     /// Prometheus `GET /metrics` (`--metrics.enabled`); not served when null.
     metrics_address: ?Address = null,
     sequencer: bool = false,
@@ -248,6 +251,8 @@ pub fn Node(comptime IO: type) type {
             .reset_derivation_pipeline = admin_reset_derivation_pipeline,
             .post_unsafe_payload = admin_post_unsafe_payload,
             .task_queue_length = admin_task_queue_length,
+            .conductor_enabled = admin_conductor_enabled,
+            .override_leader = admin_override_leader,
         };
         const base_vtable: base_rpc.VTable = .{
             .config = base_config,
@@ -318,11 +323,13 @@ pub fn Node(comptime IO: type) type {
         metrics: metrics_module.Metrics = .{},
         metrics_server: ?MetricsServer = null,
         follower: ?*Follower = null,
+        conductor: ?*Conductor = null,
         /// Source labels waiting for the local blocks they are checked against.
         follow_labels: ?follow.Labels = null,
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
         pub const Follower = follow.Follower(IO);
+        pub const Conductor = conductor_module.Conductor(IO);
         pub const MetricsServer = http.Server(IO, *Metrics, Metrics.handle);
         const Metrics = metrics_module.Metrics;
         pub const Network = p2p_network.Network(IO);
@@ -395,7 +402,32 @@ pub fn Node(comptime IO: type) type {
             errdefer node.deinit_checkpoints();
             if (options.follow_source) |source| try node.init_follower(source);
             errdefer node.deinit_follower();
+            if (options.conductor) |address| try node.init_conductor(address);
+            errdefer node.deinit_conductor();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_conductor(node: *Self, address: Address) !void {
+            assert(node.conductor == null);
+            const conductor = try node.allocator.create(Conductor);
+            errdefer node.allocator.destroy(conductor);
+            try conductor.init(node.allocator, node.io, address, node.options.engine_http_client);
+            node.conductor = conductor;
+            node.driver.queue.context.committer = conductor.committer();
+            assert(node.driver.queue.context.committer != null);
+        }
+
+        fn deinit_conductor(node: *Self) void {
+            const conductor = node.conductor orelse return;
+            node.driver.queue.context.committer = null;
+            var rounds: u32 = 0;
+            while (conductor.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+                conductor.client.http.tick();
+            }
+            conductor.deinit();
+            node.allocator.destroy(conductor);
+            node.conductor = null;
         }
 
         fn init_follower(node: *Self, source: Address) !void {
@@ -727,6 +759,7 @@ pub fn Node(comptime IO: type) type {
             node.deinit_upgrade();
             node.deinit_checkpoints();
             node.deinit_follower();
+            node.deinit_conductor();
             node.gossip_arena.deinit();
             node.deinit_metrics();
             node.rpc_server.deinit();
@@ -782,9 +815,10 @@ pub fn Node(comptime IO: type) type {
             const blobs_busy = if (node.blobs) |blobs| blobs.busy() else false;
             const signer_busy = if (node.signer) |signer| signer.busy() else false;
             const follower_busy = if (node.follower) |follower| follower.busy() else false;
+            const conductor_busy = if (node.conductor) |conductor| conductor.busy() else false;
             return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
                 node.message_passer.busy() or node.engine.busy() or blobs_busy or signer_busy or
-                follower_busy;
+                follower_busy or conductor_busy;
         }
 
         /// One step of the node's state machines; call every few milliseconds.
@@ -805,6 +839,7 @@ pub fn Node(comptime IO: type) type {
             }
             node.tick_checkpoints();
             node.tick_follow();
+            if (node.conductor) |conductor| conductor.tick();
             node.record_metrics();
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
@@ -999,6 +1034,10 @@ pub fn Node(comptime IO: type) type {
 
         fn admin_start_sequencer(context: *anyopaque, head: Hash) admin_rpc.StartError!void {
             const node = from_context(context);
+            if (node.conductor) |conductor| {
+                // base/base checks `conductor_leader` first; this answers from the last poll.
+                if (conductor.leader != true) return error.NotLeader;
+            }
             try node.driver.start_sequencer(head);
             node.logger.log(.info, "consensus", "sequencer started", .{});
         }
@@ -1022,6 +1061,17 @@ pub fn Node(comptime IO: type) type {
             const node = from_context(context);
             node.driver.request_reset();
             node.logger.log(.info, "consensus", "derivation pipeline reset requested", .{});
+        }
+
+        fn admin_conductor_enabled(context: *anyopaque) bool {
+            return from_context(context).conductor != null;
+        }
+
+        fn admin_override_leader(context: *anyopaque) admin_rpc.OverrideError!void {
+            const node = from_context(context);
+            const conductor = node.conductor orelse return error.NoConductor;
+            conductor.request_override();
+            node.logger.log(.info, "consensus", "conductor leader override requested", .{});
         }
 
         fn admin_task_queue_length(context: *anyopaque) u64 {
@@ -1230,6 +1280,51 @@ test "node: follow mode polls the source node and never derives" {
     // The driver is not running (the fake L1 origin is missing), so no block is fetched.
     try testing.expectEqual(@as(u64, 0), follower.stats.blocks);
     try testing.expectEqual(@as(u64, 0), node.driver.stats.consolidated);
+    while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
+}
+
+test "node: conductor gates the sequencer start and commits seals" {
+    var fake: FakeRpc = .{};
+    fake.add(.{ .method = "conductor_leader", .result = "false" });
+    var harness: Harness = undefined;
+    try harness.init_connections(&fake, 0xc1, 6);
+    defer harness.deinit();
+    var rollup: RollupConfig = .{ .block_time = 2 };
+    var log_buffer: [4096]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const node = try testing.allocator.create(TestNode);
+    defer testing.allocator.destroy(node);
+    try node.init(testing.allocator, &harness.client_io, &logger, &rollup, .{
+        .l1 = harness.address,
+        .l2 = harness.address,
+        .conductor = harness.address,
+        .sequencer = true,
+        .driver = .{ .sequencer = true, .sequencer_stopped = true },
+        .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
+        .http_client = harness_module.client_options,
+    });
+    defer node.deinit();
+    try testing.expect(node.driver.queue.context.committer != null);
+    try testing.expect(!node.driver.sequencer_active);
+    const head = node.driver.sync_state().unsafe_head.block_info.hash;
+    // Leadership unknown before the first poll, then false: starting is refused.
+    try testing.expectError(error.NotLeader, TestNode.admin_start_sequencer(node, head));
+    for (0..10) |_| {
+        node.tick();
+        harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+    try testing.expect(node.conductor.?.leader == false);
+    try testing.expectError(error.NotLeader, TestNode.admin_start_sequencer(node, head));
+    try testing.expect(TestNode.admin_conductor_enabled(node));
+    try TestNode.admin_override_leader(node);
+    fake.add(.{ .method = "conductor_overrideLeader", .result = "null" });
+    for (0..10) |_| {
+        node.tick();
+        harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+    try testing.expectEqual(@as(u64, 1), node.conductor.?.stats.overrides);
     while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
 }
 

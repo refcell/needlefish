@@ -6,9 +6,10 @@
 //! `admin_postUnsafePayload` hands the raw `OpExecutionPayloadEnvelope` JSON to the node,
 //! which decodes it and queues it like a gossiped unsafe block.
 //!
-//! Without a conductor `admin_overrideLeader` fails like base/base's sequencer does with no
-//! conductor configured. `admin_refreshUpgradeSignal` needs the runtime-admin upgrade mode
-//! (only metrics-only exists), so it reports the signal as not configured (-32004).
+//! With a conductor (`--conductor.rpc`) `admin_startSequencer` requires leadership and
+//! `admin_overrideLeader` is forwarded; without one the override fails like base/base's.
+//! `admin_refreshUpgradeSignal` needs the runtime-admin upgrade mode (only metrics-only
+//! exists), so it reports the signal as not configured (-32004).
 //! `dev_taskQueueLength` reports the engine task queue length.
 //! Not implemented: `admin_clearPendingP2pConnections` (needs a p2p dial-abort API).
 
@@ -24,7 +25,18 @@ const Backend = rollup.Backend;
 const Call = rpc.Call;
 const HandlerError = rpc.HandlerError;
 
-pub const StartError = error{ NotSequencer, AlreadyActive, UnsafeHeadMismatch, NotReady };
+pub const StartError = error{
+    NotSequencer,
+    AlreadyActive,
+    UnsafeHeadMismatch,
+    NotReady,
+    /// A conductor is configured and this node is not (known to be) its leader.
+    NotLeader,
+};
+pub const OverrideError = error{NoConductor};
+
+/// base/base `NOT_LEADER_CODE`.
+pub const not_leader_code: i32 = -32002;
 pub const StopError = error{ NotSequencer, NotActive };
 pub const PostError = error{
     /// The envelope is not a valid execution payload envelope.
@@ -46,6 +58,9 @@ pub const VTable = struct {
     post_unsafe_payload: *const fn (context: *anyopaque, envelope_json: []const u8) PostError!void,
     /// Tasks waiting in the engine queue (`dev_taskQueueLength`).
     task_queue_length: *const fn (context: *anyopaque) u64,
+    conductor_enabled: *const fn (context: *anyopaque) bool,
+    /// Asks the conductor to make this node the leader (`admin_overrideLeader`).
+    override_leader: *const fn (context: *anyopaque) OverrideError!void,
 };
 
 /// base/base `UPGRADE_SIGNAL_UNAVAILABLE_CODE`.
@@ -88,8 +103,10 @@ fn start_sequencer(backend: *const Backend, call: *Call) HandlerError!void {
             error.AlreadyActive => "sequencer already running",
             error.UnsafeHeadMismatch => "block hash does not match unsafe head",
             error.NotReady => "sequencer not ready (engine sync in progress)",
+            error.NotLeader => "Node is not the conductor leader.",
         };
-        return call.fail(rpc.code.server_error, message);
+        const code = if (err == error.NotLeader) not_leader_code else rpc.code.server_error;
+        return call.fail(code, message);
     };
     try call.writer.null_value();
 }
@@ -109,15 +126,17 @@ fn stop_sequencer(backend: *const Backend, call: *Call) HandlerError!void {
 
 fn conductor_enabled(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    _ = backend;
-    try call.writer.boolean(false); // No conductor: a single sequencer.
+    const vtable = backend.admin orelse return call.writer.boolean(false);
+    try call.writer.boolean(vtable.conductor_enabled(backend.context));
 }
 
 fn override_leader(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    _ = try admin(backend, call);
+    const vtable = try admin(backend, call);
     // base/base: `LeaderOverrideError("No conductor configured")`, mapped to InternalError.
-    return call.fail(rpc.code.internal_error, "Internal error");
+    vtable.override_leader(backend.context) catch
+        return call.fail(rpc.code.internal_error, "Internal error");
+    try call.writer.null_value();
 }
 
 fn refresh_upgrade_signal(backend: *const Backend, call: *Call) HandlerError!void {
@@ -187,6 +206,9 @@ const StubNode = struct {
     recover: bool = false,
     resets: u32 = 0,
     posts: u32 = 0,
+    conductor: bool = false,
+    leader: bool = true,
+    overrides: u32 = 0,
     head: Hash = .{ .bytes = @splat(0xab) },
     config: protocol.rollup_config.RollupConfig = .{ .block_time = 2 },
 
@@ -199,6 +221,8 @@ const StubNode = struct {
         .reset_derivation_pipeline = reset,
         .post_unsafe_payload = post,
         .task_queue_length = queue_length,
+        .conductor_enabled = conductor_of,
+        .override_leader = override,
     };
     const rollup_vtable: Backend.VTable = .{
         .sync_status = status_of,
@@ -215,6 +239,7 @@ const StubNode = struct {
     fn start(context: *anyopaque, head: Hash) StartError!void {
         const node = of(context);
         if (node.active) return error.AlreadyActive;
+        if (node.conductor and !node.leader) return error.NotLeader;
         if (!head.eql(node.head)) return error.UnsafeHeadMismatch;
         node.active = true;
     }
@@ -236,6 +261,14 @@ const StubNode = struct {
     fn post(context: *anyopaque, envelope_json: []const u8) PostError!void {
         if (envelope_json[0] != '{') return error.InvalidPayload;
         of(context).posts += 1;
+    }
+    fn conductor_of(context: *anyopaque) bool {
+        return of(context).conductor;
+    }
+    fn override(context: *anyopaque) OverrideError!void {
+        const node = of(context);
+        if (!node.conductor) return error.NoConductor;
+        node.overrides += 1;
     }
     fn queue_length(context: *anyopaque) u64 {
         return of(context).resets + 3;
@@ -317,6 +350,24 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
         \\{"jsonrpc":"2.0","id":11,"method":"admin_overrideLeader"}
     , &buffer);
     try testing.expect(contains(leader, "-32603"));
+    node.conductor = true;
+    const overridden = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":13,"method":"admin_overrideLeader"}
+    , &buffer);
+    try testing.expect(contains(overridden, "\"result\":null"));
+    try testing.expectEqual(@as(u32, 1), node.overrides);
+    const enabled = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":14,"method":"admin_conductorEnabled"}
+    , &buffer);
+    try testing.expect(contains(enabled, "\"result\":true"));
+    node.active = false;
+    node.leader = false;
+    const refused = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":15,"method":"admin_startSequencer","params":["0xabababababababababababababababababababababababababababababababab"]}
+    , &buffer);
+    try testing.expect(contains(refused, "-32002"));
+    try testing.expect(contains(refused, "Node is not the conductor leader."));
+    try testing.expect(!node.active);
     const refresh = call_text(&backend,
         \\{"jsonrpc":"2.0","id":12,"method":"admin_refreshUpgradeSignal"}
     , &buffer);
