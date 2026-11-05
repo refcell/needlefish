@@ -33,6 +33,8 @@ const FakeChain = struct {
     sends: u64 = 0,
     /// Creations confirm but leave no code (an out-of-gas deploy).
     creations_fail: bool = false,
+    /// Every receipt reports execution failure (status 0x0).
+    reverting: bool = false,
     created: [created_max]Created = undefined,
     created_count: u32 = 0,
     funded: [funded_max]Address = undefined,
@@ -132,7 +134,9 @@ const FakeChain = struct {
             for (account.mined[0..account.nonce], 0..) |block, nonce| {
                 if (!std.mem.eql(u8, &account.mined_hash[nonce], &hash)) continue;
                 return std.fmt.bufPrint(out, "{{\"blockNumber\":\"0x{x}\"," ++
-                    "\"blockHash\":\"0x{x:0>64}\"}}", .{ block.?, block.? });
+                    "\"blockHash\":\"0x{x:0>64}\",\"status\":\"0x{d}\"}}", .{
+                    block.?, block.?, @intFromBool(!chain.reverting),
+                });
             }
             return "null";
         }
@@ -398,6 +402,16 @@ test "load_test runner: a deploy without code fails the prep and ends the run" {
     const json = writer.buffered();
     try testing.expect(std.mem.indexOf(u8, json, "\"phase\":\"failed\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"contracts\":null") != null);
+}
+
+test "load_test runner: a reverted prep transaction fails the prep" {
+    const setup = try create_setup(try prep_config(15));
+    defer destroy_setup(setup);
+    setup.chain.reverting = true;
+    _ = setup.run(1_000);
+    try testing.expect(setup.runner.prep_failed());
+    try testing.expect(setup.runner.prep.?.reverted > 0);
+    try testing.expectEqual(@as(u64, 0), setup.runner.recorder.submitted);
 }
 
 test "load_test runner: contract payloads need a prep phase" {

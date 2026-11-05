@@ -15,6 +15,8 @@ pub const Summary = struct {
     submitted: u64,
     confirmed: u64,
     failed: u64,
+    /// Confirmed (included) but reverted; also counted in `confirmed`.
+    reverted: u64,
     send_errors: u64,
     bumps: u64,
     latency_p50_ms: u64,
@@ -39,6 +41,7 @@ pub fn Recorder(comptime samples_max: u32) type {
         submitted: u64 = 0,
         confirmed: u64 = 0,
         failed: u64 = 0,
+        reverted: u64 = 0,
         failures: [failure_count]u64 = @splat(0),
         send_errors: u64 = 0,
         bumps: u64 = 0,
@@ -68,8 +71,9 @@ pub fn Recorder(comptime samples_max: u32) type {
                     recorder.failed += 1;
                     recorder.failures[@backingInt(failure)] += 1;
                 },
-                .confirmed => {
+                .confirmed => |confirmed| {
                     recorder.confirmed += 1;
+                    if (!confirmed.success) recorder.reverted += 1;
                     recorder.last_confirm_ms = @max(recorder.last_confirm_ms, now_ms);
                     recorder.record_latency(latency_ms);
                 },
@@ -100,6 +104,7 @@ pub fn Recorder(comptime samples_max: u32) type {
                 .submitted = recorder.submitted,
                 .confirmed = recorder.confirmed,
                 .failed = recorder.failed,
+                .reverted = recorder.reverted,
                 .send_errors = recorder.send_errors,
                 .bumps = recorder.bumps,
                 .latency_p50_ms = percentile(sorted, 50),
@@ -118,6 +123,7 @@ pub fn Recorder(comptime samples_max: u32) type {
             try out.print("submitted      {d}\nconfirmed      {d}\nfailed         {d}\n", .{
                 s.submitted, s.confirmed, s.failed,
             });
+            try out.print("reverted       {d}\n", .{s.reverted});
             try out.print("send errors    {d}\nfee bumps      {d}\n", .{ s.send_errors, s.bumps });
             try out.print("throughput     {d}.{d:0>3} tx/s\n", .{
                 s.throughput_milli_tps / 1000, s.throughput_milli_tps % 1000,
@@ -141,8 +147,8 @@ pub fn write_json_members(
     out: *std.Io.Writer,
 ) std.Io.Writer.Error!void {
     assert(failures.len == failure_count);
-    try out.print("\"submitted\":{d},\"confirmed\":{d},\"failed\":{d},", .{
-        s.submitted, s.confirmed, s.failed,
+    try out.print("\"submitted\":{d},\"confirmed\":{d},\"failed\":{d},\"reverted\":{d},", .{
+        s.submitted, s.confirmed, s.failed, s.reverted,
     });
     try out.print("\"send_errors\":{d},\"fee_bumps\":{d},\"throughput_milli_tps\":{d},", .{
         s.send_errors, s.bumps, s.throughput_milli_tps,
@@ -208,4 +214,10 @@ test "metrics: reservoir keeps percentiles representative" {
     recorder.record_completion(.{ .failed = .send_timeout }, 2, 0, 1);
     const index = @backingInt(manager.Failure.send_timeout);
     try testing.expectEqual(@as(u64, 1), recorder.failures[index]);
+    recorder.record_submit(0);
+    const reverted: manager.Outcome = .{
+        .confirmed = .{ .hash = @splat(0), .block_number = 1, .success = false },
+    };
+    recorder.record_completion(reverted, 0, 5, 1);
+    try testing.expectEqual(@as(u64, 1), recorder.summary().reverted);
 }

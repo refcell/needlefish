@@ -333,8 +333,8 @@ pub const Runner = struct {
         try out.print("prep           {t}: funded {d} minted {d}", .{
             prep.phase, prep.funded, prep.minted,
         });
-        try out.print(" send errors {d} rpc errors {d}\n", .{
-            prep.send_errors, prep.rpc_errors,
+        try out.print(" reverted {d} send errors {d} rpc errors {d}\n", .{
+            prep.reverted, prep.send_errors, prep.rpc_errors,
         });
         if (prep.failure) |failure| try out.print("prep failure   {t}\n", .{failure});
         if (prep.contracts_deployed()) |deployed| {
@@ -364,8 +364,8 @@ pub const Runner = struct {
         try out.print("{{\"phase\":\"{t}\",\"funded\":{d},\"minted\":{d},", .{
             prep.phase, prep.funded, prep.minted,
         });
-        try out.print("\"send_errors\":{d},\"rpc_errors\":{d},\"failure\":", .{
-            prep.send_errors, prep.rpc_errors,
+        try out.print("\"reverted\":{d},\"send_errors\":{d},\"rpc_errors\":{d},\"failure\":", .{
+            prep.reverted, prep.send_errors, prep.rpc_errors,
         });
         if (prep.failure) |failure| {
             try out.print("\"{t}\"", .{failure});

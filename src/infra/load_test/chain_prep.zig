@@ -62,6 +62,8 @@ pub const Prep = struct {
     send_errors: u64 = 0,
     rpc_errors: u64 = 0,
     failure: ?manager.Failure = null,
+    /// Prep transactions that were included but reverted (fails the prep).
+    reverted: u32 = 0,
     funded: u32 = 0,
     minted: u32 = 0,
     /// Every deployed contract holds the expected code.
@@ -209,7 +211,14 @@ pub const Prep = struct {
                     prep.phase = .failed;
                     continue;
                 },
-                .confirmed => prep.confirmed += 1,
+                .confirmed => |confirmed| {
+                    prep.confirmed += 1;
+                    if (!confirmed.success) {
+                        prep.reverted += 1;
+                        prep.phase = .failed;
+                        continue;
+                    }
+                },
             }
             switch (pending.item) {
                 .deploy => |kind| {
