@@ -64,7 +64,40 @@ pub const BlockEnv = struct {
     excess_blob_gas: ?u64 = null,
 };
 
-pub const Error = evm.evm.Error || @import("state_db.zig").Error || error{
+/// A stateless backend could not read or update state (details stay in the backend).
+pub const BackendError = @import("state_db.zig").Error || error{StateUnavailable};
+
+/// Where blocks read state and commit: the node's `StateDb` (`Backend.of_state_db`), or a
+/// stateless backend such as the fault-proof program's oracle-backed sparse state.
+pub const Backend = struct {
+    context: *anyopaque,
+    database: evm.state.Database,
+    /// Folds the block's journaled evm state into the backend.
+    commit: *const fn (context: *anyopaque, state: *evm.State) BackendError!void,
+    /// The state root after the last commit.
+    root: *const fn (context: *anyopaque) BackendError!Hash,
+
+    pub fn of_state_db(db: *StateDb) Backend {
+        return .{
+            .context = db,
+            .database = db.database(),
+            .commit = state_db_commit,
+            .root = state_db_root,
+        };
+    }
+
+    fn state_db_commit(context: *anyopaque, state: *evm.State) BackendError!void {
+        const db: *StateDb = @ptrCast(@alignCast(context));
+        return db.commit(state);
+    }
+
+    fn state_db_root(context: *anyopaque) BackendError!Hash {
+        const db: *StateDb = @ptrCast(@alignCast(context));
+        return db.root();
+    }
+};
+
+pub const Error = evm.evm.Error || BackendError || error{
     ScratchFull,
     TooManyTransactions,
     InvalidTransaction,
@@ -89,7 +122,7 @@ pub const Executed = struct {
 
 pub const Executor = struct {
     spec: *const chainspec.ChainSpec,
-    db: *StateDb,
+    backend: Backend,
     state: *evm.State,
     machine: *evm.Evm,
     scratch: []u8,
@@ -110,10 +143,19 @@ pub const Executor = struct {
         db: *StateDb,
         config: Config,
     ) !Executor {
+        return init_backend(allocator, spec, .of_state_db(db), config);
+    }
+
+    pub fn init_backend(
+        allocator: std.mem.Allocator,
+        spec: *const chainspec.ChainSpec,
+        backend: Backend,
+        config: Config,
+    ) !Executor {
         assert(config.scratch_bytes > 0);
         const state = try allocator.create(evm.State);
         errdefer allocator.destroy(state);
-        state.* = try evm.State.init(allocator, db.database(), config.limits);
+        state.* = try evm.State.init(allocator, backend.database, config.limits);
         errdefer state.deinit(allocator);
         const machine = try allocator.create(evm.Evm);
         errdefer allocator.destroy(machine);
@@ -127,7 +169,7 @@ pub const Executor = struct {
         const senders = try allocator.alloc(?primitives.Address, config.transactions_max);
         return .{
             .spec = spec,
-            .db = db,
+            .backend = backend,
             .state = state,
             .machine = machine,
             .scratch = scratch,
@@ -238,14 +280,14 @@ pub const Executor = struct {
         const requests = try executor.finish_changes(building.fork, withdrawals);
         const receipts = building.receipts[0..building.count];
         const receipts_root_hash = try executor.receipts_root(receipts);
-        try executor.db.commit(executor.state);
+        try executor.backend.commit(executor.backend.context, executor.state);
         return .{
             .receipts = receipts,
             .gas_used = building.gas_used,
             .blob_gas_used = building.blob_gas_used,
             .logs_bloom = building.logs_bloom,
             .receipts_root = receipts_root_hash,
-            .state_root = try executor.db.root(),
+            .state_root = try executor.backend.root(executor.backend.context),
             .requests = requests,
             .fees = building.fees,
         };
