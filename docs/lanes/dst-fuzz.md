@@ -35,7 +35,8 @@ provably robust.
   family so legacy derivation stays covered.
 - [ ] Sim: drop the `BUG(batcher)` gates (admin ops, reorg tx loss, `evict_reorged`) when
   the batcher tracks confirmation depth and re-queues reorged frames (reported to
-  nf-batcher-devnet).
+  nf-batcher-devnet). Partly fixed in 371cb6d4 (seeds 2562, 2856, 850 pass ungated);
+  gate kept until crash/byzantine cases (seed 329: reused nonce, older tx wins) are fixed.
 - [x] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
   reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
