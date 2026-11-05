@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: `base node` binary (flags per etc/devnet/devnet.sh): --dev-l1 mines and serves beacon API; smoke-tested with curl. Decisions: state in memory, --datadir created but unused; devnet-sized default limits (~485 MB RSS ReleaseSafe); past slots since genesis are mined back-to-back at startup.
 - 2026-11-05: node/service: Service(IO) owns the whole node, eth HTTP server, dev-L1 slot miner (one block per slot through the Engine API, head=safe=finalized) and beacon API; blob sidecars captured from the pool before FCU prunes them. SimIo e2e tests.
 - 2026-11-05: ChainSpec from genesis config, genesis loader into StateDb; test proves our L1/L2 genesis hashes equal the devnet rollup.json anchors. Decision: blobSchedule not parsed yet, standard Cancun/Prague params used.
 - 2026-11-05: eth/net/web3 JSON-RPC (`src/execution/rpc/eth.zig`): values, state (head only), blocks, txs, receipts, sendRawTransaction, call/estimateGas (executor simulate), getLogs, feeHistory (zero rewards). Chain tx-hash index (bounded ring). Shared node test fixture.

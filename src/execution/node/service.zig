@@ -42,19 +42,45 @@ pub const Options = struct {
 
 /// Every bound of the node. Defaults suit a devnet; all memory is allocated at init.
 pub const Limits = struct {
-    state: state_db.Config = .{},
-    executor: executor_module.Config = .{ .scratch_bytes = 32 << 20, .transactions_max = 4096 },
+    state: state_db.Config = .{
+        .trie = .{
+            .accounts_max = 1 << 16,
+            .account_nodes_max = 1 << 17,
+            .storage_nodes_max = 1 << 18,
+        },
+        .code_bytes_max = 32 << 20,
+        .codes_max = 1 << 13,
+        .undo_entries_max = 1 << 17,
+    },
+    /// Devnet-sized EVM bounds (a transaction exceeding one fails like out-of-gas).
+    executor: executor_module.Config = .{
+        .scratch_bytes = 16 << 20,
+        .transactions_max = 4096,
+        .evm = .{ .memory_bytes_max = 16 << 20, .code_arena_bytes = 16 << 20 },
+        .limits = .{
+            .accounts_max = 1 << 14,
+            .slots_max = 1 << 16,
+            .transient_slots_max = 1 << 15,
+            .journal_entries_max = 1 << 18,
+            .logs_max = 1 << 13,
+            .log_data_bytes_max = 8 << 20,
+            .code_bytes_max = 4 << 20,
+        },
+    },
     pool: txpool.Config = .{},
-    chain: chain_module.Config = .{ .store = .{ .blocks_max = 1 << 14, .bytes_max = 64 << 20 } },
-    beacon: beacon_module.Config = .{},
+    chain: chain_module.Config = .{
+        .store = .{ .blocks_max = 1 << 14, .bytes_max = 32 << 20 },
+        .staging_bytes = 8 << 20,
+    },
+    beacon: beacon_module.Config = .{ .slots_max = 256, .bytes_max = 32 << 20 },
     http: http.server.Options = .{
-        .connections_max = 8,
+        .connections_max = 4,
         .recv_buffer_size = 4 << 20,
         .send_buffer_size = 1 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
     },
     beacon_http: http.server.Options = .{
-        .connections_max = 4,
+        .connections_max = 2,
         .recv_buffer_size = 16 * 1024,
         .send_buffer_size = 4 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },

@@ -5,6 +5,7 @@ const std = @import("std");
 const base = @import("base");
 const devnet = @import("devnet.zig");
 const batcher = @import("batcher.zig");
+const node = @import("node.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -13,12 +14,14 @@ const usage =
     \\  version    print version
     \\  devnet     generate local devnet config (base devnet init)
     \\  batcher    submit L2 batches to L1
+    \\  node       execution node (--dev-l1 for a standalone L1 dev chain)
     \\
 ;
 
 test {
     _ = devnet;
     _ = batcher;
+    _ = node;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -38,6 +41,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "devnet")) {
         std.process.exit(try devnet.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "node")) {
+        std.process.exit(try node.main(init, args[2..]));
     }
     if (std.mem.eql(u8, command, "batcher")) {
         std.process.exit(try batcher.main(init, args[2..]));
