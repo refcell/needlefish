@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const evm = @import("../evm/root.zig");
+const trie = @import("../trie/root.zig");
 const state_module = @import("state.zig");
 const overlay_module = @import("overlay.zig");
 const State = state_module.State;
@@ -34,8 +35,15 @@ fn from(context: *anyopaque) *State {
 }
 
 fn basic(context: *anyopaque, address: evm.Address) evm.state.Error!?evm.state.AccountInfo {
-    const info = from(context).basic(address) orelse return null;
-    return .{ .balance = info.balance, .nonce = info.nonce, .code_hash = info.code_hash };
+    const state = from(context);
+    const info = state.basic(address) orelse return null;
+    const address_hash = trie.node.keccak256(&address);
+    return .{
+        .balance = info.balance,
+        .nonce = info.nonce,
+        .code_hash = info.code_hash,
+        .has_storage = state.state_trie.has_storage(address_hash),
+    };
 }
 
 fn code_by_hash(context: *anyopaque, code_hash: evm.B256) evm.state.Error![]const u8 {
@@ -152,6 +160,11 @@ test "evm backend: evm writes commit through the overlay and unwind cleanly" {
     const reloaded = try evm_state.load(contract);
     const reloaded_slot = (try evm_state.storage_access(reloaded, 7)).slot;
     try testing.expectEqual(@as(u256, 42), reloaded_slot.present);
+
+    // EIP-7610: an account with storage reports it; one without does not.
+    const backend = database(&state);
+    try testing.expect((try backend.vtable.basic(backend.context, contract)).?.has_storage);
+    try testing.expect(!(try backend.vtable.basic(backend.context, alice)).?.has_storage);
 
     try state.unwind(&changeset);
     try testing.expectEqual(empty_root, try state.state_root());

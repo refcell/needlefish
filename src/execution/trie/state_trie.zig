@@ -118,6 +118,12 @@ pub const StateTrie = struct {
         return entry.account;
     }
 
+    /// True when the account has a non-empty storage trie (EIP-7610 create collision check).
+    pub fn has_storage(self: *const StateTrie, address_hash: Hash) bool {
+        const entry = self.entries.getPtr(address_hash) orelse return false;
+        return entry.storage_root != StorageTrie.none;
+    }
+
     pub fn get_storage(self: *const StateTrie, address_hash: Hash, slot_hash: Hash) u256 {
         const entry = self.entries.getPtr(address_hash) orelse return 0;
         const value = self.storage.get_in(entry.storage_root, &slot_hash) orelse return 0;
