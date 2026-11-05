@@ -66,7 +66,13 @@ pub fn Transport(comptime IO: type) type {
             send_buffer: [socket_buffer_bytes]u8 = undefined,
             send_offset: usize = 0,
             send_length: usize = 0,
+            /// The connection closed with bytes (e.g. its go-away) still being sent.
+            close_after_send: bool = false,
+            close_deadline_ns: u64 = 0,
         };
+
+        /// How long a graceful close may wait for its last bytes before a hard close.
+        const close_linger_ns = 2 * std.time.ns_per_s;
 
         allocator: std.mem.Allocator,
         io: *IO,
@@ -89,6 +95,9 @@ pub fn Transport(comptime IO: type) type {
             closed: u64 = 0,
             bytes_received: u64 = 0,
             bytes_sent: u64 = 0,
+            /// Connections we closed with a go-away, and ones the remote closed that way.
+            local_go_aways: u64 = 0,
+            remote_go_aways: u64 = 0,
         };
 
         /// Allocates every link and buffer up front. `transport` must not move afterwards.
@@ -179,6 +188,10 @@ pub fn Transport(comptime IO: type) type {
             transport.execute_commands();
             for (transport.links) |*link| {
                 if (link.state != .open) continue;
+                if (link.close_after_send) {
+                    if (now >= link.close_deadline_ns) transport.teardown(link);
+                    continue;
+                }
                 link.connection.tick(now);
                 transport.pump(link);
             }
@@ -194,7 +207,10 @@ pub fn Transport(comptime IO: type) type {
                     .dial => |address| transport.dial(&address),
                     .disconnect => |slot| {
                         const link = transport.link_of_slot(slot) orelse continue;
-                        transport.teardown(link);
+                        // Graceful: yamux go-away first, socket closed once it is sent.
+                        link.connection.close();
+                        transport.stats.local_go_aways += 1;
+                        transport.pump(link);
                     },
                 }
             }
@@ -372,6 +388,19 @@ pub fn Transport(comptime IO: type) type {
             }
             transport.forward_gossip(link);
             transport.flush(link);
+            if (link.state == .open and link.connection.closed_reason() != null) {
+                transport.finish_close(link);
+            }
+        }
+
+        /// The connection is closed: close the socket now, or after the in-flight send
+        /// delivers its last bytes (bounded by `close_linger_ns`).
+        fn finish_close(transport: *Self, link: *Link) void {
+            assert(link.state == .open);
+            if (!link.send_inflight) return transport.teardown(link);
+            if (link.close_after_send) return;
+            link.close_after_send = true;
+            link.close_deadline_ns = transport.now_ns() + close_linger_ns;
         }
 
         fn on_event(transport: *Self, link: *Link, event: connection_module.Event) void {
@@ -391,7 +420,13 @@ pub fn Transport(comptime IO: type) type {
                     const slot = link.slot orelse return;
                     transport.service.on_gossip_frame(slot, frame, now);
                 },
-                .closed => transport.teardown(link),
+                .closed => |reason| {
+                    switch (reason) {
+                        .remote_go_away => transport.stats.remote_go_aways += 1,
+                        else => {},
+                    }
+                    transport.finish_close(link);
+                },
                 .identified, .ping_rtt_ns => {},
             }
         }
@@ -463,6 +498,7 @@ pub fn Transport(comptime IO: type) type {
             link.send_offset += sent;
             assert(link.send_offset <= link.send_length);
             if (link.send_offset < link.send_length) return transport.submit_send(link);
+            if (link.close_after_send) return transport.teardown(link);
             transport.flush(link);
         }
 

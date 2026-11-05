@@ -239,6 +239,23 @@ test "connection: handshake, identify, gossip both ways with a 1 MiB frame, ping
     try testing.expect(pair.dialer_record.closed == null and pair.listener_record.closed == null);
 }
 
+test "connection: graceful close sends go-away and the peer closes too" {
+    var prng = Prng.init(0x676f_6177);
+    var pair = try Pair.init(&prng);
+    defer pair.deinit();
+    var mutation: Mutation = .{ .prng = &prng, .chunk_max = 4096 };
+    try pair.pump(&mutation);
+    try expect_established(&pair, null);
+    pair.dialer.close();
+    try testing.expect(pair.dialer.is_closing());
+    try testing.expectError(error.Closed, pair.dialer.send_gossip(&.{ 1, 0 }));
+    try pair.pump(&mutation);
+    pair.dialer_record.drain(&pair.dialer);
+    try testing.expectEqual(@as(?CloseReason, .local), pair.dialer_record.closed);
+    try testing.expectEqual(@as(?CloseReason, .remote_go_away), pair.listener_record.closed);
+    try testing.expect(!pair.dialer.is_closing());
+}
+
 test "connection: byte-at-a-time delivery" {
     var prng = Prng.init(0x6279_7465);
     var pair = try Pair.init(&prng);

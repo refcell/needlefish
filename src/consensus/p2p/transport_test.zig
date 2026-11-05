@@ -318,6 +318,11 @@ test "p2p transport: a node gossiping badly signed blocks is banned by its peers
         try std.testing.expect(node.transport.open_count() >= 1);
     }
     try std.testing.expectEqual(@as(u32, 0), cluster.storage[attacker].transport.open_count());
+    // Bans disconnect gracefully: the attacker hears yamux go-aways.
+    try std.testing.expect(cluster.storage[attacker].transport.stats.remote_go_aways >= 1);
+    var local_go_aways: u64 = 0;
+    for (cluster.all()[0..attacker]) |*node| local_go_aways += node.transport.stats.local_go_aways;
+    try std.testing.expect(local_go_aways >= 1);
     // The honest nodes still gossip valid blocks among themselves.
     try cluster.publish(0, 50);
     cluster.run(1 * ns_per_s);

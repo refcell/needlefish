@@ -118,6 +118,8 @@ pub const CloseReason = enum {
     gossip_frame_invalid,
     /// The peer sent more negotiation messages than our outbound buffers hold.
     buffer_overflow,
+    /// The remote sent a yamux go-away: it is shutting down (or failed).
+    remote_go_away,
     local,
 };
 
@@ -275,6 +277,8 @@ pub const Connection = struct {
     event_head: u32 = 0,
     event_count: u32 = 0,
     gossip_events_pending: u32 = 0,
+    /// `close` queued a go-away; the connection closes once it is flushed.
+    closing: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, role: Role, config: Config) !Connection {
         assert(config.gossip_frame_size_max > 0);
@@ -421,9 +425,19 @@ pub const Connection = struct {
     }
 
     /// Closes the connection locally; the caller drops the socket.
+    /// Closes the connection. When established, a yamux go-away (normal) is queued first
+    /// and the connection closes once `flush` has written it; otherwise it closes now.
     pub fn close(connection: *Connection) void {
-        connection.fail(.local);
-        assert(connection.phase == .closed);
+        if (connection.phase != .established) return connection.fail(.local);
+        if (connection.closing) return;
+        connection.closing = true;
+        connection.session.go_away(.normal);
+        assert(connection.phase == .established);
+    }
+
+    /// True once `close` queued a go-away that has not been flushed yet.
+    pub fn is_closing(connection: *const Connection) bool {
+        return connection.closing and connection.phase != .closed;
     }
 
     fn fail(connection: *Connection, reason: CloseReason) void {
@@ -620,6 +634,9 @@ pub const Connection = struct {
 
     fn service(connection: *Connection) void {
         assert(connection.phase == .established);
+        // A peer that says go-away is leaving: stop gossiping with it now (rust-libp2p
+        // closes the connection too). Gossip is redundant, so dropped frames are fine.
+        if (connection.session.remote_go_away != null) return connection.fail(.remote_go_away);
         connection.sweep();
         connection.compact_gossip_rx();
         connection.accept_streams();
@@ -1003,7 +1020,7 @@ pub const Connection = struct {
 
     /// Queues one framed gossip RPC (uvarint length + RPC) on the outbound meshsub stream.
     pub fn send_gossip(connection: *Connection, frame: []const u8) SendError!void {
-        if (connection.phase == .closed) return error.Closed;
+        if (connection.phase == .closed or connection.closing) return error.Closed;
         if (connection.phase != .established) return error.NotEstablished;
         const decoded = rpc.frame_decode(frame, connection.gossip_frame_size_max) catch
             return error.InvalidFrame;
@@ -1056,6 +1073,12 @@ pub const Connection = struct {
             length += sealed.len;
         }
         if (connection.phase == .established) connection.sweep();
+        // The go-away is in `output`; nothing more will be sent.
+        if (connection.closing and connection.phase == .established and
+            connection.session.go_away_sent and connection.secure_tx_length == 0)
+        {
+            connection.fail(.local);
+        }
         assert(length <= output.len);
         return output[0..length];
     }
