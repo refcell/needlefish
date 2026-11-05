@@ -114,6 +114,13 @@ pub const Pipeline = struct {
         assert(pipeline.dispatcher.cursor != null);
     }
 
+    /// Starts a fresh session (the admin `admin_startProposer` after a stop): drops
+    /// every cache and cursor, so the next tick recovers from chain state.
+    pub fn reset(pipeline: *Pipeline) void {
+        pipeline.restart();
+        assert(pipeline.cache == null);
+    }
+
     /// Drops every cache and cursor; the next tick recovers from chain state.
     fn restart(pipeline: *Pipeline) void {
         pipeline.stats.restarts += 1;

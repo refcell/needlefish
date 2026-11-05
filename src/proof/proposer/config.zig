@@ -58,6 +58,11 @@ pub const Config = struct {
     metrics_enabled: bool = false,
     metrics_addr: [4]u8 = @splat(0),
     metrics_port: u16 = 7300,
+    /// The admin JSON-RPC (`admin.zig`) when `--rpc.enable-admin`, on `--rpc.addr`
+    /// `--rpc.port` (base/base defaults).
+    rpc_enable_admin: bool = false,
+    rpc_addr: [4]u8 = .{ 127, 0, 0, 1 },
+    rpc_port: u16 = 8545,
 
     pub fn native_prover(config: *const Config) bool {
         return std.mem.eql(u8, config.prover_rpc, "native");
@@ -110,6 +115,9 @@ const Flag = enum {
     metrics_enabled,
     metrics_addr,
     metrics_port,
+    rpc_enable_admin,
+    rpc_addr,
+    rpc_port,
 };
 
 fn flag_of(name: []const u8) Error!Flag {
@@ -121,14 +129,24 @@ fn flag_of(name: []const u8) Error!Flag {
     return std.meta.stringToEnum(Flag, field) orelse error.UnknownFlag;
 }
 
-/// Parses and validates `args` (flag/value pairs; `--dry-run` takes no value).
+/// Flags without a value.
+fn is_switch(flag: Flag) bool {
+    return flag == .dry_run or flag == .metrics_enabled or flag == .rpc_enable_admin;
+}
+
+/// Parses and validates `args` (flag/value pairs; `is_switch` flags take no value).
 pub fn parse(args: []const []const u8) Error!Config {
     var config: Config = .{};
     var index: usize = 0;
     while (index < args.len) {
         const flag = try flag_of(args[index]);
-        if (flag == .dry_run or flag == .metrics_enabled) {
-            if (flag == .dry_run) config.dry_run = true else config.metrics_enabled = true;
+        if (is_switch(flag)) {
+            switch (flag) {
+                .dry_run => config.dry_run = true,
+                .metrics_enabled => config.metrics_enabled = true,
+                .rpc_enable_admin => config.rpc_enable_admin = true,
+                else => unreachable,
+            }
             index += 1;
             continue;
         }
@@ -142,9 +160,12 @@ pub fn parse(args: []const []const u8) Error!Config {
 }
 
 fn set(config: *Config, flag: Flag, value: []const u8) Error!void {
-    assert(flag != .dry_run and flag != .metrics_enabled);
+    assert(!is_switch(flag));
     switch (flag) {
-        .dry_run, .metrics_enabled => unreachable,
+        .dry_run, .metrics_enabled, .rpc_enable_admin => unreachable,
+        .rpc_addr => config.rpc_addr = try parse_ip4(value),
+        .rpc_port => config.rpc_port = std.fmt.parseUnsigned(u16, value, 10) catch
+            return error.InvalidValue,
         .health_addr => config.health_addr = try parse_ip4(value),
         .metrics_addr => config.metrics_addr = try parse_ip4(value),
         .health_port => config.health_port = std.fmt.parseUnsigned(u16, value, 10) catch
@@ -258,6 +279,13 @@ test "proposer config: flags, defaults and validation" {
         "--health.addr", "127.0.0.1",         "--health.port",  "0",
     }));
     try testing.expect(served.metrics_enabled);
+    try testing.expect(!served.rpc_enable_admin);
+    const admin = try parse(&(required ++ [_][]const u8{
+        "--dry-run", "--rpc.enable-admin", "--rpc.port", "18545",
+    }));
+    try testing.expect(admin.rpc_enable_admin);
+    try testing.expectEqual(@as(u16, 18545), admin.rpc_port);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, admin.rpc_addr);
     try testing.expectEqual(@as(u16, 9300), served.metrics_port);
     try testing.expectEqual(@as(u16, 0), served.health_port);
     try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, served.health_addr);
