@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "version", "0.0.0");
     const git_rev = b.option([]const u8, "git-rev", "Git revision baked into binaries");
     options.addOption([]const u8, "git_rev", git_rev orelse "unknown");
+    const slow_tests = b.option(bool, "slow-tests", "Also run large simulation tests") orelse false;
+    options.addOption(bool, "slow_tests", slow_tests);
 
     const base = b.addModule("base", .{
         .root_source_file = b.path("src/base.zig"),

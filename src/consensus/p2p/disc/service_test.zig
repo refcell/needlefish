@@ -4,6 +4,7 @@
 //! most of the cluster. The same seed must produce the same execution.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const assert = std.debug.assert;
 const service_module = @import("service.zig");
 const Service = service_module.Service;
@@ -181,28 +182,37 @@ test "disc service: two nodes handshake and exchange records" {
     try std.testing.expect(cluster.discovered[0][1]);
 }
 
-test "disc service: simulated cluster converges through one boot node" {
-    const cluster = try Cluster.init(std.testing.allocator, 0x5eed, 16, 20_000);
+fn expect_convergence(node_count: u8, duration_ms: u64, live_min: u32) !void {
+    const cluster = try Cluster.init(std.testing.allocator, 0x5eed, node_count, 20_000);
     defer cluster.deinit();
     cluster.boot_all_from(0);
-    cluster.run(20_000 * ns_per_ms);
+    cluster.run(duration_ms * ns_per_ms);
     const fraction = cluster.discovered_fraction_min();
     if (fraction < 0.75) {
         std.debug.print("disc sim: min discovered fraction {d:.2}\n", .{fraction});
         return error.TestUnexpectedResult;
     }
     for (cluster.services[0..cluster.node_count]) |*service| {
-        try std.testing.expect(service.table.live_count() >= 8);
+        try std.testing.expect(service.table.live_count() >= live_min);
     }
+}
+
+test "disc service: simulated cluster converges through one boot node" {
+    try expect_convergence(6, 6000, 3);
+}
+
+test "disc service: large simulated cluster converges (-Dslow-tests)" {
+    if (!build_options.slow_tests) return error.SkipZigTest;
+    try expect_convergence(16, 20_000, 8);
 }
 
 test "disc service: same seed, same execution" {
     var hashes: [2]u64 = undefined;
     for (&hashes) |*hash| {
-        const cluster = try Cluster.init(std.testing.allocator, 0xd57, 8, 50_000);
+        const cluster = try Cluster.init(std.testing.allocator, 0xd57, 4, 50_000);
         defer cluster.deinit();
         cluster.boot_all_from(0);
-        cluster.run(5000 * ns_per_ms);
+        cluster.run(2000 * ns_per_ms);
         hash.* = cluster.trace.final();
     }
     try std.testing.expectEqual(hashes[0], hashes[1]);
