@@ -58,6 +58,14 @@ pub fn build(b: *std.Build) void {
         .description = "Run micro benchmarks",
     });
 
+    // ethereum/tests GeneralStateTests runner (vectors from `just vectors`).
+    _ = add_tool(b, base, target, optimize, .{
+        .name = "statetest",
+        .path = "src/execution/evm/state_test_main.zig",
+        .step = "statetest",
+        .description = "Run state tests: zig build statetest -- <file-or-dir>",
+    });
+
     // Compile-only check for editors and CI speed.
     const check_step = b.step("check", "Compile everything without running");
     check_step.dependOn(&unit_tests.step);

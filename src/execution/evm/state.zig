@@ -198,6 +198,21 @@ pub const State = struct {
         state.* = undefined;
     }
 
+    /// Drop every cached account and slot and point at a new database (new block or
+    /// test case), keeping all allocations.
+    pub fn reset(state: *State, database: Database) void {
+        state.database = database;
+        state.accounts.clearRetainingCapacity();
+        state.slots.clearRetainingCapacity();
+        state.transient.clearRetainingCapacity();
+        state.journal_len = 0;
+        state.logs_len = 0;
+        state.log_data_len = 0;
+        state.code_store_len = 0;
+        state.tx_id = 1;
+        assert(state.accounts.count() == 0);
+    }
+
     // ---------------------------------------------------------------- transactions
 
     pub fn begin_transaction(state: *State) void {

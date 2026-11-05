@@ -17,6 +17,7 @@ pub const interpreter = @import("interpreter.zig");
 pub const evm = @import("evm.zig");
 pub const precompiles = @import("precompiles.zig");
 pub const transaction = @import("transaction.zig");
+pub const state_test = @import("state_test.zig");
 
 test {
     _ = @import("evm_test.zig");
