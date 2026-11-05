@@ -20,6 +20,22 @@ const RlpNode = node.RlpNode;
 const Hash = node.Hash;
 
 /// A builder for keys of at most `depth_max` nibbles.
+/// Receives the encoding of every node the builder hashes (encodings of at least 32
+/// bytes, plus the root), streamed as `write` chunks closed by one `end`. Lets callers
+/// store trie nodes as keccak preimages (the fault-proof host serves list tries this way).
+pub const NodeSink = struct {
+    context: *anyopaque,
+    write: *const fn (context: *anyopaque, bytes: []const u8) void,
+    end: *const fn (context: *anyopaque) void,
+
+    const Writer = struct {
+        sink: NodeSink,
+        pub fn write(writer: *Writer, bytes: []const u8) void {
+            writer.sink.write(writer.sink.context, bytes);
+        }
+    };
+};
+
 pub fn HashBuilderType(comptime depth_max: u32) type {
     comptime assert(depth_max > 0 and depth_max <= nibbles_module.nibbles_max);
     return struct {
@@ -41,6 +57,8 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
         groups_len: u32 = 0,
         stack: [stack_capacity]RlpNode = undefined,
         stack_len: u32 = 0,
+        /// Optional: receives every hashed node's encoding.
+        node_sink: ?NodeSink = null,
 
         pub fn init() Self {
             return .{};
@@ -83,7 +101,22 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
             }
             assert(self.stack_len <= 1);
             if (self.stack_len == 0) return node.empty_root;
+            // An inline root is still hashed: its encoding is a preimage too.
+            if (self.node_sink) |sink| if (!self.stack[0].is_hash()) {
+                sink.write(sink.context, self.stack[0].slice());
+                sink.end(sink.context);
+            };
             return self.stack[0].root_hash();
+        }
+
+        fn emit_leaf(self: *Self, path: []const u8, value: []const u8) void {
+            const sink = self.node_sink orelse return;
+            var hp: [nibbles_module.hex_prefix_bytes_max]u8 = undefined;
+            const compact = hp[0..nibbles_module.hex_prefix_encode(path, true, &hp)];
+            if (node.leaf_length_compact(compact, value) < 32) return;
+            var writer: NodeSink.Writer = .{ .sink = sink };
+            node.encode_leaf_compact(&writer, compact, value);
+            sink.end(sink.context);
         }
 
         fn push(self: *Self, reference: RlpNode) void {
@@ -127,7 +160,10 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
                 if (!build_extensions) {
                     switch (self.value) {
                         .none => unreachable, // update() runs only with a pending entry.
-                        .leaf => |value| self.push(node.leaf_ref(short_key, value)),
+                        .leaf => |value| {
+                            self.emit_leaf(short_key, value);
+                            self.push(node.leaf_ref(short_key, value));
+                        },
                         .hash => |hash| {
                             self.push(RlpNode.from_hash(hash));
                             build_extensions = true;
@@ -136,6 +172,13 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
                 }
                 if (build_extensions and short_key.len > 0) {
                     const child = self.pop();
+                    if (self.node_sink) |sink| {
+                        if (node.extension_length(short_key, &child) >= 32) {
+                            var writer: NodeSink.Writer = .{ .sink = sink };
+                            node.encode_extension(&writer, short_key, &child);
+                            sink.end(sink.context);
+                        }
+                    }
                     self.push(node.extension_ref(short_key, &child));
                 }
                 if (preceding_len <= common and succeeding.len > 0) return;
@@ -156,6 +199,14 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
             assert(count >= 2);
             assert(self.stack_len >= count);
             const first = self.stack_len - count;
+            if (self.node_sink) |sink| {
+                const children = self.stack[first..self.stack_len];
+                if (node.branch_length(mask, children, &.{}) >= 32) {
+                    var writer: NodeSink.Writer = .{ .sink = sink };
+                    node.encode_branch(&writer, mask, children, &.{});
+                    sink.end(sink.context);
+                }
+            }
             const reference = node.branch_ref(mask, self.stack[first..self.stack_len], &.{});
             self.stack_len = first;
             self.push(reference);

@@ -46,7 +46,16 @@ pub fn adjust_index_for_rlp(step: u64, count: u64) u64 {
 
 /// Root of the trie mapping `rlp(i)` to `items[i]`. Items are already-encoded values.
 pub fn ordered_trie_root(items: []const []const u8) node.Hash {
+    return ordered_trie_root_with_nodes(items, null);
+}
+
+/// `ordered_trie_root`, also streaming every hashed node's encoding to `sink`.
+pub fn ordered_trie_root_with_nodes(
+    items: []const []const u8,
+    sink: ?@import("hash_builder.zig").NodeSink,
+) node.Hash {
     var builder = OrderedHashBuilder.init();
+    builder.node_sink = sink;
     var step: u64 = 0;
     while (step < items.len) : (step += 1) {
         const index = adjust_index_for_rlp(step, items.len);
@@ -113,5 +122,72 @@ test "ordered: seeded differential against the mutable trie" {
             try trie.put(encode_index(index, &key_buffer), items[index]);
         }
         try testing.expectEqual(trie.root_hash(), ordered_trie_root(items[0..count]));
+    }
+}
+
+/// Test sink: buffers one node at a time and records its hash.
+const CollectNodes = struct {
+    buffer: [1024]u8 = undefined,
+    len: usize = 0,
+    hashes: std.AutoHashMapUnmanaged(node.Hash, void) = .empty,
+
+    fn write(context: *anyopaque, bytes: []const u8) void {
+        const collect: *CollectNodes = @ptrCast(@alignCast(context));
+        @memcpy(collect.buffer[collect.len..][0..bytes.len], bytes);
+        collect.len += bytes.len;
+    }
+
+    fn end(context: *anyopaque) void {
+        const collect: *CollectNodes = @ptrCast(@alignCast(context));
+        const hash = node.keccak256(collect.buffer[0..collect.len]);
+        collect.hashes.put(testing.allocator, hash, {}) catch @panic("test allocation");
+        collect.len = 0;
+    }
+
+    /// `TrieType.visit_nodes` visitor: checks each hashed node was emitted.
+    const Check = struct {
+        collect: *CollectNodes,
+        seen: *u32,
+        pub fn visit(check: Check, visit_info: trie_module.Visit) !void {
+            if (visit_info.encoding.len < 32 and visit_info.path.len > 0) return;
+            const hash = node.keccak256(visit_info.encoding);
+            try testing.expect(check.collect.hashes.contains(hash));
+            check.seen.* += 1;
+        }
+    };
+};
+
+test "ordered: the node sink emits exactly the hashed nodes" {
+    const Trie = trie_module.TrieType(.{ .key_bytes_max = 9, .value_size_max = 64 });
+    var trie = try Trie.init(testing.allocator, 2048);
+    defer trie.deinit(testing.allocator);
+    try trie.track_changes(testing.allocator);
+    var prng = Prng.init(0x51c4);
+    var storage: [300][64]u8 = undefined;
+    var items: [300][]const u8 = undefined;
+    for (0..10) |_| {
+        const count = prng.range(1, items.len);
+        trie.clear();
+        for (0..count) |index| {
+            const len = prng.range(1, 64);
+            prng.fill(storage[index][0..len]);
+            items[index] = storage[index][0..len];
+            var key_buffer: [9]u8 = undefined;
+            try trie.put(encode_index(index, &key_buffer), items[index]);
+        }
+        var collect: CollectNodes = .{};
+        defer collect.hashes.deinit(testing.allocator);
+        const sink: @import("hash_builder.zig").NodeSink = .{
+            .context = &collect,
+            .write = CollectNodes.write,
+            .end = CollectNodes.end,
+        };
+        const root = ordered_trie_root_with_nodes(items[0..count], sink);
+        try testing.expectEqual(trie.root_hash(), root);
+        try testing.expect(collect.hashes.contains(root));
+        var seen: u32 = 0;
+        const check: CollectNodes.Check = .{ .collect = &collect, .seen = &seen };
+        try trie.visit_nodes(trie.root, .all, check);
+        try testing.expectEqual(@as(u32, @intCast(collect.hashes.count())), seen);
     }
 }
