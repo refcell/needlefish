@@ -30,7 +30,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] Persistence + restart, reorg handling via forkchoice.
 - [x] rpc: miner_getMaxDASize, miner_setGasLimit (builder fill target), base_transactionStatus,
   admin_dropTransaction, admin_dropSenderTransactions.
-- [ ] rpc: eth_config (EIP-7910 fork config: current/next/last, blob schedule, precompiles,
+- [x] rpc: eth_config (EIP-7910 fork config: current/next/last, blob schedule, precompiles,
   system contracts).
 - [ ] rpc: eth_createAccessList (needs an access-list inspector from the evm).
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
@@ -73,6 +73,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_config (EIP-7910) as reth's handler plus base/base's L2 sanitizing (zero blob schedule; system contracts only beacon roots from Ecotone and history storage from Isthmus). Forks are the distinct schedule times; fork id is EIP-2124 CRC32 over genesis hash plus times after genesis (no block forks on our chains; `Chain.genesis_timestamp` added). Decision: when no fork is active yet we return "no active timestamp fork found" instead of reth's fallback to the last fork. No DEPOSIT_CONTRACT_ADDRESS: the dev chains configure none.
 - 2026-11-05: perf profile after pipelining: the executing thread finishes early and spends ~half its samples helping recovery, so block time is bounded by secp256k1 ecrecover throughput (~30 us each, crypto lane) plus ~5% thread spawn; no large lever left in this lane. Added miner/base/admin pool methods (base/base shapes: `[maxTx, maxBlock]`, `{"status":"Known"|"Unknown"}`, drop returns hashes lowest nonce first); `miner_setGasLimit` caps pool selection, not the header gas limit, as base/base's standard builder.
 - 2026-11-05: perf: execution now runs behind sender recovery (`senders.Pipeline`: workers claim 8-tx batches in order and publish per-batch done flags; the executor waits per transaction and recovers unclaimed batches itself instead of idling). Interleaved A/B of ReleaseFast bench binaries on a loaded host (load 14-25 on 14 cores): 500-transfer block median 6.2 ms vs 7.5 ms before (9 runs each). Next perf targets: commit/trie root (~2 ms of the remaining main-thread time) and spawn cost (a resident pool needs std.Io-free sync; still deferred).
 - 2026-11-05: eth_call/estimateGas at older blocks: `Executor.simulate_on` swaps the evm database for a `HistoryDatabase` (proof per account/slot read; code from the head code store; BLOCKHASH from the head ring, valid for canonical ancestors). The block is resolved before the call object is parsed so historical call data stays clear of the proof buffers at the scratch tail. Context matches the head path (block N+1 on N's state) for consistency between `latest` and explicit numbers.

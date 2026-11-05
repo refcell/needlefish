@@ -11,6 +11,8 @@ const rpc = @import("../../utilities/rpc/root.zig");
 const trie_proof = @import("../trie/proof.zig");
 const fixture = @import("../node/test_fixture.zig");
 const filters_module = @import("filters.zig");
+const eth_config = @import("eth_config.zig");
+const chainspec = @import("../chainspec/root.zig");
 const history_module = @import("../db/history.zig");
 const eth = @import("eth.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
@@ -29,11 +31,15 @@ const Harness = struct {
     out: [1 << 16]u8 = undefined,
 
     fn create() !*Harness {
+        return create_for(fixture.spec);
+    }
+
+    fn create_for(spec: *const chainspec.ChainSpec) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
-        harness.node = try fixture.Node.create();
+        harness.node = try fixture.Node.create_for(spec);
         harness.api = .{
-            .spec = fixture.spec,
+            .spec = spec,
             .chain = &harness.node.chain,
             .pool = &harness.node.pool,
             .scratch = &harness.scratch,
@@ -552,6 +558,52 @@ test "eth: base_transactionStatus and admin drop methods" {
     try expect_contains(try h.request_runtime(sender_body), "\"result\":[]");
 }
 
+test "eth: eth_config on the dev L1 lists Prague with no next fork" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const text = try h.request("eth_config", "[]");
+    try expect_contains(text, "\"current\":{\"activationTime\":0,");
+    const schedule = "\"blobSchedule\":{\"baseFeeUpdateFraction\":5007716,\"max\":9,\"target\":6}";
+    try expect_contains(text, schedule);
+    try expect_contains(text, "\"chainId\":\"0x539\"");
+    const pairing = "\"BLS12_PAIRING_CHECK\":\"0x000000000000000000000000000000000000000F\"";
+    try expect_contains(text, pairing);
+    try testing.expect(std.mem.indexOf(u8, text, "P256VERIFY") == null);
+    try expect_contains(text, "\"WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS\"");
+    const roots = "\"BEACON_ROOTS_ADDRESS\":\"0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02\"";
+    try expect_contains(text, roots);
+    try expect_contains(text, "\"next\":null,\"last\":null}");
+    var expected: [32]u8 = undefined;
+    const hash = std.hash.Crc32.hash(&h.node.chain.genesis_hash);
+    const fork_id = try std.fmt.bufPrint(&expected, "\"forkId\":\"0x{x:0>8}\"", .{hash});
+    try expect_contains(text, fork_id);
+}
+
+var l2_config_spec: chainspec.ChainSpec = chainspec.ChainSpec.presets.base_devnet;
+
+test "eth: eth_config on L2 zeroes blobs, keeps Base system contracts, shows next fork" {
+    l2_config_spec.upgrades[@backingInt(chainspec.Upgrade.beryl)] = 1_000_000;
+    const h = try Harness.create_for(&l2_config_spec);
+    defer h.destroy();
+    const text = try h.request("eth_config", "[]");
+    const zero = "\"blobSchedule\":{\"baseFeeUpdateFraction\":0,\"max\":0,\"target\":0}";
+    try testing.expectEqual(@as(usize, 3), count_of(text, zero));
+    try expect_contains(text, "\"P256VERIFY\":\"0x0000000000000000000000000000000000000100\"");
+    try testing.expect(std.mem.indexOf(u8, text, "WITHDRAWAL_REQUEST") == null);
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"HISTORY_STORAGE_ADDRESS\""));
+    try expect_contains(text, "\"next\":{\"activationTime\":1000000,");
+    try expect_contains(text, "\"last\":{\"activationTime\":1000000,");
+    // The next fork's id folds the Beryl time into the current one.
+    const forks = eth_config.fork_times(&l2_config_spec);
+    const genesis = h.node.chain.genesis_hash;
+    const now = eth_config.fork_hash(genesis, 0, forks.slice(), 0);
+    const next = eth_config.fork_hash(genesis, 0, forks.slice(), 1_000_000);
+    try testing.expect(now != next);
+    var expected: [32]u8 = undefined;
+    const next_id = try std.fmt.bufPrint(&expected, "\"forkId\":\"0x{x:0>8}\"", .{next});
+    try expect_contains(text, next_id);
+}
+
 fn txpool_scenario(seed: u64) !void {
     var prng = Prng.init(seed);
     const h = try Harness.create();
@@ -628,6 +680,7 @@ const method_names = [_][]const u8{
     "base_transactionStatus",
     "admin_dropTransaction",
     "admin_dropSenderTransactions",
+    "eth_config",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

@@ -192,6 +192,8 @@ pub const Chain = struct {
     /// Block whose post-state `db` holds.
     state_hash: Hash,
     genesis_hash: Hash,
+    /// Genesis time: forks at or before it are not part of the EIP-2124 fork id.
+    genesis_timestamp: u64,
     forkchoice: engine.ForkchoiceState,
     builds: [builds_max]Built = undefined,
     builds_len: u32 = 0,
@@ -239,6 +241,7 @@ pub const Chain = struct {
             .tx_ring = tx_ring,
             .state_hash = hash,
             .genesis_hash = hash,
+            .genesis_timestamp = genesis.timestamp,
             .forkchoice = .{
                 .head_block_hash = .{ .bytes = hash },
                 .safe_block_hash = .zero,

@@ -41,7 +41,7 @@ pub const Api = struct {
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
-    @import("txpool.zig").methods;
+    @import("txpool.zig").methods ++ @import("eth_config.zig").methods;
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
@@ -830,6 +830,7 @@ pub fn block_logs(
 }
 
 test {
+    _ = @import("eth_config.zig");
     _ = @import("eth_test.zig");
     _ = @import("debug_test.zig");
     _ = @import("debug_http_test.zig");
