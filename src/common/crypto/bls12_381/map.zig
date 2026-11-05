@@ -92,14 +92,35 @@ fn map_to_curve_sswu(comptime F: type, comptime params: SswuParameters(F), u: F)
     const tv1 = denominator.inverse();
     const x1 = if (tv1.is_zero()) params.b_over_za else params.minus_b_over_a.mul(F.one.add(tv1));
     var x = x1;
-    var y = curve_rhs(F, params, x1).sqrt() orelse blk: {
-        x = z_u2.mul(x1);
-        // gx1 non-square implies gx2 = Z^3 u^6 gx1 is a square.
-        break :blk curve_rhs(F, params, x).sqrt().?;
-    };
+    var y = if (F == Fp) sswu_y_fp(params, u, z_u2, &x) else sswu_y_generic(F, params, z_u2, &x);
     if (sgn0(F, u) != sgn0(F, y)) y = y.neg();
     assert(y.square().eql(curve_rhs(F, params, x)));
     return .{ x, y };
+}
+
+fn sswu_y_generic(comptime F: type, comptime params: SswuParameters(F), z_u2: F, x: *F) F {
+    if (curve_rhs(F, params, x.*).sqrt()) |y| return y;
+    // gx1 non-square implies gx2 = Z^3 u^6 gx1 is a square.
+    x.* = z_u2.mul(x.*);
+    const y = curve_rhs(F, params, x.*).sqrt().?;
+    assert(y.square().eql(curve_rhs(F, params, x.*)));
+    return y;
+}
+
+/// Fp only (p = 3 mod 4): one exponentiation. y' = gx1^((p+1)/4) squares to gx1 or, when
+/// gx1 is not a square, to -gx1; then gx2 = (Z u^3)^2 Z gx1 has the root
+/// Z u^3 sqrt(-Z) y' because Z gx1 = (-Z)(-gx1). Updates `x` to x2 in that case.
+fn sswu_y_fp(comptime params: SswuParameters(Fp), u: Fp, z_u2: Fp, x: *Fp) Fp {
+    const sqrt_minus_z = comptime blk: {
+        @setEvalBranchQuota(10_000_000);
+        break :blk params.z.neg().sqrt().?;
+    };
+    const gx1 = curve_rhs(Fp, params, x.*);
+    const candidate = gx1.pow((fields.p + 1) / 4);
+    if (candidate.square().eql(gx1)) return candidate;
+    assert(candidate.square().eql(gx1.neg()));
+    x.* = z_u2.mul(x.*);
+    return params.z.mul(u.square().mul(u)).mul(sqrt_minus_z).mul(candidate);
 }
 
 fn curve_rhs(comptime F: type, comptime params: SswuParameters(F), x: F) F {

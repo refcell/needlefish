@@ -5,7 +5,9 @@ fallback but hot paths should be our own, optimized implementations.
 
 ## Backlog
 - [x] keccak256: fast single + batch (SIMD multi-lane) implementation, vectors, bench vs std.
-- [ ] keccak256: dedicated NEON-SHA3 / AVX2 single-message path to beat std by >20%.
+- [x] keccak256 single-message: closed. Lazy rotation measured slower; published AArch64 work
+  (Becker-Kannwischer 2022) finds scalar fastest for one message on Apple cores, NEON-SHA3 only
+  wins multi-lane, which `keccak256_batch` covers.
 - [x] sha256 (use/beat std), ripemd160, blake2f (EIP-152 compression), identity.
 - [x] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
@@ -20,7 +22,7 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
 - [x] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets (done); dedicated
   squaring and lazy Fp2 evaluated, both slower on M4 (not adopted).
-- [ ] BLS12-381: single-exponentiation sqrt_ratio in SSWU (map_fp_to_g1 41us, ~2 pows today).
+- [x] BLS12-381: single-exponentiation SSWU square root for Fp (map_fp_to_g1 41->34us).
 - [x] KZG point evaluation (EIP-4844 precompile 0x0A) with the public trusted setup (embed the public setup as a compressed file or generate from the public ceremony output).
 - [x] KZG blob API (EIP-4844 polynomial-commitments): blob_to_kzg_commitment (MSM over the
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
@@ -244,3 +246,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: montgomery lazy reduction (mul_wide/reduce_wide/add_unreduced, needs 4p < R); bn254 Fp2 mul uses it: pairing 2 pairs 559->494us. Tried on BLS12-381 Fp2 (6 limbs): slower (586->612us), not adopted.
 - 2026-11-05: review of KZG blob API, prepared lines, MSM (Booth + batch-affine), GLV/GLS: no consensus defects; fixed batch length mismatch to return InvalidInputLength instead of asserting.
 - 2026-11-05: tried replacing secp256k1/modinv.zig with generic safegcd.Modulus(u256, ...): ecrecover 28.6->31.7us (same algorithm, codegen difference); kept the specialized copy.
+- 2026-11-05: bls SSWU (Fp) single exponentiation via sqrt(-Z) trick: map_fp_to_g1 41->34us. Closed keccak single-message item (see backlog).
