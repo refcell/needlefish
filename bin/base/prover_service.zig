@@ -7,6 +7,7 @@ const Io = std.Io;
 const base = @import("base");
 const consensus_cli = @import("consensus.zig");
 const beacon = @import("beacon.zig");
+const telemetry_servers = @import("telemetry.zig");
 
 const io = base.utilities.io;
 const http = base.utilities.http;
@@ -22,11 +23,15 @@ const Client = proof.prover_service.client.Client(io.IO);
 const Worker = proof.prover_service.worker.Worker(io.IO);
 const Native = proof.prover_service.native_backend.Native(io.IO);
 const Endpoint = proof.rpc.Endpoint(io.IO);
+const exporters = proof.prover_service.exporter;
+const ServiceTelemetry = telemetry_servers.Servers(exporters.ServiceExporter);
+const WorkerTelemetry = telemetry_servers.Servers(exporters.WorkerExporter);
 
 pub const ServiceFlags = struct {
     listen: []const u8 = "http://127.0.0.1:7300",
     jobs_max: u32 = 64,
     proof_bytes_max: u32 = 1 << 20,
+    telemetry: telemetry_servers.Flags = .{},
 };
 
 pub const WorkerFlags = struct {
@@ -39,6 +44,7 @@ pub const WorkerFlags = struct {
     worker_id: []const u8 = "native",
     poll_interval_ms: u64 = 1000,
     proof_bytes_max: u32 = 1 << 20,
+    telemetry: telemetry_servers.Flags = .{},
 };
 
 fn parse_u32(value: []const u8) !u32 {
@@ -51,6 +57,8 @@ pub fn parse_service(args: []const []const u8) !ServiceFlags {
     var flags: ServiceFlags = .{};
     var index: usize = 0;
     while (index < args.len) : (index += 2) {
+        while (index < args.len and try flags.telemetry.parse_one(args, &index)) {}
+        if (index == args.len) break;
         if (index + 1 == args.len) return error.InvalidArguments;
         const name = args[index];
         const value = args[index + 1];
@@ -70,6 +78,8 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
     var flags: WorkerFlags = .{};
     var index: usize = 0;
     while (index < args.len) : (index += 2) {
+        while (index < args.len and try flags.telemetry.parse_one(args, &index)) {}
+        if (index == args.len) break;
         if (index + 1 == args.len) return error.InvalidArguments;
         const name = args[index];
         const value = args[index + 1];
@@ -110,7 +120,8 @@ fn open_io() !io.IO {
 pub fn service_main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse_service(args) catch |err| {
         std.debug.print("prover-service: {t}\nusage: base prover-service " ++
-            "[--listen http://127.0.0.1:7300] [--jobs-max 64] [--proof-bytes-max N]\n", .{err});
+            "[--listen http://127.0.0.1:7300] [--jobs-max 64] [--proof-bytes-max N]\n         " ++
+            telemetry_servers.Flags.usage ++ "\n", .{err});
         return 2;
     };
     const allocator = init.gpa;
@@ -140,7 +151,21 @@ pub fn service_main(init: std.process.Init, args: []const []const u8) !u8 {
     defer server.deinit();
     const bound = try server.listen(try consensus_cli.parse_url(flags.listen));
     std.debug.print("prover-service: listening on {f}\n", .{bound});
-    while (true) try os_io.run_for_ns(10 * std.time.ns_per_ms);
+    const servers = try allocator.create(ServiceTelemetry);
+    defer allocator.destroy(servers);
+    const loop_ns = 10 * std.time.ns_per_ms;
+    try servers.open(allocator, &os_io, &flags.telemetry, .{
+        .version = "needlefish",
+        .poll_interval_ns = loop_ns,
+        .stale_after_intervals = 100,
+    }, "prover-service");
+    defer servers.close(allocator, &os_io);
+    var loops: u64 = 0;
+    while (true) {
+        loops += 1;
+        exporters.observe_service(&servers.exporter, service.requests, store.stats, loops);
+        try os_io.run_for_ns(loop_ns);
+    }
 }
 
 const response_bytes_max = 256 << 20;
@@ -179,7 +204,8 @@ pub fn worker_main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse_worker(args) catch |err| {
         std.debug.print("prover-worker: {t}\nusage: base prover-worker --prover-rpc <url> " ++
             "--l1 <url> --l2 <url> --rollup-config <file> [--l1-genesis <file>] " ++
-            "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n", .{err});
+            "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n         " ++
+            telemetry_servers.Flags.usage ++ "\n", .{err});
         return 2;
     };
     const allocator = init.gpa;
@@ -275,9 +301,22 @@ fn run_worker(init: std.process.Init, process: *WorkerProcess, flags: *const Wor
         .zk_backends = &.{.cluster},
         .poll_interval_ns = flags.poll_interval_ms * std.time.ns_per_ms,
     });
+    const servers = try allocator.create(WorkerTelemetry);
+    defer allocator.destroy(servers);
+    const loop_ns = 100 * std.time.ns_per_ms;
+    try servers.open(allocator, &process.os_io, &flags.telemetry, .{
+        .version = "needlefish",
+        .poll_interval_ns = loop_ns,
+        // A tick blocks while it proves; allow long proofs before reporting unready.
+        .stale_after_intervals = 36_000,
+    }, "prover-worker");
+    defer servers.close(allocator, &process.os_io);
+    var ticks: u64 = 0;
     while (true) {
         worker.tick();
-        try process.os_io.run_for_ns(100 * std.time.ns_per_ms);
+        ticks += 1;
+        exporters.observe_worker(&servers.exporter, worker.stats, ticks);
+        try process.os_io.run_for_ns(loop_ns);
     }
 }
 
@@ -294,4 +333,8 @@ test "prover service: command flags" {
     try std.testing.expectEqual(@as(?[]const u8, null), worker.l1_beacon);
     try std.testing.expectError(error.MissingFlag, parse_worker(&.{ "--l1", "http://a:1" }));
     try std.testing.expectError(error.InvalidArguments, parse_worker(&.{"--bogus"}));
+    const served = try parse_service(&.{ "--metrics.enabled", "--jobs-max", "4" });
+    try std.testing.expect(served.telemetry.metrics_enabled);
+    try std.testing.expectEqual(@as(u32, 4), served.jobs_max);
+    try std.testing.expectEqual(@as(u16, 0), served.telemetry.health_port);
 }

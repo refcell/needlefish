@@ -88,3 +88,59 @@ pub fn Servers(comptime Exporter: type) type {
         }
     };
 }
+
+/// The health/metrics flags for commands that parse their own flags.
+pub const Flags = struct {
+    health_addr: [4]u8 = @splat(0),
+    /// Off unless set: these commands' own ports default near the usual 8080/7300.
+    health_port: u16 = 0,
+    metrics_enabled: bool = false,
+    metrics_addr: [4]u8 = @splat(0),
+    metrics_port: u16 = 9300,
+
+    pub const usage = "[--health.addr 0.0.0.0] [--health.port 0 (off)] [--metrics.enabled] " ++
+        "[--metrics.addr 0.0.0.0] [--metrics.port 9300]";
+
+    /// Consumes a telemetry flag at `args[index.*]`; false when it is another flag.
+    pub fn parse_one(flags: *Flags, args: []const []const u8, index: *usize) !bool {
+        const name = args[index.*];
+        if (std.mem.eql(u8, name, "--metrics.enabled")) {
+            flags.metrics_enabled = true;
+            index.* += 1;
+            return true;
+        }
+        const names = [_][]const u8{
+            "--health.addr", "--health.port", "--metrics.addr", "--metrics.port",
+        };
+        const which = for (names, 0..) |known, position| {
+            if (std.mem.eql(u8, name, known)) break position;
+        } else return false;
+        if (index.* + 1 == args.len) return error.InvalidArguments;
+        const value = args[index.* + 1];
+        const ip4 = base.proof.proposer.config.parse_ip4;
+        switch (which) {
+            0 => flags.health_addr = try ip4(value),
+            1 => flags.health_port = try std.fmt.parseUnsigned(u16, value, 10),
+            2 => flags.metrics_addr = try ip4(value),
+            3 => flags.metrics_port = try std.fmt.parseUnsigned(u16, value, 10),
+            else => unreachable,
+        }
+        index.* += 2;
+        return true;
+    }
+};
+
+test "telemetry flags: switches and values" {
+    var flags: Flags = .{};
+    const args = [_][]const u8{ "--metrics.enabled", "--health.port", "8081", "--other" };
+    var index: usize = 0;
+    try std.testing.expect(try flags.parse_one(&args, &index));
+    try std.testing.expect(try flags.parse_one(&args, &index));
+    try std.testing.expect(!try flags.parse_one(&args, &index));
+    try std.testing.expectEqual(@as(usize, 3), index);
+    try std.testing.expect(flags.metrics_enabled);
+    try std.testing.expectEqual(@as(u16, 8081), flags.health_port);
+    const missing = [_][]const u8{"--metrics.port"};
+    index = 0;
+    try std.testing.expectError(error.InvalidArguments, flags.parse_one(&missing, &index));
+}

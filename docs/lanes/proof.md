@@ -94,9 +94,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   count); the proposer exporter moved onto it; `challenger/exporter.zig` (driver, bond and
   anchor counters as `base_challenger_*`, ready while scans succeed) checked in the seeded
   sim; `base challenger --health.* --metrics.*` like the proposer (`bin/base/telemetry.zig`).
-- [ ] `proof/prover-service-metrics`: `prover_service.*` counters (requests by outcome,
-  completed by status, stuck/retried, worker failures) over `proof.telemetry`; health and
-  metrics on `base prover-service` and `base prover-worker`.
+- [x] `proof/prover-service-metrics`: `Store.stats` (created, retried, succeeded,
+  failed, cancelled, abandoned, expired) and `Service.requests`; `prover_service/exporter.zig`
+  (`prover_service_*`, `prover_worker_*` over `proof.telemetry`); `base prover-service` and
+  `base prover-worker` take `--health.*`/`--metrics.*` (off by default: health port 0,
+  metrics port 9300, since the service itself listens on 7300).
 - [ ] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
   COSE_Sign1 attestation documents, X.509 chain to the AWS Nitro root (std
   `crypto.Certificate`), P-384 ECDSA signature, PCRs, and the `VerifierJournal` ABI.
@@ -308,6 +310,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: prover-service and prover-worker metrics and health.
 - 2026-11-05: shared proof telemetry exporter; challenger health and metrics.
 - 2026-11-05: proposer admin JSON-RPC (start/stop/running).
 - 2026-11-05: proposer health/readiness/metrics endpoints.
