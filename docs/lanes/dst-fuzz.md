@@ -30,7 +30,8 @@ provably robust.
 - [x] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
 - [x] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
-- [ ] Fuzz the proof lane's decoders (preimage oracle wire format, hint parsing, MPT node
+- [ ] Fuzz the proof lane's decoders (preimage: done end-to-end; MPT and boot info
+  pending) (preimage oracle wire format, hint parsing, MPT node
   decoding, boot info) as `src/proof` lands: round trips plus arbitrary-input robustness.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
@@ -191,3 +192,7 @@ provably robust.
   fields), arbitrary bytes. Sidecar field-swap mutant caught.
 - 2026-11-05: derive lane fixed the reset livelock (db0b967); dropped the
   `real_verifier_fragile` gate. Seed 48 and 2000 swarm seeds green.
+- 2026-11-05: end-to-end preimage protocol fuzz (`fuzz_targets_proof.zig`): client and
+  host over hint and oracle duplexes; hinted gets return keccak-verified values,
+  unhinted gets fail framed, bad hints are acknowledged. The proof lane already fuzzes
+  key, hint text/frames, pipe, and oracle requests per module. 2/2 mutants caught.
