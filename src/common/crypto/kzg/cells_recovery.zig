@@ -252,3 +252,34 @@ test "cells recovery: input checks" {
     const expected = std.mem.asBytes(&zero_cells);
     try testing.expectEqualSlices(u8, expected, std.mem.asBytes(&test_recovered));
 }
+
+var fuzz_cells: [cells_per_ext_blob]Cell = undefined;
+
+/// Arbitrary index lists (unsorted, duplicated, out of range, too few) and cell bytes
+/// either recover or return an error; recovery input comes from untrusted peers.
+fn fuzz_one(_: void, smith: *testing.Smith) anyerror!void {
+    var indices: [cells_per_ext_blob]u64 = undefined;
+    const count: usize = 62 + smith.value(u8) % 67;
+    assert(count <= cells_per_ext_blob);
+    const sorted_unique = smith.value(bool);
+    // A valid case is a strictly increasing run at a random offset, so recovery itself runs.
+    const offset: u64 = smith.value(u8) % (cells_per_ext_blob + 1 - count);
+    for (indices[0..count], 0..) |*index, position| {
+        index.* = if (sorted_unique) offset + position else smith.value(u8);
+    }
+    for (fuzz_cells[0..count]) |*cell| {
+        @memset(cell, 0);
+        _ = smith.slice(cell[0..64]);
+    }
+    recover_for_test(indices[0..count], fuzz_cells[0..count]) catch return;
+    for (test_recovered) |cell| {
+        for (0..cells.field_elements_per_cell) |element| {
+            const value = std.mem.readInt(u256, cell[element * 32 ..][0..32], .big);
+            try testing.expect(value < @import("root.zig").bls_modulus);
+        }
+    }
+}
+
+test "cells recovery: coverage-guided fuzz (never crashes)" {
+    try testing.fuzz({}, fuzz_one, .{});
+}
