@@ -30,6 +30,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] EL sync mode, checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
+  - [x] optimism_outputAtBlock, safeHeadAtL1Block, syncStatus, version
+  - [ ] rollup.json codec (protocol) + optimism_rollupConfig
+  - [ ] admin_* (sequencer control, resetDerivationPipeline, postUnsafePayload), base_*
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
 - [ ] `p2p` (stub first): real implementation is owned by the p2p lane in `src/consensus/p2p/` (see p2p.md); consume its `p2p.Service`.
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
@@ -71,7 +74,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   L2 fetch errors during span checks make the span undecided (as base/base). `l1_blocks`
   and the queue's batch list are allocator-bounded only, as in base/base.
 
+- RPC handlers never block: `optimism_outputAtBlock` returns -32000 "output not available
+  yet" until the backend has the EL proof. `optimism_rollupConfig` waits for a rollup.json codec.
+
 ## Log
+- 2026-11-05: rpc: optimism_{outputAtBlock,safeHeadAtL1Block,syncStatus,version}.
 - 2026-11-05: engine: resumable starting-forkchoice finder (reorg walk, safe walk), fuzzed.
 - 2026-11-05: derive: channel reader, batch stream/queue/validator/provider (ported tests, fuzz).
 - 2026-11-05: engine: sync state + forkchoice state, L2 finalizer (bounded, fuzzed).
