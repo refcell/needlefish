@@ -350,14 +350,43 @@ pub fn Field(comptime limb_count: comptime_int, comptime modulus_int: anytype) t
         }
 
         /// a^exponent for a public exponent (square-and-multiply, MSB first).
+        const pow_window = 5;
+
+        /// a^exponent with a left-to-right sliding window (odd powers a, a^3, ..., a^31).
+        /// The exponent must be public: the multiplication pattern follows its bits. The
+        /// base may be secret (fixed-exponent uses such as Fermat inversion stay uniform).
         pub fn pow(a: Self, exponent: Int) Self {
+            if (exponent == 0) return one;
+            var table: [1 << (pow_window - 1)]Self = undefined;
+            table[0] = a;
+            const a_squared = a.square();
+            for (1..table.len) |index| table[index] = table[index - 1].mul(a_squared);
             var result = one;
-            var index: u32 = bits;
-            while (index > 0) {
-                index -= 1;
-                result = result.square();
-                if ((exponent >> @intCast(index)) & 1 == 1) result = result.mul(a);
+            var started = false;
+            var top: i32 = bits - 1 - @as(i32, @clz(exponent));
+            while (top >= 0) {
+                if ((exponent >> @intCast(top)) & 1 == 0) {
+                    result = result.square();
+                    top -= 1;
+                    continue;
+                }
+                // Longest window [low, top] of at most pow_window bits ending in a one.
+                var low: i32 = @max(top - (pow_window - 1), 0);
+                while ((exponent >> @intCast(low)) & 1 == 0) low += 1;
+                const width: u32 = @intCast(top - low + 1);
+                const mask = (@as(Int, 1) << @intCast(width)) - 1;
+                const value: u32 = @intCast((exponent >> @intCast(low)) & mask);
+                assert(value & 1 == 1 and value < (1 << pow_window));
+                if (started) {
+                    for (0..width) |_| result = result.square();
+                    result = result.mul(table[value >> 1]);
+                } else {
+                    result = table[value >> 1];
+                    started = true;
+                }
+                top = low - 1;
             }
+            assert(started);
             return result;
         }
 
@@ -431,6 +460,21 @@ fn check_lazy_reduction(comptime F: type, seed: u64) !void {
         const imaginary = F.reduce_wide(F.wide_sub(F.wide_sub(cross, ab), cd));
         try testing.expect(imaginary.eql(a.mul(d).add(c.mul(b))));
     }
+}
+
+test "montgomery: sliding-window pow on edge exponents" {
+    const F = Field(6, bls_p);
+    var prng = Prng.init(0x706f77);
+    const a = F.from_int(prng.int(u384) % F.modulus);
+    try testing.expect(a.pow(0).eql(F.one));
+    try testing.expect(a.pow(1).eql(a));
+    try testing.expect(a.pow(2).eql(a.square()));
+    try testing.expect(a.pow(31).eql(a.pow(16).mul(a.pow(15))));
+    try testing.expect(a.pow(32).eql(a.pow(16).square()));
+    try testing.expect(a.pow(F.modulus - 1).eql(F.one));
+    try testing.expect(a.pow(F.modulus - 2).mul(a).eql(F.one));
+    const max = std.math.maxInt(F.Int);
+    try testing.expect(a.pow(max).eql(a.pow(max - 1).mul(a)));
 }
 
 test "montgomery: lazy reduction matches mul for bn254 and bls12-381" {
