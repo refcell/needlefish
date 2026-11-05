@@ -74,9 +74,7 @@ pub const Options = struct {
     },
 };
 
-/// The L2 safe chain view the driver needs on top of the L2 provider. Full safe blocks
-/// (span batches overlapping the safe chain) are not fetched yet, so those checks stay
-/// undecided (`NotAvailable`) until the full-block fetch lands in the L2 provider.
+/// The L2 safe chain view the driver needs, over the L2 provider.
 pub fn L2View(comptime IO: type) type {
     return struct {
         provider: *l2_provider.L2Provider(IO),
@@ -103,9 +101,7 @@ pub fn L2View(comptime IO: type) type {
         }
 
         pub fn l2_block_by_number(view: *Self, number: u64) ProviderError!SafeBlock {
-            _ = view;
-            _ = number;
-            return error.NotAvailable;
+            return view.provider.l2_block_by_number(number);
         }
     };
 }

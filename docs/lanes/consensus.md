@@ -53,7 +53,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     consolidate, safedb + finalizer, sequencer build → seal (one loop, client-generic)
   - [x] service node stage 2: run the driver in `Node` over real providers (L1Provider,
     BlobProvider + KZG, L2Provider, polling engine client); logs phase/unsafe/safe heads
-  - [ ] L2Provider `l2_block_by_number` (full safe blocks via `l2_block_full`) so span
+  - [x] L2Provider `l2_block_by_number` (full safe blocks via `l2_block_full`) so span
     batches overlapping the safe chain decide instead of waiting
   - [x] devnet smoke green (sequencer produces blocks, verifier safe head follows)
   - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
@@ -163,6 +163,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: sources: L2 provider full safe blocks (arena slots, TTL) for span checks.
 - 2026-11-05: devnet smoke green; driver/L1 failure logging; L1 server connection limit.
 - 2026-11-05: service: node runs the driver over real providers (`base consensus`).
 - 2026-11-05: service: driver (startup, derivation, finalization, sequencing), fuzzed.

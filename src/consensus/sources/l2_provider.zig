@@ -9,9 +9,11 @@
 //! `error.NotFound`; failed or unverifiable responses are dropped and re-requested on the
 //! next query. With `jwt_secret` every request carries a fresh bearer token.
 //! Bounds: one request in flight, a fixed de-duplicating queue, fixed LRU caches.
-//! Each cached block keeps only its `L2BlockInfo` and `SystemConfig`, so caching allocates
-//! nothing after `init`. By-number results expire after `block_by_number_ttl_ns` because
-//! unsafe L2 numbers move on reorgs; hash-keyed results are immutable.
+//! Each cached block keeps only its `L2BlockInfo` and `SystemConfig`. Full safe blocks
+//! (`l2_block_by_number`, raw transactions for span batch checks) live in a few slots with
+//! one arena each, reused in LRU order. By-number results expire after
+//! `block_by_number_ttl_ns` because unsafe L2 numbers move on reorgs; hash-keyed results are
+//! immutable.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +27,8 @@ const primitives = @import("../../common/primitives/root.zig");
 const protocol = @import("../protocol/root.zig");
 const errors = @import("../derive/errors.zig");
 const l2_block = @import("l2_block.zig");
+const l2_block_full = @import("l2_block_full.zig");
+const SafeBlock = protocol.span_batch.SafeBlock;
 
 const B256 = primitives.B256;
 const L2BlockInfo = protocol.block.L2BlockInfo;
@@ -41,6 +45,11 @@ pub const Options = struct {
     cache_entries: u32 = 256,
     queue_size: u32 = 16,
     block_by_number_ttl_ns: u64 = 2 * std.time.ns_per_s,
+    /// Slots for full safe blocks (`l2_block_by_number`).
+    full_blocks: u32 = 8,
+    /// Memory a full-block slot's arena keeps across reuse.
+    full_block_retain_bytes: usize = 256 * 1024,
+    full_block_limits: l2_block_full.Limits = .{},
     /// Authenticates every request with a fresh JWT (the engine endpoint serves `eth_*`).
     jwt_secret: ?jwt.Secret = null,
 };
@@ -52,10 +61,13 @@ pub const Request = union(enum) {
     number: u64,
     hash: B256,
     label: Label,
+    /// A full block (raw transactions) by number.
+    full: u64,
 
     pub fn eql(a: Request, b: Request) bool {
         return switch (a) {
             .number => |number| b == .number and b.number == number,
+            .full => |number| b == .full and b.full == number,
             .hash => |hash| b == .hash and b.hash.eql(hash),
             .label => |label| b == .label and b.label == label,
         };
@@ -75,6 +87,14 @@ pub const Stats = struct {
 };
 
 const BlockEntry = struct { used: u64 = 0, block: l2_block.L2Block = undefined };
+/// A full safe block; `transactions` live in `arena`.
+const FullEntry = struct {
+    used: u64 = 0,
+    number: u64 = 0,
+    fetched_ns: u64 = 0,
+    block: SafeBlock = .{ .transactions = &.{}, .l1_origin_number = null },
+    arena: std.heap.ArenaAllocator,
+};
 /// A number- or label-keyed result pointing at a hash-keyed block.
 const KeyEntry = struct {
     used: u64 = 0,
@@ -111,6 +131,7 @@ pub fn L2Provider(comptime IO: type) type {
         in_flight: ?Request = null,
         blocks: []BlockEntry,
         numbers: []KeyEntry,
+        fulls: []FullEntry,
         missing: [missing_max]Request = undefined,
         missing_count: u32 = 0,
         clock: u64 = 0,
@@ -133,8 +154,12 @@ pub fn L2Provider(comptime IO: type) type {
             const blocks = try allocator.alloc(BlockEntry, options.cache_entries);
             errdefer allocator.free(blocks);
             const numbers = try allocator.alloc(KeyEntry, options.cache_entries);
+            errdefer allocator.free(numbers);
+            assert(options.full_blocks > 0);
+            const fulls = try allocator.alloc(FullEntry, options.full_blocks);
             @memset(blocks, .{});
             @memset(numbers, .{});
+            for (fulls) |*entry| entry.* = .{ .arena = .init(allocator) };
             provider.* = .{
                 .io = io,
                 .allocator = allocator,
@@ -143,11 +168,14 @@ pub fn L2Provider(comptime IO: type) type {
                 .options = options,
                 .blocks = blocks,
                 .numbers = numbers,
+                .fulls = fulls,
             };
         }
 
         pub fn deinit(provider: *Self) void {
             assert(provider.in_flight == null);
+            for (provider.fulls) |*entry| entry.arena.deinit();
+            provider.allocator.free(provider.fulls);
             provider.allocator.free(provider.numbers);
             provider.allocator.free(provider.blocks);
             provider.client.deinit();
@@ -200,6 +228,24 @@ pub fn L2Provider(comptime IO: type) type {
                 return block.block.info;
             }
             return provider.miss(key);
+        }
+
+        /// The full block `number` (raw EIP-2718 transactions, deposits first) for span batch
+        /// checks against the safe chain. Borrowed until the slot is reused.
+        pub fn l2_block_by_number(provider: *Self, number: u64) ProviderError!SafeBlock {
+            const now_ns = provider.io.now_monotonic_ns();
+            for (provider.fulls) |*entry| {
+                if (entry.used == 0 or entry.number != number) continue;
+                if (now_ns -| entry.fetched_ns >= provider.options.block_by_number_ttl_ns) {
+                    entry.used = 0;
+                    continue;
+                }
+                entry.used = provider.touch();
+                const genesis_number = provider.rollup.genesis.l2.number;
+                assert(entry.block.transactions.len > 0 or number == genesis_number);
+                return entry.block;
+            }
+            return provider.miss(.{ .full = number });
         }
 
         pub fn l2_block_info_by_hash(provider: *Self, hash: B256) ProviderError!L2BlockInfo {
@@ -295,7 +341,7 @@ pub fn L2Provider(comptime IO: type) type {
 
         fn write_params(request: *const Request, writer: *json.Writer) json.Writer.WriteError!void {
             switch (request.*) {
-                .number => |number| try writer.quantity(number),
+                .number, .full => |number| try writer.quantity(number),
                 .hash => |hash| try writer.data(&hash.bytes),
                 .label => |label| try writer.string(@tagName(label)),
             }
@@ -340,13 +386,38 @@ pub fn L2Provider(comptime IO: type) type {
             assert(provider.missing_count <= missing_max);
         }
 
+        fn complete_full(provider: *Self, number: u64, raw: []const u8) !void {
+            const entry = victim(FullEntry, provider.fulls);
+            entry.used = 0;
+            const retain = provider.options.full_block_retain_bytes;
+            _ = entry.arena.reset(.{ .retain_with_limit = retain });
+            const genesis = &provider.rollup.genesis;
+            const limits = provider.options.full_block_limits;
+            const block = try l2_block_full.decode(entry.arena.allocator(), raw, genesis, limits);
+            if (block.info.block_info.number != number) return error.BlockMismatch;
+            const genesis_number = genesis.l2.number;
+            entry.* = .{
+                .used = provider.touch(),
+                .number = number,
+                .fetched_ns = provider.io.now_monotonic_ns(),
+                .block = .{
+                    .transactions = block.transactions,
+                    .l1_origin_number = block.info.l1_origin.number,
+                },
+                .arena = entry.arena,
+            };
+            assert(number == genesis_number or entry.block.transactions.len > 0);
+        }
+
         fn complete(provider: *Self, request: Request, raw: []const u8) !void {
+            if (request == .full) return provider.complete_full(request.full, raw);
             const block = try l2_block.decode_with_system_config(raw, provider.rollup);
             const info = block.info.block_info;
             switch (request) {
                 .number => |number| if (info.number != number) return error.BlockMismatch,
                 .hash => |hash| if (!info.hash.eql(hash)) return error.BlockMismatch,
                 .label => {},
+                .full => unreachable, // Handled by `complete_full`.
             }
             if (provider.block_entry(info.hash) == null) {
                 const entry = victim(BlockEntry, provider.blocks);

@@ -26,6 +26,8 @@ const Fixture = struct {
     block: []const u8 = "",
     hash: [32]u8 = undefined,
     hash_hex: [66]u8 = undefined,
+    full: fixtures.L2FullBlock = undefined,
+    full_text: [8192]u8 = undefined,
 
     fn init(fixture: *Fixture, options: l2_provider.Options) !void {
         fixture.rollup.upgrades.set(.holocene, 0);
@@ -36,6 +38,9 @@ const Fixture = struct {
         fake.add(.{ .method = by_number, .params_contain = "\"0x7\"", .result = fixture.block });
         fake.add(.{ .method = by_number, .params_contain = "\"0x8\"", .result = "{\"bad\":1}" });
         fake.add(.{ .method = by_number, .params_contain = "\"safe\"", .result = fixture.block });
+        fixture.full.init(9, .init(@splat(0x08)), 1, &.{});
+        const full = try fixture.full.json_text(&fixture.full_text);
+        fake.add(.{ .method = by_number, .params_contain = "\"0x9\"", .result = full });
         fake.add(.{
             .method = "eth_getBlockByHash",
             .params_contain = &fixture.hash_hex,
@@ -88,6 +93,28 @@ test "l2 provider: misses fetch, completions fill info and system config" {
     try testing.expectError(error.NotAvailable, provider.l2_block_info_by_label(.finalized));
     fixture.harness.run();
     try testing.expectError(error.NotFound, provider.l2_block_info_by_label(.finalized));
+}
+
+test "l2 provider: full safe blocks by number, malformed dropped" {
+    var fixture: Fixture = .{};
+    try fixture.init(.{ .full_blocks = 2 });
+    defer fixture.deinit();
+    const provider = &fixture.provider;
+    try testing.expectError(error.NotAvailable, provider.l2_block_by_number(9));
+    fixture.harness.run();
+    const block = try provider.l2_block_by_number(9);
+    try testing.expectEqual(@as(?u64, 509), block.l1_origin_number);
+    try testing.expectEqual(@as(usize, 1), block.transactions.len);
+    try testing.expectEqual(@as(u8, 0x7e), block.transactions[0][0]);
+    const requests = fixture.fake.requests;
+    _ = try provider.l2_block_by_number(9);
+    try testing.expectEqual(requests, fixture.fake.requests);
+    try testing.expectError(error.NotAvailable, provider.l2_block_by_number(8));
+    fixture.harness.run();
+    try testing.expectError(error.NotAvailable, provider.l2_block_by_number(8));
+    fixture.harness.run();
+    try testing.expect(provider.stats.failures >= 1);
+    try testing.expect(!provider.busy());
 }
 
 test "l2 provider: null once as NotFound, malformed dropped, by-number expiry" {
