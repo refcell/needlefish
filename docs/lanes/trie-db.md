@@ -41,6 +41,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   hash/tx indices and a canonical ring. Reorgs: `plan_reorg` -> caller unwinds/applies
   state from stored changesets -> `set_head`. Side branches are executed by unwinding to the
   fork point (no historical-state overlay yet).
+- EVM integration (`db/evm_backend.zig`): `database(&state)` is the evm vtable `Database`;
+  `commit_evm` folds the evm's journaled block State into an Overlay with the same rules as
+  `node/state_db.zig`, so the node can move to `db.State` and get changesets/unwind/snapshots.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -53,4 +56,5 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: ChainStore: block ring, canonical index, tx lookup, reorg plans; reorg test
   moves State purely from stored changesets.
 - 2026-11-05: State snapshots (stream write/load, trie rebuilt and root-checked on load).
+- 2026-11-05: evm backend adapter (Database vtable + commit_evm fold into Overlay).
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
