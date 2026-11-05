@@ -156,6 +156,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
   `eth_getProof` with many storage keys at an older block walks the history trie once per
   key; reuse `path_targets` + `history.Store.walk_paths` for one sorted walk per trie.
+- [ ] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
+  117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
+  (version allocation, path index probes, node re-encoding) and cut it, or move it off the
+  block's critical path (commit history after the head commit is durable, bounded queue of
+  one block, proofs at the newest block wait or fall back to live state).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
