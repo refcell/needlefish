@@ -15,8 +15,12 @@ pub const client_key = frame.client_key;
 pub const parse_close = frame.parse_close;
 pub const client = @import("client.zig");
 pub const Client = client.Client;
+pub const stream = @import("stream.zig");
+pub const server = @import("server.zig");
+pub const Server = server.Server;
 
 test {
     _ = @import("frame_test.zig");
     _ = @import("client_test.zig");
+    _ = @import("server_test.zig");
 }

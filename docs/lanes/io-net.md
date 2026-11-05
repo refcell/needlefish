@@ -9,7 +9,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `http`: HTTP/1.1 server + client on the IO interface (keep-alive, pipelining, bounded buffers), fuzzed parser.
 - [x] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
 - [x] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
-- [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
+- [x] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [x] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [ ] Linux CI coverage for io_uring (`just test-linux`).
@@ -44,6 +44,10 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   required. Environment is injected (`cli.Env.from_map(init.environ_map)`).
 - Logging: fixed messages + typed fields, logfmt or JSON, one sink call per line,
   timestamps from an injected clock (simulated time under DST).
+- WebSocket: one frame engine (`ws/stream.zig`) shared by client and server; owners embed
+  it and get hooks via `@fieldParentPtr`. Server broadcast drops consumers whose send buffer
+  is full (`SlowConsumer`) instead of blocking the feed. Protocol violations fail without a
+  close frame; handshake rejections flush a 400 first.
 - kqueue disk ops run synchronously (no async file IO on macOS); macOS is a dev platform.
 - io_uring: absolute monotonic timeouts; SQ overflow goes to a retry queue; setup denial
   (EPERM/EACCES/ENOSYS) returns `error.IoUringUnavailable` and OS tests skip.
@@ -65,3 +69,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: ws: RFC 6455 frame codec (in-place unmask, minimal-length/control/mask checks), accept key, close parsing; fuzzed. Next: ws client/server on IO.
 - 2026-11-05: io: `shutdown_now(fd)` on all backends: wakes pending recvs with 0 and sends FIN, so components with concurrent recv+send can tear down before `close_now` without fd reuse races.
 - 2026-11-05: ws: Client(IO, Context) with concurrent recv/send, ping auto-reply, fragment reassembly, close handshake, shutdown-based teardown; SimIo tests with 7-byte segments. Next: ws server.
+- 2026-11-05: ws: shared Stream engine, Server(IO, Context) with connection ids, broadcast, slow-consumer drop, 400 on non-upgrade; client refactored onto Stream. Tests: client<->server on SimIo (13-byte segments) and kqueue.

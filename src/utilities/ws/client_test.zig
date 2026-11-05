@@ -272,7 +272,7 @@ test "ws: client handshake, ping, fragments, echo, and close" {
         try std.testing.expectEqual(@as(?client_module.Error, null), recorder.closed.?.err);
         try std.testing.expectEqual(@as(u32, 1), recorder.close_calls);
         try std.testing.expect(harness.server.got_pong and harness.server.got_close);
-        try std.testing.expect(harness.client.fd == null);
+        try std.testing.expect(harness.client.idle());
     }
 }
 
