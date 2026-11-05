@@ -7,7 +7,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `primitives`: `Address`, `B256`, `U256` helpers (Zig native `u256`), `Bloom`, hex encode/decode (fast, SIMD), checksum (EIP-55), `Bytes` view types. Fuzz hex round-trip.
 - [x] `rlp`: zero-alloc encoder into caller buffer + streaming decoder over slices, length precompute, strict canonical decoding. Fuzz decode/encode round trip, ethereum RLP vectors.
 - [x] `consensus` tx types: legacy (EIP-155), 2930, 1559, 4844 (blob), 7702 (set code), OP deposit (0x7E). Signing hash, tx hash, encode/decode (network + EIP-2718), sender recovery (std fallback behind `Recoverer`).
-- [ ] EIP-4844 pooled/network form with sidecar (blobs, commitments, proofs; EIP-7594 wrapper version), EIP-2718 pooled tx decoding for txpool/RPC.
+- [x] EIP-4844 pooled/network form with sidecar (blobs, commitments, proofs; EIP-7594 wrapper version), EIP-2718 pooled tx decoding for txpool/RPC.
 - [ ] EIP-8130 (0x79, account abstraction, Everest) transaction type as in base/base.
 - [x] Switch `Recoverer` default to `common.crypto` ecrecover once the crypto lane lands it.
 - [x] Headers, blocks, receipts (incl. OP deposit receipt fields), logs, bloom calculation, withdrawals, requests hash.
@@ -41,6 +41,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   the dev test pins our root. Verified locally that Base mainnet/Sepolia/Zeronet genesis
   JSON (9 MB each, not committed) reproduce the genesis hashes in `chains`. Genesis JSON
   writing stays with batcher `devnet/genesis.zig` (its only producer).
+- Pooled blob txs (`consensus/sidecar.zig`): blobs/commitments/proofs are zero-copy fixed-item
+  lists; `validate` checks counts and versioned hashes only. KZG blob/cell proof verification
+  waits on the crypto lane (only point evaluation exists); txpool must call it once it lands.
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
 
 ## Log
@@ -52,3 +55,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: flz (FastLZ length, base/base vectors) and l1_fees (Bedrock..Jovian, operator fee).
 - 2026-11-05: genesis (JSON, alloc, state/storage roots, fork-aware header incl. Isthmus).
 - 2026-11-05: signatures now use crypto lane secp256k1 (ecrecover, constant-time sign).
+- 2026-11-05: pooled EIP-4844 network form (v0 sidecar, EIP-7594 v1 cell proofs), `PooledTx`.

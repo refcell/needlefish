@@ -178,6 +178,23 @@ fn encode_typed(encoder: *Encoder, tx_type: TxType, tx: anytype, signature: ?Sig
     if (signature) |sig| encode_signature(encoder, sig);
 }
 
+/// Length of the payload of `rlp([fields..., y_parity, r, s])` for a signed typed tx.
+pub fn signed_payload_length(comptime T: type, signed: Signed(T)) usize {
+    return typed_payload_length(signed.tx, signed.signature);
+}
+
+/// Writes `rlp([fields..., y_parity, r, s])` without the EIP-2718 type byte.
+pub fn encode_signed_list(comptime T: type, encoder: *Encoder, signed: Signed(T)) void {
+    encoder.list_header(typed_payload_length(signed.tx, signed.signature));
+    rlp.codec.encode_fields(encoder, signed.tx);
+    encode_signature(encoder, signed.signature);
+}
+
+/// Decodes exactly one `rlp([fields..., y_parity, r, s])` list item.
+pub fn decode_signed_list(comptime T: type, item: []const u8) DecodeError!Signed(T) {
+    return decode_typed(T, item);
+}
+
 fn tx_type_of(comptime T: type) TxType {
     return switch (T) {
         Legacy => .legacy,

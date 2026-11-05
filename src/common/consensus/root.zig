@@ -10,6 +10,7 @@ pub const hashing = @import("hashing.zig");
 pub const header = @import("header.zig");
 pub const receipt = @import("receipt.zig");
 pub const block = @import("block.zig");
+pub const sidecar = @import("sidecar.zig");
 
 pub const Signature = signature.Signature;
 pub const Recoverer = signature.Recoverer;
@@ -28,6 +29,9 @@ pub const Eip7702 = tx.Eip7702;
 pub const Deposit = tx.Deposit;
 pub const Envelope = tx.Envelope;
 pub const Signed = tx.Signed;
+pub const Sidecar = sidecar.Sidecar;
+pub const PooledBlobTx = sidecar.PooledBlobTx;
+pub const PooledTx = sidecar.PooledTx;
 pub const Header = header.Header;
 pub const Receipt = receipt.Receipt;
 pub const Log = receipt.Log;
