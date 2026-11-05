@@ -114,7 +114,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Performance: erc20/storage path — the state slot map (`State.slot_for`, wyhash) and
   overlay lookups dominate after the interpreter; try a flat open-addressed slot table.
 - [ ] Performance: frame entry copies `Frame` by value (`run` local); measure the call loop
-  with a pointer-based frame and keep it if `evm: call loop` improves.
+  with a pointer-based frame and keep it if `evm: call loop` improves. Call-loop profile:
+  interpreter 35%, account-map lookup + key compare ~25%, start_call/push_frame/resume ~20%,
+  memmove 10%. A u160-compare hash context for `State.accounts` measured no gain (load ~30)
+  and a custom slot context was slower, so both were dropped.
 - [x] Fuzz: differential opcode fuzz of the arithmetic family (`arith_fuzz.zig`) (DIV/SDIV/MOD/SMOD/ADDMOD/
   MULMOD/EXP/SIGNEXTEND/shifts) through the interpreter against reference formulas.
 - [x] Performance: compare with revm on the same machine (snailtracer: revm 31-46 ms,
