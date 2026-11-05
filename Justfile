@@ -62,6 +62,10 @@ fmt:
 tidy:
     etc/scripts/tidy.sh
 
+# Asserts per function, lowest first (informational): just assert-density src/testing/
+assert-density prefix='src/':
+    etc/scripts/assert-density.sh {{ prefix }}
+
 # Everything CI runs
 ci: tidy test
 

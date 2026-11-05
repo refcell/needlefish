@@ -18,6 +18,12 @@ if long=$(git ls-files -co --exclude-standard '*.zig' \
   echo "tidy: lines over 100 columns:"; echo "$long"; fail=1
 fi
 
+# Function length <= 70 lines (TigerStyle). Generic type constructors are exempt.
+if long_fns=$(git ls-files -co --exclude-standard '*.zig' \
+  | xargs awk -v max=70 -f etc/scripts/fn-length.awk 2>/dev/null) && [ -n "$long_fns" ]; then
+  echo "tidy: functions over 70 lines:"; echo "$long_fns"; fail=1
+fi
+
 # Secrets and private data. Patterns are assembled so this file does not match itself.
 p_home='/Us''ers/'
 p_internal='cb''hq|coinbase\.g''he|\.g''he\.com'
