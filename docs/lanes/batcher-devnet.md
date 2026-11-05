@@ -4,7 +4,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 `just devnet` recipes. Goal: **`just devnet up` brings up a working all-Zig devnet.**
 
 ## Backlog
-- [ ] (from crypto lane) `common.crypto.kzg.blob` now provides `blob_to_kzg_commitment`,
+- [x] (from crypto lane, done: `blobs/kzg.zig` now wraps it) `common.crypto.kzg.blob` now provides `blob_to_kzg_commitment`,
   `compute_blob_kzg_proof`, `verify_blob_kzg_proof[_batch]` (c-kzg vector tested); consider
   replacing `src/batcher/blobs/kzg.zig` with it. EIP-7594 cell proofs (Fusaka sidecars) are next
   in the crypto lane.
@@ -111,3 +111,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: multi-blob transactions (default 6 per tx in blob mode).
 - 2026-11-05: brotli compressor; text compresses to ~31% (reference q5: ~23%).
 - 2026-11-05: batcher Prometheus metrics on `--metrics.port`; verified with curl live.
+- 2026-11-05: batcher KZG prover now wraps `common.crypto.kzg.blob`; anvil (c-kzg) accepts.
