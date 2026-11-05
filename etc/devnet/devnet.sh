@@ -177,7 +177,8 @@ start_consensus() {
   local signer; signer=$("$BASE" devnet account "$SEQUENCER_INDEX")
   start ver-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_VERIFIER_ENGINE" \
     --rpc.port "$PORT_VERIFIER_RPC" "${p2p[@]}" --p2p.listen.tcp 9232 --p2p.listen.udp 9233 \
-    --p2p.unsafe.block.signer "$signer" ${gossip[@]+"${gossip[@]}"}
+    --p2p.unsafe.block.signer "$signer" ${gossip[@]+"${gossip[@]}"} \
+    --metrics.enabled --metrics.port "${PORT_VERIFIER_METRICS:-7301}"
 }
 
 down() {

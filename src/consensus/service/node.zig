@@ -420,6 +420,7 @@ pub fn Node(comptime IO: type) type {
             const ws_rpc = try node.allocator.create(WsRpc);
             errdefer node.allocator.destroy(ws_rpc);
             try ws_rpc.init(node.allocator, node.io, &node.backend);
+            ws_rpc.fallback = .{ .context = node, .serve = ws_serve_rpc };
             node.ws_rpc = ws_rpc;
         }
 
@@ -1021,6 +1022,12 @@ pub fn Node(comptime IO: type) type {
             if (request.method != .POST) return response.fail(405);
             const outcome = node.serve_rpc(request.body, response.writer());
             if (outcome == .empty) response.status = 204;
+        }
+
+        fn ws_serve_rpc(context: *anyopaque, body: []const u8, out: *std.Io.Writer) RpcOutcome {
+            const node = from_context(context);
+            assert(node.ws_rpc != null);
+            return node.serve_rpc(body, out);
         }
 
         fn serve_rpc(node: *Self, body: []const u8, out: *std.Io.Writer) RpcOutcome {

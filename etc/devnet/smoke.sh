@@ -82,6 +82,16 @@ derived() {
 until_ok "verifier safe head reaches block $block with hash $seq_hash" derived
 ok "verifier derived block $block ($seq_hash)"
 
+# 3b. Metrics: the verifier's Prometheus safe-head label reached the block.
+VER_METRICS="http://127.0.0.1:${PORT_VERIFIER_METRICS:-7301}/metrics"
+metrics_safe() {
+  local value; value=$(curl -s --max-time 2 "$VER_METRICS" \
+    | grep '^base_node_block_labels{label="safe"}' | awk '{print $2}' | cut -d. -f1)
+  [ -n "$value" ] && [ "$value" -ge "$block" ]
+}
+until_ok "verifier metrics report safe head >= $block" metrics_safe
+ok "verifier metrics report the safe head"
+
 # 4. Deposits: ETH sent to the L1 portal appears on L2 for the sender.
 # Balances exceed 64 bits, so convert and compare with bc.
 balance() {

@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const ws = @import("../../utilities/ws/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc_ws = @import("../../utilities/rpc/ws.zig");
+const rpc = @import("../../utilities/rpc/root.zig");
 const protocol = @import("../protocol/root.zig");
 const rollup_rpc = @import("../rpc/rollup.zig");
 const SyncState = @import("../engine/state.zig").SyncState;
@@ -49,6 +50,13 @@ const scratch_size = 64 * 1024;
 /// What subscribers watch, sampled from the node.
 pub const Sample = struct { sync_state: SyncState, queue_size: u64 };
 
+/// Serves non-subscription requests instead of `rollup_rpc.NodeRouter` (the node passes its
+/// merged router so `opp2p_*` work over WebSocket as over HTTP).
+pub const Fallback = struct {
+    context: *anyopaque,
+    serve: *const fn (context: *anyopaque, body: []const u8, out: *std.Io.Writer) rpc.Outcome,
+};
+
 const Slot = struct {
     connection: ?ConnectionId = null,
     /// Subscription id per topic; 0 when not subscribed.
@@ -72,6 +80,7 @@ pub fn WsRpc(comptime IO: type) type {
         scratch: []u8,
         next_id: u64 = 1,
         last: ?Sample = null,
+        fallback: ?Fallback = null,
         notifications: u64 = 0,
         send_failures: u64 = 0,
 
@@ -137,9 +146,18 @@ pub fn WsRpc(comptime IO: type) type {
             assert(&ws_rpc.server == server);
             const payload = message.payload;
             if (ws_rpc.subscription_call(id, payload)) return;
-            const Router = rollup_rpc.NodeRouter;
-            const backend = ws_rpc.backend;
-            rpc_ws.serve_message(Router, backend, server, id, message, ws_rpc.scratch) catch {
+            const fallback = ws_rpc.fallback orelse {
+                const Router = rollup_rpc.NodeRouter;
+                const backend = ws_rpc.backend;
+                rpc_ws.serve_message(Router, backend, server, id, message, ws_rpc.scratch) catch {
+                    ws_rpc.send_failures += 1;
+                };
+                return;
+            };
+            var out: std.Io.Writer = .fixed(ws_rpc.scratch);
+            if (fallback.serve(fallback.context, payload, &out) != .response) return;
+            assert(out.buffered().len > 0);
+            server.send(id, .text, out.buffered()) catch {
                 ws_rpc.send_failures += 1;
             };
         }
@@ -423,6 +441,16 @@ fn unsubscribe_params(id: u64, writer: *json.Writer) json.Writer.WriteError!void
     try writer.integer(id);
 }
 
+/// Answers every request with result 7 under the request's id.
+fn stub_fallback(context: *anyopaque, body: []const u8, out: *std.Io.Writer) rpc.Outcome {
+    const calls: *u32 = @ptrCast(@alignCast(context));
+    calls.* += 1;
+    const id = (json.find_path(body, &.{"id"}) catch null) orelse return .empty;
+    assert(id.len > 0);
+    out.print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":7}}", .{id}) catch return .empty;
+    return .response;
+}
+
 fn head_at(number: u64) SyncState {
     var state: SyncState = .{};
     state.unsafe_head.block_info.number = number;
@@ -496,6 +524,14 @@ test "ws rpc: subscriptions notify on change; other methods go to the router" {
     world.run_for_ns(100 * std.time.ns_per_ms);
     try testing.expectEqual(@as(usize, 2), recorder.notification_count);
     try testing.expectEqual(@as(u64, 2), ws_rpc.notifications);
+    var fallback_calls: u32 = 0;
+    ws_rpc.fallback = .{ .context = &fallback_calls, .serve = stub_fallback };
+    _ = try client.call("opp2p_peerCount", {}, rpc_client.no_params);
+    _ = try client.call("ws_subscribe_safe_head", {}, rpc_client.no_params);
+    world.run_for_ns(100 * std.time.ns_per_ms);
+    try testing.expectEqualStrings("7", recorder.result_text(5));
+    try testing.expectEqualStrings("3", recorder.result_text(6)); // Subscriptions stay local.
+    try testing.expectEqual(@as(u32, 1), fallback_calls);
     client.abort();
     world.run_for_ns(100 * std.time.ns_per_ms);
 }

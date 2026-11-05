@@ -216,6 +216,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: WebSocket requests use the node's merged router (opp2p_* included); devnet verifier serves metrics and smoke checks the safe-head metric (not run: ports held by another devnet).
 - 2026-11-05: rpc: admin error codes and idempotent start/stop match base/base.
 - 2026-11-05: rpc: WebSocket RPC (--rpc.ws-enabled/--rpc.ws-port): head and engine queue size subscriptions, router fallback.
 - 2026-11-05: sequencer: op-conductor client: seals commit before insert, leader-gated admin_startSequencer (-32002), overrideLeader forwarded, --sequencer.stopped.
