@@ -183,6 +183,9 @@ test "os io: timeout fires after its duration" {
 }
 
 const FileState = struct {
+    /// Callbacks run so far; each step waits for its own callback instead of a fixed time,
+    /// because disk latency under a loaded CI host can exceed any small fixed budget.
+    completed: u32 = 0,
     written: usize = 0,
     synced: bool = false,
     read: usize = 0,
@@ -190,6 +193,7 @@ const FileState = struct {
 
     fn on_write(state: *FileState, completion: *Completion, result: common.WriteError!usize) void {
         _ = completion;
+        state.completed += 1;
         state.written = result catch blk: {
             state.failed = true;
             break :blk 0;
@@ -197,6 +201,7 @@ const FileState = struct {
     }
     fn on_fsync(state: *FileState, completion: *Completion, result: common.FsyncError!void) void {
         _ = completion;
+        state.completed += 1;
         result catch {
             state.failed = true;
             return;
@@ -205,12 +210,21 @@ const FileState = struct {
     }
     fn on_read(state: *FileState, completion: *Completion, result: common.ReadError!usize) void {
         _ = completion;
+        state.completed += 1;
         state.read = result catch blk: {
             state.failed = true;
             break :blk 0;
         };
     }
 };
+
+fn run_until_completed(io: *IO, state: *const FileState, count: u32) !void {
+    var rounds: u32 = 0;
+    while (state.completed < count and rounds < 5000) : (rounds += 1) {
+        try io.run_for_ns(std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(count, state.completed);
+}
 
 test "os io: file write fsync read" {
     var io = try init_io();
@@ -225,12 +239,12 @@ test "os io: file write fsync read" {
     var state: FileState = .{};
     var completion: Completion = .{};
     io.write(*FileState, &state, FileState.on_write, &completion, fd, "needlefish", 4);
-    try io.run_for_ns(std.time.ns_per_ms);
+    try run_until_completed(&io, &state, 1);
     io.fsync(*FileState, &state, FileState.on_fsync, &completion, fd);
-    try io.run_for_ns(std.time.ns_per_ms);
+    try run_until_completed(&io, &state, 2);
     var buffer: [32]u8 = undefined;
     io.read(*FileState, &state, FileState.on_read, &completion, fd, &buffer, 0);
-    try io.run_for_ns(std.time.ns_per_ms);
+    try run_until_completed(&io, &state, 3);
     try std.testing.expect(!state.failed);
     try std.testing.expect(state.synced);
     try std.testing.expectEqual(@as(usize, 10), state.written);

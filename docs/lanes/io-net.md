@@ -74,3 +74,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: ws: Client(IO, Context) with concurrent recv/send, ping auto-reply, fragment reassembly, close handshake, shutdown-based teardown; SimIo tests with 7-byte segments. Next: ws server.
 - 2026-11-05: ws: shared Stream engine, Server(IO, Context) with connection ids, broadcast, slow-consumer drop, 400 on non-upgrade; client refactored onto Stream. Tests: client<->server on SimIo (13-byte segments) and kqueue.
 - 2026-11-05: http: server idle/io timeouts and client request timeout via tick() + shutdown_now; SimIo tests.
+- 2026-11-05: test-linux (io_uring, Docker): 1040/1047 pass incl. ws/shutdown; fixed a timing-flaky file test (waits for each callback instead of a fixed 1 ms).
