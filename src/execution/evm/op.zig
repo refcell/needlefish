@@ -73,6 +73,8 @@ pub const Upgrade = enum(u8) {
 /// Per-block OP context; null on `BlockEnv.op` means plain Ethereum semantics.
 pub const Context = struct {
     upgrade: Upgrade,
+    /// Chain-configured ActivationRegistry admin (Beryl+), `beryl_activation_admin_address`.
+    activation_admin: ?Address = null,
 
     pub fn rules(context: Context) Rules {
         return context.upgrade.rules();

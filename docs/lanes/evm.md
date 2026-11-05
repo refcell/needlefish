@@ -16,7 +16,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (Isthmus/Jovian).
 - [x] Native precompile framework (`native.zig`) and Cobalt tx-context 0x8130..aa02 and 2D
   nonce manager 0x8130..aa01 getters.
-- [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory, B20 tokens)
+- [x] Beryl ActivationRegistry 0x8453..01 (Cobalt value gate and state-backed admin).
+- [ ] Base native precompiles (Beryl+: policy registry, B20 factory, B20 tokens)
   and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
   0x01-0x11 and P256VERIFY (0x100).
@@ -68,9 +69,14 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 - Native precompiles meter state access with the Osaka schedule regardless of fork (base/base
   passes `GasParams::default()`); they run against the journal and are warmed at tx start
-  when their upgrade is active. Errors revert with the bare selector (Cobalt+ encoding).
+  when their upgrade is active. Malformed calls to known selectors revert with the bare
+  selector from Cobalt and with selector + alloy's decoder message before (overrun and
+  tuple type-check texts reproduced). Only implemented singletons are warmed; PolicyRegistry
+  and B20Factory join the warm set when they land. The activation admin comes from
+  `op.Context.activation_admin` (chain config). `__initialize` keeps existing code.
 
 ## Log
+- 2026-11-05: Beryl ActivationRegistry native precompile.
 - 2026-11-05: native precompile framework; Cobalt TxContext and NonceManager getters.
 - 2026-11-05: pre-Osaka wide-modulus MODEXP via startup-sized scratch (`precompiles.Buffers`).
 - 2026-11-05: EVM micro benchmarks: 0.74 ns/instruction, 117 ns/call frame, 0.70 us/tx.

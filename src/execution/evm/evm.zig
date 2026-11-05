@@ -381,6 +381,7 @@ pub const Evm = struct {
         var context = native.Context{
             .state = evm.state,
             .upgrade = evm.op_upgrade().?,
+            .activation_admin = evm.block.op.?.activation_admin,
             .address = request.code_address,
             .caller = call.caller,
             .origin = evm.tx.origin,

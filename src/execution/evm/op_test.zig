@@ -204,11 +204,13 @@ fn native_call_gas(
     value: u256,
     gas_limit: u64,
 ) !transaction.Executed {
+    // State carries over between calls, like transactions in one block.
     try h.database.put_account(sender_address, 1 << 60, 0, &.{});
-    h.state.reset(h.database.interface());
+    const sender = try h.state.load(sender_address);
     const tx = transaction.TxEnv{
         .caller = sender_address,
         .gas_limit = gas_limit,
+        .nonce = sender.info.nonce,
         .to = to,
         .data = data,
         .value = value,
@@ -299,12 +301,26 @@ const native_selectors = [_][4]u8{
     native.selector_get_transaction_payer,
     native.selector_get_transaction_sender_actor_id,
     native.selector_get_nonce,
+    activation.selector_is_activated,
+    activation.selector_check_activated,
+    activation.selector_admin,
+    activation.selector_set_admin,
+    activation.selector_activate,
+    activation.selector_deactivate,
+};
+
+const native_targets = [_]Address{
+    native.tx_context_address,
+    native.nonce_manager_address,
+    activation.address,
 };
 
 fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
     var prng = Prng.init(smith.value(u64));
-    h.evm.block.op = .{ .upgrade = .cobalt };
-    const to = if (prng.chance(1, 2)) native.tx_context_address else native.nonce_manager_address;
+    const upgrade: op_stack.Upgrade = if (prng.chance(1, 2)) .beryl else .cobalt;
+    const admin = if (prng.chance(1, 2)) sender_address else target;
+    h.evm.block.op = .{ .upgrade = upgrade, .activation_admin = admin };
+    const to = native_targets[prng.below(native_targets.len)];
     var data: [100]u8 = undefined;
     prng.random().bytes(&data);
     data[0..4].* = native_selectors[prng.below(native_selectors.len)];
@@ -313,17 +329,14 @@ fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
     const value: u256 = if (prng.chance(1, 8)) 1 else 0;
     // EIP-7623 floor (10 gas per token, a nonzero byte is 4 tokens) bounds intrinsic gas.
     const floor = 21_000 + calldata_gas(data[0..length]) * 10 / 4;
-    const gas_limit = floor + prng.below(4_000);
+    const gas_limit = floor + prng.below(80_000);
     const executed = try native_call_gas(h, to, data[0..length], value, gas_limit);
     try testing.expect(executed.gas_used <= gas_limit);
     switch (executed.status) {
-        .success => try testing.expectEqual(@as(usize, 32), executed.output.len),
-        .revert => try testing.expect(executed.output.len == 0 or executed.output.len == 4),
+        .success => try testing.expect(executed.output.len == 0 or executed.output.len == 32),
+        .revert => try testing.expect(executed.output.len <= 4 + 64),
         .halt => try testing.expectEqual(gas_limit, executed.gas_used),
     }
-    const again = try native_call_gas(h, to, data[0..length], value, gas_limit);
-    try testing.expectEqual(executed.status, again.status);
-    try testing.expectEqual(executed.gas_used, again.gas_used);
 }
 
 test "op fuzz: native precompile calls keep gas and result invariants" {
@@ -332,4 +345,76 @@ test "op fuzz: native precompile calls keep gas and result invariants" {
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
     try fuzz.run(h, fuzz_native, .{ .seed = 0x6e6174697665, .iterations = 256 });
+}
+
+const activation = @import("native_activation.zig");
+
+fn activation_input(selector: [4]u8, word: u256) [36]u8 {
+    var data: [36]u8 = undefined;
+    data[0..4].* = selector;
+    std.mem.writeInt(u256, data[4..36], word, .big);
+    return data;
+}
+
+test "op: ActivationRegistry activates features for the configured admin" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    const feature = activation.feature_b20_asset;
+    const activate = activation_input(activation.selector_activate, feature);
+    const executed = try native_call(&h, activation.address, &activate, 0);
+    try testing.expectEqual(evm_module.Status.success, executed.status);
+    // Calldata 2 words, cold SLOAD, marker code (deposit, G_create, hash), SSTORE, LOG3.
+    const execution: u64 = 12 + 2_100 + (200 + 32_000 + 30 + 6) + 20_000 + 1_500;
+    try testing.expectEqual(21_000 + calldata_gas(&activate) + execution, executed.gas_used);
+    try testing.expectEqual(@as(usize, 1), executed.logs.len);
+    try testing.expectEqual(@as(u256, 1), try h.storage(activation.address, feature_slot(feature)));
+
+    const again = try native_call(&h, activation.address, &activate, 0);
+    try testing.expectEqual(evm_module.Status.revert, again.status);
+    const already = activation_input(activation.error_already_activated, feature);
+    try testing.expectEqualSlices(u8, &already, again.output);
+    const query = activation_input(activation.selector_is_activated, feature);
+    const answer = try native_call(&h, activation.address, &query, 1); // Beryl keeps value.
+    try testing.expectEqual(evm_module.Status.success, answer.status);
+    try testing.expectEqual(@as(u8, 1), answer.output[31]);
+
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = target };
+    const denied = try native_call(&h, activation.address, &activate, 0);
+    var unauthorized: [36]u8 = @splat(0);
+    unauthorized[0..4].* = activation.error_unauthorized;
+    unauthorized[16..36].* = sender_address;
+    try testing.expectEqualSlices(u8, &unauthorized, denied.output);
+}
+
+fn feature_slot(feature: u256) u256 {
+    return activation.feature_slot(native.u256_word(feature));
+}
+
+test "op: ActivationRegistry decode errors and admin storage follow the upgrade" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    const short = activation.selector_is_activated ++ [_]u8{1};
+    const beryl = try native_call(&h, activation.address, &short, 0);
+    const message = "ABI decoding failed: buffer overrun while deserializing";
+    const expected = activation.selector_is_activated ++ message.*;
+    try testing.expectEqualSlices(u8, &expected, beryl.output);
+    const set_admin = activation_input(activation.selector_set_admin, 0xbeef);
+    const unknown = try native_call(&h, activation.address, &set_admin, 0);
+    try testing.expectEqualSlices(u8, &activation.selector_set_admin, unknown.output);
+
+    h.evm.block.op = .{ .upgrade = .cobalt, .activation_admin = sender_address };
+    const cobalt = try native_call(&h, activation.address, &short, 0);
+    try testing.expectEqualSlices(u8, &activation.selector_is_activated, cobalt.output);
+    const paid = try native_call(&h, activation.address, &set_admin, 1);
+    try testing.expectEqualSlices(u8, &native.selector_non_payable, paid.output);
+    const changed = try native_call(&h, activation.address, &set_admin, 0);
+    try testing.expectEqual(evm_module.Status.success, changed.status);
+    const query = activation.selector_admin;
+    const current = try native_call(&h, activation.address, &query, 0);
+    try testing.expectEqual(@as(u8, 0xef), current.output[31]);
+    try testing.expectEqual(@as(u8, 0xbe), current.output[30]);
 }

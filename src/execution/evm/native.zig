@@ -20,6 +20,7 @@ const gas = @import("gas.zig");
 const state_module = @import("state.zig");
 const op = @import("op.zig");
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
+const activation = @import("native_activation.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const State = state_module.State;
@@ -40,6 +41,8 @@ pub const Error = error{ OutOfGas, Revert } || state_module.Error;
 pub const Context = struct {
     state: *State,
     upgrade: op.Upgrade,
+    /// Chain-configured activation admin (`beryl_activation_admin_address`).
+    activation_admin: ?Address = null,
     address: Address,
     caller: Address,
     origin: Address,
@@ -96,6 +99,61 @@ pub const Context = struct {
         try context.state.storage_write(account, stored, value);
     }
 
+    /// `__initialize`: install the one-byte `0xef` marker code (G_codedeposit, plus G_create
+    /// and the code-hash cost when the account had no code). Existing code is kept.
+    pub fn install_marker(context: *Context) Error!void {
+        if (context.is_static) return context.revert(&.{});
+        try context.charge(gas.code_deposit_byte);
+        const account = try context.state.load(context.address);
+        if (account.info.has_code()) return;
+        try context.charge(gas.create + keccak256_gas + gas.keccak256_word);
+        try context.state.set_code(account, &marker_code);
+    }
+
+    pub fn is_cobalt(context: *const Context) bool {
+        return context.upgrade.at_least(.cobalt);
+    }
+
+    /// A known selector with malformed arguments: the bare selector from Cobalt, the
+    /// selector followed by the ABI decoder's message before.
+    pub fn revert_decode(
+        context: *Context,
+        selector: [4]u8,
+        comptime parameters: []const u8,
+        failure: DecodeFailure,
+    ) error{Revert} {
+        if (context.is_cobalt()) return context.revert_selector(selector);
+        return switch (failure) {
+            .overrun => context.revert_message(
+                selector,
+                "ABI decoding failed: buffer overrun while deserializing",
+            ),
+            .type_check => context.revert_message(
+                selector,
+                "type check failed for \"" ++ parameters ++ "\"",
+            ),
+        };
+    }
+
+    fn revert_message(
+        context: *Context,
+        selector: [4]u8,
+        comptime message: []const u8,
+    ) error{Revert} {
+        var buffer: [4 + message.len]u8 = undefined;
+        buffer[0..4].* = selector;
+        buffer[4..].* = message[0..message.len].*;
+        return context.revert(&buffer);
+    }
+
+    /// Revert with `selector` followed by one ABI word.
+    pub fn revert_word(context: *Context, selector: [4]u8, word: [32]u8) error{Revert} {
+        var buffer: [36]u8 = undefined;
+        buffer[0..4].* = selector;
+        buffer[4..36].* = word;
+        return context.revert(&buffer);
+    }
+
     pub fn tload_unmetered(context: *Context, slot: u256) u256 {
         return context.state.transient_load(context.address, slot);
     }
@@ -109,13 +167,19 @@ pub const Context = struct {
     pub fn emit(context: *Context, topics: []const B256, data: []const u8) Error!void {
         assert(topics.len <= 4);
         if (context.is_static) return context.revert(&.{});
-        const cost = 375 + 375 * @as(u64, topics.len) + 8 * @as(u64, data.len);
+        const cost = gas.log + gas.log_topic * @as(u64, topics.len) +
+            gas.log_data_byte * @as(u64, data.len);
         try context.charge(cost);
         try context.state.log(context.address, topics, data);
     }
 };
 
 pub const calldata_word_gas: u64 = 6;
+pub const marker_code = [_]u8{0xef};
+/// G_sha3, the static KECCAK256 cost.
+const keccak256_gas: u64 = 30;
+
+pub const DecodeFailure = enum { overrun, type_check };
 
 /// Returns the output slice (inside `context.out`) on success.
 pub const Native = *const fn (context: *Context, input: []const u8) Error![]const u8;
@@ -130,6 +194,8 @@ pub const selector_non_payable = [4]u8{ 0x6f, 0xb1, 0xb0, 0xe9 };
 /// The native precompile at `address` under `upgrade`, if any.
 pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     const active = upgrade orelse return null;
+    if (!active.at_least(.beryl)) return null;
+    if (std.mem.eql(u8, &address, &activation.address)) return activation.dispatch;
     if (!active.at_least(.cobalt)) return null;
     if (std.mem.eql(u8, &address, &tx_context_address)) return tx_context;
     if (std.mem.eql(u8, &address, &nonce_manager_address)) return nonce_manager;
@@ -139,8 +205,9 @@ pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
 /// Singletons warmed at transaction start (they are in the precompile set).
 pub fn warm_addresses(upgrade: ?op.Upgrade) []const Address {
     const active = upgrade orelse return &.{};
-    if (!active.at_least(.cobalt)) return &.{};
-    return &.{ nonce_manager_address, tx_context_address };
+    if (!active.at_least(.beryl)) return &.{};
+    if (!active.at_least(.cobalt)) return &.{activation.address};
+    return &.{ activation.address, nonce_manager_address, tx_context_address };
 }
 
 /// Run `native` and map its result. `is_direct` is false for DELEGATECALL / CALLCODE.
@@ -181,32 +248,32 @@ pub fn run(
 // ------------------------------------------------------------------ ABI helpers
 
 /// The 4-byte selector; calls shorter than 4 bytes use zeros (an unknown selector).
-fn selector_of(input: []const u8) [4]u8 {
+pub fn selector_of(input: []const u8) [4]u8 {
     if (input.len < 4) return @splat(0);
     return input[0..4].*;
 }
 
 /// Argument word `index` after the selector, or null when the calldata is too short.
-fn argument(input: []const u8, index: usize) ?*const [32]u8 {
+pub fn argument(input: []const u8, index: usize) ?*const [32]u8 {
     const start = 4 + 32 * index;
     if (input.len < start + 32) return null;
     return input[start..][0..32];
 }
 
 /// ABI `address` validation: the 12 high bytes must be zero.
-fn argument_address(word: *const [32]u8) ?Address {
+pub fn argument_address(word: *const [32]u8) ?Address {
     for (word[0..12]) |byte| {
         if (byte != 0) return null;
     }
     return word[12..32].*;
 }
 
-fn write_word(context: *Context, word: [32]u8) []const u8 {
+pub fn write_word(context: *Context, word: [32]u8) []const u8 {
     context.out[0..32].* = word;
     return context.out[0..32];
 }
 
-fn address_word(address: Address) [32]u8 {
+pub fn address_word(address: Address) [32]u8 {
     var word: [32]u8 = @splat(0);
     word[12..32].* = address;
     return word;
@@ -253,15 +320,24 @@ pub const nonce_manager_root: u256 =
 pub const selector_get_nonce = [4]u8{ 0x89, 0x53, 0x58, 0x03 };
 pub const selector_protocol_nonce_not_supported = [4]u8{ 0x1b, 0xc8, 0x1c, 0xa9 };
 
+/// Solidity mapping slot: keccak256(key word ++ be32(base)).
+pub fn mapping_slot(key: [32]u8, base: u256) u256 {
+    var buffer: [64]u8 = undefined;
+    buffer[0..32].* = key;
+    std.mem.writeInt(u256, buffer[32..64], base, .big);
+    return std.mem.readInt(u256, &keccak256(&buffer), .big);
+}
+
+pub fn u256_word(value: u256) [32]u8 {
+    var word: [32]u8 = undefined;
+    std.mem.writeInt(u256, &word, value, .big);
+    return word;
+}
+
 /// `nonces[account][key]`: keccak256(be32(key) ++ keccak256(pad32(account) ++ be32(root))).
 pub fn nonce_slot(account: Address, key: u256) u256 {
-    var buffer: [64]u8 = undefined;
-    buffer[0..32].* = address_word(account);
-    std.mem.writeInt(u256, buffer[32..64], nonce_manager_root, .big);
-    const inner = keccak256(&buffer);
-    std.mem.writeInt(u256, buffer[0..32], key, .big);
-    buffer[32..64].* = inner;
-    return std.mem.readInt(u256, &keccak256(&buffer), .big);
+    const inner = mapping_slot(address_word(account), nonce_manager_root);
+    return mapping_slot(u256_word(key), inner);
 }
 
 /// EIP-8130 2D nonce manager (Cobalt). Only `getNonce(address,uint256)` is callable;
@@ -297,6 +373,10 @@ test "native: selectors match their Solidity signatures" {
     try expect_selector("getTransactionSenderActorId()", selector_get_transaction_sender_actor_id);
     try expect_selector("getNonce(address,uint256)", selector_get_nonce);
     try expect_selector("ProtocolNonceNotSupported()", selector_protocol_nonce_not_supported);
+}
+
+test {
+    _ = activation;
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {
