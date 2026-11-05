@@ -62,9 +62,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   for `eth_getProof` with a block tag inside the window.
   (`Config.history`, `history_drops`/`history_off`; `Journal.proof` + `eth_getProof` at older
   canonical blocks of the window on durable nodes, small additive node/rpc edit)
-- [ ] Node canonical index after a reorg back (node lane, found here): `Chain.mark_canonical`
+- [x] Node canonical index after a reorg back (node lane, found here): `Chain.mark_canonical`
   stops at the first matching entry, so after head A6 -> side B5 -> A6 the number index still
   maps 5 to B5 (number-tagged RPCs resolve the side block). Clear entries above a lower head.
+  (fixed by the node lane: `BlockStore.clear_canonical_above` + regression test + chain fuzz)
 - [x] Witness codec for the proof lane: canonical binary encoding of a `Witness` (strict
   decoder, encode(decode(x)) == x) plus a keccak256 preimage view (iterator + lookup by digest).
   (`db/witness_codec.zig`)
