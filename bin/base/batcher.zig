@@ -23,6 +23,7 @@ const Flags = struct {
     private_key: ?[32]u8 = null,
     max_channel_duration: u64 = 2,
     poll_interval_ms: u64 = 1000,
+    data_availability: batcher.txmgr.DataAvailability = .calldata,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -54,7 +55,10 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (eql(u8, arg, "--metrics.port")) {
             // Metrics land with utilities/metrics; accepted for the process contract.
         } else if (eql(u8, arg, "--data-availability")) {
-            if (!eql(u8, value, "calldata")) return error.BlobsNotSupported;
+            flags.data_availability = std.meta.stringToEnum(
+                batcher.txmgr.DataAvailability,
+                value,
+            ) orelse return error.UnknownDataAvailability;
         } else return error.UnknownFlag;
     }
     if (i != args.len) return error.MissingValue;
@@ -81,9 +85,14 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const account = flags.private_key orelse accounts.derive_dev(flags.key_index).private_key;
     var seed: [16]u8 = undefined;
     init.io.random(&seed);
+    // One frame per transaction payload: the payload is `version byte ++ frame`.
+    const payload_max: u32 = switch (flags.data_availability) {
+        .calldata => tx_data_bytes_max,
+        .blobs => batcher.blobs.blob_data_length_max,
+    };
     var service = try batcher.service.Service.init(init.gpa, .{
         .channels = .{
-            .channel = .{ .frame_size_max = tx_data_bytes_max - 1, .input_bytes_max = 4 << 20 },
+            .channel = .{ .frame_size_max = payload_max - 1, .input_bytes_max = 4 << 20 },
             .max_channel_duration_l1_blocks = flags.max_channel_duration,
         },
         .txs = .{
@@ -91,7 +100,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             .private_key = account,
             .from = accounts.address_of(account),
             .to = rollup.batch_inbox_address,
-            .tx_data_bytes_max = tx_data_bytes_max,
+            .tx_data_bytes_max = payload_max,
+            .data_availability = flags.data_availability,
         },
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
@@ -163,6 +173,8 @@ test "batcher: flags" {
     const flags = try parse_flags(&args);
     try std.testing.expectEqual(@as(u32, 3), flags.key_index);
     const blobs = [_][]const u8{ "--data-availability", "blobs" };
-    try std.testing.expectError(error.BlobsNotSupported, parse_flags(&blobs));
+    try std.testing.expectEqual(.blobs, (try parse_flags(&blobs)).data_availability);
+    const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
+    try std.testing.expectError(error.UnknownDataAvailability, parse_flags(&bad));
     try std.testing.expectError(error.MissingValue, parse_flags(&.{"--l1"}));
 }

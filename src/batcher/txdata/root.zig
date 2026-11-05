@@ -5,6 +5,7 @@
 //! only decides field values. The same helpers sign plain transfers for devnet tools.
 
 const std = @import("std");
+pub const blob = @import("blob.zig");
 const assert = std.debug.assert;
 const consensus = @import("../../common/consensus/root.zig");
 const signature = consensus.signature;
@@ -173,4 +174,8 @@ test "txdata: signed calldata tx round trips and recovers the batcher" {
     const sender = decoded.recover_sender(signature.recover_address).?;
     try testing.expectEqualSlices(u8, &batcher.address.bytes, &sender.bytes);
     try testing.expectEqualSlices(u8, &envelope.hash().bytes, &decoded.hash().bytes);
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

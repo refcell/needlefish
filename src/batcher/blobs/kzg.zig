@@ -21,6 +21,9 @@ pub const Blob = [kzg.bytes_per_blob]u8;
 pub const Commitment = [kzg.bytes_per_commitment]u8;
 pub const Proof = [kzg.bytes_per_proof]u8;
 
+pub const versioned_hash = kzg.versioned_hash;
+pub const versioned_hash_version = kzg.versioned_hash_version_kzg;
+
 pub const fiat_shamir_domain = "FSBLOBVERIFY_V1_";
 /// Generator of the multiplicative group of Fr used by the specs.
 const primitive_root_of_unity = 7;
