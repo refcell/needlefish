@@ -150,6 +150,16 @@ pub fn Transport(comptime IO: type) type {
             transport.allocator.free(transport.links);
         }
 
+        /// After a simulated process crash (`SimIo.crash`): every descriptor is already
+        /// closed and every pending operation dropped without a callback, so forget them
+        /// before `deinit` instead of closing them again.
+        pub fn forget_after_crash(transport: *Self) void {
+            transport.stopped = true;
+            transport.udp = null;
+            for (transport.links) |*link| link.fd_shut = false;
+            assert(transport.stopped);
+        }
+
         /// Opens the listener and starts the accept loop and the service timer.
         pub fn start(transport: *Self) !void {
             const family: io_module.Address.Family = transport.config.listen.family;

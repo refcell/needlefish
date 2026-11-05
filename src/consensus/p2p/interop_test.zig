@@ -54,7 +54,19 @@ const Pair = struct {
         bootnodes_file: bool = false,
     };
 
+    const Chaos = struct { seed: u64 = 0x1e70, datagram_loss_ppm: u32 = 0, reset_ppm: u32 = 0 };
+
     fn init_flags(pair: *Pair, upgrade: rollup_config.Upgrade, a: Flags, b: Flags) !void {
+        return pair.init_chaos(upgrade, a, b, .{});
+    }
+
+    fn init_chaos(
+        pair: *Pair,
+        upgrade: rollup_config.Upgrade,
+        a: Flags,
+        b: Flags,
+        chaos: Chaos,
+    ) !void {
         const allocator = testing.allocator;
         pair.rollup = .{ .l2_chain_id = chain_id, .block_time = 2 };
         pair.rollup.upgrades.set(upgrade, 0);
@@ -64,7 +76,11 @@ const Pair = struct {
         pair.secrets[0][31] = 3;
         pair.secrets[1][31] = 4;
         pair.prngs = .{ Prng.init(1), Prng.init(2) };
-        pair.world = try io_module.SimWorld.init(allocator, .{ .seed = 0x1e70 });
+        pair.world = try io_module.SimWorld.init(allocator, .{
+            .seed = chaos.seed,
+            .datagram_loss_ppm = chaos.datagram_loss_ppm,
+            .reset_ppm = chaos.reset_ppm,
+        });
         errdefer pair.world.deinit();
         pair.scratch = try allocator.alloc(u8, 10 << 20);
         pair.signer = .{ .bytes = try common_secp256k1.address(pair.sequencer_key) };
@@ -187,6 +203,31 @@ const Pair = struct {
         if (writer.failed) return error.WriteFailed;
     }
 
+    /// Crashes node `index` (its process dies: pending IO and unsynced disk writes are
+    /// lost), then starts a fresh network on the same host and disk.
+    fn crash_restart(pair: *Pair, index: usize, flags: Flags) !void {
+        pair.ios[index].crash();
+        pair.networks[index].deinit_after_crash(testing.allocator);
+        try pair.init_network(index, flags);
+        _ = try pair.networks[index].start();
+    }
+
+    /// Publishes from `from` until the other node has it (gossip under loss can need a
+    /// retry when the mesh is still forming); returns false if it never arrived.
+    fn deliver(pair: *Pair, from: usize, number: u64, random: std.Random) !bool {
+        for (0..10) |_| {
+            pair.exchange(from, number, random) catch |err| switch (err) {
+                error.BlockNotDelivered => {
+                    pair.run(1 * ns_per_s);
+                    continue;
+                },
+                else => return err,
+            };
+            return true;
+        }
+        return false;
+    }
+
     fn run(pair: *Pair, duration_ns: u64) void {
         var elapsed_ns: u64 = 0;
         while (elapsed_ns < duration_ns) : (elapsed_ns += 10 * ns_per_ms) {
@@ -222,7 +263,7 @@ const Pair = struct {
             .timestamp = now_s,
             .gas_limit = 30_000_000 + @as(u64, random.int(u16)),
             .gas_used = random.int(u16),
-            .base_fee_per_gas = 1 + random.int(u8),
+            .base_fee_per_gas = 1 + @as(u64, random.int(u8)),
             .extra_data = "base",
             .transactions = ssz.Transactions.encode(storage[0..2048], transactions[0..count]),
         };
@@ -355,4 +396,46 @@ test "p2p interop: a missing bootnodes file falls back to the chain defaults" {
     try testing.expectEqual(@as(u64, 1), network.bootnodes_file.?.stats.open_errors);
     try testing.expectEqual(@as(u32, 0), network.options.bootnodes_count);
     try testing.expect(network.service.discovery.boot_records_count > 0);
+}
+
+test "p2p interop: crash-restart under packet loss rejoins and keeps gossiping" {
+    for (0..4) |seed| {
+        crash_restart_seed(seed) catch |err| {
+            std.debug.print("crash-restart: failing seed={d}\n", .{seed});
+            return err;
+        };
+    }
+}
+
+fn crash_restart_seed(seed: u64) !void {
+    const pair = try testing.allocator.create(Pair);
+    defer testing.allocator.destroy(pair);
+    var prng = Prng.init(seed);
+    const random = prng.random();
+    const persistent: Pair.Flags = .{ .boot_other = true, .bootstore = true };
+    try pair.init_chaos(.ecotone, persistent, .{ .boot_other = false }, .{
+        .seed = 0xc4a5 + seed,
+        .datagram_loss_ppm = 100_000,
+        .reset_ppm = 500,
+    });
+    defer pair.deinit();
+    pair.run(8 * ns_per_s);
+    try testing.expectEqual(@as(u32, 1), pair.networks[0].peer_count());
+    pair.run(61 * ns_per_s); // At least one bootstore sync.
+    try testing.expect(try pair.deliver(1, 1, random));
+    // Crash mid-gossip: a block is in flight when node 0 dies.
+    var storage: [4096]u8 = undefined;
+    const lost = try pair.payload(2, random, &storage);
+    _ = try pair.networks[1].publish_block(pair.sequencer_key, beacon_root, lost);
+    pair.run(random.uintAtMost(u64, 20) * ns_per_ms);
+    try pair.crash_restart(0, .{ .boot_other = false, .bootstore = true });
+    const restarted = &pair.networks[0];
+    try testing.expectEqual(@as(u32, 0), restarted.peer_count());
+    pair.run(10 * ns_per_s);
+    try testing.expectEqual(@as(u64, 1), restarted.bootstore_file.?.stats.loads);
+    try testing.expect(restarted.store.?.count >= 1);
+    try testing.expectEqual(@as(u32, 1), restarted.peer_count());
+    // New blocks reach the restarted node, and its own blocks reach the peer.
+    try testing.expect(try pair.deliver(1, 3, random));
+    try testing.expect(try pair.deliver(0, 4, random));
 }

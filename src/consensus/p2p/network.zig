@@ -274,6 +274,16 @@ pub fn Network(comptime IO: type) type {
             return bootnodes or bootstore;
         }
 
+        /// Frees memory after the IO layer crashed (`SimIo.crash`): nothing is drained or
+        /// closed, because the crash already dropped every operation and descriptor.
+        pub fn deinit_after_crash(self: *Self, allocator: std.mem.Allocator) void {
+            self.transport.forget_after_crash();
+            if (self.bootnodes_file) |*file| file.forget_after_crash();
+            if (self.bootstore_file) |*file| file.forget_after_crash();
+            assert(!self.busy());
+            self.deinit(allocator);
+        }
+
         /// Frees memory after `stop` once the IO loop has drained the completions.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.bootnodes_file) |*file| file.deinit(allocator);

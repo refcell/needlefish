@@ -89,6 +89,15 @@ pub fn StoreFile(comptime IO: type, comptime Owner: type, comptime hooks: Hooks(
             self.* = undefined;
         }
 
+        /// After a simulated process crash: the descriptor is closed and pending operations
+        /// (timer included) vanished without callbacks, so `deinit` must not wait or close.
+        pub fn forget_after_crash(self: *Self) void {
+            self.phase = .closed;
+            self.timer_armed = false;
+            self.stopping = true;
+            assert(!self.busy());
+        }
+
         /// Opens (or creates) the file and starts reading it. An open failure is counted
         /// and leaves the store memory-only.
         pub fn start(self: *Self) void {

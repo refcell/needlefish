@@ -37,9 +37,11 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
-- [ ] DST: crash-restart under loss: `SimIo.crash` a node mid-gossip (pending ops vanish),
-  rebuild its `Network` on the same disk (needs an `abandon` path that frees without
-  draining), and require it to rejoin from its bootstore and receive new blocks.
+- [x] DST: crash-restart under loss (4 seeds, 10% datagram loss, 0.05% resets):
+  `SimIo.crash` node 0 while a block is in flight, rebuild it on the same disk via
+  `Network.deinit_after_crash` (`Transport`/`StoreFile.forget_after_crash`: nothing is
+  closed twice), and require it to reload its bootstore, reconnect, and gossip both ways.
+  (The peer may also redial; the clean-restart DST isolates the bootstore path.)
 - [ ] Devnet: run both CLs with discovery + bootstore (ENR bootnode instead of enode) once
   the batcher-devnet lane agrees; verified by hand on 2026-11-05 (see above).
 - [ ] Peerstore/bootstore observability: local metrics for peerstore size and evictions
@@ -383,3 +385,4 @@ behind a small interface and switch later.
 - 2026-11-05: identify peerstore + opp2p_peers(false) disconnected peers.
 - 2026-11-05: devnet real-process interop checked (enode, discv5 ENR, bootstore restart).
 - 2026-11-05: opp2p_* served by the consensus node RPC via p2p.rpc.Merged.
+- 2026-11-05: crash-restart DST under packet loss.
