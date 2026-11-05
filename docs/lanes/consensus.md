@@ -41,8 +41,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `p2p` (stub first): real implementation is owned by the p2p lane in `src/consensus/p2p/` (see p2p.md); consume its `p2p.Service`.
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
   - [x] service: L1 head watcher (latest/safe/finalized polling, verified headers)
-  - [ ] service: node (providers, startup forkchoice, derivation → engine queue, safedb,
-    optimism_* RPC server); `base consensus` subcommand with the docs/DEVNET.md flags
+  - [x] service node stage 1: L1 watcher + engine label heads → optimism_* RPC server;
+    `base consensus` subcommand with the docs/DEVNET.md flags
+  - [ ] service node stage 2: startup forkchoice, derivation → engine queue, safedb updates,
+    finalization; sequencer block building
+  - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
 - Frame `is_last` byte other than 0/1 is rejected (OP Stack spec / op-node), stricter
@@ -111,6 +114,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 
 
 ## Log
+- 2026-11-05: service: node stage 1 (heads + RPC); bin: `base consensus` subcommand.
 - 2026-11-05: sources: L2 provider label queries; service: L1 head watcher.
 - 2026-11-05: sources: L2 chain provider; protocol: system config from L2 blocks.
 - 2026-11-05: sources: L1 JSON decoders, caching L1 provider, beacon blob provider, engine

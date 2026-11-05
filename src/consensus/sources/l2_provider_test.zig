@@ -6,53 +6,16 @@ const std = @import("std");
 const testing = std.testing;
 
 const io = @import("../../utilities/io/root.zig");
-const json = @import("../../utilities/json/root.zig");
-const format = @import("../../execution/rpc/format.zig");
 const protocol = @import("../protocol/root.zig");
 const harness_module = @import("sim_harness.zig");
+const fixtures = @import("fixtures.zig");
 const l2_provider = @import("l2_provider.zig");
-const Header = @import("../../common/consensus/root.zig").Header;
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const FakeRpc = harness_module.FakeRpc;
 const Harness = harness_module.Harness(*FakeRpc, FakeRpc.handle);
 const Provider = l2_provider.L2Provider(io.SimIo);
 const RollupConfig = protocol.rollup_config.RollupConfig;
-
-/// A Holocene L2 block JSON whose first transaction is an Ecotone L1 info deposit.
-fn l2_block_json(buffer: []u8, number: u64, header_hash: *[32]u8) ![]const u8 {
-    const info: protocol.l1_info.L1BlockInfo = .{
-        .format = .ecotone,
-        .number = 500 + number,
-        .block_hash = .init(@splat(0x55)),
-        .sequence_number = number % 3,
-        .batcher_address = .init(@splat(0xba)),
-        .blob_base_fee_scalar = 2,
-        .base_fee_scalar = 3,
-    };
-    var calldata: [protocol.l1_info.calldata_length_max]u8 = undefined;
-    const input = info.encode_calldata(&calldata);
-    const l2_header: Header = .{
-        .number = number,
-        .timestamp = 2 * number,
-        .gas_limit = 30_000_000,
-        .extra_data = &.{ 0, 0, 0, 0, 250, 0, 0, 0, 6 },
-    };
-    header_hash.* = l2_header.hash().bytes;
-    var out: std.Io.Writer = .fixed(buffer);
-    var writer = json.Writer.init(&out);
-    try writer.begin_object();
-    try format.header_fields(&writer, &l2_header, header_hash.*, 100);
-    try writer.key("transactions");
-    try writer.begin_array();
-    try writer.begin_object();
-    try format.field_quantity(&writer, "type", @as(u8, 0x7e));
-    try format.field_data(&writer, "input", input);
-    try writer.end_object();
-    try writer.end_array();
-    try writer.end_object();
-    return out.buffered();
-}
 
 const Fixture = struct {
     fake: FakeRpc = .{},
@@ -66,7 +29,7 @@ const Fixture = struct {
 
     fn init(fixture: *Fixture, options: l2_provider.Options) !void {
         fixture.rollup.upgrades.set(.holocene, 0);
-        fixture.block = try l2_block_json(&fixture.text, 7, &fixture.hash);
+        fixture.block = try fixtures.l2_block_json(&fixture.text, 7, &fixture.hash);
         _ = try std.fmt.bufPrint(&fixture.hash_hex, "0x{x}", .{&fixture.hash});
         const fake = &fixture.fake;
         const by_number = "eth_getBlockByNumber";
