@@ -51,9 +51,14 @@ behind a small interface and switch later.
   `block_topic_blocked_total{version,direction}` from new `Router.stats` (message, peer
   subscribe/unsubscribe, slow-peer queue drops, inbound on unsubscribed topics) and handler
   stats (retirements, refused publishes). `not_supported` stays 0 (transport closes such peers).
-- [ ] DST: discovery-only swarm (16 nodes, one ENR bootnode, no enode dial) converges over SimIo
-  UDP with `datagram_loss_ppm` and a healed partition (`-Dslow-tests`).
-- [ ] DST: 10% datagram loss; discv5 handshakes and lookups still fill tables (retry paths).
+- [x] DST: discovery-only swarm (16 nodes, one ENR bootnode, no enode dial) converges over SimIo
+  UDP with 5% datagram loss and a healed partition, then gossips blocks (`-Dslow-tests`).
+- [x] DST: 10% datagram loss; discv5 handshakes and lookups still fill tables. The DSTs found
+  three discv5 bugs, all fixed: (1) concurrent requests to one node each started a handshake,
+  the second replacing the first session (its response failed authentication) — requests
+  now wait behind one handshake per node; (2) no request retry — added sigp
+  `request_retries = 1`; (3) a node whose boot exchanges were lost evicted its boot node and
+  stayed isolated forever — boot records are re-added when the table is empty.
 - [x] Transport closes with io `shutdown_now`, then `close_now` once the link is idle, so a
   reused descriptor never meets a stale recv (asserted on every new descriptor).
 - [x] UDP discovery over io: added a minimal polled UDP path to io (all backends, noted in
@@ -253,6 +258,9 @@ behind a small interface and switch later.
   `ReqRespScores` as zeros, so this lane does the same and does not implement req/resp.
 - Validation duration histogram is not exported: the gossip state machine has no wall clock.
 
+- Bans stay base/base-shaped (discovery ban + disconnect, no TCP gate): a banned peer may
+  redial, but its retained gossipsub score keeps it graylisted and it is banned again.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -302,3 +310,4 @@ behind a small interface and switch later.
 - 2026-11-05: peer score and connection duration histograms.
 - 2026-11-05: gossip event, topic retirement, and blocked-topic metrics.
 - 2026-11-05 (crypto lane): `common.crypto.secp256k1` now has everything `peers/secp256k1.zig` takes from std: `compress_public_key`/`decompress_public_key`, `verify` (accepts high s like std; `is_low_s` available), `ecdh` (compressed shared point, constant time), `sign` (RFC 6979, low s), `public_key`. verify 24us vs std 63us, ecdh 29us vs 69us, sign 11us vs 74us, public_key 9us vs 67us.
+- 2026-11-05: discovery DSTs (loss, 16-node swarm); discv5 handshake/retry/rebootstrap fixes.

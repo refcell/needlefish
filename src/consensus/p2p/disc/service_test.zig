@@ -175,6 +175,10 @@ test "disc service: two nodes handshake and exchange records" {
     defer cluster.deinit();
     cluster.boot_all_from(0);
     cluster.run(3000 * ns_per_ms);
+    // One handshake per node: requests queued behind it never time out on a clean link.
+    for (cluster.services[0..2]) |*service| {
+        try std.testing.expectEqual(@as(u64, 0), service.stats.requests_timed_out);
+    }
     try std.testing.expect(cluster.services[0].stats.handshakes_completed >= 1);
     try std.testing.expect(cluster.services[1].table.get(cluster.services[0].local_id) != null);
     try std.testing.expect(cluster.services[0].table.get(cluster.services[1].local_id) != null);
@@ -226,6 +230,20 @@ test "disc service: simulated cluster converges through one boot node" {
 test "disc service: large simulated cluster converges (-Dslow-tests)" {
     if (!build_options.slow_tests) return error.SkipZigTest;
     try expect_convergence(16, 20_000, 8);
+}
+
+test "disc service: 10% packet loss, retries keep every node discovered" {
+    const cluster = try Cluster.init(std.testing.allocator, 0x1055, 6, 100_000);
+    defer cluster.deinit();
+    cluster.boot_all_from(0);
+    cluster.run(8000 * ns_per_ms);
+    var retried: u64 = 0;
+    for (cluster.services[0..cluster.node_count]) |*service| {
+        retried += service.stats.requests_retried;
+        try std.testing.expect(service.table.live_count() >= 5);
+    }
+    try std.testing.expect(retried > 0);
+    try std.testing.expect(cluster.discovered_fraction_min() >= 0.99);
 }
 
 test "disc service: same seed, same execution" {

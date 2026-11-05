@@ -21,12 +21,18 @@ const lookup_module = @import("lookup.zig");
 pub const Endpoint = table_module.Endpoint;
 const ns_per_ms = std.time.ns_per_ms;
 
+/// Boot records remembered for re-bootstrapping an empty table.
+pub const boot_records_max = 16;
+
 pub const Config = struct {
     chain_id: u64,
     /// Random-target lookup interval (base/base default: 5 s).
     lookup_interval_ns: u64 = 5000 * ns_per_ms,
     request_timeout_ns: u64 = 500 * ns_per_ms,
     handshake_timeout_ns: u64 = 1000 * ns_per_ms,
+    /// Resends of a timed-out request before the node counts as failed (sigp discv5
+    /// `request_retries`, default 1); lone lost datagrams then do not evict live nodes.
+    request_retries: u8 = 1,
     sessions_max: u32 = 256,
     pending_max: u32 = 64,
     challenges_max: u32 = 64,
@@ -51,6 +57,7 @@ pub const Stats = struct {
     discovered_dropped: u64 = 0,
     handshakes_completed: u64 = 0,
     requests_timed_out: u64 = 0,
+    requests_retried: u64 = 0,
     records_rejected: u64 = 0,
     packets_banned: u64 = 0,
 };
@@ -82,6 +89,10 @@ const Pending = struct {
     nodes_total: u8,
     nodes_received: u8,
     handshake_sent: bool,
+    /// Held back while another request to the same node runs the handshake; sent over
+    /// the session once the node's first authenticated message proves it exists.
+    awaiting_session: bool,
+    retries: u8,
     plaintext_length: u16,
     plaintext: [messages.plaintext_length_max]u8,
 };
@@ -132,6 +143,10 @@ pub const Service = struct {
     discovered: Ring(enr.Record),
     lookup: lookup_module.Lookup = .{},
     next_lookup_ns: u64 = 0,
+    /// Boot records, re-added whenever the table runs empty (sigp discv5 keeps failed
+    /// boot nodes in its table, so a node that lost its first exchanges retries them).
+    boot_records: [boot_records_max]enr.Record = undefined,
+    boot_records_count: u8 = 0,
     stats: Stats = .{},
     bans: [bans_max]Ban = undefined,
     bans_count: u32 = 0,
@@ -224,6 +239,22 @@ pub const Service = struct {
 
     /// Seeds the table with a boot record and pings it to start a session.
     pub fn add_boot_record(service: *Service, record: *const enr.Record, now_ns: u64) void {
+        service.remember_boot_record(record);
+        service.insert_boot_record(record, now_ns);
+    }
+
+    fn remember_boot_record(service: *Service, record: *const enr.Record) void {
+        const node_id = record.node_id();
+        for (service.boot_records[0..service.boot_records_count]) |*known| {
+            if (std.mem.eql(u8, &known.node_id(), &node_id)) return;
+        }
+        if (service.boot_records_count == boot_records_max) return;
+        service.boot_records[service.boot_records_count] = record.*;
+        service.boot_records_count += 1;
+        assert(service.boot_records_count <= boot_records_max);
+    }
+
+    fn insert_boot_record(service: *Service, record: *const enr.Record, now_ns: u64) void {
         if (service.is_banned(record.node_id(), now_ns)) return;
         const endpoint = endpoint_of(record) orelse return;
         const result = service.table.insert(record, endpoint, now_ns);
@@ -275,6 +306,12 @@ pub const Service = struct {
     fn expire_pending(service: *Service, now_ns: u64) void {
         for (service.pending) |*pending| {
             if (!pending.used or pending.deadline_ns > now_ns) continue;
+            if (pending.retries < service.config.request_retries) {
+                pending.retries += 1;
+                service.stats.requests_retried += 1;
+                service.transmit(pending, now_ns);
+                continue;
+            }
             pending.used = false;
             service.stats.requests_timed_out += 1;
             _ = service.table.mark_failed(pending.node_id);
@@ -292,6 +329,10 @@ pub const Service = struct {
         if (count == 0) {
             service.lookup.active = false;
             service.next_lookup_ns = now_ns + service.config.lookup_interval_ns;
+            // Empty table: try the boot nodes again (at most once per lookup interval).
+            for (service.boot_records[0..service.boot_records_count]) |*record| {
+                service.insert_boot_record(record, now_ns);
+            }
         }
     }
 
@@ -317,6 +358,25 @@ pub const Service = struct {
     }
 
     // ---------------------------------------------------------------- requests
+
+    /// Another in-flight request to the same node that is running the handshake.
+    fn handshake_leader(service: *Service, pending: *const Pending) ?*Pending {
+        for (service.pending) |*other| {
+            if (!other.used or other == pending or other.awaiting_session) continue;
+            if (std.mem.eql(u8, &other.node_id, &pending.node_id)) return other;
+        }
+        return null;
+    }
+
+    /// The node sent an authenticated message, so the session is live on both sides:
+    /// send the requests held back for it.
+    fn flush_awaiting(service: *Service, node_id: enr.NodeId, now_ns: u64) void {
+        for (service.pending) |*pending| {
+            if (!pending.used or !pending.awaiting_session) continue;
+            if (!std.mem.eql(u8, &pending.node_id, &node_id)) continue;
+            service.transmit(pending, now_ns);
+        }
+    }
 
     fn claim_pending(service: *Service) ?*Pending {
         for (service.pending) |*pending| {
@@ -384,9 +444,22 @@ pub const Service = struct {
         pending.public_key = public_key;
         pending.request_id = message.request_id();
         pending.plaintext_length = @intCast(plaintext.len);
+        pending.retries = 0;
+        service.transmit(pending, now_ns);
+    }
+
+    /// Sends (or resends) a pending request: over its session if one exists, otherwise as
+    /// a random packet that provokes WHOAREYOU and a handshake.
+    fn transmit(service: *Service, pending: *Pending, now_ns: u64) void {
+        assert(pending.used);
+        assert(pending.retries <= service.config.request_retries);
+        const plaintext = pending.plaintext[0..pending.plaintext_length];
+        const node_id = pending.node_id;
+        const endpoint = pending.endpoint;
         pending.nodes_total = 0;
         pending.nodes_received = 0;
         pending.handshake_sent = false;
+        pending.awaiting_session = false;
         pending.deadline_ns = now_ns + service.config.request_timeout_ns;
         if (service.sessions.get(node_id, endpoint)) |session| {
             if (service.send_message(session, plaintext, now_ns)) |nonce| {
@@ -394,6 +467,15 @@ pub const Service = struct {
                 return;
             }
             service.sessions.remove(session);
+        }
+        // One handshake per node: a second random packet would start a second handshake
+        // whose keys replace the first session and break the first request's response.
+        if (service.handshake_leader(pending) != null) {
+            pending.awaiting_session = true;
+            service.random.bytes(&pending.nonce); // Never matches a WHOAREYOU.
+            pending.deadline_ns = now_ns + service.config.handshake_timeout_ns +
+                service.config.request_timeout_ns;
+            return;
         }
         // No session: a random packet provokes WHOAREYOU, answered by a handshake.
         pending.nonce = service.send_random(node_id, endpoint);
@@ -486,6 +568,7 @@ pub const Service = struct {
             if (packet.open_message(decoded, session.read_key, &plaintext)) |opened| {
                 session.last_used_ns = now_ns;
                 service.handle_message(from, src_id, opened, now_ns);
+                service.flush_awaiting(src_id, now_ns);
                 return;
             } else |_| {}
         }
@@ -655,6 +738,7 @@ pub const Service = struct {
         service.stats.handshakes_completed += 1;
         if (handshake.record.len > 0) service.learn(record, now_ns);
         service.handle_message(from, handshake.src_id, opened, now_ns);
+        service.flush_awaiting(handshake.src_id, now_ns);
     }
 
     /// The initiator's record: from the handshake (verified, id must match) or our table.
