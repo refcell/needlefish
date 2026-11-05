@@ -5,6 +5,8 @@ const std = @import("std");
 
 pub const rpc = @import("rpc.zig");
 pub const snappy = @import("snappy.zig");
+pub const seen = @import("seen.zig");
+pub const mcache = @import("mcache.zig");
 
 test {
     std.testing.refAllDecls(@This());
