@@ -222,6 +222,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: derive: end-to-end pipeline test of native 200 ms Denim blocks (singular batches sharing a second, BaseTimeUpdateTx millis).
 - 2026-11-05: sequencer: native 200 ms cadence: driver ticks in ms; subsecond blocks build from the parent's timestamp and seal 150 ms into the slot (base/base `block_seal_target`); stop discards a waiting payload.
 - 2026-11-05: rpc: `admin_*` only with `--rpc.enable-admin`, `dev_*` (and the engine queue ws subscription) only with `--rpc.dev-enabled`, else -32601; devnet sequencer enables admin for the batcher's leader check.
 - 2026-11-05: rpc: WebSocket requests use the node's merged router (opp2p_* included); devnet verifier serves metrics and smoke checks the safe-head metric (not run: ports held by another devnet).

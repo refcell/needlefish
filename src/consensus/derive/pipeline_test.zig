@@ -657,3 +657,40 @@ test "pipeline: seeded fuzz with unavailable data and resets is deterministic" {
         for (clean, first) |a, b| try testing.expect(a.same_block(b));
     }
 }
+
+test "pipeline: derives native 200 ms Denim blocks from singular batches" {
+    var scenario: Scenario = undefined;
+    scenario.init(3);
+    defer scenario.deinit();
+    scenario.rollup.upgrades.set(.denim, genesis_time); // Subsecond blocks from genesis.
+    const arena = scenario.arena_state.allocator();
+    const blocks = scenario.chain.blocks;
+    const count = 10; // Two seconds of 200 ms blocks, all in epoch 0.
+    var channel: ChannelBuilder = .{ .arena = arena };
+    for (1..count + 1) |number| {
+        const timestamp_ms = scenario.rollup.l2_block_timestamp_ms(number);
+        try testing.expectEqual(genesis_time * 1000 + number * 200, timestamp_ms);
+        var batch = single(number, blocks[0], &.{});
+        batch.timestamp = timestamp_ms / 1000; // Several batches share one second.
+        try channel.add_single(batch);
+    }
+    scenario.chain.transactions[1] = try calldata_txs(arena, try channel.payloads(0xd, 1));
+    var driver: Driver = undefined;
+    try driver.init(&scenario);
+    defer driver.deinit();
+    try driver.run_to_end();
+    try testing.expect(driver.records.items.len >= count + 1);
+    const attributes = @import("attributes.zig");
+    for (driver.records.items[1 .. count + 1], 1..) |record, number| {
+        const timestamp_ms = scenario.rollup.l2_block_timestamp_ms(number);
+        try testing.expectEqual(timestamp_ms / 1000, record.block.block_info.timestamp);
+        try testing.expect(record.block.l1_origin.eql(blocks[0].id()));
+        try testing.expectEqual(@as(u64, number), record.block.sequence_number);
+        try testing.expectEqual(@as(u64, 1), record.derived_from);
+        // L1 info, then BaseTimeUpdateTx with the millisecond part; no user transactions.
+        try testing.expectEqual(@as(u32, 2), record.tx_count);
+        const millis: u16 = @intCast(timestamp_ms % 1000);
+        const expected = try attributes.encode_base_time(arena, number, millis);
+        try testing.expectEqualSlices(u8, expected, record.last_tx);
+    }
+}
