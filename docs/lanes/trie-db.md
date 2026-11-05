@@ -138,12 +138,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Read-path benchmark for the EVM backend: `State.basic` / `storage` / `code_by_hash`
   hit/miss latency on 100k accounts and the overlay read path; compare with trie `get`.
   (`db/read_bench.zig`, `-- db/read`; docs/PERF.md "db reads")
-- [ ] evm backend `basic` hit costs ~330 ns (vs 17 ns for `State.basic`): it keccaks the
+- [x] evm backend `basic` hit costs ~330 ns (vs 17 ns for `State.basic`): it keccaks the
   address on every hit only to answer `has_storage` from `StateTrie`. Keep a has-storage
   flag (or slot count) per account in `State` so the vtable read stays a table lookup.
+  (`State.AccountEntry.storage_slots`, see Decisions; `db/has_storage_test.zig`; docs/PERF.md
+  "evm backend `basic` without keccak")
 - [x] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
   sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
   (`--rehash-threads`, auto min(cores - 1, 4); db/commit sim cpu p50 7.81 -> 6.79 ms, PERF.md)
+- [ ] History memory budget at 200 ms blocks: measure bytes per retained block in
+  `history.Store` (storage-heavy and typical blocks), express the window as wall-clock span
+  at 5 blocks/s, add a byte budget (`Config.history_bytes_max`) that shrinks the window
+  (pruning oldest) instead of dropping history on overflow; record in docs/PERF.md.
+- [ ] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
+  `eth_getProof` with many storage keys at an older block walks the history trie once per
+  key; reuse `path_targets` + `history.Store.walk_paths` for one sorted walk per trie.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -584,6 +593,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   preallocation: reads past end of file zero-fill. Short reads/writes are resubmitted by
   `IoStorage` and covered by the flaky-IO test. The real-file test ("engine over the os
   backend on a real file") already runs on both io_uring and kqueue, so no new test.
+- `has_storage` for the evm backend (EIP-7610) is a per-account nonzero slot count stored
+  with the account in `State.account_table` (`AccountEntry.storage_slots`), not a cached
+  storage root: `StateTrie` storage roots are only hashed at flush, so a root compare is
+  stale mid-block, and a separate presence map costs a second probe. The count is updated in
+  the same `storage_table` probe by every slot writer (`apply`/`unwind` via `set_slot`,
+  `put_account`/`put_storage` for genesis, snapshot load); wipes and selfdestructs reach
+  `State` only as per-slot changeset entries, and removing an account asserts its count is
+  zero. The evm backend reads committed `State` only (the evm keeps its own block cache and
+  `Overlay` has no `has_storage`), so overlay reads need no count. Genesis writes in
+  `node/state_db.zig` now go through `State.put_account`/`put_storage` (they wrote the tables
+  directly and would have bypassed the count).
+- Block time: needlefish runs Base's native 200 ms L2 blocks (AGENTS.md rule 10, no
+  flashblocks). Trie/db budgets assume 5 blocks/s: commit latency must stay well under the
+  200 ms slot (seal at 150 ms), and block-count windows (history, retention, pruning) cover
+  5x fewer seconds than at 1 s blocks; size them in blocks from the desired wall-clock span.
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -731,3 +755,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   engine, journal, superblock, checkpoint, `io:`: all exit 0, 0 skipped (122, 130, 217, 126,
   123, 129, 126 tests; database 6 s, engine 4 s). Includes the real-file
   format/commit/checkpoint/reopen-on-a-fresh-fd test over io_uring. No code changes.
+- 2026-11-05: evm backend `basic` without keccak: per-account slot count in
+  `State.account_table` answers `has_storage`; vtable `basic` hit 294 -> 24 ns, db/block
+  unchanged within noise (7.8-8.2 -> 7.4-7.8 ms, load ~25). Seeded differential vs
+  `StateTrie.has_storage` (genesis puts, overlay blocks with destroys/wipes/discards,
+  unwinds, snapshot reloads) and a fuzz.

@@ -12,7 +12,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const evm = @import("../evm/root.zig");
-const trie = @import("../trie/root.zig");
 const state_module = @import("state.zig");
 const overlay_module = @import("overlay.zig");
 const State = state_module.State;
@@ -35,14 +34,14 @@ fn from(context: *anyopaque) *State {
 }
 
 fn basic(context: *anyopaque, address: evm.Address) evm.state.Error!?evm.state.AccountInfo {
-    const state = from(context);
-    const info = state.basic(address) orelse return null;
-    const address_hash = trie.node.keccak256(&address);
+    // One table lookup: the entry's slot count answers `has_storage` (EIP-7610) without
+    // keccak256(address) and a `StateTrie` lookup.
+    const entry = from(context).account(address) orelse return null;
     return .{
-        .balance = info.balance,
-        .nonce = info.nonce,
-        .code_hash = info.code_hash,
-        .has_storage = state.state_trie.has_storage(address_hash),
+        .balance = entry.info.balance,
+        .nonce = entry.info.nonce,
+        .code_hash = entry.info.code_hash,
+        .has_storage = entry.storage_slots > 0,
     };
 }
 

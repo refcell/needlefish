@@ -278,12 +278,36 @@ Takeaways:
   cache-resident), but a trie read needs keccak of its keys first: 300 ns per account and
   450 ns per slot here. The flat tables keyed by raw address/slot are what make reads cheap.
 - The vtable indirection costs ~1-3 ns per call (storage, code, misses): noise. `basic` hits
-  are the exception: `evm_backend.basic` keccaks the address to answer `has_storage` from
-  `StateTrie`, ~310 ns extra per account load (19x a table read). Lane backlog item.
+  were the exception: `evm_backend.basic` keccaked the address to answer `has_storage` from
+  `StateTrie`, ~310 ns extra per account load (19x a table read). Fixed: see "evm backend
+  `basic` without keccak" (294 -> 24 ns).
 - Overlay reads: a key in the overlay is as cheap as State or cheaper (small map); a miss
   costs the overlay probe on top of State (basic +4 ns; storage ~+20 ns because it probes the
   account map and the slot map before falling through).
 - Misses are as cheap as hits (no negative-lookup penalty in the open-addressing tables).
+
+## 2026-11-05 evm backend `basic` without keccak (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`evm_backend.basic` keccaked the address on every hit only to answer `has_storage` (EIP-7610)
+from `StateTrie`. `State.account_table` values now carry each account's nonzero slot count
+(`AccountEntry.storage_slots`), kept by every path that adds or removes a slot (`apply`,
+`unwind`, `put_storage`, snapshot load), so the vtable read is the one table probe. Same
+fixture as "db reads"; A/B on one machine back to back, load average ~25 (noisy).
+
+| Case | before | after |
+| --- | ---: | ---: |
+| vtable `basic` hit | 294 ns | 24.0 ns |
+| vtable `basic` miss | 20.7 ns | 22.0 ns |
+| `State.basic` hit | 17.1 ns | 18.1 ns |
+| db/block 1k acct + 4k slot apply+root (3 runs) | 7.84-8.25 ms | 7.43-7.77 ms |
+
+Takeaways:
+- An account load through the evm backend is now a table read (12x faster); the remaining
+  ~6 ns over `State.basic` is the vtable call and the larger `AccountInfo` result.
+- Write path: one count update per slot change in the same `storage_table` probe
+  (`getOrPut`/`remove` already ran); db/block is unchanged within noise.
+- Memory: `AccountEntry` is 16 bytes larger than `AccountInfo` (alignment), ~1.6 MB per 100k
+  accounts.
 
 ## 2026-11-05 trie compact node layout (aarch64-macos, Apple M4 Pro, ReleaseFast)
 

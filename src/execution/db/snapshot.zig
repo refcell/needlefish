@@ -69,9 +69,9 @@ pub fn write(state: *State, sink: anytype) !void {
     var accounts = state.account_table.iterator();
     while (accounts.next()) |entry| {
         try sink.write(entry.key_ptr);
-        try write_int(sink, u64, entry.value_ptr.nonce);
-        try write_word(sink, entry.value_ptr.balance);
-        try sink.write(&entry.value_ptr.code_hash);
+        try write_int(sink, u64, entry.value_ptr.info.nonce);
+        try write_word(sink, entry.value_ptr.info.balance);
+        try sink.write(&entry.value_ptr.info.code_hash);
     }
     var slots = state.storage_table.iterator();
     while (slots.next()) |entry| {
@@ -126,7 +126,8 @@ pub fn load(state: *State, source: anytype) !void {
     // Code bytes are outside the root: every referenced code hash must resolve.
     var accounts = state.account_table.iterator();
     while (accounts.next()) |entry| {
-        if (state.code_by_hash(entry.value_ptr.code_hash) == null) return error.InvalidSnapshot;
+        const code_hash = entry.value_ptr.info.code_hash;
+        if (state.code_by_hash(code_hash) == null) return error.InvalidSnapshot;
     }
 }
 
@@ -140,7 +141,7 @@ fn load_accounts(state: *State, source: anytype, count: u32) !void {
         };
         try source.read(&info.code_hash);
         if (state.account_table.contains(address)) return error.InvalidSnapshot;
-        state.account_table.putAssumeCapacityNoClobber(address, info);
+        state.account_table.putAssumeCapacityNoClobber(address, .{ .info = info });
         try state.state_trie.set_account(node.keccak256(&address), .{
             .nonce = info.nonce,
             .balance = info.balance,
@@ -156,9 +157,13 @@ fn load_slots(state: *State, source: anytype, count: u32) !void {
         key.slot = try read_word(source);
         const value = try read_word(source);
         if (value == 0) return error.InvalidSnapshot;
-        if (!state.account_table.contains(key.address)) return error.InvalidSnapshot;
+        const account = state.account_table.getPtr(key.address) orelse {
+            return error.InvalidSnapshot;
+        };
         if (state.storage_table.contains(key)) return error.InvalidSnapshot;
         state.storage_table.putAssumeCapacityNoClobber(key, value);
+        account.storage_slots += 1;
+        assert(account.storage_slots <= state.storage_table.count());
         var slot_bytes: [32]u8 = undefined;
         std.mem.writeInt(u256, &slot_bytes, key.slot, .big);
         const address_hash = node.keccak256(&key.address);

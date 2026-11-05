@@ -88,8 +88,23 @@ fn trie_account(info: AccountInfo) trie.Account {
     return .{ .nonce = info.nonce, .balance = info.balance, .code_hash = info.code_hash };
 }
 
+/// A committed account and how many nonzero slots it holds in `State.storage_table`. The count
+/// answers `has_storage` (EIP-7610 create collisions) with the account lookup itself, instead
+/// of keccak256(address) and a `StateTrie` lookup. Every path that adds or removes a slot
+/// (`apply`, `unwind`, `put_storage`, snapshot load) keeps it equal to the trie's view:
+/// `storage_slots > 0` exactly when `StateTrie.has_storage(keccak256(address))`.
+pub const AccountEntry = struct {
+    info: AccountInfo,
+    storage_slots: u32 = 0,
+
+    comptime {
+        // The count rides in the info's alignment padding: one 16-byte step at most.
+        assert(@sizeOf(AccountEntry) <= @sizeOf(AccountInfo) + 16);
+    }
+};
+
 pub const State = struct {
-    account_table: std.AutoHashMapUnmanaged(Address, AccountInfo),
+    account_table: std.AutoHashMapUnmanaged(Address, AccountEntry),
     storage_table: std.AutoHashMapUnmanaged(SlotKey, u256),
     code_table: std.AutoHashMapUnmanaged(Hash, CodeRef),
     code_arena: []u8,
@@ -103,7 +118,7 @@ pub const State = struct {
     config: Config,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !State {
-        var account_table: std.AutoHashMapUnmanaged(Address, AccountInfo) = .empty;
+        var account_table: std.AutoHashMapUnmanaged(Address, AccountEntry) = .empty;
         try account_table.ensureTotalCapacity(allocator, config.accounts_max);
         errdefer account_table.deinit(allocator);
         var storage_table: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty;
@@ -140,7 +155,20 @@ pub const State = struct {
     }
 
     pub fn basic(self: *const State, address: Address) ?AccountInfo {
+        const entry = self.account_table.get(address) orelse return null;
+        return entry.info;
+    }
+
+    /// The account with its storage slot count, in one table lookup.
+    pub fn account(self: *const State, address: Address) ?AccountEntry {
         return self.account_table.get(address);
+    }
+
+    /// True when the account holds at least one nonzero storage slot.
+    pub fn has_storage(self: *const State, address: Address) bool {
+        const entry = self.account_table.get(address) orelse return false;
+        assert(entry.storage_slots <= self.storage_table.count());
+        return entry.storage_slots > 0;
     }
 
     pub fn storage(self: *const State, address: Address, slot: u256) u256 {
@@ -189,6 +217,55 @@ pub const State = struct {
         return self.state_trie.root();
     }
 
+    /// Writes one account directly (genesis), outside any changeset. Keeps its storage.
+    pub fn put_account(self: *State, address: Address, info: AccountInfo) Error!void {
+        const table = &self.account_table;
+        if (!table.contains(address) and table.count() == self.config.accounts_max) {
+            return error.StateFull;
+        }
+        const result = table.getOrPutAssumeCapacity(address);
+        if (!result.found_existing) result.value_ptr.* = .{ .info = info };
+        result.value_ptr.info = info;
+        try self.state_trie.set_account(node.keccak256(&address), trie_account(info));
+        assert(table.contains(address));
+    }
+
+    /// Writes one storage slot of an existing account directly (genesis); zero deletes it.
+    pub fn put_storage(self: *State, address: Address, slot: u256, value: u256) Error!void {
+        const entry = self.account_table.getPtr(address) orelse return error.UnknownAccount;
+        const key: SlotKey = .{ .address = address, .slot = slot };
+        if (value != 0 and !self.storage_table.contains(key) and
+            self.storage_table.count() == self.config.storage_slots_max)
+        {
+            return error.StateFull;
+        }
+        self.set_slot(entry, key, value);
+        var slot_bytes: [32]u8 = undefined;
+        std.mem.writeInt(u256, &slot_bytes, slot, .big);
+        try self.state_trie.set_storage(
+            node.keccak256(&address),
+            node.keccak256(&slot_bytes),
+            value,
+        );
+    }
+
+    /// Sets one slot in `storage_table` (zero removes it) and keeps the account's slot count.
+    /// `entry` is `key.address`'s account; the table must have room for an insert.
+    fn set_slot(self: *State, entry: *AccountEntry, key: SlotKey, value: u256) void {
+        assert(entry.storage_slots <= self.storage_table.count());
+        if (value == 0) {
+            if (self.storage_table.remove(key)) {
+                assert(entry.storage_slots > 0);
+                entry.storage_slots -= 1;
+            }
+        } else {
+            const result = self.storage_table.getOrPutAssumeCapacity(key);
+            if (!result.found_existing) entry.storage_slots += 1;
+            result.value_ptr.* = value;
+        }
+        assert(entry.storage_slots <= self.storage_table.count());
+    }
+
     /// Applies a block forward.
     pub fn apply(self: *State, changeset: *const Changeset) Error!void {
         try self.apply_direction(changeset, true);
@@ -230,7 +307,9 @@ pub const State = struct {
             for (chunk, address_hashes[0..chunk.len]) |*change, address_hash| {
                 const target = if (forward) change.new else change.old;
                 const info = target orelse continue;
-                self.account_table.putAssumeCapacity(change.address, info);
+                const result = self.account_table.getOrPutAssumeCapacity(change.address);
+                if (!result.found_existing) result.value_ptr.* = .{ .info = info };
+                result.value_ptr.info = info;
                 try self.state_trie.set_account(address_hash, trie_account(info));
             }
         }
@@ -238,7 +317,10 @@ pub const State = struct {
         for (accounts) |*change| {
             const target = if (forward) change.new else change.old;
             if (target != null) continue;
-            _ = self.account_table.remove(change.address);
+            const removed = self.account_table.fetchRemove(change.address);
+            // Removing an account drops its trie storage too; the changeset already removed
+            // its slots from the table (a destroyed account's slots are all recorded).
+            if (removed) |entry| assert(entry.value.storage_slots == 0);
             try self.state_trie.delete_account(node.keccak256(&change.address));
         }
     }
@@ -256,16 +338,14 @@ pub const State = struct {
             while (end < changes.len and end - start < slots_chunk_max and
                 std.mem.eql(u8, &changes[end].address, address)) end += 1;
             const run = changes[start..end];
+            // Storage only changes under an account that exists at this point (removed
+            // accounts go after storage); the trie rejects it otherwise.
+            const entry = self.account_table.getPtr(address.*) orelse return error.UnknownAccount;
             for (run, values[0..run.len]) |*change, *value| {
                 value.* = if (forward) change.new else change.old;
+                assert(std.mem.eql(u8, &change.address, address));
                 const key: SlotKey = .{ .address = change.address, .slot = change.slot };
-                if (value.* == 0) {
-                    _ = self.storage_table.remove(key);
-                } else {
-                    // Nonzero storage only lives under an account that exists at this point.
-                    assert(self.account_table.contains(change.address));
-                    self.storage_table.putAssumeCapacity(key, value.*);
-                }
+                self.set_slot(entry, key, value.*);
             }
             var hashed: usize = 0;
             while (hashed < run.len) : (hashed += keccak.batch_width) {

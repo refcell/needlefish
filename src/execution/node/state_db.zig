@@ -187,32 +187,13 @@ pub const StateDb = struct {
             .balance = balance,
             .code_hash = code_hash,
         };
-        const table = &db.state.account_table;
-        if (!table.contains(address) and table.count() == db.state.config.accounts_max) {
-            return error.StateFull;
-        }
-        table.putAssumeCapacity(address, info);
-        try db.state.state_trie.set_account(keccak256(&address), .{
-            .nonce = nonce,
-            .balance = balance,
-            .code_hash = code_hash,
-        });
+        try db.state.put_account(address, info);
     }
 
     /// Genesis storage of an existing account.
     pub fn put_storage(db: *StateDb, address: Address, slot: u256, value: u256) Error!void {
         assert(db.state.account_table.contains(address));
-        const key: db_module.state.SlotKey = .{ .address = address, .slot = slot };
-        const table = &db.state.storage_table;
-        if (value == 0) {
-            _ = table.remove(key);
-        } else {
-            if (!table.contains(key) and table.count() == db.state.config.storage_slots_max) {
-                return error.StateFull;
-            }
-            table.putAssumeCapacity(key, value);
-        }
-        try db.state.state_trie.set_storage(keccak256(&address), slot_key(slot), value);
+        try db.state.put_storage(address, slot, value);
     }
 
     pub fn root(db: *StateDb) Error!Hash {
@@ -321,12 +302,6 @@ pub const StateDb = struct {
         db.undo_write = record.offset;
     }
 };
-
-fn slot_key(slot: u256) Hash {
-    var bytes: [32]u8 = undefined;
-    std.mem.writeInt(u256, &bytes, slot, .big);
-    return keccak256(&bytes);
-}
 
 const testing = std.testing;
 
