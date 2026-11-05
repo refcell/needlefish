@@ -6,7 +6,9 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 DIR=.devnet
-BASE=zig-out/bin/base
+# Override to run a binary outside zig-out (rebuilding zig-out under a live devnet can
+# kill its nodes on macOS).
+BASE=${BASE:-zig-out/bin/base}
 BLOCKS="${1:-8}"
 # shellcheck disable=SC1091
 . "$DIR/devnet.env"

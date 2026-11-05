@@ -175,8 +175,16 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     const l1_config = try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
     try boot(&source, &store, flags, rollup_json, l1_config);
     const os_io = &endpoints.os_io;
-    const verdict = try prove(allocator, &store, &source, os_io, flags.l1_beacon);
-    if (flags.out) |path| try write_archive(init, &store, path);
+    // `--out` records the witness: exactly the preimages the client read.
+    var witness: host.Store = .init(allocator, .{});
+    defer witness.deinit();
+    const record = if (flags.out != null) &witness else null;
+    const verdict = try prove(allocator, &store, &source, .{
+        .os_io = os_io,
+        .beacon_url = flags.l1_beacon,
+        .witness = record,
+    });
+    if (flags.out) |path| try write_archive(init, &witness, path);
     const line = "proof: block {d} output root 0x{x} claimed 0x{x}: {s} " ++
         "({d} preimages, {d} calls)\n";
     std.debug.print(line, .{
@@ -191,14 +199,19 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
 }
 
 const BlobProvider = base.consensus.sources.blob_provider;
+
+const ProveContext = struct {
+    os_io: *io.IO,
+    beacon_url: ?[]const u8,
+    witness: ?*host.Store,
+};
 const Beacon = host.beacon_blobs.BeaconBlobs(io.IO, BlobProvider.KzgVerifier);
 
 fn prove(
     allocator: std.mem.Allocator,
     store: *host.Store,
     source: *Source,
-    os_io: *io.IO,
-    beacon_url: ?[]const u8,
+    context: ProveContext,
 ) !host.offline.Verdict {
     const storage = try allocator.create(kzg.blob.Settings.Storage);
     defer allocator.destroy(storage);
@@ -213,8 +226,10 @@ fn prove(
         .kzg_settings = &settings,
         .kzg_workspace = workspace,
     };
-    const url = beacon_url orelse
-        return host.native.run(allocator, store, source.as_source(), roots, options);
+    const os_io = context.os_io;
+    const witness = context.witness;
+    const url = context.beacon_url orelse
+        return host.native.run(allocator, store, source.as_source(), roots, options, witness);
     // The verifier gets its own workspace: the handler uses `workspace` after a fetch.
     const verifier_workspace = try allocator.create(kzg.blob.Workspace);
     defer allocator.destroy(verifier_workspace);
@@ -235,7 +250,7 @@ fn prove(
     };
     source.blobs = beacon.fetcher();
     defer source.blobs = null;
-    return host.native.run(allocator, store, source.as_source(), roots, options);
+    return host.native.run(allocator, store, source.as_source(), roots, options, witness);
 }
 
 test "proof run: flags" {
