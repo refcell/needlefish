@@ -95,6 +95,9 @@ pub const Slot = struct {
     /// Caller's tag for the data this tx carries (the service: the first L2 block of its
     /// channel), reported back if a reorg un-mines the tx after its slot was freed.
     tag: u64 = 0,
+    /// Another tx of ours may hold this nonce (from before a reset or restart, or one a
+    /// reorg re-injected): being mined at this nonce does not prove this tx was mined.
+    contested: bool = false,
     /// Sidecar version 1 only: 128 cell proofs per blob, computed once at submit.
     cell_proofs: ?*[blobs_per_tx_max]kzg.CellProofs = null,
 };
@@ -105,6 +108,10 @@ pub const recent_max = 128;
 
 /// `mined`: seen below the account's mined nonce. Slots dropped by `reset` start
 /// unmined (they may still be mined later); only a mined record can be lost.
+/// Lost-data tag when the data is unknown (txs from before a restart): the caller re-posts
+/// from the earliest point it trusts (the service: the finalized L2 head).
+pub const tag_unknown: u64 = 0;
+
 pub const Recent = struct { live: bool = false, mined: bool = false, nonce: u64 = 0, tag: u64 = 0 };
 
 pub const Error = rpc.Error || rpc.DecodeError || txdata.SignError || kzg.Error || kzg.CellError ||
@@ -132,6 +139,18 @@ pub const TxManager = struct {
     recent: [recent_max]Recent = @splat(.{}),
     recent_next: u32 = 0,
     lost_floor: ?u64 = null,
+    /// Whether the last lost data reused nonces (a reorg or a taken nonce), so pending txs
+    /// must be dropped to fill them; a contested confirmation only re-posts.
+    lost_needs_reset: bool = false,
+    /// Highest nonce another tx of ours may hold; new txs at or below it are contested.
+    contested_max: ?u64 = null,
+    /// The first `latest` read also reads `pending`: a restarted batcher's old txs.
+    started: bool = false,
+    /// Mined nonce at startup: a rollback below it un-mines txs this run never knew
+    /// (a previous run's), reported with `tag_unknown`.
+    startup_mined: ?u64 = null,
+    /// Highest nonce a previous run's tx may hold: losses there carry `tag_unknown`.
+    unknown_max: ?u64 = null,
     raw_buffer: []u8,
     params_buffer: []u8,
     prover: ?*kzg.Prover,
@@ -303,6 +322,7 @@ pub const TxManager = struct {
         slot.attempts = 0;
         slot.retries_left = manager.config.publish_max_retries;
         slot.tag = manager.submit_tag;
+        slot.contested = if (manager.contested_max) |max| nonce <= max else false;
         manager.supersede(nonce);
         manager.next_nonce = nonce + 1;
         try manager.send(client, slot, now_ms);
@@ -327,6 +347,8 @@ pub const TxManager = struct {
         for (manager.slots) |*slot| {
             if (slot.state != .pending) continue;
             if (slot.nonce < confirmed_nonce) {
+                // A nonce another tx of ours may have taken: re-post conservatively.
+                if (slot.contested) manager.mark_lost(manager.contested_tag(slot), false);
                 manager.remember(slot, true);
                 slot.state = .free;
                 confirmed += 1;
@@ -379,6 +401,7 @@ pub const TxManager = struct {
             slot.state = .free;
             // Its tx may still be mined (and then lost to a reorg): keep watching it.
             manager.remember(slot, false);
+            manager.contest(slot.nonce);
             var replaced: Replaced = manager.replaced orelse
                 .{ .nonce_max = slot.nonce, .fees = slot.fees, .blob_fee = slot.blob_fee };
             replaced.nonce_max = @max(replaced.nonce_max, slot.nonce);
@@ -490,7 +513,7 @@ pub const TxManager = struct {
                     // took the nonce before our first attempt: this data is not on L1.
                     slot.state = .free;
                     manager.next_nonce = null;
-                    manager.lost_floor = @min(manager.lost_floor orelse slot.tag, slot.tag);
+                    manager.mark_lost(slot.tag, true);
                     return;
                 }
                 if (!benign_send_error(message)) return err;
@@ -520,19 +543,45 @@ pub const TxManager = struct {
             tag,
         }) catch unreachable; // Fixed-size content.
         const nonce = try rpc.quantity(u64, try client.call("eth_getTransactionCount", params));
-        if (std.mem.eql(u8, tag, "latest")) manager.observe_mined(nonce);
+        if (std.mem.eql(u8, tag, "latest")) {
+            manager.observe_mined(nonce);
+            if (!manager.started) try manager.contest_pooled(client, nonce);
+        }
         return nonce;
+    }
+
+    /// Startup: pooled txs from a previous run hold nonces from `latest` up; new txs there
+    /// are contested.
+    fn contest_pooled(manager: *TxManager, client: *rpc.Client, mined_nonce: u64) Error!void {
+        assert(!manager.started);
+        const pending = try manager.account_nonce(client, "pending");
+        manager.started = true;
+        manager.startup_mined = mined_nonce;
+        if (pending > mined_nonce) {
+            manager.contest(pending - 1);
+            manager.unknown_max = pending - 1;
+        }
+        assert(manager.started);
     }
 
     /// Every remembered tx at or above the account's mined nonce is no longer mined.
     fn observe_mined(manager: *TxManager, mined_nonce: u64) void {
+        if (manager.startup_mined) |startup| if (mined_nonce < startup) {
+            // A previous run's tx was un-mined; its data is unknown here.
+            manager.startup_mined = mined_nonce;
+            manager.contest(startup - 1);
+            manager.unknown_max = @max(manager.unknown_max orelse startup - 1, startup - 1);
+            manager.mark_lost(tag_unknown, true);
+        };
         for (&manager.recent) |*recent| {
             if (!recent.live) continue;
             if (recent.nonce < mined_nonce) {
                 recent.mined = true;
             } else if (recent.mined) {
                 recent.live = false;
-                manager.lost_floor = @min(manager.lost_floor orelse recent.tag, recent.tag);
+                // A reorg re-injects it: it may still win its nonce later.
+                manager.contest(recent.nonce);
+                manager.mark_lost(recent.tag, true);
             }
         }
         for (manager.recent) |recent| {
@@ -546,9 +595,27 @@ pub const TxManager = struct {
         for (&manager.recent) |*recent| {
             if (!recent.live or recent.mined or recent.nonce != nonce) continue;
             recent.live = false;
-            manager.lost_floor = @min(manager.lost_floor orelse recent.tag, recent.tag);
+            manager.mark_lost(recent.tag, false);
         }
         for (manager.recent) |recent| assert(!recent.live or recent.mined or recent.nonce != nonce);
+    }
+
+    fn mark_lost(manager: *TxManager, tag: u64, reuses_nonces: bool) void {
+        manager.lost_floor = @min(manager.lost_floor orelse tag, tag);
+        manager.lost_needs_reset = manager.lost_needs_reset or reuses_nonces;
+        assert(manager.lost_floor.? <= tag);
+    }
+
+    /// The data a contested nonce may have lost: a previous run's is unknown.
+    fn contested_tag(manager: *const TxManager, slot: *const Slot) u64 {
+        assert(slot.contested);
+        const unknown = if (manager.unknown_max) |max| slot.nonce <= max else false;
+        return if (unknown) tag_unknown else slot.tag;
+    }
+
+    fn contest(manager: *TxManager, nonce: u64) void {
+        manager.contested_max = @max(manager.contested_max orelse nonce, nonce);
+        assert(manager.contested_max.? >= nonce);
     }
 
     fn remember(manager: *TxManager, slot: *const Slot, mined: bool) void {
@@ -572,6 +639,13 @@ pub const TxManager = struct {
     pub fn take_lost_floor(manager: *TxManager) ?u64 {
         defer manager.lost_floor = null;
         return manager.lost_floor;
+    }
+
+    /// Whether the data reported lost since the last call reused nonces (pending txs must
+    /// be dropped so new ones fill them).
+    pub fn take_lost_needs_reset(manager: *TxManager) bool {
+        defer manager.lost_needs_reset = false;
+        return manager.lost_needs_reset;
     }
 
     fn suggested_fees(manager: *TxManager, client: *rpc.Client) Error!txdata.Fees {
@@ -647,10 +721,17 @@ const accounts = @import("../devnet/accounts.zig");
 /// Scripted L1: tracks the mined nonce and records sent transactions.
 const FakeL1 = struct {
     mined_nonce: u64 = 5,
+    /// `pending` nonce when txs sit in the pool (a previous run's); null: the mined nonce.
+    pending_nonce: ?u64 = null,
     sends: u32 = 0,
     reject_with: ?[]const u8 = null,
     /// First bytes of the last sent raw transaction (enough for a blob tx body).
     last_raw_prefix: [600]u8 = undefined,
+
+    fn account_nonce(l1: *const FakeL1, body: []const u8) u64 {
+        const pending = std.mem.indexOf(u8, body, "\"pending\"") != null;
+        return if (pending) l1.pending_nonce orelse l1.mined_nonce else l1.mined_nonce;
+    }
 
     fn transport(l1: *FakeL1) rpc.Transport {
         return .{ .context = l1, .send_fn = send };
@@ -662,7 +743,8 @@ const FakeL1 = struct {
         const id = body[id_start..][0..std.mem.indexOfScalar(u8, body[id_start..], ',').?];
         var result_buffer: [64]u8 = undefined;
         const result: []const u8 = if (std.mem.indexOf(u8, body, "eth_getTransactionCount")) |_|
-            std.fmt.bufPrint(&result_buffer, "\"0x{x}\"", .{l1.mined_nonce}) catch unreachable
+            std.fmt.bufPrint(&result_buffer, "\"0x{x}\"", .{l1.account_nonce(body)}) catch
+                unreachable
         else if (std.mem.indexOf(u8, body, "eth_getBlockByNumber")) |_|
             "{\"baseFeePerGas\":\"0x64\"}"
         else if (std.mem.indexOf(u8, body, "eth_maxPriorityFeePerGas")) |_|
@@ -759,12 +841,57 @@ test "txmgr: a dropped tx replaced at its nonce, or a taken nonce, reports the t
     try testing.expectEqual(@as(?u64, null), manager.next_nonce);
 }
 
+test "txmgr: a contested nonce re-posts its data on confirmation, without a reset" {
+    var l1: FakeL1 = .{ .mined_nonce = 5 };
+    var client, var manager = try reorg_test_manager(&l1);
+    defer client.deinit(testing.allocator);
+    defer manager.deinit(testing.allocator);
+    manager.submit_tag = 30;
+    try manager.submit(&client, "\x00frame-a", 0);
+    manager.reset(); // The dropped tx may still win nonce 5.
+    manager.submit_tag = 31;
+    try manager.submit(&client, "\x00frame-b", 1);
+    try testing.expectEqual(@as(?u64, 30), manager.take_lost_floor());
+    try testing.expect(!manager.take_lost_needs_reset());
+    try testing.expect(manager.slots[0].contested or manager.slots[1].contested);
+    // Nonce 5 mined: either tx may be the one; tag 31 is re-posted at fresh nonces.
+    l1.mined_nonce = 6;
+    try testing.expectEqual(@as(u32, 1), try manager.poll(&client, 2));
+    try testing.expectEqual(@as(?u64, 31), manager.take_lost_floor());
+    try testing.expect(!manager.take_lost_needs_reset());
+    // A fresh nonce above every contested one is trusted.
+    manager.submit_tag = 32;
+    try manager.submit(&client, "\x00frame-c", 3);
+    l1.mined_nonce = 7;
+    try testing.expectEqual(@as(u32, 1), try manager.poll(&client, 4));
+    try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
+}
+
+test "txmgr: a restarted batcher contests its old pooled nonces and their rollback" {
+    var l1: FakeL1 = .{ .mined_nonce = 5, .pending_nonce = 7 };
+    var client, var manager = try reorg_test_manager(&l1);
+    defer client.deinit(testing.allocator);
+    defer manager.deinit(testing.allocator);
+    // A previous run left nonces 5 and 6 in the pool; this run replaces nonce 5.
+    manager.submit_tag = 40;
+    try manager.submit(&client, "\x00frame-a", 0);
+    l1.mined_nonce = 6;
+    _ = try manager.poll(&client, 1);
+    // The old tx's data is unknown here: re-post from the earliest trusted point.
+    try testing.expectEqual(@as(?u64, tag_unknown), manager.take_lost_floor());
+    // A reorg below the startup nonce un-mines a previous run's tx: unknown data again.
+    l1.mined_nonce = 4;
+    _ = try manager.poll(&client, 2);
+    try testing.expectEqual(@as(?u64, tag_unknown), manager.take_lost_floor());
+    try testing.expect(manager.take_lost_needs_reset());
+}
+
 fn fuzz_reorg_tracking(prng: *Prng, l1: *FakeL1, manager: *TxManager, client: *rpc.Client) !void {
     for (0..64) |step| {
         const now_ms: u64 = step;
-        switch (prng.below(4)) {
+        switch (prng.below(5)) {
             0 => if (manager.has_capacity()) {
-                manager.submit_tag = prng.below(1000);
+                manager.submit_tag = 1 + prng.below(999);
                 try manager.submit(client, "\x00frame", now_ms);
             },
             1 => {
@@ -773,10 +900,20 @@ fn fuzz_reorg_tracking(prng: *Prng, l1: *FakeL1, manager: *TxManager, client: *r
                 l1.mined_nonce = 5 + prng.below(@max(highest, 5) - 5 + 1);
             },
             2 => manager.reset(),
+            // A previous run's txs in the pool, seen only by the first read.
+            3 => if (prng.chance(1, 4)) {
+                l1.pending_nonce = l1.mined_nonce + prng.below(3);
+            },
             else => {},
         }
         _ = try manager.poll(client, now_ms);
         if (manager.take_lost_floor()) |floor| try testing.expect(floor < 1000);
+        _ = manager.take_lost_needs_reset();
+        try testing.expect(!manager.take_lost_needs_reset());
+        for (manager.slots) |slot| {
+            if (slot.state != .pending or !slot.contested) continue;
+            try testing.expect(slot.nonce <= manager.contested_max.?);
+        }
         try testing.expectEqual(@as(?u64, null), manager.take_lost_floor());
         try testing.expect(manager.recent_live_count() <= recent_max);
         for (manager.recent) |recent| {

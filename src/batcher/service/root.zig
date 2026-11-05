@@ -54,6 +54,8 @@ pub const Heads = struct {
     unsafe_l2: u64,
     /// False when no rollup node answered and `safe_l2` is a placeholder 0.
     safe_known: bool = false,
+    /// The rollup node's finalized L2 head; null when unknown or not reported.
+    finalized_l2: ?u64 = null,
 };
 
 pub const Report = struct {
@@ -151,7 +153,7 @@ pub const Service = struct {
             try service.submit_frames(clients.l1, now_ms, &report);
         }
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
-        if (service.txs.take_lost_floor()) |floor| service.repost_from(floor, &report);
+        if (service.txs.take_lost_floor()) |tag| service.on_lost(tag, &report);
         if (service.txs.needs_reset(now_ms)) {
             // A lost nonce: drop the waiting txs and reload from safe + 1, which requeues
             // the lost frames' blocks (base/base resets its nonce and requeues frames).
@@ -163,10 +165,33 @@ pub const Service = struct {
         return report;
     }
 
-    /// Re-posts from `floor`: the in-flight state is dropped (its data is reloaded too).
-    fn repost_from(service: *Service, floor: u64, report: *Report) void {
+    /// Lost data from `tag`. A previous run's data (`tag_unknown`) re-posts from the first
+    /// non-finalized block; without a finalized head it resumes from the safe head, as
+    /// base/base does after any restart (re-posting from genesis would never catch up).
+    fn on_lost(service: *Service, tag: u64, report: *Report) void {
+        const reset_txs = service.txs.take_lost_needs_reset();
+        const floor = if (tag != txmgr.tag_unknown)
+            tag
+        else if (report.heads.finalized_l2) |finalized|
+            finalized + 1
+        else {
+            if (reset_txs) {
+                service.channels.reset();
+                service.txs.reset();
+                report.resets += 1;
+            }
+            return;
+        };
+        assert(floor > 0 or tag == 0);
+        service.repost_from(floor, reset_txs, report);
+    }
+
+    /// Re-posts from `floor`. Lost nonces are refilled at once when `reset_txs` (their
+    /// pending successors' data is reloaded too); a contested confirmation keeps the txs,
+    /// so re-posted data goes out at fresh nonces and the re-post cannot repeat.
+    fn repost_from(service: *Service, floor: u64, reset_txs: bool, report: *Report) void {
         service.channels.reset();
-        service.txs.reset();
+        if (reset_txs) service.txs.reset();
         service.repost_floor = @min(service.repost_floor orelse floor, floor);
         service.repost_through = @max(service.repost_through, report.heads.safe_l2, floor);
         report.resets += 1;
@@ -318,6 +343,15 @@ pub const RollupFields = struct {
     }
 };
 
+/// `finalized_l2.number` when reported (optional: missing or malformed reads as null),
+/// never above the safe head.
+fn finalized_number(status: std.json.Value, safe_l2: u64) ?u64 {
+    const finalized = rpc.field(status, "finalized_l2") catch return null;
+    const number = rpc.number(rpc.field(finalized, "number") catch return null) catch
+        return null;
+    return @min(number, safe_l2);
+}
+
 fn read_heads(clients: Clients) Error!Heads {
     const l1 = try rpc.quantity(u64, try clients.l1.call("eth_blockNumber", "[]"));
     if (clients.rollup) |rollup| {
@@ -328,7 +362,14 @@ fn read_heads(clients: Clients) Error!Heads {
                 const leader = try clients.l2.call("eth_blockNumber", "[]");
                 break :blk @max(safe_l2, try rpc.quantity(u64, leader));
             } else try rpc.number(try rpc.field(try rpc.field(status, "unsafe_l2"), "number"));
-            return .{ .l1 = l1, .safe_l2 = safe_l2, .unsafe_l2 = unsafe_l2, .safe_known = true };
+            const finalized_l2 = finalized_number(status, safe_l2);
+            return .{
+                .l1 = l1,
+                .safe_l2 = safe_l2,
+                .unsafe_l2 = unsafe_l2,
+                .safe_known = true,
+                .finalized_l2 = finalized_l2,
+            };
         } else |_| {}
     }
     const unsafe = try rpc.quantity(u64, try clients.l2.call("eth_blockNumber", "[]"));
@@ -609,6 +650,54 @@ fn heads_for(l2_head: u64, safe: u64, unsafe: u64, unsafe_from_l2: bool) !Heads 
     return read_heads(clients);
 }
 
+fn finalized_of(text: []const u8, safe_l2: u64) !?u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{}) catch
+        return null; // Malformed status text: the caller never gets this far.
+    defer parsed.deinit();
+    const finalized = finalized_number(parsed.value, safe_l2);
+    if (finalized) |number| try testing.expect(number <= safe_l2);
+    return finalized;
+}
+
+test "service: the finalized head bounds a re-post of unknown data, null when absent" {
+    try testing.expectEqual(@as(?u64, 4), try finalized_of(
+        "{\"finalized_l2\":{\"number\":4},\"safe_l2\":{\"number\":9}}",
+        9,
+    ));
+    // Missing or malformed: null.
+    try testing.expectEqual(@as(?u64, null), try finalized_of("{\"safe_l2\":{\"number\":9}}", 9));
+    try testing.expectEqual(@as(?u64, null), try finalized_of("{\"finalized_l2\":7}", 9));
+    try testing.expectEqual(@as(?u64, null), try finalized_of("[1]", 9));
+    // Never above the safe head.
+    try testing.expectEqual(@as(?u64, 3), try finalized_of(
+        "{\"finalized_l2\":{\"number\":8}}",
+        3,
+    ));
+}
+
+test "service: seeded fuzz of the finalized head" {
+    var prng = Prng.init(0xf1a1);
+    for (0..200) |_| {
+        var text: [96]u8 = undefined;
+        const number = prng.below(1 << 40);
+        const safe = prng.below(1 << 40);
+        const status = try std.fmt.bufPrint(&text, "{{\"finalized_l2\":{{\"number\":{d}}}}}", .{
+            number,
+        });
+        try testing.expectEqual(@as(?u64, @min(number, safe)), try finalized_of(status, safe));
+    }
+}
+
+fn fuzz_finalized(_: void, smith: *testing.Smith) anyerror!void {
+    var text: [256]u8 = undefined;
+    const length = smith.slice(&text);
+    _ = try finalized_of(text[0..length], smith.value(u64));
+}
+
+test "service: fuzz the finalized head" {
+    try testing.fuzz({}, fuzz_finalized, .{});
+}
+
 test "service: shadow mode reads the unsafe head from the leader" {
     const canonical = try heads_for(9, 2, 3, false);
     try testing.expectEqual(@as(u64, 3), canonical.unsafe_l2);
@@ -768,9 +857,11 @@ test "service: a reorg that un-mines confirmed batch txs re-posts below the safe
         loaded += report.blocks_loaded;
         chains.l1_head += 1;
     }
-    // Re-posted from block 1 though 1..6 count as safe; the floor is consumed.
-    try testing.expectEqual(@as(u32, 1), reposts);
-    try testing.expectEqual(@as(u32, 6), loaded);
+    // Re-posted from block 1 though 1..6 count as safe; the floor is consumed. The
+    // re-post reuses the lost nonces, so its confirmation is contested (the old txs could
+    // have re-mined there instead) and re-posts once more, at fresh nonces.
+    try testing.expectEqual(@as(u32, 2), reposts);
+    try testing.expectEqual(@as(u32, 12), loaded);
     try testing.expect(chains.sent_count > sent_before);
     try testing.expectEqual(@as(?u64, null), service.repost_floor);
     // Without a loss nothing is re-posted again.

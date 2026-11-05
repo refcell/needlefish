@@ -237,8 +237,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   channel reaching every safe head seen since is handed out. Sweep with the gate removed
   except for crashes/byzantine posts: 1/3000 left (329: a re-posted tx at a reused nonce
   loses to the older tx; the nonce-only confirmation cannot tell). Gate kept until fixed.
-- [ ] Narrow the sim BUG(batcher) gate: mark txs at contested (reused) nonces and re-post on
-  confirmation; stop resetting txs on a repost; then ask dst-fuzz to drop the gate.
+- [ ] (coordinator) Drop the sim BUG(batcher) gate: (a) seed 329, an older tx wins a reused
+  nonce, so confirm contested nonces by receipt (all attempt hashes) and re-post when none is
+  ours; (b) crash-restart, a restarted batcher forgets its old txs, so a rollback below the
+  startup nonce re-posts from the rollup node's finalized head. Then tell nf-dst-fuzz.
 - 2026-11-05: Devnet at native 200 ms blocks (AGENTS.md rule 10, no flashblocks). rollup.json
   and the L2 genesis activate the Base upgrades through Denim at genesis (`"base"` objects),
   `block_time`/`blockTime` is the legacy 2 s, and the L2 genesis allocates the BaseTime proxy
@@ -247,4 +249,17 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   lane: the EL engine API now serves `engine_getPayloadV5` (Azul/Osaka; the CL calls it).
   Live: 50 blocks per 10 s, five blocks share each timestamp second, smoke passes, and the
   batcher keeps safe within ~20 blocks (about 4 s) of unsafe with singular batches.
+- 2026-11-05: Contested nonces (seed 329). txmgr marks a nonce contested when another tx of
+  ours may hold it: a reset or a reorg left one behind, or the first `pending` read at startup
+  shows a previous run's pooled txs. Confirming a contested nonce re-posts its data at fresh
+  nonces without dropping in-flight txs (only nonce-reusing losses reset). Losses of a
+  previous run's txs (pooled at startup, or un-mined below the startup nonce) carry
+  `tag_unknown`, and the service re-posts from the rollup node's `finalized_l2` + 1. Without a
+  finalized head it resumes from the safe head as base/base does (a from-genesis fallback
+  failed liveness on seeds 121 and 2503). The gated 3000-seed sweep is clean. With the gate removed, seed 329 passes and seeds 15, 16 and 850 still fail. In
+  850 the batcher crashes right after a loss whose txs L1 evicted. The restarted batcher sees
+  latest == pending and safe = 95 while canonical L1 data ends at 67, so it has no evidence
+  of the loss. Next: decide between re-posting unfinalized blocks on every start
+  (DA cost) and a safe-head regression check. The real verifier keeps its safe head after
+  the data was orphaned, which may be a verifier reorg-handling gap; ask dst-fuzz.
 
