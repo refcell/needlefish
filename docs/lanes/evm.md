@@ -21,7 +21,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `native_abi.zig`).
 - [x] PolicyRegistry V2 (Cobalt: composite policies, children arrays with tail cleanup) and
   V3 (Denim: inverted policy ids).
-- [ ] Base native precompiles (Beryl+: B20 factory, B20 tokens)
+- [ ] Base native precompiles (Beryl+: B20 factory, B20 tokens). Breakdown (base/base
+  `crates/common/precompiles/src`, non-test lines): common core storage/accounting/ops
+  (~1k), factory (~1k: dispatch, variant address derivation, logic v1), Asset V1/V2/V3
+  (~3.5k), Stablecoin V1/V2/V3 (~2.5k), dynamic lookup (`lookup.rs`, 0xb2-prefixed
+  addresses, marker-code check from Cobalt). Order: core + factory + Asset V1 first.
   and EIP-8130 (Everest, type 0x79: tx-context transient slots, nonce increments).
 - [x] Precompile dispatch wired to `common.crypto` with per-fork sets and gas: all of
   0x01-0x11 and P256VERIFY (0x100).
@@ -83,6 +87,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: native string/bytes storage (`native_storage.zig`) with Cobalt tail cleanup.
 - 2026-11-05: PolicyRegistry V2/V3 (composite and inverted policies).
 - 2026-11-05: Beryl PolicyRegistry V1 and the native ABI decoder.
 - 2026-11-05: Beryl ActivationRegistry native precompile.

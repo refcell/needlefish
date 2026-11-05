@@ -195,6 +195,8 @@ pub const nonce_manager_address = op.nonce_manager;
 
 pub const selector_delegate_call_not_allowed = [4]u8{ 0x0d, 0x89, 0x43, 0x8e };
 pub const selector_non_payable = [4]u8{ 0x6f, 0xb1, 0xb0, 0xe9 };
+/// Solidity `Panic(uint256)`.
+pub const error_panic = [4]u8{ 0x4e, 0x48, 0x7b, 0x71 };
 
 /// The native precompile at `address` under `upgrade`, if any.
 pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
@@ -385,6 +387,7 @@ test {
     _ = activation;
     _ = policy;
     _ = native_abi;
+    _ = @import("native_storage.zig");
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {

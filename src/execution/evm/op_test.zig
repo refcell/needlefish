@@ -585,3 +585,42 @@ test "op: PolicyRegistry composite and inverted policies (Denim)" {
     const unknown = try policy_call(&h, again);
     try testing.expectEqualSlices(u8, &policy_selector(.inverted_policy_id), unknown.output);
 }
+
+const native_storage = @import("native_storage.zig");
+
+fn storage_context(h: *Harness, upgrade: op_stack.Upgrade, out: []u8) native.Context {
+    return .{
+        .state = &h.state,
+        .upgrade = upgrade,
+        .address = target,
+        .caller = sender_address,
+        .origin = sender_address,
+        .value = 0,
+        .is_static = false,
+        .gas_limit = 10_000_000,
+        .out = out,
+    };
+}
+
+test "op: native string storage round-trips and cleans tails from Cobalt" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    try h.database.put_account(target, 0, 1, &.{});
+    var out: [64]u8 = undefined;
+    const long = "a long token name that needs more than one storage chunk to hold it all";
+    var buffer: [native_storage.bytes_length_max]u8 = undefined;
+    const tail_slot = std.mem.readInt(u256, &primitives.keccak256(&native.u256_word(9)), .big) + 2;
+    inline for (.{ op_stack.Upgrade.beryl, op_stack.Upgrade.cobalt }) |upgrade| {
+        var context = storage_context(&h, upgrade, &out);
+        try native_storage.store(&context, 9, long);
+        try testing.expectEqualStrings(long, try native_storage.load(&context, 9, &buffer));
+        try testing.expect(try h.storage(target, tail_slot) != 0);
+        try native_storage.store(&context, 9, "B20");
+        try testing.expectEqualStrings("B20", try native_storage.load(&context, 9, &buffer));
+        const cleaned = try h.storage(target, tail_slot) == 0;
+        try testing.expectEqual(upgrade == .cobalt, cleaned);
+        try native_storage.delete(&context, 9);
+        try testing.expectEqual(@as(u256, 0), try h.storage(target, 9));
+    }
+}
