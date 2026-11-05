@@ -43,8 +43,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [ ] `proof/e2e-3`: e2e intermediate output roots (boot key 9); a host witness for the
   attempted payload, so a deposit-only retry can follow valid user txs that read state.
 - [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
-  canonical archive, offline replay, JSON-RPC source. Left: beacon blobs in the RPC
-  source and a server loop over fds for a separate client process.
+  canonical archive, offline replay, JSON-RPC source, beacon blobs (`beacon_blobs.zig`
+  over the consensus `BlobProvider`; `proof run --l1-beacon`). Left: a server loop over
+  fds for a separate client process.
 - [x] `bin/base proof`: `replay <archive>` (offline) and `run` (native mode against
   L1/L2 execution RPCs; boot values from `--agreed`/`--claimed` headers, output roots
   from state root + withdrawals root; `--out` records the archive).
@@ -136,6 +137,8 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: host beacon blobs: blocking adapter over the consensus blob provider;
+  `proof run --l1-beacon`; devnet script passes the beacon.
 - 2026-11-05: `proof/rpc`: blocking endpoint + typed L1/L2/rollup calls; host source on it.
 - 2026-11-05: `proof/contracts`: ABI codec and dispute-game contract call codecs.
 - 2026-11-05: host: served-hint dedupe; live 40-block proof 40 s -> 1.2 s.

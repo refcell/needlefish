@@ -47,6 +47,8 @@ pub fn RpcSource(comptime IO: type) type {
         l1: Endpoint,
         l2: Endpoint,
         options: Options,
+        /// Beacon blobs (`beacon_blobs.zig`); without it blob hints fail as `NotFound`.
+        blobs: ?handler_module.BlobFetcher = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -147,10 +149,9 @@ pub fn RpcSource(comptime IO: type) type {
         }
 
         fn blob(context: *anyopaque, hash: Hash, timestamp: u64) SourceError!handler_module.Blob {
-            _ = of(context);
-            _ = hash;
-            _ = timestamp;
-            return error.NotFound;
+            const source = of(context);
+            const fetcher = source.blobs orelse return error.NotFound;
+            return fetcher.fetch(fetcher.context, hash, timestamp);
         }
 
         fn preimage(context: *anyopaque, hash: Hash) SourceError![]const u8 {

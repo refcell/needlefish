@@ -35,6 +35,12 @@ pub const Blob = struct {
     commitment: [kzg.bytes_per_commitment]u8,
 };
 
+/// Fetches the blob with a versioned hash, included in the L1 block at `timestamp`.
+pub const BlobFetcher = struct {
+    context: *anyopaque,
+    fetch: *const fn (context: *anyopaque, hash: Hash, timestamp: u64) SourceError!Blob,
+};
+
 /// Where the host gets chain data. Returned slices are valid until the next call.
 pub const Source = struct {
     context: *anyopaque,
