@@ -28,6 +28,8 @@ pub const Flags = struct {
     /// Claimed output root (default: the L2 endpoint's own root for `claimed`).
     claim_root: ?[32]u8 = null,
     out: ?[]const u8 = null,
+    /// L1 genesis JSON, for an L1 chain that is not built in (its `config` object).
+    l1_genesis: ?[]const u8 = null,
 };
 
 pub fn parse(args: []const []const u8) !Flags {
@@ -53,6 +55,8 @@ pub fn parse(args: []const []const u8) !Flags {
             flags.claim_root = try base.utilities.json.parse_fixed(32, value);
         } else if (std.mem.eql(u8, name, "--out")) {
             flags.out = value;
+        } else if (std.mem.eql(u8, name, "--l1-genesis")) {
+            flags.l1_genesis = value;
         } else return error.InvalidArguments;
     }
     const required = [_]bool{
@@ -97,7 +101,13 @@ fn connect(endpoints: *Endpoints, allocator: std.mem.Allocator, flags: Flags) !v
 }
 
 /// Fills the boot values and the agreed output root preimage into `store`.
-fn boot(source: *Source, store: *host.Store, flags: Flags, rollup_json: []const u8) !void {
+fn boot(
+    source: *Source,
+    store: *host.Store,
+    flags: Flags,
+    rollup_json: []const u8,
+    l1_config_json: []const u8,
+) !void {
     const rollup = try protocol.rollup_json.parse(rollup_json);
     const agreed = try host.native.output_of(try source.header_by_number(.l2, flags.agreed.?));
     const agreed_root = try store.put_keccak(&agreed.encode());
@@ -111,7 +121,14 @@ fn boot(source: *Source, store: *host.Store, flags: Flags, rollup_json: []const 
         .claimed_l2_block_number = flags.claimed.?,
         .chain_id = rollup.l2_chain_id,
         .rollup_config_json = rollup_json,
+        .l1_config_json = l1_config_json,
     });
+}
+
+fn read_optional(init: std.process.Init, path: ?[]const u8) ![]u8 {
+    const file = path orelse return init.gpa.alloc(u8, 0);
+    const limit: Io.Limit = .limited(256 << 20);
+    return Io.Dir.cwd().readFileAlloc(init.io, file, init.gpa, limit);
 }
 
 fn write_archive(init: std.process.Init, store: *const host.Store, path: []const u8) !void {
@@ -147,7 +164,10 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     defer source.deinit();
     var store: host.Store = .init(allocator, .{});
     defer store.deinit();
-    try boot(&source, &store, flags, rollup_json);
+    const l1_genesis = try read_optional(init, flags.l1_genesis);
+    defer allocator.free(l1_genesis);
+    const l1_config = try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
+    try boot(&source, &store, flags, rollup_json, l1_config);
     const verdict = try prove(allocator, &store, &source);
     if (flags.out) |path| try write_archive(init, &store, path);
     std.debug.print("proof: block {d} output root 0x{x} claimed 0x{x}: {s} ({d} preimages)\n", .{

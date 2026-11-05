@@ -15,6 +15,7 @@ const usage =
     \\       base proof run --l1 <url> --l2 <url> --rollup-config <file>
     \\                      --agreed <n> --claimed <n> [--l1-head <n>]
     \\                      [--claim-root <hex>] [--out <archive>]
+    \\                      [--l1-genesis <file>]  (L1 chains that are not built in)
     \\
     \\  replay   run the fault-proof client over a recorded preimage archive
     \\  run      prove a claim against L1/L2 execution RPCs (native mode) and
