@@ -7,6 +7,7 @@ const Io = std.Io;
 const base = @import("base");
 const consensus_cli = @import("consensus.zig");
 const beacon = @import("beacon.zig");
+const telemetry_servers = @import("telemetry.zig");
 
 const io = base.utilities.io;
 const http = base.utilities.http;
@@ -22,7 +23,6 @@ const Endpoint = proof.rpc.Endpoint(io.IO);
 const Chain = proposer.rpc_chain.RpcChain(Endpoint);
 const Submitter = proposer.tx_submitter.TxSubmitter(Endpoint);
 const Exporter = proposer.exporter.Exporter;
-const Server = http.Server(io.IO, *Exporter, Exporter.handle);
 const Admin = proposer.admin.Admin;
 const AdminServer = http.Server(io.IO, *Admin, Admin.handle_http);
 
@@ -147,26 +147,12 @@ fn run(init: std.process.Init, service: *Service, config: *const proposer.config
     return tick_loop(service, config, &dry_run, endpoints);
 }
 
-/// The health/readiness/metrics servers (`proposer.exporter`): the health port, and the
-/// metrics port when `--metrics.enabled` and different; and the admin JSON-RPC
-/// (`proposer.admin`) when `--rpc.enable-admin`.
+/// The health/readiness/metrics servers (`proposer.exporter` over `telemetry.zig`) and
+/// the admin JSON-RPC (`proposer.admin`) when `--rpc.enable-admin`.
 const Endpoints = struct {
-    exporter: Exporter,
-    servers: [2]?*Server = .{ null, null },
+    telemetry: telemetry_servers.Servers(Exporter),
     admin: Admin = .{},
     admin_server: ?*AdminServer = null,
-
-    const server_options: http.server.Options = .{
-        .connections_max = 8,
-        .recv_buffer_size = 16 * 1024,
-        .send_buffer_size = 16 * 1024,
-        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
-    };
-
-    fn now_ns(context: *anyopaque) u64 {
-        const os_io: *io.IO = @ptrCast(@alignCast(context));
-        return os_io.now_monotonic_ns();
-    }
 
     fn open(
         endpoints: *Endpoints,
@@ -174,62 +160,31 @@ const Endpoints = struct {
         os_io: *io.IO,
         config: *const proposer.config.Config,
     ) !void {
-        endpoints.servers = .{ null, null };
         endpoints.admin = .{};
         endpoints.admin_server = null;
-        try endpoints.exporter.init(.{ .context = os_io, .now_ns = now_ns }, .{
+        try endpoints.telemetry.open(allocator, os_io, config, .{
             .version = "needlefish",
             .poll_interval_ns = config.poll_interval_ms * std.time.ns_per_ms,
-        });
+        }, "proposer");
         errdefer endpoints.close(allocator, os_io);
-        const health = io.Address.ip4(config.health_addr, config.health_port);
-        const metrics = io.Address.ip4(config.metrics_addr, config.metrics_port);
-        const same = config.health_port == config.metrics_port and
-            std.mem.eql(u8, &config.health_addr, &config.metrics_addr);
-        const wanted = [2]bool{ config.health_port != 0, config.metrics_enabled and !same };
-        for (wanted, [2]io.Address{ health, metrics }, &endpoints.servers) |on, at, *slot| {
-            if (!on) continue;
-            const server = try allocator.create(Server);
-            errdefer allocator.destroy(server);
-            try server.init(allocator, os_io, &endpoints.exporter, server_options);
-            slot.* = server;
-            const bound = try server.listen(at);
-            std.debug.print("proposer: serving health and metrics on port {d}\n", .{bound.port});
-        }
         if (!config.rpc_enable_admin) return;
         const admin_server = try allocator.create(AdminServer);
         errdefer allocator.destroy(admin_server);
-        try admin_server.init(allocator, os_io, &endpoints.admin, server_options);
+        const options = telemetry_servers.server_options;
+        try admin_server.init(allocator, os_io, &endpoints.admin, options);
         endpoints.admin_server = admin_server;
         const bound = try admin_server.listen(io.Address.ip4(config.rpc_addr, config.rpc_port));
         std.debug.print("proposer: serving the admin JSON-RPC on port {d}\n", .{bound.port});
     }
 
-    fn stopped(endpoints: *const Endpoints) bool {
-        for (endpoints.servers) |slot| {
-            if (slot) |server| if (!server.stopped()) return false;
-        }
-        const admin_server = endpoints.admin_server orelse return true;
-        return admin_server.stopped();
-    }
-
     fn close(endpoints: *Endpoints, allocator: std.mem.Allocator, os_io: *io.IO) void {
-        for (endpoints.servers) |slot| if (slot) |server| server.stop();
-        if (endpoints.admin_server) |admin_server| admin_server.stop();
-        var rounds: u32 = 0;
-        while (rounds < 1000 and !endpoints.stopped()) : (rounds += 1) {
-            os_io.run_for_ns(std.time.ns_per_ms) catch break;
-        }
+        telemetry_servers.stop_all(os_io, [1]?*AdminServer{endpoints.admin_server});
         if (endpoints.admin_server) |admin_server| {
             admin_server.deinit();
             allocator.destroy(admin_server);
             endpoints.admin_server = null;
         }
-        for (&endpoints.servers) |*slot| if (slot.*) |server| {
-            server.deinit();
-            allocator.destroy(server);
-            slot.* = null;
-        };
+        endpoints.telemetry.close(allocator, os_io);
     }
 };
 
@@ -385,7 +340,8 @@ fn tick_loop(
             service.pipeline.tick(service.os_io.now_monotonic_ns() - start_ns);
         }
         const stats = service.pipeline.stats;
-        endpoints.exporter.observe(stats, service.pipeline.collector.stats);
+        const exporter = &endpoints.telemetry.exporter;
+        proposer.exporter.observe(exporter, stats, service.pipeline.collector.stats);
         std.debug.print("proposer: tick {d}: {d} skipped, {d} restarts, {d} dry-run sends\n", .{
             stats.ticks,
             stats.skipped,

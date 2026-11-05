@@ -89,6 +89,11 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   `admin_stopProposer`, `admin_proposerRunning`, -32000 on a redundant start/stop);
   `--rpc.enable-admin --rpc.addr 127.0.0.1 --rpc.port 8545`; stopped skips ticks, a start
   begins a fresh session (`Pipeline.reset`).
+- [x] `proof/telemetry` + challenger health/metrics: generic `telemetry.Exporter(Stats,
+  prefix)` (every `u64` field a `<prefix>_<field>_total` counter, readiness on a progress
+  count); the proposer exporter moved onto it; `challenger/exporter.zig` (driver, bond and
+  anchor counters as `base_challenger_*`, ready while scans succeed) checked in the seeded
+  sim; `base challenger --health.* --metrics.*` like the proposer (`bin/base/telemetry.zig`).
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
@@ -297,6 +302,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: shared proof telemetry exporter; challenger health and metrics.
 - 2026-11-05: proposer admin JSON-RPC (start/stop/running).
 - 2026-11-05: proposer health/readiness/metrics endpoints.
 - 2026-11-05: submission fee bumping at the same nonce; on in proposer and challenger.

@@ -4,6 +4,7 @@
 const std = @import("std");
 const base = @import("base");
 const consensus_cli = @import("consensus.zig");
+const telemetry_servers = @import("telemetry.zig");
 
 const io = base.utilities.io;
 const http = base.utilities.http;
@@ -17,6 +18,7 @@ const Chain = challenger.rpc_chain.RpcChain(Endpoint);
 const Submitter = challenger.tx_submitter.TxSubmitter(Endpoint);
 const ServiceClient = proof.prover_service.client.Client(io.IO);
 const ChallengerProver = proof.prover_service.challenger_prover.ChallengerProver(io.IO);
+const Telemetry = telemetry_servers.Servers(challenger.exporter.Exporter);
 
 const usage =
     \\usage: base challenger --l1-eth-rpc <url> --l2-eth-rpc <url>
@@ -25,6 +27,8 @@ const usage =
     \\         [--poll-interval 12s] [--max-proof-duration 4h] [--tee-submit-retry-limit 3]
     \\         [--bond-discovery-lookback-games 1000] [--bond-discovery-interval 300s]
     \\         [--bond-claim-addresses a,b] [--ticks-max n]
+    \\         [--health.addr 0.0.0.0] [--health.port 8080 (0: off)]
+    \\         [--metrics.enabled] [--metrics.addr 0.0.0.0] [--metrics.port 7300]
     \\
 ;
 
@@ -113,7 +117,14 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .prover = prover,
         .submitter = process.submitter.submitter(),
     });
-    return tick_loop(process, &flags);
+    const servers = try allocator.create(Telemetry);
+    defer allocator.destroy(servers);
+    try servers.open(allocator, &process.os_io, &flags, .{
+        .version = "needlefish",
+        .poll_interval_ns = flags.poll_interval_ms * std.time.ns_per_ms,
+    }, "challenger");
+    defer servers.close(allocator, &process.os_io);
+    return tick_loop(process, &flags, &servers.exporter);
 }
 
 fn connect(
@@ -181,13 +192,18 @@ fn disconnect(process: *Process, allocator: std.mem.Allocator) void {
     process.os_io.deinit();
 }
 
-fn tick_loop(process: *Process, flags: *const challenger.flags.Flags) !u8 {
+fn tick_loop(
+    process: *Process,
+    flags: *const challenger.flags.Flags,
+    exporter: *challenger.exporter.Exporter,
+) !u8 {
     const interval_ns = flags.poll_interval_ms * std.time.ns_per_ms;
     const start_ns = process.os_io.now_monotonic_ns();
     var ticks: u64 = 0;
     while (flags.ticks_max == null or ticks < flags.ticks_max.?) : (ticks += 1) {
         process.driver.tick(process.os_io.now_monotonic_ns() - start_ns);
         const stats = process.driver.stats;
+        challenger.exporter.observe(exporter, &process.driver);
         std.debug.print(
             "challenger: step {d}: {d} games scanned, {d} invalid, {d} scan errors\n",
             .{ stats.steps, stats.games_scanned, stats.invalid_detected, stats.scan_errors },
