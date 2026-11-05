@@ -29,6 +29,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] starting forkchoice discovery (resumable find_starting_forkchoice)
   - [ ] EL sync mode, checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
+  - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
+  - [ ] build ticker + attributes for sequenced blocks, seal, admin start/stop
 - [ ] `rpc`: optimism_* (outputAtBlock, syncStatus, rollupConfig), admin_*.
   - [x] optimism_outputAtBlock, safeHeadAtL1Block, syncStatus, version
   - [x] rollup.json codec (protocol) + optimism_rollupConfig
@@ -87,6 +89,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 
 
 ## Log
+- 2026-11-05: sequencer: non-blocking L1 origin selector, fuzzed.
 - 2026-11-05: derive: attributes queue, pipeline core (step, signals, reset walk-back), e2e + fuzz.
 - 2026-11-05: protocol: rollup.json codec; rpc: optimism_rollupConfig.
 - 2026-11-05: rpc: optimism_{outputAtBlock,safeHeadAtL1Block,syncStatus,version}.
