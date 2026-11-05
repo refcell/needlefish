@@ -37,6 +37,19 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] In-process interop (`interop_test.zig`): two full `Network`s find each other via discv5
+  over SimIo UDP only (ENR bootnodes, no enode), gossip randomized Ecotone (v3) and Isthmus
+  (v4) blocks both ways, and every received block round-trips through the consensus
+  `gossip_bridge` (decode -> engine envelope -> encode) to the published block hash.
+- [ ] Bootstore persistence through `utilities.io` (base/base `BootStoreFile`, 60 s sync):
+  `Network` reads `--p2p.bootstore` at start, writes the merged store (space-padded JSON +
+  fsync) every 60 s and on stop. DST: `SimIo.crash` mid-run, restart, records reload.
+- [ ] `--p2p.bootnodes-file` read through `utilities.io` at start (today only parsed when the
+  caller hands over the contents; the binary never does).
+- [ ] Identify peerstore (base/base `max_identify_peerstore_peers` = 1024): LRU of identify
+  info that outlives connections, evicting disconnected peers first; admin `peers` reports it.
+- [x] Dial rate limiting (base/base gater `peer_redialing` / `dial_period`): already in
+  `peers/gater.zig` (500 redials per 60 min, protected peers exempt).
 - [x] DST: chaos seed sweep (8 seeds, 5 nodes, 5% datagram loss, connection resets, a 3 s
   partition of one node, then a block must reach everyone) (`-Dslow-tests`).
 - [x] discv5 unverifiable ENRs (sigp `UnverifiableEnr` + base/base NAT handling): a handshake
@@ -332,3 +345,4 @@ behind a small interface and switch later.
 - 2026-11-05: per-method admin RPC call metrics.
 - 2026-11-05: discv5 unverifiable-ENR handling (table poisoning guard + NAT verification ping).
 - 2026-11-05: chaos seed sweep DST.
+- 2026-11-05: in-process p2p<->consensus interop test; backlog extended (bootstore/bootnodes-file persistence via io, identify peerstore).

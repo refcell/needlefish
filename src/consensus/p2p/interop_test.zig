@@ -1,0 +1,212 @@
+//! In-process interop: two full p2p `Network`s (as `base consensus` runs them) find each
+//! other only through discv5 over SimIo UDP, connect over libp2p, and gossip sequencer
+//! blocks both ways. Each received block goes through the consensus side's
+//! `gossip_bridge` (gossip envelope -> engine envelope -> gossip payload) and must
+//! re-hash to the block hash that was published, so the p2p wire format and the
+//! consensus types agree end to end. Covers the Ecotone (v3) and Isthmus (v4) topics.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const io_module = @import("../../utilities/io/root.zig");
+const network_module = @import("network.zig");
+const options_module = @import("options.zig");
+const enr = @import("peers/enr.zig");
+const secp256k1 = @import("peers/secp256k1.zig");
+const block = @import("gossip/block.zig");
+const ssz = @import("gossip/ssz_payload.zig");
+const validity = @import("gossip/validity.zig");
+const gossip_bridge = @import("../service/gossip_bridge.zig");
+const primitives = @import("../../common/primitives/root.zig");
+const common_secp256k1 = @import("../../common/crypto/secp256k1/root.zig");
+const consensus_types = @import("../../common/consensus/root.zig");
+const rollup_config = @import("../protocol/rollup_config.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
+
+const testing = std.testing;
+const Network = network_module.Network(io_module.SimIo);
+const ns_per_ms = std.time.ns_per_ms;
+const ns_per_s = std.time.ns_per_s;
+const chain_id = 8453;
+const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
+
+const Pair = struct {
+    world: io_module.SimWorld,
+    ios: [2]io_module.SimIo,
+    networks: [2]Network,
+    prngs: [2]Prng,
+    secrets: [2]secp256k1.SecretKey,
+    rollup: rollup_config.RollupConfig,
+    sequencer_key: [32]u8,
+    scratch: []u8,
+    /// `Options` borrows its argument strings, so they live as long as the networks.
+    boot_flags: [2][enr.text_length_max + 16]u8,
+    listen_flags: [2][32]u8,
+
+    /// Each node boots discovery from the other's ENR only: no enode, no manual dial.
+    fn init(pair: *Pair, upgrade: rollup_config.Upgrade) !void {
+        const allocator = testing.allocator;
+        pair.rollup = .{ .l2_chain_id = chain_id, .block_time = 2 };
+        pair.rollup.upgrades.set(upgrade, 0);
+        pair.sequencer_key = @splat(0);
+        pair.sequencer_key[31] = 5;
+        pair.secrets = .{ @splat(0), @splat(0) };
+        pair.secrets[0][31] = 3;
+        pair.secrets[1][31] = 4;
+        pair.prngs = .{ Prng.init(1), Prng.init(2) };
+        pair.world = try io_module.SimWorld.init(allocator, .{ .seed = 0x1e70 });
+        errdefer pair.world.deinit();
+        pair.scratch = try allocator.alloc(u8, 10 << 20);
+        const signer: primitives.Address = .{
+            .bytes = try common_secp256k1.address(pair.sequencer_key),
+        };
+        for (0..2) |index| try pair.init_node(index, signer);
+        for (&pair.networks) |*network| try testing.expectEqual(@as(u32, 0), try network.start());
+    }
+
+    fn init_node(pair: *Pair, index: usize, signer: primitives.Address) !void {
+        assert(index < 2);
+        const allocator = testing.allocator;
+        const host: [4]u8 = .{ 10, 0, 0, @intCast(index + 1) };
+        try io_module.SimIo.init(&pair.ios[index], allocator, &pair.world, .{
+            .host = io_module.Address.ip4(host, 0),
+        });
+        const other = 1 - index;
+        const other_record = try enr.build(pair.secrets[other], .{
+            .ip4 = .{ 10, 0, 0, @intCast(other + 1) },
+            .tcp = 9222,
+            .udp = 9223,
+            .opstack = .{ .chain_id = chain_id },
+        });
+        var record_text: [enr.text_length_max]u8 = undefined;
+        const bootnodes = try std.fmt.bufPrint(&pair.boot_flags[index], "--p2p.bootnodes={s}", .{
+            enr.encode_text(&record_text, &other_record),
+        });
+        const listen_text = "--p2p.listen.ip=10.0.0.{d}";
+        const listen_flag = try std.fmt.bufPrint(&pair.listen_flags[index], listen_text, .{
+            index + 1,
+        });
+        const options = try options_module.parse(&.{ listen_flag, bootnodes });
+        try pair.networks[index].init(
+            allocator,
+            &pair.ios[index],
+            &pair.rollup,
+            options,
+            pair.secrets[index],
+            signer,
+            pair.prngs[index].random(),
+            index,
+        );
+    }
+
+    fn deinit(pair: *Pair) void {
+        for (&pair.networks) |*network| network.stop();
+        pair.world.run_for_ns(100 * ns_per_ms);
+        for (&pair.networks, &pair.ios) |*network, *io| {
+            network.deinit(testing.allocator);
+            io.deinit();
+        }
+        testing.allocator.free(pair.scratch);
+        pair.world.deinit();
+    }
+
+    fn run(pair: *Pair, duration_ns: u64) void {
+        var elapsed_ns: u64 = 0;
+        while (elapsed_ns < duration_ns) : (elapsed_ns += 10 * ns_per_ms) {
+            pair.world.run_for_ns(10 * ns_per_ms);
+            for (&pair.networks) |*network| network.transport.execute_commands();
+        }
+    }
+
+    /// A sealed-looking payload with random header fields and 0-3 deposit transactions.
+    fn payload(pair: *Pair, number: u64, random: std.Random, storage: []u8) !ssz.ExecutionPayload {
+        assert(storage.len >= 4096);
+        var transactions: [3][]const u8 = undefined;
+        const count = random.uintAtMost(usize, transactions.len);
+        var offset: usize = 2048;
+        for (transactions[0..count], 0..) |*transaction, index| {
+            const deposit: consensus_types.Envelope = .{ .deposit = .{
+                .source_hash = .{ .bytes = @splat(@truncate(number + index)) },
+                .from = .zero,
+                .to = .create,
+                .mint = random.int(u32),
+                .value = random.int(u32),
+                .gas_limit = 1_000_000,
+                .is_system_transaction = false,
+                .input = "needlefish interop",
+            } };
+            transaction.* = deposit.encode_to(storage[offset..]);
+            offset += transaction.len;
+        }
+        const now_s = pair.ios[0].now_realtime_ns() / ns_per_s;
+        var result: ssz.ExecutionPayload = .{
+            .version = block.version_at(&pair.rollup, now_s),
+            .block_number = number,
+            .timestamp = now_s,
+            .gas_limit = 30_000_000 + @as(u64, random.int(u16)),
+            .gas_used = random.int(u16),
+            .base_fee_per_gas = 1 + random.int(u8),
+            .extra_data = "base",
+            .transactions = ssz.Transactions.encode(storage[0..2048], transactions[0..count]),
+        };
+        random.bytes(&result.parent_hash.bytes);
+        random.bytes(&result.state_root.bytes);
+        random.bytes(&result.prev_randao.bytes);
+        if (@backingInt(result.version) >= @backingInt(ssz.Version.v4)) {
+            random.bytes(&result.withdrawals_root.bytes);
+        }
+        result.block_hash = try validity.block_hash(&pair.rollup, &result, beacon_root);
+        return result;
+    }
+
+    /// Publishes from `from`, then checks the other node received it and that the
+    /// consensus bridge round-trips it to the same block hash.
+    fn exchange(pair: *Pair, from: usize, number: u64, random: std.Random) !void {
+        var storage: [4096]u8 = undefined;
+        const sent = try pair.payload(number, random, &storage);
+        _ = try pair.networks[from].publish_block(pair.sequencer_key, beacon_root, sent);
+        pair.run(300 * ns_per_ms);
+        const envelope = pair.networks[1 - from].pop_block(pair.scratch) orelse
+            return error.BlockNotDelivered;
+        try testing.expect(envelope.payload.block_hash.eql(sent.block_hash));
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const decoded = try gossip_bridge.decode_gossip(arena.allocator(), &envelope);
+        try testing.expectEqual(number, decoded.payload.block_number);
+        try testing.expectEqual(sent.transactions.count, decoded.payload.transactions.len);
+        var reencoded_storage: [4096]u8 = undefined;
+        const reencoded = try gossip_bridge.encode_gossip(
+            &pair.rollup,
+            &decoded,
+            &reencoded_storage,
+        );
+        const root = decoded.parent_beacon_block_root;
+        const rehashed = try validity.block_hash(&pair.rollup, &reencoded, root);
+        try testing.expect(rehashed.eql(sent.block_hash));
+    }
+};
+
+fn expect_interop(upgrade: rollup_config.Upgrade, seed: u64) !void {
+    const pair = try testing.allocator.create(Pair);
+    defer testing.allocator.destroy(pair);
+    try pair.init(upgrade);
+    defer pair.deinit();
+    pair.run(5 * ns_per_s);
+    for (&pair.networks) |*network| {
+        try testing.expectEqual(@as(u32, 1), network.peer_count());
+        // The connection came from discovery over UDP, not from an enode bootnode.
+        try testing.expect(network.transport.stats.datagrams_received > 0);
+    }
+    var prng = Prng.init(seed);
+    const random = prng.random();
+    for (0..12) |round| {
+        try pair.exchange(round % 2, 100 + round, random);
+    }
+}
+
+test "p2p interop: two networks gossip Ecotone (v3) blocks through the consensus bridge" {
+    try expect_interop(.ecotone, 0xec0);
+}
+
+test "p2p interop: two networks gossip Isthmus (v4) blocks through the consensus bridge" {
+    try expect_interop(.isthmus, 0x157);
+}

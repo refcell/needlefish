@@ -18,4 +18,5 @@ pub const observations = @import("observations.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("interop_test.zig");
 }
