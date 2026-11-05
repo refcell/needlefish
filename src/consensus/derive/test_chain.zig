@@ -92,6 +92,10 @@ pub const TestChain = struct {
         return chain.blocks[try chain.index_of_number(number)];
     }
 
+    pub fn l1_block_info_by_hash(chain: *TestChain, hash: Hash) ProviderError!BlockInfo {
+        return chain.blocks[try chain.index_of_hash(hash)];
+    }
+
     pub fn l1_receipts_by_hash(chain: *TestChain, hash: Hash) ProviderError![]const Receipt {
         return chain.receipts[try chain.index_of_hash(hash)];
     }

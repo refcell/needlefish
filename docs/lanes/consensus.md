@@ -47,6 +47,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] service: L1 head watcher (latest/safe/finalized polling, verified headers)
   - [x] service node stage 1: L1 watcher + engine label heads → optimism_* RPC server;
     `base consensus` subcommand with the docs/DEVNET.md flags
+  - [x] sequencer: next-block attributes on the unsafe head (origin selection, consistency
+    check, pool gating; resets reported to the caller)
   - [ ] service node stage 2: startup forkchoice, derivation → engine queue, safedb updates,
     finalization; sequencer block building
   - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
@@ -136,6 +138,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   fallback builds with the leading-deposits prefix of the attributes' transactions.
 
 ## Log
+- 2026-11-05: sequencer: next-block attributes (build_on, pool gating), fuzzed.
 - 2026-11-05: service: node stage 1 (heads + RPC); bin: `base consensus` subcommand.
 - 2026-11-05: sources: L2 provider label queries; service: L1 head watcher.
 - 2026-11-05: sources: L2 chain provider; protocol: system config from L2 blocks.
