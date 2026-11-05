@@ -19,6 +19,7 @@ const usage =
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
+    \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
     \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
     \\         [--wait-node-sync-timeout SECONDS]]
@@ -51,7 +52,8 @@ const Flags = struct {
     /// Start with ingestion stopped until `admin_startBatcher` (base/base `--stopped`).
     stopped: bool = false,
     /// DA throttling of the sequencer (base/base default: quadratic).
-    throttle_strategy: batcher.throttle.Strategy = .quadratic,
+    /// DA throttling (base/base defaults); `--throttle-*` flags override fields.
+    throttle: batcher.throttle.Config = .{},
     /// base/base txmgr flags.
     confirmations: u64 = 1,
     min_tip_wei: u128 = 0,
@@ -126,7 +128,7 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (eql(u8, arg, "--admin-addr")) {
             flags.admin_address = try base.utilities.io.Address.parse(value);
         } else if (eql(u8, arg, "--throttle-strategy")) {
-            flags.throttle_strategy = std.meta.stringToEnum(batcher.throttle.Strategy, value) orelse
+            flags.throttle.strategy = std.meta.stringToEnum(batcher.throttle.Strategy, value) orelse
                 return error.UnknownThrottleStrategy;
         } else if (eql(u8, arg, "--compression")) {
             flags.compression = std.meta.stringToEnum(batcher.comp.Algorithm, value) orelse
@@ -196,7 +198,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         },
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
-        .throttle = .{ .strategy = flags.throttle_strategy },
+        .throttle = flags.throttle,
         .stopped = flags.stopped,
     }, seed);
     defer service.deinit(init.gpa);
@@ -296,7 +298,31 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
 /// command lines work unchanged. Returns false for flags it does not know.
 fn apply_alias(flags: *Flags, arg: []const u8, value: []const u8) !bool {
     if (try apply_txmgr_flag(flags, arg, value)) return true;
+    if (try apply_throttle_flag(flags, arg, value)) return true;
     return apply_alias_settings(flags, arg, value);
+}
+
+/// base/base throttle thresholds and limits (bytes); checked together in `validate_flags`.
+fn apply_throttle_flag(flags: *Flags, arg: []const u8, value: []const u8) !bool {
+    const names = [_][]const u8{
+        "--throttle-start-threshold",        "--throttle-full-threshold",
+        "--throttle-block-size-lower-limit", "--throttle-block-size-upper-limit",
+        "--throttle-tx-size-lower-limit",    "--throttle-tx-size-upper-limit",
+    };
+    const config = &flags.throttle;
+    const fields = [_]*u64{
+        &config.start_threshold_bytes,  &config.full_threshold_bytes,
+        &config.block_size_lower_limit, &config.block_size_upper_limit,
+        &config.tx_size_lower_limit,    &config.tx_size_upper_limit,
+    };
+    comptime std.debug.assert(names.len == fields.len);
+    for (names, fields) |name, field| {
+        if (std.mem.eql(u8, arg, name)) {
+            field.* = try std.fmt.parseInt(u64, value, 10);
+            return true;
+        }
+    }
+    return false;
 }
 
 /// base/base tx manager flags.
@@ -354,7 +380,7 @@ fn parse_switch(flags: *Flags, arg: []const u8) bool {
     } else if (eql(u8, arg, "--wait-node-sync")) {
         flags.wait_node_sync = true;
     } else if (eql(u8, arg, "--no-throttle")) {
-        flags.throttle_strategy = .off;
+        flags.throttle.strategy = .off;
     } else return false;
     return true;
 }
@@ -363,6 +389,7 @@ fn parse_switch(flags: *Flags, arg: []const u8) bool {
 fn validate_flags(flags: Flags) !void {
     // base/base rejects a margin that leaves no channel duration.
     if (flags.sub_safety_margin >= flags.max_channel_duration) return error.SubSafetyMarginTooLarge;
+    if (flags.throttle.problem() != null) return error.InvalidThrottleConfig;
     const recent_depth_max = batcher.sync.recent_txs_depth_max;
     if (flags.check_recent_txs_depth > recent_depth_max) return error.RecentTxsDepthTooLarge;
     if (flags.check_recent_txs_depth > 0 and !flags.wait_node_sync)
@@ -487,13 +514,13 @@ test "batcher: flags" {
     try std.testing.expectEqual(.brotli, (try parse_flags(&blobs)).compression);
     const zlib = [_][]const u8{ "--compression", "zlib" };
     try std.testing.expectEqual(.zlib, (try parse_flags(&zlib)).compression);
-    try std.testing.expectEqual(.quadratic, (try parse_flags(&zlib)).throttle_strategy);
+    try std.testing.expectEqual(.quadratic, (try parse_flags(&zlib)).throttle.strategy);
     const no_throttle = [_][]const u8{ "--no-throttle", "--compression", "zlib", "--no-throttle" };
     const switched = try parse_flags(&no_throttle);
-    try std.testing.expectEqual(.off, switched.throttle_strategy);
+    try std.testing.expectEqual(.off, switched.throttle.strategy);
     try std.testing.expectEqual(.zlib, switched.compression);
     const linear = [_][]const u8{ "--throttle-strategy", "linear" };
-    try std.testing.expectEqual(.linear, (try parse_flags(&linear)).throttle_strategy);
+    try std.testing.expectEqual(.linear, (try parse_flags(&linear)).throttle.strategy);
     const admin = [_][]const u8{ "--stopped", "--admin-port", "7301", "--admin-addr", "0.0.0.0" };
     const admin_flags = try parse_flags(&admin);
     try std.testing.expect(admin_flags.stopped);
@@ -556,6 +583,16 @@ test "batcher: flags" {
     for (bad_aliases) |pair| {
         try std.testing.expect(std.meta.isError(parse_flags(&pair)));
     }
+    const throttle_args = [_][]const u8{
+        "--throttle-start-threshold",     "1000", "--throttle-full-threshold",         "5000",
+        "--throttle-tx-size-lower-limit", "100",  "--throttle-block-size-upper-limit", "90000",
+    };
+    const throttle_flags = try parse_flags(&throttle_args);
+    try std.testing.expectEqual(@as(u64, 5000), throttle_flags.throttle.full_threshold_bytes);
+    try std.testing.expectEqual(@as(u64, 100), throttle_flags.throttle.tx_size_lower_limit);
+    try std.testing.expectEqual(@as(u64, 90000), throttle_flags.throttle.block_size_upper_limit);
+    const inverted = [_][]const u8{ "--throttle-full-threshold", "1" };
+    try std.testing.expectError(error.InvalidThrottleConfig, parse_flags(&inverted));
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
@@ -568,10 +605,11 @@ test {
 }
 
 const fuzz_flag_names = [_][]const u8{
-    "--poll-interval",            "--max-blobs-per-tx",       "--resubmission-timeout",
-    "--max-calldata-size-bytes",  "--data-availability-type", "--num-confirmations",
-    "--max-pending-transactions", "--sub-safety-margin",      "--max-channel-duration",
-    "--check-recent-txs-depth",   "--wait-node-sync",         "--stopped",
+    "--poll-interval",            "--max-blobs-per-tx",        "--resubmission-timeout",
+    "--max-calldata-size-bytes",  "--data-availability-type",  "--num-confirmations",
+    "--max-pending-transactions", "--sub-safety-margin",       "--max-channel-duration",
+    "--check-recent-txs-depth",   "--wait-node-sync",          "--stopped",
+    "--throttle-start-threshold", "--throttle-full-threshold", "--throttle-tx-size-lower-limit",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 
@@ -584,6 +622,7 @@ fn check_flag_invariants(flags: Flags) !void {
     try std.testing.expect(flags.calldata_bytes_max <= tx_data_bytes_max);
     try std.testing.expect(flags.confirmations >= 1 and flags.pending_max >= 1);
     try std.testing.expect(flags.sub_safety_margin < flags.max_channel_duration);
+    try std.testing.expect(flags.throttle.problem() == null);
 }
 
 fn fuzz_args(bytes: []const u8, args: *[16][]const u8) usize {

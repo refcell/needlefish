@@ -70,7 +70,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `batcher`: `--network-timeout` (needs a request timeout in the HTTP transport).
 - [ ] `batcher`: `--compressed-size-target` (close the channel once compressed output passes
   the target, keeping the batch that reached it).
-- [ ] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
+- [x] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
 - [ ] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
 - [ ] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).

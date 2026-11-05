@@ -113,6 +113,8 @@ Each binary must accept at least the flags below. Lanes may add more.
   base/base flag names also work: `--l1-rpc-url`, `--poll-interval S`,
   `--data-availability-type`, `--max-blobs-per-tx`, `--resubmission-timeout S`,
   `--max-calldata-size-bytes`.
+  Throttle tuning: `--throttle-{start,full}-threshold`, `--throttle-{block,tx}-size-{lower,upper}-limit`
+  (bytes, base/base defaults, validated together).
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 
