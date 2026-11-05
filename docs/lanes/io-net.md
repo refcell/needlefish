@@ -11,7 +11,7 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [ ] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
 - [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
-- [ ] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
+- [x] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [ ] Linux CI coverage for io_uring (`just test-linux`).
 - [ ] `io`: `cancel` operation (IORING_OP_ASYNC_CANCEL / kqueue EV_DELETE / SimIo) so a
   server can stop with an accept in flight and a client can abandon a request on timeout.
@@ -61,3 +61,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: jwt: HS256 create/verify, +-60s iat window, alg-none rejection, hex secret; fuzzed.
 - 2026-11-05: metrics: atomic Counter/Gauge/Histogram, static Registry, Prometheus text. log: leveled logfmt/JSON Logger with fixed messages, typed fields, injected sink and clock.
 - 2026-11-05: cli: spec-struct flags with env fallback, required/optional, help text; fuzzed.
+- 2026-11-05: ring_buffer (comptime capacity, asserted ordering, binary-search first_after), retry (base/base defaults, seeded SplitMix64 jitter), health (GET / liveness, GET /healthz version).

@@ -12,6 +12,9 @@ pub const jwt = @import("jwt/root.zig");
 pub const metrics = @import("metrics/root.zig");
 pub const log = @import("log/root.zig");
 pub const cli = @import("cli/root.zig");
+pub const ring_buffer = @import("ring_buffer/root.zig");
+pub const retry = @import("retry/root.zig");
+pub const health = @import("health/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

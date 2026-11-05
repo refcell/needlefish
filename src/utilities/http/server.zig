@@ -55,7 +55,7 @@ pub const ResponseBuilder = struct {
     extra_headers: [extra_headers_max]parser.Header = undefined,
     extra_headers_count: u32 = 0,
 
-    fn init(buffer: []u8) ResponseBuilder {
+    pub fn init(buffer: []u8) ResponseBuilder {
         assert(buffer.len > head_reserve_size);
         return .{ .buffer = buffer, .body = .fixed(buffer[head_reserve_size..]) };
     }
