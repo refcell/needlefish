@@ -477,3 +477,35 @@ test "p2p transport: sixteen-node discovery swarm heals a partition and gossips 
         }
     }
 }
+
+test "p2p transport: chaos seed sweep with loss, resets, and a partition (slow)" {
+    if (!build_options.slow_tests) return error.SkipZigTest;
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    for (40..48) |seed| {
+        const cluster = try std.testing.allocator.create(Cluster);
+        defer std.testing.allocator.destroy(cluster);
+        try cluster.init_options(seed, 5, 2_000, 50_000);
+        defer cluster.deinit();
+        cluster.run(10 * ns_per_s);
+        // Cut one node off for a while, then heal and let it rejoin.
+        const cut = seed % 5;
+        for (cluster.all(), 0..) |*node, index| {
+            if (index == cut) continue;
+            cluster.world.partition(node.io.index, cluster.storage[cut].io.index);
+        }
+        cluster.run(3 * ns_per_s);
+        cluster.world.heal_all();
+        cluster.run(6 * ns_per_s);
+        const from = (seed + 1) % 5;
+        try cluster.publish(from, seed);
+        cluster.run(2 * ns_per_s);
+        for (0..cluster.count) |index| {
+            if (index == from) continue;
+            if (!cluster.received(index, seed, scratch)) {
+                std.debug.print("chaos seed {d}: node {d} missed the block\n", .{ seed, index });
+                return error.BlockNotDelivered;
+            }
+        }
+    }
+}

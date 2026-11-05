@@ -37,6 +37,8 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [x] DST: chaos seed sweep (8 seeds, 5 nodes, 5% datagram loss, connection resets, a 3 s
+  partition of one node, then a block must reach everyone) (`-Dslow-tests`).
 - [x] discv5 unverifiable ENRs (sigp `UnverifiableEnr` + base/base NAT handling): a handshake
   record enters the table only if it advertises the packet's source socket; otherwise it is
   forwarded for dialing and, when only the port differs, its advertised socket is pinged and a
@@ -329,3 +331,4 @@ behind a small interface and switch later.
 - 2026-11-05: discovery metrics under base/base's `base_node_disc` scope.
 - 2026-11-05: per-method admin RPC call metrics.
 - 2026-11-05: discv5 unverifiable-ENR handling (table poisoning guard + NAT verification ping).
+- 2026-11-05: chaos seed sweep DST.
