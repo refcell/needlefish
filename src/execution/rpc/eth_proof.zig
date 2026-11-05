@@ -1,8 +1,9 @@
 //! `eth_getProof` (EIP-1186): the account's Merkle proof against the head state root,
 //! plus one proof per requested storage slot against the account's storage root. Only
 //! the head state is held in memory, so other blocks are refused like every state call,
-//! except on a durable node whose database keeps a history window: then any canonical
-//! block of that window is served from it (`Journal.proof`, `Database.proof_at`).
+//! except when the chain keeps history (`Chain.proof_at`): a durable node's database
+//! window (`Journal.proof`, `Database.proof_at`) or the in-memory `--proofs-history`
+//! window; then any canonical block of that window is served from it.
 //! Proof buffers are carved from the API's bounded scratch, not the stack.
 
 const std = @import("std");
@@ -25,7 +26,7 @@ const StorageProof = state_trie.StateTrie.StorageProof;
 /// Upper bound on storage keys per request (each proof is serialised in the response).
 pub const storage_keys_max = 256;
 
-const Scratch = struct {
+pub const Scratch = struct {
     account: AccountProof,
     storage: StorageProof,
 };
@@ -67,13 +68,12 @@ pub fn get_proof(api: *eth.Api, call: *Call) HandlerError!void {
     try w.end_object();
 }
 
-/// An older block (hash and number) when the journal serves historical proofs
-/// (durable node with history); null for the head (or no tag), so the head path (and
-/// its "historical state unavailable" error for other blocks) applies.
-fn historical_block(api: *eth.Api, call: *Call, tag: ?[]const u8) HandlerError!?Block {
+/// An older block (hash and number) when the chain serves historical proofs; null for
+/// the head (or no tag), so the head path (and its "historical state unavailable" error
+/// for other blocks) applies.
+pub fn historical_block(api: *eth.Api, call: *Call, tag: ?[]const u8) HandlerError!?Block {
     const text = tag orelse return null;
-    const journal = api.chain.journal orelse return null;
-    if (journal.proof == null) return null;
+    if (!api.chain.serves_history()) return null;
     // History follows the database head, which the head state keeps at the chain head.
     api.chain.ensure_head_state() catch {
         return call.fail(rpc.code.internal_error, "head state unavailable");
@@ -83,13 +83,13 @@ fn historical_block(api: *eth.Api, call: *Call, tag: ?[]const u8) HandlerError!?
     const header = api.chain.header(hash) orelse {
         return call.fail(rpc.code.server_error, "block not found");
     };
-    // The journal checks that `hash` is canonical in its own index (side blocks fail).
+    // `Chain.proof_at` checks that `hash` is canonical (side blocks fail).
     return .{ .hash = hash, .number = header.number };
 }
 
-const Block = struct { hash: Hash, number: u64 };
+pub const Block = struct { hash: Hash, number: u64 };
 
-/// `eth_getProof` at an older canonical block from the journal's history window.
+/// `eth_getProof` at an older canonical block from the chain's history window.
 fn get_proof_at(
     api: *eth.Api,
     call: *Call,
@@ -98,15 +98,13 @@ fn get_proof_at(
     block: Block,
 ) HandlerError!void {
     assert(keys.len <= storage_keys_max);
-    const journal = api.chain.journal.?;
-    const proof = journal.proof.?;
+    const chain = api.chain;
     const scratch = scratch_of(api) orelse {
         return call.fail(rpc.code.internal_error, "proof scratch too small");
     };
-    const context = journal.context;
     const hash = block.hash;
     const number = block.number;
-    const found = proof(context, hash, number, address, &.{}, &scratch.account, &.{}, &.{});
+    const found = chain.proof_at(hash, number, address, &.{}, &scratch.account, &.{}, &.{});
     const account = found catch |err| return fail_history(call, err);
     const w = call.writer;
     try write_account(w, &address, &scratch.account, account orelse .{
@@ -123,7 +121,7 @@ fn get_proof_at(
         const proofs: *[1]StorageProof = (&scratch.storage)[0..1];
         const account_proof = &scratch.account;
         const result =
-            proof(context, hash, number, address, &slots, account_proof, proofs, &values);
+            chain.proof_at(hash, number, address, &slots, account_proof, proofs, &values);
         _ = result catch |err| return fail_history(call, err);
         try write_slot(w, slot, values[0], &proofs[0]);
     }
@@ -131,7 +129,7 @@ fn get_proof_at(
     try w.end_object();
 }
 
-fn fail_history(call: *Call, err: db_database.ProofError) HandlerError {
+pub fn fail_history(call: *Call, err: db_database.ProofError) HandlerError {
     return switch (err) {
         error.BlockOutOfWindow, error.HistoryUnavailable, error.NotInitialized => {
             return call.fail(rpc.code.server_error, "historical state unavailable");
@@ -187,7 +185,7 @@ fn write_proof(w: *json.Writer, proof: anytype) json.Writer.WriteError!void {
 }
 
 /// The proof buffers inside `api.scratch`, aligned; null when the scratch is too small.
-fn scratch_of(api: *eth.Api) ?*Scratch {
+pub fn scratch_of(api: *eth.Api) ?*Scratch {
     const base = @intFromPtr(api.scratch.ptr);
     const offset = std.mem.alignForward(usize, base, @alignOf(Scratch)) - base;
     if (api.scratch.len < offset + @sizeOf(Scratch)) return null;

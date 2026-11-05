@@ -11,6 +11,7 @@ const rpc = @import("../../utilities/rpc/root.zig");
 const trie_proof = @import("../trie/proof.zig");
 const fixture = @import("../node/test_fixture.zig");
 const filters_module = @import("filters.zig");
+const history_module = @import("../db/history.zig");
 const eth = @import("eth.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -163,6 +164,53 @@ test "eth: getProof account and storage proofs verify against the state root" {
     try expect_contains(try h.request("eth_getProof", not_strings), "error");
     const historical = "[" ++ address_one ++ ",[],\"0x9\"]";
     try expect_contains(try h.request("eth_getProof", historical), "error");
+}
+
+test "eth: state reads and getProof at an older block from the history window" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var one: [20]u8 = @splat(0);
+    one[19] = 1;
+    try h.node.db.put_account(one, 5, 0, &.{});
+    try h.node.db.put_storage(one, 7, 0x2a);
+    var store = try history_module.Store.init(testing.allocator, .{
+        .window_blocks = 8,
+        .paths_max = 1 << 12,
+        .small_versions_max = 1 << 12,
+        .large_versions_max = 1 << 10,
+        .prune_per_commit = 256,
+    });
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const first = try h.mine(12);
+    try h.node.db.put_account(one, 6, 0, &.{});
+    try h.node.db.put_storage(one, 7, 0x2b);
+    _ = try h.mine(24);
+    const at_one = "[" ++ address_one ++ ",\"0x1\"]";
+    try testing.expectEqualStrings("\"result\":\"0x5\"", try h.request("eth_getBalance", at_one));
+    const latest = "[" ++ address_one ++ ",\"latest\"]";
+    try testing.expectEqualStrings("\"result\":\"0x6\"", try h.request("eth_getBalance", latest));
+    const slot_at_one = "[" ++ address_one ++ ",\"0x7\",\"0x1\"]";
+    try expect_contains(try h.request("eth_getStorageAt", slot_at_one), "2a\"");
+    const nonce_at_one = "[" ++ address_one ++ ",\"0x1\"]";
+    const nonce = try h.request("eth_getTransactionCount", nonce_at_one);
+    try testing.expectEqualStrings("\"result\":\"0x0\"", nonce);
+    const proof_params = "[" ++ address_one ++ ",[\"0x7\"],\"0x1\"]";
+    const text = try h.request("eth_getProof", proof_params);
+    try expect_contains(text, "\"balance\":\"0x5\"");
+    try expect_contains(text, "\"value\":\"0x2a\"");
+    var storage: [16][700]u8 = undefined;
+    var slices: [16][]u8 = undefined;
+    for (&slices, &storage) |*slice, *bytes| slice.* = bytes;
+    var nodes: [16][]const u8 = undefined;
+    const count = try proof_nodes(text, "\"accountProof\"", &slices, &nodes);
+    const root = h.node.chain.header(first.bytes).?.state_root.bytes;
+    const address_hash = primitives.keccak256(&one).bytes;
+    try testing.expect(try trie_proof.verify(root, &address_hash, nodes[0..count]) != null);
+    // Genesis predates the window's first state (the puts changed it): refused.
+    const at_genesis = "[" ++ address_one ++ ",\"0x0\"]";
+    try expect_contains(try h.request("eth_getBalance", at_genesis), "historical state");
 }
 
 /// Decodes a `"result":"0x..."` response into `out`.

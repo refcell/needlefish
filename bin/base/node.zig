@@ -4,6 +4,8 @@
 //! the node follows the chain in `--chain` and serves eth JSON-RPC (and the Engine API on
 //! `--authrpc.port`). With `--datadir` the state and chain persist in `DIR/node.db` (a
 //! journal plus checkpoints) and a restart resumes from it; without it state is in memory.
+//! `--proofs-history` keeps the last `--proofs-history.window` blocks (default 256) of
+//! trie nodes in memory, so state reads and eth_getProof work at older blocks.
 
 const std = @import("std");
 const base = @import("base");
@@ -18,6 +20,7 @@ const usage =
     \\usage: base node --chain GENESIS.json [--datadir DIR] [--http.addr IP] [--http.port P]
     \\         [--dev-l1 [--block-time S] [--beacon.port P]]
     \\         [--authrpc.port P --authrpc.jwtsecret FILE] [--log.level LEVEL]
+    \\         [--proofs-history [--proofs-history.window BLOCKS]]
     \\
 ;
 
@@ -32,6 +35,8 @@ pub const Flags = struct {
     authrpc_port: ?u16 = null,
     jwt_secret_path: ?[]const u8 = null,
     log_level: log.Level = .info,
+    proofs_history: bool = false,
+    proofs_history_window: u32 = 256,
 };
 
 pub fn parse_flags(args: []const []const u8) !Flags {
@@ -43,6 +48,11 @@ pub fn parse_flags(args: []const []const u8) !Flags {
         if (eql(u8, arg, "--dev-l1")) {
             flags.dev_l1 = true;
             i += 1; // A switch takes no value.
+            continue;
+        }
+        if (eql(u8, arg, "--proofs-history")) {
+            flags.proofs_history = true;
+            i += 1;
             continue;
         }
         if (i + 1 == args.len) return error.MissingValue;
@@ -64,6 +74,9 @@ pub fn parse_flags(args: []const []const u8) !Flags {
             flags.authrpc_port = try std.fmt.parseInt(u16, value, 10);
         } else if (eql(u8, arg, "--authrpc.jwtsecret")) {
             flags.jwt_secret_path = value;
+        } else if (eql(u8, arg, "--proofs-history.window")) {
+            flags.proofs_history_window = try std.fmt.parseInt(u32, value, 10);
+            if (flags.proofs_history_window == 0) return error.InvalidProofsHistoryWindow;
         } else if (eql(u8, arg, "--log.level")) {
             flags.log_level = std.meta.stringToEnum(log.Level, value) orelse
                 return error.UnknownLogLevel;
@@ -147,6 +160,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .authrpc_address = authrpc_address(flags),
         .jwt_secret = secret,
         .data_path = data_path,
+        .proofs_history_window = if (flags.proofs_history) flags.proofs_history_window else 0,
         .limits = limits(),
     });
     defer service.deinit();
@@ -173,5 +187,19 @@ test "node: flags" {
     try std.testing.expectError(
         error.AuthrpcNeedsPortAndSecret,
         parse_flags(&.{ "--chain", "g.json", "--authrpc.port", "9551" }),
+    );
+}
+
+test "node: proofs history flags" {
+    const off = try parse_flags(&.{ "--chain", "g.json" });
+    try std.testing.expect(!off.proofs_history);
+    const on = try parse_flags(&.{
+        "--proofs-history", "--chain", "g.json", "--proofs-history.window", "64",
+    });
+    try std.testing.expect(on.proofs_history);
+    try std.testing.expectEqual(@as(u32, 64), on.proofs_history_window);
+    try std.testing.expectError(
+        error.InvalidProofsHistoryWindow,
+        parse_flags(&.{ "--chain", "g.json", "--proofs-history.window", "0" }),
     );
 }

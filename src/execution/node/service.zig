@@ -97,6 +97,9 @@ pub const Options = struct {
     data_path: ?[]const u8 = null,
     /// Distinguishes formats of the same file (low 64 bits of the format id).
     format_nonce: u64 = 0,
+    /// `--proofs-history.window`: blocks of historical state served from memory (state
+    /// reads and eth_getProof at older blocks); 0 disables the window.
+    proofs_history_window: u32 = 0,
     limits: Limits = .{},
 };
 
@@ -133,6 +136,9 @@ pub const Limits = struct {
         .staging_bytes = 8 << 20,
     },
     beacon: beacon_module.Config = .{ .slots_max = 256, .bytes_max = 32 << 20 },
+    /// Trie node versions one block writes to the historical window, at most; sizes the
+    /// window (see `db.history.Store` "Sizing") together with the state trie bounds.
+    history_versions_per_block: u32 = 1 << 10,
     /// `debug_executionWitness` buffers (null disables it); see `witness_config` for the
     /// derived fields. Every large buffer is reserved at init and committed on first touch
     /// (`lazy_alloc`); only the hash-map indexes are written at init (their metadata in
@@ -253,6 +259,27 @@ pub const Limits = struct {
     }
 };
 
+/// Sizes the historical window so `commit_block` never runs out (`db.history.Store`
+/// "Sizing"): every live trie node once, plus `window` blocks of the per-block bound.
+/// Dense branches (large versions) are at most a quarter of either.
+pub fn history_config(limits: *const Limits, window: u32) db_module.history.Config {
+    assert(window > 0);
+    const trie = limits.state.trie;
+    const nodes: u64 = @as(u64, trie.account_nodes_max) + trie.storage_nodes_max;
+    const per_block: u64 = limits.history_versions_per_block;
+    const total = nodes + @as(u64, window) * per_block;
+    assert(total <= std.math.maxInt(u32));
+    const config: db_module.history.Config = .{
+        .window_blocks = window,
+        .paths_max = @intCast(total),
+        .small_versions_max = @intCast(total),
+        .large_versions_max = @intCast(total / 4),
+        .prune_per_commit = limits.history_versions_per_block,
+    };
+    assert(config.paths_max >= nodes);
+    return config;
+}
+
 pub fn Service(comptime IO: type) type {
     return struct {
         const Self = @This();
@@ -277,6 +304,7 @@ pub fn Service(comptime IO: type) type {
         engine_api: ?engine_rpc.EngineApi = null,
         kzg: ?*KzgMemory = null,
         filters: ?*filters_module.Filters = null,
+        history: ?*db_module.history.Store = null,
         auth_server: ?AuthServer = null,
         beacon: ?beacon_module.Beacon = null,
         beacon_server: ?BeaconServer = null,
@@ -367,6 +395,9 @@ pub fn Service(comptime IO: type) type {
             const limits = &service.options.limits;
             var config = limits.durable;
             config.state = StateDb.state_config(limits.state);
+            // A durable node's history window lives in the database (fed by its head moves).
+            const window = service.options.proofs_history_window;
+            if (window > 0) config.history = history_config(limits, window);
             config.changeset = .{
                 .accounts_max = limits.state.block_accounts_max,
                 .storage_max = limits.state.block_slots_max,
@@ -482,6 +513,8 @@ pub fn Service(comptime IO: type) type {
             errdefer if (service.kzg) |memory| lazy.destroy(allocator, memory);
             try service.init_witness();
             errdefer service.deinit_witness();
+            try service.init_history();
+            errdefer service.deinit_history();
             try service.http_server.init(allocator, service.io, service, limits.http);
             errdefer service.http_server.deinit();
             try service.init_authrpc();
@@ -524,6 +557,31 @@ pub fn Service(comptime IO: type) type {
             assert(generator.state == service.chain.db.state);
         }
 
+        /// The in-memory historical proofs window, started at the current state (durable
+        /// nodes keep theirs in the database instead, see `init_durable`).
+        fn init_history(service: *Self) !void {
+            const window = service.options.proofs_history_window;
+            if (window == 0) return;
+            if (service.options.data_path != null) return; // The database keeps it.
+            const allocator = service.allocator;
+            const store = try allocator.create(db_module.history.Store);
+            errdefer allocator.destroy(store);
+            store.* = try .init(allocator, history_config(&service.options.limits, window));
+            errdefer store.deinit(allocator);
+            try service.db.trie().track_changes(allocator);
+            service.history = store;
+            try service.chain.attach_history(store);
+            assert(service.chain.history == store);
+        }
+
+        fn deinit_history(service: *Self) void {
+            const store = service.history orelse return;
+            service.chain.history = null;
+            store.deinit(service.allocator);
+            service.allocator.destroy(store);
+            service.history = null;
+        }
+
         fn deinit_witness(service: *Self) void {
             const generator = service.api.witness orelse return;
             generator.deinit(service.allocator);
@@ -542,6 +600,7 @@ pub fn Service(comptime IO: type) type {
             service.deinit_authrpc();
             service.http_server.deinit();
             service.deinit_witness();
+            service.deinit_history();
             lazy.free(service.allocator, service.api.scratch);
             if (service.filters) |filters| service.allocator.destroy(filters);
             if (service.kzg) |memory| lazy.destroy(service.allocator, memory);

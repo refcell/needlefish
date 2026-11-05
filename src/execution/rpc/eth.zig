@@ -42,6 +42,7 @@ pub const Api = struct {
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods;
 const filters_module = @import("filters.zig");
+const state_view = @import("state_view.zig");
 
 const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
@@ -238,8 +239,8 @@ pub fn require_head_state(api: *Api, call: *Call, raw: ?[]const u8) HandlerError
 
 fn get_balance(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
-    try require_head_state(api, call, try call.params.optional_raw());
-    const account = api.chain.db.get_account(address);
+    const view = try state_view.resolve(api, call, try call.params.optional_raw());
+    const account = try state_view.account(api, call, view, address);
     try call.writer.quantity(if (account) |a| a.balance else 0);
 }
 
@@ -247,8 +248,8 @@ fn get_transaction_count(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
     const tag = try call.params.optional_raw();
     const pending = if (tag) |t| std.mem.eql(u8, t, "\"pending\"") else false;
-    try require_head_state(api, call, if (pending) null else tag);
-    const account = api.chain.db.get_account(address);
+    const view = try state_view.resolve(api, call, if (pending) null else tag);
+    const account = try state_view.account(api, call, view, address);
     var nonce = if (account) |a| a.nonce else 0;
     if (pending) if (api.pool) |pool| {
         nonce = pool.next_nonce(.{ .bytes = address }, nonce);
@@ -258,17 +259,18 @@ fn get_transaction_count(api: *Api, call: *Call) HandlerError!void {
 
 fn get_code(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
-    try require_head_state(api, call, try call.params.optional_raw());
-    const account = api.chain.db.get_account(address) orelse return call.writer.data(&.{});
-    try call.writer.data(api.chain.db.code(account.code_hash) orelse &.{});
+    const view = try state_view.resolve(api, call, try call.params.optional_raw());
+    const account = try state_view.account(api, call, view, address) orelse
+        return call.writer.data(&.{});
+    try call.writer.data(state_view.code(api, account.code_hash));
 }
 
 fn get_storage_at(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
     const slot = try call.params.quantity(u256);
-    try require_head_state(api, call, try call.params.optional_raw());
+    const view = try state_view.resolve(api, call, try call.params.optional_raw());
     var value: [32]u8 = undefined;
-    std.mem.writeInt(u256, &value, api.chain.db.get_storage(address, slot), .big);
+    std.mem.writeInt(u256, &value, try state_view.storage(api, call, view, address, slot), .big);
     try call.writer.data(&value);
 }
 

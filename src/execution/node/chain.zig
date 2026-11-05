@@ -24,6 +24,7 @@ const StateDb = @import("state_db.zig").StateDb;
 const witness_block = @import("../db/witness_block.zig");
 const db_database = @import("../db/database.zig");
 const db_history = @import("../db/history.zig");
+const history_module = db_history;
 const StateTrie = @import("../trie/state_trie.zig").StateTrie;
 
 const Hash = [32]u8;
@@ -171,6 +172,10 @@ pub const Chain = struct {
     store: block_store.BlockStore,
     pool: ?*txpool.Pool = null,
     journal: ?Journal = null,
+    /// Historical proofs window following the executed state (`attach_history`).
+    history: ?*history_module.Store = null,
+    /// Times the window was rebuilt from scratch (reorgs, moves, full store).
+    history_resets: u64 = 0,
     da_limits: DaLimits = .{},
     staging: []u8,
     select_buffer: []*const txpool.Tx,
@@ -468,6 +473,7 @@ pub const Chain = struct {
         for (transactions, 0..) |raw, index| chain.index_transaction(raw, hash, @intCast(index));
         chain.state_hash = hash;
         chain.db.set_block_hash(child.number, hash);
+        chain.sync_history();
     }
 
     fn journal_block(
@@ -534,6 +540,86 @@ pub const Chain = struct {
     }
 
     /// Makes the head's post-state current (after a build left a newer block's state).
+    /// Starts a historical proofs window at the current state. The state trie must track
+    /// changes (`StateTrie.track_changes`) from here on.
+    pub fn attach_history(chain: *Chain, store: *history_module.Store) Error!void {
+        chain.history = store;
+        const number = chain.store.ref(chain.state_hash).?.number;
+        store.reset(chain.db.trie(), number) catch return error.StateUnavailable;
+        assert(store.window().?.head == number);
+    }
+
+    /// True when older blocks can be served: from the journal's history (durable node)
+    /// or from the in-memory window (`attach_history`).
+    pub fn serves_history(chain: *const Chain) bool {
+        if (chain.journal) |journal| return journal.proof != null;
+        return chain.history != null;
+    }
+
+    /// `eth_getProof` at the canonical block `hash` (number `number`) from whichever
+    /// history the chain keeps; `HistoryUnavailable` for a side block or no history.
+    pub fn proof_at(
+        chain: *Chain,
+        hash: Hash,
+        number: u64,
+        address: [20]u8,
+        slots: []const u256,
+        account_proof: *StateTrie.AccountProof,
+        storage_proofs: []StateTrie.StorageProof,
+        values: []u256,
+    ) db_database.ProofError!?db_history.AccountState {
+        assert(slots.len == storage_proofs.len and slots.len == values.len);
+        if (chain.journal) |journal| {
+            const proof = journal.proof orelse return error.HistoryUnavailable;
+            const context = journal.context;
+            const proofs = storage_proofs;
+            return proof(context, hash, number, address, slots, account_proof, proofs, values);
+        }
+        const store = chain.history orelse return error.HistoryUnavailable;
+        const canonical = chain.store.canonical_hash(number) orelse
+            return error.HistoryUnavailable;
+        if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+        const header_at = chain.header(hash) orelse return error.HistoryUnavailable;
+        if (!chain.history_has(number, header_at.state_root.bytes)) {
+            return error.HistoryUnavailable; // The window holds another branch there.
+        }
+        return store.get_proof(number, address, slots, account_proof, storage_proofs, values);
+    }
+
+    /// The block number `number` is served from the window when the window holds that
+    /// number with the state root of the canonical block there.
+    pub fn history_has(chain: *const Chain, number: u64, state_root: Hash) bool {
+        const store = chain.history orelse return false;
+        const root = store.state_root_at(number) catch return false;
+        return std.mem.eql(u8, &root, &state_root);
+    }
+
+    /// Keeps the window in step with the executed state: the next block is committed, a
+    /// move back to a block in the window unwinds, and anything else (a move across
+    /// branches, a full store) restarts the window at the current state.
+    fn sync_history(chain: *Chain) void {
+        const store = chain.history orelse return;
+        const header_now = chain.header(chain.state_hash).?;
+        const number = header_now.number;
+        const root = header_now.state_root.bytes;
+        if (store.window()) |window| {
+            if (number == window.head + 1 and chain.history_extends(header_now)) {
+                if (store.commit_block(chain.db.trie(), number)) |_| return else |_| {}
+            } else if (number <= window.head and chain.history_has(number, root)) {
+                if (store.unwind_to(number)) |_| return else |_| {}
+            }
+        }
+        chain.history_resets += 1;
+        store.reset(chain.db.trie(), number) catch {
+            chain.history = null; // Out of capacity even for one state: stop serving.
+        };
+    }
+
+    fn history_extends(chain: *const Chain, child: Header) bool {
+        const parent = chain.header(child.parent_hash.bytes) orelse return false;
+        return chain.history_has(parent.number, parent.state_root.bytes);
+    }
+
     pub fn ensure_head_state(chain: *Chain) Error!void {
         try chain.move_state(chain.head_hash());
     }
@@ -550,6 +636,7 @@ pub const Chain = struct {
             journal.move_head(journal.context, target) catch return error.StateUnavailable;
             chain.db.clear_undo();
             chain.state_hash = target;
+            chain.sync_history();
             return;
         }
         var path: [reexecute_max]Hash = undefined;
@@ -571,6 +658,7 @@ pub const Chain = struct {
         if (rollbacks > chain.db.undo_depth()) return error.StateUnavailable;
         for (0..rollbacks) |_| try chain.db.rollback();
         chain.state_hash = a.hash;
+        if (rollbacks > 0) chain.sync_history();
         while (path_len > 0) {
             path_len -= 1;
             try chain.reexecute(path[path_len]);
@@ -598,6 +686,7 @@ pub const Chain = struct {
         assert(std.mem.eql(u8, &executed.state_root, &stored.header.state_root.bytes));
         chain.state_hash = hash;
         chain.db.set_block_hash(stored.header.number, hash);
+        chain.sync_history();
     }
 
     /// Points the canonical index at `head`'s ancestry and refreshes the txpool for the

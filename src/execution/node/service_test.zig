@@ -173,18 +173,24 @@ const Harness = struct {
     durable: bool,
     /// Restarts so far; shifts the ports because a dead process's listeners linger.
     restarts: u16 = 0,
+    history_window: u32 = 0,
 
     fn create() !*Harness {
         return create_with(false);
     }
 
     fn create_with(durable: bool) !*Harness {
+        return create_full(durable, 0);
+    }
+
+    fn create_full(durable: bool, history_window: u32) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
         harness.world = try io.SimWorld.init(testing.allocator, .{ .seed = 11 });
         errdefer harness.world.deinit();
         harness.durable = durable;
         harness.restarts = 0;
+        harness.history_window = history_window;
         try harness.init_io();
         errdefer harness.node_io.deinit();
         var text: [64 * 1024]u8 = undefined;
@@ -217,6 +223,7 @@ const Harness = struct {
             .verify_blob_proofs = false, // Fake proofs; KZG is covered in release tests.
             .limits = if (harness.durable) durable_limits else test_limits,
             .data_path = if (harness.durable) durable_file else null,
+            .proofs_history_window = harness.history_window,
         });
     }
 
@@ -293,6 +300,42 @@ fn blob_transaction(
         .proofs = consensus.sidecar.ProofList.build(&proof_buffer, &.{proof}),
     } };
     return pooled.encode_to(buffer);
+}
+
+test "service: in-memory proofs history window follows mined blocks" {
+    const harness = try Harness.create_full(false, 2);
+    defer harness.destroy();
+    const service = &harness.service;
+    _ = try service.start();
+    harness.world.run_for_ns(7 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 3), service.blocks_mined);
+    try testing.expect(service.chain.serves_history());
+    const window = service.history.?.window().?;
+    try testing.expectEqual(@as(u64, 3), window.head);
+    try testing.expectEqual(@as(u64, 2), window.oldest);
+    for ([_]u64{ 2, 3 }) |number| {
+        const header = service.chain.header(service.chain.store.canonical_hash(number).?).?;
+        try testing.expect(service.chain.history_has(number, header.state_root.bytes));
+    }
+    try testing.expectEqual(@as(u64, 0), service.chain.history_resets);
+}
+
+test "service: durable proofs history lives in the database and survives restart" {
+    const harness = try Harness.create_full(true, 2);
+    defer harness.destroy();
+    const service = &harness.service;
+    _ = try service.start();
+    harness.world.run_for_ns(7 * std.time.ns_per_s);
+    try testing.expect(service.history == null);
+    try testing.expect(service.chain.serves_history());
+    const window = service.durable.?.database.history.?.window().?;
+    try testing.expectEqual(@as(u64, 3), window.head);
+    harness.world.run_for_ns(std.time.ns_per_s / 2); // Let the storage tick sync.
+    try harness.restart();
+    try testing.expect(service.chain.serves_history());
+    const head = service.chain.header(service.chain.head_hash()).?;
+    const restored = service.durable.?.database.history.?.window().?;
+    try testing.expectEqual(head.number, restored.head);
 }
 
 test "service: dev L1 keeps blob sidecars of mined blob transactions" {

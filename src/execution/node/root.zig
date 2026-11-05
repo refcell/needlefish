@@ -26,6 +26,7 @@ test {
     _ = @import("service_test.zig");
     _ = @import("durable_test.zig");
     _ = @import("witness_memory_test.zig");
+    _ = @import("history_test.zig");
 }
 
 test {
