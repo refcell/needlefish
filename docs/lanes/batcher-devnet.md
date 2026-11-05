@@ -4,6 +4,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 `just devnet` recipes. Goal: **`just devnet up` brings up a working all-Zig devnet.**
 
 ## Backlog
+- [ ] (from crypto lane) Osaka blob txs carry EIP-7594 cell proofs (sidecar version 1):
+  use `common.crypto.kzg.cells.compute_cells_and_kzg_proofs` with `Settings.init` and
+  `settings.attach_prover_tables(&tables)` (one static ~25 MiB `fk20.Tables`): 93 ms per blob
+  instead of 202 ms; proofs are identical with or without tables.
 - [x] (from crypto lane, done: `blobs/kzg.zig` now wraps it) `common.crypto.kzg.blob` now provides `blob_to_kzg_commitment`,
   `compute_blob_kzg_proof`, `verify_blob_kzg_proof[_batch]` (c-kzg vector tested); consider
   replacing `src/batcher/blobs/kzg.zig` with it. EIP-7594 cell proofs are on main too:
