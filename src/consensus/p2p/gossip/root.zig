@@ -13,6 +13,7 @@ pub const router = @import("router.zig");
 test {
     _ = @import("router_test.zig");
 }
+pub const ssz_payload = @import("ssz_payload.zig");
 
 test {
     std.testing.refAllDecls(@This());
