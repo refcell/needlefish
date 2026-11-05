@@ -15,6 +15,7 @@ const std = @import("std");
 /// Every binary lives at `bin/<name>/main.zig`. Add new ones here.
 const binaries = [_][]const u8{
     "base",
+    "witness-diff",
 };
 
 pub fn build(b: *std.Build) void {
