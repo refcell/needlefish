@@ -90,6 +90,14 @@ fn add_vector_tools(
         .description = "Run state tests: zig build statetest -- <file-or-dir>",
     });
 
+    // ethereum/tests TransactionTests through the strict tx decoder.
+    _ = add_tool(b, base, target, optimize, .{
+        .name = "txtest",
+        .path = "src/common/consensus/tx_test_main.zig",
+        .step = "txtest",
+        .description = "Run transaction tests: zig build txtest -- <file-or-dir>",
+    });
+
     // base/base genesis parity (files from `just vectors`).
     _ = add_tool(b, base, target, optimize, .{
         .name = "genesischeck",

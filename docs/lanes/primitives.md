@@ -41,6 +41,10 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] Genesis parity: `zig build genesischeck -- .cache/vectors/base-genesis/*.json` (files from
   `just vectors`) recomputes state root + header hash of base/base's mainnet, sepolia and
   zeronet genesis and matches `chains.*.genesis_l2_hash` (all three pass, 2026-11-05).
+- [x] `zig build txtest -- .cache/vectors/ethereum-tests/TransactionTests`: strict decoder +
+  static checks (EIP-2 low s, chain 1, EIP-2681 nonce) vs ethereum/tests. Prague: 47 valid ok,
+  150 invalid rejected, 0 failures, 3 u128-fee divergences, 12 execution-level skips.
+  Seven curated vectors are committed for `zig build test`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -106,6 +110,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   `observability-events`, `evm*`, `precompile*`) are trait glue, engine API (node lane) or
   execution, so they are not ported here.
 
+- Fee fields are u128 like alloy (base/base), so three ethereum/tests vectors with 31-byte
+  gas prices that geth accepts are rejected; `txtest` reports them as `wider_than_u128`.
+
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
 - 2026-11-05: rlp encoder/decoder/codec; all ethereum/tests valid+invalid RLP vectors pass.
@@ -133,3 +140,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: RPC transaction JSON parsing with hash check.
 - 2026-11-05: EIP-7594 v1 sidecar cell-proof verification (`CellVerifier`).
 - 2026-11-05: `genesischeck` tool; base/base mainnet/sepolia/zeronet genesis hashes match.
+- 2026-11-05: `txtest` TransactionTests runner, 0 failures.
