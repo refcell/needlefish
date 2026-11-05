@@ -61,8 +61,18 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   arena) shared with the host source; typed execution calls (block number, raw headers by
   number/tag/hash, `eth_call`, balance) and rollup calls (`optimism_syncStatus`,
   `optimism_outputAtBlock`); canned-server SimIo test.
-- [ ] `proof/proposer`: output-root proposal pipeline (targets, intervals, collector,
-  submitter via the batcher's txmgr), `bin/base proposer`, DST test with L1 reorgs.
+- [x] `proof/proposer`: pure logic + pipeline state machine (intervals, targets, recovery
+  walk, dispatcher, collector/submitter) over injected chain/prover/submitter interfaces,
+  in-memory fakes, DST with prover faults and L1 reorgs (`src/proof/proposer/`).
+- [ ] `proof/proposer-adapters`: `Chain` over `src/proof/rpc` (rollup `syncStatus` /
+  `outputAtBlock`, `eth_call` of `AnchorStateRegistry.getAnchorRoot`+`anchorGame` at one
+  block, factory `gameCount`/`games`/`gameImpls`, verifier `version` +
+  `intervalsForStartingBlock` with the legacy getters below 0.3.0); a `Prover` client for
+  the prover service once it exists.
+- [ ] `proof/proposer-txmgr`: `Submitter` over the batcher lane's txmgr (init bond from
+  `initBonds`, revert selector mapping incl. `GameAlreadyExists`, receipt polling).
+- [ ] `bin/base proposer`: flags/config validation (base/base `config.rs`/`cli.rs`), dry-run
+  submitter, the pipeline driven by `utilities.io` time, health/metrics later.
 - [ ] `proof/challenger`: scanner of dispute games, validator that recomputes output
   roots, bond claiming, `bin/base challenger` (port `challenge/src/*`), DST test.
 - [x] `proof/witness`: recording fetcher (base/base `host/src/recording.rs`): the witness
@@ -155,12 +165,35 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - Host has no separate-process fd mode: base/base `crates/proof/host` runs its
   `PreimageServer` in-process over channels only (`start_server(hint, preimage)`); so does
   `host.native.run`. A pipe transport can be added if a FPVM target needs it.
+- Proposer (port of base/base `crates/proof/proposer`): one tick-driven state machine
+  (`Pipeline.tick(now_ns)`, once per poll interval) instead of two async loops; the
+  dispatcher and collector share one recovery cache and a restart clears it, both cursors
+  and the dispatch ring. Dispatch runs at most `proofs_in_flight_max` targets ahead
+  (fixed ring, base/base is unbounded); a recovered state on the dispatched path keeps the
+  ring, any other resets it. Recovery walks at most `walk_steps_max` games per tick.
+- Proposer submission is asynchronous (one creation in flight, polled per tick; the game
+  is then looked up by key up to 3 times, as base/base's `lookup_recent_game`). A game that
+  already exists for the key is adopted as the parent: base/base also attaches its TEE
+  proof to it (`verify_proposal_proof`), which is left out with the TEE/ZK proof formats,
+  the prover-service retry-exhausted reset, the admin start/stop API, metrics and the
+  L1-head check of an existing game. Failure mapping follows `submission_error_action`:
+  invalid signer / parent / L1 origin discard and re-prove, other failures restart with the
+  proof kept, a submit timeout restarts (recovery finds a late landing).
+- Proposer recovery skips rereading the factory while the finalized head is below the
+  cached next target (base/base `try_recover_and_plan`), so an L1 reorg of the newest games
+  is noticed only once the finalized head passes the next target (or a submission fails);
+  the DST keeps the finalized head growing after its last reorg for that reason.
+- Proposer proof L1 head is the rollup node's `finalized_l1` (added to the rpc
+  `SyncStatus`); the base/base check that it is not below the finalized L2 block's L1
+  origin waits for the adapter (the `SyncStatus` type has no L1 origin).
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
   worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/proposer` first slice: intervals, recovery walk, dispatcher/collector
+  pipeline over injected interfaces, fakes, ported recovery tests, DST with L1 reorgs.
 - 2026-11-05: `proof/e2e-fuzz`: e2e block count is per scenario; 12 random seeds pass.
 - 2026-11-05: `proof/witness`: recorded witness replays alone (e2e + live devnet).
 - 2026-11-05: `proof/e2e-3` landed: intermediate output roots sampled at boot key 9 (e2e:
