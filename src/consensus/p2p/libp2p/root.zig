@@ -9,6 +9,9 @@ pub const protobuf = @import("protobuf.zig");
 pub const identity = @import("identity.zig");
 pub const noise = @import("noise.zig");
 pub const yamux = @import("yamux.zig");
+pub const identify = @import("identify.zig");
+pub const ping = @import("ping.zig");
+pub const connections = @import("connections.zig");
 
 test {
     std.testing.refAllDecls(@This());
