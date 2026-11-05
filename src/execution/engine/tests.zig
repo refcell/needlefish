@@ -58,8 +58,12 @@ const Mock = struct {
         return .valid;
     }
 
-    pub fn set_forkchoice(mock: *Mock, state: types.ForkchoiceState) types.EngineError!void {
+    pub fn set_forkchoice(
+        mock: *Mock,
+        state: types.ForkchoiceState,
+    ) types.EngineError!engine_module.ForkchoiceApplied {
         mock.forkchoice = state;
+        return .applied;
     }
 
     pub fn start_build(

@@ -6,7 +6,7 @@
 //!   fn block(*Backend, B256) ?BlockRef
 //!   fn is_ancestor(*Backend, ancestor: B256, descendant: B256) bool
 //!   fn insert(*Backend, *const ExecutionPayload, *const NewPayloadParams) InsertResult
-//!   fn set_forkchoice(*Backend, ForkchoiceState) EngineError!void
+//!   fn set_forkchoice(*Backend, ForkchoiceState) EngineError!ForkchoiceApplied
 //!   fn start_build(*Backend, PayloadId, parent: BlockRef, *const PayloadAttributes)
 //!       EngineError!void
 //!   fn built(*Backend, PayloadId) ?Backend.Built     // Built has `timestamp: u64`
@@ -40,7 +40,14 @@ pub const BlockRef = struct {
 pub const InsertResult = union(enum) {
     valid,
     invalid: []const u8,
+    /// The parent state is not available (e.g. too deep a reorg); the block is not
+    /// judged and stays unknown.
+    syncing,
 };
+
+/// `syncing`: the backend cannot reach the head's state yet; the forkchoice is not
+/// applied and no payload is built.
+pub const ForkchoiceApplied = enum { applied, syncing };
 
 pub const invalid_cache_size = 256;
 
@@ -95,6 +102,7 @@ pub fn Engine(comptime Backend: type) type {
                     engine.remember_invalid(p.block_hash, parent.hash);
                     return PayloadStatus.invalid(parent.hash, r);
                 },
+                .syncing => return PayloadStatus.syncing,
             }
         }
 
@@ -114,7 +122,10 @@ pub fn Engine(comptime Backend: type) type {
             };
             try engine.check_ancestor(state.finalized_block_hash, head.hash);
             try engine.check_ancestor(state.safe_block_hash, head.hash);
-            try engine.backend.set_forkchoice(state);
+            switch (try engine.backend.set_forkchoice(state)) {
+                .applied => {},
+                .syncing => return .{ .payload_status = PayloadStatus.syncing },
+            }
             engine.forkchoice = state;
             const valid = PayloadStatus.valid(head.hash);
             const attrs = attributes orelse return .{ .payload_status = valid };

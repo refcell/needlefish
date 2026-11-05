@@ -44,6 +44,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: executor split into begin/apply/finish (builder can skip bad txs); bounded block store ring; engine InsertResult/forkchoice gain `syncing` for unreachable state.
 - 2026-11-05: state db undo journal (bounded ring, per-block rollback) for root mismatches and reorgs. Decision: a storage wipe of pre-existing storage (impossible post-Cancun/EIP-7610) drops undo history instead of logging every slot.
 - 2026-11-05: L1 block executor (system calls, withdrawals, Prague requests, receipts, bloom, state root); OP deposits pending evm OP support.
 - 2026-11-05: node state db (evm backend, block commit to state trie).

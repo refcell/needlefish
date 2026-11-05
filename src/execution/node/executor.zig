@@ -76,8 +76,8 @@ pub const Executed = struct {
     state_root: Hash,
     /// Prague+: EIP-7685 requests (`type || data`, empty data omitted).
     requests: []const []const u8,
-    /// Index of the failing transaction when `execute_block` returns InvalidTransaction.
-    invalid_index: ?u32 = null,
+    /// Priority fees paid to the beneficiary.
+    fees: u256 = 0,
 };
 
 pub const Executor = struct {
@@ -139,44 +139,93 @@ pub const Executor = struct {
         transactions: []const []const u8,
         withdrawals: ?[]const payload.Withdrawal,
     ) Error!Executed {
-        executor.arena.reset();
         executor.invalid_index = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
-        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
-        errdefer executor.discard();
-        executor.set_block_env(block);
-        try executor.pre_block_calls(fork, block);
-        const receipts = try executor.alloc(Receipt, transactions.len);
-        var gas_used: u64 = 0;
-        var blob_gas_used: u64 = 0;
-        var bloom = primitives.Bloom.zero;
+        var building = try executor.begin_block(block);
+        errdefer executor.abort_block();
         for (transactions, 0..) |raw, index| {
             executor.invalid_index = @intCast(index);
-            const result =
-                try executor.apply_transaction(fork, block, raw, gas_used, blob_gas_used);
-            gas_used += result.gas_used;
-            blob_gas_used += result.blob_gas_used;
-            receipts[index] = result.receipt;
-            receipts[index].cumulative_gas_used = gas_used;
-            bloom_or(&bloom, &result.receipt.logs_bloom);
+            try executor.apply(&building, raw);
         }
         executor.invalid_index = null;
-        if (withdrawals) |list| try executor.apply_withdrawals(fork, list);
-        const requests = try executor.post_block_requests(fork);
+        return executor.finish_block(&building, withdrawals);
+    }
+
+    /// An open block: transactions applied so far (uncommitted).
+    pub const Building = struct {
+        block: *const BlockEnv,
+        fork: evm.Fork,
+        receipts: []Receipt,
+        count: u32 = 0,
+        gas_used: u64 = 0,
+        blob_gas_used: u64 = 0,
+        logs_bloom: primitives.Bloom = .zero,
+        /// Sum of priority fees paid to the beneficiary (the payload's block value).
+        fees: u256 = 0,
+    };
+
+    /// Starts a block: resets the scratch arena and runs the pre-block system calls.
+    pub fn begin_block(executor: *Executor, block: *const BlockEnv) Error!Building {
+        executor.arena.reset();
+        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
+        errdefer executor.abort_block();
+        executor.set_block_env(block);
+        try executor.pre_block_calls(fork, block);
+        return .{
+            .block = block,
+            .fork = fork,
+            .receipts = try executor.alloc(Receipt, executor.transactions_max),
+        };
+    }
+
+    /// Applies one transaction. Errors leave the block's prior transactions intact, so a
+    /// builder can skip the transaction and continue; an importer aborts the block.
+    pub fn apply(executor: *Executor, building: *Building, raw: []const u8) Error!void {
+        if (building.count == executor.transactions_max) return error.TooManyTransactions;
+        const result = try executor.apply_transaction(
+            building.fork,
+            building.block,
+            raw,
+            building.gas_used,
+            building.blob_gas_used,
+        );
+        building.gas_used += result.gas_used;
+        building.blob_gas_used += result.blob_gas_used;
+        building.fees += result.fees;
+        var receipt = result.receipt;
+        receipt.cumulative_gas_used = building.gas_used;
+        bloom_or(&building.logs_bloom, &receipt.logs_bloom);
+        building.receipts[building.count] = receipt;
+        building.count += 1;
+    }
+
+    /// Withdrawals, requests, commit and roots. The commit can be reverted with
+    /// `StateDb.rollback` (for example when the roots do not match a header).
+    pub fn finish_block(
+        executor: *Executor,
+        building: *const Building,
+        withdrawals: ?[]const payload.Withdrawal,
+    ) Error!Executed {
+        errdefer executor.abort_block();
+        if (withdrawals) |list| try executor.apply_withdrawals(building.fork, list);
+        const requests = try executor.post_block_requests(building.fork);
+        const receipts = building.receipts[0..building.count];
+        const receipts_root_hash = try executor.receipts_root(receipts);
         try executor.db.commit(executor.state);
         return .{
             .receipts = receipts,
-            .gas_used = gas_used,
-            .blob_gas_used = blob_gas_used,
-            .logs_bloom = bloom,
-            .receipts_root = try executor.receipts_root(receipts),
+            .gas_used = building.gas_used,
+            .blob_gas_used = building.blob_gas_used,
+            .logs_bloom = building.logs_bloom,
+            .receipts_root = receipts_root_hash,
             .state_root = try executor.db.root(),
             .requests = requests,
+            .fees = building.fees,
         };
     }
 
     /// Drops every uncommitted change (failed block).
-    fn discard(executor: *Executor) void {
+    pub fn abort_block(executor: *Executor) void {
         executor.state.accounts.clearRetainingCapacity();
         executor.state.slots.clearRetainingCapacity();
         executor.state.code_store_len = 0;
@@ -203,7 +252,7 @@ pub const Executor = struct {
         return executor.arena.allocator().alloc(T, n) catch error.ScratchFull;
     }
 
-    const Applied = struct { receipt: Receipt, gas_used: u64, blob_gas_used: u64 };
+    const Applied = struct { receipt: Receipt, gas_used: u64, blob_gas_used: u64, fees: u256 };
 
     fn apply_transaction(
         executor: *Executor,
@@ -240,6 +289,7 @@ pub const Executor = struct {
             },
             .gas_used = executed.gas_used,
             .blob_gas_used = blob_gas,
+            .fees = @as(u256, executed.gas_used) * priority_fee(&tx, block.base_fee),
         };
     }
 
@@ -424,6 +474,13 @@ fn log_payload_length(log: *const evm.state.Log) usize {
 
 fn log_length(log: *const evm.state.Log) usize {
     return rlp.list_length(log_payload_length(log));
+}
+
+fn priority_fee(tx: *const TxEnv, base_fee: u64) u256 {
+    assert(tx.gas_price >= base_fee);
+    const headroom = tx.gas_price - base_fee;
+    const tip = tx.gas_priority_fee orelse return headroom;
+    return @min(tip, headroom);
 }
 
 fn finalize(state: *evm.State, fork: evm.Fork) void {
