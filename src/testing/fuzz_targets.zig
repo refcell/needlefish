@@ -9,6 +9,7 @@
 //!   - trie proofs: a proof tampered anywhere never verifies to a different value, and
 //!     arbitrary proof bytes never crash the verifier.
 //!   - bls12-381 points: decoding is canonical (accepted bytes == compress(point)).
+//!   - rlp comptime codec: accepted input re-encodes byte-identically.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -428,4 +429,65 @@ test "fuzz_targets: bls12-381 g1 point encoding is canonical" {
 
 test "fuzz_targets: bls12-381 g2 point encoding is canonical" {
     try fuzz.run({}, fuzz_bls_points(g2), .{ .iterations = 32 });
+}
+
+const codec = @import("../common/rlp/codec.zig");
+
+/// Every type kind the comptime codec maps: ints of several widths, bool, fixed arrays,
+/// borrowed byte strings, byte wrappers, and nested lists.
+const RlpShape = struct {
+    small: u8,
+    nonce: u64,
+    value: u256,
+    flag: bool,
+    tag: [4]u8,
+    data: []const u8,
+    inner: struct { word: struct { bytes: [20]u8 }, count: u16, note: []const u8 },
+};
+
+/// The codec is canonical: whatever it accepts re-encodes to the identical bytes, so a
+/// decoded value can be hashed or re-broadcast without changing its identity.
+fn check_rlp_canonical(input: []const u8) !void {
+    const value = codec.decode_exact(RlpShape, input) catch return;
+    var buffer: [512]u8 = undefined;
+    try std.testing.expect(codec.length(value) == input.len);
+    try std.testing.expectEqualSlices(u8, input, codec.encode_to(&buffer, value));
+}
+
+fn fuzz_rlp_codec(_: void, smith: *Smith) anyerror!void {
+    var bytes: [256]u8 = undefined;
+    var data: [64]u8 = undefined;
+    var note: [64]u8 = undefined;
+    const value: RlpShape = .{
+        .small = smith.value(u8),
+        .nonce = smith.value(u64),
+        .value = smith.value(u256),
+        .flag = smith.value(bool),
+        .tag = smith.value([4]u8),
+        .data = data[0..smith.slice(&data)],
+        .inner = .{
+            .word = .{ .bytes = smith.value([20]u8) },
+            .count = smith.value(u16),
+            .note = note[0..smith.slice(&note)],
+        },
+    };
+    const encoded = codec.encode_to(&bytes, value);
+    const decoded = try codec.decode_exact(RlpShape, encoded);
+    try std.testing.expectEqual(value.value, decoded.value);
+    try std.testing.expectEqualSlices(u8, value.data, decoded.data);
+    try std.testing.expectEqualSlices(u8, value.inner.note, decoded.inner.note);
+    try check_rlp_canonical(encoded);
+    // Mutate the valid encoding: anything still accepted must stay canonical.
+    var mutated: [256]u8 = undefined;
+    @memcpy(mutated[0..encoded.len], encoded);
+    var length: u32 = @intCast(encoded.len);
+    if (smith.value(bool)) length = smith.valueRangeAtMost(u32, 0, length);
+    if (length > 0) mutated[smith.index(length)] = smith.value(u8);
+    try check_rlp_canonical(mutated[0..length]);
+    // Raw bytes too: most are rejected, all accepted ones are canonical.
+    try check_rlp_canonical(bytes[0..smith.slice(&bytes)]);
+}
+
+test "fuzz_targets: rlp comptime codec is canonical and round trips" {
+    try fuzz.run({}, fuzz_rlp_codec, .{ .iterations = 512 });
 }

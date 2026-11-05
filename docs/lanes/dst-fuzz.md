@@ -73,3 +73,5 @@ provably robust.
   time); flagged 73 s p2p test to coordinator.
 - 2026-11-05: sim runs real batcher/protocol codecs on the L1 data path; checker for
   undecodable batches; corrupt-batcher negative test (mutation-checked).
+- 2026-11-05: fuzz target for the comptime RLP codec (canonical re-encoding of anything
+  accepted, value round trip, mutated and raw input).
