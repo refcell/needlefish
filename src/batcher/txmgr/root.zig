@@ -34,6 +34,9 @@ pub const Config = struct {
     data_availability: DataAvailability = .calldata,
     /// Blob mode: frames (one per blob) packed into each transaction, 1..6.
     blobs_per_tx: u8 = 1,
+    /// Calldata mode: also load the KZG prover and blob buffers so `force_blobs` can switch
+    /// new transactions to blobs at runtime (base/base `force_blobs_when_throttling`).
+    blob_override: bool = false,
     /// L1 blocks a tx must be buried under before its slot is freed (base/base
     /// `--num-confirmations`; 1 = included in the latest block).
     confirmations: u64 = 1,
@@ -98,6 +101,9 @@ pub const TxManager = struct {
     raw_buffer: []u8,
     params_buffer: []u8,
     prover: ?*kzg.Prover,
+    /// Send new transactions as blobs even in calldata mode (needs `blob_override`).
+    /// Pending ones keep their type: geth never replaces across blob and non-blob txs.
+    force_blobs: bool = false,
 
     const Replaced = struct { nonce_max: u64, fees: txdata.Fees, blob_fee: u128 };
 
@@ -108,7 +114,7 @@ pub const TxManager = struct {
         const slots = try allocator.alloc(Slot, config.slots_max);
         errdefer allocator.free(slots);
         var initialized: usize = 0;
-        const use_blobs = config.data_availability == .blobs;
+        const use_blobs = config.data_availability == .blobs or config.blob_override;
         if (use_blobs) assert(config.tx_data_bytes_max <= blobs.blob_data_length_max);
         assert(config.blobs_per_tx >= 1 and config.blobs_per_tx <= blobs_per_tx_max);
         const blob_count: u8 = if (use_blobs) config.blobs_per_tx else 0;
@@ -201,15 +207,17 @@ pub const TxManager = struct {
         // that L1 evicts would leave a nonce gap nothing re-sends.
         const nonce = manager.next_nonce orelse try manager.account_nonce(client, "latest");
         var fees = try manager.suggested_fees(client);
-        var blob_fee = if (manager.prover != null) try manager.suggested_blob_fee(client) else 0;
+        const as_blobs = manager.sends_blobs();
+        var blob_fee = if (as_blobs) try manager.suggested_blob_fee(client) else 0;
         if (manager.replaced) |replaced| {
             if (nonce <= replaced.nonce_max) {
                 fees = txdata.bump_fees(replaced.fees, fees, manager.replacement_bump_percent());
                 blob_fee = @max(blob_fee, replaced.blob_fee *| 2);
             } else manager.replaced = null;
         }
-        if (manager.prover) |prover| {
-            slot.blob_count = 0;
+        slot.blob_count = 0;
+        if (as_blobs) {
+            const prover = manager.prover.?;
             while (slot.blob_count < manager.config.blobs_per_tx) : (slot.blob_count += 1) {
                 const tx_data = frames.next() orelse break;
                 const index = slot.blob_count;
@@ -312,6 +320,12 @@ pub const TxManager = struct {
         assert(manager.pending_count() == 0);
     }
 
+    /// Whether the next new transaction carries blobs.
+    pub fn sends_blobs(manager: *const TxManager) bool {
+        if (manager.prover == null) return false;
+        return manager.config.data_availability == .blobs or manager.force_blobs;
+    }
+
     fn replacement_bump_percent(manager: *const TxManager) u8 {
         if (manager.prover != null) return blob_tx.blob_bump_percent;
         return manager.config.bump_percent;
@@ -319,7 +333,7 @@ pub const TxManager = struct {
 
     fn bump(manager: *TxManager, client: *rpc.Client, slot: *Slot) Error!void {
         const suggested = try manager.suggested_fees(client);
-        if (manager.prover == null) {
+        if (slot.blob_count == 0) {
             slot.fees = txdata.bump_fees(slot.fees, suggested, manager.config.bump_percent);
             return;
         }
@@ -332,7 +346,7 @@ pub const TxManager = struct {
 
     /// Signs `slot` and returns its raw network encoding (in `raw_buffer`).
     fn sign_slot(manager: *TxManager, slot: *Slot) Error!struct { []u8, primitives.B256 } {
-        if (manager.prover == null) {
+        if (slot.blob_count == 0) {
             const data = slot.data[0..slot.data_length];
             const envelope = try txdata.sign_eip1559(.{
                 .chain_id = manager.config.chain_id,
@@ -681,6 +695,50 @@ test "txmgr: blob mode packs up to blobs_per_tx frames per transaction" {
     try testing.expectEqual(@as(u32, 2), try manager.poll(&client, 0));
     try testing.expect(!try manager.submit_from(&client, list.source(), 0));
     try testing.expectEqual(@as(u32, 2), l1.sends);
+}
+
+test "txmgr: forced blobs switch new txs only; pending txs keep their type" {
+    const batcher = accounts.derive_dev(@backingInt(accounts.Role.batcher));
+    var l1: FakeL1 = .{ .mined_nonce = 0 };
+    var client = try rpc.Client.init(testing.allocator, l1.transport(), .{
+        .request_bytes_max = 600 * 1024,
+        .response_bytes_max = 4096,
+        .parse_bytes_max = 64 * 1024,
+    });
+    defer client.deinit(testing.allocator);
+    var manager = try TxManager.init(testing.allocator, .{
+        .chain_id = 900,
+        .private_key = batcher.private_key,
+        .from = batcher.address,
+        .to = .{ .bytes = @splat(0xff) },
+        .slots_max = 3,
+        .tx_data_bytes_max = 4096,
+        .resubmit_after_ms = 1000,
+        .blobs_per_tx = 2,
+        .blob_override = true,
+    });
+    defer manager.deinit(testing.allocator);
+    try testing.expect(!manager.sends_blobs());
+    var list: ListFrames = .{ .frames = &.{ "\x00one", "\x00two", "\x00three", "\x00four" } };
+    try testing.expect(try manager.submit_from(&client, list.source(), 0));
+    try testing.expectEqual(@as(u8, 0), manager.slots[0].blob_count);
+    try testing.expectEqual(@as(u8, 0x02), l1.last_raw_prefix[0]); // EIP-1559 calldata.
+    manager.force_blobs = true;
+    try testing.expect(manager.sends_blobs());
+    try testing.expect(try manager.submit_from(&client, list.source(), 0));
+    try testing.expectEqual(@as(u8, 2), manager.slots[1].blob_count);
+    try testing.expectEqual(@as(u8, 0x03), l1.last_raw_prefix[0]); // EIP-4844 blobs.
+    manager.force_blobs = false;
+    try testing.expect(try manager.submit_from(&client, list.source(), 0));
+    try testing.expectEqual(@as(u8, 0), manager.slots[2].blob_count);
+    // Resubmissions re-sign each slot as its original type.
+    const sends = l1.sends;
+    _ = try manager.poll(&client, 5_000);
+    try testing.expectEqual(sends + 3, l1.sends);
+    try testing.expectEqual(@as(u8, 0), manager.slots[0].blob_count);
+    try testing.expectEqual(@as(u8, 2), manager.slots[1].blob_count);
+    try testing.expectEqual(@as(u128, 0), manager.slots[0].blob_fee);
+    try testing.expect(manager.slots[1].blob_fee > 0);
 }
 
 /// An L1 with a nonce-indexed pool, reorgs, and tx loss. `fees[n]` is the max fee of the

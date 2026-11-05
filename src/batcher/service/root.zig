@@ -14,6 +14,7 @@ const rpc = @import("../rpc/root.zig");
 const source = @import("../source/root.zig");
 const channel_manager = @import("../channel/manager.zig");
 const throttle = @import("../throttle/root.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 const txmgr = @import("../txmgr/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 
@@ -31,6 +32,9 @@ pub const Config = struct {
     throttle: throttle.Config = .{ .strategy = .off },
     /// Start with block ingestion stopped (base/base `--stopped`); see `start`.
     stopped: bool = false,
+    /// While DA throttling is active, send new transactions as blobs (base/base
+    /// `force_blobs_when_throttling`); needs `txs.blob_override` in calldata mode.
+    force_blobs_when_throttling: bool = false,
 };
 
 pub const Clients = struct {
@@ -57,6 +61,8 @@ pub const Report = struct {
     da_backlog_bytes: u64 = 0,
     throttle: throttle.Outcome = .idle,
     stopped: bool = false,
+    /// New transactions use blobs because throttling is active (calldata mode).
+    blobs_forced: bool = false,
 };
 
 /// base/base `BatcherStatus` (admin_getBatcherStatus).
@@ -77,6 +83,7 @@ pub const Service = struct {
     backlog: throttle.BacklogEstimate,
     stopped: bool,
     last_da_backlog_bytes: u64,
+    force_blobs_when_throttling: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, channel_id_seed: [16]u8) !Service {
         assert(config.blocks_per_step_max > 0);
@@ -98,6 +105,7 @@ pub const Service = struct {
             .backlog = .{},
             .stopped = config.stopped,
             .last_da_backlog_bytes = 0,
+            .force_blobs_when_throttling = config.force_blobs_when_throttling,
         };
     }
 
@@ -123,6 +131,10 @@ pub const Service = struct {
             if (report.heads.safe_known) service.watch_safe_head(report.heads, &report);
             try service.load_blocks(clients, report.heads, &report);
             report.throttle = service.throttle.update(clients.l2, report.da_backlog_bytes, now_ms);
+            service.txs.force_blobs = service.force_blobs_when_throttling and
+                service.throttling(report.da_backlog_bytes);
+            report.blobs_forced = service.txs.force_blobs and service.txs.sends_blobs() and
+                service.txs.config.data_availability == .calldata;
             try service.submit_frames(clients.l1, now_ms, &report);
         }
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
@@ -135,6 +147,14 @@ pub const Service = struct {
         }
         assert(report.txs_submitted <= service.txs.slots.len);
         return report;
+    }
+
+    /// DA throttling is in effect: enabled, the builder supports it, and the backlog is
+    /// past the start threshold.
+    pub fn throttling(service: *const Service, backlog_bytes: u64) bool {
+        const throttle_state = &service.throttle;
+        if (throttle_state.disabled or throttle_state.config.strategy == .off) return false;
+        return throttle_state.config.intensity_ppm(backlog_bytes) > 0;
     }
 
     /// Stops block ingestion and drops the encoding pipeline (base/base `on_admin_stop`).
@@ -424,6 +444,9 @@ test "service: L2 blocks reach L1 as a complete channel of singular batches" {
         chains.l1_head += 1;
     }
     try testing.expectEqual(@as(u32, 12), loaded);
+    // Throttling is on, but forcing blobs was not enabled: everything stayed calldata.
+    try testing.expect(service.throttling(12 * 70));
+    try testing.expect(!service.txs.force_blobs);
     // Steps at 0..10 s: pushed at 0 (new limits) and at 10 s (refresh), at full throttle.
     try testing.expectEqual(@as(u32, 2), chains.da_limit_pushes);
     try testing.expectEqual(@as(u64, 42_000), chains.da_max_block_size);
@@ -460,6 +483,53 @@ test "service: L2 blocks reach L1 as a complete channel of singular batches" {
         try testing.expectEqual(@as(usize, 0), batch.transactions.len);
     }
     try testing.expectEqual(@as(u64, 13), number);
+}
+
+test "service: seeded fuzz of the throttling predicate behind forced blobs" {
+    var service: Service = undefined;
+    var prng = Prng.init(0xb10b);
+    const strategies = [_]throttle.Strategy{ .off, .step, .linear, .quadratic };
+    for (0..2000) |_| {
+        const strategy = strategies[@intCast(prng.below(strategies.len))];
+        const start = prng.range(1, 1000);
+        service.throttle = throttle.Throttle.init(.{
+            .strategy = strategy,
+            .start_threshold_bytes = start,
+            .full_threshold_bytes = start + prng.range(1, 1000),
+        });
+        service.throttle.disabled = service.throttle.disabled or prng.chance(1, 4);
+        const backlog = prng.range(0, 3000);
+        const throttling = service.throttling(backlog);
+        // Never throttling when disabled, off, or below the start threshold.
+        if (service.throttle.disabled or strategy == .off or backlog < start) {
+            try testing.expect(!throttling);
+        } else {
+            const intensity = service.throttle.config.intensity_ppm(backlog);
+            try testing.expectEqual(intensity > 0, throttling);
+            if (strategy == .step) try testing.expect(throttling); // Full from the start.
+        }
+    }
+}
+
+test "service: fuzz the throttling predicate" {
+    try testing.fuzz({}, fuzz_throttling, .{});
+}
+
+fn fuzz_throttling(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [12]u8 = @splat(0);
+    _ = smith.slice(&bytes);
+    var service: Service = undefined;
+    const start: u64 = 1 + std.mem.readInt(u16, bytes[0..2], .little);
+    service.throttle = throttle.Throttle.init(.{
+        .strategy = @fromBackingInt(@intCast(bytes[2] % 4)),
+        .start_threshold_bytes = start,
+        .full_threshold_bytes = start + 1 + std.mem.readInt(u16, bytes[3..5], .little),
+    });
+    service.throttle.disabled = service.throttle.disabled or bytes[5] & 1 == 1;
+    const backlog = std.mem.readInt(u32, bytes[6..10], .little);
+    if (service.throttling(backlog)) {
+        try testing.expect(!service.throttle.disabled and backlog >= start);
+    }
 }
 
 test "service: rollup fields from the devnet rollup.json" {

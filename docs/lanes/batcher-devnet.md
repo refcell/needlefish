@@ -73,7 +73,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
   `--throttle-{block,tx}-size-{upper,lower}-limit`).
 - [ ] `batcher`: `--brotli-quality` (encoder effort levels; lazy matching at high quality).
-- [ ] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
+- [x] `batcher`: force blobs while throttling (`--no-force-blobs-when-throttling` opts out).
 - [ ] `batcher`: `--publish-max-retries` / `--publish-retry-delay` for send failures.
 - [ ] `batcher`: shadow mode (`--shadow.*`): post to a shadow inbox and compare a parity
   validator's derived hashes with the leader's.
@@ -176,3 +176,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   `--sequencer-urls verifier,sequencer` the batcher picks #1 via `admin_sequencerActive` and
   batches; "no sequencer active" is now logged on change only.
 - 2026-11-05: base/base flag aliases; flag parsing seeded-fuzzed against its invariants.
+- 2026-11-05: smoke on 3dae167 (incl. consensus p2p + sealing 43a8665): all checks pass.
+- 2026-11-05: force blobs while throttling (default on in calldata mode; KZG prover loaded only
+  when it can apply). Pending txs keep their type (geth never replaces across blob/non-blob).
+  Live: forced blob batches stalled the verifier with BlobsUnavailable because the dev L1
+  beacon served only `blob_sidecars` while consensus requests `/eth/v1/beacon/blobs/{slot}`;
+  added that endpoint (versioned-hash filter) to `execution/node/beacon.zig` as an
+  integration fix. Verifier then derived from blobs (safe head 40).

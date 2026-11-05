@@ -115,6 +115,8 @@ Each binary must accept at least the flags below. Lanes may add more.
   `--max-calldata-size-bytes`.
   Throttle tuning: `--throttle-{start,full}-threshold`, `--throttle-{block,tx}-size-{lower,upper}-limit`
   (bytes, base/base defaults, validated together).
+  In calldata mode new txs switch to blobs while throttling is active
+  (`--no-force-blobs-when-throttling` turns that off).
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 

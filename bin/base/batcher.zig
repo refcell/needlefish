@@ -20,6 +20,7 @@ const usage =
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
+    \\         [--no-force-blobs-when-throttling]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
     \\         [--sub-safety-margin L1_BLOCKS] [--wait-node-sync [--check-recent-txs-depth N]
     \\         [--wait-node-sync-timeout SECONDS]]
@@ -71,6 +72,9 @@ const Flags = struct {
     resubmit_after_ms: u64 = 12_000,
     /// Calldata payload limit incl. the version byte (`--max-calldata-size-bytes`).
     calldata_bytes_max: u32 = tx_data_bytes_max,
+    /// Calldata mode: send blobs while DA throttling is active (base/base default on;
+    /// `--no-force-blobs-when-throttling` turns it off).
+    force_blobs_when_throttling: bool = true,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -172,6 +176,9 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .calldata => flags.calldata_bytes_max,
         .blobs => batcher.blobs.blob_data_length_max,
     };
+    // Forcing blobs needs the KZG prover in calldata mode; skip it when it cannot apply.
+    const force_blobs = flags.force_blobs_when_throttling and
+        flags.data_availability == .calldata and flags.throttle.strategy != .off;
     var service = try batcher.service.Service.init(init.gpa, .{
         .channels = .{
             .channel = .{
@@ -191,6 +198,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             // op-batcher's blob default: up to 6 frames (blobs) per transaction.
             .blobs_per_tx = if (flags.data_availability == .blobs) flags.blobs_per_tx else 1,
             .resubmit_after_ms = flags.resubmit_after_ms,
+            .blob_override = force_blobs,
             .slots_max = flags.pending_max,
             .confirmations = flags.confirmations,
             .min_tip_wei = flags.min_tip_wei,
@@ -200,6 +208,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .stall_l1_blocks = 30,
         .throttle = flags.throttle,
         .stopped = flags.stopped,
+        .force_blobs_when_throttling = force_blobs,
     }, seed);
     defer service.deinit(init.gpa);
     return run(init, flags, &service, l1_url, entries[0..entry_count]);
@@ -233,6 +242,7 @@ fn run(
     var servers: Servers = undefined;
     const serving = start_servers(&servers, init.gpa, flags, &metrics, &admin);
     var throttle_logged: batcher.throttle.Outcome = .idle;
+    var blobs_forced_logged = false;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
         const clients = follow_leader(&leader, &l1, endpoints.has_rollup, service, &active_count);
@@ -240,6 +250,11 @@ fn run(
             log_report(report);
             metrics.record(report, service.txs.pending_count());
             log_throttle(report.throttle, &throttle_logged);
+            if (report.blobs_forced != blobs_forced_logged) {
+                blobs_forced_logged = report.blobs_forced;
+                const state = if (report.blobs_forced) "on (DA throttling)" else "off";
+                std.debug.print("batcher: forcing blob transactions {s}\n", .{state});
+            }
         } else |err| {
             metrics.step_failures.increment();
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
@@ -379,6 +394,8 @@ fn parse_switch(flags: *Flags, arg: []const u8) bool {
         flags.stopped = true;
     } else if (eql(u8, arg, "--wait-node-sync")) {
         flags.wait_node_sync = true;
+    } else if (eql(u8, arg, "--no-force-blobs-when-throttling")) {
+        flags.force_blobs_when_throttling = false;
     } else if (eql(u8, arg, "--no-throttle")) {
         flags.throttle.strategy = .off;
     } else return false;
@@ -593,6 +610,9 @@ test "batcher: flags" {
     try std.testing.expectEqual(@as(u64, 90000), throttle_flags.throttle.block_size_upper_limit);
     const inverted = [_][]const u8{ "--throttle-full-threshold", "1" };
     try std.testing.expectError(error.InvalidThrottleConfig, parse_flags(&inverted));
+    const no_force = [_][]const u8{"--no-force-blobs-when-throttling"};
+    try std.testing.expect(!(try parse_flags(&no_force)).force_blobs_when_throttling);
+    try std.testing.expect((try parse_flags(&.{})).force_blobs_when_throttling);
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
@@ -605,11 +625,22 @@ test {
 }
 
 const fuzz_flag_names = [_][]const u8{
-    "--poll-interval",            "--max-blobs-per-tx",        "--resubmission-timeout",
-    "--max-calldata-size-bytes",  "--data-availability-type",  "--num-confirmations",
-    "--max-pending-transactions", "--sub-safety-margin",       "--max-channel-duration",
-    "--check-recent-txs-depth",   "--wait-node-sync",          "--stopped",
-    "--throttle-start-threshold", "--throttle-full-threshold", "--throttle-tx-size-lower-limit",
+    "--poll-interval",
+    "--max-blobs-per-tx",
+    "--resubmission-timeout",
+    "--max-calldata-size-bytes",
+    "--data-availability-type",
+    "--num-confirmations",
+    "--max-pending-transactions",
+    "--sub-safety-margin",
+    "--max-channel-duration",
+    "--check-recent-txs-depth",
+    "--wait-node-sync",
+    "--stopped",
+    "--throttle-start-threshold",
+    "--throttle-full-threshold",
+    "--throttle-tx-size-lower-limit",
+    "--no-force-blobs-when-throttling",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 

@@ -145,6 +145,8 @@ pub const Beacon = struct {
             write_version(&w)
         else if (std.mem.startsWith(u8, path, sidecars_prefix))
             beacon.write_sidecars(&w, path[sidecars_prefix.len..], query, response)
+        else if (std.mem.startsWith(u8, path, blobs_prefix))
+            beacon.write_blobs(&w, path[blobs_prefix.len..], query)
         else
             return response.fail(404);
         result catch |err| switch (err) {
@@ -155,6 +157,37 @@ pub const Beacon = struct {
     }
 
     const sidecars_prefix = "/eth/v1/beacon/blob_sidecars/";
+    const blobs_prefix = "/eth/v1/beacon/blobs/";
+
+    /// `GET /eth/v1/beacon/blobs/{slot}?versioned_hashes=0x..,0x..` (the endpoint the
+    /// consensus node's blob provider uses by default): the slot's blobs whose versioned
+    /// hash is listed, in slot order; all of them without the parameter.
+    fn write_blobs(
+        beacon: *Beacon,
+        w: *json.Writer,
+        slot_text: []const u8,
+        query: []const u8,
+    ) HandleError!void {
+        const slot = std.fmt.parseInt(u64, slot_text, 10) catch return error.BadRequest;
+        const entries = beacon.sidecars(slot) orelse return error.NotFound;
+        assert(entries.len % entry_size == 0);
+        var wanted: [blobs_per_block_max][32]u8 = undefined;
+        const wanted_count = parse_versioned_hashes(query, &wanted) catch
+            return error.BadRequest;
+        try w.begin_object();
+        try w.key("data");
+        try w.begin_array();
+        for (0..entries.len / entry_size) |index| {
+            const entry = entries[index * entry_size ..][0..entry_size];
+            const hash = versioned_hash(entry[bytes_per_blob..][0..commitment_size]);
+            const listed = for (wanted[0..wanted_count]) |item| {
+                if (std.mem.eql(u8, &item, &hash)) break true;
+            } else false;
+            if (wanted_count == 0 or listed) try w.data(entry[0..bytes_per_blob]);
+        }
+        try w.end_array();
+        try w.end_object();
+    }
     const HandleError = json.Writer.WriteError || error{ NotFound, BadRequest };
 
     fn write_genesis(beacon: *Beacon, w: *json.Writer) HandleError!void {
@@ -217,6 +250,33 @@ fn slot_ref(slot: u64) block_store.Ref {
 fn split_target(target: []const u8) struct { []const u8, []const u8 } {
     const question = std.mem.indexOfScalar(u8, target, '?') orelse return .{ target, "" };
     return .{ target[0..question], target[question + 1 ..] };
+}
+
+/// EIP-4844 versioned hash: `0x01 ++ sha256(commitment)[1..]`.
+fn versioned_hash(commitment: *const [commitment_size]u8) [32]u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(commitment, &hash, .{});
+    hash[0] = 0x01;
+    return hash;
+}
+
+/// `versioned_hashes=0x..,0x..` (absent: none, meaning all). At most one per blob slot.
+fn parse_versioned_hashes(query: []const u8, out: *[blobs_per_block_max][32]u8) !u8 {
+    var count: u8 = 0;
+    var parameters = std.mem.splitScalar(u8, query, '&');
+    while (parameters.next()) |parameter| {
+        const prefix = "versioned_hashes=";
+        if (!std.mem.startsWith(u8, parameter, prefix)) continue;
+        var values = std.mem.splitScalar(u8, parameter[prefix.len..], ',');
+        while (values.next()) |value| {
+            if (count == out.len) return error.TooMany;
+            if (value.len != 66 or !std.mem.startsWith(u8, value, "0x")) return error.Invalid;
+            _ = try std.fmt.hexToBytes(&out[count], value[2..]);
+            count += 1;
+        }
+    }
+    assert(count <= out.len);
+    return count;
 }
 
 const Indices = struct { mask: u64 };
@@ -351,6 +411,78 @@ test "beacon: capture, commit and serve sidecars" {
     try json.validate(text);
     try testing.expect(std.mem.indexOf(u8, text, "\"index\":\"1\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"index\":\"0\"") == null);
+}
+
+test "beacon: blobs endpoint filters by versioned hash" {
+    var beacon = try Beacon.init(testing.allocator, 1_000, 2, .{
+        .slots_max = 4,
+        .bytes_max = 1 << 20,
+    });
+    defer beacon.deinit(testing.allocator);
+    const buffer = try testing.allocator.alloc(u8, 2 * entry_size + 1024);
+    defer testing.allocator.free(buffer);
+    try beacon.capture(try pooled_blob_tx(buffer, 2, 0x10));
+    try beacon.commit_slot(5);
+    const second = beacon.sidecars(5).?[entry_size..][0..entry_size];
+    const hash = versioned_hash(second[bytes_per_blob..][0..commitment_size]);
+    var target_buffer: [128]u8 = undefined;
+    const out = try testing.allocator.alloc(u8, 6 * entry_size); // Hex doubles each blob.
+    defer testing.allocator.free(out);
+    const cases = [_]struct { query: []const u8, blobs: usize, status: u16 }{
+        .{ .query = "", .blobs = 2, .status = 200 },
+        .{ .query = "?versioned_hashes=0x{x}", .blobs = 1, .status = 200 },
+        .{ .query = "?versioned_hashes=0x12", .blobs = 0, .status = 400 },
+    };
+    for (cases) |case| {
+        var target_writer: std.Io.Writer = .fixed(&target_buffer);
+        try target_writer.writeAll("/eth/v1/beacon/blobs/5");
+        if (std.mem.indexOf(u8, case.query, "{x}")) |_| {
+            try target_writer.print("?versioned_hashes=0x{x}", .{&hash});
+        } else try target_writer.writeAll(case.query);
+        var response = http.ResponseBuilder.init(out);
+        const request: http.Request = .{
+            .method = .GET,
+            .method_text = "GET",
+            .target = target_writer.buffered(),
+            .version = .http_1_1,
+            .headers = .{},
+            .body = "",
+            .keep_alive = true,
+        };
+        beacon.handle(&request, &response);
+        try testing.expectEqual(case.status, response.status);
+        if (case.status != 200) continue;
+        const text = response.body.buffered();
+        try json.validate(text);
+        // Each blob is `"0x" ++ hex`; blob bytes are `fill + index` (0x10, 0x11).
+        try testing.expectEqual(case.blobs, std.mem.count(u8, text, "\"0x"));
+        if (case.blobs == 1) try testing.expect(std.mem.indexOf(u8, text, "\"0x1111") != null);
+    }
+}
+
+test "beacon: seeded fuzz of versioned hash queries" {
+    var prng = @import("../../testing/prng.zig").Prng.init(0xb10b5);
+    var out: [blobs_per_block_max][32]u8 = undefined;
+    const alphabet = "0x1f,=&versioned_hashes";
+    for (0..2000) |_| {
+        var query: [96]u8 = undefined;
+        const length = prng.range(0, query.len);
+        for (query[0..length]) |*byte| byte.* = alphabet[prng.below(alphabet.len)];
+        const count = parse_versioned_hashes(query[0..length], &out) catch continue;
+        try testing.expect(count <= blobs_per_block_max);
+    }
+}
+
+test "beacon: fuzz versioned hash queries" {
+    try testing.fuzz({}, fuzz_versioned_hashes, .{});
+}
+
+fn fuzz_versioned_hashes(_: void, smith: *testing.Smith) anyerror!void {
+    var bytes: [256]u8 = undefined;
+    const length = smith.slice(&bytes);
+    var out: [blobs_per_block_max][32]u8 = undefined;
+    const count = parse_versioned_hashes(bytes[0..length], &out) catch return;
+    try testing.expect(count <= blobs_per_block_max);
 }
 
 test "beacon: genesis, spec and unknown paths" {
