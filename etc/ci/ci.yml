@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install zig
+        run: |
+          sh etc/scripts/install-zig.sh "$HOME/zig"
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+      - name: tidy
+        run: bash etc/scripts/tidy.sh
+      - name: test
+        run: zig build test --summary all
+      - name: test release-safe
+        run: zig build test -Doptimize=ReleaseSafe
+      - name: simulator seeds
+        run: |
+          for seed in 1 2 3 4 5 6 7 8 9 10; do zig build sim -Doptimize=ReleaseSafe -- $seed; done

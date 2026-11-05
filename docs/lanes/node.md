@@ -1,0 +1,19 @@
+# Lane: node
+
+Owns `src/execution/{chainspec,txpool,payload,engine,rpc,node}` and `bin/node`.
+Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
+
+## Backlog
+- [ ] `chainspec`: per-chain fork activation, gas limits, base fee params; L1 mode (plain Ethereum, Cancun+/Prague+) and L2 mode (Base/OP).
+- [ ] Block executor: apply txs through evm + state provider, receipts, gas/bloom, state root via trie, block validation (header checks, base fee, blob gas, OP rules).
+- [ ] `txpool`: pending/queued per sender, nonce gaps, price ordering, replacement, bounded size, eviction; deposit txs never pooled.
+- [ ] `payload`: payload builder (from attributes: forced txs + pool txs, noTxPool, gasLimit, eip1559Params, minBaseFee), async build with getPayload.
+- [ ] `engine`: Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
+- [ ] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
+- [ ] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
+- [ ] Persistence + restart, reorg handling via forkchoice.
+- [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
+
+## Decisions
+
+## Log

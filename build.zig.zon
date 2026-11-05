@@ -1,0 +1,16 @@
+.{
+    .name = .needlefish,
+    .version = "0.0.0",
+    .fingerprint = 0xed76f244ef4bf89d,
+    .minimum_zig_version = "0.17.1",
+    // No dependencies. Ever. Only the Zig standard library.
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "bin",
+        "LICENSE",
+        "README.md",
+    },
+}

@@ -2,3 +2,12 @@
 zig-out/
 zig-pkg/
 *.o
+.devnet/
+.cache/
+.env
+.env.*
+*.pem
+*.key
+.pi/
+.claude/
+.DS_Store
