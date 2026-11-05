@@ -34,7 +34,10 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     client contract in `engine/task.zig`, plus a full L2 block fetch (header fields + raw
     EIP-2718 txs incl. deposits + withdrawals) for consolidation
   - [x] starting forkchoice discovery (resumable find_starting_forkchoice)
-  - [ ] EL sync mode, checkpoint reader / pruned-block recovery
+  - [x] EL sync mode: derivation and sequencing wait for `el_sync_finished`; the driver
+    re-sends the forkchoice state every 2 s while the engine answers SYNCING (base/base
+    `AwaitingELSyncCompletion` + `probe_el_sync`)
+  - [ ] checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
@@ -71,6 +74,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Engine queue: an empty `synchronize` update is always a forced forkchoice update (startup
+  sync and EL sync probes); unforced it was a no-op once the heads were known, so
+  `el_sync_finished` could stay false.
 - Pre-Isthmus output roots: the RPC router is synchronous, so the first query for a block
   starts an `eth_getProof` (keyed by block hash, 64-entry LRU) and answers "output not
   available yet"; retries answer from the cache. Like base/base, the proof is not verified.
@@ -183,6 +189,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: derivation and sequencing wait for EL sync, probing the engine every 2 s.
 - 2026-11-05: rpc: pre-Isthmus optimism_outputAtBlock from cached eth_getProof storage roots.
 - 2026-11-05: protocol: span batches carry EIP-8130 transactions (base/base `SpanBatchEip8130TransactionData`).
 - 2026-11-05: engine: payload bodies by hash/range and capability exchange on the engine client, with codecs and fuzz.

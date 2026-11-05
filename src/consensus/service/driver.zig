@@ -51,6 +51,8 @@ pub const Options = struct {
     steps_per_tick_max: u32 = 64,
     /// Gossiped blocks ahead of the unsafe head kept until their parent is inserted.
     unsafe_buffer_capacity: u32 = 64,
+    /// While the execution engine syncs, re-send the forkchoice state this often.
+    el_sync_probe_interval_s: u64 = 2,
 };
 
 pub const Phase = enum { starting, resetting, running };
@@ -68,6 +70,8 @@ pub const Stats = struct {
     engine_failures: u64 = 0,
     derivation_failures: u64 = 0,
     critical_errors: u64 = 0,
+    /// Forced forkchoice updates sent while waiting for EL sync to finish.
+    el_sync_probes: u64 = 0,
 };
 
 /// Adapts the node providers to the startup finder's client (null on `NotFound`).
@@ -129,6 +133,8 @@ pub const Driver = struct {
     building: bool = false,
     /// Runtime sequencer switch (`admin_startSequencer`/`admin_stopSequencer`).
     sequencer_active: bool = false,
+    /// Wall clock (seconds) of the last EL sync probe.
+    el_sync_probe_s: u64 = 0,
     stats: Stats = .{},
     /// The most recent failure of any kind, for logs; `error_sequence` counts them.
     last_error: ?anyerror = null,
@@ -195,6 +201,9 @@ pub const Driver = struct {
                 driver.step_engine(providers);
                 if (driver.phase != .running) return;
                 driver.drain_unsafe();
+                // Derivation and sequencing wait until the engine has finished its initial
+                // sync (base/base `AwaitingELSyncCompletion`).
+                if (!driver.queue.state.el_sync_finished) return driver.probe_el_sync(now_s);
                 driver.derive(providers);
                 if (driver.phase != .running) return;
                 driver.finalize(providers.l1_finalized);
@@ -225,6 +234,19 @@ pub const Driver = struct {
         driver.finalizer.clear();
         driver.safe_db.safe_head_reset(found.safe_head);
         driver.phase = .resetting;
+        assert(driver.queue.len() == 1);
+    }
+
+    /// base/base `probe_el_sync`: a forced forkchoice update of the current state, since the
+    /// engine can move from SYNCING to VALID without the forkchoice changing.
+    fn probe_el_sync(driver: *Driver, now_s: u64) void {
+        assert(!driver.queue.state.el_sync_finished);
+        if (driver.queue.len() > 0) return; // The startup synchronize or inserts first.
+        const interval_s = driver.options.el_sync_probe_interval_s;
+        if (driver.el_sync_probe_s != 0 and now_s < driver.el_sync_probe_s + interval_s) return;
+        driver.queue.enqueue(.{ .synchronize = .{} }) catch return; // Empty: forced.
+        driver.el_sync_probe_s = @max(now_s, 1);
+        driver.stats.el_sync_probes += 1;
         assert(driver.queue.len() == 1);
     }
 
@@ -621,6 +643,36 @@ test "driver: starts from genesis, synchronizes, and resets the pipeline" {
     const safe_hash = driver.sync_state().safe_head.block_info.hash;
     try testing.expect(safe_hash.eql(scenario.rollup.genesis.l2.hash));
     try testing.expect(driver.pipeline.origin() != null);
+    try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+test "driver: derivation waits for EL sync and probes the engine meanwhile" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{ .sequencer = true });
+    defer scenario.deinit();
+    scenario.mock.forkchoice_status = .syncing;
+    const driver = &scenario.driver;
+    const start_s = Scenario.genesis_time + 2;
+    for (0..32) |_| driver.tick(scenario.providers(), start_s);
+    try testing.expectEqual(Phase.running, driver.phase);
+    try testing.expect(!driver.queue.state.el_sync_finished);
+    try testing.expectEqual(@as(u64, 1), driver.stats.el_sync_probes);
+    // Neither derivation nor the sequencer touch the engine while it syncs.
+    try testing.expect(driver.consolidating == null);
+    try testing.expect(!driver.building);
+    try testing.expectEqual(@as(u32, 0), scenario.mock.build_calls);
+    const calls = scenario.mock.forkchoice_calls;
+    driver.tick(scenario.providers(), start_s + 1); // Inside the probe interval.
+    try testing.expectEqual(calls, scenario.mock.forkchoice_calls);
+    for (0..4) |_| driver.tick(scenario.providers(), start_s + 2);
+    try testing.expectEqual(@as(u64, 2), driver.stats.el_sync_probes);
+    try testing.expect(scenario.mock.forkchoice_calls > calls);
+    // The engine finishes syncing: the next probe confirms it and the sequencer builds.
+    scenario.mock.forkchoice_status = .valid;
+    for (0..8) |_| driver.tick(scenario.providers(), start_s + 4);
+    try testing.expect(driver.queue.state.el_sync_finished);
+    try testing.expectEqual(@as(u64, 3), driver.stats.el_sync_probes);
+    try testing.expect(driver.building or scenario.mock.build_calls >= 1);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
 }
 

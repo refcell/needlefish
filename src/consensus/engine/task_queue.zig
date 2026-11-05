@@ -191,7 +191,12 @@ pub const EngineTaskQueue = struct {
         errdefer _ = slot.arena.reset(.{ .retain_with_limit = queue.options.retain_bytes });
         const allocator = slot.arena.allocator();
         slot.task = switch (request) {
-            .synchronize => |update| .{ .synchronize = .{ .update = update } },
+            // An empty update only makes sense as a forced forkchoice update (startup sync,
+            // EL sync probes): unforced, it would be a no-op once the heads are known.
+            .synchronize => |update| .{ .synchronize = .{
+                .update = update,
+                .force = std.meta.eql(update, task.SyncStateUpdate{}),
+            } },
             .finalize => |number| .{ .finalize = .{ .block_number = number } },
             .consolidate => |attributes| blk: {
                 slot.attributes = try copy_attributes(allocator, attributes);
