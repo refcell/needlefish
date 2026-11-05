@@ -287,26 +287,10 @@ inline fn montgomery_mul_n(
     const acc = t[0 .. n + 2];
     @memset(acc, 0);
     for (b) |bi| {
-        var carry: Limb = 0;
-        for (0..n) |j| {
-            const wide = @as(u128, a[j]) * bi + acc[j] + carry;
-            acc[j] = @truncate(wide);
-            carry = @intCast(wide >> 64);
+        // Small (comptime) lengths: fused shifting loops; large: unrolled row helper.
+        if (n <= specialized_limbs_max) cios_row_small(n, acc, a, m, bi, constant) else {
+            cios_row_large(n, acc, a, m, bi, constant);
         }
-        const top = @as(u128, acc[n]) + carry;
-        acc[n] = @truncate(top);
-        acc[n + 1] = @intCast(top >> 64);
-        const q = acc[0] *% constant;
-        var wide = @as(u128, q) * m[0] + acc[0];
-        carry = @intCast(wide >> 64);
-        for (1..n) |j| {
-            wide = @as(u128, q) * m[j] + acc[j] + carry;
-            acc[j - 1] = @truncate(wide);
-            carry = @intCast(wide >> 64);
-        }
-        const high = @as(u128, acc[n]) + carry;
-        acc[n - 1] = @truncate(high);
-        acc[n] = acc[n + 1] + @as(Limb, @intCast(high >> 64));
     }
     if (acc[n] != 0 or compare(acc[0..n], m) != .lt) {
         _ = sub(out, acc[0..n], m);
@@ -344,13 +328,7 @@ inline fn montgomery_sqr_n(
     const w = t[0 .. 2 * n];
     @memset(w, 0);
     for (0..n - 1) |i| { // off-diagonal products a[i] * a[j], j > i
-        var carry: Limb = 0;
-        for (i + 1..n) |j| {
-            const wide = @as(u128, a[i]) * a[j] + w[i + j] + carry;
-            w[i + j] = @truncate(wide);
-            carry = @intCast(wide >> 64);
-        }
-        w[i + n] = carry;
+        w[i + n] = mul_add_row_sized(n, w[2 * i + 1 .. i + n], a[i + 1 .. n], a[i]);
     }
     assert(shift_left_bits(w, w, 1) == 0);
     var carry: Limb = 0;
@@ -366,12 +344,7 @@ inline fn montgomery_sqr_n(
     var pending: Limb = 0; // carry into position i + n of the next row
     for (0..n) |i| {
         const q = w[i] *% constant;
-        var row_carry: Limb = 0;
-        for (0..n) |j| {
-            const wide = @as(u128, q) * m[j] + w[i + j] + row_carry;
-            w[i + j] = @truncate(wide);
-            row_carry = @intCast(wide >> 64);
-        }
+        const row_carry = mul_add_row_sized(n, w[i..][0..n], m, q);
         const top = @as(u128, w[i + n]) + row_carry + pending;
         w[i + n] = @truncate(top);
         pending = @intCast(top >> 64);
@@ -382,6 +355,95 @@ inline fn montgomery_sqr_n(
     } else {
         @memcpy(out, result);
     }
+}
+
+inline fn cios_row_small(
+    n: usize,
+    acc: []Limb,
+    a: []const Limb,
+    m: []const Limb,
+    bi: Limb,
+    constant: Limb,
+) void {
+    assert(acc.len == n + 2 and a.len == n);
+    var carry: Limb = 0;
+    for (0..n) |j| {
+        const wide = @as(u128, a[j]) * bi + acc[j] + carry;
+        acc[j] = @truncate(wide);
+        carry = @intCast(wide >> 64);
+    }
+    const top = @as(u128, acc[n]) + carry;
+    acc[n] = @truncate(top);
+    acc[n + 1] = @intCast(top >> 64);
+    const q = acc[0] *% constant;
+    var wide = @as(u128, q) * m[0] + acc[0];
+    carry = @intCast(wide >> 64);
+    for (1..n) |j| {
+        wide = @as(u128, q) * m[j] + acc[j] + carry;
+        acc[j - 1] = @truncate(wide);
+        carry = @intCast(wide >> 64);
+    }
+    const high = @as(u128, acc[n]) + carry;
+    acc[n - 1] = @truncate(high);
+    acc[n] = acc[n + 1] + @as(Limb, @intCast(high >> 64));
+}
+
+fn cios_row_large(
+    n: usize,
+    acc: []Limb,
+    a: []const Limb,
+    m: []const Limb,
+    bi: Limb,
+    constant: Limb,
+) void {
+    assert(acc.len == n + 2 and a.len == n);
+    const carry = mul_add_row(acc[0..n], a, bi);
+    const top = @as(u128, acc[n]) + carry;
+    acc[n] = @truncate(top);
+    acc[n + 1] = @intCast(top >> 64);
+    const q = acc[0] *% constant;
+    const reduce_carry = mul_add_row(acc[0..n], m, q);
+    assert(acc[0] == 0);
+    const high = @as(u128, acc[n]) + reduce_carry;
+    std.mem.copyForwards(Limb, acc[0 .. n - 1], acc[1..n]);
+    acc[n - 1] = @truncate(high);
+    acc[n] = acc[n + 1] + @as(Limb, @intCast(high >> 64));
+}
+
+/// `mul_add_row`, but plain loops for the comptime-length small moduli.
+inline fn mul_add_row_sized(n: usize, row: []Limb, m: []const Limb, q: Limb) Limb {
+    assert(row.len == m.len and m.len <= n);
+    if (n > specialized_limbs_max) return mul_add_row(row, m, q);
+    var carry: Limb = 0;
+    for (row, m) |*limb, factor| {
+        const wide = @as(u128, q) * factor + limb.* + carry;
+        limb.* = @truncate(wide);
+        carry = @intCast(wide >> 64);
+    }
+    return carry;
+}
+
+/// row += q * m over row.len limbs; returns the carry out. Unrolled by four so the
+/// independent multiplies of a group overlap.
+inline fn mul_add_row(row: []Limb, m: []const Limb, q: Limb) Limb {
+    assert(row.len == m.len);
+    var carry: Limb = 0;
+    var j: usize = 0;
+    while (j + 4 <= m.len) : (j += 4) {
+        var products: [4]u128 = undefined;
+        inline for (0..4) |k| products[k] = @as(u128, q) * m[j + k];
+        inline for (0..4) |k| {
+            const wide = products[k] + row[j + k] + carry;
+            row[j + k] = @truncate(wide);
+            carry = @intCast(wide >> 64);
+        }
+    }
+    while (j < m.len) : (j += 1) {
+        const wide = @as(u128, q) * m[j] + row[j] + carry;
+        row[j] = @truncate(wide);
+        carry = @intCast(wide >> 64);
+    }
+    return carry;
 }
 
 /// One Knuth-D step: rem = (rem * 2^64 + w) mod dn, for dn normalized (top bit set),
