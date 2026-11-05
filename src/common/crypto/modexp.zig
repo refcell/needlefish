@@ -4,12 +4,15 @@
 //! Odd moduli use Montgomery multiplication (CIOS on runtime-length limbs) with a sliding
 //! window. An even modulus m = 2^k * q (q odd) is solved as b^e mod q (Montgomery) and
 //! b^e mod 2^k (truncated products), then joined with the Chinese remainder theorem.
-//! Nothing allocates: scratch lives on the stack, sized by `limbs_max`.
+//! Nothing allocates: scratch lives on the stack (`Modexp(limbs_max)`, the Osaka bound) or in a
+//! caller-provided `[]u64` (`precompile_modexp_run_with_scratch`, any modulus length).
 //!
 //! Decision: only the modulus is capacity bound (`operand_bytes_max` = 1024 bytes, the
 //! EIP-7823 limit). The base streams through `bigint.reduce_shifted` and the exponent is
-//! scanned bit by bit, so both may be any length; pre-Osaka callers whose modulus exceeds
-//! the capacity get `error.ModulusTooLarge` from `modexp_checked` and must handle it.
+//! scanned bit by bit, so both may be any length; the static entry points return
+//! `error.ModulusTooLarge` above the capacity and callers must handle it.
+//! Pre-Osaka history has valid, affordable moduli above that bound, so the scratch entry
+//! points run the same code over slices (`scratch_limbs_needed` sizes them).
 //! Gas is pure arithmetic here (`gas_cost`); the evm lane owns charging it.
 //! `std.math.big` is used only as a test oracle.
 
@@ -185,6 +188,9 @@ pub fn precompile_modexp_parse(input: []const u8) ParseError!Parsed {
 
 pub const Error = error{ModulusTooLarge};
 
+/// Failures of the caller-provided-scratch entry points.
+pub const ScratchError = error{ ModulusTooLarge, ScratchTooSmall };
+
 fn window_for(exponent_bits: u64) u6 {
     if (exponent_bits > 239) return 5;
     if (exponent_bits > 79) return 4;
@@ -198,184 +204,263 @@ fn mask_top(limbs: []Limb, bits: u32) void {
     if (used != 0) limbs[limbs.len - 1] &= (@as(Limb, 1) << used) - 1;
 }
 
+/// Sanity cap on the modulus limb count (128 MiB): keeps every bit count inside u32. Gas for
+/// such a modulus exceeds any block gas limit by many orders of magnitude.
+const limbs_cap: u64 = 1 << 24;
+
+/// Limbs of the shared temporary pool for an n-limb modulus: `pow_odd` is the largest user
+/// (2n + 2 for products, 2^(window_bits_max - 1) table entries, squared, accumulator, one).
+fn pool_limbs(n: u64) u64 {
+    return (2 * n + 2) + table_entries * n + 3 * n;
+}
+
+/// Limbs of scratch `run_in` needs for an n-limb modulus: m, result, q, x1, x2 plus the pool.
+fn workspace_limbs(n: u64) u64 {
+    return 5 * n + pool_limbs(n);
+}
+
+/// u64 limbs of scratch that `precompile_modexp_run_with_scratch` needs for a modulus of
+/// `modulus_len` bytes (the operand length from the input header, so it can be sized from
+/// gas-bounded lengths before looking at the value). Saturates instead of overflowing.
+pub fn scratch_limbs_needed(modulus_len: u64) u64 {
+    const remainder = @intFromBool(modulus_len % bigint.limb_bytes != 0);
+    const limbs = modulus_len / bigint.limb_bytes + remainder;
+    assert(limbs <= modulus_len);
+    return workspace_limbs(@min(limbs, std.math.maxInt(u64) / 32));
+}
+
+comptime {
+    assert(workspace_limbs(1) == 26 + 2);
+    assert(workspace_limbs(limbs_max) == 26 * limbs_max + 2);
+}
+
+/// Writes (base ^ exponent) mod modulus, big endian, into `out` (`modulus.len` bytes), using
+/// `scratch` as the only working memory (no allocation, no recursion). The modulus needs
+/// `workspace_limbs(significant limbs)` limbs of scratch; `ModulusTooLarge` is returned
+/// above `capacity_bits` significant bits (or the sanity cap), `ScratchTooSmall` when
+/// `scratch` is short. Every other input is valid, so no assert depends on operand values.
+fn run_in(
+    base: Padded,
+    exponent: Padded,
+    modulus: Padded,
+    out: []u8,
+    scratch: []Limb,
+    capacity_bits: u64,
+) ScratchError!void {
+    assert(out.len == modulus.len);
+    assert(capacity_bits <= limbs_cap * 64);
+    @memset(out, 0);
+    const bits = modulus.bit_length();
+    if (bits == 0) return; // modulus zero: result zero by EVM rule
+    if (bits > capacity_bits) return error.ModulusTooLarge;
+    const n: usize = @intCast((bits + 63) / 64);
+    if (scratch.len < workspace_limbs(n)) return error.ScratchTooSmall;
+    const m = scratch[0..n];
+    const value = scratch[n .. 2 * n];
+    const pool = scratch[5 * n ..][0..pool_limbs(n)];
+    modulus.load_limbs(m);
+    if (bits == 1) return; // modulus one: everything is zero
+    if (exponent.bit_length() == 0) {
+        @memset(value, 0);
+        value[0] = 1;
+    } else if (m[0] & 1 == 1) {
+        pow_odd(value, base, exponent, m, pool);
+    } else {
+        const parts = scratch[2 * n .. 5 * n]; // q, x1, x2
+        pow_even(value, base, exponent, m, parts, pool);
+    }
+    bigint.to_be_bytes(out, value);
+}
+
+/// out = base ^ exponent mod m for odd m > 1; exponent non-zero. `pool` is `pool_limbs`.
+fn pow_odd(out: []Limb, base: Padded, exponent: Padded, m: []const Limb, pool: []Limb) void {
+    const n = m.len;
+    assert(m[0] & 1 == 1 and (n > 1 or m[0] > 1));
+    assert(out.len == n and pool.len >= pool_limbs(n));
+    const t = pool[0 .. 2 * n + 2]; // also the reducer's 2n + 1 scratch before first use
+    const table = pool[2 * n + 2 ..][0 .. table_entries * n]; // entry i at [i * n ..][0..n]
+    const squared = pool[(2 + table_entries) * n + 2 ..][0..n];
+    const acc = pool[(3 + table_entries) * n + 2 ..][0..n];
+    const one = pool[(4 + table_entries) * n + 2 ..][0..n];
+    const constant = bigint.montgomery_constant(m[0]);
+    // Montgomery form of the base: base * R mod m, R = 2^(64 n).
+    bigint.reduce_shifted(table[0..n], m, base, @intCast(n), t);
+    const bits = exponent.bit_length();
+    const window = window_for(bits);
+    if (window > 1) {
+        bigint.montgomery_sqr(squared, table[0..n], m, constant, t);
+        for (1..(@as(usize, 1) << (window - 1))) |index| {
+            const previous = table[(index - 1) * n ..][0..n];
+            const entry = table[index * n ..][0..n];
+            bigint.montgomery_mul(entry, previous, squared, m, constant, t);
+        }
+    }
+    exponentiate(acc, table, exponent, bits, window, m, constant, t);
+    // Leave Montgomery form: multiply by the plain integer 1.
+    @memset(one, 0);
+    one[0] = 1;
+    bigint.montgomery_mul(out, acc, one, m, constant, t);
+    assert(bigint.compare(out, m) == .lt);
+}
+
+/// Left-to-right sliding window over `bits` exponent bits (top bit set).
+fn exponentiate(
+    acc: []Limb,
+    table: []const Limb,
+    exponent: Padded,
+    bits: u64,
+    window: u6,
+    m: []const Limb,
+    constant: Limb,
+    t: []Limb,
+) void {
+    assert(bits > 0 and exponent.bit(bits - 1));
+    const n = m.len;
+    assert(table.len == table_entries * n);
+    var started = false;
+    var end = bits; // bits [0, end) remain; the loop runs at most `bits` times
+    while (end > 0) {
+        const top = end - 1;
+        if (!exponent.bit(top)) {
+            assert(started);
+            bigint.montgomery_sqr(acc, acc, m, constant, t);
+            end -= 1;
+            continue;
+        }
+        var low: u64 = if (top + 1 >= window) top + 1 - window else 0;
+        while (!exponent.bit(low)) low += 1;
+        var value: usize = 0;
+        var cursor = top + 1;
+        while (cursor > low) {
+            cursor -= 1;
+            value = (value << 1) | @intFromBool(exponent.bit(cursor));
+        }
+        assert(value & 1 == 1 and value < (@as(usize, 1) << window));
+        const entry = table[(value >> 1) * n ..][0..n];
+        if (started) {
+            for (0..top - low + 1) |_| bigint.montgomery_sqr(acc, acc, m, constant, t);
+            bigint.montgomery_mul(acc, acc, entry, m, constant, t);
+        } else {
+            @memcpy(acc, entry);
+            started = true;
+        }
+        end = low;
+    }
+    assert(started);
+}
+
+/// out = base ^ exponent mod 2^bits (square and multiply, truncated products). `pool`
+/// supplies two `out.len`-limb temporaries.
+fn pow_power_of_two(
+    out: []Limb,
+    base: Padded,
+    exponent: Padded,
+    bits: u32,
+    pool: []Limb,
+) void {
+    const count = out.len;
+    assert(count == (bits + 63) / 64 and pool.len >= 2 * count);
+    const b = pool[0..count];
+    const product = pool[count .. 2 * count];
+    for (b, 0..) |*limb, index| limb.* = base.limb_at(index);
+    mask_top(b, bits);
+    @memset(out, 0);
+    out[0] = 1;
+    mask_top(out, bits);
+    var cursor = exponent.bit_length();
+    while (cursor > 0) {
+        cursor -= 1;
+        bigint.mul_low(product, out, out);
+        @memcpy(out, product);
+        if (exponent.bit(cursor)) {
+            bigint.mul_low(product, out, b);
+            @memcpy(out, product);
+        }
+        mask_top(out, bits);
+    }
+}
+
+/// out = base ^ exponent mod m for even m: m = 2^k * q, CRT over q and 2^k. `parts` holds
+/// q, x1, x2 (n limbs each); `pool` is `pool_limbs(n)`.
+fn pow_even(
+    out: []Limb,
+    base: Padded,
+    exponent: Padded,
+    m: []const Limb,
+    parts: []Limb,
+    pool: []Limb,
+) void {
+    const n = m.len;
+    const k = bigint.trailing_zero_bits(m);
+    assert(k >= 1 and out.len == n and parts.len == 3 * n);
+    const q_full = parts[0..n];
+    bigint.shift_right_bits(q_full, m, k);
+    const q = q_full[0..bigint.trimmed_len(q_full)];
+    const k_limbs = (k + 63) / 64;
+    assert(k_limbs <= n);
+    const x2 = parts[2 * n ..][0..k_limbs];
+    pow_power_of_two(x2, base, exponent, k, pool);
+    if (q.len == 1 and q[0] == 1) { // m = 2^k
+        @memset(out, 0);
+        @memcpy(out[0..k_limbs], x2);
+        return;
+    }
+    const x1 = parts[n..][0..q.len];
+    pow_odd(x1, base, exponent, q, pool);
+    combine(out, x1, x2, q, k, pool);
+}
+
+/// out = x1 + q * ((x2 - x1) * q^-1 mod 2^k): the value mod q * 2^k congruent to
+/// x1 mod q and x2 mod 2^k. `pool` supplies 7 * x2.len limbs.
+fn combine(
+    out: []Limb,
+    x1: []const Limb,
+    x2: []const Limb,
+    q: []const Limb,
+    k: u32,
+    pool: []Limb,
+) void {
+    const k_limbs = x2.len;
+    assert(pool.len >= 7 * k_limbs and k_limbs > 0);
+    const inverse_input = pool[0..k_limbs];
+    const inverse = pool[k_limbs .. 2 * k_limbs];
+    const scratch = pool[2 * k_limbs .. 4 * k_limbs];
+    const difference = pool[4 * k_limbs .. 5 * k_limbs];
+    const x1_low = pool[5 * k_limbs .. 6 * k_limbs];
+    const t = pool[6 * k_limbs .. 7 * k_limbs];
+    for (inverse_input, 0..) |*limb, index| {
+        limb.* = if (index < q.len) q[index] else 0;
+    }
+    bigint.inverse_mod_pow2(inverse, inverse_input, scratch);
+    for (x1_low, 0..) |*limb, index| {
+        limb.* = if (index < x1.len) x1[index] else 0;
+    }
+    _ = bigint.sub(difference, x2, x1_low);
+    mask_top(difference, k);
+    bigint.mul_low(t, difference, inverse);
+    mask_top(t, k);
+    bigint.mul_low(out, q, t);
+    const carry = bigint.add_short(out, x1);
+    assert(carry == 0);
+}
+
+/// Static-capacity implementation: scratch lives on the stack, sized by `capacity_limbs`.
 pub fn Modexp(comptime capacity_limbs: u32) type {
+    comptime assert(capacity_limbs > 0 and capacity_limbs <= limbs_cap);
     return struct {
         pub const capacity_bytes = capacity_limbs * bigint.limb_bytes;
 
         /// Writes (base ^ exponent) mod modulus, big endian, into `out` (`modulus.len` bytes).
         pub fn run(base: Padded, exponent: Padded, modulus: Padded, out: []u8) Error!void {
-            assert(out.len == modulus.len);
-            @memset(out, 0);
-            const bits = modulus.bit_length();
-            if (bits == 0) return; // modulus zero: result zero by EVM rule
-            if (bits > capacity_limbs * 64) return error.ModulusTooLarge;
-            const count: u32 = @intCast((bits + 63) / 64);
-            var m_buffer: [capacity_limbs]Limb = undefined;
-            const m = m_buffer[0..count];
-            modulus.load_limbs(m);
-            if (bits == 1) return; // modulus one: everything is zero
-            var result: [capacity_limbs]Limb = undefined;
-            const value = result[0..count];
-            if (exponent.bit_length() == 0) {
-                @memset(value, 0);
-                value[0] = 1;
-            } else if (m[0] & 1 == 1) {
-                pow_odd(value, base, exponent, m);
-            } else {
-                pow_even(value, base, exponent, m);
-            }
-            bigint.to_be_bytes(out, value);
-        }
-
-        /// out = base ^ exponent mod m for odd m > 1; exponent non-zero.
-        fn pow_odd(out: []Limb, base: Padded, exponent: Padded, m: []const Limb) void {
-            const n = m.len;
-            assert(m[0] & 1 == 1 and (n > 1 or m[0] > 1));
-            var reduce_scratch: [2 * capacity_limbs + 1]Limb = undefined;
-            var t: [2 * capacity_limbs + 2]Limb = undefined;
-            var table: [table_entries][capacity_limbs]Limb = undefined;
-            const constant = bigint.montgomery_constant(m[0]);
-            // Montgomery form of the base: base * R mod m, R = 2^(64 n).
-            bigint.reduce_shifted(table[0][0..n], m, base, @intCast(n), &reduce_scratch);
-            const bits = exponent.bit_length();
-            const window = window_for(bits);
-            if (window > 1) {
-                var squared: [capacity_limbs]Limb = undefined;
-                const first = table[0][0..n];
-                bigint.montgomery_sqr(squared[0..n], first, m, constant, &t);
-                for (1..(@as(usize, 1) << (window - 1))) |index| {
-                    const previous = table[index - 1][0..n];
-                    const entry = table[index][0..n];
-                    bigint.montgomery_mul(entry, previous, squared[0..n], m, constant, &t);
+            var buffer: [workspace_limbs(capacity_limbs)]Limb = undefined;
+            const capacity_bits: u64 = capacity_limbs * 64;
+            // The modulus is checked against the capacity first, so scratch always suffices.
+            run_in(base, exponent, modulus, out, &buffer, capacity_bits) catch |err| {
+                switch (err) {
+                    error.ModulusTooLarge => return error.ModulusTooLarge,
+                    error.ScratchTooSmall => unreachable, // buffer covers capacity_limbs
                 }
-            }
-            var accumulator: [capacity_limbs]Limb = undefined;
-            const acc = accumulator[0..n];
-            exponentiate(acc, &table, exponent, bits, window, m, constant, &t);
-            // Leave Montgomery form: multiply by the plain integer 1.
-            var one: [capacity_limbs]Limb = @splat(0);
-            one[0] = 1;
-            bigint.montgomery_mul(out, acc, one[0..n], m, constant, &t);
-            assert(bigint.compare(out, m) == .lt);
-        }
-
-        /// Left-to-right sliding window over `bits` exponent bits (top bit set).
-        fn exponentiate(
-            acc: []Limb,
-            table: *const [table_entries][capacity_limbs]Limb,
-            exponent: Padded,
-            bits: u64,
-            window: u6,
-            m: []const Limb,
-            constant: Limb,
-            t: []Limb,
-        ) void {
-            assert(bits > 0 and exponent.bit(bits - 1));
-            const n = m.len;
-            var started = false;
-            var end = bits; // bits [0, end) remain; the loop runs at most `bits` times
-            while (end > 0) {
-                const top = end - 1;
-                if (!exponent.bit(top)) {
-                    assert(started);
-                    bigint.montgomery_sqr(acc, acc, m, constant, t);
-                    end -= 1;
-                    continue;
-                }
-                var low: u64 = if (top + 1 >= window) top + 1 - window else 0;
-                while (!exponent.bit(low)) low += 1;
-                var value: usize = 0;
-                var cursor = top + 1;
-                while (cursor > low) {
-                    cursor -= 1;
-                    value = (value << 1) | @intFromBool(exponent.bit(cursor));
-                }
-                assert(value & 1 == 1 and value < (@as(usize, 1) << window));
-                const entry = table[value >> 1][0..n];
-                if (started) {
-                    for (0..top - low + 1) |_| bigint.montgomery_sqr(acc, acc, m, constant, t);
-                    bigint.montgomery_mul(acc, acc, entry, m, constant, t);
-                } else {
-                    @memcpy(acc, entry);
-                    started = true;
-                }
-                end = low;
-            }
-            assert(started);
-        }
-
-        /// out = base ^ exponent mod 2^bits (square and multiply, truncated products).
-        fn pow_power_of_two(out: []Limb, base: Padded, exponent: Padded, bits: u32) void {
-            const count = out.len;
-            assert(count == (bits + 63) / 64 and count <= capacity_limbs);
-            var b_buffer: [capacity_limbs]Limb = undefined;
-            var product: [capacity_limbs]Limb = undefined;
-            const b = b_buffer[0..count];
-            for (b, 0..) |*limb, index| limb.* = base.limb_at(index);
-            mask_top(b, bits);
-            @memset(out, 0);
-            out[0] = 1;
-            mask_top(out, bits);
-            var cursor = exponent.bit_length();
-            while (cursor > 0) {
-                cursor -= 1;
-                bigint.mul_low(product[0..count], out, out);
-                @memcpy(out, product[0..count]);
-                if (exponent.bit(cursor)) {
-                    bigint.mul_low(product[0..count], out, b);
-                    @memcpy(out, product[0..count]);
-                }
-                mask_top(out, bits);
-            }
-        }
-
-        /// out = base ^ exponent mod m for even m: m = 2^k * q, CRT over q and 2^k.
-        fn pow_even(out: []Limb, base: Padded, exponent: Padded, m: []const Limb) void {
-            const k = bigint.trailing_zero_bits(m);
-            assert(k >= 1 and out.len == m.len);
-            var q_buffer: [capacity_limbs]Limb = undefined;
-            bigint.shift_right_bits(q_buffer[0..m.len], m, k);
-            const q = q_buffer[0..bigint.trimmed_len(q_buffer[0..m.len])];
-            const k_limbs = (k + 63) / 64;
-            var x2_buffer: [capacity_limbs]Limb = undefined;
-            const x2 = x2_buffer[0..k_limbs];
-            pow_power_of_two(x2, base, exponent, k);
-            if (q.len == 1 and q[0] == 1) { // m = 2^k
-                @memset(out, 0);
-                @memcpy(out[0..k_limbs], x2);
-                return;
-            }
-            var x1_buffer: [capacity_limbs]Limb = undefined;
-            const x1 = x1_buffer[0..q.len];
-            pow_odd(x1, base, exponent, q);
-            combine(out, x1, x2, q, k);
-        }
-
-        /// out = x1 + q * ((x2 - x1) * q^-1 mod 2^k): the value mod q * 2^k congruent to
-        /// x1 mod q and x2 mod 2^k.
-        fn combine(out: []Limb, x1: []const Limb, x2: []const Limb, q: []const Limb, k: u32) void {
-            const k_limbs = x2.len;
-            var inverse_input: [capacity_limbs]Limb = @splat(0);
-            for (inverse_input[0..k_limbs], 0..) |*limb, index| {
-                limb.* = if (index < q.len) q[index] else 0;
-            }
-            var inverse: [capacity_limbs]Limb = undefined;
-            var scratch: [2 * capacity_limbs]Limb = undefined;
-            bigint.inverse_mod_pow2(inverse[0..k_limbs], inverse_input[0..k_limbs], &scratch);
-            var difference: [capacity_limbs]Limb = undefined;
-            var x1_low: [capacity_limbs]Limb = @splat(0);
-            for (x1_low[0..k_limbs], 0..) |*limb, index| {
-                limb.* = if (index < x1.len) x1[index] else 0;
-            }
-            _ = bigint.sub(difference[0..k_limbs], x2, x1_low[0..k_limbs]);
-            mask_top(difference[0..k_limbs], k);
-            var t_buffer: [capacity_limbs]Limb = undefined;
-            const t = t_buffer[0..k_limbs];
-            bigint.mul_low(t, difference[0..k_limbs], inverse[0..k_limbs]);
-            mask_top(t, k);
-            bigint.mul_low(out, q, t);
-            const carry = bigint.add_short(out, x1);
-            assert(carry == 0);
+            };
         }
     };
 }
@@ -405,10 +490,45 @@ pub fn modexp(base: []const u8, exponent: []const u8, modulus: []const u8, out: 
     modexp_checked(base, exponent, modulus, out) catch unreachable; // length asserted above
 }
 
-/// Runs the precompile on parsed operands; `out` is the output (`modulus.len` bytes).
+/// Runs the precompile on parsed operands with the static 1024-byte capacity (Osaka bound,
+/// EIP-7823); `out` is the output (`modulus.len` bytes). Pre-Osaka calls whose modulus has
+/// more than `operand_bytes_max` significant bytes return `error.ModulusTooLarge`: use
+/// `precompile_modexp_run_with_scratch` for those. No assert is reachable from the operand
+/// bytes; the caller only has to size `out` from `parsed.modulus.len`.
 pub fn precompile_modexp_run(parsed: Parsed, out: []u8) Error!void {
     assert(out.len == parsed.modulus.len);
     return Default.run(parsed.base, parsed.exponent, parsed.modulus, out);
+}
+
+/// As `precompile_modexp_run` for any modulus length (pre-Osaka history), computing in the
+/// caller-provided `scratch` instead of the stack. Size it with `scratch_limbs_needed(
+/// parsed.modulus.len)` (gas bounds that length, so the EVM lane can size it from an arena or
+/// at startup). Returns `error.ScratchTooSmall` when `scratch` is shorter than the
+/// significant modulus needs, and `error.ModulusTooLarge` beyond the 128 MiB sanity cap.
+pub fn precompile_modexp_run_with_scratch(
+    parsed: Parsed,
+    out: []u8,
+    scratch: []Limb,
+) ScratchError!void {
+    assert(out.len == parsed.modulus.len);
+    return run_in(parsed.base, parsed.exponent, parsed.modulus, out, scratch, limbs_cap * 64);
+}
+
+/// Slice form of `precompile_modexp_run_with_scratch`.
+pub fn modexp_with_scratch(
+    base: []const u8,
+    exponent: []const u8,
+    modulus: []const u8,
+    out: []u8,
+    scratch: []Limb,
+) ScratchError!void {
+    assert(out.len == modulus.len);
+    const operands: [3]Padded = .{
+        Padded.from_slice(base),
+        Padded.from_slice(exponent),
+        Padded.from_slice(modulus),
+    };
+    return run_in(operands[0], operands[1], operands[2], out, scratch, limbs_cap * 64);
 }
 
 // ---------------------------------------------------------------- tests
@@ -722,5 +842,132 @@ test "modexp: seeded input fuzz never crashes and respects bounds" {
         }
         var smith: testing.Smith = .{ .in = input[0..length] };
         try fuzz_one({}, &smith);
+    }
+}
+
+fn expect_scratch_matches_oracle(
+    prng: *Prng,
+    base: []const u8,
+    exponent: []const u8,
+    modulus: []const u8,
+) !void {
+    const allocator = testing.allocator;
+    const got = try allocator.alloc(u8, modulus.len);
+    defer allocator.free(got);
+    const want = try allocator.alloc(u8, modulus.len);
+    defer allocator.free(want);
+    const scratch_len: usize = @intCast(scratch_limbs_needed(modulus.len));
+    const scratch = try allocator.alloc(Limb, scratch_len);
+    defer allocator.free(scratch);
+    prng.fill(std.mem.sliceAsBytes(scratch)); // stale garbage must not matter
+    try oracle_modexp(allocator, base, exponent, modulus, want);
+    try modexp_with_scratch(base, exponent, modulus, got, scratch);
+    testing.expectEqualSlices(u8, want, got) catch |err| {
+        std.debug.print("modexp mismatch: mod_len={d} exp={x}\n", .{ modulus.len, exponent });
+        return err;
+    };
+}
+
+test "modexp: pre-Osaka modulus of 1025 bytes (2^1024 * 1) computes 2^1 exactly" {
+    // lengths base=1 exp=1 mod=1025; base 02, exp 01, modulus 01 then 1024 zero bytes.
+    var input: [96 + 1 + 1 + 1025]u8 = @splat(0);
+    input[31] = 1;
+    input[63] = 1;
+    input[95] = 0x01; // mod_len = 0x401 = 1025
+    input[94] = 0x04;
+    input[96] = 0x02;
+    input[97] = 0x01;
+    input[98] = 0x01;
+    const parsed = try precompile_modexp_parse(&input);
+    try testing.expectEqual(@as(u64, 1025), parsed.modulus.len);
+    try testing.expectEqual(@as(u64, 5547), parsed.gas(.berlin));
+    try testing.expectError(error.InputTooLarge, parsed.check_osaka_limits());
+    var out: [1025]u8 = undefined;
+    try testing.expectError(error.ModulusTooLarge, precompile_modexp_run(parsed, &out));
+    const needed: usize = @intCast(scratch_limbs_needed(parsed.modulus.len));
+    const scratch = try testing.allocator.alloc(Limb, needed);
+    defer testing.allocator.free(scratch);
+    try precompile_modexp_run_with_scratch(parsed, &out, scratch);
+    var expected: [1025]u8 = @splat(0);
+    expected[1024] = 2;
+    try testing.expectEqualSlices(u8, &expected, &out);
+}
+
+test "modexp: scratch entry point rejects short scratch and agrees with the static path" {
+    var short: [4]Limb = undefined;
+    var out: [16]u8 = undefined;
+    const modulus: [16]u8 = .{0x80} ++ @as([14]u8, @splat(0)) ++ .{0x01};
+    try testing.expectError(
+        error.ScratchTooSmall,
+        modexp_with_scratch(&.{2}, &.{3}, &modulus, &out, &short),
+    );
+    // zero and one moduli need no scratch at all.
+    try modexp_with_scratch(&.{2}, &.{3}, &.{ 0, 0 }, out[0..2], short[0..0]);
+    var scratch: [workspace_limbs(2)]Limb = undefined;
+    try modexp_with_scratch(&.{2}, &.{3}, &modulus, &out, &scratch);
+    var again: [16]u8 = undefined;
+    modexp(&.{2}, &.{3}, &modulus, &again);
+    try testing.expectEqualSlices(u8, &again, &out);
+    try testing.expectEqual(workspace_limbs(1), scratch_limbs_needed(1));
+    try testing.expectEqual(workspace_limbs(128), scratch_limbs_needed(1024));
+    try testing.expectEqual(workspace_limbs(129), scratch_limbs_needed(1025));
+    _ = scratch_limbs_needed(std.math.maxInt(u64)); // saturates, never overflows
+}
+
+test "modexp: moduli of 1025..3000 bytes match the big-int oracle (odd and even)" {
+    var prng = Prng.init(0x62696767);
+    var base_buffer: [3200]u8 = undefined;
+    var exponent_buffer: [4]u8 = undefined;
+    var modulus_buffer: [3000]u8 = undefined;
+    for (0..24) |round| {
+        const extra: usize = if (round < 3) round else @intCast(prng.below(1976));
+        const modulus_len = 1025 + extra;
+        const base_len: usize = @intCast(prng.below(3201));
+        const exponent_len: usize = @intCast(1 + prng.below(3));
+        const base = random_operand(&prng, &base_buffer, base_len);
+        const exponent = random_operand(&prng, &exponent_buffer, exponent_len);
+        const modulus = modulus_buffer[0..modulus_len];
+        random_modulus(&prng, modulus);
+        if (round % 4 == 0) modulus[0] |= 0x80; // full width
+        if (round % 4 == 1) modulus[modulus_len - 1] |= 1; // odd
+        if (round % 4 == 2) modulus[modulus_len - 1] &= 0xfe; // even
+        try expect_scratch_matches_oracle(&prng, base, exponent, modulus);
+    }
+}
+
+test "modexp: scratch path handles wide even moduli, powers of two, and trailing zeros" {
+    var prng = Prng.init(0x7061646d);
+    var modulus: [1500]u8 = undefined;
+    var base: [1500]u8 = undefined;
+    prng.fill(&modulus);
+    prng.fill(&base);
+    modulus[0] |= 0x80;
+    const exponent = [_]u8{ 0x01, 0x00, 0x01 };
+    modulus[1499] |= 1;
+    try expect_scratch_matches_oracle(&prng, &base, &exponent, &modulus);
+    modulus[1499] &= 0xf0; // even: CRT with a 4-bit power of two
+    try expect_scratch_matches_oracle(&prng, &base, &exponent, &modulus);
+    @memset(modulus[1400..], 0); // 800 trailing zero bits
+    try expect_scratch_matches_oracle(&prng, &base, &exponent, &modulus);
+    @memset(modulus[1..], 0); // exactly 2^11992
+    try expect_scratch_matches_oracle(&prng, &base, &exponent, &modulus);
+}
+
+test "modexp: scratch path agrees with the static path up to 1024 bytes" {
+    var prng = Prng.init(0x73746174);
+    var base: [300]u8 = undefined;
+    var modulus_buffer: [1024]u8 = undefined;
+    var scratch: [workspace_limbs(limbs_max)]Limb = undefined;
+    for (0..40) |_| {
+        const modulus = modulus_buffer[0..@intCast(1 + prng.below(1024))];
+        random_modulus(&prng, modulus);
+        prng.fill(&base);
+        var exponent: [3]u8 = undefined;
+        prng.fill(&exponent);
+        var want: [1024]u8 = undefined;
+        var got: [1024]u8 = undefined;
+        modexp(&base, &exponent, modulus, want[0..modulus.len]);
+        try modexp_with_scratch(&base, &exponent, modulus, got[0..modulus.len], &scratch);
+        try testing.expectEqualSlices(u8, want[0..modulus.len], got[0..modulus.len]);
     }
 }

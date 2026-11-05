@@ -62,6 +62,19 @@ fallback but hot paths should be our own, optimized implementations.
   bitwise, so both may be any length (pre-Osaka). A modulus above capacity returns
   `error.ModulusTooLarge` from `modexp_checked` (pre-Osaka callers must handle it; `modexp`
   asserts instead). `Modexp(limbs)` is generic for a larger capacity.
+- modexp above the static capacity (2026-11-05): pre-Osaka history has valid, affordable moduli
+  over 1024 bytes (e.g. mod = 2^8192 costs 5547 gas under Berlin with 1-byte base/exponent),
+  so rejecting them forked from Base. The arithmetic is now written once over slices:
+  `run_in` partitions one flat `[]u64` scratch of `26 * limbs + 2` limbs (m, result, q, x1,
+  x2, and a shared pool for the 16-entry window table, squared, accumulator, products).
+  `Modexp(n)` just supplies a stack buffer, so the <= 1024-byte fast path is unchanged
+  apart from a flat table layout. `precompile_modexp_run_with_scratch` /
+  `modexp_with_scratch` take caller memory sized by `scratch_limbs_needed(modulus_len)`
+  (the header length, so the EVM lane can size an arena from gas-bounded lengths; crypto
+  never allocates). `ScratchTooSmall` and `ModulusTooLarge` (128 MiB sanity cap) are errors,
+  not asserts, so no operand value reaches an assert. `precompile_modexp_run` keeps its
+  contract (1024-byte capacity, `ModulusTooLarge` above); the EVM lane must pick the scratch
+  entry point for pre-Osaka moduli above `operand_bytes_max`.
 - modexp gas: pure helpers `adjusted_exponent_length`, `iteration_count`,
   `multiplication_complexity`, `gas_cost(rules, ...)` (byzantium/berlin/osaka, saturating
   u64) mirror revm's `modexp.rs`; `precompile_modexp_parse` returns `Padded` operands plus
@@ -117,3 +130,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: modexp (EIP-198/2565/7883/7823) + bigint: public geth vectors (22 incl. even moduli, gas for 3 rule sets), seeded differential fuzz vs std big ints, coverage fuzz; bench (ReleaseFast, M-series): 256-bit full exp 5.6us, 2048-bit e=65537 23.6us, 2048-bit full exp 2.52ms, 4096-bit e=65537 101us, 4096-bit full exp 21.9ms, 8192-bit e=65537 428us, even 2048-bit e=65537 24.4us.
 - 2026-11-05: secp256r1 P256VERIFY (EIP-7951) on montgomery.Field; vectors, differential fuzz vs std ecdsa, coverage fuzz; bench (ReleaseFast: verify 51-71us depending on machine load vs std 108us).
 - 2026-11-05: secp256k1: ecrecover/precompile 0x01, tx recovery (low s), RFC 6979 signing, public key/address; vectors, seeded differential fuzz vs std (mul, recovery, ecdsa verify), coverage fuzz of precompile vs std reference; bench (ReleaseFast, Apple M4, loaded host): ecrecover 28.8us (std verify 62us), sign 10.7us (std 75us), public_key 8.9us (std 65us).
+- 2026-11-05: modexp: pre-Osaka moduli above 1024 bytes via caller-provided scratch (`precompile_modexp_run_with_scratch`, `scratch_limbs_needed`); 1025-byte Berlin example (5547 gas) and differential fuzz vs std big ints for 1025..3000-byte odd/even moduli.
