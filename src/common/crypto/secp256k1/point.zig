@@ -249,6 +249,25 @@ const Projective = struct {
         return .{ .x = x3, .y = y3, .z = z3 };
     }
 
+    /// Complete doubling, RCB15 algorithm 9 (a = 0, b3 = 21). Correct for every
+    /// point including the identity.
+    fn dbl(a: Projective) Projective {
+        const t0 = a.y.sqr();
+        var z3 = t0.mul_small(8);
+        var t1 = a.y.mul(a.z);
+        var t2 = a.z.sqr().mul_small(21);
+        var x3 = t2.mul(z3);
+        var y3 = t0.add(t2);
+        z3 = t1.mul(z3);
+        t1 = t2.dbl();
+        t2 = t1.add(t2);
+        const t0_reduced = t0.sub(t2);
+        y3 = t0_reduced.mul(y3).add(x3);
+        t1 = a.x.mul(a.y);
+        x3 = t0_reduced.mul(t1).dbl();
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
     fn select(a: Projective, b: Projective, flag: u1) Projective {
         return .{
             .x = a.x.select(b.x, flag),
@@ -274,11 +293,9 @@ fn lookup(row: *const [table.gen_row_size]Affine, digit: i8) Affine {
     return result;
 }
 
-/// k G in constant time. Returns null only for k = 0. `blind` is a secret, uniformly
-/// random field element: the final inversion runs in variable time on Z * blind,
-/// which is independent of k, so its timing reveals nothing about k.
-pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
-    // Signed nibbles in [-8, 7] plus a final carry digit, so k = sum d_i 16^i.
+/// Signed nibbles in [-8, 7] plus a final carry digit, so k = sum d_i 16^i.
+/// Branch-free in k.
+fn signed_nibbles(k: Scalar) [table.gen_row_count]i8 {
     var digits: [table.gen_row_count]i8 = undefined;
     var carry: u8 = 0;
     for (0..64) |index| {
@@ -290,13 +307,14 @@ pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
     }
     digits[64] = @intCast(carry);
     assert(carry <= 1);
+    assert(digits.len == 65);
+    return digits;
+}
 
-    var acc = Projective.identity;
-    for (&table.gen_rows, digits) |*row, digit| {
-        const sum = acc.add_affine(lookup(row, digit));
-        acc = acc.select(sum, @intFromBool(digit != 0));
-    }
-    if (k.is_zero()) return null;
+/// Affine form of a constant-time projective result. The variable-time inversion
+/// runs on Z * blind, which is independent of the secret for a secret uniform blind.
+fn to_affine_blinded(acc: Projective, blind: Fe) Affine {
+    assert(!acc.z.is_zero());
     const z_inverse = if (blind.is_zero())
         acc.z.invert()
     else
@@ -307,4 +325,68 @@ pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
     };
     assert(on_curve(point));
     return point;
+}
+
+/// k G in constant time. Returns null only for k = 0. `blind` is a secret, uniformly
+/// random field element: the final inversion runs in variable time on Z * blind,
+/// which is independent of k, so its timing reveals nothing about k.
+pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
+    const digits = signed_nibbles(k);
+    var acc = Projective.identity;
+    for (&table.gen_rows, digits) |*row, digit| {
+        const sum = acc.add_affine(lookup(row, digit));
+        acc = acc.select(sum, @intFromBool(digit != 0));
+    }
+    if (k.is_zero()) return null;
+    return to_affine_blinded(acc, blind);
+}
+
+/// [P, 2P, ..., 8P] in affine form with one shared inversion. P is public.
+fn small_multiples_affine(base: Affine) [table.gen_row_size]Affine {
+    var jacobian: [table.gen_row_size]Jacobian = undefined;
+    jacobian[0] = Jacobian.from_affine(base);
+    for (1..jacobian.len) |index| jacobian[index] = jacobian[index - 1].add_affine(base);
+    // Prime order: iP for i <= 8 is never the identity.
+    var prefix: [table.gen_row_size]Fe = undefined;
+    var product = Fe.one;
+    for (jacobian, &prefix) |entry, *slot| {
+        assert(!entry.infinity);
+        slot.* = product;
+        product = product.mul(entry.z);
+    }
+    var inverse = Fe.from_int(FieldInverse.invert(product.to_int()));
+    var multiples: [table.gen_row_size]Affine = undefined;
+    var index: usize = jacobian.len;
+    while (index > 0) {
+        index -= 1;
+        const z_inverse = inverse.mul(prefix[index]);
+        inverse = inverse.mul(jacobian[index].z);
+        const z_inverse_squared = z_inverse.sqr();
+        multiples[index] = .{
+            .x = jacobian[index].x.mul(z_inverse_squared).normalize(),
+            .y = jacobian[index].y.mul(z_inverse_squared.mul(z_inverse)).normalize(),
+        };
+    }
+    assert(multiples[0].x.equal(base.x));
+    return multiples;
+}
+
+/// k P in constant time in k for a public curve point P (ECDH). Returns null only
+/// for k = 0. The table of P multiples is built in variable time (P is public); the
+/// digit loop uses complete formulas, full-row lookups, and no secret branches.
+/// `blind` has the same role as in `mul_generator_ct`.
+pub fn mul_ct(base: Affine, k: Scalar, blind: Fe) ?Affine {
+    assert(on_curve(base));
+    const multiples = small_multiples_affine(base);
+    const digits = signed_nibbles(k);
+    var acc = Projective.identity;
+    var index: usize = digits.len;
+    while (index > 0) {
+        index -= 1;
+        for (0..4) |_| acc = acc.dbl();
+        const sum = acc.add_affine(lookup(&multiples, digits[index]));
+        acc = acc.select(sum, @intFromBool(digits[index] != 0));
+    }
+    if (k.is_zero()) return null;
+    return to_affine_blinded(acc, blind);
 }

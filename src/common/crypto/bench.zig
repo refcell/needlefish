@@ -347,6 +347,45 @@ fn bench_public_key(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_verify(iterations: u32) u64 {
+    const hash: [32]u8 = @splat(0x42);
+    const signature = secp256k1.sign(bench_private_key, hash) catch unreachable;
+    var public = secp256k1.public_key(bench_private_key) catch unreachable;
+    var accumulator: u64 = 0;
+    for (0..iterations) |index| {
+        var digest = hash;
+        digest[0] = @truncate(index);
+        accumulator +%= @intFromBool(secp256k1.verify(digest, signature.r, signature.s, &public));
+    }
+    public[0] ^= @truncate(accumulator);
+    return accumulator +% public[0];
+}
+
+fn bench_ecdh(iterations: u32) u64 {
+    var private_key = bench_private_key;
+    const public = secp256k1.public_key(bench_private_key) catch unreachable;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const shared = secp256k1.ecdh(private_key, &public) catch unreachable;
+        private_key[31] = shared[32] | 1;
+        accumulator +%= shared[1];
+    }
+    return accumulator;
+}
+
+fn bench_ecdh_std(iterations: u32) u64 {
+    var private_key = bench_private_key;
+    const public = std.crypto.ecc.Secp256k1.basePoint.mul(bench_private_key, .big) catch
+        unreachable;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const shared = (public.mul(private_key, .big) catch unreachable).toCompressedSec1();
+        private_key[31] = shared[32] | 1;
+        accumulator +%= shared[1];
+    }
+    return accumulator;
+}
+
 const StdEcdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
 fn bench_public_key_std(iterations: u32) u64 {
@@ -572,7 +611,10 @@ pub const cases = [_]Case{
     .{ .name = "blake2f/12 rounds", .iterations = 1_000_000, .run = bench_blake2f_12 },
     .{ .name = "blake2b/128B (std)", .iterations = 1_000_000, .run = bench_blake2b_128_std },
     .{ .name = "secp256k1/ecrecover", .iterations = 20_000, .run = bench_ecrecover },
+    .{ .name = "secp256k1/verify", .iterations = 20_000, .run = bench_verify },
     .{ .name = "secp256k1/verify (std)", .iterations = 5_000, .run = bench_verify_std },
+    .{ .name = "secp256k1/ecdh", .iterations = 10_000, .run = bench_ecdh },
+    .{ .name = "secp256k1/ecdh (std)", .iterations = 5_000, .run = bench_ecdh_std },
     .{ .name = "secp256k1/sign", .iterations = 20_000, .run = bench_sign },
     .{ .name = "secp256k1/sign (std)", .iterations = 5_000, .run = bench_sign_std },
     .{ .name = "secp256k1/public_key", .iterations = 20_000, .run = bench_public_key },

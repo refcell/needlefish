@@ -44,6 +44,17 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] fuzz campaigns: first pass done (keccak 1.4M runs, every other target 20K, ReleaseSafe,
   no failures). Note: one `--fuzz` run spends its budget on a single test, so run each target
   with its own `-Dtest-filter`. Longer runs pending lower host load.
+- [x] secp256k1 p2p API (base/base discv5/ENR/libp2p use k256/secp256k1 for these):
+  `compress_public_key`, `decompress_public_key`, `decode_public_key`, `verify` (plain ECDSA,
+  accepts high s like std; `is_low_s` for libsecp/k256 semantics), `ecdh` (discv5: compressed
+  shared point, constant time via `point.mul_ct`). verify 24us (std 63us), ecdh 29us (std 69us).
+- [ ] constant-time audit of secret paths (sign, public_key, ecdh, P256 has none secret, BLS
+  none): advisor review + a dudect-style timing smoke test on fixed vs random secrets.
+- [ ] sha256: check whether ARMv8 SHA2 instructions (sha256h/sha256su) via inline asm beat
+  the portable path (sha256 precompile, KZG challenge, discv5/libp2p hashing).
+- [ ] secp256k1 batch ecrecover for block sender recovery: shared batch inversion of the
+  final Z across N signatures (expected ~5%); only if the node lane recovers in batches.
+- [ ] ecdh via constant-time GLV (two 128-bit halves, half the doublings): ~29us -> ~18us.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -320,3 +331,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: added coverage fuzz for cell recovery (arbitrary indices/cells never crash; recovered cells canonical); 3K ReleaseSafe runs clean.
 - 2026-11-05: montgomery.pow sliding window (w=5, public exponents): bls map_fp_to_g1 34->31.8us, bls inverse_constant_time 13.8->11.1us, bn254 5.8->5.2us.
 - 2026-11-05: cell verify cost model (128 cells, 12.1 ms): ~5 ms proof decompression (sqrt ~15 us + subgroup check ~25 us each; no sound batched subgroup check because G1 cofactor has small factors), ~5 ms two 128-point MSMs, 1.3 ms 64-point MSM, 0.5 ms pairing. A 6-blob v1 sidecar is ~70-80 ms. No further work planned.
+- 2026-11-05: secp256k1 SEC1 encode/decode, plain verify, constant-time ecdh (`point.mul_ct`, RCB15 complete doubling) with std-oracle tests and a coverage fuzz target. BLS signatures (sign/aggregate) not added: base/base uses BLS12-381 only for the EIP-2537 precompiles, not p2p/consensus.

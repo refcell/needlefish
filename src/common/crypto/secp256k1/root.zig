@@ -2,7 +2,8 @@
 //! RFC 6979 deterministic signing, and private key -> public key -> address.
 //!
 //! Recovery runs on public data in variable time (GLV + wNAF Strauss-Shamir).
-//! Signing and key derivation touch secrets and use the constant-time path.
+//! Signing, key derivation, and ECDH touch secrets and use the constant-time path.
+//! Plain ECDSA verification and SEC1 key encoding serve p2p (discv5, ENR, libp2p).
 //! Mirrors the k256/libsecp256k1 behavior that base/base relies on through revm and
 //! alloy: r and s must be in [1, n - 1]; only transaction signatures demand low s.
 
@@ -31,7 +32,11 @@ pub const Signature = struct {
     recovery_id: u2,
 };
 
+/// SEC1 compressed public key: 0x02 / 0x03 (y parity) || x, big-endian.
+pub const CompressedPublicKey = [33]u8;
+
 pub const Error = error{InvalidPrivateKey};
+pub const EcdhError = Error || error{InvalidPublicKey};
 
 comptime {
     // r + n can only be a valid abscissa when r < p - n.
@@ -137,6 +142,82 @@ pub fn public_key(private_key: [32]u8) Error!PublicKey {
     return encode_public_key(public);
 }
 
+/// The curve point of an uncompressed key, or null when x or y is not below p or
+/// the point is not on the curve.
+pub fn decode_public_key(public: *const PublicKey) ?Affine {
+    const x = Fe.from_bytes(public[0..32]) orelse return null;
+    const y = Fe.from_bytes(public[32..64]) orelse return null;
+    const result: Affine = .{ .x = x, .y = y };
+    if (!point.on_curve(result)) return null;
+    assert(!x.is_zero() or !y.is_zero());
+    return result;
+}
+
+/// SEC1 compression of a valid uncompressed key, or null for an invalid key.
+pub fn compress_public_key(public: *const PublicKey) ?CompressedPublicKey {
+    const decoded = decode_public_key(public) orelse return null;
+    var compressed: CompressedPublicKey = undefined;
+    compressed[0] = if (decoded.y.is_odd()) 0x03 else 0x02;
+    compressed[1..33].* = public[0..32].*;
+    assert(compressed[0] == 0x02 or compressed[0] == 0x03);
+    return compressed;
+}
+
+/// SEC1 decompression, or null for a bad prefix, x >= p, or x off the curve.
+pub fn decompress_public_key(compressed: *const CompressedPublicKey) ?PublicKey {
+    if (compressed[0] != 0x02 and compressed[0] != 0x03) return null;
+    const x = Fe.from_bytes(compressed[1..33]) orelse return null;
+    const decoded = point.decompress(x, compressed[0] == 0x03) orelse return null;
+    assert(point.on_curve(decoded));
+    return encode_public_key(decoded);
+}
+
+/// s in [1, n / 2] (EIP-2 / libsecp256k1 normalized form).
+pub fn is_low_s(s_bytes: [32]u8) bool {
+    const s = Scalar.from_bytes(&s_bytes) orelse return false;
+    if (s.is_zero()) return false;
+    return !s.is_high();
+}
+
+/// ECDSA verification of (r, s) over a 32-byte hash against a known key, in variable
+/// time (all inputs public). Accepts r and s in [1, n - 1], high s included, like
+/// `std.crypto`. libsecp256k1 and k256 reject high s, so callers mirroring them check
+/// `is_low_s` first.
+pub fn verify(hash: [32]u8, r_bytes: [32]u8, s_bytes: [32]u8, public: *const PublicKey) bool {
+    const q = decode_public_key(public) orelse return false;
+    const r = Scalar.from_bytes(&r_bytes) orelse return false;
+    const s = Scalar.from_bytes(&s_bytes) orelse return false;
+    if (r.is_zero() or s.is_zero()) return false;
+    const z = Scalar.from_bytes_reduce(&hash);
+    const s_inverse = Scalar.from_int(ScalarInverse.invert(s.to_int()));
+    const sum = point.mul_double_var(z.mul(s_inverse), r.mul(s_inverse), q);
+    if (sum.infinity) return false;
+    // x(R) = X / Z^2; compare r Z^2 (and (r + n) Z^2 when r + n < p) with X, no inversion.
+    const z_squared = sum.z.sqr();
+    const x = sum.x.normalize();
+    const r_int = r.to_int();
+    if (Fe.from_int(r_int).mul(z_squared).normalize().equal(x)) return true;
+    if (r_int >= field.p_int - scalar.n_int) return false;
+    assert(r_int + scalar.n_int < field.p_int);
+    return Fe.from_int(r_int + scalar.n_int).mul(z_squared).normalize().equal(x);
+}
+
+/// ECDH as discv5 defines it: the SEC1 compressed encoding of private_key * public
+/// (no hashing of the shared point). Constant time in the private key.
+pub fn ecdh(private_key: [32]u8, public: *const PublicKey) EcdhError!CompressedPublicKey {
+    const d = try private_scalar(&private_key);
+    const q = decode_public_key(public) orelse return error.InvalidPublicKey;
+    var blind_bytes: [32]u8 = undefined;
+    var mac = NonceGenerator.Hmac.init(&private_key);
+    mac.update("secp256k1 ecdh blinding");
+    mac.update(public);
+    mac.final(&blind_bytes);
+    const shared = point.mul_ct(q, d, Fe.from_bytes_unchecked(&blind_bytes)) orelse
+        unreachable; // d != 0
+    const encoded = encode_public_key(shared);
+    return compress_public_key(&encoded) orelse unreachable; // shared is on the curve.
+}
+
 /// Ethereum address of a private key.
 pub fn address(private_key: [32]u8) Error!Address {
     const public = try public_key(private_key);
@@ -240,4 +321,5 @@ pub fn sign(private_key: [32]u8, hash: [32]u8) Error!Signature {
 test {
     std.testing.refAllDecls(@This());
     _ = @import("tests.zig");
+    _ = @import("sec1_ecdh_tests.zig");
 }

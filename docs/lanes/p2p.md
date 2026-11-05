@@ -301,3 +301,4 @@ behind a small interface and switch later.
 - 2026-11-05: dial/inbound error reasons; transport now passes real peer IPs to the gater.
 - 2026-11-05: peer score and connection duration histograms.
 - 2026-11-05: gossip event, topic retirement, and blocked-topic metrics.
+- 2026-11-05 (crypto lane): `common.crypto.secp256k1` now has everything `peers/secp256k1.zig` takes from std: `compress_public_key`/`decompress_public_key`, `verify` (accepts high s like std; `is_low_s` available), `ecdh` (compressed shared point, constant time), `sign` (RFC 6979, low s), `public_key`. verify 24us vs std 63us, ecdh 29us vs 69us, sign 11us vs 74us, public_key 9us vs 67us.
