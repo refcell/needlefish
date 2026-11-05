@@ -33,8 +33,13 @@ behind a small interface and switch later.
   streams/windows). Interop vectors; fuzz each codec.
 - [x] `libp2p`: IO-free connection pipeline (`connection.zig`): multistream -> noise ->
   multistream -> yamux, per-stream meshsub/identify/ping, fuzzed.
-- [ ] `libp2p`: TCP transport over utilities/io (`transport.zig`, `Transport(IO)`) feeding
-  `p2p.Service`; SimIo DST; interop test against a real go/rust libp2p peer.
+- [x] `libp2p`: TCP transport over utilities/io (`transport.zig`, `Transport(IO)`) feeding
+  `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
+  partition heal, 16-seed sweep behind `-Dslow-tests`).
+- [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
+- [ ] io asks (io lane): `shutdown(fd)` so closing never races a pending recv, and UDP
+  (`open_socket_udp`, `recvfrom`, `sendto`) so discv5 runs over io; then wire
+  `Service.on_datagram`/`pop_datagram` into the transport.
 - [ ] `libp2p`: yamux go-away handling; backpressure instead of `buffer_overflow` when a
   caller never flushes.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
@@ -58,8 +63,8 @@ behind a small interface and switch later.
 - [x] `Service` (`service.zig`): IO-free state machine tying disc + gater + connection
   limits + block gossip; dials every valid discovered record, bans peers under -100 for
   1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
-- [ ] `Service` DST: 5+ node cluster over the libp2p `connection.zig` byte pipeline with
-  latency, loss, and partitions (seeded, `-Dslow-tests` for the big one).
+- [ ] `Service` DST: grow `transport_test.zig` to 8 nodes with connection resets
+  (`reset_ppm`), crash/restart, and a sequencer publishing a block every 2 s.
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
@@ -175,6 +180,14 @@ behind a small interface and switch later.
   meshsub stream per peer (second reset). Identify key mismatch closes. Gossip frame
   slices live until the next receive/tick after all gossip events are popped.
 
+- Transport: one recv + one send in flight per link, 16 KiB socket buffers, timer 50 ms
+  drives `Service.tick`. Gossip is drained from the router only when a full frame fits
+  the connection's send queue (2 frames), so the router never drops a block. Closing uses
+  `close_now` and quarantines the link until in-flight completions return (noise makes a
+  stale read on a reused fd a liveness, not safety, issue). Simultaneous dials: both
+  sides keep the connection dialed by the smaller peer id. Time is `now_realtime_ns`
+  (block validity needs wall time).
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -201,3 +214,4 @@ behind a small interface and switch later.
 - 2026-11-05: `Service` orchestrator with score bans and end-to-end block test.
 - 2026-11-05: vectorized ChaCha20 for noise (2.1x transport throughput).
 - 2026-11-05: libp2p connection pipeline (worker, 1624507).
+- 2026-11-05: TCP transport over utilities/io; SimIo cluster gossips blocks end to end.
