@@ -132,6 +132,8 @@ test "block gossip: a signed block reaches every node and is delivered once" {
     for (net.gossips[1..]) |gossip| {
         try std.testing.expectEqual(@as(u64, 1), gossip.stats.accepted);
         try std.testing.expectEqual(@as(u64, 1), gossip.stats.versions[2]); // Ecotone: v3.
+        try std.testing.expectEqual(@as(u64, 1), gossip.router.stats.message);
+        try std.testing.expect(gossip.router.stats.subscribed > 0);
         const envelope = gossip.pop_block(scratch).?;
         try std.testing.expectEqual(@as(u64, 7), envelope.payload.block_number);
         try std.testing.expect(envelope.payload.block_hash.eql(value.block_hash));
@@ -180,4 +182,6 @@ test "block gossip: old topics retire after their fork leaves the age window" {
     value.version = .v2;
     const result = gossip.publish(net.secret, null, value, net.now_ns);
     try std.testing.expectError(error.NotSubscribed, result);
+    try std.testing.expectEqual([4]u64{ 1, 1, 0, 0 }, gossip.stats.retirements);
+    try std.testing.expectEqual([4]u64{ 0, 1, 0, 0 }, gossip.stats.blocked_outbound);
 }

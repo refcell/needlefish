@@ -21,7 +21,7 @@ test "p2p metrics: register, update, and render" {
     var fixture: Fixture = undefined;
     try fixture.init();
     defer fixture.deinit();
-    var registry: metrics.Registry(64) = .{};
+    var registry: metrics.Registry(128) = .{};
     var cells: p2p_metrics.Metrics = .{};
     try cells.register(&registry);
     try testing.expectEqual(@as(u32, p2p_metrics.Metrics.entries_count), registry.count);
@@ -50,6 +50,12 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_inbound_connection_error{type=\"blocked_peer\"} 0\n");
     try expect_contains(text, "base_node_p2p_bytes_received 120\n");
     try expect_contains(text, "# TYPE base_node_peer_scores histogram\n");
+    try expect_contains(text, "base_node_gossip_event{type=\"slow_peer\"} 0\n");
+    try expect_contains(text, "base_node_block_topic_retirements_total{version=\"v3\"} 0\n");
+    try expect_contains(
+        text,
+        "base_node_block_topic_blocked_total{version=\"v1\",direction=\"outbound\"} 0\n",
+    );
     try expect_contains(text, "base_node_peer_scores_count 1\n");
     try expect_contains(
         text,

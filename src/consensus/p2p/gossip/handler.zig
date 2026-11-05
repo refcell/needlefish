@@ -60,6 +60,10 @@ pub const Stats = struct {
     versions: [versions.len]u64 = @splat(0),
     /// Validation failures per reason (base/base `block_validation_failed`).
     failed: [std.meta.fieldNames(validity.Reason).len]u64 = @splat(0),
+    /// Topics unsubscribed after their fork left the age window, per version.
+    retirements: [versions.len]u64 = @splat(0),
+    /// Local publishes refused because the version's topic is retired, per version.
+    blocked_outbound: [versions.len]u64 = @splat(0),
 };
 
 pub const BlockGossip = struct {
@@ -243,8 +247,12 @@ pub const BlockGossip = struct {
         payload: block.ExecutionPayload,
         now_ns: u64,
     ) PublishError!Id {
-        const topic = gossip.topics[@backingInt(payload.version) - 1];
-        if (!gossip.router.is_subscribed(topic)) return error.NotSubscribed;
+        const index = @backingInt(payload.version) - 1;
+        const topic = gossip.topics[index];
+        if (!gossip.router.is_subscribed(topic)) {
+            gossip.stats.blocked_outbound[index] += 1;
+            return error.NotSubscribed;
+        }
         if (block.signed_length(payload) > publish_size_max) return error.TooLarge;
         const message = try block.encode_signed(
             gossip.chain_id,
@@ -272,11 +280,13 @@ pub const BlockGossip = struct {
     /// rejoined, even if the clock moves backwards. Returns how many were retired.
     pub fn retire_topics(gossip: *BlockGossip, now_ns: u64) u32 {
         var retired: u32 = 0;
-        for (versions, gossip.topics) |version, topic| {
+        for (versions, gossip.topics, 0..) |version, topic, index| {
             if (!block.is_topic_retired(gossip.validator.config, version, now_ns / ns_per_s)) {
                 continue;
             }
-            if (gossip.router.unsubscribe(topic, now_ns)) retired += 1;
+            if (!gossip.router.unsubscribe(topic, now_ns)) continue;
+            gossip.stats.retirements[index] += 1;
+            retired += 1;
         }
         assert(retired <= versions.len);
         return retired;

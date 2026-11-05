@@ -147,8 +147,11 @@ const Peer = struct {
             peer.queue_count > 0 or peer.idontwant_out_count > 0;
     }
 
-    fn enqueue(peer: *Peer, id: *const Id) void {
-        if (peer.queue_count == queue_max) {
+    /// Queues `id` for sending. Returns true when the queue was full and the oldest
+    /// message was dropped (a slow peer).
+    fn enqueue(peer: *Peer, id: *const Id) bool {
+        const full = peer.queue_count == queue_max;
+        if (full) {
             // Slow peer: drop the oldest queued message.
             peer.queue_head = (peer.queue_head + 1) % queue_max;
             peer.queue_count -= 1;
@@ -157,6 +160,7 @@ const Peer = struct {
         peer.queue[(peer.queue_head + peer.queue_count) % queue_max] = id.*;
         peer.queue_count += 1;
         assert(peer.queue_count <= queue_max);
+        return full;
     }
 };
 
@@ -185,7 +189,20 @@ const Topic = struct {
 const Rpc = rpc.RpcDefault;
 const limits: rpc.Limits = .{};
 
+/// Gossip events (base/base `gossip_event{type}`) and per-topic drops.
+pub const Stats = struct {
+    /// New (non-duplicate) messages received on subscribed topics.
+    message: u64 = 0,
+    subscribed: u64 = 0,
+    unsubscribed: u64 = 0,
+    /// Messages dropped from a full per-peer send queue.
+    slow_peer: u64 = 0,
+    /// Messages received on a known topic we are not (or no longer) subscribed to.
+    blocked_inbound: [topics_max]u64 = @splat(0),
+};
+
 pub const Router = struct {
+    stats: Stats = .{},
     config: Config,
     random: std.Random,
     peers: []Peer,
@@ -527,8 +544,10 @@ pub const Router = struct {
         const target = router.peer(slot);
         const mask = @as(u8, 1) << @intCast(topic);
         if (sub_opts.subscribe orelse false) {
+            router.stats.subscribed += @intFromBool(target.topics & mask == 0);
             target.topics |= mask;
         } else {
+            router.stats.unsubscribed += @intFromBool(target.topics & mask != 0);
             target.topics &= ~mask;
             if (in_set(router.mesh[topic], slot)) router.mesh_remove(slot, topic);
         }
@@ -537,11 +556,15 @@ pub const Router = struct {
     fn on_message(router: *Router, slot: Slot, message: rpc.Message, now_ns: u64) void {
         const name = message.topic orelse return;
         const topic = router.topic_index(name) orelse return;
-        if (!router.topics[topic].subscribed) return;
+        if (!router.topics[topic].subscribed) {
+            router.stats.blocked_inbound[topic] += 1;
+            return;
+        }
         const data = message.data orelse &.{};
         if (data.len > router.config.message_size_max) return;
         const id = router.config.message_id(router.config.message_id_context, name, data);
         if (!router.seen.insert(&id, now_ns)) return router.on_duplicate(slot, &id, now_ns);
+        router.stats.message += 1;
         router.fulfil_promises(&id);
         _ = router.cache.put(&id, topic, data, false) orelse return;
         if (data.len > router.config.idontwant_size_min) {
@@ -658,7 +681,7 @@ pub const Router = struct {
             const delivery = router.find_delivery(id) orelse continue;
             if (in_set(delivery.peers, slot)) continue;
             delivery.peers |= bit(slot);
-            target.enqueue(id);
+            router.stats.slow_peer += @intFromBool(target.enqueue(id));
         }
     }
 
@@ -717,7 +740,7 @@ pub const Router = struct {
         while (targets != 0) : (targets &= targets - 1) {
             const target = &router.peers[@ctz(targets)];
             if (target.does_not_want(&delivery.id)) continue;
-            target.enqueue(&delivery.id);
+            router.stats.slow_peer += @intFromBool(target.enqueue(&delivery.id));
         }
     }
 
@@ -747,7 +770,7 @@ pub const Router = struct {
             delivery.peers = router.pick_random(eligible, router.config.d);
             var targets = delivery.peers;
             while (targets != 0) : (targets &= targets - 1) {
-                router.peers[@ctz(targets)].enqueue(&id);
+                router.stats.slow_peer += @intFromBool(router.peers[@ctz(targets)].enqueue(&id));
             }
         }
         router.forward(&delivery);

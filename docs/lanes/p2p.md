@@ -47,8 +47,10 @@ behind a small interface and switch later.
 - [x] metrics parity: `peer_scores` and `gossip_peer_connection_duration_seconds` histograms,
   observed on every ping and on disconnect (as base/base) into plain service buckets
   (`observations.zig`), copied into `metrics.Histogram` by `update`.
-- [ ] metrics parity: `gossip_event{type}`, `block_topic_retirements_total{version}`,
-  `block_topic_blocked_total{version,direction}`.
+- [x] metrics parity: `gossip_event{type}`, `block_topic_retirements_total{version}`,
+  `block_topic_blocked_total{version,direction}` from new `Router.stats` (message, peer
+  subscribe/unsubscribe, slow-peer queue drops, inbound on unsubscribed topics) and handler
+  stats (retirements, refused publishes). `not_supported` stays 0 (transport closes such peers).
 - [ ] DST: discovery-only swarm (16 nodes, one ENR bootnode, no enode dial) converges over SimIo
   UDP with `datagram_loss_ppm` and a healed partition (`-Dslow-tests`).
 - [ ] DST: 10% datagram loss; discv5 handshakes and lookups still fill tables (retry paths).
@@ -298,3 +300,4 @@ behind a small interface and switch later.
 - 2026-11-05: validation failure reasons and block versions as labeled metrics.
 - 2026-11-05: dial/inbound error reasons; transport now passes real peer IPs to the gater.
 - 2026-11-05: peer score and connection duration histograms.
+- 2026-11-05: gossip event, topic retirement, and blocked-topic metrics.

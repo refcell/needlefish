@@ -6,7 +6,8 @@
 //! touch atomics. Call `update` before serving a scrape, or on every service tick.
 //! Label sets follow base/base. `block_validation_*` count decoded envelopes only (decode
 //! failures are rejected before validation, as in base/base); validation duration is not
-//! exported because the state machines have no wall clock.
+//! exported because the state machines have no wall clock. `gossip_event{type="not_supported"}`
+//! stays 0: peers without gossipsub fail stream negotiation and are closed by the transport.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -47,6 +48,24 @@ const dial_error_labels = type_labels(dial_errors);
 const inbound_errors = std.meta.fieldNames(service_module.InboundError);
 const inbound_error_labels = type_labels(inbound_errors);
 
+const gossip_events = [_][:0]const u8{
+    "message", "subscribed", "unsubscribed", "slow_peer", "not_supported",
+};
+const gossip_event_labels = type_labels(&gossip_events);
+/// base/base registers retirements for the versions that can retire (v4 is current).
+const retirable_versions = 3;
+const directions = [_][]const u8{ "inbound", "outbound" };
+const blocked_labels = labels: {
+    var labels: [versions.len * directions.len][2]metrics.Label = undefined;
+    for (versions, 0..) |version, v| {
+        for (directions, 0..) |direction, d| labels[v * directions.len + d] = .{
+            .{ .name = "version", .value = version },
+            .{ .name = "direction", .value = direction },
+        };
+    }
+    break :labels labels;
+};
+
 fn type_labels(comptime names: []const [:0]const u8) [names.len][1]metrics.Label {
     var labels: [names.len][1]metrics.Label = undefined;
     for (names, &labels) |name, *label| label.* = .{.{ .name = "type", .value = name }};
@@ -81,11 +100,15 @@ pub const Metrics = struct {
     block_version: [versions.len]Counter = @splat(.{}),
     p2p_bytes_received: Counter = .{},
     p2p_bytes_sent: Counter = .{},
+    gossip_event: [gossip_events.len]Gauge = @splat(.{}),
+    block_topic_retirements_total: [retirable_versions]Counter = @splat(.{}),
+    block_topic_blocked_total: [versions.len * directions.len]Counter = @splat(.{}),
     peer_scores: metrics.Histogram = .init(&observations.score_bounds),
     connection_duration: metrics.Histogram = .init(&observations.duration_bounds_s),
 
     pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len +
-        dial_errors.len + inbound_errors.len + 2;
+        dial_errors.len + inbound_errors.len + 2 + gossip_events.len + retirable_versions +
+        versions.len * directions.len;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -130,6 +153,7 @@ pub const Metrics = struct {
             });
         }
         try self.register_validation(registry);
+        try self.register_topics(registry);
         try registry.register(.{
             .name = "base_node_peer_scores",
             .help = "Observations of peer scores in the gossipsub mesh",
@@ -148,6 +172,51 @@ pub const Metrics = struct {
             &self.p2p_bytes_sent,
         );
         assert(registry.count - count_before == entries_count);
+    }
+
+    fn register_topics(self: *Metrics, registry: anytype) metrics.RegisterError!void {
+        const count_before = registry.count;
+        try register_typed(registry, "base_node_gossip_event", "Events received by the " ++
+            "gossip protocol", &self.gossip_event, &gossip_event_labels);
+        const retirements = &self.block_topic_retirements_total;
+        for (retirements, version_labels[0..retirable_versions]) |*counter, *labels| {
+            try registry.register(.{
+                .name = "base_node_block_topic_retirements_total",
+                .help = "Block topic subscriptions removed at runtime after their fork " ++
+                    "grace period",
+                .labels = labels,
+                .metric = .{ .counter = counter },
+            });
+        }
+        for (&self.block_topic_blocked_total, &blocked_labels) |*counter, *labels| {
+            try registry.register(.{
+                .name = "base_node_block_topic_blocked_total",
+                .help = "Block messages blocked by topic retirement or a removed subscription",
+                .labels = labels,
+                .metric = .{ .counter = counter },
+            });
+        }
+        const expected = gossip_events.len + retirable_versions + blocked_labels.len;
+        assert(registry.count - count_before == expected);
+    }
+
+    fn update_topics(self: *Metrics, service: *const Service) void {
+        const gossip = service.gossip;
+        const events = &gossip.router.stats;
+        const counts = [gossip_events.len]u64{
+            events.message, events.subscribed, events.unsubscribed, events.slow_peer, 0,
+        };
+        for (&self.gossip_event, counts) |*gauge, count| gauge.set(@intCast(count));
+        for (&self.block_topic_retirements_total, 0..) |*counter, version| {
+            store(counter, gossip.stats.retirements[version]);
+        }
+        for (gossip.topics, 0..) |topic, version| {
+            const inbound = &self.block_topic_blocked_total[version * directions.len];
+            store(inbound, events.blocked_inbound[topic]);
+            const outbound = &self.block_topic_blocked_total[version * directions.len + 1];
+            store(outbound, gossip.stats.blocked_outbound[version]);
+        }
+        assert(gossip.topics.len == versions.len);
     }
 
     fn register_validation(self: *Metrics, registry: anytype) metrics.RegisterError!void {
@@ -216,6 +285,7 @@ pub const Metrics = struct {
         store(&self.p2p_bytes_received, transport.bytes_received);
         store(&self.p2p_bytes_sent, transport.bytes_sent);
         copy_histogram(&self.peer_scores, &service.stats.peer_scores);
+        self.update_topics(service);
         copy_histogram(&self.connection_duration, &service.stats.connection_durations);
         assert(self.block_validation_total.get() >= self.block_validation_success.get());
     }
