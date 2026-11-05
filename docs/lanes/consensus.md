@@ -27,7 +27,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] attributes queue, pipeline core (step, reset, signals)
 - [ ] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
-  - [ ] engine task queue: insert unsafe, consolidate, build/seal, finalize, synchronize
+  - [x] engine task queue: insert unsafe, consolidate (AttributesMatch), build/seal (Holocene
+    deposits-only fallback), finalize, synchronize; deterministic mock engine, fuzzed
+  - [ ] polling adapter over `sources.EngineClient` (callback-based) implementing the task
+    client contract in `engine/task.zig`, plus a full L2 block fetch (header fields + raw
+    EIP-2718 txs incl. deposits + withdrawals) for consolidation
   - [x] starting forkchoice discovery (resumable find_starting_forkchoice)
   - [ ] EL sync mode, checkpoint reader / pruned-block recovery
 - [ ] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
@@ -112,11 +116,31 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   `HoloceneActivation` with an activation signal and other reset errors with a reset.
   The attributes queue only checks the batch parent hash, as base/base.
 
+- Engine task queue: tasks are resumable state machines over a polling client contract
+  (`engine/task.zig`; `NotAvailable` while in flight, same arguments on retry). Zig errors
+  carry no payload, so each base/base task error is a distinct error with a fixed severity
+  (temporary/deferred/critical/reset/flush); nested errors keep their own. Priorities:
+  build 5 > seal 4 > insert 3 > consolidate 2 > finalize 1 > synchronize 0 (base/base queues
+  only seal/insert/consolidate/finalize; build and synchronize are direct calls there), FIFO
+  within a priority. A task waiting on the client stays active (no preemption) so tasks stay
+  atomic. Temporary failures restart the task and return to the caller (base/base retries in
+  place); deferred/critical keep it; flush drops it; reset clears the queue. Fixed capacity
+  (`QueueFull`), one arena per slot holding copies of payloads/attributes.
+- Engine heads: applying an update that would break finalized <= safe <= local safe <= unsafe
+  fails with critical `UnorderedHeads` instead of storing it; a SYNCING-filtered partial update
+  that would break it is dropped. Seal results go to the caller through the queue's step
+  result (no `result_tx`); `UnsafeHeadChangedSinceBuild` (direct `get_payload`) and Denim
+  `BaseTimeUpdateTx` timestamp validation on insert are not ported yet. All-zero Holocene
+  `eip1559Params` resolve to `Context.fee_params_canyon` (default 250/6, base/base
+  `post_canyon_params`) because `RollupConfig` has no chain op config. Deposits-only
+  fallback builds with the leading-deposits prefix of the attributes' transactions.
 
 ## Log
 - 2026-11-05: service: node stage 1 (heads + RPC); bin: `base consensus` subcommand.
 - 2026-11-05: sources: L2 provider label queries; service: L1 head watcher.
 - 2026-11-05: sources: L2 chain provider; protocol: system config from L2 blocks.
+- 2026-11-05: engine: task queue (insert, consolidate, build, seal, finalize, synchronize),
+  AttributesMatch, mock engine, seeded + std fuzz.
 - 2026-11-05: sources: L1 JSON decoders, caching L1 provider, beacon blob provider, engine
   client with L2 block info.
 - 2026-11-05: sequencer: non-blocking L1 origin selector, fuzzed.
