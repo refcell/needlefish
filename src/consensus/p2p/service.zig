@@ -43,7 +43,8 @@ pub const Config = struct {
     unsafe_block_signer: primitives.Address,
     block_time_s: u64 = 2,
     disc: disc.service.Config,
-    gater: gater_module.Config = .{},
+    /// base/base CLI defaults: 500 redials per 60 min (`--p2p.redial`, `.period`).
+    gater: gater_module.Config = .{ .peer_redialing = 500 },
     limits: connections.Limits = .{},
     /// base/base `PeerMonitoring` (`--p2p.ban.threshold`, `--p2p.ban.duration`).
     ban_threshold: f64 = -100,

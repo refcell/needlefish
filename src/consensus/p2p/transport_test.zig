@@ -48,6 +48,10 @@ const Cluster = struct {
     tx_storage: [512]u8 = undefined,
 
     fn init(cluster: *Cluster, seed: u64) !void {
+        return cluster.init_options(seed, 0);
+    }
+
+    fn init_options(cluster: *Cluster, seed: u64, reset_ppm: u32) !void {
         const allocator = std.testing.allocator;
         cluster.rollup = .{ .l2_chain_id = chain_id };
         cluster.rollup.upgrades.set(.ecotone, 0);
@@ -58,6 +62,7 @@ const Cluster = struct {
             .latency_min_ns = 1 * ns_per_ms,
             .latency_max_ns = 20 * ns_per_ms,
             .pipe_size_bytes = 64 * 1024,
+            .reset_ppm = reset_ppm,
         });
         var key_prng = Prng.init(seed ^ 0x6b65_7973);
         for (&cluster.nodes, 0..) |*node, index| try cluster.init_node(node, index, &key_prng);
@@ -228,6 +233,30 @@ test "p2p transport: a partitioned node gets the block after the partition heals
     cluster.world.heal_all();
     cluster.run(2 * ns_per_s);
     try std.testing.expect(cluster.received(isolated, 9, scratch));
+}
+
+test "p2p transport: blocks keep flowing through random connection resets" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init_options(5, 5_000);
+    defer cluster.deinit();
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    cluster.run(8 * ns_per_s);
+    const blocks = 10;
+    var delivered: [nodes]u32 = @splat(0);
+    for (0..blocks) |number| {
+        try cluster.publish(0, number + 1);
+        cluster.run(2 * ns_per_s);
+        for (1..nodes) |index| {
+            while (cluster.nodes[index].service.pop_block(scratch)) |_| delivered[index] += 1;
+        }
+    }
+    var resets: u64 = 0;
+    for (&cluster.nodes) |*node| resets += node.transport.stats.closed;
+    try std.testing.expect(resets > 0);
+    for (delivered[1..]) |count| try std.testing.expectEqual(@as(u32, blocks), count);
+    for (&cluster.nodes) |*node| try std.testing.expect(node.transport.open_count() >= 2);
 }
 
 test "p2p transport: seed sweep, every node gets every block (slow)" {

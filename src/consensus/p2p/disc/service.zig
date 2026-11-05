@@ -676,8 +676,10 @@ pub const Service = struct {
     fn learn(service: *Service, record: *const enr.Record, now_ns: u64) void {
         if (service.is_banned(record.node_id(), now_ns)) return;
         const endpoint = endpoint_of(record) orelse return;
+        // Known nodes are published again (base/base forwards every lookup result), so
+        // the dialer can reconnect peers that dropped, subject to the gater's redial cap.
         switch (service.table.insert(record, endpoint, now_ns)) {
-            .added => service.publish(record),
+            .added, .updated => service.publish(record),
             .pending => |value| {
                 const entry = service.table.get(value.least_recent) orelse return;
                 service.send_ping(entry.node_id, entry.endpoint, entry.record.public_key, now_ns);
