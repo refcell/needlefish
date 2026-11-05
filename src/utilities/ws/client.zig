@@ -133,6 +133,15 @@ pub fn Client(comptime IO: type, comptime Context: type) type {
             try client.stream.send(.binary, payload);
         }
 
+        /// Sends an empty ping (keepalive); compare `pongs_received` later for the reply.
+        pub fn ping(client: *Self) SendError!void {
+            try client.stream.ping("");
+        }
+
+        pub fn pongs_received(client: *const Self) u64 {
+            return client.stream.pongs_received;
+        }
+
         /// Starts the close handshake; `on_close` runs once the server echoes it.
         pub fn close(client: *Self, code: frame.CloseCode) void {
             client.stream.close(code);

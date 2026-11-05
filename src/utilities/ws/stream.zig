@@ -71,6 +71,8 @@ pub fn Stream(comptime IO: type, comptime Hooks: type) type {
         close_received: bool = false,
         close_code: ?u16 = null,
         failure: ?Error = null,
+        /// Pong frames received over the stream's lifetime (keepalive liveness checks).
+        pongs_received: u64 = 0,
         random_state: u64,
 
         pub fn init(
@@ -146,6 +148,13 @@ pub fn Stream(comptime IO: type, comptime Hooks: type) type {
             assert(opcode == .text or opcode == .binary);
             if (stream.state != .open) return error.NotOpen;
             try stream.queue_frame(opcode, payload);
+        }
+
+        /// Queues a ping control frame; the peer's pong bumps `pongs_received`.
+        pub fn ping(stream: *Self, payload: []const u8) SendError!void {
+            assert(payload.len <= 125); // RFC 6455 5.5: control payloads are short.
+            if (stream.state != .open) return error.NotOpen;
+            try stream.queue_frame(.ping, payload);
         }
 
         /// Starts the close handshake; `closed` follows once the peer echoes it.
@@ -313,7 +322,7 @@ pub fn Stream(comptime IO: type, comptime Hooks: type) type {
         fn handle_frame(stream: *Self, header: frame.Header, payload: []const u8) void {
             switch (header.opcode) {
                 .ping => stream.queue_frame(.pong, payload) catch {}, // Drop under pressure.
-                .pong => {},
+                .pong => stream.pongs_received +%= 1,
                 .close => stream.handle_close(payload),
                 .text, .binary => {
                     if (stream.message_opcode != null) return stream.fail(error.ProtocolError);
