@@ -75,6 +75,9 @@ behind a small interface and switch later.
   block-hash vector through `validity.header_from_payload`.
 - [x] `gossip`: EIP-8130 (0x79) transactions decode through `Envelope` in validity
   (malformed ones reject instead of passing undecoded).
+- [x] Protected peers (`opp2p_protectPeer`): bypass pending-outbound and established limits
+  (up to `Limits.bypass_max` = 8 extra; per-peer limit still applies) and are never
+  score-banned (base/base `bypass_peer_id`, `can_disconnect`).
 - [x] `Service` (`service.zig`): IO-free state machine tying disc + gater + connection
   limits + block gossip; dials every valid discovered record, bans peers under -100 for
   1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
@@ -269,3 +272,4 @@ behind a small interface and switch later.
 - 2026-11-05: Denim BaseTime schedule check in block gossip validity.
 - 2026-11-05: real Base mainnet block-hash vector.
 - 2026-11-05: block validity decodes EIP-8130 transactions.
+- 2026-11-05: protected peers bypass limits and score bans.

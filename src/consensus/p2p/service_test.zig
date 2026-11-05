@@ -252,3 +252,40 @@ test "p2p service: peers under the ban threshold are disconnected and banned" {
     const banned_id = net.records[other].node_id();
     try std.testing.expect(service.discovery.is_banned(banned_id, net.now_ns));
 }
+
+test "p2p service: protected peers are never score-banned" {
+    const net = try std.testing.allocator.create(Net);
+    defer std.testing.allocator.destroy(net);
+    try net.init();
+    defer net.deinit();
+    for (0..12) |_| try net.step(500 * ns_per_ms);
+    const service = net.services[0];
+    const link = for (net.links[0..net.links_count]) |link| {
+        if (link.a == 0 or link.b == 0) break link;
+    } else return error.NoLink;
+    const slot = if (link.a == 0) link.slot_a else link.slot_b;
+    try std.testing.expect(service.gater.protect_peer(service.connected[slot].peer));
+    service.gossip.router.peer(slot).counters.behaviour_penalty = 1000;
+    const before = service.connected_count();
+    try net.step(16 * ns_per_s);
+    try std.testing.expectEqual(@as(u64, 0), service.stats.banned);
+    try std.testing.expectEqual(before, service.connected_count());
+}
+
+test "p2p service: a protected peer connects past the established limit" {
+    var fixture: @import("rpc_test.zig").Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const service = fixture.service;
+    service.limits.limits.established_max = 2; // Two peers are already connected.
+    var secret: [32]u8 = @splat(0);
+    secret[31] = 50;
+    const extra = peer_id.from_public_key(try secp256k1.public_key(secret));
+    try std.testing.expect(service.reserve_inbound(null));
+    const refused = service.on_connected(extra, .inbound, null, 0);
+    try std.testing.expectError(error.EstablishedLimit, refused);
+    try std.testing.expect(service.gater.protect_peer(extra));
+    try std.testing.expect(service.reserve_inbound(null));
+    _ = try service.on_connected(extra, .inbound, null, 0);
+    try std.testing.expectEqual(@as(u32, 3), service.connected_count());
+}

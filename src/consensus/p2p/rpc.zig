@@ -8,8 +8,7 @@
 //! `base`, inbound, its protocol list, the local TCP multiaddr). Fields this node does not
 //! track are zero: per-topic score parts and req/resp scores.
 //! Differences: `opp2p_blockPeer` also disconnects the peer (base/base blacklists it in
-//! gossipsub, which drops all its messages), and `opp2p_protectPeer` does not lift
-//! connection limits (only gater limits).
+//! gossipsub, which drops all its messages).
 
 const std = @import("std");
 const assert = std.debug.assert;

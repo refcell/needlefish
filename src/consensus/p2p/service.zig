@@ -196,6 +196,8 @@ pub const Service = struct {
         errdefer service.gossip.destroy(allocator);
         service.gater = try gater_module.Gater.init(allocator, config.gater);
         errdefer service.gater.deinit(allocator);
+        assert(config.limits.established_max + config.limits.bypass_max <=
+            router_module.peers_max);
         service.limits = try connections.Manager.init(allocator, config.limits);
         return service;
     }
@@ -264,7 +266,8 @@ pub const Service = struct {
             service.stats.dials_refused += 1;
             return;
         };
-        service.limits.begin(.outbound) catch {
+        const protected = service.gater.protected_peers.contains(peer);
+        service.limits.begin_bypass(.outbound, protected) catch {
             service.stats.dials_refused += 1;
             return;
         };
@@ -327,7 +330,8 @@ pub const Service = struct {
                 };
             }
         }
-        try service.limits.establish(peer, direction);
+        const protected = service.gater.protected_peers.contains(peer);
+        try service.limits.establish_bypass(peer, direction, protected);
         const router = &service.gossip.router;
         const slot = router.add_peer(peer, direction == .outbound, address, now_ns) orelse {
             service.limits.close(peer, direction);
@@ -450,6 +454,8 @@ pub const Service = struct {
             if (!connection.active or connection.disconnecting) continue;
             const value = service.gossip.router.peer_score_value(@intCast(slot));
             if (value >= service.config.ban_threshold) continue;
+            // Protected peers are never disconnected (base/base `can_disconnect`).
+            if (!service.gater.can_disconnect(connection.peer)) continue;
             service.stats.banned += 1;
             service.request_disconnect(@intCast(slot));
             const key = connection.peer.secp256k1_public_key() orelse continue;
