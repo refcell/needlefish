@@ -22,20 +22,20 @@ behind a small interface and switch later.
 - [ ] `peers`: bounded peer store, peer scoring params (port `score.rs`: topic params
   from block time, thresholds, decay), connection gater (ip/subnet bans, dial limits;
   port `gater.rs`/`gate.rs`).
-- [ ] `disc`: discv5 wire protocol: packet masking (AES-CTR), header, ordinary /
+- [x] `disc`: discv5 wire protocol: packet masking (AES-CTR), header, ordinary /
   WHOAREYOU / handshake packets, session key derivation (ECDH + HKDF), AES-GCM message
   encryption, messages PING/PONG/FINDNODE/NODES/TALKREQ/TALKRESP. Spec test vectors.
-- [ ] `disc`: Kademlia routing table (bounded k-buckets, 256 log distances), lookup
+- [x] `disc`: Kademlia routing table (bounded k-buckets, 256 log distances), lookup
   iteration, bootstrap, ENR filter on `opstack` chain id, discovery driver state machine
   (port `driver.rs`), DST test with a simulated network of N nodes.
 - [ ] `libp2p`: multistream-select 1.0, noise XX handshake (X25519, ChaCha20-Poly1305,
   SHA256, libp2p signed static key payload), yamux framing + flow control (bounded
   streams/windows), TCP transport over utilities/io. Interop vectors; fuzz each codec.
 - [ ] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
-- [ ] `gossip`: gossipsub v1.1 (protobuf RPC codec written by hand, mesh maintenance,
+- [ ] `gossip`: gossipsub v1.1 (protobuf RPC codec written by hand [done: `gossip/rpc.zig`], mesh maintenance,
   heartbeat, IHAVE/IWANT, fanout, message cache, seen cache, peer scoring integration),
   OP Stack message id (sha256 of domain + snappy-decoded payload).
-- [ ] `gossip`: snappy block-format codec (own implementation, fuzzed round trip),
+- [ ] `gossip`: snappy block-format codec (own implementation, fuzzed round trip) [done],
   unsafe block topics `/optimism/<chain_id>/{0,1,2,3}/blocks` (v1..v4), payload SSZ
   decode (ExecutionPayload v1..v4 envelopes), signature check against the unsafe block
   signer, block validity rules (port `block_validity.rs`: timestamp window, seen hashes
@@ -59,8 +59,28 @@ behind a small interface and switch later.
 - Multiaddr supports ip4/ip6/tcp/udp/dns/dns4/dns6/p2p/quic-v1 only; anything else is
   `UnsupportedProtocol`. Empty binary multiaddrs are rejected (no text form).
 - Node key files are hex text; library code takes file contents, never paths.
+- discv5 spec vectors embed identity secret keys; tests check every packet vector with
+  public values only (dest node id unmasks, published read keys open, offline-derived
+  pubkeys/ECDH outputs verify), and re-encode each packet byte for byte.
+- discv5 `Service` is IO-free: `on_packet`/`tick` in, `pop_outgoing`/`pop_discovered`
+  out, randomness from an injected `std.Random`. The DST test drives 16 nodes over a
+  seeded in-test UDP network (latency 1-40 ms, 2% loss). It will move onto
+  `testing/sim` once that network can carry byte payloads to more than 8 nodes.
+- Topic messages (REGTOPIC..TOPICNODES) are not implemented: OP Stack does not use them.
+- Routing table: 16 per bucket, 8 replacements, 1024 entries total, evict after 2
+  failures, /24 limits 2 per bucket and 10 per table. Lookups: 16 candidates, 3 in
+  flight, 48 queries max, distances = target log distance +-1 (geth style).
+- WHOAREYOU is only answered when it echoes a pending request's nonce from the same
+  endpoint; handshake keys are bound to `(node id, endpoint)`.
+- Snappy/protobuf varints accept non-minimal encodings like reference decoders;
+  multiaddr/ENR varints stay strict.
 
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
   base58, varint, ip text, multiaddr, enode, Base boot nodes, node keys; all fuzzed.
+- 2026-11-05: `disc` wire: packet codec, handshake crypto, messages; all 4 spec packet
+  vectors + KDF + id-signature vectors pass.
+- 2026-11-05: `gossip` snappy block codec and gossipsub protobuf RPC codec (worker).
+- 2026-11-05: `disc` routing table, session cache, lookups, discovery service; 16-node
+  seeded simulation converges through one boot node.
