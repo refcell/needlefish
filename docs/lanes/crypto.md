@@ -10,7 +10,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
 - [x] montgomery: faster inversion (safegcd); dedicated squaring evaluated (no gain on M4).
-- [ ] montgomery: no-carry CIOS for moduli with spare top bits.
+- [x] montgomery: no-carry CIOS for spare-bit moduli evaluated: no gain over row-wise chains
+  (bn254 18.3ns, bls 25.8ns either way); not adopted.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
 - [x] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
