@@ -29,6 +29,13 @@ pub fn g1_mul(iterations: u32) u64 {
     return point.x.limbs_value[0];
 }
 
+pub fn g1_mul_glv(iterations: u32) u64 {
+    var point = g1.generator.to_jacobian();
+    for (0..iterations) |_| point = g1.mul_glv(point, scalar);
+    assert(point.is_on_curve());
+    return point.x.limbs_value[0];
+}
+
 pub fn g2_mul(iterations: u32) u64 {
     var point = g2.generator.to_jacobian();
     for (0..iterations) |_| point = point.mul(scalar);

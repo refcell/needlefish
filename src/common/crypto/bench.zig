@@ -445,6 +445,7 @@ pub const cases = [_]Case{
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
     .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },
     .{ .name = "bls12-381/g1 mul", .iterations = 5_000, .run = bls_bench.g1_mul },
+    .{ .name = "bls12-381/g1 mul glv", .iterations = 5_000, .run = bls_bench.g1_mul_glv },
     .{ .name = "bls12-381/g2 mul", .iterations = 2_000, .run = bls_bench.g2_mul },
     .{ .name = "bls12-381/pairing-2", .iterations = 500, .run = bls_bench.pairing_2 },
     .{ .name = "bls12-381/map_fp_to_g1", .iterations = 5_000, .run = bls_bench.map_fp_to_g1 },

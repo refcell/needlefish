@@ -53,8 +53,8 @@ pub fn verify_kzg_proof(
     // scalar multiplications remain: e(C - [y]G1 + [z]proof, G2) * e(-proof, [tau]G2).
     const g1_generator = bls.g1.generator.to_jacobian();
     const left = commitment.to_jacobian()
-        .sub(g1_generator.mul(y))
-        .add(proof.to_jacobian().mul(z))
+        .sub(bls.g1.mul_glv(g1_generator, y))
+        .add(bls.g1.mul_glv(proof.to_jacobian(), z))
         .to_affine();
     const pairs = [2]bls.pairing.Pair{
         .{ .g1 = left, .g2 = bls.g2.generator },

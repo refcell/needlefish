@@ -53,6 +53,84 @@ pub fn is_in_subgroup(point: Affine) bool {
     return minus_x_squared.eql(endomorphism(jacobian));
 }
 
+/// x^2 for the BLS parameter; r = x^4 - x^2 + 1, so scalars mod r split into two
+/// halves below x^2 (128 bits).
+const x_squared: u128 = @as(u128, x_abs) * x_abs;
+
+const wnaf_width = 5;
+/// Odd multiples 1P, 3P, ..., 15P.
+const wnaf_table_size = 1 << (wnaf_width - 2);
+/// A 128-bit scalar recodes to at most 129 width-5 NAF digits.
+const wnaf_digits_max = 130;
+
+/// Width-5 NAF of `scalar`: digits are zero or odd in [-15, 15]. Returns the length.
+fn wnaf_recode(scalar: u128, digits: *[wnaf_digits_max]i8) u32 {
+    var value: u130 = scalar;
+    var length: u32 = 0;
+    while (value != 0) : (length += 1) {
+        assert(length < wnaf_digits_max);
+        var digit: i8 = 0;
+        if (value & 1 == 1) {
+            const low: i8 = @intCast(value & 31);
+            digit = if (low >= 16) low - 32 else low;
+            if (digit >= 0) value -= @intCast(digit) else value += @intCast(-digit);
+        }
+        digits[length] = digit;
+        value >>= 1;
+    }
+    assert(length <= 129);
+    return length;
+}
+
+/// Affine odd multiples of `point` with a single inversion.
+fn odd_multiples(point: G1, table: *[wnaf_table_size]Affine) void {
+    assert(!point.is_identity());
+    var jacobian: [wnaf_table_size]G1 = undefined;
+    jacobian[0] = point;
+    const twice = point.double();
+    for (1..wnaf_table_size) |index| jacobian[index] = jacobian[index - 1].add(twice);
+    var scratch: [wnaf_table_size]Fp = undefined;
+    G1.batch_to_affine(&jacobian, table, &scratch);
+}
+
+inline fn add_digit(result: G1, table: *const [wnaf_table_size]Affine, digit: i8) G1 {
+    if (digit > 0) return result.add_affine(table[@intCast((digit - 1) >> 1)]);
+    if (digit < 0) return result.add_affine(table[@intCast((-digit - 1) >> 1)].neg());
+    return result;
+}
+
+/// Scalar multiplication for points in G1 using the GLV endomorphism: with
+/// k = k1 + k2 x^2 and x^2 P = -phi(P), kP = k1 P + k2 (-phi(P)). Both 128-bit halves
+/// are recoded to width-5 NAF and share one doubling chain with mixed additions
+/// from affine tables. Public scalars only.
+/// Precondition: `point` is in the order-r subgroup (phi acts as -x^2 only there).
+pub fn mul_glv(point: G1, scalar: u256) G1 {
+    const k = scalar % fields.r;
+    if (k == 0 or point.is_identity()) return G1.identity;
+    const k1: u128 = @intCast(k % x_squared);
+    const k2: u128 = @intCast(k / x_squared);
+    assert(@as(u256, k2) * x_squared + k1 == k);
+    var table1: [wnaf_table_size]Affine = undefined;
+    odd_multiples(point, &table1);
+    // -phi on affine points: (x, y) -> (beta x, -y); valid on every table entry.
+    var table2: [wnaf_table_size]Affine = undefined;
+    for (&table2, table1) |*entry, source| {
+        entry.* = .{ .x = source.x.mul(beta), .y = source.y.neg(), .infinity = source.infinity };
+    }
+    var digits1: [wnaf_digits_max]i8 = @splat(0);
+    var digits2: [wnaf_digits_max]i8 = @splat(0);
+    const length = @max(wnaf_recode(k1, &digits1), wnaf_recode(k2, &digits2));
+    var result = G1.identity;
+    var index = length;
+    while (index > 0) {
+        index -= 1;
+        if (!result.is_identity()) result = result.double();
+        result = add_digit(result, &table1, digits1[index]);
+        result = add_digit(result, &table2, digits2[index]);
+    }
+    return result;
+}
+
 /// Maps a curve point into G1: multiplication by h_eff = 1 - x = 1 + |x|.
 pub fn clear_cofactor(point: G1) G1 {
     const result = point.add(point.mul_u64(x_abs));
@@ -117,6 +195,40 @@ pub fn test_point_off_subgroup(seed: u64) Affine {
         }
     }
     unreachable; // Half of all x are valid; 64 failures has probability 2^-64.
+}
+
+test "g1: width-5 NAF recoding reconstructs the scalar" {
+    var prng = Prng.init(0x6e6166);
+    for (0..500) |round| {
+        const scalar: u128 = if (round < 3) round else prng.int(u128) >> @intCast(prng.below(128));
+        var digits: [wnaf_digits_max]i8 = @splat(0);
+        const length = wnaf_recode(scalar, &digits);
+        var value: i256 = 0;
+        var index = length;
+        while (index > 0) {
+            index -= 1;
+            const digit = digits[index];
+            const odd_in_range = @rem(digit, 2) != 0 and digit >= -15 and digit <= 15;
+            try testing.expect(digit == 0 or odd_in_range);
+            value = value * 2 + digit;
+        }
+        try testing.expectEqual(@as(i256, scalar), value);
+    }
+}
+
+test "g1: GLV multiplication matches plain multiplication" {
+    var prng = Prng.init(0x676c76);
+    const g = generator.to_jacobian();
+    try testing.expect(mul_glv(g, 0).is_identity());
+    try testing.expect(mul_glv(g, fields.r).is_identity());
+    try testing.expect(mul_glv(G1.identity, 12345).is_identity());
+    const edges = [_]u256{ 1, 2, x_squared - 1, x_squared, x_squared + 1, fields.r - 1 };
+    for (edges) |k| try testing.expect(mul_glv(g, k).eql(g.mul(k)));
+    for (0..16) |_| {
+        const base = g.mul(prng.int(u256));
+        const k = prng.int(u256);
+        try testing.expect(mul_glv(base, k).eql(base.mul(k)));
+    }
 }
 
 test "g1: generator, order, and group laws" {

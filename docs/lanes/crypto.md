@@ -9,7 +9,8 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] sha256 (use/beat std), ripemd160, blake2f (EIP-152 compression), identity.
 - [x] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
-- [ ] montgomery: no-carry CIOS for moduli with spare top bits, dedicated squaring, faster inversion (bernstein-yang / binary gcd).
+- [x] montgomery: faster inversion (safegcd); dedicated squaring evaluated (no gain on M4).
+- [ ] montgomery: no-carry CIOS for moduli with spare top bits.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
 - [ ] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
@@ -174,3 +175,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: kzg verify_kzg_proof + 0x0A precompile on BLS12-381; c-kzg + geth vectors; 1.01 ms per call (1.26 ms before the G2-free rearrangement). Fixed kzg tests not running (missing refAllDecls).
 - 2026-11-05: montgomery mul row-wise carry chains: bn254 19.6->18.2ns, bls 31.4->25.8ns; bls g1 mul 89->71us, msm-64 1.78->1.25ms, pairing-2 0.71->0.66ms.
 - 2026-11-05: generic safegcd inversion: bls Fp inverse 13.8->1.8us, bn254 5.8->1.2us; map_fp_to_g1 77->41us, pairing-2 0.66->0.59ms, kzg point eval 1.01->0.88ms.
+- 2026-11-05: bls g1.mul_glv (GLV split by x^2, width-5 NAF, affine tables, mixed adds): 71->42us; kzg point eval now uses it (0.88->0.76ms).
