@@ -150,6 +150,14 @@ pub const Reader = struct {
         };
     }
 
+    /// Decode the next item head without consuming it.
+    pub fn peek(reader: *const Reader) Error!Item {
+        var copy = reader.*;
+        const item = try copy.next();
+        assert(copy.position > reader.position);
+        return item;
+    }
+
     /// Skip one complete data item (including all nested elements).
     pub fn skip(reader: *Reader, limits: Limits) Error!void {
         assert(limits.depth_max <= depth_limit);
