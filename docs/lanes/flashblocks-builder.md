@@ -61,9 +61,15 @@ can drive the builder and the flashblocks consumer.
   canonical chain (forkchoice head moves, with the block's transaction hashes).
 - [ ] `execution/flashblocks` state builder: reuse the previous snapshot's per-transaction
   results instead of re-executing on every rebuild (base/base `execute_with_cached_data`).
-- [ ] `execution/flashblocks` RPC: pending-tag overrides for `eth_getBlockByNumber`,
+- [x] `execution/flashblocks` RPC: pending-tag overrides for `eth_getBlockByNumber`,
   `eth_getTransactionReceipt`, `eth_getBalance`, `eth_call`, `eth_getTransactionCount`,
   plus the `eth_subscribe` flashblocks pubsub (port `rpc/*`).
+- [ ] `execution/flashblocks` RPC wiring: serve `rpc.Router` instead of `eth.Router` when the
+  node runs a flashblocks consumer; a WebSocket transport that owns one `pubsub.Subscriptions`
+  per connection and calls `pubsub.notify` after every processed flashblock.
+- [ ] `execution/flashblocks` RPC: remaining base/base overrides (`eth_getTransactionByHash`,
+  `eth_estimateGas`, `eth_getLogs` pending, `eth_sendRawTransactionSync`,
+  `eth_getBlockTransactionCountByNumber`, `eth_simulateV1`, `eth_call` state/block overrides).
 - [ ] `bin/base builder` subcommand + flags matching base/base `builder/cli/args.rs`;
   devnet hook (coordinate with batcher-devnet lane) so the devnet sequencer EL can run
   with flashblocks and `just devnet smoke` checks a pending-tag receipt.
@@ -150,6 +156,15 @@ can drive the builder and the flashblocks consumer.
   collisions reads the canonical trie (unless wiped); BLOCKHASH of an earlier pending block
   answers its latest delta hash. Any failure resets (base/base drops the pending state).
 
+- `execution/flashblocks` RPC: `rpc.Router` is the node's eth method table with the pending
+  overrides and `eth_subscribe`/`eth_unsubscribe` swapped in over an `Api` wrapping `eth.Api`
+  (the eth lane is untouched; non-pending calls restore the params and delegate). The
+  pending block's `size` is its RLP block size (the eth lane reports the stored record
+  length); every other field equals the imported block's JSON. Pending nonces are the
+  pending state's account nonce (base/base: canonical count plus flashblock count). Pubsub
+  serves only the flashblocks kinds (the node has no standard subscriptions); a full
+  `TransactionWithLogs` message is dropped (counted) if its transaction JSON exceeds 16 KiB.
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -172,3 +187,6 @@ can drive the builder and the flashblocks consumer.
 - 2026-11-05: `execution/flashblocks` `ExecutorState`: pending re-execution on the node executor
   over a canonical overlay; receipts, balances, nonces, storage, code, pending `eth_call`;
   differential seeded + fuzz tests against the builder generator and imported blocks.
+- 2026-11-05: `execution/flashblocks` RPC: pending-tag overrides (block, receipt, balance, nonce,
+  call) and `newFlashblocks`/`pendingLogs`/`newFlashblockTransactions` pubsub; byte-equal to
+  the producer's canonical JSON; seeded + fuzz request shapes.

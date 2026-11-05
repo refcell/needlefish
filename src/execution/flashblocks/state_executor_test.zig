@@ -57,7 +57,7 @@ const options: state_executor.Options = .{
 };
 
 /// Producer node + generator, consumer node + executor state + processor (heap-pinned).
-const Harness = struct {
+pub const Harness = struct {
     producer: *Node,
     consumer: *Node,
     cache: best_txs.RejectionCache,
@@ -66,7 +66,7 @@ const Harness = struct {
     processor: Processor,
     consumer_root: [32]u8,
 
-    fn create() !*Harness {
+    pub fn create() !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
         harness.producer = try Node.create_for(l2);
@@ -99,7 +99,7 @@ const Harness = struct {
         return harness;
     }
 
-    fn destroy(harness: *Harness) void {
+    pub fn destroy(harness: *Harness) void {
         harness.processor.deinit(testing.allocator);
         harness.builder.destroy(testing.allocator);
         harness.generator.deinit(testing.allocator);
@@ -109,12 +109,12 @@ const Harness = struct {
         testing.allocator.destroy(harness);
     }
 
-    fn genesis(harness: *const Harness) B256 {
+    pub fn genesis(harness: *const Harness) B256 {
         return .{ .bytes = harness.producer.chain.genesis_hash };
     }
 };
 
-fn deposit(buffer: []u8, source: u8) []const u8 {
+pub fn deposit(buffer: []u8, source: u8) []const u8 {
     const envelope: consensus.Envelope = .{ .deposit = .{
         .source_hash = .{ .bytes = @splat(source) },
         .from = fixture.address_of(7),
@@ -129,7 +129,7 @@ fn deposit(buffer: []u8, source: u8) []const u8 {
 }
 
 /// Adds a signed EIP-1559 transaction to the producer's pool.
-fn submit(
+pub fn submit(
     node: *Node,
     from: u8,
     nonce: u64,
@@ -168,7 +168,7 @@ fn submit(
 /// Builds block `parent + 1` on the producer, feeding every flashblock to the consumer
 /// and checking the consumer's execution against each delta; then the producer imports
 /// the sealed block (canonical). Returns the sealed hash.
-fn produce_block(
+pub fn produce_block(
     harness: *Harness,
     parent: B256,
     attributes: *const payload.PayloadAttributes,
