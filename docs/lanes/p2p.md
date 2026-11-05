@@ -50,9 +50,11 @@ behind a small interface and switch later.
 - [ ] `gossip`: Denim sub-second timestamp check (`BaseTimeUpdateTx::
   validate_block_timestamp`) once consensus has the Base time-update tx decoder; a real
   Base block as a block-hash vector; EIP-8130 (0x79) tx decoding in validity.
-- [ ] `Service`: one state machine tying disc + libp2p + gossip; publish signed unsafe
-  blocks (sequencer), deliver validated blocks to consensus; DST of a 5-node cluster
-  gossiping blocks with partitions/latency.
+- [x] `Service` (`service.zig`): IO-free state machine tying disc + gater + connection
+  limits + block gossip; dials every valid discovered record, bans peers under -100 for
+  1 h every 15 s (disconnect + discv5 ban), publishes and delivers unsafe blocks.
+- [ ] `Service` DST: 5+ node cluster over the libp2p `connection.zig` byte pipeline with
+  latency, loss, and partitions (seeded, `-Dslow-tests` for the big one).
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [ ] Perf: noise transport at 338 MB/s seal+open is std ChaCha20-Poly1305; profile and
@@ -147,6 +149,11 @@ behind a small interface and switch later.
   from the message cache. Our own published blocks enter the seen-hash table. Topics
   retire on heartbeat once their fork leaves the 60 s window and are never rejoined.
 
+- Service: commands out (dial, disconnect) and calls in; the transport must report every
+  dial result (`on_connected` or `on_dial_failed`) so pending limits never leak. Inbound
+  is reserved before the handshake (`reserve_inbound`), like libp2p's pending limit.
+  Invalid RPC frames disconnect the peer; graylisted frames are dropped silently.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -170,3 +177,4 @@ behind a small interface and switch later.
 - 2026-11-05: `disc` node bans.
 - 2026-11-05: `gossip` block handler (validate before forward, publish, topic retirement).
 - 2026-11-05: `gossip` v1.2 IDONTWANT.
+- 2026-11-05: `Service` orchestrator with score bans and end-to-end block test.
