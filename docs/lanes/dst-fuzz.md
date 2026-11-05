@@ -46,7 +46,10 @@ provably robust.
   never re-posts it and every other node stalls. L1 loses it in a lossy reorg, or when a
   txmgr reset (admin stop) replaces the re-injected txs at the same nonces. Repro: swarm
   seeds 2562 (admin ops) and 2856 (reorg tx loss) with the `BUG(batcher)` gate in
-  `Config.random` removed. Fix idea: the batcher requeues frames of txs a reorg orphaned
+  `Config.random` removed. A third loss path: a mempool eviction of a tx the reorg
+  re-injected (seed 850, needs the real sequencer's timing: the real verifier keeps safe
+  182 from orphaned L1 blocks 30..32, the re-injected nonce 45 is evicted, the batcher
+  posts from 183, and the real verifier ends safe 331 while L1 holds data only to 175). Fix idea: the batcher requeues frames of txs a reorg orphaned
   (track confirmations to depth, as op-batcher's txmgr does) instead of trusting the safe
   head; the sim gates both faults when the real batcher and real verifier run together.
 - derive (batch queue): a pipeline reset whose L2 safe head has L1 origin `genesis.l1 + 1`
@@ -269,3 +272,15 @@ provably robust.
   `validity: fuzz validation of mutated envelopes` (flipped signature byte 64 without
   `y_parity`, tripping `recover_signer`'s assert; no decoder builds that state): fixed to
   flip r/s only, reported to the consensus lane.
+- 2026-11-05: seed 850 (LivenessViolation, batcher confirmed 175 of 331): not a sim bug.
+  The real verifier derived safe 141..182 from L1 blocks 30..32, a depth-3 reorg orphaned
+  them, L1 re-injected the txs, and an eviction dropped re-injected nonce 45; the driver's
+  startup discovery keeps the labeled safe head (base/base `find_starting_forkchoice`), so
+  the real batcher (confirmations 1, loads from the rollup node's safe head) posted from 183
+  and the gap 176..182 was never re-posted (known `BUG(batcher)`, third loss path). Gate:
+  `Config.evict_reorged` (false when real batcher and real verifier run together): an
+  eviction that picks a re-injected tx keeps it (`nodes.Batch.reorged`, `EvictPolicy`),
+  with unchanged draws. New invariant at settle: the real verifier's safe head must not
+  exceed the model batcher's L1-observed `confirmed` ("real verifier safe beyond L1 batch
+  data", safety). Mutant: gate off reports it on seed 850. Swarm 1..5000 green
+  (ReleaseSafe).

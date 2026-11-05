@@ -58,7 +58,12 @@ pub const Batch = struct {
     /// Account nonce for transactions from the real batcher's account. L1 includes them
     /// strictly in nonce order; model and attacker transactions carry none.
     nonce: ?u64 = null,
+    /// Mined once, then orphaned by an L1 reorg and re-injected into the mempool.
+    reorged: bool = false,
 };
+
+/// Which pending transactions a mempool eviction may drop.
+pub const EvictPolicy = enum { any, never_reorged };
 
 pub const SubmitResult = enum { accepted, replaced, nonce_too_low, mempool_full };
 
@@ -389,6 +394,7 @@ pub const L1 = struct {
                 if (batch.nonce != null and l1.has_nonce(batch.nonce.?)) continue;
                 if (prng.chance(loss_ppm, 1_000_000)) continue;
                 merged[count] = batch;
+                merged[count].reorged = true;
                 count += 1;
             }
         }
@@ -412,9 +418,12 @@ pub const L1 = struct {
     }
 
     /// Mempool eviction: a random pending transaction disappears. Returns whether one did.
-    pub fn evict(l1: *L1, prng: *Prng) bool {
+    /// With `never_reorged`, a pick that a reorg re-injected survives (same draw count).
+    pub fn evict(l1: *L1, prng: *Prng, policy: EvictPolicy) bool {
         if (l1.mempool_count == 0) return false;
         const index: usize = @intCast(prng.below(l1.mempool_count));
+        assert(index < l1.mempool_count);
+        if (policy == .never_reorged and l1.mempool[index].reorged) return false;
         std.mem.copyForwards(
             Batch,
             l1.mempool[index .. l1.mempool_count - 1],
@@ -1068,10 +1077,10 @@ test "nodes: L1 evictions and lossy reorgs drop transactions" {
         .verifier_count = 0,
         .tx_pool = &pool,
     };
-    try std.testing.expect(!l1.evict(&prng));
+    try std.testing.expect(!l1.evict(&prng, .any));
     _ = l1.submit_nonced(1, 0);
     _ = l1.submit_nonced(2, 1);
-    try std.testing.expect(l1.evict(&prng));
+    try std.testing.expect(l1.evict(&prng, .any));
     try std.testing.expectEqual(@as(u8, 1), l1.mempool_count);
     _ = l1.submit_nonced(3, 0);
     _ = l1.submit_nonced(4, 1);
@@ -1081,6 +1090,17 @@ test "nodes: L1 evictions and lossy reorgs drop transactions" {
     l1.reorg(&env, 1, &prng, 1_000_000);
     try std.testing.expectEqual(@as(u8, 0), l1.blocks[1].batch_count);
     try std.testing.expectEqual(@as(u64, 0), l1.nonce_mined());
+    try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
+    // A lossless reorg re-injects mined txs; `never_reorged` evictions spare them.
+    _ = l1.submit_nonced(5, 0);
+    l1.mine(&env);
+    l1.reorg(&env, 1, &prng, 0);
+    l1.orphan(1, &prng, 0);
+    try std.testing.expectEqual(@as(u8, 1), l1.mempool_count);
+    try std.testing.expect(l1.mempool[0].reorged);
+    for (0..16) |_| try std.testing.expect(!l1.evict(&prng, .never_reorged));
+    try std.testing.expectEqual(@as(u8, 1), l1.mempool_count);
+    try std.testing.expect(l1.evict(&prng, .any));
     try std.testing.expectEqual(@as(u8, 0), l1.mempool_count);
 }
 

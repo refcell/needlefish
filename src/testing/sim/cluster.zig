@@ -90,6 +90,8 @@ pub const Config = struct {
     /// Chance an orphaned transaction is lost instead of re-injected on an L1 reorg; the
     /// batcher must notice the lost nonce and fill the gap.
     reorg_tx_loss_ppm: u32 = 0,
+    /// Mempool evictions may drop transactions that a reorg re-injected (mined once).
+    evict_reorged: bool = true,
     /// Largest frame both batchers write. Below the full size, channels span several L1
     /// transactions and blocks, and derivation reassembles them in the channel bank.
     frame_size: u32 = codec.frame_size_full,
@@ -151,9 +153,13 @@ pub const Config = struct {
         // stalls. The data is lost by lossy reorgs, or by a txmgr reset (admin stop) that
         // replaces the re-injected txs at the same nonces (swarm seeds 2562, 2856; lane
         // notes). Both are drawn above, so the streams of existing seeds stay the same.
+        // A mempool eviction of a re-injected tx loses the data the same way (seed 850:
+        // the real verifier stays safe at 331 while L1 only holds data up to 175), so
+        // evictions spare re-injected txs; the eviction draws are unchanged.
         if (config.real_batcher and config.real_verifier) {
             config.admin_ops_per_minute = 0;
             config.reorg_tx_loss_ppm = 0;
+            config.evict_reorged = false;
         }
         // Drawn after every other field so the existing streams stay the same.
         config.real_sequencer = prng.chance(1, 2);
@@ -582,7 +588,10 @@ pub const Cluster = struct {
             cluster.inject_byzantine(prng);
         }
         if (prng.chance(cluster.config.mempool_evictions_per_minute, steps_per_minute)) {
-            cluster.report.evictions += @intFromBool(cluster.l1.evict(prng));
+            cluster.report.evictions += @intFromBool(cluster.l1.evict(
+                prng,
+                if (cluster.config.evict_reorged) .any else .never_reorged,
+            ));
         }
         if (cluster.config.admin_ops_per_minute > 0) {
             if (prng.chance(cluster.config.admin_ops_per_minute, steps_per_minute)) {
@@ -831,6 +840,15 @@ pub const Cluster = struct {
 
     fn check_liveness(cluster: *Cluster) Failure!void {
         const head = cluster.sequencer.head;
+        // Settled: every safe block must have its batch data on canonical L1, which the
+        // model batcher observes (`confirmed`). A higher real safe head kept a block whose
+        // data a reorg orphaned and L1 then lost.
+        if (cluster.real_verifier) |verifier| {
+            if (verifier.safe_number() > cluster.batcher.confirmed) {
+                const node = nodes.node_verifier_first;
+                return cluster.fail("real verifier safe beyond L1 batch data", node);
+            }
+        }
         if (cluster.batcher.confirmed != head) {
             return cluster.fail("batcher did not confirm sequencer head", nodes.node_batcher);
         }
@@ -1238,7 +1256,10 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     config.reorg_tx_loss_ppm = smith.valueRangeAtMost(u32, 0, 1_000_000);
     config.real_sequencer = smith.value(bool);
     // BUG(batcher): see `Config.random`.
-    if (config.real_batcher and config.real_verifier) config.reorg_tx_loss_ppm = 0;
+    if (config.real_batcher and config.real_verifier) {
+        config.reorg_tx_loss_ppm = 0;
+        config.evict_reorged = false;
+    }
     var cluster = try Cluster.init(std.testing.allocator, smith.value(u64), config);
     defer cluster.deinit(std.testing.allocator);
     _ = try cluster.run();
