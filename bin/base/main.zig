@@ -9,6 +9,7 @@ const node = @import("node.zig");
 const consensus = @import("consensus.zig");
 const proof = @import("proof.zig");
 const proposer = @import("proposer.zig");
+const prover_service = @import("prover_service.zig");
 const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
 const snapshotter = @import("snapshotter.zig");
@@ -27,6 +28,8 @@ const usage =
     \\  consensus  consensus (rollup) node: derivation, engine driving, optimism_* RPC
     \\  proof      fault-proof tooling (replay a recorded preimage archive)
     \\  proposer   propose output-root dispute games
+    \\  prover-service  proof-request JSON-RPC service
+    \\  prover-worker   claim and prove range jobs with the native host
     \\  balance-monitor  poll an account balance, serve metrics and health
     \\  load-test  send a seeded transaction workload, report inclusion latency
     \\  snapshotter  create, restore, or verify node datadir snapshots
@@ -43,6 +46,7 @@ test {
     _ = consensus;
     _ = proof;
     _ = proposer;
+    _ = prover_service;
     _ = balance_monitor;
     _ = load_test;
     _ = snapshotter;
@@ -77,6 +81,12 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "batcher")) {
         std.process.exit(try batcher.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "prover-service")) {
+        std.process.exit(try prover_service.service_main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "prover-worker")) {
+        std.process.exit(try prover_service.worker_main(init, args[2..]));
     }
     if (std.mem.eql(u8, command, "proposer")) {
         std.process.exit(try proposer.main(init, args[2..]));

@@ -113,8 +113,14 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   contract, job lifecycle) with the native host as the in-process prover backend
   (`src/proof/prover_service/`: protocol + strict codec, bounded job store, router
   service, requester/worker clients, proposer `Prover`, worker tick, native backend).
-- [ ] `proof/prover-service-bin`: `base prover-service` / `base prover-worker` commands
-  (HTTP listen, flags) and the proposer wired to `ProposerProver`.
+- [x] `proof/prover-service-bin`: `base prover-service` (HTTP JSON-RPC, `--listen`,
+  `--jobs-max`, `--proof-bytes-max`) and `base prover-worker` (native backend over
+  `RpcSource`, `--l1-beacon`, compressed/sp1/cluster jobs); `base proposer --prover-rpc
+  <url>` talks to it. Smoke: service answers JSON-RPC, worker polls it idle.
+- [ ] `proof/proposer-native-proof-type`: the proposer's `ProposerProver` requests TEE
+  (AWS Nitro) proofs as base/base does, which the native worker does not prove; add a
+  native proof kind (or a compressed request mode) so proposer -> service -> native worker
+  runs end to end.
 - [ ] `proof/prover-service-native-e2e`: native backend proving a real range end to end
   (SimIo node RPC + `RpcSource`), proof bytes replayed with `base proof replay`.
 
@@ -272,6 +278,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: `base prover-service` / `base prover-worker`; empty L1 genesis fix.
 - 2026-11-05: `base proposer --prover-rpc <url>` and `--l1-beacon`.
 - 2026-11-05: `base proposer` (native prover, dry-run, JSON-RPC submitter).
 - 2026-11-05: proposer native prover (witness archive as initData), e2e replayed.

@@ -189,14 +189,17 @@ const Provers = struct {
             allocator,
             .limited(proof.program.boot.rollup_config_bytes_max),
         );
+        errdefer allocator.free(provers.rollup_json);
         provers.l1_genesis = try read_optional(init, config.l1_genesis);
-        const l1_config = try base.utilities.json.find_path(provers.l1_genesis, &.{"config"}) orelse
-            "";
+        errdefer allocator.free(provers.l1_genesis);
+        const l1_config = try beacon.l1_chain_config(provers.l1_genesis);
         const rollup = try protocol.rollup_json.parse(provers.rollup_json);
         provers.source = .init(allocator, &service.l1_client, &service.l2_client, service.pump(), .{
             .steps_max = 300_000,
         });
+        errdefer provers.source.deinit();
         provers.kzg_state = try KzgState.create(allocator);
+        errdefer provers.kzg_state.destroy(allocator);
         if (config.l1_beacon.len > 0) {
             const settings = &provers.kzg_state.settings;
             const url = config.l1_beacon;
@@ -205,6 +208,7 @@ const Provers = struct {
             provers.blobs = try .create(allocator, os_io, url, settings, http_options, pump);
             provers.source.blobs = provers.blobs.?.fetcher();
         }
+        errdefer if (provers.blobs) |blobs| blobs.destroy(allocator);
         provers.native = try .init(allocator, provers.source.as_source(), .{
             .rollup_config_json = provers.rollup_json,
             .chain_id = rollup.l2_chain_id,
@@ -215,7 +219,7 @@ const Provers = struct {
         return provers.native.prover_interface();
     }
 
-    /// Releases what `open` acquired; on an `open` error, the process exits.
+    /// Releases what a successful `open` acquired.
     fn close(provers: *Provers, allocator: std.mem.Allocator) void {
         switch (provers.mode) {
             .remote => {

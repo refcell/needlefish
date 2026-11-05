@@ -14,6 +14,12 @@ const Pump = base.proof.rpc.endpoint.Pump;
 
 const Beacon = host.beacon_blobs.BeaconBlobs(io.IO, BlobProvider.KzgVerifier);
 
+/// The `config` object of an L1 genesis file; empty without one (a built-in L1 chain).
+pub fn l1_chain_config(l1_genesis: []const u8) ![]const u8 {
+    if (l1_genesis.len == 0) return "";
+    return try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
+}
+
 /// Heap-allocated once: the provider's buffers are large.
 pub const Blobs = struct {
     provider: Beacon.Provider,

@@ -1,0 +1,297 @@
+//! `base prover-service` and `base prover-worker` (base/base `bin/prover-service`,
+//! `crates/proof/worker`): the proof-request JSON-RPC service over HTTP, and a worker
+//! that claims `compressed` range jobs from it and proves them with the native host.
+
+const std = @import("std");
+const Io = std.Io;
+const base = @import("base");
+const consensus_cli = @import("consensus.zig");
+const beacon = @import("beacon.zig");
+
+const io = base.utilities.io;
+const http = base.utilities.http;
+const proof = base.proof;
+const service_module = proof.prover_service.service;
+const kzg = base.common.crypto.kzg;
+const protocol = base.consensus.protocol;
+
+const Store = proof.prover_service.store.Store;
+const Service = service_module.Service;
+const Server = http.Server(io.IO, *Service, Service.handle_http);
+const Client = proof.prover_service.client.Client(io.IO);
+const Worker = proof.prover_service.worker.Worker(io.IO);
+const Native = proof.prover_service.native_backend.Native(io.IO);
+const Endpoint = proof.rpc.Endpoint(io.IO);
+
+pub const ServiceFlags = struct {
+    listen: []const u8 = "http://127.0.0.1:7300",
+    jobs_max: u32 = 64,
+    proof_bytes_max: u32 = 1 << 20,
+};
+
+pub const WorkerFlags = struct {
+    prover_rpc: ?[]const u8 = null,
+    l1: ?[]const u8 = null,
+    l2: ?[]const u8 = null,
+    rollup_config: ?[]const u8 = null,
+    l1_genesis: ?[]const u8 = null,
+    l1_beacon: ?[]const u8 = null,
+    worker_id: []const u8 = "native",
+    poll_interval_ms: u64 = 1000,
+    proof_bytes_max: u32 = 1 << 20,
+};
+
+fn parse_u32(value: []const u8) !u32 {
+    const parsed = try std.fmt.parseUnsigned(u32, value, 10);
+    if (parsed == 0) return error.InvalidArguments;
+    return parsed;
+}
+
+pub fn parse_service(args: []const []const u8) !ServiceFlags {
+    var flags: ServiceFlags = .{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 2) {
+        if (index + 1 == args.len) return error.InvalidArguments;
+        const name = args[index];
+        const value = args[index + 1];
+        if (std.mem.eql(u8, name, "--listen")) {
+            flags.listen = value;
+        } else if (std.mem.eql(u8, name, "--jobs-max")) {
+            flags.jobs_max = try parse_u32(value);
+        } else if (std.mem.eql(u8, name, "--proof-bytes-max")) {
+            flags.proof_bytes_max = try parse_u32(value);
+        } else return error.InvalidArguments;
+    }
+    _ = try consensus_cli.parse_url(flags.listen);
+    return flags;
+}
+
+pub fn parse_worker(args: []const []const u8) !WorkerFlags {
+    var flags: WorkerFlags = .{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 2) {
+        if (index + 1 == args.len) return error.InvalidArguments;
+        const name = args[index];
+        const value = args[index + 1];
+        const fields = .{
+            .{ "--prover-rpc", "prover_rpc" }, .{ "--l1", "l1" },
+            .{ "--l2", "l2" },                 .{ "--rollup-config", "rollup_config" },
+            .{ "--l1-genesis", "l1_genesis" }, .{ "--l1-beacon", "l1_beacon" },
+        };
+        var matched = false;
+        inline for (fields) |field| {
+            if (std.mem.eql(u8, name, field[0])) {
+                @field(flags, field[1]) = value;
+                matched = true;
+            }
+        }
+        if (matched) continue;
+        if (std.mem.eql(u8, name, "--worker-id")) {
+            if (value.len == 0 or value.len > protocol_worker_id_max) return error.InvalidArguments;
+            flags.worker_id = value;
+        } else if (std.mem.eql(u8, name, "--poll-interval-ms")) {
+            flags.poll_interval_ms = try parse_u32(value);
+        } else if (std.mem.eql(u8, name, "--proof-bytes-max")) {
+            flags.proof_bytes_max = try parse_u32(value);
+        } else return error.InvalidArguments;
+    }
+    const required = [_]?[]const u8{ flags.prover_rpc, flags.l1, flags.l2, flags.rollup_config };
+    for (required) |present| if (present == null) return error.MissingFlag;
+    return flags;
+}
+
+const protocol_worker_id_max = proof.prover_service.protocol.worker_id_bytes_max;
+
+fn open_io() !io.IO {
+    const builtin = @import("builtin");
+    return if (builtin.os.tag == .linux) try io.IO.init(.{}) else try io.IO.init();
+}
+
+pub fn service_main(init: std.process.Init, args: []const []const u8) !u8 {
+    const flags = parse_service(args) catch |err| {
+        std.debug.print("prover-service: {t}\nusage: base prover-service " ++
+            "[--listen http://127.0.0.1:7300] [--jobs-max 64] [--proof-bytes-max N]\n", .{err});
+        return 2;
+    };
+    const allocator = init.gpa;
+    var os_io = try open_io();
+    defer os_io.deinit();
+    var store: Store = try .init(allocator, .{
+        .jobs_max = flags.jobs_max,
+        .proof_bytes_max = flags.proof_bytes_max,
+        .seed = os_io.now_realtime_ns(),
+    });
+    defer store.deinit(allocator);
+    const clock = service_module.Clock.of(io.IO, &os_io);
+    // A submitted proof travels as hex: twice its size, plus the envelope.
+    const body_max = 2 * flags.proof_bytes_max + (64 << 10);
+    var service: Service = try .init(allocator, &store, clock, .{
+        .request_arena_bytes = body_max + (1 << 20),
+    });
+    defer service.deinit(allocator);
+    const server = try allocator.create(Server);
+    defer allocator.destroy(server);
+    try server.init(allocator, &os_io, &service, .{
+        .connections_max = 16,
+        .recv_buffer_size = body_max + 8 * 1024,
+        .send_buffer_size = body_max + 8 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = body_max },
+    });
+    defer server.deinit();
+    const bound = try server.listen(try consensus_cli.parse_url(flags.listen));
+    std.debug.print("prover-service: listening on {f}\n", .{bound});
+    while (true) try os_io.run_for_ns(10 * std.time.ns_per_ms);
+}
+
+const response_bytes_max = 256 << 20;
+
+const http_options: http.client.Options = .{
+    .recv_buffer_size = response_bytes_max + 64 * 1024,
+    .limits = .{ .head_size_max = 8 * 1024, .body_size_max = response_bytes_max },
+    .request_timeout_ns = 120 * std.time.ns_per_s,
+};
+
+/// The worker process: connections, the native backend and its KZG state.
+const WorkerProcess = struct {
+    os_io: io.IO,
+    l1: Native.Source.Client,
+    l2: Native.Source.Client,
+    service_http: Native.Source.Client,
+    service_endpoint: Endpoint,
+    client: Client,
+    source: Native.Source,
+    kzg_storage: kzg.blob.Settings.Storage,
+    kzg_workspace: kzg.blob.Workspace,
+    roots: [kzg.field_elements_per_blob][32]u8,
+    settings: kzg.blob.Settings,
+
+    fn step(context: *anyopaque) anyerror!void {
+        const os_io: *io.IO = @ptrCast(@alignCast(context));
+        try os_io.run_for_ns(std.time.ns_per_ms);
+    }
+
+    fn pump(process: *WorkerProcess) proof.rpc.endpoint.Pump {
+        return .{ .context = &process.os_io, .step = step };
+    }
+};
+
+pub fn worker_main(init: std.process.Init, args: []const []const u8) !u8 {
+    const flags = parse_worker(args) catch |err| {
+        std.debug.print("prover-worker: {t}\nusage: base prover-worker --prover-rpc <url> " ++
+            "--l1 <url> --l2 <url> --rollup-config <file> [--l1-genesis <file>] " ++
+            "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n", .{err});
+        return 2;
+    };
+    const allocator = init.gpa;
+    const process = try allocator.create(WorkerProcess);
+    defer allocator.destroy(process);
+    try connect_worker(process, allocator, &flags);
+    defer disconnect_worker(process, allocator);
+    return run_worker(init, process, &flags);
+}
+
+fn connect_worker(
+    process: *WorkerProcess,
+    allocator: std.mem.Allocator,
+    flags: *const WorkerFlags,
+) !void {
+    process.os_io = try open_io();
+    errdefer process.os_io.deinit();
+    const os_io = &process.os_io;
+    const l1_address = try consensus_cli.parse_url(flags.l1.?);
+    process.l1 = try .init(allocator, os_io, l1_address, http_options, 4096);
+    errdefer process.l1.deinit();
+    const l2_address = try consensus_cli.parse_url(flags.l2.?);
+    process.l2 = try .init(allocator, os_io, l2_address, http_options, 4096);
+    errdefer process.l2.deinit();
+    const service_address = try consensus_cli.parse_url(flags.prover_rpc.?);
+    process.service_http = try .init(allocator, os_io, service_address, http_options, 4096);
+    errdefer process.service_http.deinit();
+    process.service_endpoint = .init(allocator, &process.service_http, process.pump(), 300_000);
+    errdefer process.service_endpoint.deinit();
+    process.client = try .init(allocator, &process.service_endpoint, .{
+        .request_bytes_max = 2 * flags.proof_bytes_max + (64 << 10),
+    });
+    errdefer process.client.deinit(allocator);
+    process.source = .init(allocator, &process.l1, &process.l2, process.pump(), .{
+        .steps_max = 300_000,
+    });
+    base.proof.host.handler.fill_roots(&process.roots);
+    process.settings = try kzg.blob.Settings.init(&process.kzg_storage);
+}
+
+fn disconnect_worker(process: *WorkerProcess, allocator: std.mem.Allocator) void {
+    process.source.deinit();
+    process.client.deinit(allocator);
+    process.service_endpoint.deinit();
+    process.service_http.deinit();
+    process.l2.deinit();
+    process.l1.deinit();
+    process.os_io.deinit();
+}
+
+fn run_worker(init: std.process.Init, process: *WorkerProcess, flags: *const WorkerFlags) !u8 {
+    const allocator = init.gpa;
+    const rollup_json = try Io.Dir.cwd().readFileAlloc(
+        init.io,
+        flags.rollup_config.?,
+        allocator,
+        .limited(proof.program.boot.rollup_config_bytes_max),
+    );
+    defer allocator.free(rollup_json);
+    const l1_genesis = if (flags.l1_genesis) |path|
+        try Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(256 << 20))
+    else
+        try allocator.alloc(u8, 0);
+    defer allocator.free(l1_genesis);
+    const l1_config = try beacon.l1_chain_config(l1_genesis);
+    const rollup = try protocol.rollup_json.parse(rollup_json);
+    var blobs: ?*beacon.Blobs = null;
+    defer if (blobs) |opened| opened.destroy(allocator);
+    if (flags.l1_beacon) |url| {
+        const os_io = &process.os_io;
+        const settings = &process.settings;
+        blobs = try .create(allocator, os_io, url, settings, http_options, process.pump());
+        process.source.blobs = blobs.?.fetcher();
+    }
+    var native: Native = try .init(allocator, &process.source, .{
+        .rollup_config_json = rollup_json,
+        .l1_config_json = l1_config,
+        .chain_id = rollup.l2_chain_id,
+        .client_options = .{
+            .builder = proof.client.client.default_builder_config,
+            .kzg_settings = &process.settings,
+            .kzg_workspace = &process.kzg_workspace,
+        },
+        .roots_brp = &process.roots,
+        .proof_bytes_max = flags.proof_bytes_max,
+    });
+    defer native.deinit();
+    const clock = service_module.Clock.of(io.IO, &process.os_io);
+    var worker: Worker = .init(&process.client, native.backend(), clock, .{
+        .worker_id = .from(flags.worker_id),
+        .proof_type = .compressed,
+        .zk_vms = &.{.sp1},
+        .zk_backends = &.{.cluster},
+        .poll_interval_ns = flags.poll_interval_ms * std.time.ns_per_ms,
+    });
+    while (true) {
+        worker.tick();
+        try process.os_io.run_for_ns(100 * std.time.ns_per_ms);
+    }
+}
+
+test "prover service: command flags" {
+    const service = try parse_service(&.{ "--listen", "http://127.0.0.1:7301", "--jobs-max", "8" });
+    try std.testing.expectEqual(@as(u32, 8), service.jobs_max);
+    try std.testing.expectError(error.InvalidArguments, parse_service(&.{ "--jobs-max", "0" }));
+    const worker = try parse_worker(&.{
+        "--prover-rpc",    "http://127.0.0.1:7300", "--l1",        "http://127.0.0.1:8545",
+        "--l2",            "http://127.0.0.1:9545", "--worker-id", "w1",
+        "--rollup-config", "rollup.json",
+    });
+    try std.testing.expectEqualStrings("w1", worker.worker_id);
+    try std.testing.expectEqual(@as(?[]const u8, null), worker.l1_beacon);
+    try std.testing.expectError(error.MissingFlag, parse_worker(&.{ "--l1", "http://a:1" }));
+    try std.testing.expectError(error.InvalidArguments, parse_worker(&.{"--bogus"}));
+}

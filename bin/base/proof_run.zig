@@ -173,7 +173,7 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     defer store.deinit();
     const l1_genesis = try read_optional(init, flags.l1_genesis);
     defer allocator.free(l1_genesis);
-    const l1_config = try base.utilities.json.find_path(l1_genesis, &.{"config"}) orelse "";
+    const l1_config = try beacon.l1_chain_config(l1_genesis);
     try boot(&source, &store, flags, rollup_json, l1_config);
     const os_io = &endpoints.os_io;
     // `--out` records the witness: exactly the preimages the client read.
