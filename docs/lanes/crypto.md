@@ -319,3 +319,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: EIP-7594 cells (FK20 compute 189 ms/blob, batch verify, recovery) reviewed: no defects; setup bytes match public c-kzg setup; ReleaseSafe cell tests (FK20 proofs) green.
 - 2026-11-05: added coverage fuzz for cell recovery (arbitrary indices/cells never crash; recovered cells canonical); 3K ReleaseSafe runs clean.
 - 2026-11-05: montgomery.pow sliding window (w=5, public exponents): bls map_fp_to_g1 34->31.8us, bls inverse_constant_time 13.8->11.1us, bn254 5.8->5.2us.
+- 2026-11-05: cell verify cost model (128 cells, 12.1 ms): ~5 ms proof decompression (sqrt ~15 us + subgroup check ~25 us each; no sound batched subgroup check because G1 cofactor has small factors), ~5 ms two 128-point MSMs, 1.3 ms 64-point MSM, 0.5 ms pairing. A 6-blob v1 sidecar is ~70-80 ms. No further work planned.
