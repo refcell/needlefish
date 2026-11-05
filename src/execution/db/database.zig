@@ -25,6 +25,15 @@
 //! If the newest checkpoint is rotten, the engine resets the staged bytes, streams the older
 //! fallback checkpoint instead, and replays the longer journal kept since it.
 //!
+//! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
+//! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
+//! each applied block in order (the state trie tracks rehashed nodes for it). History is
+//! derived data and never journaled: `open` rebuilds it with `reset` at the recovered head,
+//! so proofs for older blocks return as the window refills. A failed history update
+//! (`HistoryFull`, a reorg below the window) never fails the operation: history is dropped
+//! and rebuilt at the head (`history_drops`). `proof_at` serves `eth_getProof` at any block
+//! of the window.
+//!
 //! Determinism: replay must make the same decisions as the live run. Operations that fail are
 //! never journaled, and block retention is decided here (by count, bytes, and transactions,
 //! oldest-inserted first) rather than by the chain store's byte ring, whose fragmentation
@@ -41,6 +50,11 @@ const overlay_module = @import("overlay.zig");
 const chain_module = @import("chain.zig");
 const changeset_module = @import("changeset.zig");
 const snapshot_module = @import("snapshot.zig");
+const history_module = @import("history.zig");
+const trie_module = @import("../trie/root.zig");
+
+const StateTrie = trie_module.StateTrie;
+const keccak256 = trie_module.node.keccak256;
 
 pub const Hash = chain_module.Hash;
 pub const BlockInput = chain_module.BlockInput;
@@ -239,6 +253,8 @@ pub const Config = struct {
     queue_entries_max: u32,
     /// Largest serialized checkpoint (snapshot plus retained blocks).
     checkpoint_staging_bytes: u32,
+    /// Historical proofs window; null keeps no history (and no trie change tracking).
+    history: ?history_module.Config = null,
 
     /// The chain ring holds the retention budget plus three of the largest records, so it
     /// never has to evict on its own: with live bytes L <= budget - n before inserting n,
@@ -265,6 +281,12 @@ pub const OpenError = engine_module.OpenError || error{
     ReplayFailed,
     MetadataMismatch,
 };
+
+pub const ProofError = error{
+    NotReady,
+    /// History is off (not configured, or a rebuild failed) and the block is not the head.
+    HistoryUnavailable,
+} || history_module.Error;
 
 pub const Commit = struct {
     /// The one entry that inserts the block and moves the head to it.
@@ -319,6 +341,14 @@ pub fn DatabaseType(comptime Storage: type) type {
         open_error: ?OpenError = null,
         load_done: bool = false,
         load_error: ?OpenError = null,
+        /// Historical proofs (`Config.history`); its window is null until the first head.
+        history: ?history_module.Store = null,
+        /// Times history was discarded and rebuilt at the head (a failed update).
+        history_drops: u64 = 0,
+        /// A rebuild at the head failed: history stays off until the next open.
+        history_off: bool = false,
+        /// The current head move could not update history; rebuild once it ends.
+        history_stale: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
@@ -345,6 +375,12 @@ pub fn DatabaseType(comptime Storage: type) type {
             errdefer changeset.deinit(allocator);
             var changeset_built = try Changeset.init(allocator, config.changeset);
             errdefer changeset_built.deinit(allocator);
+            var history_store: ?history_module.Store = null;
+            if (config.history) |history_config| {
+                try state.state_trie.track_changes(allocator);
+                history_store = try history_module.Store.init(allocator, history_config);
+            }
+            errdefer if (history_store) |*store| store.deinit(allocator);
             const buffers = try Buffers.init(allocator, config);
             return .{
                 .engine = engine,
@@ -360,6 +396,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .queue_lengths = buffers.queue_lengths,
                 .queue_metadata = buffers.queue_metadata,
                 .staging = buffers.staging,
+                .history = history_store,
             };
         }
 
@@ -394,6 +431,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Frees memory. After a simulated crash, engine operations may still be in flight.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.history) |*store| store.deinit(allocator);
             allocator.free(self.staging);
             allocator.free(self.queue_metadata);
             allocator.free(self.queue_lengths);
@@ -531,6 +569,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.journal_bytes_pending = 0;
             self.phase = .ready;
             assert(self.queue_count == 0);
+            if (self.head_info.present) self.history_rebuild();
         }
 
         // Operations.
@@ -641,6 +680,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .hash = input.hash,
                 .state_root = state_root,
             };
+            self.history_commit_head();
             const body = encode_block_and_head(input, self.queue_slot());
             const sequence = self.queue_push(@intCast(body.len));
             return .{ .sequence = sequence, .state_root = state_root };
@@ -860,9 +900,12 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .hash = head_meta.hash,
                 .state_root = state_root,
             };
+            self.history_settle();
         }
 
         fn move_state(self: *Self) OperationError!void {
+            assert(!self.history_stale);
+            const store = self.history_tracking();
             // The first head also applies the block the walk stopped at (genesis).
             if (self.chain.head() == null) try self.apply_block(self.plan.ancestor.hash);
             for (self.plan.unwind_hashes()) |hash| {
@@ -870,7 +913,20 @@ pub fn DatabaseType(comptime Storage: type) type {
                 self.changeset.decode(view.changeset) catch return error.InvalidChangeset;
                 try self.state.unwind(&self.changeset);
             }
-            for (self.plan.apply_hashes()) |hash| try self.apply_block(hash);
+            if (store) |tracked| if (self.plan.unwind_len > 0) {
+                tracked.unwind_to(self.plan.ancestor.number) catch {
+                    self.history_stale = true;
+                };
+            };
+            for (self.plan.apply_hashes()) |hash| {
+                try self.apply_block(hash);
+                const tracked = store orelse continue;
+                if (self.history_stale) continue;
+                const number = self.chain.meta(hash).?.number;
+                tracked.commit_block(&self.state.state_trie, number) catch {
+                    self.history_stale = true;
+                };
+            }
         }
 
         fn apply_block(self: *Self, hash: Hash) OperationError!void {
@@ -878,6 +934,107 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.changeset.decode(view.changeset) catch return error.InvalidChangeset;
             try self.state.apply(&self.changeset);
             self.state.set_block_hash(view.meta.number, hash);
+        }
+
+        // History.
+
+        /// The store when live head moves update it: ready, configured, on, and initialized.
+        fn history_tracking(self: *Self) ?*history_module.Store {
+            if (self.phase != .ready or self.history_off) return null;
+            const store = if (self.history) |*store| store else return null;
+            if (store.window() == null) return null;
+            assert(self.state.state_trie.accounts.changed.len > 0);
+            return store;
+        }
+
+        /// After a head move: history is at the head, or it is rebuilt there.
+        fn history_settle(self: *Self) void {
+            assert(self.head_info.present);
+            const stale = self.history_stale;
+            self.history_stale = false;
+            if (self.phase != .ready or self.history_off) return;
+            const store = if (self.history) |*store| store else return;
+            if (store.window()) |window| {
+                if (!stale) {
+                    assert(window.head == self.head_info.number);
+                    return;
+                }
+                self.history_drops += 1;
+            }
+            self.history_rebuild();
+        }
+
+        /// `commit_applied` moved the head one block without `move_state`.
+        fn history_commit_head(self: *Self) void {
+            assert(!self.history_stale);
+            if (self.history_tracking()) |store| {
+                const number = self.head_info.number;
+                store.commit_block(&self.state.state_trie, number) catch {
+                    self.history_stale = true;
+                };
+            }
+            self.history_settle();
+        }
+
+        /// Drops all history and records the head state as the only block of the window.
+        /// A failure leaves history off until the next open (never fails the database).
+        fn history_rebuild(self: *Self) void {
+            assert(self.phase == .ready and self.head_info.present);
+            const store = if (self.history) |*store| store else return;
+            self.history_off = false;
+            store.reset(&self.state.state_trie, self.head_info.number) catch {
+                self.history_off = true;
+                return;
+            };
+            assert(store.window().?.head == self.head_info.number);
+        }
+
+        /// `eth_getProof` at block `number`: the account proof, one storage proof and value
+        /// per slot, and the account (null when absent), from history for any block of its
+        /// window. Without history only the head is served (from the live trie).
+        pub fn proof_at(
+            self: *Self,
+            number: u64,
+            address: history_module.Address,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) ProofError!?history_module.AccountState {
+            assert(slots.len == storage_proofs.len and slots.len == values.len);
+            if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            if (self.history_tracking()) |store| {
+                const proofs = storage_proofs;
+                return store.get_proof(number, address, slots, account_proof, proofs, values);
+            }
+            if (number != self.head_info.number) return error.HistoryUnavailable;
+            return self.proof_live(address, slots, account_proof, storage_proofs, values);
+        }
+
+        fn proof_live(
+            self: *Self,
+            address: history_module.Address,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) ProofError!?history_module.AccountState {
+            const state_trie = &self.state.state_trie;
+            const address_hash = keccak256(&address);
+            try state_trie.prove_account(address_hash, account_proof);
+            for (slots, storage_proofs, values) |slot, *proof, *value| {
+                var slot_bytes: [32]u8 = undefined;
+                std.mem.writeInt(u256, &slot_bytes, slot, .big);
+                state_trie.prove_storage(address_hash, keccak256(&slot_bytes), proof);
+                value.* = self.state.storage(address, slot);
+            }
+            const info = self.state.basic(address) orelse return null;
+            return .{
+                .nonce = info.nonce,
+                .balance = info.balance,
+                .storage_root = state_trie.storage_root(address_hash),
+                .code_hash = info.code_hash,
+            };
         }
 
         // Checkpoints.
