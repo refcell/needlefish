@@ -34,9 +34,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Historical proofs store (base/base `crates/execution/trie`, `BaseProofsStore`): per-block
   versioned account/storage leaves + trie node preimages for a retention window, so
   `eth_getProof` works at any block in the fault-proof window without re-execution.
-  (`db/history.zig`; in memory, rebuilt by `reset` after restart; not yet fed by `Database`)
+  (`db/history.zig`; in memory, rebuilt from retained changesets on open, see Decisions)
 - [x] Window pruner: bounded work per tick, removes history older than the window; crash-safe
-  by rebuild (history is in memory; `reset` at the recovered head, see Decisions).
+  by rebuild (history is in memory; rebuilt on open from retained changesets, see Decisions).
   (`Store.prune_step(budget)`, tombstones free deleted paths, atomic `commit_block`)
 - [x] Execution witness (`debug_executionWitness`): touched trie nodes + codes + headers for a
   block, verified by re-executing statelessly against a sparse trie built from the witness.
@@ -125,10 +125,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] End-to-end rpc test with a real witness over 1 MiB (storage-heavy fixture block) through
   the large send buffers; today only a 3 MiB generic response covers that path.
   (`rpc/debug_large_test.zig`: code-heavy block instead of storage-heavy, see Log)
-- [ ] Persist the history window across restarts: today `open` resets history at the head,
+- [x] Persist the history window across restarts: today `open` resets history at the head,
   so `eth_getProof` / witnesses for older blocks are unavailable until the window refills.
   Rebuild the window on open by replaying retained blocks' changesets from the checkpoint
   (or checkpoint the history store), bounded by the window.
+  (`Database.history_rebuild_window`, `Config.history_rebuild_on_open`; rebuild from
+  retained changesets, see Decisions; `db/database_history_test.zig`)
 - [ ] Linux io_uring run of the storage engine: run `IoStorage` engine/database tests under
   `just test-linux` (Docker) and fix any backend differences (fsync vs fdatasync, short
   writes); record results.
@@ -277,10 +279,28 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   second `drain` walk only on success, so the commit can be retried. Replaces the old
   `count`-then-write sizing walk (still two walks per block). The oldest block only moves
   after the write succeeds.
-- History is not journaled: it is derived data. After a restart it is rebuilt with
-  `reset(state_trie, head)` at the recovered head; proofs for blocks before that head are
-  unavailable until the window refills (one window of blocks). Journaling every node
-  version would multiply the journal volume per block for data the node can regenerate.
+- History is not journaled: it is derived data. After a restart the durable database
+  rebuilds the window from the retained blocks' changesets (see "History rebuild on open").
+  Journaling every node version would multiply the journal volume per block for data the
+  node can regenerate.
+- History rebuild on open (`Database.history_rebuild_window`, `Config.history_rebuild_on_open`,
+  default true; only with `Config.history`): after checkpoint load and journal replay, State
+  is unwound in memory through the retained canonical blocks' stored changesets down to
+  `max(head - window + 1, the state below the oldest contiguous canonical block whose
+  changeset is retained)` (genesis is never unwound), `reset` there, then each block is
+  re-applied with `commit_block`; the state ends at the recovered head (root asserted).
+  Nothing is journaled and the chain index never moves; it runs once, synchronously, before
+  the first operation. Cost at open: O(window) unwinds + applies + state roots + history
+  commits, plus one O(state) `reset` (the old cost). Proofs equal the pre-crash ones because
+  the trie is canonical for a state. If retention holds fewer blocks than the window, the
+  window starts at the oldest state retention reaches. An unwind that does not fit
+  (`State.unwind` fails before any change) starts the window at the block it reached; a
+  history failure (`HistoryFull`) falls back to `reset` at the head (`history_drops`); a
+  failed re-apply fails the open (`ReplayFailed`), recoverable by opening with
+  `history_rebuild_on_open = false`. Chosen over checkpointing the history store: the store
+  is up to N + window * B versions, would bloat every checkpoint and need its own format,
+  versioning, and validation, while the changesets are already durable in the retained
+  blocks.
 - Witness of a stored block (`db/witness_block.zig`): the state is unwound in memory with the
   stored changesets (head down to the block) and re-applied afterwards, instead of
   `set_head(parent)`, so nothing is journaled, the chain index and head never move, and the
@@ -385,9 +405,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   moves update it inside `move_state`: unwinds, then `unwind_to(fork point)`, then
   `commit_block` after each applied block (a state root per applied block, so a multi-block
   reorg costs one extra root per block); `commit_applied` commits its one block. Replay at
-  open never touches history; `open` ends with `reset` at the recovered head (O(state) once;
-  older proofs return as the window refills). Any history failure (`HistoryFull`, a reorg
-  below the window, `NotNextBlock`) never fails the operation and never touches state: the
+  open never touches history; `open` ends by rebuilding the window from retained changesets
+  (see "History rebuild on open"; `reset` at the head when disabled). Any history failure
+  (`HistoryFull`, a reorg below the window, `NotNextBlock`) never fails the operation and never touches state: the
   move finishes, history is rebuilt with `reset` at the new head, and `history_drops` counts
   it. If that rebuild fails too (the store cannot hold one state), history stays off
   (`history_off`) until the next open instead of retrying O(state) per block.
@@ -653,3 +673,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   12.5 ms, 1k-account 3.2 -> 2.5 ms, evm block 2.2 -> 1.8-2.0 ms; verifier replay 9.9 ->
   8.2-9.4 ms. Witness bytes identical to before (differential digests across 72 builds);
   new seeded differential of batched vs serial sparse roots over three tries per pool.
+- 2026-11-05: history window rebuilt on open: `open` unwinds State through the retained
+  canonical changesets to the window start, `reset`s history there, and re-applies with
+  `commit_block` (O(window) at open, configurable). Seeded workload (2 seeds + a retention-4
+  run, reorgs, crash/reopen after a random number of steps x 3): the head and root survive,
+  the window reaches `max(head - window + 1, retention floor)`, proofs at every block of it
+  verify against the stored roots and equal the pre-crash proofs; rebuild off restarts at the
+  head; history off serves only the head. ~0.9 s Debug for the history test group.

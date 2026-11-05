@@ -28,11 +28,13 @@
 //! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
 //! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
 //! each applied block in order (the state trie tracks rehashed nodes for it). History is
-//! derived data and never journaled: `open` rebuilds it with `reset` at the recovered head,
-//! so proofs for older blocks return as the window refills. A failed history update
-//! (`HistoryFull`, a reorg below the window) never fails the operation: history is dropped
-//! and rebuilt at the head (`history_drops`). `proof_at` serves `eth_getProof` at any block
-//! of the window.
+//! derived data and never journaled: `open` rebuilds the window from the retained canonical
+//! blocks (`history_rebuild_window`, `Config.history_rebuild_on_open`): it unwinds State in
+//! memory down to the oldest block the window and retention allow, `reset`s history there,
+//! and re-applies the blocks with `commit_block`, ending at the recovered head and root.
+//! A failed history update (`HistoryFull`, a reorg below the window) never fails the
+//! operation: history is dropped and rebuilt at the head (`history_drops`). `proof_at`
+//! serves `eth_getProof` at any block of the window.
 //!
 //! Determinism: replay must make the same decisions as the live run. Operations that fail are
 //! never journaled, and block retention is decided here (by count, bytes, and transactions,
@@ -255,6 +257,10 @@ pub const Config = struct {
     checkpoint_staging_bytes: u32,
     /// Historical proofs window; null keeps no history (and no trie change tracking).
     history: ?history_module.Config = null,
+    /// With history on, `open` rebuilds the window from the retained blocks' changesets
+    /// (one unwind, apply, state root, and history commit per block, at most one window,
+    /// plus one `reset` of the whole state) instead of restarting it at the head.
+    history_rebuild_on_open: bool = true,
 
     /// The chain ring holds the retention budget plus three of the largest records, so it
     /// never has to evict on its own: with live bytes L <= budget - n before inserting n,
@@ -569,7 +575,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.journal_bytes_pending = 0;
             self.phase = .ready;
             assert(self.queue_count == 0);
-            if (self.head_info.present) self.history_rebuild();
+            if (self.head_info.present) self.history_rebuild_window();
         }
 
         // Operations.
@@ -996,6 +1002,85 @@ pub fn DatabaseType(comptime Storage: type) type {
                 return;
             };
             assert(store.window().?.head == self.head_info.number);
+        }
+
+        /// At open: rebuilds the history window from the retained canonical blocks. Unwinds
+        /// State in memory (nothing is journaled, the chain index never moves) through the
+        /// stored changesets down to `history_rebuild_start`, `reset`s history there, then
+        /// re-applies each block with `commit_block`, so the state ends at the recovered head
+        /// (root asserted). Cost: O(window) unwinds, applies, state roots, and history
+        /// commits, plus one O(state) `reset`. Any history failure falls back to `reset` at
+        /// the head; a failed re-apply fails the database (state no longer at the head).
+        fn history_rebuild_window(self: *Self) void {
+            assert(self.phase == .ready and self.head_info.present);
+            assert(!self.history_stale and !self.history_off);
+            const store = if (self.history) |*store| store else return;
+            if (!self.config.history_rebuild_on_open) return self.history_rebuild();
+            const head = self.head_info.number;
+            const start = self.history_unwind_to(self.history_rebuild_start());
+            assert(start <= head);
+            var history_ok = true;
+            store.reset(&self.state.state_trie, start) catch {
+                history_ok = false;
+            };
+            var number = start;
+            while (number < head) {
+                number += 1;
+                const hash = self.chain.canonical_hash(number).?;
+                self.apply_block(hash) catch {
+                    self.phase = .failed;
+                    self.open_error = error.ReplayFailed;
+                    return;
+                };
+                if (!history_ok) continue;
+                store.commit_block(&self.state.state_trie, number) catch {
+                    history_ok = false;
+                };
+            }
+            const root = self.state.state_root() catch {
+                self.phase = .failed;
+                self.open_error = error.ReplayFailed;
+                return;
+            };
+            assert(std.mem.eql(u8, &root, &self.head_info.state_root));
+            if (history_ok) {
+                assert(store.window().?.head == head);
+                return;
+            }
+            self.history_drops += 1;
+            self.history_rebuild();
+        }
+
+        /// The oldest block the window can be rebuilt from: `head - window_blocks + 1`, or
+        /// the state below the oldest canonical block whose changeset is still retained
+        /// (genesis is never unwound).
+        fn history_rebuild_start(self: *const Self) u64 {
+            const head = self.head_info.number;
+            const window_blocks = self.config.history.?.window_blocks;
+            assert(window_blocks > 0);
+            const lowest = head -| (window_blocks - 1);
+            var start = head;
+            while (start > lowest and start > 0) : (start -= 1) {
+                const hash = self.chain.canonical_hash(start) orelse break;
+                if (self.chain.block(hash) == null) break;
+            }
+            assert(start >= lowest and start <= head);
+            return start;
+        }
+
+        /// Unwinds State from the head down to block `target`; returns the block it reached
+        /// (higher than `target` when an unwind does not fit: `State.unwind` fails before
+        /// any change, so the state still holds the block above).
+        fn history_unwind_to(self: *Self, target: u64) u64 {
+            assert(target <= self.head_info.number);
+            var number = self.head_info.number;
+            while (number > target) : (number -= 1) {
+                const view = self.chain.block(self.chain.canonical_hash(number).?).?;
+                self.changeset.decode(view.changeset) catch break;
+                self.state.unwind(&self.changeset) catch break;
+            }
+            assert(number >= target);
+            return number;
         }
 
         /// `eth_getProof` at block `number`: the account proof, one storage proof and value

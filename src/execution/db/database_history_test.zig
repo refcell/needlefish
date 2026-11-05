@@ -2,8 +2,10 @@
 //! crash/reopen over `SimStorage` with `Config.history` on. At checkpoints of the run,
 //! `proof_at` at every block of the window must verify against that block's recorded state
 //! root and equal the proof of the database's own `State` unwound to that block. After a
-//! reopen the window restarts at the recovered head. A full store drops history (counted in
-//! `history_drops`) and rebuilds it at the head without failing any commit.
+//! crash and reopen at a random point the window is rebuilt from the retained blocks: it
+//! reaches back as far as the window and retention allow, and its proofs equal the proofs
+//! served before the crash. A full store drops history (counted in `history_drops`) and
+//! rebuilds it at the head without failing any commit.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -119,6 +121,7 @@ fn verify(root: Hash, key: *const Hash, proof: anytype) !?[]const u8 {
 }
 
 const RootEntry = struct { hash: Hash, root: Hash };
+const DigestEntry = struct { hash: Hash, digest: u64 };
 
 const Harness = struct {
     sim: SimStorage,
@@ -135,6 +138,9 @@ const Harness = struct {
     known_len: u32 = 0,
     block_id_next: u32 = 0,
     header: [16]u8 = undefined,
+    /// Proof digests of the window's blocks taken before a crash, by block hash.
+    digests: [window_blocks]DigestEntry = undefined,
+    digests_len: u32 = 0,
 
     fn create(seed: u64, config: database.Config) !*Harness {
         const self = try testing.allocator.create(Harness);
@@ -215,8 +221,13 @@ const Harness = struct {
     /// Crash (pending writes may be lost) and reopen over the same storage.
     fn crash_and_reopen(self: *Harness) !void {
         self.sim.crash();
+        try self.reopen(self.config);
+    }
+
+    /// Reopens over the same storage with `config` (the caller crashed or drained it).
+    fn reopen(self: *Harness, config: database.Config) !void {
         self.db.deinit(testing.allocator);
-        self.db = try Database.init(testing.allocator, &self.sim, self.config);
+        self.db = try Database.init(testing.allocator, &self.sim, config);
         self.overlay.discard();
         self.overlay.base = &self.db.state;
         try self.open();
@@ -351,22 +362,24 @@ const Harness = struct {
     }
 
     /// Checks every block of the window by unwinding the database's state down to the
-    /// oldest, then re-applies the changesets back to the head.
+    /// oldest (or as far as retained changesets reach), then re-applies the changesets back
+    /// to the head.
     fn sweep(self: *Harness) !void {
         const head = self.db.head_info;
         const window = self.db.history.?.window().?;
         try testing.expectEqual(head.number, window.head);
         try testing.expect(window.head - window.oldest < window_blocks);
+        const floor = @max(window.oldest, self.expected_oldest(window_blocks));
         var number = window.head;
         var steps: u32 = 0;
         while (steps < window_blocks) : (steps += 1) {
             for (0..3) |_| try self.expect_matches_live(number, self.prng.below(addresses_max));
-            if (number == window.oldest) break;
+            if (number == floor) break;
             try self.load_changeset(number);
             try self.db.state.unwind(&self.changeset);
             number -= 1;
         }
-        try testing.expectEqual(window.oldest, number);
+        try testing.expectEqual(floor, number);
         while (number < head.number) {
             number += 1;
             try self.load_changeset(number);
@@ -374,50 +387,159 @@ const Harness = struct {
         }
         try testing.expectEqual(head.state_root, try self.db.state.state_root());
     }
+
+    /// A digest of `proof_at(number)` for every third address: proof nodes, values, account.
+    fn proof_digest(self: *Harness, number: u64) !u64 {
+        const proofs = self.proofs;
+        var hasher = std.hash.Wyhash.init(number);
+        var index: u64 = 0;
+        while (index < addresses_max) : (index += 3) {
+            const account = try self.db.proof_at(
+                number,
+                address_of(index),
+                &all_slots,
+                &proofs.account,
+                &proofs.storage,
+                &proofs.values,
+            );
+            hasher.update(&.{@intFromBool(account != null)});
+            for (0..proofs.account.count) |node| {
+                hasher.update(proofs.account.node_at(@intCast(node)));
+            }
+            for (&proofs.storage, &proofs.values) |*proof, value| {
+                for (0..proof.count) |node| hasher.update(proof.node_at(@intCast(node)));
+                hasher.update(std.mem.asBytes(&value));
+            }
+        }
+        return hasher.final();
+    }
+
+    /// Records the proof digest of every block of the window (before a crash).
+    fn record_digests(self: *Harness) !void {
+        const window = self.db.history.?.window().?;
+        assert(window.head - window.oldest < window_blocks);
+        self.digests_len = 0;
+        var number = window.oldest;
+        while (number <= window.head) : (number += 1) {
+            self.digests[self.digests_len] = .{
+                .hash = self.db.chain.canonical_hash(number).?,
+                .digest = try self.proof_digest(number),
+            };
+            self.digests_len += 1;
+        }
+    }
+
+    /// The window `open` must rebuild: back to `head - window + 1`, stopping above the
+    /// newest canonical block without a retained changeset (genesis is never unwound).
+    fn expected_oldest(self: *const Harness, window: u32) u64 {
+        const head = self.db.head_info.number;
+        const lowest = head -| (window - 1);
+        var number = head;
+        while (number > lowest) : (number -= 1) {
+            const hash = self.db.chain.canonical_hash(number) orelse return number;
+            if (self.db.chain.block(hash) == null) return number;
+        }
+        return lowest;
+    }
+
+    /// After a reopen: the window is the expected one, every block of it that was in the
+    /// window before the crash serves the same proofs, and the rest verify (`sweep`).
+    fn check_rebuilt(self: *Harness) !u32 {
+        const head = self.db.head_info;
+        const window = self.db.history.?.window().?;
+        try testing.expectEqual(head.number, window.head);
+        try testing.expectEqual(self.expected_oldest(window_blocks), window.oldest);
+        try testing.expectEqual(head.state_root, try self.db.state.state_root());
+        var matched: u32 = 0;
+        for (self.digests[0..self.digests_len]) |entry| {
+            const meta = self.db.chain.meta(entry.hash) orelse continue;
+            if (meta.number < window.oldest or meta.number > window.head) continue;
+            if (!self.db.chain.is_canonical(entry.hash)) continue;
+            try testing.expectEqual(entry.digest, try self.proof_digest(meta.number));
+            matched += 1;
+        }
+        try self.sweep();
+        return matched;
+    }
 };
 
-fn run_seed(seed: u64) !void {
-    const h = try Harness.create(seed, base_config);
+fn run_seed(seed: u64, config: database.Config) !void {
+    const h = try Harness.create(seed, config);
     defer h.destroy();
     try h.format();
     var window_full = false;
+    var matched: u32 = 0;
     var cycle: u32 = 0;
     while (cycle < 3) : (cycle += 1) {
-        for (0..24) |round| {
+        const rounds = h.prng.range(4, 30);
+        for (0..rounds) |round| {
             try h.step();
             if (round % 6 == 5) try h.sweep();
             const window = h.db.history.?.window().?;
             if (window.head - window.oldest + 1 == window_blocks) window_full = true;
         }
+        try h.record_digests();
+        const head = h.db.head_info;
         try h.crash_and_reopen();
-        // History restarts at the recovered head; older blocks are out of the window.
-        const head = h.db.head_info.number;
-        const window = h.db.history.?.window().?;
-        try testing.expectEqual(head, window.oldest);
-        try testing.expectEqual(head, window.head);
-        if (head > 0) {
-            try testing.expectError(error.BlockOutOfWindow, h.db.proof_at(
-                head - 1,
-                address_of(0),
-                &.{},
-                &h.proofs.account,
-                &.{},
-                &.{},
-            ));
-        }
-        try h.sweep();
+        // Commits waited for durability: the head and root survive the crash.
+        try testing.expect(head.eql(h.db.head_info));
+        matched += try h.check_rebuilt();
     }
+    // Without the rebuild the window restarts at the head; the head is the same.
+    try h.tick_until(Harness.idle);
+    const head = h.db.head_info;
+    var no_rebuild = config;
+    no_rebuild.history_rebuild_on_open = false;
+    try h.reopen(no_rebuild);
+    try testing.expect(head.eql(h.db.head_info));
+    const window = h.db.history.?.window().?;
+    try testing.expectEqual(head.number, window.oldest);
+    try testing.expectEqual(head.number, window.head);
     try testing.expect(window_full);
+    try testing.expect(matched > 0);
     try testing.expectEqual(@as(u64, 0), h.db.history_drops);
     try testing.expect(!h.db.history_off);
 }
 
 test "database history: proofs at every block of the window across reorgs and reopen" {
     // Two seeds keep Debug runtime low; raise the count locally for deeper runs.
-    for (0..2) |seed| run_seed(0xd8_4157 + seed) catch |err| {
+    for (0..2) |seed| run_seed(0xd8_4157 + seed, base_config) catch |err| {
         std.debug.print("database history: failing seed={d}\n", .{seed});
         return err;
     };
+}
+
+test "database history: a reopen rebuilds only the blocks retention keeps" {
+    var config = base_config;
+    // Fewer retained blocks than the window: the rebuilt window is bounded by retention.
+    config.chain.blocks_max = 4;
+    config.chain.reorg_depth_max = 3;
+    run_seed(0x4e7a_10, config) catch |err| {
+        std.debug.print("database history: failing retention seed\n", .{});
+        return err;
+    };
+}
+
+test "database history: without history a reopen serves only the head" {
+    var config = base_config;
+    config.history = null;
+    const h = try Harness.create(0x0ff0, config);
+    defer h.destroy();
+    try h.format();
+    for (0..8) |_| try h.build();
+    const head = h.db.head_info;
+    try h.crash_and_reopen();
+    try testing.expect(head.eql(h.db.head_info));
+    try testing.expect(h.db.history == null);
+    try testing.expectEqual(head.state_root, try h.db.state.state_root());
+    try testing.expectError(error.HistoryUnavailable, h.db.proof_at(
+        head.number - 1,
+        address_of(1),
+        &.{},
+        &h.proofs.account,
+        &.{},
+        &.{},
+    ));
 }
 
 test "database history: a full store drops history and the database stays healthy" {

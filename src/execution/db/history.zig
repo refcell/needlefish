@@ -14,9 +14,9 @@
 //! Leaf values are the leaves themselves (accounts and slots decode from leaf nodes), so no
 //! separate leaf history is kept. All memory is sized at init from `Config`.
 //!
-//! The store is in memory only and is not journaled: after a restart it is rebuilt with
-//! `reset` at the recovered head, and proofs for older blocks are unavailable until the
-//! window refills.
+//! The store is in memory only and is not journaled: after a restart the durable database
+//! rebuilds it (`reset` at the oldest block it can unwind to, then `commit_block` for each
+//! retained block up to the recovered head).
 
 const std = @import("std");
 const assert = std.debug.assert;
