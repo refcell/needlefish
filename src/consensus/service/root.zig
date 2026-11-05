@@ -9,6 +9,7 @@ pub const unsafe_buffer = @import("unsafe_buffer.zig");
 pub const signer_watcher = @import("signer_watcher.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const metrics = @import("metrics.zig");
+pub const follow = @import("follow.zig");
 pub const Node = node.Node;
 
 test {
@@ -20,4 +21,5 @@ test {
     _ = signer_watcher;
     _ = checkpoint;
     _ = metrics;
+    _ = follow;
 }

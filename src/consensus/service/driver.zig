@@ -38,6 +38,7 @@ const ProviderError = derive_errors.ProviderError;
 const Pipeline = pipeline_module.Pipeline;
 const EngineTaskQueue = task_queue.EngineTaskQueue;
 const SyncState = @import("../engine/state.zig").SyncState;
+const SyncStateUpdate = @import("../engine/state.zig").SyncStateUpdate;
 const InsertEnvelope = @import("../engine/insert_task.zig").Envelope;
 const UnsafeBuffer = @import("unsafe_buffer.zig").UnsafeBuffer;
 
@@ -53,6 +54,10 @@ pub const Options = struct {
     unsafe_buffer_capacity: u32 = 64,
     /// While the execution engine syncs, re-send the forkchoice state this often.
     el_sync_probe_interval_s: u64 = 2,
+    /// Follow mode (base/base `FollowNode`): no derivation or L1 finalization; unsafe blocks
+    /// come from a source node through `insert_unsafe` and safe/finalized labels through
+    /// `promote_labels`.
+    follow: bool = false,
 };
 
 pub const Phase = enum { starting, resetting, running };
@@ -72,6 +77,8 @@ pub const Stats = struct {
     critical_errors: u64 = 0,
     /// Forced forkchoice updates sent while waiting for EL sync to finish.
     el_sync_probes: u64 = 0,
+    /// Follow mode: label updates queued.
+    labels_promoted: u64 = 0,
 };
 
 /// Adapts the node providers to the startup finder's client (null on `NotFound`).
@@ -225,6 +232,7 @@ pub const Driver = struct {
                 // Derivation and sequencing wait until the engine has finished its initial
                 // sync (base/base `AwaitingELSyncCompletion`).
                 if (!driver.queue.state.el_sync_finished) return driver.probe_el_sync(now_s);
+                if (driver.options.follow) return;
                 driver.derive(providers);
                 if (driver.phase != .running) return;
                 driver.finalize(providers.l1_finalized);
@@ -333,6 +341,39 @@ pub const Driver = struct {
         driver.stats.unsafe_ignored += 1;
         assert(driver.stats.unsafe_ignored > 0);
         return false;
+    }
+
+    /// Follow mode: moves the safe and finalized heads to verified source labels. A label at
+    /// or behind the current head, or ahead of the unsafe (safe) head, is ignored, so the
+    /// heads never unwind. Returns whether an update was queued.
+    pub fn promote_labels(driver: *Driver, safe: ?L2BlockInfo, finalized: ?L2BlockInfo) bool {
+        assert(driver.options.follow);
+        if (driver.phase != .running) return false;
+        const state = &driver.queue.state.sync_state;
+        var update: SyncStateUpdate = .{};
+        var safe_number = state.safe_head.block_info.number;
+        if (safe) |head| {
+            const number = head.block_info.number;
+            if (number > safe_number and number <= state.unsafe_head.block_info.number) {
+                update.local_safe_head = head;
+                update.safe_head = head;
+                safe_number = number;
+            }
+        }
+        if (finalized) |head| {
+            const number = head.block_info.number;
+            if (number > state.finalized_head.block_info.number and number <= safe_number) {
+                update.finalized_head = head;
+            }
+        }
+        if (update.safe_head == null and update.finalized_head == null) return false;
+        driver.queue.enqueue(.{ .synchronize = update }) catch |err| {
+            driver.note(err);
+            return false;
+        };
+        driver.stats.labels_promoted += 1;
+        assert(driver.stats.labels_promoted > 0);
+        return true;
     }
 
     fn enqueue_unsafe(driver: *Driver, envelope: *const InsertEnvelope) bool {
@@ -790,6 +831,47 @@ fn seal_two(arena: Allocator) ![2]InsertEnvelope {
     try testing.expectEqual(@as(u64, 2), sealed[1].payload.block_number);
     try testing.expect(sealed[1].payload.parent_hash.eql(sealed[0].payload.block_hash));
     return sealed;
+}
+
+test "driver: follow mode inserts source blocks and promotes labels without deriving" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const sealed = try seal_two(arena.allocator());
+    var follower: Scenario = undefined;
+    try follower.init(.{ .follow = true });
+    defer follower.deinit();
+    const driver = &follower.driver;
+    for (0..32) |_| driver.tick(follower.providers(), Scenario.genesis_time + 1);
+    try testing.expectEqual(Phase.running, driver.phase);
+    // Past the sequencing window a verifier would derive and build; a follower does not.
+    try testing.expect(driver.consolidating == null);
+    try testing.expectEqual(@as(u32, 0), follower.mock.build_calls);
+    try testing.expect(driver.insert_unsafe(&sealed[0]));
+    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 2);
+    const first = driver.sync_state().unsafe_head;
+    try testing.expectEqual(@as(u64, 1), first.block_info.number);
+    try testing.expect(driver.insert_unsafe(&sealed[1]));
+    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    const second = driver.sync_state().unsafe_head;
+    try testing.expectEqual(@as(u64, 2), second.block_info.number);
+    // Finalized ahead of safe is held back until safe catches up.
+    try testing.expect(driver.promote_labels(first, second));
+    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    try testing.expectEqual(@as(u64, 1), driver.sync_state().safe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 0), driver.sync_state().finalized_head.block_info.number);
+    try testing.expect(driver.promote_labels(second, first));
+    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    const state = driver.sync_state();
+    try testing.expect(state.safe_head.block_info.hash.eql(second.block_info.hash));
+    try testing.expect(state.local_safe_head.block_info.hash.eql(second.block_info.hash));
+    try testing.expect(state.finalized_head.block_info.hash.eql(first.block_info.hash));
+    // Stale labels never unwind; labels past the unsafe head are ignored.
+    try testing.expect(!driver.promote_labels(first, first));
+    var ahead = second;
+    ahead.block_info.number = 9;
+    try testing.expect(!driver.promote_labels(ahead, null));
+    try testing.expectEqual(@as(u64, 2), driver.stats.labels_promoted);
+    try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
 }
 
 test "driver: out-of-order gossip waits in the unsafe buffer for its parent" {

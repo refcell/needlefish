@@ -46,6 +46,7 @@ const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
 const checkpoint = @import("checkpoint.zig");
 const metrics_module = @import("metrics.zig");
+const follow = @import("follow.zig");
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -94,6 +95,9 @@ pub const Options = struct {
     l2: Address,
     jwt_secret: jwt.Secret,
     rpc_address: Address,
+    /// Follow mode (`--source-l2-rpc`): insert blocks from this source node's execution RPC
+    /// instead of deriving them.
+    follow_source: ?Address = null,
     /// Prometheus `GET /metrics` (`--metrics.enabled`); not served when null.
     metrics_address: ?Address = null,
     sequencer: bool = false,
@@ -313,8 +317,12 @@ pub fn Node(comptime IO: type) type {
         checkpoints_logged: bool = false,
         metrics: metrics_module.Metrics = .{},
         metrics_server: ?MetricsServer = null,
+        follower: ?*Follower = null,
+        /// Source labels waiting for the local blocks they are checked against.
+        follow_labels: ?follow.Labels = null,
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
+        pub const Follower = follow.Follower(IO);
         pub const MetricsServer = http.Server(IO, *Metrics, Metrics.handle);
         const Metrics = metrics_module.Metrics;
         pub const Network = p2p_network.Network(IO);
@@ -367,12 +375,14 @@ pub fn Node(comptime IO: type) type {
             errdefer node.safe_db.deinit(allocator);
             try node.init_sources();
             errdefer node.deinit_sources();
+            var driver_options = options.driver;
+            driver_options.follow = options.follow_source != null;
             try node.driver.init(
                 allocator,
                 rollup,
                 &node.blob_schedule,
                 &node.safe_db,
-                options.driver,
+                driver_options,
             );
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
@@ -383,7 +393,104 @@ pub fn Node(comptime IO: type) type {
             errdefer node.deinit_upgrade();
             if (options.checkpoint_path) |path| try node.init_checkpoints(path);
             errdefer node.deinit_checkpoints();
+            if (options.follow_source) |source| try node.init_follower(source);
+            errdefer node.deinit_follower();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        fn init_follower(node: *Self, source: Address) !void {
+            assert(node.follower == null);
+            assert(node.driver.options.follow);
+            const follower = try node.allocator.create(Follower);
+            errdefer node.allocator.destroy(follower);
+            // Full blocks: the engine client's buffers fit them.
+            try follower.init(node.allocator, node.io, source, node.options.engine_http_client);
+            node.follower = follower;
+        }
+
+        fn deinit_follower(node: *Self) void {
+            const follower = node.follower orelse return;
+            var rounds: u32 = 0;
+            while (follower.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+                follower.client.http.tick();
+            }
+            follower.deinit();
+            node.allocator.destroy(follower);
+            node.follower = null;
+        }
+
+        /// Follow mode: inserts the next source block once the engine queue is idle (so the
+        /// unsafe head is current and no block is inserted twice), then checks labels.
+        fn tick_follow(node: *Self) void {
+            const follower = node.follower orelse return;
+            const unsafe_number = node.driver.sync_state().unsafe_head.block_info.number;
+            const idle = node.driver.phase == .running and node.driver.queue.len() == 0;
+            follower.tick(unsafe_number, idle);
+            if (follower.take()) |envelope| {
+                if (envelope.payload.block_number != unsafe_number + 1) {
+                    follower.consume(); // The head moved meanwhile; fetch again.
+                } else if (idle and node.driver.insert_unsafe(envelope)) {
+                    follower.consume();
+                }
+            }
+            if (follower.take_labels()) |labels| node.follow_labels = labels;
+            node.tick_follow_labels();
+            assert(node.driver.options.follow);
+        }
+
+        /// Checks pending source labels against the local blocks at their heights (base/base
+        /// `update_safe_and_finalized`): safe within `[safe, unsafe]`, finalized within
+        /// `[finalized, new safe]`. A hash mismatch drops the update.
+        fn tick_follow_labels(node: *Self) void {
+            const labels = node.follow_labels orelse return;
+            const state = node.driver.sync_state();
+            const latest = state.unsafe_head.block_info.number;
+            const safe_floor = state.safe_head.block_info.number;
+            const safe = node.follow_local(labels.safe, safe_floor, latest) catch |err| {
+                if (err == error.NotAvailable) return; // Asked again next tick.
+                return node.drop_follow_labels(labels.safe.?);
+            };
+            const safe_limit = if (safe) |head| head.block_info.number else safe_floor;
+            const floor = state.finalized_head.block_info.number;
+            const top = @min(latest, safe_limit);
+            const finalized = node.follow_local(labels.finalized, floor, top) catch |err| {
+                if (err == error.NotAvailable) return;
+                return node.drop_follow_labels(labels.finalized.?);
+            };
+            node.follow_labels = null;
+            if (safe != null or finalized != null) _ = node.driver.promote_labels(safe, finalized);
+            assert(node.follow_labels == null);
+        }
+
+        fn drop_follow_labels(node: *Self, label: protocol.block.BlockInfo) void {
+            assert(node.follow_labels != null);
+            node.follow_labels = null;
+            node.logger.log(.warn, "consensus", "follow source label does not match", .{
+                .number = label.number,
+            });
+        }
+
+        /// The local block for a source label in range, or null when it is out of range or
+        /// missing locally.
+        fn follow_local(
+            node: *Self,
+            source: ?protocol.block.BlockInfo,
+            floor: u64,
+            ceiling: u64,
+        ) error{ NotAvailable, Mismatch }!?L2BlockInfo {
+            const label = source orelse return null;
+            if (label.number < floor or label.number > ceiling) return null;
+            const local = node.l2.l2_block_info_by_number(label.number) catch |err| {
+                if (err == error.NotAvailable) return error.NotAvailable;
+                return null;
+            };
+            assert(local.block_info.number == label.number);
+            return switch (follow.verify_label(label, local.block_info, floor, ceiling)) {
+                .skip => null,
+                .promote => local,
+                .mismatch => error.Mismatch,
+            };
         }
 
         fn init_metrics(node: *Self) !void {
@@ -619,6 +726,7 @@ pub fn Node(comptime IO: type) type {
             node.deinit_p2p();
             node.deinit_upgrade();
             node.deinit_checkpoints();
+            node.deinit_follower();
             node.gossip_arena.deinit();
             node.deinit_metrics();
             node.rpc_server.deinit();
@@ -673,8 +781,10 @@ pub fn Node(comptime IO: type) type {
         pub fn busy(node: *const Self) bool {
             const blobs_busy = if (node.blobs) |blobs| blobs.busy() else false;
             const signer_busy = if (node.signer) |signer| signer.busy() else false;
+            const follower_busy = if (node.follower) |follower| follower.busy() else false;
             return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
-                node.message_passer.busy() or node.engine.busy() or blobs_busy or signer_busy;
+                node.message_passer.busy() or node.engine.busy() or blobs_busy or signer_busy or
+                follower_busy;
         }
 
         /// One step of the node's state machines; call every few milliseconds.
@@ -694,6 +804,7 @@ pub fn Node(comptime IO: type) type {
                 node.tick_gossip(network);
             }
             node.tick_checkpoints();
+            node.tick_follow();
             node.record_metrics();
             node.log_progress();
             assert(node.driver.sync_state().is_ordered());
@@ -1081,6 +1192,45 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
     }
+}
+
+test "node: follow mode polls the source node and never derives" {
+    var block_text: [4096]u8 = undefined;
+    var hash: [32]u8 = undefined;
+    const block = try fixtures.l2_block_json(&block_text, 7, &hash);
+    var fake: FakeRpc = .{};
+    fake.add(.{ .method = "eth_getBlockByNumber", .params_contain = "latest", .result = block });
+    fake.add(.{ .method = "eth_getBlockByNumber", .params_contain = "safe", .result = block });
+    var harness: Harness = undefined;
+    try harness.init_connections(&fake, 0xf1, 6);
+    defer harness.deinit();
+    var rollup: RollupConfig = .{ .block_time = 2 };
+    rollup.upgrades.set(.holocene, 0);
+    var log_buffer: [4096]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const node = try testing.allocator.create(TestNode);
+    defer testing.allocator.destroy(node);
+    try node.init(testing.allocator, &harness.client_io, &logger, &rollup, .{
+        .l1 = harness.address,
+        .l2 = harness.address,
+        .follow_source = harness.address,
+        .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545),
+        .http_client = harness_module.client_options,
+    });
+    defer node.deinit();
+    try testing.expect(node.driver.options.follow);
+    for (0..20) |_| {
+        node.tick();
+        harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+    const follower = node.follower.?;
+    try testing.expect(follower.stats.label_reads >= 2);
+    // The driver is not running (the fake L1 origin is missing), so no block is fetched.
+    try testing.expectEqual(@as(u64, 0), follower.stats.blocks);
+    try testing.expectEqual(@as(u64, 0), node.driver.stats.consolidated);
+    while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
 }
 
 test "node: observes the upgrade signal and serves base_upgradeReadiness" {

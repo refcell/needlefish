@@ -67,7 +67,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `bin/consensus`: sequencer + verifier modes, flags like base/base.
   - [x] Prometheus metrics endpoint (`--metrics.enabled/addr/port`) with base/base metric
     names (heads, derivation, engine queue, sequencer, p2p)
-  - [ ] follow mode (base/base `service/follow`): follow a remote CL's safe/finalized heads
+  - [x] follow mode (base/base `service/follow`): follow a remote CL's safe/finalized heads
     over RPC instead of deriving
   - [ ] op-conductor client (`--conductor.rpc`): leader check before sequencing,
     commitUnsafePayload, overrideLeader
@@ -89,6 +89,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Follow mode: one block in flight, fetched only while the engine queue is idle (the unsafe head is current, no double insert); labels polled every 30 s; no prefetch window, proof gate, or L1 origin check yet. The driver skips derivation and L1 finalization.
 - Metrics: base/base names where they map (`base_node_block_labels{label}`, `base_node_engine_task_queue_depth`, `base_node_engine_reset_count`); driver counters are `base_node_*_total`, sampled from monotonic driver stats each tick.
 - `ProviderError.Pruned` is critical for derivation (it cannot go below a pruned body). The
   node holds the driver until the checkpoint file is read, so startup sees the checkpoints.
@@ -210,6 +211,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: service: follow mode (--source-l2-rpc): source blocks inserted in order, safe/finalized labels verified against local blocks and promoted.
 - 2026-11-05: service: Prometheus /metrics (--metrics.enabled/addr/port): block labels, queue depth, driver counters.
 - 2026-11-05: rpc: admin_overrideLeader, admin_refreshUpgradeSignal, dev_taskQueueLength; backlog extended.
 - 2026-11-05: engine: startup recovers pruned safe/finalized heads from checkpoints or the earliest unpruned block.

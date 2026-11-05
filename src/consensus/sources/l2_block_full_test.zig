@@ -71,6 +71,36 @@ test "l2 block full: decodes deposits, signed transactions, and withdrawals" {
     try testing.expectEqual(@as(u8, 0x7e), decoded.transactions[1][0]);
 }
 
+test "l2 block full: decodes the block as an execution payload envelope" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const signed = fixtures.signed_transactions();
+    const extra = [_]Envelope{ signed[0], user_deposit("x", false) };
+    var block: L2FullBlock = undefined;
+    block.init(12, .init(@splat(3)), 1, &extra);
+    var buffer: [16 * 1024]u8 = undefined;
+    const text = try block.json_text(&buffer);
+    const envelope = try l2_block_full.decode_envelope(arena.allocator(), text, .{});
+    const payload = &envelope.payload;
+    try testing.expect(payload.block_hash.eql(block.hash()));
+    try testing.expectEqual(@as(u64, 12), payload.block_number);
+    try testing.expect(payload.parent_hash.eql(block.header.parent_hash));
+    try testing.expect(payload.state_root.eql(block.header.state_root));
+    try testing.expectEqual(block.header.timestamp, payload.timestamp);
+    try testing.expectEqual(@as(u256, block.header.base_fee_per_gas.?), payload.base_fee_per_gas);
+    try testing.expectEqualStrings("needlefish", payload.extra_data);
+    try testing.expect(envelope.parent_beacon_block_root.?.eql(.init(@splat(0xbe))));
+    try testing.expectEqual(@as(usize, 3), payload.transactions.len);
+    try testing.expectEqual(@as(usize, 0), payload.withdrawals.?.len);
+    const decoded = try l2_block_full.decode(arena.allocator(), text, &genesis_default, .{});
+    for (decoded.transactions, payload.transactions) |a, b| try testing.expectEqualSlices(u8, a, b);
+    // A tampered header fails the hash check.
+    const position = std.mem.indexOf(u8, text, "\"gasUsed\":\"0x").? + 13;
+    buffer[position] = if (buffer[position] == '1') '2' else '1';
+    const tampered = l2_block_full.decode_envelope(arena.allocator(), text, .{});
+    try testing.expectError(error.HashMismatch, tampered);
+}
+
 test "l2 block full: genesis anchors at the rollup genesis" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -190,6 +220,9 @@ test "l2 block full: seeded round trip and mutation fuzz" {
         try expect_transactions(&block, &decoded);
         try testing.expect(decoded.info.block_info.hash.eql(block.hash()));
         try testing.expectEqual(block.withdrawal_count, decoded.withdrawals.?.len);
+        const envelope = try l2_block_full.decode_envelope(allocator, text, .{});
+        try testing.expect(envelope.payload.block_hash.eql(block.hash()));
+        try testing.expectEqual(decoded.transactions.len, envelope.payload.transactions.len);
         for (0..prng.range(1, 3)) |_| {
             const position = prng.below(text.len);
             buffer[position] = switch (prng.below(3)) {
@@ -205,6 +238,11 @@ test "l2 block full: seeded round trip and mutation fuzz" {
 }
 
 fn decode_arbitrary(allocator: std.mem.Allocator, input: []const u8) void {
+    if (l2_block_full.decode_envelope(allocator, input, .{})) |envelope| {
+        // Every transaction came out of the input text, so they cannot outnumber its bytes.
+        assert(envelope.payload.transactions.len <= input.len);
+        assert(envelope.payload.extra_data.len <= 32);
+    } else |_| {}
     const decoded = l2_block_full.decode(allocator, input, &genesis_default, .{}) catch return;
     // Whatever decodes is self-consistent: one L1 info deposit leads a non-genesis block.
     assert(decoded.transactions.len > 0);

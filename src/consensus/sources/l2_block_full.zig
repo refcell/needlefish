@@ -22,6 +22,7 @@ const consensus = @import("../../common/consensus/root.zig");
 const ordered = @import("../../execution/trie/ordered.zig");
 const protocol = @import("../protocol/root.zig");
 const attributes_match = @import("../engine/attributes_match.zig");
+const insert_task = @import("../engine/insert_task.zig");
 
 const B256 = primitives.B256;
 const Envelope = consensus.Envelope;
@@ -30,6 +31,8 @@ const ChainGenesis = protocol.rollup_config.ChainGenesis;
 const L1BlockInfo = protocol.l1_info.L1BlockInfo;
 
 pub const L2Block = attributes_match.L2Block;
+/// A block as an engine insert (`newPayload`) envelope, for follow mode.
+pub const PayloadEnvelope = insert_task.Envelope;
 
 pub const Error = l2_block.Error || transaction_json.Error;
 
@@ -81,6 +84,54 @@ pub fn decode(
     assert(block.info.block_info.hash.eql(decoded.hash));
     assert(block.transactions.len == transactions.len);
     return block;
+}
+
+/// Decodes a full L2 block into the execution payload that produced it (base/base
+/// `BaseExecutionPayloadEnvelope::from_block_unchecked`, used by follow mode). The header
+/// hash and transactions root are verified like `decode`. Slices live in `arena`.
+pub fn decode_envelope(arena: Allocator, raw: []const u8, limits: Limits) Error!PayloadEnvelope {
+    var extra: [header_json.extra_data_size_max]u8 = undefined;
+    const decoded = try header_json.decode(raw, &extra);
+    const header = &decoded.header;
+    const base_fee = header.base_fee_per_gas orelse return error.MissingField;
+    const body = try scan_body(raw);
+    const transactions = try decode_transactions(
+        arena,
+        body.transactions,
+        header.transactions_root,
+        limits.transactions,
+    );
+    const withdrawal_limits: engine_json.Limits = .{ .withdrawals_max = limits.withdrawals_max };
+    const withdrawals = if (body.withdrawals) |list|
+        try engine_json.decode_withdrawals(arena, list, withdrawal_limits)
+    else
+        null;
+    const envelope: PayloadEnvelope = .{
+        .payload = .{
+            .parent_hash = header.parent_hash,
+            .fee_recipient = header.beneficiary,
+            .state_root = header.state_root,
+            .receipts_root = header.receipts_root,
+            .logs_bloom = header.logs_bloom,
+            .prev_randao = header.mix_hash,
+            .block_number = header.number,
+            .gas_limit = header.gas_limit,
+            .gas_used = header.gas_used,
+            .timestamp = header.timestamp,
+            .extra_data = try arena.dupe(u8, header.extra_data),
+            .base_fee_per_gas = base_fee,
+            .block_hash = decoded.hash,
+            .transactions = transactions,
+            .withdrawals = withdrawals,
+            .blob_gas_used = header.blob_gas_used,
+            .excess_blob_gas = header.excess_blob_gas,
+            .withdrawals_root = if (header.requests_hash != null) header.withdrawals_root else null,
+        },
+        .parent_beacon_block_root = header.parent_beacon_block_root,
+    };
+    assert(envelope.payload.block_hash.eql(decoded.hash));
+    assert(envelope.payload.transactions.len == transactions.len);
+    return envelope;
 }
 
 fn scan_body(raw: []const u8) Error!Body {

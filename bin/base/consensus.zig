@@ -21,6 +21,7 @@ const usage =
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
     \\         [--checkpoint.path FILE]
     \\         [--metrics.enabled [--metrics.addr IP] [--metrics.port P]]
+    \\         [--source-l2-rpc URL]   follow mode: insert blocks from a source node
     \\
 ;
 
@@ -29,6 +30,8 @@ pub const Flags = struct {
     l1: ?io.Address = null,
     l1_beacon: ?io.Address = null,
     l2: ?io.Address = null,
+    /// Follow mode (base/base `follow --source-l2-rpc`): no derivation.
+    source_l2_rpc: ?io.Address = null,
     l2_jwt: ?[]const u8 = null,
     rpc_addr: [4]u8 = .{ 127, 0, 0, 1 },
     rpc_port: u16 = 7545,
@@ -113,6 +116,8 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.l1_beacon = try parse_url(value);
     } else if (eql(u8, arg, "--l2")) {
         flags.l2 = try parse_url(value);
+    } else if (eql(u8, arg, "--source-l2-rpc")) {
+        flags.source_l2_rpc = try parse_url(value);
     } else if (eql(u8, arg, "--l2-jwt")) {
         flags.l2_jwt = value;
     } else if (eql(u8, arg, "--rpc.addr")) {
@@ -169,6 +174,7 @@ pub fn parse_flags(args: []const []const u8) !Flags {
     if (flags.rollup_config == null) return error.MissingRollupConfig;
     if (flags.l1 == null or flags.l2 == null) return error.MissingEndpoint;
     if (flags.l2_jwt == null) return error.MissingJwt;
+    if (flags.source_l2_rpc != null and flags.sequencer) return error.FollowSequencer;
     flags.p2p = try p2p.options.parse(p2p_args[0..p2p_count]);
     return flags;
 }
@@ -217,6 +223,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .p2p = p2p_config,
         .upgrade_signal = upgrade_settings(&flags, rollup.l2_chain_id),
         .checkpoint_path = flags.checkpoint_path,
+        .follow_source = flags.source_l2_rpc,
         .metrics_address = if (flags.metrics_enabled)
             io.Address.ip4(flags.metrics_addr, flags.metrics_port)
         else
@@ -328,6 +335,11 @@ test "consensus: flags" {
     try std.testing.expect(metered.metrics_enabled);
     try std.testing.expectEqual(@as(u16, 9191), metered.metrics_port);
     try std.testing.expectEqual(@as(u8, 127), metered.metrics_addr[0]);
+    const follow_args = required ++ [_][]const u8{ "--source-l2-rpc", "http://10.0.0.9:8545" };
+    const following = try parse_flags(&follow_args);
+    try std.testing.expectEqual(@as(u16, 8545), following.source_l2_rpc.?.port);
+    const follow_sequencer = follow_args ++ [_][]const u8{"--sequencer"};
+    try std.testing.expectError(error.FollowSequencer, parse_flags(&follow_sequencer));
     try std.testing.expect(upgrade_settings(&upgrade, 1).?.block_tag == .safe);
     try std.testing.expect(upgrade_settings(&disabled, 901) == null);
     try std.testing.expect(upgrade_settings(&disabled, 8453) != null);
