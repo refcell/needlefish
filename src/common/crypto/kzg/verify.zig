@@ -70,14 +70,24 @@ pub fn verify_kzg_proof_points(
     return pairing_check_fixed_g2(left, proof);
 }
 
+/// Miller loop lines of the two fixed G2 points, computed at compile time.
+const prepared_generator: bls.pairing.PreparedG2 = blk: {
+    @setEvalBranchQuota(100_000_000);
+    break :blk bls.pairing.prepare(bls.g2.generator);
+};
+const prepared_tau: bls.pairing.PreparedG2 = blk: {
+    @setEvalBranchQuota(100_000_000);
+    break :blk bls.pairing.prepare(tau_g2);
+};
+
 /// True when e(left, G2) * e(-proof, [tau]G2) == 1 (the shared form of every KZG check).
 pub fn pairing_check_fixed_g2(left: bls.G1Affine, proof: bls.G1Affine) bool {
-    const pairs = [2]bls.pairing.Pair{
-        .{ .g1 = left, .g2 = bls.g2.generator },
-        .{ .g1 = proof.neg(), .g2 = tau_g2 },
+    const pairs = [2]bls.pairing.PreparedPair{
+        .{ .g1 = left, .g2 = &prepared_generator },
+        .{ .g1 = proof.neg(), .g2 = &prepared_tau },
     };
     assert(pairs[0].g1.is_on_curve() and pairs[1].g1.is_on_curve());
-    return bls.pairing.pairing_check(&pairs);
+    return bls.pairing.pairing_check_prepared(&pairs);
 }
 
 /// The 0x0A precompile: 192-byte input, versioned hash match, valid proof.
@@ -92,6 +102,17 @@ pub fn precompile_point_evaluation(input: []const u8) setup.PrecompileError![64]
 }
 
 const testing = std.testing;
+
+test "kzg verify: comptime prepared lines match runtime preparation" {
+    const runtime_generator = bls.pairing.prepare(bls.g2.generator);
+    const runtime_tau = bls.pairing.prepare(tau_g2);
+    for (runtime_generator.lines, prepared_generator.lines) |a, b| {
+        for (a, b) |x, y| try testing.expect(x.eql(y));
+    }
+    for (runtime_tau.lines, prepared_tau.lines) |a, b| {
+        for (a, b) |x, y| try testing.expect(x.eql(y));
+    }
+}
 
 test "kzg verify: setup [tau]G2 is a valid G2 subgroup point" {
     const point = try bls.g2.decompress(setup.setup_g2_monomial(1));

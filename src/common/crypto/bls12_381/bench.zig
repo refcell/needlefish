@@ -61,6 +61,18 @@ pub fn pairing_2(iterations: u32) u64 {
     return valid;
 }
 
+pub fn pairing_2_prepared(iterations: u32) u64 {
+    const prepared = pairing.prepare(g2.generator);
+    const pairs = [2]pairing.PreparedPair{
+        .{ .g1 = g1.generator, .g2 = &prepared },
+        .{ .g1 = g1.generator.neg(), .g2 = &prepared },
+    };
+    var valid: u64 = 0;
+    for (0..iterations) |_| valid += @intFromBool(pairing.pairing_check_prepared(&pairs));
+    assert(valid == iterations);
+    return valid;
+}
+
 pub fn map_fp_to_g1(iterations: u32) u64 {
     var u = fields.Fp.from_int(0x1234_5678_9abc_def0);
     var accumulator: u64 = 0;

@@ -26,8 +26,9 @@ fallback but hot paths should be our own, optimized implementations.
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
 - [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
   recover. (in progress, worker)
-- [ ] bls: GLV-split scalars inside large G1 MSM (halves windows); prepared G2 lines for the
-  fixed KZG G2 points in pairing checks.
+- [x] bls: prepared G2 lines (`pairing.prepare`, `pairing_check_prepared`); KZG fixed G2 lines
+  prepared at comptime.
+- [ ] bls: GLV-split scalars inside large G1 MSM (halves windows).
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -238,3 +239,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: bls msm: stateless Booth digits, one pass over all points (no 256-point chunks), window up to 10 (G1) / 9 (G2): msm-4096 / blob_to_kzg_commitment 56.8->44.0ms.
 - 2026-11-05: bls G1 msm >= 256 points: batch-affine bucket accumulation (128 pending adds per inversion, Jacobian side buckets for collisions): msm-4096 44.0->36.3ms.
 - 2026-11-05: KZG blob API (blob_to_kzg_commitment, compute_kzg_proof, compute/verify_blob_kzg_proof, batch) with c-kzg vectors, round trips, fuzz; bench (ReleaseFast, Apple M-series, loaded host): commitment 26 ms, compute_blob_kzg_proof 27 ms, verify_blob_kzg_proof 1.1 ms, batch of 6 verify 3.9 ms (0.65 ms/blob).
+- 2026-11-05: bls prepared G2 lines: pairing-2 588->493us; KZG checks use comptime-prepared lines for G2 and [tau]G2: point evaluation 0.76->0.65ms, verify_blob_kzg_proof 1.0ms.

@@ -120,6 +120,83 @@ pub fn miller_loop(pairs: []const Pair) Fp12 {
     return f.conjugate();
 }
 
+/// Lines in one Miller loop: 63 doublings plus one addition per set bit of |x|
+/// below the leading one.
+pub const line_count = 63 + @popCount(x_abs) - 1;
+
+/// The Miller loop line coefficients of a fixed G2 point, computed once so that
+/// pairings against it skip all G2 arithmetic.
+pub const PreparedG2 = struct {
+    lines: [line_count]Line,
+    infinity: bool,
+};
+
+pub fn prepare(q: g2.Affine) PreparedG2 {
+    assert(q.is_on_curve());
+    var prepared: PreparedG2 = .{ .lines = undefined, .infinity = q.infinity };
+    if (q.infinity) return prepared;
+    var t = q.to_jacobian();
+    var index: usize = 0;
+    var bit: u32 = 63;
+    while (bit > 1) {
+        bit -= 1;
+        prepared.lines[index] = doubling_step(&t);
+        index += 1;
+        if ((x_abs >> @intCast(bit)) & 1 == 1) {
+            prepared.lines[index] = addition_step(&t, q);
+            index += 1;
+        }
+    }
+    prepared.lines[index] = doubling_step(&t);
+    index += 1;
+    assert(index == line_count);
+    return prepared;
+}
+
+pub const PreparedPair = struct {
+    g1: g1.Affine,
+    g2: *const PreparedG2,
+};
+
+/// Miller loop over pairs whose G2 points are prepared; same result as `miller_loop`.
+pub fn miller_loop_prepared(pairs: []const PreparedPair) Fp12 {
+    assert(pairs.len <= pairs_per_loop_max);
+    var f = Fp12.one;
+    var index: usize = 0;
+    var bit: u32 = 63;
+    while (bit > 1) {
+        bit -= 1;
+        f = ell_prepared(f, pairs, index);
+        index += 1;
+        if ((x_abs >> @intCast(bit)) & 1 == 1) {
+            f = ell_prepared(f, pairs, index);
+            index += 1;
+        }
+        f = f.square();
+    }
+    f = ell_prepared(f, pairs, index);
+    index += 1;
+    assert(index == line_count);
+    return f.conjugate();
+}
+
+fn ell_prepared(f: Fp12, pairs: []const PreparedPair, index: usize) Fp12 {
+    assert(index < line_count);
+    var result = f;
+    for (pairs) |pair| {
+        if (pair.g1.infinity or pair.g2.infinity) continue;
+        result = ell(result, pair.g2.lines[index], pair.g1);
+    }
+    return result;
+}
+
+/// True when the product of e(P_i, Q_i) over prepared pairs is one.
+pub fn pairing_check_prepared(pairs: []const PreparedPair) bool {
+    assert(pairs.len <= pairs_per_loop_max);
+    for (pairs) |pair| assert(pair.g1.is_on_curve());
+    return final_exponentiation(miller_loop_prepared(pairs)).eql(Fp12.one);
+}
+
 /// f^x with x < 0, for f in the cyclotomic subgroup.
 fn cyclotomic_exp_by_x(f: Fp12) Fp12 {
     var result = Fp12.one;
@@ -198,6 +275,32 @@ fn fp12_pow(base: Fp12, exponent: u256) Fp12 {
         if ((exponent >> @intCast(bit)) & 1 == 1) result = result.mul(base);
     }
     return result;
+}
+
+test "pairing: prepared G2 lines match the plain Miller loop" {
+    var prng = Prng.init(0x707265);
+    for (0..3) |_| {
+        const p1 = g1.generator.to_jacobian().mul(prng.int(u256)).to_affine();
+        const p2 = g1.generator.to_jacobian().mul(prng.int(u256)).to_affine();
+        const q1 = g2.generator.to_jacobian().mul(prng.int(u256)).to_affine();
+        const q2 = g2.generator.to_jacobian().mul(prng.int(u256)).to_affine();
+        const prepared = [2]PreparedG2{ prepare(q1), prepare(q2) };
+        const pairs = [2]Pair{ .{ .g1 = p1, .g2 = q1 }, .{ .g1 = p2, .g2 = q2 } };
+        const prepared_pairs = [2]PreparedPair{
+            .{ .g1 = p1, .g2 = &prepared[0] },
+            .{ .g1 = p2, .g2 = &prepared[1] },
+        };
+        try testing.expect(miller_loop(&pairs).eql(miller_loop_prepared(&prepared_pairs)));
+        const cancel = [2]PreparedPair{
+            .{ .g1 = p1, .g2 = &prepared[0] },
+            .{ .g1 = p1.neg(), .g2 = &prepared[0] },
+        };
+        try testing.expect(pairing_check_prepared(&cancel));
+        try testing.expect(!pairing_check_prepared(&prepared_pairs));
+    }
+    const infinity = prepare(g2.Affine.identity);
+    const with_infinity = [1]PreparedPair{.{ .g1 = g1.generator, .g2 = &infinity }};
+    try testing.expect(pairing_check_prepared(&with_infinity));
 }
 
 test "pairing: non-degenerate, order r, and bilinear" {
