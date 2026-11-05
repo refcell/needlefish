@@ -12,6 +12,8 @@ pub const proof_manager = @import("proof_manager.zig");
 pub const bond = @import("bond.zig");
 pub const anchor = @import("anchor.zig");
 pub const driver = @import("driver.zig");
+pub const rpc_chain = @import("rpc_chain.zig");
+pub const tx_submitter = @import("tx_submitter.zig");
 
 pub const Config = config.Config;
 pub const Driver = driver.Driver;
@@ -19,4 +21,6 @@ pub const Driver = driver.Driver;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("sim_test.zig");
+    _ = @import("rpc_chain_test.zig");
+    _ = @import("tx_submitter_test.zig");
 }
