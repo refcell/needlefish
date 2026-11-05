@@ -42,6 +42,14 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] pruned-block recovery: L2 provider reports a missing L1 info deposit (pruned body);
     the start finder then uses a matching checkpoint, else binary-searches the earliest
     unpruned block (base/base `find_earliest_unpruned_block`)
+- [ ] Native 200 ms blocks (AGENTS.md rule 10), consensus side done:
+  - [x] driver ticks in ms; subsecond slots build at the parent timestamp and seal 150 ms in
+  - [x] BaseTimeUpdateTx deposit in sequenced and derived attributes; singular-only and
+    same-second batch rules; pipeline test of 200 ms derivation
+  - [ ] devnet smoke at 200 ms. Blocked on the node lane: the EL chainspec ignores genesis
+    `config.base` upgrades (no Azul/Osaka/Denim), and engine `forkchoiceUpdated`/`newPayload`
+    reject same-second timestamps. Blocked on batcher-devnet: Denim at genesis in
+    `genesis.zig` (L2 genesis `base` and rollup.json `base`). Both lanes notified.
 - [x] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop
@@ -222,6 +230,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: 200 ms devnet trial (local, uncommitted Denim genesis): EL rejects same-second FCU attrs and lacks Base upgrades from genesis; handed to the node and batcher-devnet lanes.
 - 2026-11-05: derive: end-to-end pipeline test of native 200 ms Denim blocks (singular batches sharing a second, BaseTimeUpdateTx millis).
 - 2026-11-05: sequencer: native 200 ms cadence: driver ticks in ms; subsecond blocks build from the parent's timestamp and seal 150 ms into the slot (base/base `block_seal_target`); stop discards a waiting payload.
 - 2026-11-05: rpc: `admin_*` only with `--rpc.enable-admin`, `dev_*` (and the engine queue ws subscription) only with `--rpc.dev-enabled`, else -32601; devnet sequencer enables admin for the batcher's leader check.
