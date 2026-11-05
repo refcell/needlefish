@@ -391,3 +391,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: Wycheproof ECDSA (secp256k1, P-256) and secp256k1 ECDH vectors, all pass.
 - 2026-11-05: modexp raw-input fuzz 300K runs clean but shallow (47 coverage points: inputs stop at header parsing); added a structured operand target checked against the std.math.big oracle.
 - 2026-11-05: FK20 prover tables, cells+proofs 202 -> 93 ms per blob.
+- 2026-11-05: modexp operand-vs-oracle fuzz 200K runs clean (1559 unique runs, 1028 coverage points vs 47 for the raw-input target).
