@@ -53,6 +53,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_getProof (EIP-1186) from the trie lane's prove_account/prove_storage, head state only (same rule as other state calls), proof buffers carved from the bounded RPC scratch, storage keys capped at 256 per request; keys accepted as up-to-32-byte hex or minimal quantities like geth.
 - 2026-11-05: miner_setMaxDASize (batcher DA throttle) on the HTTP RPC; the L2 builder skips pool txs whose FastLZ-estimated size (base/base estimated_da_size) exceeds the per-tx limit or the cumulative per-block limit; deposits/forced txs are never limited. L2 build+import through the engine covered by a chain test (fixture now takes a spec).
 - 2026-11-05: blob tx KZG proof verification on eth_sendRawTransaction (txpool.validate.verify_blob_proofs + long-lived verifier in the service, L1 mode). Decision: EIP-7594 cell proofs accepted unverified until the crypto lane exposes cell verification (Osaka off on the dev chain). KZG test is release-only, like the crypto lane's.
 - 2026-11-05: executor OP mode: BlockEnv.op from the upgrade schedule, deposits (mint, deposit nonce/receipt version), Regolith deposit gas accounting, Jovian DA footprint as blob gas used, Canyon create2 deployer (base/base timestamp-2 heuristic) and Everest nonce-manager transitions, no EIP-7685 requests on L2, L2 envelopes passed for L1 fees. Decision: Denim BaseTime predeploy transition skipped (not in the evm's Transition set yet).

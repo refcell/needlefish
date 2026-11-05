@@ -60,6 +60,7 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "eth_call", .handler = eth_call },
     .{ .name = "eth_estimateGas", .handler = estimate_gas },
     .{ .name = "eth_getLogs", .handler = get_logs },
+    .{ .name = "eth_getProof", .handler = @import("eth_proof.zig").get_proof },
     .{ .name = "miner_setMaxDASize", .handler = set_max_da_size },
 };
 
@@ -210,7 +211,7 @@ fn scanner_next(scanner: *json.Scanner) HandlerError!json.Token {
 // ---- State ------------------------------------------------------------------------
 
 /// Requires the block param to name the head (or a pending/latest tag).
-fn require_head_state(api: *Api, call: *Call, raw: ?[]const u8) HandlerError!void {
+pub fn require_head_state(api: *Api, call: *Call, raw: ?[]const u8) HandlerError!void {
     if (raw) |text| {
         const hash = try resolve_block(api, call, text);
         if (!std.mem.eql(u8, &hash, &api.chain.head_hash())) {

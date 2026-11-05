@@ -8,6 +8,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
+const trie_proof = @import("../trie/proof.zig");
 const fixture = @import("../node/test_fixture.zig");
 const eth = @import("eth.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
@@ -21,7 +22,7 @@ const address_target = "\"0x1111111111111111111111111111111111111111\"";
 const Harness = struct {
     node: *fixture.Node,
     api: eth.Api,
-    scratch: [1 << 16]u8 = undefined,
+    scratch: [1 << 18]u8 = undefined,
     out: [1 << 16]u8 = undefined,
 
     fn create() !*Harness {
@@ -104,6 +105,54 @@ test "eth: miner_setMaxDASize sets the builder DA limits" {
     try testing.expectEqual(@as(u64, 1000), h.node.chain.da_limits.block_bytes_max);
 }
 
+/// Extracts the hex strings of the JSON array under `name` and decodes each into `out`.
+fn proof_nodes(text: []const u8, name: []const u8, storage: [][]u8, out: [][]const u8) !u32 {
+    const at = std.mem.indexOf(u8, text, name).?;
+    var scanner = json.Scanner.init(text[at + name.len + 1 ..]);
+    try testing.expectEqual(json.TokenTag.array_begin, (try scanner.next()).tag);
+    var count: u32 = 0;
+    while (true) : (count += 1) {
+        const token = try scanner.next();
+        if (token.tag == .array_end) return count;
+        out[count] = try json.parse_data(token.bytes, storage[count]);
+    }
+}
+
+test "eth: getProof account and storage proofs verify against the state root" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var one: [20]u8 = @splat(0);
+    one[19] = 1;
+    try h.node.db.put_account(one, 5, 0, &.{});
+    try h.node.db.put_storage(one, 7, 0x2a);
+    _ = try h.mine(12);
+    const head = h.node.chain.header(h.node.chain.head_hash()).?;
+    const params = "[" ++ address_one ++ ",[\"0x7\",\"0x08\"],\"latest\"]";
+    const text = try h.request("eth_getProof", params);
+    try expect_contains(text, "\"value\":\"0x2a\"");
+    try expect_contains(text, "\"value\":\"0x0\"");
+    var storage: [16][700]u8 = undefined;
+    var slices: [16][]u8 = undefined;
+    for (&slices, &storage) |*slice, *bytes| slice.* = bytes;
+    var nodes: [16][]const u8 = undefined;
+    const count = try proof_nodes(text, "\"accountProof\"", &slices, &nodes);
+    const address_hash = primitives.keccak256(&one).bytes;
+    const proven = try trie_proof.verify(head.state_root.bytes, &address_hash, nodes[0..count]);
+    try testing.expect(proven != null);
+    const storage_root = h.node.db.trie.storage_root(address_hash);
+    try expect_contains(text, "\"storageHash\"");
+    var slot: [32]u8 = @splat(0);
+    slot[31] = 7;
+    const storage_count = try proof_nodes(text, "\"proof\"", &slices, &nodes);
+    const slot_hash = primitives.keccak256(&slot).bytes;
+    const value = try trie_proof.verify(storage_root, &slot_hash, nodes[0..storage_count]);
+    try testing.expectEqualSlices(u8, &.{0x2a}, value.?);
+    const not_strings = "[" ++ address_one ++ ",[1],\"latest\"]";
+    try expect_contains(try h.request("eth_getProof", not_strings), "error");
+    const historical = "[" ++ address_one ++ ",[],\"0x9\"]";
+    try expect_contains(try h.request("eth_getProof", historical), "error");
+}
+
 test "eth: send raw transaction, mine, receipt, logs and nonce" {
     const h = try Harness.create();
     defer h.destroy();
@@ -182,6 +231,8 @@ const method_names = [_][]const u8{
     "eth_getTransactionReceipt",
     "eth_sendRawTransaction",
     "eth_getBlockByHash",
+    "eth_getProof",
+    "miner_setMaxDASize",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",
