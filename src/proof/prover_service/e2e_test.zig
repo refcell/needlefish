@@ -112,10 +112,16 @@ const Harness = struct {
             .host = io.Address.ip4(.{ 10, 0, 0, 2 }, 0),
         });
         errdefer harness.client_io.deinit();
-        harness.store = try .init(allocator, .{ .jobs_max = 8, .proof_bytes_max = 4096, .seed = 7 });
+        const store_config: store_module.Config = .{
+            .jobs_max = 8,
+            .proof_bytes_max = 4096,
+            .seed = 7,
+        };
+        harness.store = try .init(allocator, store_config);
         errdefer harness.store.deinit(allocator);
         const clock = Clock.of(io.SimIo, &harness.server_io);
-        harness.service = try .init(allocator, &harness.store, clock, .{ .request_arena_bytes = 64 << 10 });
+        const service_options: service_module.Options = .{ .request_arena_bytes = 64 << 10 };
+        harness.service = try .init(allocator, &harness.store, clock, service_options);
         errdefer harness.service.deinit(allocator);
         try harness.server.init(allocator, &harness.server_io, &harness.service, .{
             .connections_max = 4,
@@ -210,8 +216,10 @@ test "prover service e2e: proof via the proposer prover, lease expiry, idempoten
     const clock = Clock.of(io.SimIo, &harness.client_io);
     var stuck: FakeBackend = .{ .polls_needed = std.math.maxInt(u32) };
     var quick: FakeBackend = .{ .polls_needed = 2 };
-    var worker_a: Worker = .init(&harness.nodes[1].client, stuck.backend(), clock, worker_config("a"));
-    var worker_b: Worker = .init(&harness.nodes[2].client, quick.backend(), clock, worker_config("b"));
+    const client_a = &harness.nodes[1].client;
+    const client_b = &harness.nodes[2].client;
+    var worker_a: Worker = .init(client_a, stuck.backend(), clock, worker_config("a"));
+    var worker_b: Worker = .init(client_b, quick.backend(), clock, worker_config("b"));
     worker_a.tick();
     try testing.expectEqual(worker_module.State.proving, worker_a.state);
     // Worker A heartbeats through 20 s, twice its 10 s lease; B finds nothing to claim.
@@ -230,7 +238,8 @@ test "prover service e2e: proof via the proposer prover, lease expiry, idempoten
         worker_b.tick();
     }
     try testing.expectEqual(@as(u64, 1), worker_b.stats.submitted);
-    try testing.expectEqual(@as(u32, 2), harness.store.get(session_text(session).slice()).?.attempt);
+    const session_id = protocol.tee_session_id_for_root(session);
+    try testing.expectEqual(@as(u32, 2), harness.store.get(session_id.slice()).?.attempt);
     const status = try prover.poll(session);
     const proof = status.succeeded;
     try testing.expectEqual(proof_request.claimed_l2_output_root, proof.output_root);
@@ -250,10 +259,6 @@ test "prover service e2e: proof via the proposer prover, lease expiry, idempoten
     try prover.delete(session);
     try testing.expectError(error.NotFound, prover.poll(session));
     try testing.expectEqual(@as(u32, 0), harness.store.count());
-}
-
-fn session_text(root: protocol.Hash) protocol.SessionId {
-    return protocol.tee_session_id_for_root(root);
 }
 
 test "prover service e2e: worker abandons an unsupported job and lists over the client" {
@@ -284,7 +289,8 @@ test "prover service e2e: worker abandons an unsupported job and lists over the 
     const listed = try client.list_proofs(&.{ .offset = 0, .limit = 10 });
     try testing.expectEqual(@as(u64, 1), listed.total_count);
     try testing.expectEqual(protocol.ProofStatus.queued, listed.proofs[0].status);
-    try testing.expectEqualStrings("worker backend does not support this proof request", harness.store.get("range-1").?.error_message.slice());
+    const abandoned = harness.store.get("range-1").?.error_message.slice();
+    try testing.expectEqualStrings("worker backend does not support this proof request", abandoned);
     try client.cancel_proof_request(&.{ .session_id = .from("range-1") });
     try testing.expectError(error.Rejected, client.prove_block_range(&request));
     try testing.expectEqual(protocol.code.failed_precondition, client.last_code);

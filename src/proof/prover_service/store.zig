@@ -125,7 +125,15 @@ pub const Job = struct {
 };
 
 /// base/base `ClaimAuth::classify`.
-pub const Auth = enum { authorized, not_found, not_claimed, stale_lock, expired, terminal, cancelled };
+pub const Auth = enum {
+    authorized,
+    not_found,
+    not_claimed,
+    stale_lock,
+    expired,
+    terminal,
+    cancelled,
+};
 
 pub const CreateOutcome = enum {
     created,
@@ -195,10 +203,12 @@ pub const Store = struct {
         const proof_bytes = @as(usize, config.jobs_max) * config.proof_bytes_max;
         const proof_memory = try allocator.alloc(u8, proof_bytes);
         errdefer allocator.free(proof_memory);
-        const roots_memory = try allocator.alloc(Hash, @as(usize, config.jobs_max) * config.roots_max);
+        const roots_count = @as(usize, config.jobs_max) * config.roots_max;
+        const roots_memory = try allocator.alloc(Hash, roots_count);
+        const proof_size = config.proof_bytes_max;
         for (jobs, 0..) |*job, index| {
             job.* = .{
-                .proof_memory = proof_memory[index * config.proof_bytes_max ..][0..config.proof_bytes_max],
+                .proof_memory = proof_memory[index * proof_size ..][0..proof_size],
                 .roots_memory = roots_memory[index * config.roots_max ..][0..config.roots_max],
             };
         }
@@ -291,7 +301,8 @@ pub const Store = struct {
 
     /// base/base `resolve_lock_duration`: 0 means the default, capped at the maximum.
     pub fn lock_duration_seconds(store: *const Store, requested: u32) u32 {
-        const duration = if (requested == 0) store.config.default_lock_duration_seconds else requested;
+        const default = store.config.default_lock_duration_seconds;
+        const duration = if (requested == 0) default else requested;
         const resolved = @min(duration, store.config.max_lock_duration_seconds);
         assert(resolved > 0 or store.config.max_lock_duration_seconds == 0);
         return resolved;
@@ -316,8 +327,10 @@ pub const Store = struct {
             };
             if (!eligible or !matches(filter, &job.request.request)) continue;
             if (best) |current| {
-                const earlier = job.start_block() < current.start_block() or
-                    (job.start_block() == current.start_block() and job.sequence < current.sequence);
+                const start = job.start_block();
+                const current_start = current.start_block();
+                const earlier = start < current_start or
+                    (start == current_start and job.sequence < current.sequence);
                 if (!earlier) continue;
             }
             best = job;
@@ -369,7 +382,12 @@ pub const Store = struct {
     }
 
     /// base/base `heartbeat_proof_job`: extends the lease of its holder.
-    pub fn heartbeat(store: *Store, lease: *const Lease, requested_lock_seconds: u32, now_ns: u64) Answer {
+    pub fn heartbeat(
+        store: *Store,
+        lease: *const Lease,
+        requested_lock_seconds: u32,
+        now_ns: u64,
+    ) Answer {
         const answer = store.authorize(lease, now_ns);
         if (answer.auth != .authorized) return answer;
         const job = store.find(lease.session_id).?;
@@ -427,7 +445,8 @@ pub const Store = struct {
         job.completed_ns = now_ns;
         job.updated_ns = now_ns;
         for (&job.sessions) |*maybe| if (maybe.*) |*session| {
-            if (session.state == .submitting or session.state == .running) session.state = .completed;
+            const active = session.state == .submitting or session.state == .running;
+            if (active) session.state = .completed;
         };
         return .{ answer, .completed };
     }
@@ -606,9 +625,11 @@ pub fn result_fits(request: *const ProofRequest, result: *const ProofResult) boo
     return switch (request.request) {
         .compressed => |zk| zk.zk_vm == result.compressed.zk_vm,
         .snark_plonk => |snark| snark.proof.zk_vm == result.snark_plonk.proof.zk_vm,
-        .tee => |tee| tee.tee_kind == result.tee.tee_kind and
-            std.mem.eql(u8, &tee.proof.claimed_l2_output_root, &result.tee.aggregate_proposal.output_root) and
-            tee.proof.claimed_l2_block_number == result.tee.aggregate_proposal.l2_block_number,
+        .tee => |tee| tee.tee_kind == result.tee.tee_kind and std.mem.eql(
+            u8,
+            &tee.proof.claimed_l2_output_root,
+            &result.tee.aggregate_proposal.output_root,
+        ) and tee.proof.claimed_l2_block_number == result.tee.aggregate_proposal.l2_block_number,
     };
 }
 
@@ -631,7 +652,11 @@ fn tee_equal(a: *const protocol.TeeProofResult, b: *const protocol.TeeProofResul
     proposal_b.signature = "";
     return std.meta.eql(proposal_a, proposal_b) and a.tee_kind == b.tee_kind and
         std.mem.eql(u8, &a.tee_signer, &b.tee_signer) and
-        std.mem.eql(u8, std.mem.sliceAsBytes(a.intermediate_roots), std.mem.sliceAsBytes(b.intermediate_roots));
+        std.mem.eql(
+            u8,
+            std.mem.sliceAsBytes(a.intermediate_roots),
+            std.mem.sliceAsBytes(b.intermediate_roots),
+        );
 }
 
 /// `result` with its slices copied into the job's memory; null when they do not fit.
@@ -640,7 +665,8 @@ fn copy_result(job: *Job, result: *const ProofResult) ?ProofResult {
         .compressed => |zk| {
             if (zk.proof.len > job.proof_memory.len) return null;
             @memcpy(job.proof_memory[0..zk.proof.len], zk.proof);
-            return .{ .compressed = .{ .zk_vm = zk.zk_vm, .proof = job.proof_memory[0..zk.proof.len] } };
+            const proof = job.proof_memory[0..zk.proof.len];
+            return .{ .compressed = .{ .zk_vm = zk.zk_vm, .proof = proof } };
         },
         .snark_plonk => |snark| {
             const proof = snark.proof.proof;
@@ -706,7 +732,10 @@ pub fn to_summary(job: *const Job) protocol.ProofSummary {
         .created_at = timestamp(job.created_ns),
         .updated_at = timestamp(job.updated_ns),
         .completed_at = if (job.terminal()) timestamp(job.completed_ns) else null,
-        .error_message = if (job.terminal() and job.error_message.len > 0) job.error_message else null,
+        .error_message = if (job.terminal() and job.error_message.len > 0)
+            job.error_message
+        else
+            null,
         .tee_kind = if (kind == .tee) kind.tee.tee_kind else null,
         .zk_vm = switch (kind) {
             .compressed => |zk| zk.zk_vm,

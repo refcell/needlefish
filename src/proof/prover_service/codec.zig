@@ -104,7 +104,12 @@ fn bound_of(comptime Parent: type, comptime name: []const u8, comptime Field: ty
     return @field(Parent, name ++ "_max");
 }
 
-fn decode_struct(comptime T: type, arena: Allocator, scanner: *json.Scanner, token: json.Token) Error!T {
+fn decode_struct(
+    comptime T: type,
+    arena: Allocator,
+    scanner: *json.Scanner,
+    token: json.Token,
+) Error!T {
     if (token.tag != .object_begin) return error.InvalidJson;
     const info = @typeInfo(T).@"struct";
     comptime assert(info.field_names.len <= 32);
@@ -129,7 +134,8 @@ fn decode_struct(comptime T: type, arena: Allocator, scanner: *json.Scanner, tok
         } else false;
         if (!matched) scanner.skip(value) catch return error.InvalidJson;
     }
-    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, Field, attrs, index| {
+    const names = info.field_names;
+    inline for (names, info.field_types, info.field_attrs, 0..) |name, Field, attrs, index| {
         if (seen & (@as(u32, 1) << index) == 0) {
             @field(result, name) = attrs.defaultValue(Field) orelse return error.MissingField;
         }
@@ -138,7 +144,12 @@ fn decode_struct(comptime T: type, arena: Allocator, scanner: *json.Scanner, tok
     return result;
 }
 
-fn decode_union(comptime T: type, arena: Allocator, scanner: *json.Scanner, token: json.Token) Error!T {
+fn decode_union(
+    comptime T: type,
+    arena: Allocator,
+    scanner: *json.Scanner,
+    token: json.Token,
+) Error!T {
     if (token.tag != .object_begin) return error.InvalidJson;
     const Tag = std.meta.Tag(T);
     var tag: ?Tag = null;

@@ -58,7 +58,12 @@ const Fixture = struct {
         return out.buffered();
     }
 
-    fn call_value(fixture: *Fixture, method: []const u8, comptime T: type, value: *const T) ![]const u8 {
+    fn call_value(
+        fixture: *Fixture,
+        method: []const u8,
+        comptime T: type,
+        value: *const T,
+    ) ![]const u8 {
         var buffer: [4096]u8 = undefined;
         return fixture.call(method, try codec.encode_to(T, &buffer, value));
     }
@@ -84,6 +89,10 @@ fn error_code(response: []const u8) !i64 {
 
 const session = "9DCD3BF1-DA72-502D-A430-77A6F3474685";
 const canonical = "9dcd3bf1-da72-502d-a430-77a6f3474685";
+const session_json = "{\"session_id\":\"" ++ session ++ "\"}";
+const canonical_json = "{\"session_id\":\"" ++ canonical ++ "\"}";
+const ProveRequest = protocol.ProveBlockRangeRequest;
+const NextRequest = protocol.GetNextProofRequest;
 
 fn prove_request(start: u64) protocol.ProveBlockRangeRequest {
     return .{ .proof = .{
@@ -110,7 +119,7 @@ test "prover service server: request, claim, heartbeat, submit, get" {
     defer fixture.deinit();
     const method = protocol.method;
     const prove = prove_request(100);
-    const created = try fixture.call_value(method.prove_block_range, protocol.ProveBlockRangeRequest, &prove);
+    const created = try fixture.call_value(method.prove_block_range, ProveRequest, &prove);
     const response = try fixture.result_of(protocol.ProveBlockRangeResponse, created);
     try testing.expectEqualStrings(canonical, response.session_id.slice());
     // The same request again replays; a different one under the session collides.
@@ -121,12 +130,13 @@ test "prover service server: request, claim, heartbeat, submit, get" {
     ));
     try testing.expectEqual(@as(u32, 1), fixture.store.count());
     const other = prove_request(104);
-    const collision = try fixture.call_value(method.prove_block_range, protocol.ProveBlockRangeRequest, &other);
+    const collision = try fixture.call_value(method.prove_block_range, ProveRequest, &other);
     try testing.expectEqual(@as(i64, protocol.code.failed_precondition), try error_code(collision));
-    const queued = try fixture.call(method.get_proof, "{\"session_id\":\"" ++ session ++ "\"}");
-    try testing.expectEqual(.queued, (try fixture.result_of(protocol.GetProofResponse, queued)).status);
+    const queued = try fixture.call(method.get_proof, session_json);
+    const queued_response = try fixture.result_of(protocol.GetProofResponse, queued);
+    try testing.expectEqual(.queued, queued_response.status);
 
-    const next = try fixture.call_value(method.get_next_proof, protocol.GetNextProofRequest, &next_request);
+    const next = try fixture.call_value(method.get_next_proof, NextRequest, &next_request);
     const job = (try fixture.result_of(protocol.GetNextProofResponse, next)).job.?;
     try testing.expectEqual(protocol.ProofJobStatus.claimed, job.status);
     try testing.expectEqual(@as(u32, 1), job.attempt);
@@ -153,10 +163,11 @@ test "prover service server: request, claim, heartbeat, submit, get" {
         .worker_id = job.worker_id.?,
         .result = .{ .compressed = .{ .zk_vm = .sp1, .proof = "zk" } },
     };
-    const submitted = try fixture.call_value(method.submit_proof, protocol.WorkerSubmitProofRequest, &submit);
+    const Submit = protocol.WorkerSubmitProofRequest;
+    const submitted = try fixture.call_value(method.submit_proof, Submit, &submit);
     const done = (try fixture.result_of(protocol.WorkerSubmitProofResponse, submitted)).job;
     try testing.expectEqual(protocol.ProofJobStatus.succeeded, done.status);
-    const proof = try fixture.call(method.get_proof, "{\"session_id\":\"" ++ canonical ++ "\"}");
+    const proof = try fixture.call(method.get_proof, canonical_json);
     const finished = try fixture.result_of(protocol.GetProofResponse, proof);
     try testing.expectEqual(.succeeded, finished.status);
     try testing.expectEqualStrings("zk", finished.result.?.compressed.proof);
@@ -164,9 +175,9 @@ test "prover service server: request, claim, heartbeat, submit, get" {
     const list = try fixture.result_of(protocol.ListProofsResponse, listed);
     try testing.expectEqual(@as(u64, 1), list.total_count);
     try testing.expectEqual(protocol.ProofType.compressed, list.proofs[0].proof_type);
-    const deleted = try fixture.call(method.delete_proof_request, "{\"session_id\":\"" ++ session ++ "\"}");
+    const deleted = try fixture.call(method.delete_proof_request, session_json);
     try testing.expect(std.mem.indexOf(u8, deleted, "\"result\":null") != null);
-    const gone = try fixture.call(method.get_proof, "{\"session_id\":\"" ++ session ++ "\"}");
+    const gone = try fixture.call(method.get_proof, session_json);
     try testing.expectEqual(@as(i64, protocol.code.not_found), try error_code(gone));
 }
 
@@ -176,14 +187,14 @@ test "prover service server: cancel reaches the worker, lease expiry, bad params
     defer fixture.deinit();
     const method = protocol.method;
     const prove = prove_request(0);
-    _ = try fixture.call_value(method.prove_block_range, protocol.ProveBlockRangeRequest, &prove);
-    const next = try fixture.call_value(method.get_next_proof, protocol.GetNextProofRequest, &next_request);
+    _ = try fixture.call_value(method.prove_block_range, ProveRequest, &prove);
+    const next = try fixture.call_value(method.get_next_proof, NextRequest, &next_request);
     const job = (try fixture.result_of(protocol.GetNextProofResponse, next)).job.?;
     // The lease (60 s) expires; another worker reclaims the job.
     fixture.clock.now_ns += 61 * std.time.ns_per_s;
     var second = next_request;
     second.worker_id = .from("worker-2");
-    const reclaimed = try fixture.call_value(method.get_next_proof, protocol.GetNextProofRequest, &second);
+    const reclaimed = try fixture.call_value(method.get_next_proof, NextRequest, &second);
     const job_two = (try fixture.result_of(protocol.GetNextProofResponse, reclaimed)).job.?;
     try testing.expectEqual(@as(u32, 2), job_two.attempt);
     const stale: protocol.HeartbeatRequest = .{
@@ -195,20 +206,20 @@ test "prover service server: cancel reaches the worker, lease expiry, bad params
     const rejected = try fixture.call_value(method.heartbeat, protocol.HeartbeatRequest, &stale);
     try testing.expectEqual(@as(i64, protocol.code.failed_precondition), try error_code(rejected));
     try testing.expect(std.mem.indexOf(u8, rejected, "rotated") != null);
-    const cancelled = try fixture.call(method.cancel_proof_request, "{\"session_id\":\"" ++ session ++ "\"}");
+    const cancelled = try fixture.call(method.cancel_proof_request, session_json);
     try testing.expect(std.mem.indexOf(u8, cancelled, "\"result\":null") != null);
     var current = stale;
     current.lock_id = job_two.lock_id.?;
     current.worker_id = job_two.worker_id.?;
     const told = try fixture.call_value(method.heartbeat, protocol.HeartbeatRequest, &current);
     try testing.expectEqual(@as(i64, protocol.code.proof_cancelled), try error_code(told));
-    const again = try fixture.call_value(method.prove_block_range, protocol.ProveBlockRangeRequest, &prove);
+    const again = try fixture.call_value(method.prove_block_range, ProveRequest, &prove);
     try testing.expectEqual(@as(i64, protocol.code.failed_precondition), try error_code(again));
     const invalid = try fixture.call(method.get_proof, "{\"session\":\"x\"}");
     try testing.expectEqual(@as(i64, protocol.code.invalid_params), try error_code(invalid));
     const too_many = try fixture.call(method.list_proofs, "{\"offset\":0,\"limit\":1001}");
     try testing.expectEqual(@as(i64, protocol.code.invalid_params), try error_code(too_many));
-    const empty = try fixture.call(method.get_next_proof, "{\"worker_id\":\"w\",\"proof_type\":\"tee\"," ++
-        "\"tee_kinds\":[\"aws_nitro\"],\"lock_duration_seconds\":5}");
+    const empty = try fixture.call(method.get_next_proof, "{\"worker_id\":\"w\"," ++
+        "\"proof_type\":\"tee\",\"tee_kinds\":[\"aws_nitro\"],\"lock_duration_seconds\":5}");
     try testing.expect(std.mem.indexOf(u8, empty, "\"result\":{}") != null);
 }

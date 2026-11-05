@@ -133,8 +133,8 @@ pub const ZkProofRequest = struct {
         if (request.number_of_blocks_to_prove % request.intermediate_block_interval != 0) {
             return error.MisalignedRange;
         }
-        return std.math.add(u64, request.start_block_number, request.number_of_blocks_to_prove) catch
-            error.EndBlockOverflow;
+        const count = request.number_of_blocks_to_prove;
+        return std.math.add(u64, request.start_block_number, count) catch error.EndBlockOverflow;
     }
 
     pub fn validate(request: *const ZkProofRequest) error{InvalidField}!void {
@@ -502,5 +502,6 @@ test "prover service protocol: tee proof bytes" {
     try testing.expectEqual(@as(u8, 28), out[129]);
     signature[64] = 5;
     try testing.expectError(error.InvalidV, encode_tee_proof_bytes(&out, &signature, @splat(0), 0));
-    try testing.expectError(error.InvalidSignatureLength, encode_tee_proof_bytes(&out, "", @splat(0), 0));
+    const empty = encode_tee_proof_bytes(&out, "", @splat(0), 0);
+    try testing.expectError(error.InvalidSignatureLength, empty);
 }

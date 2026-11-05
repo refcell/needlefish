@@ -78,7 +78,8 @@ test "prover service store: lease ownership, expiry and submit" {
     defer store.deinit(testing.allocator);
     _ = try store.create(&zk_request("late", 20), true, 0);
     _ = try store.create(&zk_request("early", 10), true, 0);
-    try testing.expect(store.claim(&.{ .proof_type = .tee, .tee_kinds = &.{.aws_nitro} }, "w", 1, 0) == null);
+    const tee_filter: store_module.Filter = .{ .proof_type = .tee, .tee_kinds = &.{.aws_nitro} };
+    try testing.expect(store.claim(&tee_filter, "w", 1, 0) == null);
     const job = store.claim(&zk_filter, "one", 10, 0).?;
     try testing.expectEqualStrings("early", job.session_id());
     // Copies: the job's own fields change when it is reclaimed.
@@ -155,7 +156,8 @@ test "prover service store: cancel, delete, reaper and listing" {
     try testing.expectEqual(@as(u32, 1), store.expire(17 * s_ns));
     const failed = store.get("b").?;
     try testing.expectEqual(protocol.ProofStatus.failed, failed.proof_status());
-    try testing.expect(std.mem.startsWith(u8, failed.error_message.slice(), "Worker claim expired"));
+    const message = failed.error_message.slice();
+    try testing.expect(std.mem.startsWith(u8, message, "Worker claim expired"));
     var out: [4]*const store_module.Job = undefined;
     const all = store.list(0, null, &out);
     try testing.expectEqual(@as(u64, 2), all.total);
@@ -170,7 +172,10 @@ test "prover service store: backend sessions" {
     defer store.deinit(testing.allocator);
     _ = try store.create(&zk_request("a", 0), true, 0);
     const lease = lease_of(store.claim(&zk_filter, "w", 10, 0).?);
-    const running: protocol.BackendSession = .{ .backend_session_id = .from("b-1"), .state = .running };
+    const running: protocol.BackendSession = .{
+        .backend_session_id = .from("b-1"),
+        .state = .running,
+    };
     _, const recorded = store.record_session(&lease, .stark, running, 1);
     try testing.expectEqualStrings("b-1", recorded.?.backend_session_id.slice());
     try testing.expect(store.active_session("a", .stark) != null);
@@ -218,7 +223,8 @@ fn fuzz_store(_: void, smith: *std.testing.Smith) anyerror!void {
             1 => fuzz_claim(&store, worker, now_ns),
             2 => if (worker.view()) |lease| {
                 const seconds = smith.valueRangeAtMost(u32, 1, 20);
-                if (store.heartbeat(&lease, seconds, now_ns).auth != .authorized) worker.lease = null;
+                const answer = store.heartbeat(&lease, seconds, now_ns);
+                if (answer.auth != .authorized) worker.lease = null;
             },
             3 => if (worker.view()) |lease| {
                 _ = store.abandon(&lease, "boom", now_ns);
@@ -244,7 +250,8 @@ fn fuzz_create(store: *Store, session: []const u8, smith: *std.testing.Smith, no
     const before = store.count();
     const exists = store.get(session) != null;
     const start: u64 = if (smith.value(bool)) 0 else 10;
-    const outcome = store.create(&zk_request(session, start), smith.value(bool), now_ns) catch |err| {
+    const retry_failed = smith.value(bool);
+    const outcome = store.create(&zk_request(session, start), retry_failed, now_ns) catch |err| {
         try testing.expect(err == error.IdCollision or err == error.Full);
         try testing.expectEqual(before, store.count());
         return;
@@ -277,7 +284,8 @@ fn check_invariants(store: *Store, workers: []ModelWorker, now_ns: u64) !void {
         if (job.state == .free) continue;
         // One job per session.
         for (store.jobs[index + 1 ..]) |*other| {
-            if (other.state != .free) try testing.expect(!std.mem.eql(u8, job.session_id(), other.session_id()));
+            if (other.state == .free) continue;
+            try testing.expect(!std.mem.eql(u8, job.session_id(), other.session_id()));
         }
         try testing.expect(job.attempt <= store.config.reclaim_attempts);
         try testing.expect(job.retry_count <= store.config.max_proof_retries);

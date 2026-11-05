@@ -58,7 +58,12 @@ pub const Service = struct {
     page: []*const store_module.Job,
     summaries: []protocol.ProofSummary,
 
-    pub fn init(allocator: std.mem.Allocator, store: *Store, clock: Clock, options: Options) !Service {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        store: *Store,
+        clock: Clock,
+        options: Options,
+    ) !Service {
         assert(options.request_arena_bytes > 0);
         const arena_memory = try allocator.alloc(u8, options.request_arena_bytes);
         errdefer allocator.free(arena_memory);
@@ -145,7 +150,11 @@ pub const Service = struct {
         return call.fail(error_code, text);
     }
 
-    fn canonical(service: *Service, call: *Call, session_id: *const protocol.SessionId) HandlerError!protocol.SessionId {
+    fn canonical(
+        service: *Service,
+        call: *Call,
+        session_id: *const protocol.SessionId,
+    ) HandlerError!protocol.SessionId {
         return protocol.canonical_session_id(session_id) catch
             service.fail(call, code.invalid_params, "session_id must not be empty", .{});
     }
@@ -195,9 +204,9 @@ pub const Service = struct {
             .expired => "lock has expired",
             .terminal => "job has already reached a terminal state",
         };
-        return service.fail(call, code.failed_precondition, "{s} rejected for session_id {s}: {s}", .{
-            method_name, session_id, reason,
-        });
+        const format = "{s} rejected for session_id {s}: {s}";
+        const arguments = .{ method_name, session_id, reason };
+        return service.fail(call, code.failed_precondition, format, arguments);
     }
 };
 
@@ -207,18 +216,28 @@ fn prove_block_range(service: *Service, call: *Call) HandlerError!void {
     var proof = request.proof;
     proof.session_id = try service.canonical(call, &proof.session_id);
     const id = proof.session_id.slice();
-    const outcome = service.store.create(&proof, request.retry_failed, now_ns) catch |err| return switch (err) {
-        error.IdCollision => service.fail(call, code.failed_precondition, "session_id {s} already " ++
-            "exists with a different request", .{id}),
+    const created = service.store.create(&proof, request.retry_failed, now_ns);
+    const outcome = created catch |err| return switch (err) {
+        error.IdCollision => service.fail(
+            call,
+            code.failed_precondition,
+            "session_id {s} already exists with a different request",
+            .{id},
+        ),
         error.Full => call.fail(code.resource_exhausted, "proof job store is full"),
         error.InvalidRange => call.fail(code.invalid_params, "invalid proof block range"),
     };
     switch (outcome) {
         .created, .replayed, .requeued => {},
-        .retry_not_allowed => return service.fail(call, code.failed_precondition, "session_id {s} " ++
-            "already failed; set retry_failed to true to requeue it", .{id}),
+        .retry_not_allowed => return service.fail(
+            call,
+            code.failed_precondition,
+            "session_id {s} already failed; set retry_failed to true to requeue it",
+            .{id},
+        ),
         .retry_exhausted => return service.fail(call, code.resource_exhausted, "session_id {s}: " ++
-            "proof request retry budget exhausted; use get_proof for the stored terminal result", .{id}),
+            "proof request retry budget exhausted; " ++
+            "use get_proof for the stored terminal result", .{id}),
         .cancelled => return service.fail(call, code.failed_precondition, "session_id {s} was " ++
             "cancelled; delete it with deleteProofRequest before proving it again", .{id}),
     }
@@ -247,8 +266,8 @@ fn cancel_proof_request(service: *Service, call: *Call) HandlerError!void {
             code.failed_precondition,
             "cancellation is not available for this proof backend",
         ),
-        .already_terminal => return service.fail(call, code.failed_precondition, "session_id {s}: " ++
-            "proof request is terminal, expected a queued or running request", .{id}),
+        .already_terminal => return service.fail(call, code.failed_precondition, "session_id " ++
+            "{s}: proof request is terminal, expected a queued or running request", .{id}),
     }
     try call.writer.null_value();
 }
@@ -275,10 +294,14 @@ fn list_proofs(service: *Service, call: *Call) HandlerError!void {
             "equal to {d}", .{protocol.list_limit_max}),
     };
     const page_size = @min(limit, service.page.len);
-    const listed = service.store.list(request.offset, request.status_filter, service.page[0..page_size]);
+    const page = service.page[0..page_size];
+    const listed = service.store.list(request.offset, request.status_filter, page);
     const summaries = service.summaries[0..listed.page.len];
     for (summaries, listed.page) |*summary, job| summary.* = store_module.to_summary(job);
-    const response: protocol.ListProofsResponse = .{ .proofs = summaries, .total_count = listed.total };
+    const response: protocol.ListProofsResponse = .{
+        .proofs = summaries,
+        .total_count = listed.total,
+    };
     try service.reply(protocol.ListProofsResponse, call, &response);
 }
 
@@ -310,7 +333,8 @@ fn heartbeat(service: *Service, call: *Call) HandlerError!void {
     if (answer.auth != .authorized) {
         return service.reject(call, "heartbeat", held.session_id, answer.auth);
     }
-    const response: protocol.HeartbeatResponse = .{ .job = store_module.to_proof_job(answer.job.?) };
+    const job = store_module.to_proof_job(answer.job.?);
+    const response: protocol.HeartbeatResponse = .{ .job = job };
     try service.reply(protocol.HeartbeatResponse, call, &response);
 }
 
@@ -318,12 +342,14 @@ fn abandon_proof(service: *Service, call: *Call) HandlerError!void {
     const now_ns = service.begin();
     var request = try service.params(protocol.AbandonProofRequest, call);
     const held = try service.lease(call, &request.session_id, &request.lock_id, &request.worker_id);
-    const answer, const outcome = service.store.abandon(&held, request.error_message.slice(), now_ns);
+    const message = request.error_message.slice();
+    const answer, const outcome = service.store.abandon(&held, message, now_ns);
     if (answer.auth != .authorized) {
         return service.reject(call, "abandon_proof", held.session_id, answer.auth);
     }
     assert(outcome != null);
-    const response: protocol.AbandonProofResponse = .{ .job = store_module.to_proof_job(answer.job.?) };
+    const job = store_module.to_proof_job(answer.job.?);
+    const response: protocol.AbandonProofResponse = .{ .job = job };
     try service.reply(protocol.AbandonProofResponse, call, &response);
 }
 
@@ -336,10 +362,12 @@ fn submit_proof(service: *Service, call: *Call) HandlerError!void {
     if (answer.auth != .authorized) return service.reject(call, "submit_proof", id, answer.auth);
     switch (outcome.?) {
         .completed, .already_completed => {},
-        .result_mismatch => return service.fail(call, code.invalid_params, "submit_proof rejected " ++
+        .result_mismatch => return service.fail(call, code.invalid_params, "submit_proof " ++
+            "rejected " ++
             "for session_id {s}: result does not match the claimed job", .{id}),
-        .result_conflict => return service.fail(call, code.failed_precondition, "submit_proof " ++
-            "rejected for session_id {s}: job already completed with a different result", .{id}),
+        .result_conflict => return service.fail(call, code.failed_precondition, "submit_" ++
+            "proof rejected for session_id {s}: job already completed with a different " ++
+            "result", .{id}),
     }
     const response: protocol.WorkerSubmitProofResponse = .{
         .job = store_module.to_proof_job(answer.job.?),
@@ -365,12 +393,18 @@ fn record_proof_session(service: *Service, call: *Call) HandlerError!void {
         .backend_session_id = request.backend_session_id,
         .state = request.state,
     };
-    const answer, const recorded = service.store.record_session(&held, request.session_type, session, now_ns);
+    const session_type = request.session_type;
+    const answer, const recorded =
+        service.store.record_session(&held, session_type, session, now_ns);
     if (answer.auth != .authorized) {
         return service.reject(call, "record_proof_session", held.session_id, answer.auth);
     }
-    const stored = recorded orelse return service.fail(call, code.failed_precondition, "record_proof_" ++
-        "session rejected for session_id {s}: backend session status is terminal", .{held.session_id});
+    const stored = recorded orelse return service.fail(
+        call,
+        code.failed_precondition,
+        "record_proof_session rejected for session_id {s}: backend session status is terminal",
+        .{held.session_id},
+    );
     try service.reply(protocol.RecordProofSessionResponse, call, &.{ .session = stored });
 }
 

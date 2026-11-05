@@ -107,15 +107,22 @@ pub fn Client(comptime IO: type) type {
             request: *const protocol.GetProofRequest,
         ) Error!protocol.GetProofResponse {
             const method = protocol.method.get_proof;
-            return client.call(protocol.GetProofResponse, method, protocol.GetProofRequest, request);
+            const Response = protocol.GetProofResponse;
+            return client.call(Response, method, protocol.GetProofRequest, request);
         }
 
-        pub fn cancel_proof_request(client: *Self, request: *const protocol.CancelProofRequest) Error!void {
+        pub fn cancel_proof_request(
+            client: *Self,
+            request: *const protocol.CancelProofRequest,
+        ) Error!void {
             const method = protocol.method.cancel_proof_request;
             return client.call(void, method, protocol.CancelProofRequest, request);
         }
 
-        pub fn delete_proof_request(client: *Self, request: *const protocol.DeleteProofRequest) Error!void {
+        pub fn delete_proof_request(
+            client: *Self,
+            request: *const protocol.DeleteProofRequest,
+        ) Error!void {
             const method = protocol.method.delete_proof_request;
             return client.call(void, method, protocol.DeleteProofRequest, request);
         }
@@ -125,7 +132,8 @@ pub fn Client(comptime IO: type) type {
             request: *const protocol.ListProofsRequest,
         ) Error!protocol.ListProofsResponse {
             const method = protocol.method.list_proofs;
-            return client.call(protocol.ListProofsResponse, method, protocol.ListProofsRequest, request);
+            const Response = protocol.ListProofsResponse;
+            return client.call(Response, method, protocol.ListProofsRequest, request);
         }
 
         pub fn get_next_proof(
@@ -142,7 +150,8 @@ pub fn Client(comptime IO: type) type {
             request: *const protocol.HeartbeatRequest,
         ) Error!protocol.HeartbeatResponse {
             const method = protocol.method.heartbeat;
-            return client.call(protocol.HeartbeatResponse, method, protocol.HeartbeatRequest, request);
+            const Response = protocol.HeartbeatResponse;
+            return client.call(Response, method, protocol.HeartbeatRequest, request);
         }
 
         pub fn abandon_proof(
@@ -207,7 +216,10 @@ pub fn ProposerProver(comptime IO: type) type {
             return @ptrCast(@alignCast(context));
         }
 
-        fn request(context: *anyopaque, proof_request: *const interfaces.ProofRequest) interfaces.ProverError!void {
+        fn request(
+            context: *anyopaque,
+            proof_request: *const interfaces.ProofRequest,
+        ) interfaces.ProverError!void {
             const adapter = of(context);
             assert(proof_request.intermediate_block_interval > 0);
             const primitive: protocol.PrimitiveProofRequest = .{
@@ -225,7 +237,10 @@ pub fn ProposerProver(comptime IO: type) type {
             _ = adapter.client.prove_block_range(&body) catch return error.Unavailable;
         }
 
-        fn poll(context: *anyopaque, session: interfaces.Hash) interfaces.ProverError!interfaces.ProofStatus {
+        fn poll(
+            context: *anyopaque,
+            session: interfaces.Hash,
+        ) interfaces.ProverError!interfaces.ProofStatus {
             const adapter = of(context);
             const session_id = protocol.tee_session_id_for_root(session);
             const response = adapter.client.get_proof(&.{ .session_id = session_id }) catch |err|

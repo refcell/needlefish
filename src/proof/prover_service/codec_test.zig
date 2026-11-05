@@ -51,7 +51,8 @@ test "prover service codec: legacy request defaults and required fields" {
         "\"intermediate_block_interval\":10,\"zk_vm\":\"sp1\"},\"proof_type\":\"compressed\"}}}";
     const request = try decode_test(protocol.ProveBlockRangeRequest, &scratch, legacy);
     try testing.expect(request.retry_failed);
-    try testing.expectEqual(protocol.ZkBackend.cluster, request.proof.request.compressed.zk_backend);
+    const zk_backend = request.proof.request.compressed.zk_backend;
+    try testing.expectEqual(protocol.ZkBackend.cluster, zk_backend);
     const missing_session = "{\"request\":{\"proof_type\":\"compressed\",\"payload\":{" ++
         "\"start_block_number\":10,\"number_of_blocks_to_prove\":20," ++
         "\"intermediate_block_interval\":10,\"zk_vm\":\"sp1\"}}}";
@@ -99,12 +100,14 @@ test "prover service codec: tee request uses hex fixed values" {
     const encoded = try codec.encode_to(protocol.TeeProofRequest, &buffer, &request);
     try testing.expectEqualStrings(tee_request_json, encoded);
     var scratch: [256]u8 = undefined;
-    const no_kind = tee_request_json[0 .. tee_request_json.len - ",\"tee_kind\":\"aws_nitro\"}".len] ++
-        "}";
-    try testing.expectError(error.MissingField, decode_test(protocol.TeeProofRequest, &scratch, no_kind));
+    const kind_suffix = ",\"tee_kind\":\"aws_nitro\"}";
+    const no_kind = tee_request_json[0 .. tee_request_json.len - kind_suffix.len] ++ "}";
+    const Tee = protocol.TeeProofRequest;
+    try testing.expectError(error.MissingField, decode_test(Tee, &scratch, no_kind));
     // The flat shape (proof fields next to tee_kind) is rejected.
-    const flat = "{\"l1_head\":\"0x" ++ comptime hex_repeat("01") ++ "\",\"tee_kind\":\"aws_nitro\"}";
-    try testing.expectError(error.MissingField, decode_test(protocol.TeeProofRequest, &scratch, flat));
+    const flat = "{\"l1_head\":\"0x" ++ comptime hex_repeat("01") ++
+        "\",\"tee_kind\":\"aws_nitro\"}";
+    try testing.expectError(error.MissingField, decode_test(Tee, &scratch, flat));
 }
 
 fn address_six() protocol.Address {
@@ -140,11 +143,13 @@ test "prover service codec: tee result shape" {
     try testing.expectEqualSlices(u8, &.{ 1, 1, 1 }, decoded.tee.aggregate_proposal.signature);
     // base/base rejects a missing aggregate proposal and the nested `proof` shape.
     const missing = "{\"proof_type\":\"tee\",\"payload\":{\"intermediate_roots\":[]," ++
-        "\"tee_kind\":\"aws_nitro\",\"tee_signer\":\"0x" ++ "1111111111111111111111111111111111111111\"}}";
-    try testing.expectError(error.MissingField, decode_test(protocol.ProofResult, &scratch, missing));
+        "\"tee_kind\":\"aws_nitro\",\"tee_signer\":\"0x" ++
+        "1111111111111111111111111111111111111111\"}}";
+    const Result = protocol.ProofResult;
+    try testing.expectError(error.MissingField, decode_test(Result, &scratch, missing));
     const nested = "{\"proof_type\":\"tee\",\"payload\":{\"proof\":{\"intermediate_roots\":[]}," ++
         "\"tee_kind\":\"aws_nitro\"}}";
-    try testing.expectError(error.MissingField, decode_test(protocol.ProofResult, &scratch, nested));
+    try testing.expectError(error.MissingField, decode_test(Result, &scratch, nested));
 }
 
 test "prover service codec: strictness" {
@@ -166,14 +171,16 @@ test "prover service codec: strictness" {
     };
     for (cases) |case| try testing.expectError(case[1], decode_test(Request, &scratch, case[0]));
     const too_long = "{\"session_id\":\"" ++ comptime hex_repeat("aa") ++ "a\"}";
-    try testing.expectError(error.TooLarge, decode_test(protocol.GetProofRequest, &scratch, too_long));
-    const escaped = try decode_test(protocol.GetProofRequest, &scratch, "{\"session_id\":\"a\\\"b\"}");
+    const Get = protocol.GetProofRequest;
+    try testing.expectError(error.TooLarge, decode_test(Get, &scratch, too_long));
+    const escaped = try decode_test(Get, &scratch, "{\"session_id\":\"a\\\"b\"}");
     try testing.expectEqualStrings("a\"b", escaped.session_id.slice());
 }
 
 test "prover service codec: rfc 3339 timestamps" {
     var buffer: [20]u8 = undefined;
-    try testing.expectEqualStrings("1970-01-01T00:00:00Z", codec.format_rfc3339(.{ .seconds = 0 }, &buffer));
+    const epoch = codec.format_rfc3339(.{ .seconds = 0 }, &buffer);
+    try testing.expectEqualStrings("1970-01-01T00:00:00Z", epoch);
     const instant: protocol.Timestamp = .{ .seconds = 1_793_880_000 };
     const text = codec.format_rfc3339(instant, &buffer);
     try testing.expectEqualStrings("2026-11-05T12:00:00Z", text);

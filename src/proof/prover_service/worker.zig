@@ -191,7 +191,8 @@ pub fn Worker(comptime IO: type) type {
                     error.Rejected, error.NotFound => true,
                     error.Unavailable => blk: {
                         worker.heartbeat_failures += 1;
-                        break :blk worker.heartbeat_failures >= worker.config.heartbeat_failures_max or
+                        const failures_max = worker.config.heartbeat_failures_max;
+                        break :blk worker.heartbeat_failures >= failures_max or
                             now_ns >= worker.lease_deadline_ns;
                     },
                 };
