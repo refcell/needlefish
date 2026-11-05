@@ -55,6 +55,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] admin_overrideLeader (no conductor: InternalError like base/base),
     admin_refreshUpgradeSignal (-32004 outside runtime-admin mode), dev_taskQueueLength
   - [ ] admin_clearPendingP2pConnections (needs a dial-abort API in `p2p.Service`)
+  - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
+    idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
   - [x] `ws_subscribe_{unsafe,safe,finalized}_head` and `dev_subscribe_engine_queue_size`
     (needs websocket support in the RPC server)
 - [x] `safedb`: L1→safe head mapping (in-memory sorted, bounded; 80-byte records for persistence).
@@ -89,6 +91,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Admin errors follow base/base exactly (codes and redacted messages) even where ours were more descriptive; reasons go to the log instead.
 - WebSocket RPC listens on its own port (default 7546) because the HTTP server cannot upgrade; ids are numbers and notifications use the subscribe method name, like jsonrpsee; only changes after subscribing are sent.
 - Conductor: leadership is polled every 1 s and admin_startSequencer answers from the last poll (the admin API is synchronous; base/base asks per call). Commits are JSON-RPC only and retried every 100 ms until accepted; the deposits-only fallback payload is committed too.
 - Follow mode: one block in flight, fetched only while the engine queue is idle (the unsafe head is current, no double insert); labels polled every 30 s; no prefetch window, proof gate, or L1 origin check yet. The driver skips derivation and L1 finalization.
@@ -213,6 +216,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: admin error codes and idempotent start/stop match base/base.
 - 2026-11-05: rpc: WebSocket RPC (--rpc.ws-enabled/--rpc.ws-port): head and engine queue size subscriptions, router fallback.
 - 2026-11-05: sequencer: op-conductor client: seals commit before insert, leader-gated admin_startSequencer (-32002), overrideLeader forwarded, --sequencer.stopped.
 - 2026-11-05: service: follow mode (--source-l2-rpc): source blocks inserted in order, safe/finalized labels verified against local blocks and promoted.

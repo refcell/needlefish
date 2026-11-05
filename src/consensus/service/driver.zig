@@ -295,14 +295,14 @@ pub const Driver = struct {
     }
 
     /// `admin_startSequencer`: resume sequencing on `unsafe_head`, the current unsafe head.
+    /// Starting an active sequencer succeeds without effect (base/base).
     pub fn start_sequencer(driver: *Driver, unsafe_head: Hash) error{
         NotSequencer,
-        AlreadyActive,
         UnsafeHeadMismatch,
         NotReady,
     }!void {
         if (!driver.options.sequencer) return error.NotSequencer;
-        if (driver.sequencer_active) return error.AlreadyActive;
+        if (driver.sequencer_active) return;
         if (driver.phase != .running) return error.NotReady;
         const head = driver.queue.state.sync_state.unsafe_head.block_info.hash;
         if (!head.eql(unsafe_head)) return error.UnsafeHeadMismatch;
@@ -311,10 +311,9 @@ pub const Driver = struct {
     }
 
     /// `admin_stopSequencer`: stop building; returns the unsafe head to resume from. A block
-    /// already being built is still sealed.
-    pub fn stop_sequencer(driver: *Driver) error{ NotSequencer, NotActive }!Hash {
+    /// already being built is still sealed. Stopping a stopped sequencer only returns the head.
+    pub fn stop_sequencer(driver: *Driver) error{NotSequencer}!Hash {
         if (!driver.options.sequencer) return error.NotSequencer;
-        if (!driver.sequencer_active) return error.NotActive;
         driver.sequencer_active = false;
         assert(!driver.sequencer_active);
         return driver.queue.state.sync_state.unsafe_head.block_info.hash;
@@ -911,12 +910,12 @@ test "driver: admin sequencer stop and start" {
     for (0..8) |_| driver.tick(scenario.providers(), Scenario.genesis_time + 1);
     const head = try driver.stop_sequencer();
     try testing.expect(head.eql(scenario.rollup.genesis.l2.hash));
-    try testing.expectError(error.NotActive, driver.stop_sequencer());
+    try testing.expect((try driver.stop_sequencer()).eql(head)); // Idempotent.
     driver.tick(scenario.providers(), Scenario.genesis_time + 2);
     try testing.expect(!driver.building);
     try testing.expectError(error.UnsafeHeadMismatch, driver.start_sequencer(.zero));
     try driver.start_sequencer(head);
-    try testing.expectError(error.AlreadyActive, driver.start_sequencer(head));
+    try driver.start_sequencer(.zero); // Already active: no effect, no head check.
     driver.tick(scenario.providers(), Scenario.genesis_time + 2);
     try testing.expect(driver.building);
     var verifier: Scenario = undefined;

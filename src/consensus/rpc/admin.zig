@@ -27,7 +27,6 @@ const HandlerError = rpc.HandlerError;
 
 pub const StartError = error{
     NotSequencer,
-    AlreadyActive,
     UnsafeHeadMismatch,
     NotReady,
     /// A conductor is configured and this node is not (known to be) its leader.
@@ -35,9 +34,11 @@ pub const StartError = error{
 };
 pub const OverrideError = error{NoConductor};
 
+/// base/base `SEQUENCER_UNAVAILABLE_CODE`.
+pub const sequencer_unavailable_code: i32 = -32001;
 /// base/base `NOT_LEADER_CODE`.
 pub const not_leader_code: i32 = -32002;
-pub const StopError = error{ NotSequencer, NotActive };
+pub const StopError = error{NotSequencer};
 pub const PostError = error{
     /// The envelope is not a valid execution payload envelope.
     InvalidPayload,
@@ -46,6 +47,8 @@ pub const PostError = error{
 };
 
 pub const VTable = struct {
+    /// Whether the node runs a sequencer; sequencer methods fail with -32001 otherwise.
+    is_sequencer: *const fn (context: *anyopaque) bool,
     sequencer_active: *const fn (context: *anyopaque) bool,
     /// Starts sequencing on top of `unsafe_head`, which must be the current unsafe head.
     start_sequencer: *const fn (context: *anyopaque, unsafe_head: Hash) StartError!void,
@@ -87,52 +90,52 @@ fn admin(backend: *const Backend, call: *Call) HandlerError!*const VTable {
     return vtable;
 }
 
+/// The admin API of a sequencer; other nodes get base/base's -32001.
+fn sequencer(backend: *const Backend, call: *Call) HandlerError!*const VTable {
+    const vtable = try admin(backend, call);
+    if (!vtable.is_sequencer(backend.context)) {
+        return call.fail(sequencer_unavailable_code, "sequencer not available on this node");
+    }
+    return vtable;
+}
+
 fn sequencer_active(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try sequencer(backend, call);
     try call.writer.boolean(vtable.sequencer_active(backend.context));
 }
 
 fn start_sequencer(backend: *const Backend, call: *Call) HandlerError!void {
     const head: Hash = .{ .bytes = try call.params.fixed(32) };
     try call.params.finish();
-    const vtable = try admin(backend, call);
-    vtable.start_sequencer(backend.context, head) catch |err| {
-        const message = switch (err) {
-            error.NotSequencer => "node is not a sequencer",
-            error.AlreadyActive => "sequencer already running",
-            error.UnsafeHeadMismatch => "block hash does not match unsafe head",
-            error.NotReady => "sequencer not ready (engine sync in progress)",
-            error.NotLeader => "Node is not the conductor leader.",
-        };
-        const code = if (err == error.NotLeader) not_leader_code else rpc.code.server_error;
-        return call.fail(code, message);
+    const vtable = try sequencer(backend, call);
+    // base/base `sequencer_admin_error`: details other than leadership are redacted.
+    vtable.start_sequencer(backend.context, head) catch |err| return switch (err) {
+        error.NotLeader => call.fail(not_leader_code, "Node is not the conductor leader."),
+        error.NotSequencer, error.UnsafeHeadMismatch, error.NotReady => {
+            return call.fail(rpc.code.internal_error, "Internal error");
+        },
     };
     try call.writer.null_value();
 }
 
 fn stop_sequencer(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
-    const head = vtable.stop_sequencer(backend.context) catch |err| {
-        const message = switch (err) {
-            error.NotSequencer => "node is not a sequencer",
-            error.NotActive => "sequencer not running",
-        };
-        return call.fail(rpc.code.server_error, message);
-    };
+    const vtable = try sequencer(backend, call);
+    const head = vtable.stop_sequencer(backend.context) catch
+        return call.fail(rpc.code.internal_error, "Internal error");
     try call.writer.data(&head.bytes);
 }
 
 fn conductor_enabled(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = backend.admin orelse return call.writer.boolean(false);
+    const vtable = try sequencer(backend, call);
     try call.writer.boolean(vtable.conductor_enabled(backend.context));
 }
 
 fn override_leader(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try sequencer(backend, call);
     // base/base: `LeaderOverrideError("No conductor configured")`, mapped to InternalError.
     vtable.override_leader(backend.context) catch
         return call.fail(rpc.code.internal_error, "Internal error");
@@ -154,21 +157,21 @@ fn task_queue_length(backend: *const Backend, call: *Call) HandlerError!void {
 
 fn recover_mode(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try sequencer(backend, call);
     try call.writer.boolean(vtable.recover_mode(backend.context));
 }
 
 fn set_recover_mode(backend: *const Backend, call: *Call) HandlerError!void {
     const mode = try call.params.boolean();
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try sequencer(backend, call);
     vtable.set_recover_mode(backend.context, mode);
     try call.writer.null_value();
 }
 
 fn reset_derivation_pipeline(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
-    const vtable = try admin(backend, call);
+    const vtable = try sequencer(backend, call);
     vtable.reset_derivation_pipeline(backend.context);
     try call.writer.null_value();
 }
@@ -178,12 +181,13 @@ fn post_unsafe_payload(backend: *const Backend, call: *Call) HandlerError!void {
     try call.params.finish();
     const vtable = try admin(backend, call);
     assert(envelope_json.len > 0);
-    vtable.post_unsafe_payload(backend.context, envelope_json) catch |err| {
-        const message = switch (err) {
-            error.InvalidPayload => "invalid execution payload envelope",
-            error.NotAccepted => "payload not accepted (stale, sequencing, or not running)",
-        };
-        return call.fail(rpc.code.server_error, message);
+    // base/base decodes the envelope as a parameter (invalid params) and then hands it to
+    // the network without waiting, so a payload that is not queued still succeeds.
+    vtable.post_unsafe_payload(backend.context, envelope_json) catch |err| switch (err) {
+        error.InvalidPayload => {
+            return call.fail(rpc.code.invalid_params, "invalid execution payload envelope");
+        },
+        error.NotAccepted => {},
     };
     try call.writer.null_value();
 }
@@ -206,6 +210,7 @@ const StubNode = struct {
     recover: bool = false,
     resets: u32 = 0,
     posts: u32 = 0,
+    sequencer: bool = true,
     conductor: bool = false,
     leader: bool = true,
     overrides: u32 = 0,
@@ -213,6 +218,7 @@ const StubNode = struct {
     config: protocol.rollup_config.RollupConfig = .{ .block_time = 2 },
 
     const vtable: VTable = .{
+        .is_sequencer = sequencer_of,
         .sequencer_active = active_of,
         .start_sequencer = start,
         .stop_sequencer = stop,
@@ -233,19 +239,21 @@ const StubNode = struct {
     fn of(context: *anyopaque) *StubNode {
         return @ptrCast(@alignCast(context));
     }
+    fn sequencer_of(context: *anyopaque) bool {
+        return of(context).sequencer;
+    }
     fn active_of(context: *anyopaque) bool {
         return of(context).active;
     }
     fn start(context: *anyopaque, head: Hash) StartError!void {
         const node = of(context);
-        if (node.active) return error.AlreadyActive;
+        if (node.active) return;
         if (node.conductor and !node.leader) return error.NotLeader;
         if (!head.eql(node.head)) return error.UnsafeHeadMismatch;
         node.active = true;
     }
     fn stop(context: *anyopaque) StopError!Hash {
         const node = of(context);
-        if (!node.active) return error.NotActive;
         node.active = false;
         return node.head;
     }
@@ -319,7 +327,7 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
     const mismatch = call_text(&backend,
         \\{"jsonrpc":"2.0","id":2,"method":"admin_startSequencer","params":["0x0000000000000000000000000000000000000000000000000000000000000000"]}
     , &buffer);
-    try testing.expect(contains(mismatch, "does not match unsafe head"));
+    try testing.expect(contains(mismatch, "-32603")); // Redacted like base/base.
     const started = call_text(&backend,
         \\{"jsonrpc":"2.0","id":3,"method":"admin_startSequencer","params":["0xabababababababababababababababababababababababababababababababab"]}
     , &buffer);
@@ -383,6 +391,17 @@ test "admin rpc: sequencer stop/start, recover mode, reset, healthz" {
         \\{"jsonrpc":"2.0","id":7,"method":"admin_sequencerActive"}
     , &buffer);
     try testing.expect(contains(unavailable, "admin api not available"));
+    node.sequencer = false;
+    const verifier = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":16,"method":"admin_stopSequencer"}
+    , &buffer);
+    try testing.expect(contains(verifier, "-32001"));
+    try testing.expect(contains(verifier, "sequencer not available on this node"));
+    // Posting a payload is not a sequencer method.
+    const verifier_post = call_text(&backend,
+        \\{"jsonrpc":"2.0","id":17,"method":"admin_postUnsafePayload","params":[{"executionPayload":{}}]}
+    , &buffer);
+    try testing.expect(contains(verifier_post, "\"result\":null"));
 }
 
 fn fuzz_admin(_: void, smith: *std.testing.Smith) anyerror!void {

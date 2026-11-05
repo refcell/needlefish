@@ -246,6 +246,7 @@ pub fn Node(comptime IO: type) type {
         const Engine = engine_client.EngineClient(IO);
         const Polling = polling_client.PollingClient(IO);
         const admin_vtable: admin_rpc.VTable = .{
+            .is_sequencer = admin_is_sequencer,
             .sequencer_active = admin_sequencer_active,
             .start_sequencer = admin_start_sequencer,
             .stop_sequencer = admin_stop_sequencer,
@@ -1064,12 +1065,17 @@ pub fn Node(comptime IO: type) type {
             return output_of(node.rollup, &block, root);
         }
 
+        fn admin_is_sequencer(context: *anyopaque) bool {
+            return from_context(context).driver.options.sequencer;
+        }
+
         fn admin_sequencer_active(context: *anyopaque) bool {
             return from_context(context).driver.sequencer_active;
         }
 
         fn admin_start_sequencer(context: *anyopaque, head: Hash) admin_rpc.StartError!void {
             const node = from_context(context);
+            if (node.driver.sequencer_active) return; // base/base: already started is ok.
             if (node.conductor) |conductor| {
                 // base/base checks `conductor_leader` first; this answers from the last poll.
                 if (conductor.leader != true) return error.NotLeader;
@@ -1127,7 +1133,12 @@ pub fn Node(comptime IO: type) type {
                 .payload = decoded.payload,
                 .parent_beacon_block_root = decoded.parent_beacon_block_root,
             };
-            if (!node.driver.insert_unsafe(&envelope)) return error.NotAccepted;
+            if (!node.driver.insert_unsafe(&envelope)) {
+                node.logger.log(.warn, "consensus", "posted unsafe payload not queued", .{
+                    .number = envelope.payload.block_number,
+                });
+                return error.NotAccepted;
+            }
             node.logger.log(.info, "consensus", "unsafe payload posted", .{
                 .number = envelope.payload.block_number,
             });
@@ -1237,12 +1248,14 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     _ = rollup_rpc.NodeRouter.handle(&node.backend,
         \\{"jsonrpc":"2.0","id":2,"method":"admin_stopSequencer"}
     , &admin_out);
-    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "not a sequencer") != null);
+    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "-32001") != null);
     admin_out = .fixed(&admin_buffer);
     _ = rollup_rpc.NodeRouter.handle(&node.backend,
         \\{"jsonrpc":"2.0","id":3,"method":"admin_sequencerActive"}
     , &admin_out);
-    try testing.expect(std.mem.indexOf(u8, admin_out.buffered(), "\"result\":false") != null);
+    // A verifier has no sequencer admin API (base/base -32001).
+    const unavailable = std.mem.indexOf(u8, admin_out.buffered(), "sequencer not available");
+    try testing.expect(unavailable != null);
     admin_out = .fixed(&admin_buffer);
     _ = rollup_rpc.NodeRouter.handle(&node.backend,
         \\{"jsonrpc":"2.0","id":4,"method":"admin_postUnsafePayload","params":[{"executionPayload":{}}]}
