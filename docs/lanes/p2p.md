@@ -70,6 +70,10 @@ behind a small interface and switch later.
   gossips a block each way and drains the UDP completions on stop. Negative control:
   dropping received datagrams in the transport fails it with `NotConnected`. Decision:
   this replaces the devnet recheck of completion UDP, whose p2p ports are fixed.
+- [ ] Fuzz: hostile discv5 messages inside an established session (valid session keys:
+  FINDNODE with junk distance lists, NODES with oversized/invalid ENR sets and bogus
+  totals, PONG with spoofed endpoints, TALKREQ): the service must not crash, must bound
+  table/verifier growth, and must keep serving honest nodes (mirror of the libp2p one).
 - [x] Fix: publishing the same block again, or more than `blocks_per_height_max` blocks at
   one height, hit the `SeenHashes.insert` assert (a crash in a retrying sequencer). Our
   own block is now recorded only when `check` passes; regression test in `service_test`.
