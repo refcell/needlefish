@@ -41,9 +41,12 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] safegcd codegen: the generic copy's i318 accumulator was the 10% gap; rounded to whole
   words, secp256k1 now uses `safegcd.zig` and modinv.zig is deleted.
 - [x] p256 window-8 generator table: closed by analysis (removes ~4 of ~32 mixed adds, ~2%).
-- [ ] fuzz campaigns: first pass done (keccak 1.4M runs, every other target 20K, ReleaseSafe,
-  no failures). Note: one `--fuzz` run spends its budget on a single test, so run each target
-  with its own `-Dtest-filter`. Longer runs pending lower host load.
+- [x] fuzz campaigns (ReleaseSafe, one `-Dtest-filter` per target, all clean): keccak256,
+  sha256, ripemd160, blake2f, montgomery, safegcd, modexp raw 300K each; modexp operand vs
+  big-int oracle 200K; ecrecover 500K; SEC1/verify/ecdh 200K; p256 300K; bn254 and BLS raw
+  200K; bn254 and BLS group-law targets 20K; msm_precomputed 50K; kzg verify, kzg framing,
+  blob, cells verify, cells recovery 20K. Raw byte targets for curve precompiles and modexp
+  were shallow, hence the structured targets. Rerun after changes to the code they cover.
 - [x] secp256k1 p2p API (base/base discv5/ENR/libp2p use k256/secp256k1 for these):
   `compress_public_key`, `decompress_public_key`, `decode_public_key`, `verify` (plain ECDSA,
   accepts high s like std; `is_low_s` for libsecp/k256 semantics), `ecdh` (discv5: compressed
@@ -401,3 +404,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: bn254 group-law fuzz 20K runs clean (288 coverage points vs 103 raw).
 - 2026-11-05: BLS group-law fuzz 20K runs clean (385 coverage points vs 171 raw).
 - 2026-11-05: montgomery and safegcd differential fuzz 300K runs each, clean (mostly branch-free code: 87 / 70 coverage points).
+- 2026-11-05: second fuzz pass complete (sha256/ripemd160/blake2f/keccak 300K, kzg verify/framing 20K, all clean); fuzz item closed.
