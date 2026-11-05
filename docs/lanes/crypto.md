@@ -399,3 +399,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: bn254 precompile raw fuzz 200K runs clean but shallow (31 unique runs, 103 coverage points); added a structured target (valid points from fuzzed scalars; add, mul vs mul_reference, pairing bilinearity incl. G2 = [b]G2).
 - 2026-11-05: BLS precompile structured target (add, 2-point MSM, GLS G2 MSM, pairing bilinearity vs double-and-add) plus seeded group-law runs for bn254 and BLS in the normal test suite.
 - 2026-11-05: bn254 group-law fuzz 20K runs clean (288 coverage points vs 103 raw).
+- 2026-11-05: BLS group-law fuzz 20K runs clean (385 coverage points vs 171 raw).
