@@ -46,10 +46,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] driver ticks in ms; subsecond slots build at the parent timestamp and seal 150 ms in
   - [x] BaseTimeUpdateTx deposit in sequenced and derived attributes; singular-only and
     same-second batch rules; pipeline test of 200 ms derivation
-  - [ ] devnet smoke at 200 ms. Blocked on the node lane: the EL chainspec ignores genesis
-    `config.base` upgrades (no Azul/Osaka/Denim), and engine `forkchoiceUpdated`/`newPayload`
-    reject same-second timestamps. Blocked on batcher-devnet: Denim at genesis in
-    `genesis.zig` (L2 genesis `base` and rollup.json `base`). Both lanes notified.
+  - [x] devnet smoke at 200 ms (nf-builder, 2026-11-05): devnet genesis activates Denim at
+    genesis, EL serves `engine_getPayloadV5` (Azul/Osaka); `just devnet smoke` passes with
+    ~5 L2 blocks/s.
 - [x] `sequencer`: build L2 blocks at block time, sequencer drift, L1 origin selection, conductor-free single sequencer.
   - [x] L1 origin selector (non-blocking, drift, subsecond, reorg detection)
   - [x] build ticker + attributes for sequenced blocks, seal, admin start/stop

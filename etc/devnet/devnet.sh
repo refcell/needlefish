@@ -103,7 +103,9 @@ up() {
   local ver_el="http://127.0.0.1:$PORT_VERIFIER_HTTP"
   start l1 node --dev-l1 --chain "$DIR/l1-genesis.json" --datadir "$DIR/l1" \
     --http.port "$PORT_L1_HTTP" --beacon.port "$PORT_L1_BEACON" --block-time "$L1_BLOCK_TIME"
-  start_l2_el seq-el "$PORT_SEQUENCER_HTTP" "$PORT_SEQUENCER_ENGINE"
+  # The sequencer EL builds through the builder/core payload service (200 ms slots, 150 ms
+  # cutoff); the verifier EL only imports.
+  start_l2_el seq-el "$PORT_SEQUENCER_HTTP" "$PORT_SEQUENCER_ENGINE" --builder.enabled
   start_l2_el ver-el "$PORT_VERIFIER_HTTP" "$PORT_VERIFIER_ENGINE"
   patch_rollup "$l1" "$seq_el" "$ver_el"
   start_consensus
@@ -132,9 +134,10 @@ fresh_state() {
   "$BASE" devnet init --out "$DIR" --force
 }
 
+# start_l2_el NAME HTTP_PORT ENGINE_PORT [EXTRA_FLAGS...]
 start_l2_el() {
   start "$1" node --chain "$DIR/l2-genesis.json" --datadir "$DIR/$1" --http.port "$2" \
-    --authrpc.port "$3" --authrpc.jwtsecret "$DIR/jwt.hex"
+    --authrpc.port "$3" --authrpc.jwtsecret "$DIR/jwt.hex" "${@:4}"
 }
 
 # Rewrites rollup.json with the real genesis hashes once the ELs answer.

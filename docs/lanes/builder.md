@@ -32,7 +32,7 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - [x] Wire `builder/core` `Service` into the node's Engine API handlers
   (`engine_forkchoiceUpdated` with attributes, `engine_getPayload`) behind a flag, with the
   node's IO clock as the builder `Clock` (coordinate with nf-node via small edits).
-- [ ] 200 ms cadence end to end with nf-consensus and nf-batcher-devnet: sequencer
+- [x] 200 ms cadence end to end with nf-consensus and nf-batcher-devnet: sequencer
   requests a payload every 200 ms slot, seals at the offset, inserts; devnet genesis
   activates Denim/subsecond blocks at genesis; `just devnet smoke` passes at 200 ms.
 - [x] `bin/base builder` subcommand + flags (non-flashblocks subset of base/base
@@ -74,6 +74,13 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   An early `resolve` seals with the cutoff moved to now and never waits.
 - 2026-11-05: the attribute transactions are copied at `start` so the caller's FCU buffers
   need not outlive the call; `Service` is no longer generic over a publish sink.
+- 2026-11-05: 200 ms end to end: Denim at L2 genesis, the BaseTime proxy and
+  `engine_getPayloadV5` landed from the batcher-devnet/node lanes (d7f44e5f) while this lane
+  did the same work; theirs is kept. This lane's part: the devnet sequencer EL runs
+  `--builder.enabled` (verifier EL only imports), so the devnet builds every 200 ms block
+  through the `builder/core` service. `just devnet smoke` passed locally on that setup (51
+  blocks in 10 s, all checks, BaseTime slot 0 updating), so the DST item below stays for the
+  simulator rather than replacing the smoke.
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -105,6 +112,7 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - 2026-11-05: `builder/core` `NodeBuilder(IO)` wires the payload service into the node's Engine
   API (`Chain.payload_builder`, IO timers, `--builder.enabled` on `base node`); engine-level
   tests (equals a `Chain` build, early getPayload, expiry) and seeded + fuzz interleavings.
+- 2026-11-05: devnet sequencer EL on `--builder.enabled`; `just devnet smoke` passes at 200 ms.
 - 2026-11-05: removed flashblocks, step 1: `execution/flashblocks` (consumer, RPC, pubsub),
   `builder/publish`, flashblock fuzz targets, and `BaseFeature.compact_flashblock_metadata`.
 - 2026-11-05: removed flashblocks, step 2: `common/flashblocks`, `builder/multiplex`, and the

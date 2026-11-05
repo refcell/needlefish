@@ -39,9 +39,11 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] rpc: eth_createAccessList (warm-set collection after simulation, iterated to a fixpoint).
 - [x] Denim execution (no flashblocks; native 200 ms blocks, AGENTS.md rule 10): BaseTime
   predeploy install, equal-second timestamps, schedule + BaseTime deposit import checks.
-- [ ] Engine API for the regular builder at 200 ms: serve `src/builder` payload jobs
-  (FCU starts, getPayload seals, new FCU cancels); FCU+getPayload+newPayload latency
-  benchmark well under the 150 ms seal offset; record in docs/PERF.md.
+- [x] Engine API for the regular builder at 200 ms: serve `src/builder` payload jobs
+  (FCU starts, getPayload seals, new FCU cancels): `--builder.enabled`, `Chain.payload_builder`
+  (nf-builder, 2026-11-05).
+- [ ] FCU+getPayload+newPayload latency benchmark at 200 ms well under the 150 ms seal offset;
+  record in docs/PERF.md.
 - [ ] rpc: Denim `timestampMs` on blocks and BaseTime-aware pending/`eth_call` timestamps.
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
