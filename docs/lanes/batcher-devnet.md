@@ -6,8 +6,9 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 ## Backlog
 - [x] (from crypto lane, done: `blobs/kzg.zig` now wraps it) `common.crypto.kzg.blob` now provides `blob_to_kzg_commitment`,
   `compute_blob_kzg_proof`, `verify_blob_kzg_proof[_batch]` (c-kzg vector tested); consider
-  replacing `src/batcher/blobs/kzg.zig` with it. EIP-7594 cell proofs (Fusaka sidecars) are next
-  in the crypto lane.
+  replacing `src/batcher/blobs/kzg.zig` with it. EIP-7594 cell proofs are on main too:
+  `crypto.kzg.cells.compute_cells_and_kzg_proofs` (189 ms/blob; `Settings.init` builds FK20
+  tables once, 0.83 s).
 - [x] `docs/DEVNET.md`: topology, ports, process contract (see draft below), smoke test definition.
 - [x] `base devnet init` (first cut: funded accounts, portal stub, rollup.json; genesis hashes
   patched by `base devnet rollup` after ELs start; predeploys still TODO)

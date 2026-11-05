@@ -31,7 +31,7 @@ fallback but hot paths should be our own, optimized implementations.
   Lagrange setup), compute_challenge, barycentric evaluation, compute_kzg_proof,
   compute/verify_blob_kzg_proof (+ batch) — needed by the batcher and blob sidecar checks.
 - [ ] KZG cells (EIP-7594 / Osaka blob tx proofs): G1 monomial setup, FK20 cell proofs, verify,
-  recover. (in progress, worker)
+  recover. Landed (ddbf591, 4391655, ef23739); review pending.
 - [x] bls: prepared G2 lines (`pairing.prepare`, `pairing_check_prepared`); KZG fixed G2 lines
   prepared at comptime.
 - [x] bls GLV-split MSM: closed. Needs 2n half-scalars of scratch (128 KiB at n = 4096) or

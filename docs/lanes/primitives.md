@@ -4,6 +4,10 @@ Owns `src/common/{primitives,rlp,consensus,genesis,chains,flz,l1_fees}`.
 Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-alloy.
 
 ## Backlog
+- [ ] (from crypto lane, 2026-11-05) EIP-7594 cells are on main: `crypto.kzg.cells`
+  (`compute_cells`, `verify_cell_kzg_proof_batch`, `recover_cells[_and_kzg_proofs]`); use
+  `Settings.init_verifier` (1 ms, no FK20 tables) for verify-only. v1 sidecar check = compute_cells
+  per blob, then one batch verify over all 128 cells x blobs. Replace `CellProofsUnsupported`.
 - [x] `primitives`: `Address`, `B256`, `U256` helpers (Zig native `u256`), `Bloom`, hex encode/decode (fast, SIMD), checksum (EIP-55), `Bytes` view types. Fuzz hex round-trip.
 - [x] `rlp`: zero-alloc encoder into caller buffer + streaming decoder over slices, length precompute, strict canonical decoding. Fuzz decode/encode round trip, ethereum RLP vectors.
 - [x] `consensus` tx types: legacy (EIP-155), 2930, 1559, 4844 (blob), 7702 (set code), OP deposit (0x7E). Signing hash, tx hash, encode/decode (network + EIP-2718), sender recovery (std fallback behind `Recoverer`).
