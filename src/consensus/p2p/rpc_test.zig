@@ -243,6 +243,41 @@ test "p2p rpc: peers carry identify and ping data" {
     try expect_contains(dump, "\"protocols\":null");
 }
 
+test "p2p rpc: peers(false) keeps identified peers after they disconnect" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const message: @import("libp2p/identify.zig").Identify = .{
+        .agent_version = "base-consensus/gone",
+        .protocol_version = "",
+    };
+    const service = fixture.service;
+    const slot = service.slot_of(&fixture.peers[0]).?;
+    service.on_identified(slot, &message);
+    service.on_disconnected(slot, 5 * std.time.ns_per_s);
+    const connected = fixture.call(
+        \\{"jsonrpc":"2.0","id":1,"method":"opp2p_peers","params":[true]}
+    );
+    try testing.expect(std.mem.indexOf(u8, connected, "base-consensus/gone") == null);
+    const all = fixture.call(
+        \\{"jsonrpc":"2.0","id":1,"method":"opp2p_peers","params":[false]}
+    );
+    try expect_contains(all, "\"userAgent\":\"base-consensus/gone\"");
+    try expect_contains(all, "\"connectedness\":0");
+    // Banned while disconnected: CannotConnect.
+    var text: [@import("peers/peer_id.zig").text_length_max]u8 = undefined;
+    var body: [256]u8 = undefined;
+    const block_request = try std.fmt.bufPrint(&body,
+        \\{{"jsonrpc":"2.0","id":2,"method":"opp2p_blockPeer","params":["{s}"]}}
+    , .{fixture.peers[0].format(&text)});
+    _ = fixture.call(block_request);
+    while (service.pop_command()) |_| {}
+    const banned = fixture.call(
+        \\{"jsonrpc":"2.0","id":3,"method":"opp2p_peers","params":[false]}
+    );
+    try expect_contains(banned, "\"connectedness\":3");
+}
+
 test "p2p rpc: peer info truncates long identify fields" {
     const long_agent: [200]u8 = @splat('a');
     var message: @import("libp2p/identify.zig").Identify = .{ .agent_version = &long_agent };

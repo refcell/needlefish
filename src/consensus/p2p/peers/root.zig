@@ -16,6 +16,7 @@ pub const node_key = @import("node_key.zig");
 pub const score = @import("score.zig");
 pub const store = @import("store.zig");
 pub const store_file = @import("store_file.zig");
+pub const peerstore = @import("peerstore.zig");
 pub const gater = @import("gater.zig");
 
 test {

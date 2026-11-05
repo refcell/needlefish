@@ -55,8 +55,11 @@ behind a small interface and switch later.
   only when both are empty, including when the file is missing or unreadable (base/base
   fails startup there; we keep running and count `open_errors`). Interop tests: a node
   whose only route to its peer is the file connects; a missing file seeds the defaults.
-- [ ] Identify peerstore (base/base `max_identify_peerstore_peers` = 1024): LRU of identify
-  info that outlives connections, evicting disconnected peers first; admin `peers` reports it.
+- [x] Identify peerstore (base/base `max_identify_peerstore_peers` = 1024):
+  `peers/peerstore.zig` (fixed capacity, evicts the least recently updated disconnected
+  peer, else the least recently updated; reference-model fuzz + `run_bytes`). Fed by
+  identify, connect and disconnect; `opp2p_peers(false)` lists disconnected peers as
+  NotConnected (banned: CannotConnect) with score 0 and direction 0.
 - [x] Dial rate limiting (base/base gater `peer_redialing` / `dial_period`): already in
   `peers/gater.zig` (500 redials per 60 min, protected peers exempt).
 - [x] DST: chaos seed sweep (8 seeds, 5 nodes, 5% datagram loss, connection resets, a 3 s
@@ -357,3 +360,4 @@ behind a small interface and switch later.
 - 2026-11-05: in-process p2p<->consensus interop test; backlog extended (bootstore/bootnodes-file persistence via io, identify peerstore).
 - 2026-11-05: bootstore file persistence through utilities.io (StoreFile + crash fuzz + restart DST).
 - 2026-11-05: --p2p.bootnodes-file read through the io layer.
+- 2026-11-05: identify peerstore + opp2p_peers(false) disconnected peers.

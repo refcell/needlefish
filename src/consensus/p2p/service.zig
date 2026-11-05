@@ -30,6 +30,7 @@ const ip = @import("peers/ip.zig");
 const observations = @import("observations.zig");
 const multiaddr = @import("peers/multiaddr.zig");
 const identify = @import("libp2p/identify.zig");
+const peerstore_module = @import("peers/peerstore.zig");
 const peer_id = @import("peers/peer_id.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
 const primitives = @import("../../common/primitives/root.zig");
@@ -48,6 +49,8 @@ pub const Config = struct {
     disc: disc.service.Config,
     /// base/base CLI defaults: 500 redials per 60 min (`--p2p.redial`, `.period`).
     gater: gater_module.Config = .{ .peer_redialing = 500 },
+    /// Identify info kept across disconnects (base/base `max_identify_peerstore_peers`).
+    peerstore_capacity: u32 = peerstore_module.capacity_default,
     limits: connections.Limits = .{},
     /// base/base `PeerMonitoring` (`--p2p.ban.peers`, default off; `--p2p.ban.threshold`,
     /// `--p2p.ban.duration`).
@@ -112,6 +115,8 @@ pub const Stats = struct {
 };
 
 const commands_max = 128;
+
+pub const Peerstore = peerstore_module.Peerstore(PeerInfo);
 
 /// What identify and ping told us about a connected peer, bounded for static storage.
 pub const PeerInfo = struct {
@@ -180,6 +185,7 @@ pub const Service = struct {
     gossip: *BlockGossip,
     gater: gater_module.Gater,
     limits: connections.Manager,
+    peerstore: Peerstore,
     connected: [router_module.peers_max]Connected = @splat(.{}),
     commands: [commands_max]Command = undefined,
     commands_head: u32 = 0,
@@ -209,6 +215,7 @@ pub const Service = struct {
             .gossip = undefined,
             .gater = undefined,
             .limits = undefined,
+            .peerstore = undefined,
         };
         service.discovery = try disc.service.Service.init(
             allocator,
@@ -233,10 +240,13 @@ pub const Service = struct {
         assert(config.limits.established_max + config.limits.bypass_max <=
             router_module.peers_max);
         service.limits = try connections.Manager.init(allocator, config.limits);
+        errdefer service.limits.deinit(allocator);
+        service.peerstore = try Peerstore.init(allocator, config.peerstore_capacity);
         return service;
     }
 
     pub fn destroy(service: *Service, allocator: std.mem.Allocator) void {
+        service.peerstore.deinit(allocator);
         service.limits.deinit(allocator);
         service.gater.deinit(allocator);
         service.gossip.destroy(allocator);
@@ -400,6 +410,7 @@ pub const Service = struct {
             .direction = direction,
             .connected_ns = now_ns,
         };
+        service.peerstore.set_connected(peer, true);
         return slot;
     }
 
@@ -409,6 +420,7 @@ pub const Service = struct {
         assert(connection.active);
         const latency_ns = connection.info.latency_ns;
         connection.info = .from_identify(message);
+        service.peerstore.put(connection.peer, &connection.info);
         connection.info.latency_ns = latency_ns;
     }
 
@@ -432,6 +444,7 @@ pub const Service = struct {
         assert(connection.active);
         service.observe_peer(slot, now_ns);
         service.limits.close(connection.peer, connection.direction);
+        service.peerstore.set_connected(connection.peer, false);
         service.gossip.router.remove_peer(slot, now_ns);
         connection.* = .{};
     }

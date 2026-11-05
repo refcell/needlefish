@@ -75,7 +75,9 @@ fn Counted(
 
 pub const Router = rpc.Router(*Service, &methods);
 
+const connectedness_not_connected = 0;
 const connectedness_connected = 1;
+const connectedness_cannot_connect = 3;
 const direction_inbound = 1;
 const direction_outbound = 2;
 
@@ -124,10 +126,10 @@ fn peer_count(service: *Service, call: *Call) HandlerError!void {
     try writer.end_object();
 }
 
-/// `opp2p_peers(connected)`: this node only tracks connected peers, so both values list
-/// the same set.
+/// `opp2p_peers(connected)`: connected peers, plus with `false` every other peer in the
+/// identify peerstore (base/base: banned ones as CannotConnect, the rest NotConnected).
 fn peers(service: *Service, call: *Call) HandlerError!void {
-    _ = try call.params.boolean();
+    const connected_only = try call.params.boolean();
     try call.params.finish();
     const writer = call.writer;
     try writer.begin_object();
@@ -140,6 +142,14 @@ fn peers(service: *Service, call: *Call) HandlerError!void {
         var text: [peer_id.text_length_max]u8 = undefined;
         try writer.key(connection.peer.format(&text));
         try write_connected_peer(service, writer, @intCast(slot));
+    }
+    if (!connected_only) {
+        for (service.peerstore.entries) |*entry| {
+            if (!entry.used or entry.connected) continue;
+            var text: [peer_id.text_length_max]u8 = undefined;
+            try writer.key(entry.peer.format(&text));
+            try write_stored_peer(service, writer, entry);
+        }
     }
     try writer.end_object();
     try writer.key("bannedPeers");
@@ -314,7 +324,29 @@ const PeerInfo = struct {
     score: f64,
     behaviour_penalty: f64,
     protected: bool = false,
+    connectedness: u8 = connectedness_connected,
 };
+
+fn write_stored_peer(
+    service: *Service,
+    writer: *json.Writer,
+    entry: *const service_module.Peerstore.Entry,
+) !void {
+    assert(entry.used and !entry.connected);
+    const key = entry.peer.secp256k1_public_key();
+    const banned = service.gater.blocked_peers.contains(entry.peer);
+    try write_peer_info(service, writer, .{
+        .peer = entry.peer,
+        .node_id = if (key) |value| enr.node_id_from_public_key(value) else @splat(0),
+        .record = null,
+        .info = &entry.info,
+        .direction = 0,
+        .score = 0,
+        .behaviour_penalty = 0,
+        .protected = service.gater.protected_peers.contains(entry.peer),
+        .connectedness = if (banned) connectedness_cannot_connect else connectedness_not_connected,
+    });
+}
 
 fn write_connected_peer(service: *Service, writer: *json.Writer, slot: router_module.Slot) !void {
     const connection = &service.connected[slot];
@@ -369,7 +401,7 @@ fn write_peer_info(service: *Service, writer: *json.Writer, info: PeerInfo) !voi
         }
         try writer.end_array();
     }
-    try field_integer(writer, "connectedness", connectedness_connected);
+    try field_integer(writer, "connectedness", info.connectedness);
     try field_integer(writer, "direction", info.direction);
     try writer.key("protected");
     try writer.boolean(info.protected);
