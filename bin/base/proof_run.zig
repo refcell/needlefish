@@ -178,7 +178,7 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
         verdict.claimed_output_root,
         if (verdict.holds) "holds" else "does not hold",
         store.count(),
-        source.calls,
+        source.calls(),
     });
     return if (verdict.holds) 0 else 1;
 }
