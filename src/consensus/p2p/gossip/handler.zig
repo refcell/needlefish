@@ -77,6 +77,11 @@ pub const BlockGossip = struct {
     publish_output: []u8,
     compressor: snappy.Compressor = .{},
     accepted: [accepted_max]Id = undefined,
+    /// The payload hash validation computed for each queued id, so `pop_block` does
+    /// not hash the payload a second time.
+    accepted_hashes: [accepted_max]primitives.B256 = undefined,
+    /// Set by `check` for the message it just accepted.
+    checked_hash: primitives.B256 = undefined,
     accepted_head: u32 = 0,
     accepted_count: u32 = 0,
     stats: Stats = .{},
@@ -175,7 +180,7 @@ pub const BlockGossip = struct {
             switch (verdict) {
                 .accept => {
                     gossip.stats.accepted += 1;
-                    gossip.queue_accepted(&event.id);
+                    gossip.queue_accepted(&event.id, gossip.checked_hash);
                 },
                 .reject => gossip.stats.rejected += 1,
                 .ignore => gossip.stats.ignored += 1,
@@ -206,16 +211,19 @@ pub const BlockGossip = struct {
             const timestamp = envelope.payload.timestamp;
             gossip.stats.failed[@backingInt(validity.reason_of(err, timestamp, now_seconds))] += 1;
         };
+        gossip.checked_hash = envelope.payload_hash;
         return validity.acceptance(result);
     }
 
-    fn queue_accepted(gossip: *BlockGossip, id: *const Id) void {
+    fn queue_accepted(gossip: *BlockGossip, id: *const Id, payload_hash: primitives.B256) void {
         if (gossip.accepted_count == accepted_max) {
             gossip.accepted_head = (gossip.accepted_head + 1) % accepted_max;
             gossip.accepted_count -= 1;
             gossip.stats.accepted_dropped += 1;
         }
-        gossip.accepted[(gossip.accepted_head + gossip.accepted_count) % accepted_max] = id.*;
+        const tail = (gossip.accepted_head + gossip.accepted_count) % accepted_max;
+        gossip.accepted[tail] = id.*;
+        gossip.accepted_hashes[tail] = payload_hash;
         gossip.accepted_count += 1;
         assert(gossip.accepted_count <= accepted_max);
     }
@@ -226,13 +234,15 @@ pub const BlockGossip = struct {
         assert(scratch.len >= snappy.gossip_size_max);
         while (gossip.accepted_count > 0) {
             const id = gossip.accepted[gossip.accepted_head];
+            const payload_hash = gossip.accepted_hashes[gossip.accepted_head];
             gossip.accepted_head = (gossip.accepted_head + 1) % accepted_max;
             gossip.accepted_count -= 1;
             const entry = gossip.router.cache.find(&id) orelse continue;
             const data = gossip.router.cache.data(entry);
             const version = gossip.version_of(entry.topic);
             // Validation already decoded this exact message successfully.
-            return block.decode(version, data, scratch) catch unreachable;
+            return block.decode_known_hash(version, data, scratch, payload_hash) catch
+                unreachable;
         }
         return null;
     }

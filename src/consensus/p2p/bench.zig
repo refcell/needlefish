@@ -23,6 +23,9 @@ const consensus_types = @import("../../common/consensus/root.zig");
 const common_secp256k1 = @import("../../common/crypto/secp256k1/root.zig");
 const rollup_config = @import("../protocol/rollup_config.zig");
 const Direction = @import("libp2p/connections.zig").Direction;
+const block = @import("gossip/block.zig");
+const keccak = @import("../../common/crypto/keccak.zig");
+const sha256 = @import("../../common/crypto/sha256.zig");
 const IpAddress = @import("peers/ip.zig").Address;
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -80,6 +83,13 @@ pub const cases = [_]Case{
         .run = bench_end_to_end,
         .bytes_per_op = payload_bytes,
     },
+    stage("p2p/stage sha256 128 KiB", 2_000, bench_sha256, payload_bytes),
+    stage("p2p/stage keccak256 128 KiB", 2_000, bench_keccak, payload_bytes),
+    stage("p2p/stage message id 128 KiB", 1_000, bench_message_id_stage, payload_bytes),
+    stage("p2p/stage block decode 128 KiB", 1_000, bench_block_decode, payload_bytes),
+    stage("p2p/stage transactions root 128 KiB", 1_000, bench_transactions_root, payload_bytes),
+    stage("p2p/stage check transactions 128 KiB", 1_000, bench_check_transactions, payload_bytes),
+    stage("p2p/stage recover signer", 1_000, bench_recover_signer, 0),
     .{
         .name = "p2p/block gossip sequencer 128 KiB",
         .iterations = 200,
@@ -87,6 +97,11 @@ pub const cases = [_]Case{
         .bytes_per_op = payload_bytes,
     },
 };
+
+fn stage(name: []const u8, iterations: u32, run: *const fn (u32) u64, bytes: u64) Case {
+    assert(iterations > 0);
+    return .{ .name = name, .iterations = iterations, .run = run, .bytes_per_op = bytes };
+}
 
 var payload_storage: [payload_bytes]u8 = undefined;
 var payload_ready = false;
@@ -506,5 +521,123 @@ fn bench_sequencer(iterations: u32) u64 {
     };
     var checksum: u64 = 0;
     for (0..iterations) |_| checksum +%= fixture.step(false);
+    return checksum;
+}
+
+// ------------------------------------------------------------- verifier stages
+
+/// One signed, compressed 128 KiB v3 block, built from the end-to-end fixture.
+const Message = struct {
+    fixture: *EndToEnd,
+    bytes: []u8,
+
+    fn get() *const Message {
+        if (message_ready) return &message_storage;
+        const fixture = EndToEnd.create();
+        var value: ssz.ExecutionPayload = .{
+            .version = .v3,
+            .block_number = 1,
+            .timestamp = fixture.now_ns / std.time.ns_per_s,
+            .gas_limit = 30_000_000,
+            .base_fee_per_gas = 1,
+            .extra_data = "base",
+            .transactions = fixture.transaction_list(),
+        };
+        const root = EndToEnd.beacon_root;
+        value.block_hash = validity.header_from_payload(
+            &fixture.rollup,
+            &value,
+            root,
+            fixture.transactions_root,
+        ).hash();
+        const length = block.signed_length(value);
+        const out_length = snappy.max_compressed_length(length);
+        const out = std.heap.page_allocator.alloc(u8, @intCast(out_length)) catch unreachable;
+        const scratch = std.heap.page_allocator.alloc(u8, @intCast(length)) catch unreachable;
+        var message_compressor: snappy.Compressor = .{};
+        const secret = fixture.sequencer_secret;
+        const bytes = block.encode_signed(
+            8453,
+            secret,
+            root,
+            value,
+            scratch,
+            &message_compressor,
+            out,
+        ) catch unreachable;
+        message_storage = .{ .fixture = fixture, .bytes = bytes };
+        message_ready = true;
+        return &message_storage;
+    }
+};
+
+var message_storage: Message = undefined;
+var message_ready = false;
+
+fn bench_sha256(iterations: u32) u64 {
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        var hasher = sha256.Hasher.init();
+        hasher.update(payload());
+        checksum +%= hasher.final()[0];
+    }
+    return checksum;
+}
+
+fn bench_keccak(iterations: u32) u64 {
+    var checksum: u64 = 0;
+    for (0..iterations) |_| checksum +%= keccak.keccak256(payload())[0];
+    return checksum;
+}
+
+fn bench_message_id_stage(iterations: u32) u64 {
+    const message = Message.get();
+    const topic = "/optimism/8453/2/blocks";
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        checksum +%= block.message_id(topic, message.bytes, message.fixture.scratch)[0];
+    }
+    return checksum;
+}
+
+fn bench_block_decode(iterations: u32) u64 {
+    const message = Message.get();
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        const envelope = block.decode(.v3, message.bytes, message.fixture.scratch) catch
+            unreachable;
+        checksum +%= envelope.payload_hash.bytes[0];
+    }
+    return checksum;
+}
+
+fn bench_transactions_root(iterations: u32) u64 {
+    const message = Message.get();
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        checksum +%= validity.transactions_root(message.fixture.transaction_list()).bytes[0];
+    }
+    return checksum;
+}
+
+fn bench_check_transactions(iterations: u32) u64 {
+    const message = Message.get();
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        validity.check_transactions(message.fixture.transaction_list()) catch unreachable;
+        checksum += 1;
+    }
+    return checksum;
+}
+
+fn bench_recover_signer(iterations: u32) u64 {
+    const message = Message.get();
+    const envelope = block.decode(.v3, message.bytes, message.fixture.scratch) catch
+        unreachable;
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        const signer = block.recover_signer(&envelope, 8453) orelse unreachable;
+        checksum +%= signer.bytes[0];
+    }
     return checksum;
 }

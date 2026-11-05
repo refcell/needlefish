@@ -18,6 +18,7 @@
 //! flips the parity, which recovers the same key); r and s must lie in [1, n).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const primitives = @import("../../../common/primitives/root.zig");
 const keccak = @import("../../../common/crypto/keccak.zig");
@@ -168,8 +169,34 @@ pub fn decode(version: Version, data: []const u8, scratch: []u8) DecodeError!Env
     return decode_decompressed(version, decompressed);
 }
 
+/// `decode` for a message already validated: `payload_hash` is the hash its first decode
+/// computed, so the 128 KiB keccak is not paid again (checked in Debug builds).
+pub fn decode_known_hash(
+    version: Version,
+    data: []const u8,
+    scratch: []u8,
+    payload_hash: B256,
+) DecodeError!Envelope {
+    assert(scratch.len > 0);
+    const decompressed = try snappy.decompress(data, scratch, snappy.gossip_size_max);
+    var envelope = try decode_fields(version, decompressed);
+    envelope.payload_hash = payload_hash;
+    if (builtin.mode == .debug) {
+        const signed = decompressed[signature_length..];
+        assert(std.mem.eql(u8, &payload_hash.bytes, &keccak.keccak256(signed)));
+    }
+    return envelope;
+}
+
 /// Decodes an already decompressed message. The result borrows `bytes`.
 pub fn decode_decompressed(version: Version, bytes: []const u8) DecodeError!Envelope {
+    var envelope = try decode_fields(version, bytes);
+    envelope.payload_hash = .{ .bytes = keccak.keccak256(bytes[signature_length..]) };
+    return envelope;
+}
+
+/// Every field but `payload_hash`, which the caller sets.
+fn decode_fields(version: Version, bytes: []const u8) DecodeError!Envelope {
     if (bytes.len < decompressed_length_min(version)) return error.InvalidLength;
     const y_parity = parse_v(bytes[64]) orelse return error.InvalidSignature;
     const signed = bytes[signature_length..];
@@ -188,7 +215,7 @@ pub fn decode_decompressed(version: Version, bytes: []const u8) DecodeError!Enve
         .y_parity = y_parity,
         .parent_beacon_block_root = parent_beacon_block_root,
         .payload = payload,
-        .payload_hash = .{ .bytes = keccak.keccak256(signed) },
+        .payload_hash = undefined,
     };
 }
 
@@ -418,6 +445,14 @@ test "block: encode_signed round trips and recovers the signer for every version
         );
         const envelope = try decode(version, message, &decoded_scratch);
         try testing.expectEqual(payload.block_number, envelope.payload.block_number);
+        // The re-decode with the known hash yields the same envelope.
+        var known_scratch: [8192]u8 = undefined;
+        const hash = envelope.payload_hash;
+        const known = try decode_known_hash(version, message, &known_scratch, hash);
+        try testing.expect(known.payload_hash.eql(hash));
+        try testing.expectEqual(envelope.payload.block_number, known.payload.block_number);
+        try testing.expect(envelope.payload.block_hash.eql(known.payload.block_hash));
+        try testing.expectEqualSlices(u8, &envelope.signature, &known.signature);
         if (root) |value| try testing.expect(value.eql(envelope.parent_beacon_block_root.?));
         const signer = recover_signer(&envelope, chain_id).?;
         try testing.expectEqual(try secp256k1.address(secret), signer.bytes);

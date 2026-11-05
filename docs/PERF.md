@@ -261,8 +261,21 @@ End-to-end split (same run, which was ~25% noisier than the rows above: handshak
 sequencer ~0.30 ms, wire (noise seal+open of the ~90 KiB snappy frame) ~0.15 ms, verifier
 ~0.6 ms by subtraction. The verifier pays the block-hash check (keccak transactions root over
 the full payload plus decoding every transaction), signature recovery, and decompression.
-One block per 2 s costs ~0.05% of a core per peer hop; the next target is the verifier's
-transaction decode and root, which repeats work the engine does again on insert.
+One block per 2 s costs ~0.05% of a core per peer hop.
+
+Verifier stages (quiet rerun, µs per 128 KiB block): message id (snappy + sha256) 65,
+decode (snappy + SSZ + keccak payload hash) 156, transactions root (keccak trie) 136,
+recover signer 29, check transactions 1, then `pop_block` decoded again: 156. Fix: the
+handler keeps the payload hash validation computed next to each accepted id and
+`block.decode_known_hash` skips the second 128 KiB keccak (re-checked in Debug builds).
+
+| case | before ns/op | after ns/op | change |
+|---|---:|---:|---|
+| p2p/block gossip end to end 128 KiB | 1 021 471 | 829 305 | -19%: verifier ~0.6 -> ~0.42 ms |
+
+Remaining verifier cost is two keccaks over the payload (payload hash, transactions root;
+different preimages, both required) at ~980 MB/s (`common/crypto/keccak`, crypto lane) and
+two decompressions (message id, validation; ~20 µs each).
 
 ## Targets
 
