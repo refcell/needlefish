@@ -60,6 +60,10 @@ pub const Stats = struct {
     requests_retried: u64 = 0,
     records_rejected: u64 = 0,
     packets_banned: u64 = 0,
+    /// Valid records handed to the gossip side (base/base `discovery_event{discovered}`).
+    discovered: u64 = 0,
+    /// Random-target lookups started (base/base `find_node_request`).
+    lookups: u64 = 0,
 };
 
 pub const Datagram = struct {
@@ -284,6 +288,7 @@ pub const Service = struct {
             return;
         };
         slot.* = record.*;
+        service.stats.discovered += 1;
     }
 
     // ---------------------------------------------------------------- time
@@ -320,6 +325,7 @@ pub const Service = struct {
     }
 
     fn start_lookup(service: *Service, now_ns: u64) void {
+        service.stats.lookups += 1;
         var target: enr.NodeId = undefined;
         service.random.bytes(&target);
         service.lookup.start(target);

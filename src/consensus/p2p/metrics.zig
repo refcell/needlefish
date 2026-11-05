@@ -8,6 +8,8 @@
 //! failures are rejected before validation, as in base/base); validation duration is not
 //! exported because the state machines have no wall clock. `gossip_event{type="not_supported"}`
 //! stays 0: peers without gossipsub fail stream negotiation and are closed by the transport.
+//! Discovery: `unverifiable_enr*` and `discovery_dropped{closed}` stay 0 (no such paths:
+//! records are checked on receipt and the discovered queue cannot close).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -48,6 +50,16 @@ const dial_error_labels = type_labels(dial_errors);
 const inbound_errors = std.meta.fieldNames(service_module.InboundError);
 const inbound_error_labels = type_labels(inbound_errors);
 
+const discovery_events = [_][:0]const u8{
+    "discovered", "session_established", "unverifiable_enr", "unverifiable_enr_verified",
+};
+const discovery_event_labels = type_labels(&discovery_events);
+const discovery_drops = [_][]const u8{ "backpressure", "closed" };
+const discovery_drop_labels = [discovery_drops.len][1]metrics.Label{
+    .{.{ .name = "reason", .value = discovery_drops[0] }},
+    .{.{ .name = "reason", .value = discovery_drops[1] }},
+};
+
 const gossip_events = [_][:0]const u8{
     "message", "subscribed", "unsubscribed", "slow_peer", "not_supported",
 };
@@ -85,6 +97,9 @@ pub const TransportStats = struct {
 pub const Metrics = struct {
     gossip_peer_count: Gauge = .{},
     discovery_peer_count: Gauge = .{},
+    discovery_event: [discovery_events.len]Gauge = @splat(.{}),
+    discovery_dropped: [discovery_drops.len]Gauge = @splat(.{}),
+    find_node_request: Gauge = .{},
     banned_peers: Gauge = .{},
     dial_peer: Gauge = .{},
     dial_peer_error: [dial_errors.len]Gauge = @splat(.{}),
@@ -106,8 +121,9 @@ pub const Metrics = struct {
     peer_scores: metrics.Histogram = .init(&observations.score_bounds),
     connection_duration: metrics.Histogram = .init(&observations.duration_bounds_s),
 
-    pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len +
-        dial_errors.len + inbound_errors.len + 2 + gossip_events.len + retirable_versions +
+    pub const entries_count = 10 + discovery_events.len + discovery_drops.len +
+        4 * versions.len + connection_types.len + reasons.len + dial_errors.len +
+        inbound_errors.len + 2 + gossip_events.len + retirable_versions +
         versions.len * directions.len;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
@@ -116,8 +132,7 @@ pub const Metrics = struct {
         const count_before = registry.count;
         try registry.gauge("base_node_gossip_peer_count", "Number of peers connected to " ++
             "the libp2p gossip Swarm", &self.gossip_peer_count);
-        try registry.gauge("base_node_discovery_peer_count", "Number of peers connected to " ++
-            "the discv5 service", &self.discovery_peer_count);
+        try self.register_discovery(registry);
         try registry.gauge(
             "base_node_banned_peers",
             "Number of peers banned by the gater",
@@ -172,6 +187,39 @@ pub const Metrics = struct {
             &self.p2p_bytes_sent,
         );
         assert(registry.count - count_before == entries_count);
+    }
+
+    /// discv5 metrics, scope `base_node_disc` like base/base `disc/src/metrics.rs`.
+    fn register_discovery(self: *Metrics, registry: anytype) metrics.RegisterError!void {
+        const count_before = registry.count;
+        try registry.gauge("base_node_disc_discovery_peer_count", "Number of peers " ++
+            "connected to the discv5 service", &self.discovery_peer_count);
+        try register_typed(registry, "base_node_disc_discovery_event", "Events received by " ++
+            "the discv5 service", &self.discovery_event, &discovery_event_labels);
+        for (&self.discovery_dropped, &discovery_drop_labels) |*gauge, *labels| {
+            try registry.register(.{
+                .name = "base_node_disc_discovery_dropped",
+                .help = "ENRs dropped before forwarding to the gossip service",
+                .labels = labels,
+                .metric = .{ .gauge = gauge },
+            });
+        }
+        try registry.gauge("base_node_disc_find_node_request", "Requests made to find a " ++
+            "node through the discv5 peer discovery service", &self.find_node_request);
+        const expected = 2 + discovery_events.len + discovery_drops.len;
+        assert(registry.count - count_before == expected);
+    }
+
+    fn update_discovery(self: *Metrics, service: *const Service) void {
+        const discovery = &service.discovery;
+        self.discovery_peer_count.set(discovery.table.live_count());
+        const events = [discovery_events.len]u64{
+            discovery.stats.discovered, discovery.stats.handshakes_completed, 0, 0,
+        };
+        for (&self.discovery_event, events) |*gauge, count| gauge.set(@intCast(count));
+        self.discovery_dropped[0].set(@intCast(discovery.stats.discovered_dropped));
+        self.find_node_request.set(@intCast(discovery.stats.lookups));
+        assert(self.discovery_dropped[1].get() == 0);
     }
 
     fn register_topics(self: *Metrics, registry: anytype) metrics.RegisterError!void {
@@ -253,7 +301,7 @@ pub const Metrics = struct {
     /// Copies the current service and transport state into the registry cells.
     pub fn update(self: *Metrics, service: *const Service, transport: TransportStats) void {
         self.gossip_peer_count.set(service.connected_count());
-        self.discovery_peer_count.set(service.discovery.table.live_count());
+        self.update_discovery(service);
         self.banned_peers.set(@intCast(service.gater.blocked_peers.slice().len));
         self.dial_peer.set(@intCast(service.stats.dials));
         for (&self.dial_peer_error, service.stats.dial_errors) |*gauge, count| {

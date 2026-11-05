@@ -50,6 +50,10 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_inbound_connection_error{type=\"blocked_peer\"} 0\n");
     try expect_contains(text, "base_node_p2p_bytes_received 120\n");
     try expect_contains(text, "# TYPE base_node_peer_scores histogram\n");
+    try expect_contains(text, "base_node_disc_discovery_peer_count ");
+    try expect_contains(text, "base_node_disc_discovery_event{type=\"discovered\"} ");
+    try expect_contains(text, "base_node_disc_discovery_dropped{reason=\"closed\"} 0\n");
+    try expect_contains(text, "base_node_disc_find_node_request ");
     try expect_contains(text, "base_node_gossip_event{type=\"slow_peer\"} 0\n");
     try expect_contains(text, "base_node_block_topic_retirements_total{version=\"v3\"} 0\n");
     try expect_contains(
