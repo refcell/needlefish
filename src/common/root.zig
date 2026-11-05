@@ -11,6 +11,7 @@ pub const chains = @import("chains/root.zig");
 pub const flz = @import("flz/root.zig");
 pub const l1_fees = @import("l1_fees/root.zig");
 pub const genesis = @import("genesis/root.zig");
+pub const rpc_types = @import("rpc_types/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

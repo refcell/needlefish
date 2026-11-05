@@ -17,7 +17,9 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
 - [x] Predeploy, system and upgrade-deployer addresses (`predeploys.rs`).
 - [x] Denim BaseTime metadata deposit (`base_time.rs`): calldata, deposit, validation.
-- [ ] EIP-8130 span batch data and `rpc-types` JSON forms if no other lane owns them.
+- [x] `rpc_types`: JSON-RPC forms of logs, transactions (deposit, 0x79), receipts (L1 fee,
+  phaseStatuses), headers and blocks, streamed to `std.Io.Writer`.
+- [ ] `rpc_types`: request parsing (TransactionRequest, block tags) once `utilities/json` lands.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -55,6 +57,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - `.cache/push.sh` reruns the full suite after a race only when the new upstream commits touch
   `src/common/` or build files; otherwise it compiles and tidies (disjoint merge).
 - Curated public ethereum/tests RLP vectors are committed under `src/common/rlp/testdata/`.
+- rpc_types writes JSON directly (no DOM); callers pass block/position context. Addresses
+  are EIP-55 checksummed like reth; `l1FeeScalar` is a caller-formatted decimal string.
 
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.
@@ -70,3 +74,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: 0x79 wired into `TxType`/`Envelope`/`Receipt`; other lanes reject it for now.
 - 2026-11-05: benchmarks (`common/consensus/bench.zig`, results in docs/PERF.md).
 - 2026-11-05: predeploys and Denim BaseTime metadata deposit.
+- 2026-11-05: rpc_types JSON writers (alloy field names; checksummed addresses).
