@@ -8,7 +8,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] frames (zero-copy codec, payload parser), channels, `BlockInfo`/`L2BlockInfo`
   - [ ] local RLP decoder (until primitives lane lands one) + singular batches
   - [ ] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
-  - [ ] rollup config + hardfork activation, system config + L1 log updates
+  - [x] rollup config + hardfork activation, system config + L1 log updates
   - [ ] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), user deposits
   - [ ] batch validity rules (singular, span, Holocene)
 - [ ] `sources`: L1 RPC client (blocks, receipts, by number/hash), beacon blob client, L2 engine client (JWT) — all over `utilities.rpc`/`http`.
@@ -25,7 +25,13 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   than base/base's `== 1`.
 - Decoded frames borrow the input (zero-copy); channels copy frame data into allocator-owned
   memory because L1 payloads are transient. Total bytes are bounded by the channel bank.
+- `RollupConfig`, `SystemConfig` live in `src/consensus/protocol` (upstream: `common/genesis`)
+  because this lane's backlog owns them; JSON (serde) parsing comes with `bin/consensus`.
+  Execution-only Base features (Beryl/Cobalt/Everest/Zenith precompiles) are omitted from
+  `Feature`; the runtime upgrade override registry is not ported yet.
+- Invalid system config logs are skipped (base/base collects them as non-fatal errors).
 - Zig 0.17 has no array `**` operator: use `@splat`.
 
 ## Log
+- 2026-11-05: rollup config (upgrades, features, Denim schedule), system config updates.
 - 2026-11-05: protocol frames, channels, block info with seeded + std fuzz tests.

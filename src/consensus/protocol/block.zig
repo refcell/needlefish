@@ -4,8 +4,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const Hash = [32]u8;
-pub const zero_hash: Hash = @as([32]u8, @splat(0));
+const primitives = @import("../../common/primitives/root.zig");
+
+pub const Hash = primitives.B256;
+pub const zero_hash: Hash = Hash.zero;
 
 /// A block number and hash pair (alloy `BlockNumHash`).
 pub const BlockId = struct {
@@ -13,7 +15,7 @@ pub const BlockId = struct {
     hash: Hash = zero_hash,
 
     pub fn eql(a: BlockId, b: BlockId) bool {
-        return a.number == b.number and std.mem.eql(u8, &a.hash, &b.hash);
+        return a.number == b.number and a.hash.eql(b.hash);
     }
 };
 
@@ -31,12 +33,12 @@ pub const BlockInfo = struct {
     pub fn is_parent_of(parent: BlockInfo, child: BlockInfo) bool {
         if (parent.number == std.math.maxInt(u64)) return false;
         return parent.number + 1 == child.number and
-            std.mem.eql(u8, &parent.hash, &child.parent_hash);
+            parent.hash.eql(child.parent_hash);
     }
 
     pub fn eql(a: BlockInfo, b: BlockInfo) bool {
         return a.number == b.number and a.timestamp == b.timestamp and
-            std.mem.eql(u8, &a.hash, &b.hash) and std.mem.eql(u8, &a.parent_hash, &b.parent_hash);
+            a.hash.eql(b.hash) and a.parent_hash.eql(b.parent_hash);
     }
 };
 
@@ -57,8 +59,8 @@ pub const L2BlockInfo = struct {
 };
 
 test "block: parent relation" {
-    const parent: BlockInfo = .{ .hash = @splat(1), .number = 10, .timestamp = 2 };
-    var child: BlockInfo = .{ .hash = @splat(2), .number = 11, .parent_hash = parent.hash };
+    const parent: BlockInfo = .{ .hash = .init(@splat(1)), .number = 10, .timestamp = 2 };
+    var child: BlockInfo = .{ .hash = .init(@splat(2)), .number = 11, .parent_hash = parent.hash };
     try std.testing.expect(parent.is_parent_of(child));
     child.number = 12;
     try std.testing.expect(!parent.is_parent_of(child));
