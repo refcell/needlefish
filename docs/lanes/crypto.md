@@ -40,8 +40,9 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] safegcd codegen: the generic copy's i318 accumulator was the 10% gap; rounded to whole
   words, secp256k1 now uses `safegcd.zig` and modinv.zig is deleted.
 - [x] p256 window-8 generator table: closed by analysis (removes ~4 of ~32 mixed adds, ~2%).
-- [ ] fuzz campaigns: 30-minute `zig build test --fuzz -Doptimize=ReleaseSafe` runs per crypto
-  target when host load allows; commit any reproducer as a regression test.
+- [ ] fuzz campaigns: first pass done (keccak 1.4M runs, every other target 20K, ReleaseSafe,
+  no failures). Note: one `--fuzz` run spends its budget on a single test, so run each target
+  with its own `-Dtest-filter`. Longer runs pending lower host load.
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -262,3 +263,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: modexp large-modulus Montgomery rows unrolled 4-way (small comptime lengths keep fused loops): 2048b full exp 2.60->1.87ms, 4096b 22.3->15.8ms, 256b unchanged.
 - 2026-11-05: p256 verify: safegcd s^-1 (was Fermat), affine Q table via one shared inversion + mixed adds: 50.7->47.7us.
 - 2026-11-05: safegcd Wide rounded to whole words (i318 -> i320); secp256k1 switched to the generic safegcd (ecrecover 28.5us, unchanged) and modinv.zig removed.
+- 2026-11-05: coverage fuzz pass (ReleaseSafe): keccak 1.4M runs; sha256, ripemd160, blake2f, modexp, secp256k1, p256, kzg verify/framing/blob, safegcd, montgomery, bls precompile 20K each (bn254 shares the bls filter name): no failures.
