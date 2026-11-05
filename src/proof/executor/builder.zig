@@ -134,7 +134,7 @@ pub const Builder = struct {
 
     /// Points the sparse state at `header`'s post-state, fetching through the oracle.
     fn open_state(self: *Builder, header: *const Header, hash: Hash) void {
-        self.sparse.reset(header.state_root.bytes);
+        self.sparse.reset(header.state_root.bytes, .{ .number = header.number, .hash = hash });
         self.fallback = OracleFallback.init(&self.resolver, self.hints, header.number, hash);
         self.sparse.set_fallback(self.fallback.fallback());
         self.executor.state.reset(self.sparse.database());
