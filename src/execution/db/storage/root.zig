@@ -10,10 +10,12 @@ pub const storage = @import("storage.zig");
 pub const checksum = @import("checksum.zig");
 pub const sim_storage = @import("sim_storage.zig");
 pub const superblock = @import("superblock.zig");
+pub const journal = @import("journal.zig");
 
 pub const sector_size = storage.sector_size;
 pub const SimStorage = sim_storage.SimStorage;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("journal_test.zig");
 }
