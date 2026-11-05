@@ -7,6 +7,7 @@ const devnet = @import("devnet.zig");
 const batcher = @import("batcher.zig");
 const node = @import("node.zig");
 const consensus = @import("consensus.zig");
+const proof = @import("proof.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -17,6 +18,7 @@ const usage =
     \\  batcher    submit L2 batches to L1
     \\  node       execution node (--dev-l1 for a standalone L1 dev chain)
     \\  consensus  consensus (rollup) node: derivation, engine driving, optimism_* RPC
+    \\  proof      fault-proof tooling (replay a recorded preimage archive)
     \\
 ;
 
@@ -25,6 +27,7 @@ test {
     _ = batcher;
     _ = node;
     _ = consensus;
+    _ = proof;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -53,6 +56,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "batcher")) {
         std.process.exit(try batcher.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "proof")) {
+        std.process.exit(try proof.main(init, args[2..]));
     }
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);
