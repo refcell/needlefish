@@ -68,6 +68,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   consensus path) and reuse the consensus lane's brotli decoder.
 - `Sidecar.verify_kzg` batch-verifies v0 blob proofs via `crypto.kzg.blob`; v1 cell proofs
   return `CellProofsUnsupported` until the crypto lane ships cells. Tests are ReleaseSafe-only.
+- `bundles` (base/base metering tooling) is not ported: nothing in base/base consumes it.
 
 ## Log
 - 2026-11-05: primitives (hex, Address/B256/Bloom, u256, EIP-55/1191), fuzz + seeded fuzz.

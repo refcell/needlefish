@@ -8,6 +8,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] frames (zero-copy codec, payload parser), channels, `BlockInfo`/`L2BlockInfo`
   - [x] singular batches (codec + validity rules), batch drop reasons (uses `common/rlp`)
   - [x] span batches (bitlists, tx data decoding) + batch reader (zlib, brotli)
+  - [ ] span batch EIP-8130 tx data: `common/consensus/eip8130.zig` now decodes/encodes 0x79
+    (`TxEip8130`, `Signed`), so `error.Eip8130Unsupported` can be replaced.
   - [x] rollup config + hardfork activation, system config + L1 log updates
   - [x] user deposits (TransactionDeposited logs), deposit tx encoding, source hashes
   - [x] L1 info deposit tx (Bedrock/Ecotone/Isthmus/Jovian), blob base fee schedule
