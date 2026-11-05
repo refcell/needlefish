@@ -8,6 +8,7 @@
 //!     channel unchanged.
 //!   - trie proofs: a proof tampered anywhere never verifies to a different value, and
 //!     arbitrary proof bytes never crash the verifier.
+//!   - bls12-381 points: decoding is canonical (accepted bytes == compress(point)).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -382,4 +383,48 @@ test "fuzz_targets: tampered trie proofs never lie" {
 
 test "fuzz_targets: trie proof verifier survives garbage" {
     try fuzz.run({}, fuzz_proof_garbage, .{ .iterations = 2048 });
+}
+
+const g1 = @import("../common/crypto/bls12_381/g1.zig");
+const g2 = @import("../common/crypto/bls12_381/g2.zig");
+
+/// Point decoding must be canonical: every accepted encoding is the one `compress`
+/// emits, so two byte strings never name the same commitment (KZG, precompiles).
+fn check_point_encoding(comptime group: type, bytes: *const [group.compressed_length]u8) !void {
+    if (group.decompress_unchecked(bytes)) |point| {
+        try std.testing.expect(point.is_on_curve());
+        try std.testing.expectEqualSlices(u8, bytes, &group.compress(point));
+    } else |_| {}
+    if (group.decompress(bytes)) |point| {
+        try std.testing.expect(group.is_in_subgroup(point));
+    } else |_| {}
+}
+
+fn fuzz_bls_points(comptime group: type) fn (void, *Smith) anyerror!void {
+    return struct {
+        fn run(_: void, smith: *Smith) anyerror!void {
+            var bytes: [group.compressed_length]u8 = undefined;
+            if (smith.value(bool)) {
+                smith.bytes(&bytes);
+                // Set the compression flag most of the time to get past the first check.
+                if (smith.boolWeighted(1, 3)) bytes[0] |= 0x80;
+                return check_point_encoding(group, &bytes);
+            }
+            const scalar = smith.value(u64);
+            const point = group.generator.to_jacobian().mul(scalar).to_affine();
+            bytes = group.compress(point);
+            const decoded = try group.decompress(&bytes);
+            try std.testing.expect(decoded.eql(point));
+            bytes[smith.index(bytes.len)] ^= smith.value(u8) | 1;
+            try check_point_encoding(group, &bytes);
+        }
+    }.run;
+}
+
+test "fuzz_targets: bls12-381 g1 point encoding is canonical" {
+    try fuzz.run({}, fuzz_bls_points(g1), .{ .iterations = 64 });
+}
+
+test "fuzz_targets: bls12-381 g2 point encoding is canonical" {
+    try fuzz.run({}, fuzz_bls_points(g2), .{ .iterations = 32 });
 }
