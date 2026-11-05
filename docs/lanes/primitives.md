@@ -55,8 +55,10 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   `BlockchainTests/`: 3370 valid ok, 0 failures. `fixtures_blockchain_tests.tgz` (1.3 GiB
   extracted, 2998 Prague files): 77758 valid ok, 0 failures. Curated vectors committed.
 - [x] RLPTests/RandomRLPTests: run through the strict decoder (round trip or reject).
-- [ ] chains golden test: cross-check every `chains` constant (ids, hashes, addresses, block
-  times, upgrade times) against base/base `crates/common/chains/src/config.rs`.
+- [x] chains golden audit: `python3 etc/scripts/chains-audit.py <base-base-checkout>` compares
+  every `chains` field (ids, hashes, addresses, upgrade times, bootnodes) with base/base
+  `chains/src/config.rs`; 0 mismatches at base/base abdd59e. An audit, not a test: a unit test
+  would only restate the constants.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -161,3 +163,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: ethereum/tests keyaddrtest vectors (seed -> key -> address).
 - 2026-11-05: `blockrlp` BlockchainTests runner, 0 failures over 81k blocks.
 - 2026-11-05: RLPTests RandomRLPTests vector.
+- 2026-11-05: chains audit vs base/base config.rs, 0 mismatches.
