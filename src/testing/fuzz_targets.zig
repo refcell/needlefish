@@ -80,6 +80,7 @@ fn check_tx_canonical(encoded: []const u8) !void {
     var buffer: [tx_bytes_max * 2]u8 = undefined;
     try std.testing.expectEqualSlices(u8, encoded, envelope.encode_to(&buffer));
     _ = envelope.hash();
+    try check_tx_lists(envelope);
 
     var network_buffer: [tx_bytes_max * 2]u8 = undefined;
     var encoder = rlp.Encoder.init(&network_buffer);
@@ -90,6 +91,128 @@ fn check_tx_canonical(encoded: []const u8) !void {
     const again = try Envelope.decode_network(&decoder);
     try std.testing.expect(decoder.is_empty());
     try std.testing.expectEqualSlices(u8, encoded, again.encode_to(&buffer));
+}
+
+/// Iterators trust validation done at decode time (`catch unreachable`): walk them all.
+fn check_tx_lists(envelope: Envelope) !void {
+    const access_list: tx_module.AccessList = switch (envelope) {
+        .legacy, .deposit => return,
+        inline else => |signed| signed.tx.access_list,
+    };
+    var addresses: u32 = 0;
+    var keys: u64 = 0;
+    var iterator = access_list.iterator();
+    while (iterator.next()) |item| : (addresses += 1) keys += item.storage_keys.count();
+    try std.testing.expectEqual(access_list.address_count, addresses);
+    try std.testing.expectEqual(@as(u64, access_list.storage_key_count), keys);
+    if (envelope != .eip7702) return;
+    const authorizations = envelope.eip7702.tx.authorization_list;
+    var count: u32 = 0;
+    var authorization_iterator = authorizations.iterator();
+    while (authorization_iterator.next()) |_| count += 1;
+    try std.testing.expectEqual(authorizations.count, count);
+}
+
+/// Minimal big-endian RLP integer.
+fn write_int(writer: *rlp.TreeWriter, value: u256) void {
+    var bytes: [32]u8 = undefined;
+    std.mem.writeInt(u256, &bytes, value, .big);
+    const leading = @clz(value) / 8;
+    writer.bytes(bytes[leading..]);
+}
+
+fn write_random_bytes(writer: *rlp.TreeWriter, smith: *Smith, comptime len: usize) void {
+    var bytes: [len]u8 = undefined;
+    smith.bytes(&bytes);
+    writer.bytes(&bytes);
+}
+
+fn write_access_list(writer: *rlp.TreeWriter, smith: *Smith) void {
+    writer.begin_list();
+    var entries: u32 = 0;
+    while (entries < 4 and !smith.eosWeightedSimple(1, 1)) : (entries += 1) {
+        writer.begin_list();
+        write_random_bytes(writer, smith, 20);
+        writer.begin_list();
+        var keys: u32 = 0;
+        while (keys < 4 and !smith.eosWeightedSimple(1, 1)) : (keys += 1) {
+            write_random_bytes(writer, smith, 32);
+        }
+        writer.end_list();
+        writer.end_list();
+    }
+    writer.end_list();
+}
+
+fn write_authorizations(writer: *rlp.TreeWriter, smith: *Smith) void {
+    writer.begin_list();
+    var count: u32 = 0;
+    while (count < 3 and !smith.eosWeightedSimple(1, 1)) : (count += 1) {
+        writer.begin_list();
+        write_int(writer, smith.value(u256));
+        write_random_bytes(writer, smith, 20);
+        write_int(writer, smith.value(u64));
+        write_int(writer, smith.valueRangeAtMost(u8, 0, 1));
+        write_int(writer, smith.value(u256));
+        write_int(writer, smith.value(u256));
+        writer.end_list();
+    }
+    writer.end_list();
+}
+
+/// EIP-2930 / 4844 / 7702 encodings with non-empty lists, built field by field.
+fn random_typed_encoding(smith: *Smith, buffer: []u8) []u8 {
+    const tx_type = smith.valueRangeAtMost(u8, 1, 4);
+    const kind: TypedKind = switch (tx_type) {
+        1 => .eip2930,
+        3 => .eip4844,
+        4 => .eip7702,
+        else => .eip1559,
+    };
+    buffer[0] = tx_type;
+    var writer: rlp.TreeWriter = .{ .buffer = buffer[1..] };
+    writer.begin_list();
+    write_int(&writer, smith.value(u64)); // chain_id
+    write_int(&writer, smith.value(u64)); // nonce
+    write_int(&writer, smith.value(u128)); // gas_price or max_priority_fee
+    if (kind != .eip2930) write_int(&writer, smith.value(u128)); // max_fee
+    write_int(&writer, smith.value(u64)); // gas_limit
+    write_random_bytes(&writer, smith, 20); // to
+    write_int(&writer, smith.value(u256)); // value
+    var input: [48]u8 = undefined;
+    writer.bytes(input[0..smith.slice(&input)]);
+    write_access_list(&writer, smith);
+    if (kind == .eip4844) {
+        write_int(&writer, smith.value(u128));
+        writer.begin_list();
+        var hashes: u32 = 0;
+        while (hashes < 6 and !smith.eosWeightedSimple(1, 1)) : (hashes += 1) {
+            write_random_bytes(&writer, smith, 32);
+        }
+        writer.end_list();
+    }
+    if (kind == .eip7702) write_authorizations(&writer, smith);
+    write_int(&writer, smith.valueRangeAtMost(u8, 0, 1));
+    write_int(&writer, smith.value(u256));
+    write_int(&writer, smith.value(u256));
+    writer.end_list();
+    return buffer[0 .. 1 + writer.written().len];
+}
+
+const TypedKind = enum { eip2930, eip1559, eip4844, eip7702 };
+
+fn fuzz_tx_typed(_: void, smith: *Smith) anyerror!void {
+    var buffer: [tx_bytes_max]u8 = undefined;
+    const encoded = random_typed_encoding(smith, &buffer);
+    _ = try Envelope.decode(encoded); // Well-formed by construction.
+    try check_tx_canonical(encoded);
+    if (encoded.len < 2) return;
+    encoded[smith.valueRangeAtMost(u32, 1, @intCast(encoded.len - 1))] = smith.value(u8);
+    try check_tx_canonical(encoded);
+}
+
+test "fuzz_targets: typed tx with lists is canonical" {
+    try fuzz.run({}, fuzz_tx_typed, .{ .iterations = 2048 });
 }
 
 fn fuzz_tx(_: void, smith: *Smith) anyerror!void {
