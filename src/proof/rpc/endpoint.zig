@@ -38,6 +38,8 @@ pub const Param = union(enum) {
     call: struct { to: Address, data: []const u8 },
     /// `{"from", "to", "value", "data"}` for `eth_estimateGas` and replayed calls.
     transaction: Transaction,
+    /// A pre-encoded JSON value (the prover service's request objects).
+    raw_json: []const u8,
 
     fn write(param: Param, writer: *json.Writer) json.Writer.WriteError!void {
         switch (param) {
@@ -55,6 +57,7 @@ pub const Param = union(enum) {
                 try writer.end_object();
             },
             .transaction => |transaction| try transaction.write(writer),
+            .raw_json => |text| try writer.raw(text),
         }
     }
 };

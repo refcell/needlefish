@@ -9,7 +9,10 @@ pub const protocol = @import("protocol.zig");
 pub const codec = @import("codec.zig");
 pub const store = @import("store.zig");
 pub const service = @import("service.zig");
+pub const client = @import("client.zig");
+pub const worker = @import("worker.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("e2e_test.zig");
 }
