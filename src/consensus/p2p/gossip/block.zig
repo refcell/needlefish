@@ -118,16 +118,29 @@ fn message_id_hash(domain: *const [4]u8, topic_text: []const u8, data: []const u
 /// Gossipsub message id of `data` received on `topic_text`. `scratch` holds the
 /// decompressed message and must fit the 10 MiB gossip cap.
 pub fn message_id(topic_text: []const u8, data: []const u8, scratch: []u8) MessageId {
+    return message_id_and_bytes(topic_text, data, scratch).id;
+}
+
+pub const IdAndBytes = struct {
+    id: MessageId,
+    /// The decompressed message in `scratch`, or null when `data` is not valid snappy.
+    decompressed: ?[]const u8,
+};
+
+/// `message_id`, also returning the decompressed bytes so validation can reuse them.
+pub fn message_id_and_bytes(topic_text: []const u8, data: []const u8, scratch: []u8) IdAndBytes {
     assert(scratch.len >= snappy.gossip_size_max);
-    const header = snappy.decode_header(data) catch
-        return message_id_hash(&domain_invalid_snappy, topic_text, data);
-    if (header.decoded_length > snappy.gossip_size_max) {
-        return message_id_hash(&domain_invalid_snappy, topic_text, data);
-    }
+    const invalid: IdAndBytes = .{
+        .id = message_id_hash(&domain_invalid_snappy, topic_text, data),
+        .decompressed = null,
+    };
+    const header = snappy.decode_header(data) catch return invalid;
+    if (header.decoded_length > snappy.gossip_size_max) return invalid;
     const decoded = snappy.decompress(data, scratch, snappy.gossip_size_max) catch
-        return message_id_hash(&domain_invalid_snappy, topic_text, data);
+        return invalid;
     assert(decoded.len == header.decoded_length);
-    return message_id_hash(&domain_valid_snappy, topic_text, decoded);
+    const id = message_id_hash(&domain_valid_snappy, topic_text, decoded);
+    return .{ .id = id, .decompressed = decoded };
 }
 
 /// y parity of a raw signature `v` byte, or null when alloy would reject it.

@@ -50,6 +50,8 @@ pub const Mesh = struct {
 
 pub const Stats = struct {
     accepted: u64 = 0,
+    /// Validations that reused the message-id hash's decompression.
+    decompress_reused: u64 = 0,
     rejected: u64 = 0,
     ignored: u64 = 0,
     accepted_dropped: u64 = 0,
@@ -73,6 +75,10 @@ pub const BlockGossip = struct {
     /// Router topic index for each block version.
     topics: [versions.len]u8,
     scratch: []u8,
+    /// The message whose decompressed bytes `scratch[0..scratch_length]` hold, so
+    /// validation right after the message-id hash does not decompress it again.
+    scratch_id: ?Id = null,
+    scratch_length: u32 = 0,
     publish_scratch: []u8,
     publish_output: []u8,
     compressor: snappy.Compressor = .{},
@@ -145,7 +151,10 @@ pub const BlockGossip = struct {
 
     fn message_id(context: ?*anyopaque, topic: []const u8, data: []const u8) Id {
         const gossip: *BlockGossip = @ptrCast(@alignCast(context.?));
-        return block.message_id(topic, data, gossip.scratch);
+        const result = block.message_id_and_bytes(topic, data, gossip.scratch);
+        gossip.scratch_id = if (result.decompressed != null) result.id else null;
+        gossip.scratch_length = if (result.decompressed) |bytes| @intCast(bytes.len) else 0;
+        return result.id;
     }
 
     fn version_of(gossip: *const BlockGossip, topic: u8) block.Version {
@@ -200,7 +209,7 @@ pub const BlockGossip = struct {
     ) validity.Acceptance {
         const data = gossip.router.message_data(&event.id) orelse return .ignore;
         const version = gossip.version_of(event.topic);
-        const envelope = block.decode(version, data, gossip.scratch) catch {
+        const envelope = gossip.decode_event(version, &event.id, data) catch {
             gossip.stats.decode_failed += 1;
             return .reject;
         };
@@ -213,6 +222,27 @@ pub const BlockGossip = struct {
         };
         gossip.checked_hash = envelope.payload_hash;
         return validity.acceptance(result);
+    }
+
+    /// Decodes a pending message, reusing the bytes the message-id hash decompressed when
+    /// `scratch` still holds them. Afterwards `scratch` holds `id`'s bytes, or nothing.
+    fn decode_event(
+        gossip: *BlockGossip,
+        version: block.Version,
+        id: *const Id,
+        data: []const u8,
+    ) block.DecodeError!block.Envelope {
+        if (gossip.scratch_id) |held| {
+            if (std.mem.eql(u8, &held, id)) {
+                const bytes = gossip.scratch[0..gossip.scratch_length];
+                const header = snappy.decode_header(data) catch unreachable; // Hashed valid.
+                assert(header.decoded_length == bytes.len);
+                gossip.stats.decompress_reused += 1;
+                return block.decode_decompressed(version, bytes);
+            }
+        }
+        gossip.scratch_id = null;
+        return block.decode(version, data, gossip.scratch);
     }
 
     fn queue_accepted(gossip: *BlockGossip, id: *const Id, payload_hash: primitives.B256) void {

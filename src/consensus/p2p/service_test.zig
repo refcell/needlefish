@@ -229,6 +229,8 @@ test "p2p service: discovery, dialing, and block gossip end to end" {
         if (index == 1) continue;
         const envelope = service.pop_block(scratch) orelse return error.BlockNotDelivered;
         try std.testing.expectEqual(@as(u64, 42), envelope.payload.block_number);
+        // Validation decoded the bytes the message-id hash had already decompressed.
+        try std.testing.expect(service.gossip.stats.decompress_reused >= 1);
     }
 }
 

@@ -62,9 +62,10 @@ behind a small interface and switch later.
   `Network.busy`) is true until then, so a reused descriptor never meets a stale op.
 - [x] Perf: verifier stage benches (`p2p/stage *`) and `pop_block` reuses the payload hash
   validation computed (`block.decode_known_hash`): end to end 1.02 -> 0.83 ms per block.
-- [ ] Perf: decompress each gossip block once per message (message id and validation each
-  decompress today, ~20 µs per 128 KiB): cache the decompressed bytes keyed by message id
-  for the validation that follows in the same `on_rpc`.
+- [x] Perf: decompress each gossip block once per message: the handler tags its scratch
+  with the message id whose bytes it holds (`block.message_id_and_bytes`), and validation
+  decodes from it when the tag matches (`stats.decompress_reused`), else decompresses.
+  Saves one ~20 µs decompression per 128 KiB block; below this machine's bench noise.
 - Survey 2026-11-05: base/base `peers/monitoring.rs` (ban threshold/duration) and
   `peers/nodes.rs` (per-chain bootnodes) are already covered; gossipsub IDONTWANT exists.
 - [x] DST: crash-restart under loss (4 seeds, 10% datagram loss, 0.05% resets):
@@ -423,3 +424,5 @@ behind a small interface and switch later.
 
 - 2026-11-05: discv5 UDP moved to recvfrom/sendto completions; stop drains them.
 - 2026-11-05: verifier stage benches; pop_block reuses the validated payload hash (e2e -19%). Devnet recheck of completion UDP skipped: another lane's devnet held the ports.
+
+- 2026-11-05: gossip validation reuses the message-id decompression.
