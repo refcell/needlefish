@@ -42,10 +42,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   batch).
 - [x] `proof/e2e-3`: e2e intermediate output roots (boot key 9); a host witness for the
   attempted payload, so a deposit-only retry can follow valid user txs that read state.
-- [ ] `proof/host`: done: bounded store + boot keys, hint handler over a `Source`,
-  canonical archive, offline replay, JSON-RPC source, beacon blobs (`beacon_blobs.zig`
-  over the consensus `BlobProvider`; `proof run --l1-beacon`). Left: a server loop over
-  fds for a separate client process.
+- [x] `proof/host`: bounded store + boot keys, hint handler over a `Source`, canonical
+  archive, offline replay, JSON-RPC source, beacon blobs (`beacon_blobs.zig` over the
+  consensus `BlobProvider`; `proof run --l1-beacon`). No fd mode (see Decisions).
 - [x] `bin/base proof`: `replay <archive>` (offline) and `run` (native mode against
   L1/L2 execution RPCs; boot values from `--agreed`/`--claimed` headers, output roots
   from state root + withdrawals root; `--out` records the archive).
@@ -145,6 +144,9 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   config as is, and an unknown L1 its config from boot key 7 (geth chain config JSON);
   the execution spec comes from the rollup config (OP cascade, `chain_op_config`, genesis
   gas limit). Known chains keep the identity check.
+- Host has no separate-process fd mode: base/base `crates/proof/host` runs its
+  `PreimageServer` in-process over channels only (`start_server(hint, preimage)`); so does
+  `host.native.run`. A pipe transport can be added if a FPVM target needs it.
 - Push retries: the full suite runs once; after a rejected push, rebase and run a
   compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
   ~3 min suite; upstream commits were green on main). Pushes go from a separate local
