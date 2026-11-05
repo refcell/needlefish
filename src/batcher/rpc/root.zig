@@ -145,6 +145,16 @@ pub fn quantity(comptime T: type, value: json.Value) DecodeError!T {
     return primitives.hex.decode_quantity(T, value.string) catch error.MalformedResponse;
 }
 
+/// Parses a block number given either as a JSON integer (op-node `syncStatus`) or as a
+/// hex quantity (execution JSON-RPC).
+pub fn number(value: json.Value) DecodeError!u64 {
+    return switch (value) {
+        .integer => |integer| std.math.cast(u64, integer) orelse error.MalformedResponse,
+        .string => quantity(u64, value),
+        else => error.MalformedResponse,
+    };
+}
+
 /// Parses hex data (`"0x..."`) into `out`, returning the filled prefix.
 pub fn data(value: json.Value, out: []u8) DecodeError![]u8 {
     if (value != .string) return error.MalformedResponse;
@@ -218,8 +228,8 @@ test "rpc: call returns result and decodes quantities" {
         .parse_bytes_max = 64 * 1024,
     });
     defer client.deinit(testing.allocator);
-    const number = try client.call("eth_blockNumber", "[]");
-    try testing.expectEqual(@as(u64, 42), try quantity(u64, number));
+    const head = try client.call("eth_blockNumber", "[]");
+    try testing.expectEqual(@as(u64, 42), try quantity(u64, head));
     const block = try client.call("eth_getBlockByNumber", "[\"0x1\",false]");
     var out: [4]u8 = undefined;
     try testing.expectEqualSlices(u8, &.{ 1, 2 }, try data(try field(block, "hash"), &out));

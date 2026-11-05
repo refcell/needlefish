@@ -11,6 +11,8 @@ pub const devnet = @import("devnet/root.zig");
 pub const txdata = @import("txdata/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const source = @import("source/root.zig");
+pub const txmgr = @import("txmgr/root.zig");
+pub const service = @import("service/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

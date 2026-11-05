@@ -20,7 +20,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   duration close); batches decode back via consensus SingleBatch.
 - [x] `batcher/txdata`: EIP-1559 calldata tx building + signing, gas, fee bumps.
 - [ ] `batcher/txdata`: EIP-4844 blob txs (KZG commitments/proofs, sidecar network form).
-- [ ] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
+- [x] `batcher/txmgr`: nonce tracking, send, receipt polling, resubmission with bumps.
 - [x] `batcher/source`: L2 block JSON -> raw txs (legacy/2930/1559, hash-checked) + L1 origin.
 - [ ] `batcher/source`: EIP-7702 (type 4) transactions.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
@@ -64,3 +64,5 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   against a local dev node; portal log decodes with consensus `decode_deposit_log`.
 - 2026-11-05: L2 block source decoding with hash check and mutation fuzz.
 - 2026-11-05: channel manager emitting singular batches; round trip through consensus decode.
+- 2026-11-05: txmgr (nonce slots, same-nonce fee-bump resubmission) and batcher service step
+  loop; end-to-end test decodes the L1 txs back into the L2 blocks' batches.
