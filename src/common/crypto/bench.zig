@@ -13,6 +13,7 @@ const modexp = @import("modexp.zig");
 const p256 = @import("p256.zig");
 const kzg = @import("kzg/root.zig");
 const bn254 = @import("bn254/root.zig");
+const kzg_bench = @import("kzg/bench.zig");
 
 const kzg_bench_input_hex = "01e798154708fe7789429634053cbf9f99b619f9f084048927333fce637f" ++
     "549b564c0a11a0f704f4fc3e8acfe0f8245f0ad1347b378fbf96e206da11a5d3630624d25032e67a7e6a" ++
@@ -491,6 +492,26 @@ pub const cases = [_]Case{
         .run = bench_field_inverse(Bls12Fp, true),
     },
     .{ .name = "kzg/point evaluation", .iterations = 200, .run = bench_kzg_point_evaluation },
+    .{
+        .name = "kzg/blob_to_kzg_commitment",
+        .iterations = 20,
+        .run = kzg_bench.blob_to_kzg_commitment,
+    },
+    .{
+        .name = "kzg/compute_blob_kzg_proof",
+        .iterations = 20,
+        .run = kzg_bench.compute_blob_kzg_proof,
+    },
+    .{
+        .name = "kzg/verify_blob_kzg_proof",
+        .iterations = 200,
+        .run = kzg_bench.verify_blob_kzg_proof,
+    },
+    .{
+        .name = "kzg/verify_blob_kzg_proof_batch (6)",
+        .iterations = 50,
+        .run = kzg_bench.verify_blob_kzg_proof_batch_6,
+    },
     .{ .name = "field/bn254 mul", .iterations = 10_000_000, .run = bench_field_mul(Bn254Fp) },
     .{ .name = "field/bls12-381 mul", .iterations = 10_000_000, .run = bench_field_mul(Bls12Fp) },
     .{ .name = "bls12-381/g1 add", .iterations = 1_000_000, .run = bls_bench.g1_add },
