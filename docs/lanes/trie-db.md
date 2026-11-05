@@ -52,9 +52,14 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   edit in the rpc lane) returning `{state, codes, keys, headers}` as hex arrays.
   (`node/witness.zig` + `Journal.witness` hook, `Executor.execute_uncommitted`,
   `StateDb.recent_changesets`, `Api.witness`, `Limits.witness`)
-- [ ] Feed the history store from the durable database: every head move (apply/unwind) updates
+- [x] Feed the history store from the durable database: every head move (apply/unwind) updates
   `history.Store`; rebuilt with `reset` at open; `Database.proof_at(block, address, slots)`
   for `eth_getProof` with a block tag inside the window.
+  (`Config.history`, `history_drops`/`history_off`; `Journal.proof` + `eth_getProof` at older
+  canonical blocks of the window on durable nodes, small additive node/rpc edit)
+- [ ] Node canonical index after a reorg back (node lane, found here): `Chain.mark_canonical`
+  stops at the first matching entry, so after head A6 -> side B5 -> A6 the number index still
+  maps 5 to B5 (number-tagged RPCs resolve the side block). Clear entries above a lower head.
 - [x] Witness codec for the proof lane: canonical binary encoding of a `Witness` (strict
   decoder, encode(decode(x)) == x) plus a keccak256 preimage view (iterator + lookup by digest).
   (`db/witness_codec.zig`)
@@ -257,6 +262,27 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   key; keys are searched linearly since they sort by bytes, not digest. No lookup by oracle
   key: it drops the digest's high byte, so hosts load their key-value store from the iterator.
 
+- Database-owned history (`DatabaseType`, `Config.history`, null = off): the database owns a
+  `history.Store` and enables `StateTrie.track_changes` only when it is configured. Live head
+  moves update it inside `move_state`: unwinds, then `unwind_to(fork point)`, then
+  `commit_block` after each applied block (a state root per applied block, so a multi-block
+  reorg costs one extra root per block); `commit_applied` commits its one block. Replay at
+  open never touches history; `open` ends with `reset` at the recovered head (O(state) once;
+  older proofs return as the window refills). Any history failure (`HistoryFull`, a reorg
+  below the window, `NotNextBlock`) never fails the operation and never touches state: the
+  move finishes, history is rebuilt with `reset` at the new head, and `history_drops` counts
+  it. If that rebuild fails too (the store cannot hold one state), history stays off
+  (`history_off`) until the next open instead of retrying O(state) per block.
+  `proof_at(number, ...)` serves the window from history; without history only the head is
+  served (live trie proof), else `HistoryUnavailable`.
+- Historical `eth_getProof` (node/rpc integration): `Journal.proof` (set by `Durable` only when
+  history is configured) takes the block hash and number; the database's canonical index (not
+  the node's) decides whether the hash is the block at that number, so side blocks get the
+  existing "historical state unavailable" error, as do blocks outside the window. The handler
+  moves the state to the chain head first (`ensure_head_state`) so the database head and the
+  window match the chain. Storage proofs are fetched one slot per call into the existing
+  scratch (no scratch growth); the account proof is recomputed per slot (a few lookups).
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -382,3 +408,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: witness codec: canonical encoding + strict decoder + keccak preimage view; builder
   witnesses (4 seeds x 3 blocks) round-trip byte for byte, a `SparseState` loaded from the
   decoded witness replays to the same root, every node/code/key found by digest; decoder fuzzed.
+- 2026-11-05: database feeds history: seeded workload (2 seeds, side branches, reorgs, 3
+  crash/reopen cycles) checks proofs at every block of the window against each block's root and
+  the database's State unwound to it; reopen restarts the window at the head; a full store
+  drops and rebuilds history with the database healthy; history-off serves the head live.
+  `eth_getProof` at older blocks of a durable node's window returns the bytes it returned as
+  the head (by number and hash, after a reorg back too); out-of-window and side blocks refused.

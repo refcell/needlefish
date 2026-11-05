@@ -6,6 +6,8 @@
 //! - every other state move (reorg, build on another parent) is `set_head`, which unwinds
 //!   and applies stored changesets instead of re-executing.
 //! The database head is therefore always the block whose post-state the state holds.
+//! With `Config.history` set, `Journal.proof` serves `eth_getProof` at blocks of the
+//! database's history window (`Database.proof_at`).
 //!
 //! Lifecycle (storage callbacks only run from the caller's storage tick):
 //! `start` opens the storage, formatting it first when it holds no database, and reports
@@ -23,6 +25,7 @@ const consensus = @import("../../common/consensus/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
 const evm = @import("../evm/root.zig");
 const chain_module = @import("chain.zig");
+const StateTrie = @import("../trie/state_trie.zig").StateTrie;
 
 const Hash = [32]u8;
 const BlockInput = db_module.database.BlockInput;
@@ -217,7 +220,30 @@ pub fn Durable(comptime Storage: type) type {
                 .commit_block = commit_block,
                 .move_head = move_head,
                 .witness = witness,
+                .proof = if (self.database.history != null) proof else null,
             };
+        }
+
+        /// Historical `eth_getProof` from the database's history window. The database's
+        /// canonical index decides whether `hash` is the block at `number`.
+        fn proof(
+            context: *anyopaque,
+            hash: Hash,
+            number: u64,
+            address: [20]u8,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) db_module.database.ProofError!?db_module.history.AccountState {
+            const self = from(context);
+            assert(self.phase == .ready);
+            assert(slots.len == storage_proofs.len and slots.len == values.len);
+            const database = &self.database;
+            const canonical = database.chain.canonical_hash(number) orelse
+                return error.HistoryUnavailable;
+            if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+            return database.proof_at(number, address, slots, account_proof, storage_proofs, values);
         }
 
         /// The database's state moves to the block's parent in memory (no journal entry)

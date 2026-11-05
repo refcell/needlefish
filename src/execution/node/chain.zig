@@ -22,6 +22,9 @@ const executor_module = @import("executor.zig");
 const block_store = @import("block_store.zig");
 const StateDb = @import("state_db.zig").StateDb;
 const witness_block = @import("../db/witness_block.zig");
+const db_database = @import("../db/database.zig");
+const db_history = @import("../db/history.zig");
+const StateTrie = @import("../trie/state_trie.zig").StateTrie;
 
 const Hash = [32]u8;
 const B256 = primitives.B256;
@@ -129,6 +132,19 @@ pub const Journal = struct {
         hash: Hash,
         execute: witness_block.Execute,
     ) witness_block.Error!Hash = null,
+    /// `eth_getProof` at block `number` (hash `hash`, which must be canonical in the
+    /// journal) of the journal's history window (`Database.proof_at`); null when the
+    /// journal keeps no history.
+    proof: ?*const fn (
+        context: *anyopaque,
+        hash: Hash,
+        number: u64,
+        address: [20]u8,
+        slots: []const u256,
+        account_proof: *StateTrie.AccountProof,
+        storage_proofs: []StateTrie.StorageProof,
+        values: []u256,
+    ) db_database.ProofError!?db_history.AccountState = null,
 };
 
 /// Builder DA limits set by the batcher (`miner_setMaxDASize`); 0 means no limit. Sizes

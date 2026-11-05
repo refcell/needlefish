@@ -751,4 +751,5 @@ pub fn block_logs(
 test {
     _ = @import("eth_test.zig");
     _ = @import("debug_test.zig");
+    _ = @import("eth_proof_test.zig");
 }
