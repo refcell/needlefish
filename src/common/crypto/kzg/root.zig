@@ -1,9 +1,10 @@
 //! KZG commitments over BLS12-381 for EIP-4844 blobs.
 //!
 //! Holds the public Ethereum KZG ceremony output (the c-kzg-4844
-//! `trusted_setup.txt`: 4096 G1 points in Lagrange form and 65 G2 points in
-//! monomial form, compressed) and the input framing of the point evaluation
-//! precompile (address 0x0A). Proof verification lives in `verify.zig`.
+//! `trusted_setup.txt`: 4096 G1 points in Lagrange form, 65 G2 points in monomial
+//! form, and 4096 G1 points in monomial form for EIP-7594 cells, compressed) and the
+//! input framing of the point evaluation precompile (address 0x0A). Proof verification
+//! lives in `verify.zig`, the blob API in `blob.zig`, and EIP-7594 cells in `cells.zig`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -24,13 +25,16 @@ pub const bls_modulus: u256 =
 /// Version byte of a blob versioned hash (EIP-4844 `VERSIONED_HASH_VERSION_KZG`).
 pub const versioned_hash_version_kzg: u8 = 0x01;
 
-/// The compressed setup, laid out as G1 Lagrange points then G2 monomial points.
-/// sha256 of this file: 2721e57b4a7ec42d5a1c0a29ab1b14419f1f1008bd159b538c332ed923886a7e.
+/// The compressed setup in `trusted_setup.txt` order: G1 Lagrange points, G2 monomial
+/// points, then G1 monomial points.
+/// sha256 of this file: 608ac720ba55fc77f65d155391020fc5b0501db266a3e360e734d6c0db0dfae3.
 const trusted_setup_bytes = @embedFile("trusted_setup.bin");
+const g1_monomial_offset =
+    field_elements_per_blob * bytes_per_commitment + g2_points_count * bytes_per_g2;
 
 comptime {
     assert(trusted_setup_bytes.len ==
-        field_elements_per_blob * bytes_per_commitment + g2_points_count * bytes_per_g2);
+        g1_monomial_offset + field_elements_per_blob * bytes_per_commitment);
     assert(bytes_per_blob == 131072);
 }
 
@@ -47,6 +51,14 @@ pub fn setup_g2_monomial(index: u32) *const [bytes_per_g2]u8 {
     const base = field_elements_per_blob * bytes_per_commitment;
     const offset = base + @as(usize, index) * bytes_per_g2;
     return trusted_setup_bytes[offset..][0..bytes_per_g2];
+}
+
+/// Compressed G1 point `index` of the setup in monomial form ([tau^index]_1).
+pub fn setup_g1_monomial(index: u32) *const [bytes_per_commitment]u8 {
+    assert(index < field_elements_per_blob);
+    const offset = g1_monomial_offset + @as(usize, index) * bytes_per_commitment;
+    assert(offset + bytes_per_commitment <= trusted_setup_bytes.len);
+    return trusted_setup_bytes[offset..][0..bytes_per_commitment];
 }
 
 /// `kzg_to_versioned_hash`: sha256(commitment) with the first byte replaced.
@@ -104,6 +116,7 @@ pub const success_output: [64]u8 = blk: {
 pub const verify = @import("verify.zig");
 pub const verify_kzg_proof = verify.verify_kzg_proof;
 pub const blob = @import("blob.zig");
+pub const fft = @import("fft.zig");
 pub const bench = @import("bench.zig");
 pub const precompile_point_evaluation = verify.precompile_point_evaluation;
 
@@ -113,6 +126,7 @@ test {
     testing.refAllDecls(@This());
 }
 const Prng = @import("../../../testing/prng.zig").Prng;
+const bls_g1 = @import("../bls12_381/g1.zig");
 
 test "kzg: trusted setup layout" {
     // Compressed points have the compression flag (top bit) set and are never infinity
@@ -121,7 +135,16 @@ test "kzg: trusted setup layout" {
         const point = setup_g1_lagrange(@intCast(index));
         try testing.expect(point[0] & 0x80 != 0);
         try testing.expect(point[0] & 0x40 == 0);
+        const monomial = setup_g1_monomial(@intCast(index));
+        try testing.expect(monomial[0] & 0x80 != 0);
+        try testing.expect(monomial[0] & 0x40 == 0);
     }
+    // G1 monomial point 0 is [1]G1, the standard generator.
+    try testing.expectEqualSlices(
+        u8,
+        &bls_g1.compress(bls_g1.generator),
+        setup_g1_monomial(0),
+    );
     // G2 point 0 is the standard G2 generator, compressed.
     const g2_generator_prefix = [_]u8{ 0x93, 0xe0, 0x2b, 0x60, 0x52, 0x71, 0x9f, 0x60 };
     try testing.expectEqualSlices(u8, &g2_generator_prefix, setup_g2_monomial(0)[0..8]);
@@ -130,9 +153,32 @@ test "kzg: trusted setup layout" {
     var expected: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
         &expected,
-        "2721e57b4a7ec42d5a1c0a29ab1b14419f1f1008bd159b538c332ed923886a7e",
+        "608ac720ba55fc77f65d155391020fc5b0501db266a3e360e734d6c0db0dfae3",
     );
     try testing.expectEqual(expected, digest);
+}
+
+test "kzg: monomial G1 points agree with the Lagrange and G2 setup" {
+    // sum_i L_i(tau) = 1, so the Lagrange points sum to [1]G1 = monomial point 0.
+    var sum = bls_g1.G1.identity;
+    for (0..field_elements_per_blob) |index| {
+        const point = try bls_g1.decompress_unchecked(setup_g1_lagrange(@intCast(index)));
+        sum = sum.add_affine(point);
+    }
+    const first = try bls_g1.decompress_unchecked(setup_g1_monomial(0));
+    try testing.expect(sum.eql(first.to_jacobian()));
+    // e([tau^(i+1)]G1, G2) = e([tau^i]G1, [tau]G2) for a few consecutive points.
+    const bls = @import("../bls12_381/root.zig");
+    const tau_g2 = try bls.g2.decompress(setup_g2_monomial(1));
+    for ([_]u32{ 0, 63, 4094 }) |index| {
+        const low = try bls_g1.decompress(setup_g1_monomial(index));
+        const high = try bls_g1.decompress(setup_g1_monomial(index + 1));
+        const pairs = [2]bls.pairing.Pair{
+            .{ .g1 = high, .g2 = bls.g2.generator },
+            .{ .g1 = low.neg(), .g2 = tau_g2 },
+        };
+        try testing.expect(bls.pairing.pairing_check(&pairs));
+    }
 }
 
 test "kzg: success output encodes blob size and modulus" {

@@ -73,9 +73,11 @@ fallback but hot paths should be our own, optimized implementations.
   multiplication, masked final subtraction, Fermat inverse, p = 3 mod 4 sqrt.
 
 - KZG setup: the public c-kzg-4844 `trusted_setup.txt` is stored as raw compressed bytes in
-  `kzg/trusted_setup.bin` (4096 G1 Lagrange + 65 G2 monomial points, 202848 bytes,
-  sha256 2721e57b...6a7e, asserted in tests). G1 monomial points (EIP-7594 cells) are
-  omitted until PeerDAS work needs them.
+  `kzg/trusted_setup.bin` in file order: 4096 G1 Lagrange, 65 G2 monomial, then 4096 G1
+  monomial points (EIP-7594 cells), 399456 bytes, sha256 608ac720...fae3 (asserted in tests).
+  The first 202848 bytes are byte-identical to the previous Lagrange+G2 file. Consistency
+  tests: the Lagrange points sum to monomial point 0 (= the G1 generator) and
+  e([tau^(i+1)]G1, G2) = e([tau^i]G1, [tau]G2) for sampled i.
 
 - sha256: own implementation. aarch64+SHA2 uses `sha256su0/su1` LLVM intrinsics for the
   message schedule and inline asm for `sha256h/h2` (the LLVM h/h2 intrinsics measured ~10%
