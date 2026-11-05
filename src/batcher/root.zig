@@ -14,6 +14,7 @@ pub const source = @import("source/root.zig");
 pub const txmgr = @import("txmgr/root.zig");
 pub const service = @import("service/root.zig");
 pub const metrics = @import("metrics/root.zig");
+pub const throttle = @import("throttle/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

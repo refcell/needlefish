@@ -43,7 +43,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/service`: safe-head stall watchdog (resubmit from safe+1; covers timed-out channels).
 - [x] `base batcher`: metrics endpoint (`batcher/metrics`, utilities http server + metrics
   registry; served while waiting between steps; bind failure only disables metrics).
-- [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
+- [x] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches (skipped, see above), calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling (`batcher/throttle`).
 - [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
 - [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
 - [x] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
@@ -112,3 +112,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: brotli compressor; text compresses to ~31% (reference q5: ~23%).
 - 2026-11-05: batcher Prometheus metrics on `--metrics.port`; verified with curl live.
 - 2026-11-05: batcher KZG prover now wraps `common.crypto.kzg.blob`; anvil (c-kzg) accepts.
+- 2026-11-05: DA throttling (`miner_setMaxDASize`, base/base controller math in integer ppm).
+  Decision: a builder answering method-not-found disables throttling with a log line instead
+  of exiting (base/base bails unless `--no-throttle`), so the devnet runs before the EL lane
+  serves the miner API. Backlog = (unsafe - safe) x EMA of per-block FastLZ DA estimates.

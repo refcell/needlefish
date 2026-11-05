@@ -21,6 +21,7 @@ pub const Metrics = struct {
     safe_head: Gauge = .{},
     unsafe_head: Gauge = .{},
     pending_txs: Gauge = .{},
+    da_backlog_bytes: Gauge = .{},
     blocks_loaded: Counter = .{},
     txs_submitted: Counter = .{},
     txs_confirmed: Counter = .{},
@@ -36,6 +37,8 @@ pub const Metrics = struct {
         try r.gauge("base_batcher_safe_head", "L2 safe head number.", &metrics.safe_head);
         try r.gauge("base_batcher_unsafe_head", "L2 unsafe head number.", &metrics.unsafe_head);
         try r.gauge("base_batcher_pending_txs", "Unconfirmed batch txs.", &metrics.pending_txs);
+        const backlog = &metrics.da_backlog_bytes;
+        try r.gauge("base_batcher_da_backlog_bytes", "Estimated DA backlog.", backlog);
         const loaded = &metrics.blocks_loaded;
         try r.counter("base_batcher_blocks_loaded_total", "L2 blocks loaded.", loaded);
         const submitted = &metrics.txs_submitted;
@@ -44,7 +47,7 @@ pub const Metrics = struct {
         try r.counter("base_batcher_txs_confirmed_total", "Batch txs mined.", confirmed);
         try r.counter("base_batcher_resets_total", "Pipeline resets.", &metrics.resets);
         try r.counter("base_batcher_step_failures_total", "Failed steps.", &metrics.step_failures);
-        assert(metrics.registry.count == 9);
+        assert(metrics.registry.count == 10);
     }
 
     pub fn record(metrics: *Metrics, report: service.Report, pending_txs: u32) void {
@@ -52,6 +55,7 @@ pub const Metrics = struct {
         metrics.safe_head.set(@intCast(@min(report.heads.safe_l2, std.math.maxInt(i64))));
         metrics.unsafe_head.set(@intCast(@min(report.heads.unsafe_l2, std.math.maxInt(i64))));
         metrics.pending_txs.set(pending_txs);
+        metrics.da_backlog_bytes.set(@intCast(@min(report.da_backlog_bytes, std.math.maxInt(i64))));
         metrics.blocks_loaded.add(report.blocks_loaded);
         metrics.txs_submitted.add(report.txs_submitted);
         metrics.txs_confirmed.add(report.txs_confirmed);

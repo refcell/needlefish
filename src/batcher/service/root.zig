@@ -13,6 +13,7 @@ const assert = std.debug.assert;
 const rpc = @import("../rpc/root.zig");
 const source = @import("../source/root.zig");
 const channel_manager = @import("../channel/manager.zig");
+const throttle = @import("../throttle/root.zig");
 const txmgr = @import("../txmgr/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 
@@ -25,6 +26,9 @@ pub const Config = struct {
     /// blocks while we hold later blocks (lost or timed-out channels). 0 disables it;
     /// it needs a rollup node.
     stall_l1_blocks: u64 = 0,
+    /// DA throttling of the L2 block builder (`miner_setMaxDASize`); off by default here,
+    /// `base batcher` enables it like base/base.
+    throttle: throttle.Config = .{ .strategy = .off },
 };
 
 pub const Clients = struct {
@@ -48,6 +52,8 @@ pub const Report = struct {
     txs_submitted: u32 = 0,
     txs_confirmed: u32 = 0,
     resets: u32 = 0,
+    da_backlog_bytes: u64 = 0,
+    throttle: throttle.Outcome = .idle,
 };
 
 pub const Error = rpc.Error || source.Error || txmgr.Error;
@@ -61,6 +67,8 @@ pub const Service = struct {
     /// Highest safe head seen and the L1 head when it was first seen.
     safe_seen: u64,
     safe_seen_at_l1: u64,
+    throttle: throttle.Throttle,
+    backlog: throttle.BacklogEstimate,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, channel_id_seed: [16]u8) !Service {
         assert(config.blocks_per_step_max > 0);
@@ -78,6 +86,8 @@ pub const Service = struct {
             .stall_l1_blocks = config.stall_l1_blocks,
             .safe_seen = 0,
             .safe_seen_at_l1 = 0,
+            .throttle = .init(config.throttle),
+            .backlog = .{},
         };
     }
 
@@ -94,6 +104,11 @@ pub const Service = struct {
         service.channels.on_l1_head(report.heads.l1);
         if (report.heads.safe_known) service.watch_safe_head(report.heads, &report);
         try service.load_blocks(clients, report.heads, &report);
+        report.da_backlog_bytes = service.backlog.backlog_bytes(
+            report.heads.unsafe_l2,
+            report.heads.safe_l2,
+        );
+        report.throttle = service.throttle.update(clients.l2, report.da_backlog_bytes, now_ms);
         try service.submit_frames(clients.l1, now_ms, &report);
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
         assert(report.txs_submitted <= service.txs.slots.len);
@@ -143,6 +158,7 @@ pub const Service = struct {
                 },
                 error.BatchTooLarge => return error.BlockTooLarge,
             };
+            service.backlog.observe_block(throttle.block_da_bytes(block.transactions));
             report.blocks_loaded += 1;
             next += 1;
         }
@@ -223,6 +239,9 @@ const FakeChains = struct {
     sent_count: usize = 0,
     info_hex: [2 * l1_info.calldata_length_max]u8 = undefined,
     info_hex_length: usize = 0,
+    /// `miner_setMaxDASize` calls on L2: the last pushed max block size.
+    da_limit_pushes: u32 = 0,
+    da_max_block_size: u64 = 0,
 
     const Role = struct { chains: *FakeChains, is_l1: bool };
 
@@ -273,6 +292,14 @@ const FakeChains = struct {
             chains.sent_count += 1;
             chains.mined_nonce += 1;
             return "\"0x00\"";
+        }
+        if (eql(u8, method, "miner_setMaxDASize")) {
+            assert(!is_l1);
+            const params = between(body, "\"params\":[", "]");
+            const block_hex = between(params, ",\"", "\"");
+            chains.da_max_block_size = try primitives.hex.decode_quantity(u64, block_hex);
+            chains.da_limit_pushes += 1;
+            return "true";
         }
         assert(eql(u8, method, "eth_getBlockByNumber"));
         if (is_l1) return "{\"baseFeePerGas\":\"0x7\"}";
@@ -327,6 +354,8 @@ test "service: L2 blocks reach L1 as a complete channel of singular batches" {
         },
         .source = .{ .tx_count_max = 8, .tx_bytes_max = 4096, .input_bytes_max = 1024 },
         .blocks_per_step_max = 5,
+        // A tiny threshold: 12 unsafe blocks over safe 0 (~70 bytes each) fully throttle.
+        .throttle = .{ .start_threshold_bytes = 100, .full_threshold_bytes = 600 },
     }, @splat(3));
     defer service.deinit(testing.allocator);
 
@@ -335,9 +364,13 @@ test "service: L2 blocks reach L1 as a complete channel of singular batches" {
     for (0..6) |round| {
         const report = try service.step(clients, round * 2000);
         loaded += report.blocks_loaded;
+        try testing.expectEqual(@as(u64, 12 * 70), report.da_backlog_bytes);
         chains.l1_head += 1;
     }
     try testing.expectEqual(@as(u32, 12), loaded);
+    // Steps at 0..10 s: pushed at 0 (new limits) and at 10 s (refresh), at full throttle.
+    try testing.expectEqual(@as(u32, 2), chains.da_limit_pushes);
+    try testing.expectEqual(@as(u64, 42_000), chains.da_max_block_size);
     try testing.expect(chains.sent_count > 0);
     try testing.expectEqual(@as(u32, 0), service.txs.pending_count());
 

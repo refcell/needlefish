@@ -101,7 +101,9 @@ Each binary must accept at least the flags below. Lanes may add more.
   --l2 http://127.0.0.1:9545 --rollup-rpc http://127.0.0.1:7545 --key-index 6
   --metrics.port 7300 [--data-availability calldata|blobs] [--compression brotli|zlib]`
   Blob mode packs up to 6 frames per transaction. `GET :7300/metrics` serves Prometheus
-  text (`base_batcher_*` heads, pending txs, and activity counters).
+  text (`base_batcher_*` heads, pending txs, DA backlog, and activity counters).
+  DA throttling (base/base defaults, quadratic; `--throttle-strategy`, `--no-throttle`) pushes
+  `miner_setMaxDASize` to the L2 EL; a builder without that method disables it.
 
 ## Smoke test
 

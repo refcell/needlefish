@@ -12,7 +12,8 @@ const usage =
     \\usage: base batcher --rollup-config FILE --l1 URL --l2 URL [--rollup-rpc URL]
     \\         [--key-index N | --private-key HEX] [--max-channel-duration L1_BLOCKS]
     \\         [--poll-interval-ms MS] [--metrics.port P] [--data-availability calldata|blobs]
-    \\         [--compression brotli|zlib]
+    \\         [--compression brotli|zlib] [--no-throttle]
+    \\         [--throttle-strategy off|step|linear|quadratic]
     \\
 ;
 
@@ -30,6 +31,8 @@ const Flags = struct {
     compression: batcher.comp.Algorithm = .brotli,
     /// Serve Prometheus metrics on this port (op-batcher `--metrics.port`).
     metrics_port: ?u16 = null,
+    /// DA throttling of the sequencer (base/base default: quadratic).
+    throttle_strategy: batcher.throttle.Strategy = .quadratic,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -38,10 +41,16 @@ const tx_data_bytes_max: u32 = 120_000;
 fn parse_flags(args: []const []const u8) !Flags {
     var flags: Flags = .{};
     var i: usize = 0;
-    while (i + 1 < args.len) : (i += 2) {
+    const eql = std.mem.eql;
+    while (i < args.len) {
         const arg = args[i];
+        if (eql(u8, arg, "--no-throttle")) {
+            flags.throttle_strategy = .off;
+            i += 1; // A switch takes no value.
+            continue;
+        }
+        if (i + 1 == args.len) return error.MissingValue;
         const value = args[i + 1];
-        const eql = std.mem.eql;
         if (eql(u8, arg, "--rollup-config")) {
             flags.rollup_config = value;
         } else if (eql(u8, arg, "--l1")) {
@@ -65,10 +74,14 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--throttle-strategy")) {
+            flags.throttle_strategy = std.meta.stringToEnum(batcher.throttle.Strategy, value) orelse
+                return error.UnknownThrottleStrategy;
         } else if (eql(u8, arg, "--compression")) {
             flags.compression = std.meta.stringToEnum(batcher.comp.Algorithm, value) orelse
                 return error.UnknownCompression;
         } else return error.UnknownFlag;
+        i += 2;
     }
     if (i != args.len) return error.MissingValue;
     return flags;
@@ -120,6 +133,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         },
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
+        .throttle = .{ .strategy = flags.throttle_strategy },
     }, seed);
     defer service.deinit(init.gpa);
     return run(init, flags, &service, l1_url, l2_url);
@@ -158,11 +172,13 @@ fn run(
         start_metrics(&metrics_server, init.gpa, &metrics, port)
     else
         false;
+    var throttle_logged: batcher.throttle.Outcome = .idle;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
         if (service.step(clients, now_ms)) |report| {
             log_report(report);
             metrics.record(report, service.txs.pending_count());
+            log_throttle(report.throttle, &throttle_logged);
         } else |err| {
             metrics.step_failures.increment();
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
@@ -172,6 +188,22 @@ fn run(
         } else {
             try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
         }
+    }
+}
+
+/// Logs throttle outcomes when they change (pushes repeat every refresh).
+fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outcome) void {
+    if (outcome == .idle or outcome == last.*) return;
+    last.* = outcome;
+    switch (outcome) {
+        .idle => unreachable, // Returned above.
+        .pushed => std.debug.print("batcher: DA limits applied by the block builder\n", .{}),
+        .refused => std.debug.print("batcher: block builder refused the DA limits\n", .{}),
+        .failed => std.debug.print("batcher: failed to push DA limits; retrying\n", .{}),
+        .unsupported => std.debug.print(
+            "batcher: block builder lacks miner_setMaxDASize; DA throttling disabled\n",
+            .{},
+        ),
     }
 }
 
@@ -223,6 +255,15 @@ test "batcher: flags" {
     try std.testing.expectEqual(.brotli, (try parse_flags(&blobs)).compression);
     const zlib = [_][]const u8{ "--compression", "zlib" };
     try std.testing.expectEqual(.zlib, (try parse_flags(&zlib)).compression);
+    try std.testing.expectEqual(.quadratic, (try parse_flags(&zlib)).throttle_strategy);
+    const no_throttle = [_][]const u8{ "--no-throttle", "--compression", "zlib", "--no-throttle" };
+    const switched = try parse_flags(&no_throttle);
+    try std.testing.expectEqual(.off, switched.throttle_strategy);
+    try std.testing.expectEqual(.zlib, switched.compression);
+    const linear = [_][]const u8{ "--throttle-strategy", "linear" };
+    try std.testing.expectEqual(.linear, (try parse_flags(&linear)).throttle_strategy);
+    const dangling = [_][]const u8{"--l1"};
+    try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };
     try std.testing.expectError(error.UnknownDataAvailability, parse_flags(&bad));
     try std.testing.expectError(error.MissingValue, parse_flags(&.{"--l1"}));
