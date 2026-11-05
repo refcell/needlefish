@@ -7,7 +7,7 @@ dated log line after each push. Other lanes may read it to find interfaces.
 
 | Lane | File | Owns |
 | --- | --- | --- |
-| primitives | primitives.md | `src/common/{primitives,rlp,consensus,genesis,chains}` |
+| primitives | primitives.md | `src/common/{primitives,rlp,consensus,genesis,chains}` (backlog done; session retired, other lanes may extend) |
 | crypto | crypto.md | `src/common/crypto` |
 | evm | evm.md | `src/execution/evm` |
 | trie-db | trie-db.md | `src/execution/{trie,db}` |
@@ -18,6 +18,7 @@ dated log line after each push. Other lanes may read it to find interfaces.
 | dst-fuzz | dst-fuzz.md | `src/testing/*`, `etc/ci/`, benches, perf |
 | p2p | p2p.md | `src/consensus/p2p/*`, `docs/P2P.md` |
 | flashblocks-builder | flashblocks-builder.md | `src/builder/*`, `src/execution/flashblocks/*`, `bin/base builder` |
+| proof | proof.md | `src/proof/*`, `bin/base {proof,proposer,challenger}` |
 
 Future lanes (spawned when capacity frees up) are listed in `docs/ROADMAP.md`.
 
