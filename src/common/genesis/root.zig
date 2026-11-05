@@ -26,6 +26,29 @@ pub const l2_to_l1_message_passer = Address.comptime_hex(
     "4200000000000000000000000000000000000016",
 );
 
+/// Base-specific upgrades after Jovian, in activation order (base/base `UpgradeInfo`).
+pub const BaseUpgrade = enum(u8) {
+    azul,
+    beryl,
+    cobalt,
+    denim,
+    everest,
+    zenith,
+
+    /// The legacy JSON alias base/base still accepts (`v1`, `v2`, `v3`, `future`).
+    pub fn alias(upgrade: BaseUpgrade) ?[]const u8 {
+        return switch (upgrade) {
+            .azul => "v1",
+            .beryl => "v2",
+            .cobalt => "v3",
+            .zenith => "future",
+            .denim, .everest => null,
+        };
+    }
+};
+
+pub const base_upgrade_count = @typeInfo(BaseUpgrade).@"enum".field_names.len;
+
 /// The subset of the genesis `config` object that affects genesis and fork rules.
 pub const Config = struct {
     chain_id: u64 = 0,
@@ -47,6 +70,17 @@ pub const Config = struct {
     eip1559_elasticity: ?u64 = null,
     eip1559_denominator: ?u64 = null,
     eip1559_denominator_canyon: ?u64 = null,
+    /// Base upgrades (`config.base`), indexed by `BaseUpgrade`.
+    base_upgrade_times: [base_upgrade_count]?u64 = @splat(null),
+    activation_admin_address: ?Address = null,
+
+    pub fn base_upgrade_time(config: Config, upgrade: BaseUpgrade) ?u64 {
+        return config.base_upgrade_times[@backingInt(upgrade)];
+    }
+
+    pub fn is_base_upgrade_active(config: Config, upgrade: BaseUpgrade, timestamp: u64) bool {
+        return active(config.base_upgrade_time(upgrade), timestamp);
+    }
 
     pub fn is_optimism(config: Config) bool {
         return config.bedrock_block != null or config.regolith_time != null;

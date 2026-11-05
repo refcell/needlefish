@@ -101,7 +101,32 @@ fn parse_config(value: ?Value) Error!Config {
         config.eip1559_denominator_canyon =
             try optional_quantity(u64, params, "eip1559DenominatorCanyon");
     }
+    if (object.get("base")) |base| config.base_upgrade_times = try parse_base_upgrades(base);
+    config.activation_admin_address = try fixed(Address, object, "activationAdminAddress");
     return config;
+}
+
+/// `config.base`: base/base denies unknown fields and duplicate (name + alias) entries.
+fn parse_base_upgrades(value: Value) Error![genesis_module.base_upgrade_count]?u64 {
+    if (value == .null) return @splat(null);
+    if (value != .object) return error.InvalidGenesis;
+    const object = value.object;
+    var times: [genesis_module.base_upgrade_count]?u64 = @splat(null);
+    var matched: usize = 0;
+    const upgrades = comptime std.enums.values(genesis_module.BaseUpgrade);
+    inline for (upgrades) |upgrade| {
+        const index = @backingInt(upgrade);
+        const name = @tagName(upgrade);
+        const named = object.get(name) != null;
+        const aliased = if (upgrade.alias()) |alias| object.get(alias) != null else false;
+        if (named and aliased) return error.InvalidGenesis;
+        if (named) times[index] = try optional_quantity(u64, object, name);
+        if (aliased) times[index] = try optional_quantity(u64, object, upgrade.alias().?);
+        matched += @intFromBool(named) + @intFromBool(aliased);
+    }
+    assert(matched <= object.count());
+    if (matched != object.count()) return error.InvalidGenesis;
+    return times;
 }
 
 fn parse_storage(allocator: std.mem.Allocator, value: ?Value) Error![]const state.StorageSlot {
@@ -200,6 +225,37 @@ test "genesis json: quantities" {
     try testing.expectError(error.InvalidQuantity, quantity(u8, .{ .bool = true }));
 }
 
+test "genesis json: base upgrades (base/base extract_base_chain_genesis_info)" {
+    const parsed = try parse(testing.allocator,
+        \\{"config":{"chainId":8453,"bedrockBlock":10,"regolithTime":12,"canyonTime":0,
+        \\ "ecotoneTime":0,"base":{"v1":14,"v2":16,"denim":"0x20","zenith":1000000},
+        \\ "activationAdminAddress":"0x4200000000000000000000000000000000000018"}}
+    );
+    defer parsed.deinit();
+    const config = parsed.value.config;
+    try testing.expectEqual(@as(?u64, 14), config.base_upgrade_time(.azul));
+    try testing.expectEqual(@as(?u64, 16), config.base_upgrade_time(.beryl));
+    try testing.expectEqual(@as(?u64, null), config.base_upgrade_time(.cobalt));
+    try testing.expectEqual(@as(?u64, 32), config.base_upgrade_time(.denim));
+    try testing.expectEqual(@as(?u64, 1_000_000), config.base_upgrade_time(.zenith));
+    try testing.expect(config.is_base_upgrade_active(.azul, 14));
+    try testing.expect(!config.is_base_upgrade_active(.azul, 13));
+    try testing.expect(!config.is_base_upgrade_active(.everest, std.math.maxInt(u64)));
+    try testing.expectEqual(@as(u8, 0x18), config.activation_admin_address.?.bytes[19]);
+    const rejected = [_][]const u8{
+        "{\"config\":{\"base\":{\"v1\":1,\"azul\":1}}}",
+        "{\"config\":{\"base\":{\"unknown\":1}}}",
+        "{\"config\":{\"base\":[]}}",
+        "{\"config\":{\"activationAdminAddress\":\"0x42\"}}",
+    };
+    for (rejected) |text| {
+        if (parse(testing.allocator, text)) |ok| {
+            ok.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
 test "genesis json: base/base dev genesis state root" {
     const parsed = try parse(testing.allocator, @embedFile("testdata/dev.json"));
     defer parsed.deinit();
@@ -261,6 +317,21 @@ test "genesis json: seeded fuzz mutations" {
     for (0..64) |_| {
         @memcpy(&buffer, seed_text);
         for (0..prng.range(1, 8)) |_| buffer[prng.below(buffer.len)] = prng.int(u8);
+        try parse_and_root(buffer[0..prng.range(1, buffer.len)]);
+    }
+}
+
+test "genesis json: seeded fuzz config mutations" {
+    const seed_text =
+        \\{"config":{"chainId":8453,"bedrockBlock":0,"optimism":{"eip1559Elasticity":6},
+        \\"base":{"v1":14,"beryl":"0x10","everest":20},
+        \\"activationAdminAddress":"0x4200000000000000000000000000000000000018"}}
+    ;
+    var buffer: [seed_text.len]u8 = undefined;
+    var prng = Prng.init(0xba5e);
+    for (0..512) |_| {
+        buffer = seed_text.*;
+        for (0..prng.range(1, 3)) |_| buffer[prng.below(buffer.len)] = prng.int(u8);
         try parse_and_root(buffer[0..prng.range(1, buffer.len)]);
     }
 }

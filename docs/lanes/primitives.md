@@ -25,6 +25,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
   ids from a parsed `std.json.Value`.
 - [x] `rpc_types/request`: 0x79 `accountChanges`/`calls` in requests (round-trip the writer).
 - [x] `signer`: `eth_signTransaction` request body, response parse, content + signer checks.
+- [x] genesis `config.base` (azul..zenith, v1/v2/v3/future aliases, strict like base/base) and
+  `activationAdminAddress`; `Config.is_base_upgrade_active`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -90,3 +92,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: rpc_types request parsing (TransactionRequest, BlockId).
 - 2026-11-05: 0x79 accountChanges/calls request parsing.
 - 2026-11-05: remote signer codecs (`common/signer`).
+- 2026-11-05: genesis Base upgrade times and activation admin address.
