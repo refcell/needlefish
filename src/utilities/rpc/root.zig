@@ -13,6 +13,8 @@ const json = @import("../json/root.zig");
 
 pub const client = @import("client.zig");
 pub const Client = client.Client;
+pub const ws = @import("ws.zig");
+pub const WsClient = ws.WsClient;
 
 /// Standard JSON-RPC 2.0 error codes, plus those Ethereum clients use.
 pub const code = struct {
@@ -425,4 +427,5 @@ fn overflow(out: *std.Io.Writer, start: usize) Outcome {
 
 test {
     _ = @import("tests.zig");
+    _ = ws;
 }

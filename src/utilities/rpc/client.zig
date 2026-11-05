@@ -35,12 +35,21 @@ pub fn ParamsWriter(comptime Context: type) type {
 }
 
 pub fn parse_response(body: []const u8, id_expected: u64) ParseError!Result {
+    const response = try parse_response_any(body);
+    if (response.id != id_expected) return error.IdMismatch;
+    return response.result;
+}
+
+pub const Response = struct { id: u64, result: Result };
+
+/// Parses a single response with any numeric id (for transports with several in flight).
+pub fn parse_response_any(body: []const u8) ParseError!Response {
     var scanner = json.Scanner.init(body);
     json.validate(body) catch return error.InvalidResponse;
     const first = scanner.next() catch unreachable;
     if (first.tag != .object_begin) return error.InvalidResponse;
     var result: ?Result = null;
-    var id_ok = false;
+    var id: ?u64 = null;
     var iterations: usize = 0;
     while (iterations < body.len) : (iterations += 1) {
         const key = scanner.next() catch unreachable;
@@ -51,9 +60,7 @@ pub fn parse_response(body: []const u8, id_expected: u64) ParseError!Result {
         const raw = body[start..scanner.offset()];
         if (std.mem.eql(u8, key.bytes, "id")) {
             if (value.tag != .number) return error.InvalidResponse;
-            const id = std.fmt.parseInt(u64, value.bytes, 10) catch return error.InvalidResponse;
-            if (id != id_expected) return error.IdMismatch;
-            id_ok = true;
+            id = std.fmt.parseInt(u64, value.bytes, 10) catch return error.InvalidResponse;
         } else if (std.mem.eql(u8, key.bytes, "result")) {
             result = .{ .ok = raw };
         } else if (std.mem.eql(u8, key.bytes, "error")) {
@@ -61,8 +68,10 @@ pub fn parse_response(body: []const u8, id_expected: u64) ParseError!Result {
             result = .{ .rpc_error = try parse_error_object(raw) };
         }
     }
-    if (!id_ok) return error.InvalidResponse;
-    return result orelse error.InvalidResponse;
+    return .{
+        .id = id orelse return error.InvalidResponse,
+        .result = result orelse return error.InvalidResponse,
+    };
 }
 
 fn parse_error_object(raw: []const u8) error{InvalidResponse}!RpcError {
@@ -177,27 +186,6 @@ pub fn Client(comptime IO: type) type {
             try client.http.request(*Self, client, on_http, .POST, "/", used, out.buffered());
         }
 
-        fn build_request(
-            writer: *json.Writer,
-            id: u64,
-            method: []const u8,
-            params_context: anytype,
-            comptime write_params: ParamsWriter(@TypeOf(params_context)),
-        ) json.Writer.WriteError!void {
-            try writer.begin_object();
-            try writer.key("jsonrpc");
-            try writer.string("2.0");
-            try writer.key("id");
-            try writer.integer(id);
-            try writer.key("method");
-            try writer.string(method);
-            try writer.key("params");
-            try writer.begin_array();
-            try write_params(params_context, writer);
-            try writer.end_array();
-            try writer.end_object();
-        }
-
         fn on_http(
             client: *Self,
             http: *Http,
@@ -212,6 +200,28 @@ pub fn Client(comptime IO: type) type {
             client.callback(client.context, client, parsed);
         }
     };
+}
+
+/// Writes a JSON-RPC 2.0 request object.
+pub fn build_request(
+    writer: *json.Writer,
+    id: u64,
+    method: []const u8,
+    params_context: anytype,
+    comptime write_params: ParamsWriter(@TypeOf(params_context)),
+) json.Writer.WriteError!void {
+    try writer.begin_object();
+    try writer.key("jsonrpc");
+    try writer.string("2.0");
+    try writer.key("id");
+    try writer.integer(id);
+    try writer.key("method");
+    try writer.string(method);
+    try writer.key("params");
+    try writer.begin_array();
+    try write_params(params_context, writer);
+    try writer.end_array();
+    try writer.end_object();
 }
 
 fn typed(comptime Context: type, opaque_context: ?*anyopaque) Context {

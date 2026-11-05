@@ -10,6 +10,8 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - [x] `rpc`: JSON-RPC 2.0 server framework (method table, batch requests, typed params/results), client.
 - [x] `jwt`: HS256 JWT create/verify for Engine API auth (HMAC-SHA256), `iat` window.
 - [x] `ws`: WebSocket server/client (subscriptions, flashblocks feed later).
+- [x] `rpc.ws`: JSON-RPC over WebSocket (`WsClient` with id-matched calls in flight and
+  `eth_subscription` notifications; `serve_message`/`write_notification` for servers).
 - [x] `cli`: flag parsing (zero-alloc), env fallback; `log`: structured, leveled, fixed messages; `metrics`: Prometheus text endpoint, counters/gauges/histograms with static registry.
 - [x] `ring-buffer`, `retry`/backoff (deterministic under sim), `health` endpoint.
 - [x] Linux CI coverage for io_uring (`just test-linux`).
@@ -99,3 +101,4 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
 - 2026-11-05: upgrade_signal core (version, contract ABI with comptime keccak selectors, Reader: block by tag -> eth_call x2 at blockHash); decode fails closed (canonical offset, length <= 256, zero-padded uint64).
 - 2026-11-05: upgrade_signal Observer: immediate + tag-interval single-attempt polls, keeps last schedule on failure, on_update on first/changed, per-upgrade labeled metrics.
 - 2026-11-05: http: close-delimited responses (no length, no chunking) were parsed as empty bodies; now `.incomplete` until EOF, finished by `parse_response_at_eof` from the client (keep_alive=false). optimism-rpc skipped: thin typed wrappers over `rpc.Client`, call sites live in consensus/batcher.
+- 2026-11-05: rpc.ws: WsClient (bounded pending ids, notifications raw, pending fail on close), server adapter over ws.Server + Router; rpc.client gains parse_response_any and module-level build_request.
