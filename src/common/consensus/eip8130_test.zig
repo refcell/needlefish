@@ -5,6 +5,7 @@ const testing = std.testing;
 const primitives = @import("../primitives/root.zig");
 const signature = @import("signature.zig");
 const eip8130 = @import("eip8130.zig");
+const predeploys = @import("predeploys.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 const Address = primitives.Address;
 const B256 = primitives.B256;
@@ -300,4 +301,61 @@ test "eip8130: envelope integration" {
     var decoder = rlp.Decoder.init(encoder.written());
     const again = try Envelope.decode_network(&decoder);
     try testing.expect(again.hash().eql(envelope.hash()));
+}
+
+fn tip_of(phases: []const []const eip8130.Call) ?u256 {
+    var phase_buffers: [3][256]u8 = undefined;
+    var built: [3]eip8130.Phase = undefined;
+    for (phases, 0..) |calls, index| {
+        built[index] = eip8130.Phase.build(&phase_buffers[index], calls);
+    }
+    var calls_buffer: [1024]u8 = undefined;
+    const tx: TxEip8130 = .{
+        .chain_id = 8453,
+        .nonce_sequence = 0,
+        .max_priority_fee_per_gas = 1,
+        .max_fee_per_gas = 2,
+        .gas_limit = 100_000,
+        .calls = eip8130.Calls.build(&calls_buffer, built[0..phases.len]),
+    };
+    return eip8130.coinbase_tip(tx);
+}
+
+test "eip8130: coinbase tip (base/base CoinbaseTip)" {
+    const vault = predeploys.sequencer_fee_vault;
+    const tip: eip8130.Call = .{ .to = vault, .value = 7, .data = &.{} };
+    const other: eip8130.Call = .{ .to = address_1, .value = 1, .data = &.{} };
+    try testing.expectEqual(@as(?u256, 7), tip_of(&.{&.{tip}}));
+    try testing.expectEqual(@as(?u256, 7), tip_of(&.{ &.{tip}, &.{other} }));
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{}));
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{&.{}}));
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{&.{ tip, other }}));
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{ &.{other}, &.{tip} }));
+    var with_data = tip;
+    with_data.data = &.{0x01};
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{&.{with_data}}));
+    var zero = tip;
+    zero.value = 0;
+    try testing.expectEqual(@as(?u256, null), tip_of(&.{&.{zero}}));
+}
+
+test "eip8130: contracts match CREATE2 derivation and ERC-1167 proxy hash" {
+    const contracts = eip8130.contracts;
+    for (contracts.deployments) |deployment| {
+        const derived = primitives.create2_address(
+            contracts.create2_factory,
+            deployment.salt,
+            deployment.init_code_hash,
+        );
+        try testing.expect(derived.eql(deployment.address));
+    }
+    const payer = contracts.canonical_high_rate_payer_account;
+    const runtime = contracts.erc1167_proxy_runtime(payer);
+    try testing.expectEqualSlices(u8, &payer.bytes, runtime[10..30]);
+    const code_hash = contracts.erc1167_proxy_code_hash(payer);
+    try testing.expect(code_hash.eql(contracts.canonical_high_rate_payer_proxy_code_hash));
+    const other_hash = contracts.erc1167_proxy_code_hash(contracts.default_account);
+    try testing.expect(!code_hash.eql(other_hash));
+    const designator = eip8130.delegation_indicator(payer);
+    try testing.expect(!primitives.keccak256(&designator).eql(code_hash));
 }

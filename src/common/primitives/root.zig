@@ -6,6 +6,7 @@ const std = @import("std");
 
 pub const hex = @import("hex.zig");
 pub const bytes = @import("bytes.zig");
+pub const contract_address = @import("contract_address.zig");
 
 pub const FixedBytes = bytes.FixedBytes;
 pub const Address = bytes.Address;
@@ -21,6 +22,8 @@ pub const parse_address_checked = bytes.parse_address_checked;
 pub const u256_to_bytes = bytes.u256_to_bytes;
 pub const u256_from_bytes = bytes.u256_from_bytes;
 pub const u256_from_be_slice = bytes.u256_from_be_slice;
+pub const create_address = contract_address.create_address;
+pub const create2_address = contract_address.create2_address;
 
 test {
     std.testing.refAllDecls(@This());

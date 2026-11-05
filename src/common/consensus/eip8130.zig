@@ -17,6 +17,7 @@ const rlp = @import("../rlp/root.zig");
 const signature_module = @import("signature.zig");
 const item_list = @import("item_list.zig");
 const hashing = @import("hashing.zig");
+const predeploys = @import("predeploys.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const Encoder = rlp.Encoder;
@@ -52,6 +53,22 @@ pub const scope_self_payer: u16 = 0x0002;
 pub const scope_sponsor_payer: u16 = 0x0004;
 pub const scope_policy: u16 = 0x0008;
 pub const scope_nonce: u16 = 0x0010;
+
+/// A phase-0 coinbase tip recoverable without execution: phase 0 is exactly one call
+/// moving non-zero value to the sequencer fee vault with empty calldata (base/base
+/// `CoinbaseTip`). Later phases are skipped when an earlier one reverts, so only phase 0
+/// counts.
+pub fn coinbase_tip(tx: TxEip8130) ?u256 {
+    var phases = tx.calls.iterator();
+    const phase = phases.next() orelse return null;
+    if (phase.count != 1) return null;
+    var calls = phase.iterator();
+    const call = calls.next().?;
+    assert(calls.next() == null);
+    if (!call.to.eql(predeploys.sequencer_fee_vault)) return null;
+    if (call.data.len != 0 or call.value == 0) return null;
+    return call.value;
+}
 
 /// Local-channel sequence low-half sentinel (`maxInt(u32)`): an unsequenced (JIT) batch
 /// consumes no sequence. Sequenced batches run up to `unsequenced - 2`.
@@ -101,7 +118,15 @@ test "eip8130: delegation indicator" {
 
 /// Canonical CREATE2-deployed EIP-8130 contracts (identical on every Base chain).
 pub const contracts = struct {
+    /// Nick's deterministic-deployment proxy; every contract below is its CREATE2 output.
+    pub const create2_factory = Address.comptime_hex("4e59b44847b379578588920cA78FbF26c0B4956C");
     pub const account_config = Address.comptime_hex("813012Bd8D971928475235BBac6F0488c4A100AC");
+    pub const canonical_high_rate_payer_account =
+        Address.comptime_hex("813002fFdd25C81CeF79781702176D453AF0Fa57");
+    /// Code hash of the ERC-1167 proxy to `canonical_high_rate_payer_account`.
+    pub const canonical_high_rate_payer_proxy_code_hash = B256.comptime_hex(
+        "567770b5589d02464ad51c8e299cb3fc9192975068969b973839b38263f91c22",
+    );
     pub const default_account = Address.comptime_hex("81309c54D6Bc190FbBc0FA9f296ea4C6A539ADEf");
     pub const p256_authenticator =
         Address.comptime_hex("8130C89F65750431b564A4730397552a11CeA256");
@@ -114,6 +139,78 @@ pub const contracts = struct {
         webauthn_authenticator,
         delegate_authenticator,
     };
+
+    /// (address, salt, init code hash) of each CREATE2 deployment, pinned by base/base.
+    pub const deployments = [_]struct { address: Address, salt: B256, init_code_hash: B256 }{
+        .{
+            .address = account_config,
+            .salt = B256.comptime_hex(
+                "d5fe4abe7c2e23a731e7835e5e0ab0445758c8de819e8dd180528e7dcddd79c0",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "60fe45aa9ff559770214f6488ec559057fdefff4fead53ecd8e3711802bbdf9f",
+            ),
+        },
+        .{
+            .address = default_account,
+            .salt = B256.comptime_hex(
+                "0000000000000000000000000000000000000000000000000000000023195eb6",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "08f1b05056c9a1406b9d8ec9de14d482149877c83b6a58ea9e855f7bdc0205b3",
+            ),
+        },
+        .{
+            .address = canonical_high_rate_payer_account,
+            .salt = B256.comptime_hex(
+                "000000000000000000000000000000000000000000000000000000007257d389",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "8508466c8ab34d3dd0b31d7209aacde0501852819dfff3926a997f15d90b28c2",
+            ),
+        },
+        .{
+            .address = p256_authenticator,
+            .salt = B256.comptime_hex(
+                "000000000000000000000000000000000000000000000000000000014139e07b",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "64a6e7ca64d1043c5a9f6c4072ae3e06989b88f7a63df3cbbe4d717763c8b65a",
+            ),
+        },
+        .{
+            .address = webauthn_authenticator,
+            .salt = B256.comptime_hex(
+                "000000000000000000000000000000000000000000000000000000015ec496a4",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "92bc05424ceb5ef1f1ad17e1d462d45fff83f76daebeef2d5ff1cf0b80733a26",
+            ),
+        },
+        .{
+            .address = delegate_authenticator,
+            .salt = B256.comptime_hex(
+                "000000000000000000000000000000000000000000000000000000012b221529",
+            ),
+            .init_code_hash = B256.comptime_hex(
+                "0fa70638e780cea7b2a6305f13b2155e9dfb211e4e31f57a14863031c9c65035",
+            ),
+        },
+    };
+
+    pub const erc1167_prefix = [10]u8{ 0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x36, 0x3d, 0x73 };
+    pub const erc1167_suffix = [15]u8{
+        0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2b, 0x57, 0xfd, 0x5b, 0xf3,
+    };
+
+    /// Runtime code of an ERC-1167 minimal proxy to `implementation`.
+    pub fn erc1167_proxy_runtime(implementation: Address) [45]u8 {
+        return erc1167_prefix ++ implementation.bytes ++ erc1167_suffix;
+    }
+
+    pub fn erc1167_proxy_code_hash(implementation: Address) B256 {
+        return primitives.keccak256(&erc1167_proxy_runtime(implementation));
+    }
 
     pub fn is_canonical_authenticator(authenticator: Address) bool {
         for (canonical_authenticators) |canonical| {

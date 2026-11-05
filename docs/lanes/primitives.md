@@ -28,6 +28,8 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] genesis `config.base` (azul..zenith, v1/v2/v3/future aliases, strict like base/base) and
   `activationAdminAddress`; `Config.is_base_upgrade_active`.
 - [x] EIP-8130 account-state constants (flags, `unsequenced`) and the delegation indicator.
+- [x] `primitives.create_address` / `create2_address`; EIP-8130 CREATE2 deployment table
+  (salts + init code hashes verified by derivation), ERC-1167 proxy helpers, `coinbase_tip`.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -95,3 +97,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: remote signer codecs (`common/signer`).
 - 2026-11-05: genesis Base upgrade times and activation admin address.
 - 2026-11-05: EIP-8130 account flags, unsequenced sentinel, delegation indicator.
+- 2026-11-05: CREATE/CREATE2 addresses, EIP-8130 deployment table, coinbase tip.
