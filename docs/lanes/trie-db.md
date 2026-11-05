@@ -77,8 +77,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] `Builder.build` is 4-5x a full-state block apply (30.7 vs 8.2 ms storage-heavy): proves
   every key separately, then replays on a sparse trie. Share proof walks (sorted keys, one
   descent) or build the witness from the full trie's dirty-path walk.
-- [ ] Byte-compare our `debug_executionWitness` against reth's output for public fixture
-  blocks (committed small vectors); document any intended differences.
+- [ ] (blocked: base/base commits no reth witness fixtures and running reth is out of scope)
+  Byte-compare our `debug_executionWitness` against reth's output for public fixture blocks;
+  revisit when public fixtures exist. Meanwhile: the `witness-diff` port below.
+- [ ] `witness-diff` tool (port of base/base `etc/tools/witness-diff`): compare two witness
+  JSON files (or one file vs a node's `debug_executionWitness`), report differing trie nodes,
+  codes, keys, and the accounts/slots whose leaves diverge.
 - [x] Witness generator memory: default limits allocate ~40-60 MB at node start even if
   `debug_executionWitness` is never called; size from limits more tightly or allocate through
   `utilities.lazy_alloc` (node lane pattern). Large witnesses can exceed the 1 MiB HTTP buffer.
