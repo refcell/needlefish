@@ -11,7 +11,12 @@ const root = @import("root.zig");
 const ChainSpec = root.ChainSpec;
 const BaseFeeParams = root.BaseFeeParams;
 
-pub const Error = error{ PreMergeGenesis, InvalidForkOrder, InvalidBaseFeeParams };
+pub const Error = error{
+    PreMergeGenesis,
+    InvalidForkOrder,
+    InvalidBaseFeeParams,
+    InvalidBlockTime,
+};
 
 pub fn from_genesis(parsed: *const genesis.Genesis) Error!ChainSpec {
     const config = parsed.config;
@@ -54,6 +59,21 @@ fn set_upgrades(spec: *ChainSpec, config: genesis.Config) Error!void {
         .{ root.Upgrade.jovian, config.jovian_time },
     };
     inline for (pairs) |pair| upgrades[@backingInt(pair[0])] = pair[1];
+    // Base upgrades from `config.base`; Zenith (`future`) has no execution rules here.
+    const base_pairs = .{
+        .{ root.Upgrade.azul, genesis.BaseUpgrade.azul },
+        .{ root.Upgrade.beryl, genesis.BaseUpgrade.beryl },
+        .{ root.Upgrade.cobalt, genesis.BaseUpgrade.cobalt },
+        .{ root.Upgrade.denim, genesis.BaseUpgrade.denim },
+        .{ root.Upgrade.everest, genesis.BaseUpgrade.everest },
+    };
+    inline for (base_pairs) |pair| {
+        upgrades[@backingInt(pair[0])] = config.base_upgrade_time(pair[1]);
+    }
+    if (config.block_time) |seconds| {
+        if (seconds == 0) return error.InvalidBlockTime;
+        spec.block_time_seconds = seconds;
+    }
     const elasticity = config.eip1559_elasticity orelse 6;
     const denominator = config.eip1559_denominator orelse 50;
     const denominator_canyon = config.eip1559_denominator_canyon orelse denominator;
@@ -105,4 +125,37 @@ test "chainspec: from L1 and L2 genesis configs" {
     try testing.expectEqual(@as(u64, 250), l2_spec.base_fee_params_at(0).max_change_denominator);
     l1.config.london_block = null;
     try testing.expectError(error.PreMergeGenesis, from_genesis(&l1));
+}
+
+test "chainspec: Base upgrades and block time from config.base and blockTime" {
+    var l2: genesis.Genesis = .{ .config = .{
+        .chain_id = 901,
+        .london_block = 0,
+        .bedrock_block = 0,
+        .regolith_time = 0,
+        .canyon_time = 0,
+        .delta_time = 0,
+        .ecotone_time = 0,
+        .fjord_time = 0,
+        .granite_time = 0,
+        .holocene_time = 0,
+        .isthmus_time = 0,
+        .jovian_time = 0,
+        .block_time = 2,
+    } };
+    l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.azul)] = 0;
+    l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.beryl)] = 0;
+    l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.cobalt)] = 0;
+    l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.denim)] = 10;
+    const spec = try from_genesis(&l2);
+    try testing.expect(spec.is_upgrade_active(.azul, 0));
+    try testing.expect(spec.is_ethereum_fork_active(.osaka, 0));
+    try testing.expect(!spec.is_upgrade_active(.denim, 9));
+    try testing.expect(spec.is_upgrade_active(.denim, 10));
+    try testing.expect(!spec.is_upgrade_active(.everest, 1 << 40));
+    try testing.expectEqual(@as(u64, 2), spec.block_time_seconds);
+    try testing.expect(spec.timestamp_follows(10, 10));
+    try testing.expect(!spec.timestamp_follows(9, 9));
+    l2.config.block_time = 0;
+    try testing.expectError(error.InvalidBlockTime, from_genesis(&l2));
 }

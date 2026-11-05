@@ -88,7 +88,7 @@ fn parse_config(value: ?Value) Error!Config {
         .{ "delta_time", "deltaTime" },       .{ "ecotone_time", "ecotoneTime" },
         .{ "fjord_time", "fjordTime" },       .{ "granite_time", "graniteTime" },
         .{ "holocene_time", "holoceneTime" }, .{ "isthmus_time", "isthmusTime" },
-        .{ "jovian_time", "jovianTime" },
+        .{ "jovian_time", "jovianTime" },     .{ "block_time", "blockTime" },
     };
     inline for (keys) |key| {
         @field(config, key[0]) = try optional_quantity(u64, object, key[1]);

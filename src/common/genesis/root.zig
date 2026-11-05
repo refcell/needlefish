@@ -70,6 +70,8 @@ pub const Config = struct {
     holocene_time: ?u64 = null,
     isthmus_time: ?u64 = null,
     jovian_time: ?u64 = null,
+    /// Legacy L2 block interval in seconds (`config.blockTime`), anchoring Denim's schedule.
+    block_time: ?u64 = null,
     eip1559_elasticity: ?u64 = null,
     eip1559_denominator: ?u64 = null,
     eip1559_denominator_canyon: ?u64 = null,
