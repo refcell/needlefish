@@ -124,12 +124,27 @@ pub const Fe = struct {
 
     pub fn add(a: Fe, b: Fe) Fe {
         var limbs: [4]u64 = undefined;
-        var accumulator: u128 = 0;
+        var carry: u1 = 0;
         inline for (0..4) |index| {
-            accumulator = (accumulator >> 64) + a.limbs[index] + b.limbs[index];
-            limbs[index] = @truncate(accumulator);
+            const step = @addWithOverflow(a.limbs[index], b.limbs[index]);
+            const step_carry = @addWithOverflow(step[0], carry);
+            limbs[index] = step_carry[0];
+            carry = step[1] | step_carry[1];
         }
-        return fold_top(limbs, @truncate(accumulator >> 64));
+        // A carry is worth 2^256 = fold (mod p).
+        var second: u1 = 0;
+        const correction = fold & (0 -% @as(u64, carry));
+        inline for (0..4) |index| {
+            const addend = if (index == 0) correction else 0;
+            const step = @addWithOverflow(limbs[index], addend);
+            const step_carry = @addWithOverflow(step[0], second);
+            limbs[index] = step_carry[0];
+            second = step[1] | step_carry[1];
+        }
+        // A second carry leaves a value below fold, so limb 0 absorbs it.
+        assert(second == 0 or carry == 1);
+        limbs[0] +%= fold & (0 -% @as(u64, second));
+        return .{ .limbs = limbs };
     }
 
     pub fn dbl(a: Fe) Fe {
@@ -159,6 +174,28 @@ pub const Fe = struct {
         limbs[0] -%= fold & (0 -% @as(u64, second));
         assert(second == 0 or borrow == 1);
         return .{ .limbs = limbs };
+    }
+
+    /// a / 2: adds p when a is odd (a 257-bit sum), then shifts right. Branch-free.
+    pub fn half(a: Fe) Fe {
+        const mask = 0 -% (a.limbs[0] & 1);
+        const p_limbs = comptime from_int(p_int - 1).limbs;
+        var sum: [4]u64 = undefined;
+        var accumulator: u128 = 0;
+        inline for (0..4) |index| {
+            // p = (p - 1) + 1: limb 0 of p is odd, so p - 1 differs only in bit 0.
+            const p_limb = if (index == 0) p_limbs[0] | 1 else p_limbs[index];
+            accumulator = (accumulator >> 64) + a.limbs[index] + (p_limb & mask);
+            sum[index] = @truncate(accumulator);
+        }
+        const top: u64 = @truncate(accumulator >> 64);
+        assert(top <= 1);
+        var result: Fe = undefined;
+        inline for (0..3) |index| {
+            result.limbs[index] = (sum[index] >> 1) | (sum[index + 1] << 63);
+        }
+        result.limbs[3] = (sum[3] >> 1) | (top << 63);
+        return result;
     }
 
     pub fn neg(a: Fe) Fe {
@@ -329,6 +366,7 @@ test "field: arithmetic matches u512 reference" {
         try testing.expectEqual(@as(u256, @intCast((x * x) % p)), a.sqr().to_int());
         try testing.expectEqual(@as(u256, @intCast((x * 21) % p)), a.mul_small(21).to_int());
         try testing.expectEqual(@as(u256, @intCast((p * 2 - x) % p)), a.neg().to_int());
+        try testing.expect(a.half().dbl().equal(a));
         try testing.expectEqual(x % p == 0, a.is_zero());
     }
 }

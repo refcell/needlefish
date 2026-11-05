@@ -131,7 +131,10 @@ fn private_scalar(private_key: *const [32]u8) Error!Scalar {
 /// Uncompressed public key (x || y) of a private key, in constant time.
 pub fn public_key(private_key: [32]u8) Error!PublicKey {
     const d = try private_scalar(&private_key);
-    const public = point.mul_generator_ct(d) orelse unreachable; // d != 0
+    var blind_bytes: [32]u8 = undefined;
+    NonceGenerator.Hmac.create(&blind_bytes, "secp256k1 blinding", &private_key);
+    const public = point.mul_generator_ct(d, Fe.from_bytes_unchecked(&blind_bytes)) orelse
+        unreachable; // d != 0
     return encode_public_key(public);
 }
 
@@ -164,6 +167,17 @@ const NonceGenerator = struct {
         return generator;
     }
 
+    /// Secret blinding bytes derived from the current state without advancing it, so
+    /// the RFC 6979 nonce sequence is unchanged.
+    fn blinding(generator: *const NonceGenerator) [32]u8 {
+        var mac = Hmac.init(&generator.key);
+        mac.update(&generator.value);
+        mac.update(&.{0x02});
+        var bytes: [32]u8 = undefined;
+        mac.final(&bytes);
+        return bytes;
+    }
+
     fn next(generator: *NonceGenerator) [32]u8 {
         if (generator.started) {
             var mac = Hmac.init(&generator.key);
@@ -177,6 +191,17 @@ const NonceGenerator = struct {
         return generator.value;
     }
 };
+
+/// k^-1 = b (k b)^-1: the variable-time inversion only sees k b, which is uniformly
+/// random and independent of k for a secret random b. Falls back to the
+/// constant-time Fermat inversion if b = 0.
+fn blinded_inverse(k: Scalar, blind: Scalar) Scalar {
+    assert(!k.is_zero());
+    if (blind.is_zero()) return k.invert();
+    const inverse = Scalar.from_int(ScalarInverse.invert(k.mul(blind).to_int())).mul(blind);
+    assert(inverse.mul(k).equal(Scalar.one));
+    return inverse;
+}
 
 /// Attempts allowed before giving up on the nonce: each retry has probability
 /// below 2^-127, so the bound is never reached in practice.
@@ -192,11 +217,13 @@ pub fn sign(private_key: [32]u8, hash: [32]u8) Error!Signature {
         const candidate = nonces.next();
         const k = Scalar.from_bytes(&candidate) orelse continue;
         if (k.is_zero()) continue;
-        const r_point = point.mul_generator_ct(k) orelse unreachable; // k != 0
+        const blind_bytes = nonces.blinding();
+        const blind_field = Fe.from_bytes_unchecked(&blind_bytes);
+        const r_point = point.mul_generator_ct(k, blind_field) orelse unreachable; // k != 0
         const x_bytes = r_point.x.to_bytes();
         const r = Scalar.from_bytes_reduce(&x_bytes);
         if (r.is_zero()) continue;
-        var s = k.invert().mul(z.add(r.mul(d)));
+        var s = blinded_inverse(k, Scalar.from_bytes_reduce(&blind_bytes)).mul(z.add(r.mul(d)));
         if (s.is_zero()) continue;
         const x_overflow: u2 = @intFromBool(Scalar.from_bytes(&x_bytes) == null);
         var recovery_id: u2 = (x_overflow << 1) | @intFromBool(r_point.y.is_odd());

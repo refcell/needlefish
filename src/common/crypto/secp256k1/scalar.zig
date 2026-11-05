@@ -277,8 +277,8 @@ pub const wnaf_length_max = 131;
 /// Width-`window` non-adjacent form of a magnitude below 2^129: odd digits in
 /// (-2^(window-1), 2^(window-1)), at least `window - 1` zeros between non-zero
 /// digits. Returns the digit count (index of the highest non-zero digit + 1).
-pub fn wnaf(magnitude: [4]u64, comptime window: u4, digits: *[wnaf_length_max]i8) u32 {
-    comptime assert(window >= 2 and window <= 8);
+pub fn wnaf(magnitude: [4]u64, comptime window: u4, digits: *[wnaf_length_max]i16) u32 {
+    comptime assert(window >= 2 and window <= 15);
     assert(magnitude[3] == 0 and magnitude[2] <= 1);
     const padded: [5]u64 = .{ magnitude[0], magnitude[1], magnitude[2], 0, 0 };
     @memset(digits, 0);
@@ -357,7 +357,7 @@ test "scalar: byte parsing" {
     try testing.expectEqual(@as(u256, n_c_int - 1), Scalar.from_bytes_reduce(&all_ones).to_int());
 }
 
-fn wnaf_value(digits: *const [wnaf_length_max]i8, length: u32) i512 {
+fn wnaf_value(digits: *const [wnaf_length_max]i16, length: u32) i512 {
     var value: i512 = 0;
     var index = length;
     while (index > 0) {
@@ -370,7 +370,7 @@ fn wnaf_value(digits: *const [wnaf_length_max]i8, length: u32) i512 {
 test "scalar: GLV split and wNAF recode" {
     var prng = Prng.init(0x676c76);
     const lambda = Scalar.from_int(lambda_int);
-    var digits: [wnaf_length_max]i8 = undefined;
+    var digits: [wnaf_length_max]i16 = undefined;
     for (0..2000) |_| {
         const k = random_scalar(&prng);
         const halves = split_lambda(k);
@@ -381,9 +381,9 @@ test "scalar: GLV split and wNAF recode" {
             try testing.expect(magnitude < (1 << 128));
             part.* = Scalar.from_int(magnitude);
             if (half.negative) part.* = part.neg();
-            const window: u4 = @intCast(2 + prng.below(7));
+            const window: u4 = @intCast(2 + prng.below(14));
             const length = switch (window) {
-                inline 2...8 => |w| wnaf(half.magnitude, w, &digits),
+                inline 2...15 => |w| wnaf(half.magnitude, w, &digits),
                 else => unreachable,
             };
             try testing.expectEqual(@as(i512, magnitude), wnaf_value(&digits, length));

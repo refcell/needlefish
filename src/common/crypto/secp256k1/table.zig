@@ -22,7 +22,7 @@ pub const g_y_int: u256 = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47
 pub const beta_int: u256 = 0x7AE96A2B657C07106E64479EAC3434E99CF0497512F58995C1396C28719501EE;
 
 /// wNAF window for the generator: 2^(window - 2) odd multiples per table.
-pub const g_window = 8;
+pub const g_window = 10;
 pub const g_table_size = 1 << (g_window - 2);
 
 /// Constant-time generator multiplication: 65 rows (64 signed nibbles plus the final

@@ -229,7 +229,7 @@ test "secp256k1: recovery of a point at infinity returns null" {
     var prng = Prng.init(0x696e66);
     for (0..8) |_| {
         const k = Scalar.from_int(prng.int(u256) % (n_int - 1) + 1);
-        const r_point = secp.point.mul_generator_ct(k).?;
+        const r_point = secp.point.mul_generator_ct(k, Fe.one).?;
         const x_int = r_point.x.to_int();
         if (x_int >= n_int) continue;
         const s = Scalar.from_int(prng.int(u256) % (n_int - 1) + 1);
@@ -303,7 +303,7 @@ test "secp256k1: double-scalar multiplication vs std" {
     var prng = Prng.init(0x646f75626c65);
     for (0..48) |_| {
         const k = Scalar.from_int(prng.int(u256) % (n_int - 1) + 1);
-        const base = secp.point.mul_generator_ct(k).?;
+        const base = secp.point.mul_generator_ct(k, Fe.one).?;
         const g_factor = Scalar.from_int(prng.int(u256) % n_int);
         const r_factor = Scalar.from_int(prng.int(u256) % n_int);
         var sec1: [65]u8 = undefined;

@@ -68,18 +68,17 @@ pub const Jacobian = struct {
         return .{ .x = point.x, .y = point.y.neg(), .z = point.z, .infinity = point.infinity };
     }
 
-    /// dbl-2009-l (a = 0). The curve has prime order, so no finite point doubles
-    /// to infinity.
+    /// Doubling with the libsecp256k1 formula (3M + 4S): L = 3/2 X^2, S = Y^2,
+    /// X3 = L^2 - 2 X S, Y3 = L (X S - X3) - S^2, Z3 = Y Z. The curve has prime
+    /// order, so no finite point doubles to infinity.
     pub fn dbl(point: Jacobian) Jacobian {
         if (point.infinity) return point;
-        const a = point.x.sqr();
-        const b = point.y.sqr();
-        const c = b.sqr();
-        const d = point.x.add(b).sqr().sub(a).sub(c).dbl();
-        const e = a.mul_small(3);
-        const x3 = e.sqr().sub(d.dbl());
-        const y3 = e.mul(d.sub(x3)).sub(c.mul_small(8));
-        const z3 = point.y.mul(point.z).dbl();
+        const z3 = point.y.mul(point.z);
+        const s = point.y.sqr();
+        const l = point.x.sqr().mul_small(3).half();
+        const xs = point.x.mul(s);
+        const x3 = l.sqr().sub(xs).sub(xs);
+        const y3 = l.mul(xs.sub(x3)).sub(s.sqr());
         assert(!z3.is_zero());
         return .{ .x = x3, .y = y3, .z = z3, .infinity = false };
     }
@@ -138,7 +137,7 @@ const r_window = 5;
 const r_table_size = 1 << (r_window - 2);
 
 const Recoded = struct {
-    digits: [scalar_module.wnaf_length_max]i8,
+    digits: [scalar_module.wnaf_length_max]i16,
     length: u32,
 };
 
@@ -164,7 +163,7 @@ fn odd_multiples(point: Affine) [r_table_size]Jacobian {
 inline fn add_jacobian_digit(
     acc: Jacobian,
     multiples: *const [r_table_size]Jacobian,
-    digit: i8,
+    digit: i16,
 ) Jacobian {
     if (digit > 0) return acc.add(multiples[@intCast((digit - 1) >> 1)]);
     if (digit < 0) return acc.add(multiples[@intCast((-digit - 1) >> 1)].negate());
@@ -174,7 +173,7 @@ inline fn add_jacobian_digit(
 inline fn add_affine_digit(
     acc: Jacobian,
     multiples: *const [table.g_table_size]Affine,
-    digit: i8,
+    digit: i16,
 ) Jacobian {
     if (digit > 0) return acc.add_affine(multiples[@intCast((digit - 1) >> 1)]);
     if (digit < 0) {
@@ -275,8 +274,10 @@ fn lookup(row: *const [table.gen_row_size]Affine, digit: i8) Affine {
     return result;
 }
 
-/// k G in constant time. Returns null only for k = 0.
-pub fn mul_generator_ct(k: Scalar) ?Affine {
+/// k G in constant time. Returns null only for k = 0. `blind` is a secret, uniformly
+/// random field element: the final inversion runs in variable time on Z * blind,
+/// which is independent of k, so its timing reveals nothing about k.
+pub fn mul_generator_ct(k: Scalar, blind: Fe) ?Affine {
     // Signed nibbles in [-8, 7] plus a final carry digit, so k = sum d_i 16^i.
     var digits: [table.gen_row_count]i8 = undefined;
     var carry: u8 = 0;
@@ -296,7 +297,10 @@ pub fn mul_generator_ct(k: Scalar) ?Affine {
         acc = acc.select(sum, @intFromBool(digit != 0));
     }
     if (k.is_zero()) return null;
-    const z_inverse = acc.z.invert();
+    const z_inverse = if (blind.is_zero())
+        acc.z.invert()
+    else
+        Fe.from_int(FieldInverse.invert(acc.z.mul(blind).to_int())).mul(blind);
     const point: Affine = .{
         .x = acc.x.mul(z_inverse).normalize(),
         .y = acc.y.mul(z_inverse).normalize(),
