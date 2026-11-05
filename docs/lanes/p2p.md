@@ -37,9 +37,10 @@ behind a small interface and switch later.
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
-- [ ] io asks (io lane): `shutdown(fd)` so closing never races a pending recv, and UDP
-  (`open_socket_udp`, `recvfrom`, `sendto`) so discv5 runs over io; then wire
-  `Service.on_datagram`/`pop_datagram` into the transport.
+- [x] Transport closes with io `shutdown_now`, then `close_now` once the link is idle, so a
+  reused descriptor never meets a stale recv (asserted on every new descriptor).
+- [ ] io ask (io lane): UDP (`open_socket_udp`, `recvfrom`, `sendto`) so discv5 runs over
+  io; then wire `Service.on_datagram`/`pop_datagram` into the transport.
 - [x] `libp2p`: yamux go-away: a received go-away closes the connection
   (`remote_go_away`); `close()` sends go-away first and the transport closes the socket
   after it is sent (2 s linger cap). Service disconnects (bans) are graceful.
@@ -247,3 +248,4 @@ behind a small interface and switch later.
 - 2026-11-05: bootstore persistence through `Network`.
 - 2026-11-05: bootnodes file parsing.
 - 2026-11-05: opp2p admin RPC; backpressure closed as won't-do.
+- 2026-11-05: transport uses io shutdown_now before close.

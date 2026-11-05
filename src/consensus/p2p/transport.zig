@@ -6,11 +6,11 @@
 //! reports connection lifecycle to the service, moves gossip frames both ways, and ticks
 //! the service on a timer. One recv and one send are in flight per link at most.
 //!
-//! Closing: io has no `shutdown`, so a link closes its socket with `close_now` and stays
-//! quarantined until its in-flight completions return; bytes they carry are dropped. A
-//! reused descriptor could hand such a stale recv bytes of a newer connection; noise
-//! authenticates every frame, so that can only fail the newer connection, never inject
-//! data. (A `shutdown` in io would remove even that; see docs/lanes/p2p.md.)
+//! Closing: an open link calls `shutdown_now`, which completes its pending recv with end of
+//! stream, and stays quarantined with its descriptor allocated until its in-flight
+//! completions return; only then `close_now` frees the descriptor, so a reused descriptor
+//! never meets a stale recv. A link still connecting closes at once (a late connect
+//! result is ignored).
 //!
 //! Discovery datagrams stay with `Service.on_datagram`/`pop_datagram` until io has UDP.
 
@@ -52,6 +52,8 @@ pub fn Transport(comptime IO: type) type {
             transport: *Self = undefined,
             state: State = .free,
             fd: IO.Fd = undefined,
+            /// The descriptor is shut down and awaits `close_now` once the link is idle.
+            fd_shut: bool = false,
             outbound: bool = false,
             dial_address: multiaddr.Multiaddr = .{},
             connection: Connection = undefined,
@@ -130,6 +132,7 @@ pub fn Transport(comptime IO: type) type {
         pub fn deinit(transport: *Self) void {
             for (transport.links) |*link| {
                 if (link.connection_live) link.connection.deinit();
+                if (link.fd_shut) transport.io.close_now(link.fd);
             }
             transport.allocator.free(transport.drain_buffer);
             transport.allocator.free(transport.links);
@@ -251,6 +254,7 @@ pub fn Transport(comptime IO: type) type {
             const fd = transport.io.open_socket_tcp(target.family) catch {
                 return transport.dial_failed(address);
             };
+            transport.assert_descriptor_fresh(fd);
             link.* = .{
                 .transport = transport,
                 .state = .connecting,
@@ -309,6 +313,7 @@ pub fn Transport(comptime IO: type) type {
             const link = transport.free_link() orelse return transport.io.close_now(fd);
             if (!transport.service.reserve_inbound(null)) return transport.io.close_now(fd);
             transport.stats.accepted += 1;
+            transport.assert_descriptor_fresh(fd);
             link.* = .{ .transport = transport, .state = .connecting, .fd = fd };
             transport.open(link, .listener);
         }
@@ -524,20 +529,37 @@ pub fn Transport(comptime IO: type) type {
             assert(link.state == .open or link.state == .connecting);
             transport.stats.closed += 1;
             link.slot = null;
-            link.state = .closing;
             if (link.connection_live) {
                 link.connection.deinit();
                 link.connection_live = false;
             }
-            transport.io.close_now(link.fd);
+            const was_connecting = link.state == .connecting;
+            link.state = .closing;
+            if (was_connecting) {
+                transport.io.close_now(link.fd);
+            } else {
+                transport.io.shutdown_now(link.fd);
+                link.fd_shut = true;
+            }
             transport.release_if_idle(link);
         }
 
+        /// A new descriptor never aliases a shut one whose completions are still in flight.
+        fn assert_descriptor_fresh(transport: *const Self, fd: IO.Fd) void {
+            for (transport.links) |*link| {
+                if (link.fd_shut) assert(link.fd != fd);
+            }
+        }
+
         fn release_if_idle(transport: *Self, link: *Link) void {
-            _ = transport;
             assert(link.state == .closing);
             if (link.recv_inflight or link.send_inflight) return;
+            if (link.fd_shut) {
+                transport.io.close_now(link.fd);
+                link.fd_shut = false;
+            }
             link.state = .free;
+            assert(!link.fd_shut);
         }
 
         pub fn open_count(transport: *const Self) u32 {
