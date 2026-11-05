@@ -158,3 +158,22 @@ test "block gossip: wrong signer is rejected, not forwarded, and penalized" {
     const slot = net.slots[1][0].?;
     try std.testing.expect(net.gossips[1].router.peer_score_value(slot) < 0);
 }
+
+test "block gossip: old topics retire after their fork leaves the age window" {
+    const net = try std.testing.allocator.create(Net);
+    defer std.testing.allocator.destroy(net);
+    try net.init();
+    defer net.deinit();
+    const gossip = net.gossips[0];
+    // Ecotone (v3) is active from genesis, so v1 and v2 are retired at once.
+    try std.testing.expectEqual(@as(u32, 2), gossip.retire_topics(net.now_ns));
+    try std.testing.expect(!gossip.router.is_subscribed(gossip.topics[0]));
+    try std.testing.expect(!gossip.router.is_subscribed(gossip.topics[1]));
+    try std.testing.expect(gossip.router.is_subscribed(gossip.topics[2]));
+    try std.testing.expect(gossip.router.is_subscribed(gossip.topics[3]));
+    try std.testing.expectEqual(@as(u32, 0), gossip.retire_topics(0));
+    var value = try net.payload(9);
+    value.version = .v2;
+    const result = gossip.publish(net.secret, null, value, net.now_ns);
+    try std.testing.expectError(error.NotSubscribed, result);
+}

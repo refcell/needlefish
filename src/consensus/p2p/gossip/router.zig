@@ -251,6 +251,28 @@ pub const Router = struct {
         return index;
     }
 
+    /// Leaves `topic`: prunes its mesh and tells every peer. Returns false if we were not
+    /// subscribed. Messages on unsubscribed topics are dropped and cannot be published.
+    pub fn unsubscribe(router: *Router, topic: u8, now_ns: u64) bool {
+        assert(topic < router.topics_count);
+        if (!router.topics[topic].subscribed) return false;
+        router.topics[topic].subscribed = false;
+        var mesh = router.mesh[topic];
+        while (mesh != 0) : (mesh &= mesh - 1) {
+            router.prune_peer(@intCast(@ctz(mesh)), topic, now_ns);
+        }
+        for (router.peers) |*target| {
+            if (target.active) target.send_subscriptions = true;
+        }
+        assert(router.mesh[topic] == 0);
+        return true;
+    }
+
+    pub fn is_subscribed(router: *const Router, topic: u8) bool {
+        assert(topic < router.topics_count);
+        return router.topics[topic].subscribed;
+    }
+
     // Peers.
 
     /// Adds a connected peer. A peer that reconnects within `retain_score` gets its old

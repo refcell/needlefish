@@ -211,6 +211,8 @@ pub const BlockGossip = struct {
         payload: block.ExecutionPayload,
         now_ns: u64,
     ) PublishError!Id {
+        const topic = gossip.topics[@backingInt(payload.version) - 1];
+        if (!gossip.router.is_subscribed(topic)) return error.NotSubscribed;
         if (block.signed_length(payload) > publish_size_max) return error.TooLarge;
         const message = try block.encode_signed(
             gossip.chain_id,
@@ -221,14 +223,29 @@ pub const BlockGossip = struct {
             &gossip.compressor,
             gossip.publish_output,
         );
-        const topic = gossip.topics[@backingInt(payload.version) - 1];
         // Remember our own block so echoes of it count as duplicates at this height.
         gossip.validator.seen.insert(payload.block_number, payload.block_hash);
         return gossip.router.publish(topic, message, now_ns);
     }
 
     pub fn heartbeat(gossip: *BlockGossip, now_ns: u64) void {
+        _ = gossip.retire_topics(now_ns);
         gossip.router.heartbeat(now_ns);
+    }
+
+    /// Unsubscribes block topics that can no longer carry a block inside the accepted
+    /// timestamp window (base/base `retire_block_topics`). Retired topics are never
+    /// rejoined, even if the clock moves backwards. Returns how many were retired.
+    pub fn retire_topics(gossip: *BlockGossip, now_ns: u64) u32 {
+        var retired: u32 = 0;
+        for (versions, gossip.topics) |version, topic| {
+            if (!block.is_topic_retired(gossip.validator.config, version, now_ns / ns_per_s)) {
+                continue;
+            }
+            if (gossip.router.unsubscribe(topic, now_ns)) retired += 1;
+        }
+        assert(retired <= versions.len);
+        return retired;
     }
 };
 
