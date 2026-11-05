@@ -275,10 +275,15 @@ fn send_log_call(h: *Harness, nonce: u64) ![32]u8 {
     var raw_buffer: [256]u8 = undefined;
     const raw = envelope.encode_to(&raw_buffer);
     var body_buffer: [800]u8 = undefined;
-    const send_format = request_prefix_format ++ "eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}";
+    const send_format = request_prefix_format ++
+        "eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}";
     const body = try std.fmt.bufPrint(&body_buffer, send_format, .{raw});
     try expect_contains(try h.request_runtime(body), "\"result\":\"0x");
     return envelope.hash().bytes;
+}
+
+fn expect_empty(h: *Harness, comptime method: []const u8, comptime params: []const u8) !void {
+    try testing.expectEqualStrings("\"result\":[]", try h.request(method, params));
 }
 
 test "eth: block, pending and log filters report changes once" {
@@ -295,24 +300,27 @@ test "eth: block, pending and log filters report changes once" {
     var hex: [70]u8 = undefined;
     const tx_hex = try std.fmt.bufPrint(&hex, "0x{x}", .{&tx_hash});
     try expect_contains(try h.request("eth_getFilterChanges", "[\"0x2\"]"), tx_hex);
-    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x2\"]"));
-    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x1\"]"));
+    try expect_empty(h, "eth_getFilterChanges", "[\"0x2\"]");
+    try expect_empty(h, "eth_getFilterChanges", "[\"0x1\"]");
     const block_hash = try h.mine(12);
     const block_hex = try std.fmt.bufPrint(&hex, "0x{x}", .{&block_hash.bytes});
     try expect_contains(try h.request("eth_getFilterChanges", "[\"0x1\"]"), block_hex);
-    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x1\"]"));
+    try expect_empty(h, "eth_getFilterChanges", "[\"0x1\"]");
     const logs = try h.request("eth_getFilterChanges", "[\"0x3\"]");
     try expect_contains(logs, "\"address\":" ++ log_contract);
     try expect_contains(logs, "\"blockNumber\":\"0x1\"");
-    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterChanges", "[\"0x3\"]"));
+    try expect_empty(h, "eth_getFilterChanges", "[\"0x3\"]");
     try expect_contains(try h.request("eth_getFilterLogs", "[\"0x3\"]"), "\"logIndex\":\"0x0\"");
     try expect_contains(try h.request("eth_getFilterLogs", "[\"0x1\"]"), "error");
     // A filter for another address sees nothing.
-    const other = try h.request("eth_newFilter", "[{\"address\":" ++ address_one ++ ",\"fromBlock\":\"0x0\"}]");
+    const other_params = "[{\"address\":" ++ address_one ++ ",\"fromBlock\":\"0x0\"}]";
+    const other = try h.request("eth_newFilter", other_params);
     try testing.expectEqualStrings("\"result\":\"0x4\"", other);
-    try testing.expectEqualStrings("\"result\":[]", try h.request("eth_getFilterLogs", "[\"0x4\"]"));
-    try testing.expectEqualStrings("\"result\":true", try h.request("eth_uninstallFilter", "[\"0x3\"]"));
-    try testing.expectEqualStrings("\"result\":false", try h.request("eth_uninstallFilter", "[\"0x3\"]"));
+    try expect_empty(h, "eth_getFilterLogs", "[\"0x4\"]");
+    const removed = try h.request("eth_uninstallFilter", "[\"0x3\"]");
+    try testing.expectEqualStrings("\"result\":true", removed);
+    const again = try h.request("eth_uninstallFilter", "[\"0x3\"]");
+    try testing.expectEqualStrings("\"result\":false", again);
     try expect_contains(try h.request("eth_getFilterChanges", "[\"0x3\"]"), "filter not found");
 }
 

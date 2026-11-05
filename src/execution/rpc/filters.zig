@@ -147,7 +147,8 @@ fn lookup(api: *Api, call: *Call) HandlerError!*Slot {
     const filters = try table(api, call);
     const id = try call.params.quantity(u64);
     try call.params.finish();
-    const slot = filters.find(id) orelse return call.fail(rpc.code.server_error, "filter not found");
+    const slot = filters.find(id) orelse
+        return call.fail(rpc.code.server_error, "filter not found");
     filters.touch(slot);
     return slot;
 }

@@ -35,7 +35,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   getFilterChanges/getFilterLogs, uninstallFilter) with bounded slots and expiry.
 - [ ] rpc: historical state (balance/code/storage/nonce/getProof/call at older blocks)
   through the trie-db history window (`db.history.Store`).
-- [ ] rpc: `debug_executionWitness` (proof hosts) from `db.witness`.
+- [x] rpc: `debug_executionWitness` (proof hosts) from `db.witness` (landed by the trie-db lane: `node/witness.zig`).
 - [ ] txpool_content / txpool_inspect.
 
 ## Decisions
