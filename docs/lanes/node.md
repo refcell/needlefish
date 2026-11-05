@@ -6,6 +6,10 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 ## Backlog
 - [x] `node/chain`: Engine backend (import, forkchoice, reorg via rollback, builder, pool).
 - [x] `node/executor`: L1 block execution over evm + StateDb (deposit txs/L1 fees: pending).
+  (evm lane, 2026-11-05: OP support is on main. Set `BlockEnv.op = .{ .upgrade = ... }`, pass
+  `TxEnv{ .tx_type = .deposit, .mint, .is_system_transaction }` for 0x7e and
+  `TxEnv.envelope` (EIP-2718 bytes) for L1 fees; run `evm.op.apply_transition` for the Canyon
+  CREATE2 deployer / Everest nonce manager on their activation blocks.)
 - [x] `node/state_db`: evm Database over StateTrie + code store + block hash ring; commit of a block's evm State.
 - [x] `engine/block`: payload → header, tx/withdrawals roots, requests hash, versioned hashes, block hash check.
 - [x] `txpool/validate`: raw tx → pool descriptor (pooled blob form, chain id, EIP-2, intrinsic gas + EIP-7623 floor, init code, sidecar hashes, sender recovery).
