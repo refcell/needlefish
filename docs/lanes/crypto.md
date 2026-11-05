@@ -13,7 +13,9 @@ fallback but hot paths should be our own, optimized implementations.
 - [ ] montgomery: no-carry CIOS for moduli with spare top bits.
 - [x] modexp (EIP-198/2565/7883 gas lives in evm; arithmetic here), big-int helpers.
 - [ ] modexp: faster inner loops (2-accumulator mac, ADX/MULX-style on x86), window 6 above ~700 exponent bits.
-- [ ] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
+- [x] bn254 (alt_bn128): add, mul, pairing check (EIP-196/197) with official vectors.
+- [ ] bn254 perf: lazy-reduction Fp2/Fp12, precomputed G2 line coefficients, mixed-affine
+  Miller adds, batch normalization of the GLV tables.
 - [x] BLS12-381: G1/G2 ops, MSM, pairing, map-to-curve (EIP-2537 precompiles).
 - [ ] BLS12-381 perf: GLV/GLS scalar mul, batch-affine Pippenger buckets, sqrt_ratio SSWU,
   dedicated Fp squaring and lazy reduction in Fp2/Fp6 (G1 mul and map are ~2-3x blst).
@@ -162,6 +164,17 @@ fallback but hot paths should be our own, optimized implementations.
   row carries) measured no faster than `mul(a, a)` on M4 (bls 27.6 vs 26.3 ns, bn254 21.1 vs
   19.7): latency is dominated by the serial reduction. Not adopted; `square` stays `mul`.
 
+- bn254 (`bn254/`): tower Fp2 (u^2 = -1) / Fp6 (v^3 = 9 + u) / Fp12 (w^2 = v) over
+  `montgomery.Field(4, p)`. One generic Jacobian `Curve(F, b)` serves G1 and the G2 twist.
+  G1 mul uses GLV (beta, lambda, Babai rounding) with interleaved width-5 wNAF; the scalar is
+  reduced mod r, which is exact because the G1 cofactor is 1. G2 subgroup check is
+  psi(Q) == [6x^2]Q (eprint 2022/352). Miller loop over the NAF of 6x + 2 in homogeneous
+  projective coordinates (D-twist sparse 034 lines), up to 8 pairs in lockstep per chunk
+  sharing one Fp12 squaring, then one final exponentiation for the whole product
+  (Fuentes-Castaneda hard part with Granger-Scott cyclotomic squaring). Official go-ethereum
+  bn256 vectors in `bn254/vectors.zig`: all add/mul cases, 9 of 14 pairing cases (all 49
+  were checked locally before curating).
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
@@ -176,3 +189,4 @@ fallback but hot paths should be our own, optimized implementations.
 - 2026-11-05: montgomery mul row-wise carry chains: bn254 19.6->18.2ns, bls 31.4->25.8ns; bls g1 mul 89->71us, msm-64 1.78->1.25ms, pairing-2 0.71->0.66ms.
 - 2026-11-05: generic safegcd inversion: bls Fp inverse 13.8->1.8us, bn254 5.8->1.2us; map_fp_to_g1 77->41us, pairing-2 0.66->0.59ms, kzg point eval 1.01->0.88ms.
 - 2026-11-05: bls g1.mul_glv (GLV split by x^2, width-5 NAF, affine tables, mixed adds): 71->42us; kzg point eval now uses it (0.88->0.76ms).
+- 2026-11-05: bn254 add/mul/pairing precompiles (EIP-196/197) on montgomery.Field; official geth vectors, G2 subgroup check, bilinearity + seeded/coverage fuzz; bench (ReleaseFast, M-series): add 1.73us, mul 12.2us, pairing 2 pairs 0.56ms.

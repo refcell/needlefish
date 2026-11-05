@@ -12,6 +12,7 @@ const bls_bench = @import("bls12_381/bench.zig");
 const modexp = @import("modexp.zig");
 const p256 = @import("p256.zig");
 const kzg = @import("kzg/root.zig");
+const bn254 = @import("bn254/root.zig");
 
 const kzg_bench_input_hex = "01e798154708fe7789429634053cbf9f99b619f9f084048927333fce637f" ++
     "549b564c0a11a0f704f4fc3e8acfe0f8245f0ad1347b378fbf96e206da11a5d3630624d25032e67a7e6a" ++
@@ -413,7 +414,56 @@ fn bench_field_inverse(comptime F: type, comptime vartime: bool) fn (u32) u64 {
     }.run;
 }
 
+// Inputs from the official go-ethereum bn256 vectors (chfast1, chfast1, jeff1).
+const bn254_add_input = hex_bytes(bn254.vectors.add[0].input);
+const bn254_mul_input = hex_bytes(bn254.vectors.mul[0].input);
+const bn254_pairing_input = hex_bytes(bn254.vectors.pairing[0].input);
+
+fn hex_bytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(100_000);
+    var out: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex) catch unreachable; // Comptime vector, checked in tests.
+    return out;
+}
+
+fn bench_bn254_add(iterations: u32) u64 {
+    var input = bn254_add_input;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const output = bn254.precompile_bn254_add(&input) catch unreachable; // Valid vector.
+        accumulator +%= output[63];
+        std.mem.doNotOptimizeAway(&input);
+    }
+    return accumulator;
+}
+
+fn bench_bn254_mul(iterations: u32) u64 {
+    var input = bn254_mul_input;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const output = bn254.precompile_bn254_mul(&input) catch unreachable; // Valid vector.
+        accumulator +%= output[63];
+        input[95] = output[63]; // Vary the scalar; any 256-bit scalar is valid.
+    }
+    return accumulator;
+}
+
+fn bench_bn254_pairing_2(iterations: u32) u64 {
+    comptime assert(bn254_pairing_input.len == 2 * 192);
+    var input = bn254_pairing_input;
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        const output = bn254.precompile_bn254_pairing(&input) catch unreachable; // Valid.
+        accumulator +%= output[31];
+        std.mem.doNotOptimizeAway(&input);
+    }
+    return accumulator;
+}
+
 pub const cases = [_]Case{
+    .{ .name = "bn254/add", .iterations = 200_000, .run = bench_bn254_add },
+    .{ .name = "bn254/mul", .iterations = 20_000, .run = bench_bn254_mul },
+    .{ .name = "bn254/pairing 2 pairs", .iterations = 500, .run = bench_bn254_pairing_2 },
     .{ .name = "field/bn254 square", .iterations = 10_000_000, .run = bench_field_square(Bn254Fp) },
     .{
         .name = "field/bls12-381 square",
