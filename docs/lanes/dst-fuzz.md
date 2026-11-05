@@ -144,3 +144,7 @@ provably robust.
 - 2026-11-05: multi-frame channels in the sim (frame size 256..2047 per seed, both
   batchers) reassembled through the derive lane's ChannelBank over a replayed timeout
   window; L1 congestion knob. 5000 seeds green; window mutant caught (7/300 seeds).
+- 2026-11-05: model-based fuzz targets for the derive channel stages
+  (`fuzz_targets_derive.zig`): ChannelBank (arrival order, pre/post-Granite selection,
+  timeouts, size accounting, queue) and the Holocene ChannelAssembler against spec
+  models; 4/4 model mutants caught. No derive bugs found.
