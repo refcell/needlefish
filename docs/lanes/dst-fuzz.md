@@ -30,8 +30,8 @@ provably robust.
 - [x] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
 - [x] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
-- [ ] Fuzz the proof lane's decoders (preimage: done end-to-end; MPT and boot info
-  pending) (preimage oracle wire format, hint parsing, MPT node
+- [x] Fuzz the proof lane's decoders (preimage end-to-end and boot info here; MPT nodes,
+  list walker and sparse trie fuzzed in-lane) (preimage oracle wire format, hint parsing, MPT node
   decoding, boot info) as `src/proof` lands: round trips plus arbitrary-input robustness.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
 - [x] CI: Linux + macOS, ReleaseSafe test run, simulator seeds, nightly-style longer swarm on push to main.
@@ -214,3 +214,8 @@ provably robust.
   calls and account changes written by `rpc_types/eip8130` parse back to identical RLP
   lists (field parsers and `parse_transaction_request`); dropping any required member
   of a nested entry fails with `InvalidField`. 2/2 mutants caught.
+- 2026-11-05: model-based fault-proof boot info fuzz (`fuzz_targets_boot.zig`): every
+  local key served valid, empty, short or long; devnet, mainnet-with-devnet-config and
+  unknown chain ids; valid, flipped and garbage rollup JSON. The model predicts the first
+  error in load order or every loaded value. 3/3 mutants caught. Proof decoders item done.
+- 2026-11-05: swarm 30000..39999 (ReleaseSafe, real verifier ungated): 10000 passed.
