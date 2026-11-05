@@ -3,6 +3,8 @@
 
 const std = @import("std");
 
+pub const timing = @import("timing.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }

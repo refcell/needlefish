@@ -22,7 +22,7 @@ can drive the builder and the flashblocks consumer.
   publisher with per-subscriber send queues and slow-subscriber eviction, listener
   accept loop, metrics (port `broadcast.rs`, `publisher.rs`, `listener.rs`). DST test
   with N simulated subscribers, loss and slow readers.
-- [ ] `builder/core` flashblocks timing: per-block deadline schedule (interval,
+- [x] `builder/core` flashblocks timing: per-block deadline schedule (interval,
   leeway, first-flashblock offset; port `deadline.rs`, `config.rs`), pure state machine
   over injected time, exhaustive + fuzz tests of schedule invariants.
 - [ ] `builder/core` best-transactions iterator: priority-ordered txpool view that
@@ -56,9 +56,15 @@ can drive the builder and the flashblocks consumer.
 - Wire format published is plain JSON text (base/base `publisher.rs` sends `Utf8Bytes`);
   `encode_brotli` exists for consumers/tests and emits a bare brotli stream (no channel
   version byte), reusing the batcher lane's encoder.
+- `builder/core/timing`: flashblock indices follow base/base (0 = fallback built at job start,
+  regular flashblocks `1..=count`, flashblock `j` closes at `first + (j-1)*interval`). The
+  schedule uses one injected time base where base/base reads `SystemTime` then `Instant`.
+  `Config.validate` rejects interval 0, flashblocks leeway > interval, block time < interval,
+  and durations over one hour (bounds keep all u64 sums in range).
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
 - 2026-11-05: own `src/common/flashblocks`; `FlashblockId.parse` now matches Rust
   `u64::from_str` (leading '+', no '_'), dst-fuzz skip removed.
+- 2026-11-05: builder/core timing schedule (deadline.rs, config.rs) with exhaustive + fuzz tests.
