@@ -35,6 +35,9 @@ const io_storage = @import("../db/storage/io_storage.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const kzg_blob = @import("../../common/crypto/kzg/root.zig").blob;
 const kzg_cells = @import("../../common/crypto/kzg/root.zig").cells;
+const node_builder_module = @import("../../builder/core/node_builder.zig");
+
+pub const NodeBuilderConfig = node_builder_module.Config;
 
 /// Long-lived KZG verification memory (decoded setups, workspaces, batch scratch) for
 /// v0 blob proofs and v1 (EIP-7594) cell proofs.
@@ -100,6 +103,10 @@ pub const Options = struct {
     /// `--proofs-history.window`: blocks of historical state served from memory (state
     /// reads and eth_getProof at older blocks); 0 disables the window.
     proofs_history_window: u32 = 0,
+    /// `--builder.enabled`: Engine API payload jobs go through the `builder/core` payload
+    /// service (built on an IO timer, sealed at the 150 ms cutoff, getPayload never waits)
+    /// instead of the synchronous `Chain` build. L2 only; null keeps the `Chain` build.
+    builder: ?node_builder_module.Config = null,
     limits: Limits = .{},
 };
 
@@ -323,6 +330,7 @@ pub fn Service(comptime IO: type) type {
         const AuthServer = http.Server(IO, *Self, handle_authrpc);
         const Storage = io_storage.IoStorageType(IO);
         const DurableState = durable_module.Durable(Storage);
+        const NodeBuilder = node_builder_module.NodeBuilder(IO);
 
         allocator: std.mem.Allocator,
         io: *IO,
@@ -348,6 +356,7 @@ pub fn Service(comptime IO: type) type {
         storage_fd: ?IO.Fd = null,
         durable: ?*DurableState = null,
         storage_completion: IO.Completion = .{},
+        node_builder: ?*NodeBuilder = null,
         blocks_mined: u64 = 0,
         mine_failures: u64 = 0,
 
@@ -380,9 +389,32 @@ pub fn Service(comptime IO: type) type {
                 .http_server = undefined,
             };
             if (options.dev_l1 and service.spec.mode != .l1) return error.DevL1NeedsL1Genesis;
+            if (options.builder != null and service.spec.mode != .l2) {
+                return error.BuilderNeedsL2Genesis;
+            }
             try service.init_state(genesis);
             errdefer service.deinit_state();
+            try service.init_builder();
+            errdefer service.deinit_builder();
             try service.init_servers(genesis.timestamp);
+        }
+
+        /// The payload service in front of the chain's synchronous build (`--builder.enabled`).
+        fn init_builder(service: *Self) !void {
+            const config = service.options.builder orelse return;
+            assert(service.spec.mode == .l2);
+            const node_builder = try service.allocator.create(NodeBuilder);
+            errdefer service.allocator.destroy(node_builder);
+            try node_builder.init(service.allocator, service.io, &service.chain, config);
+            service.node_builder = node_builder;
+            assert(service.chain.payload_builder != null);
+        }
+
+        fn deinit_builder(service: *Self) void {
+            const node_builder = service.node_builder orelse return;
+            node_builder.deinit(service.allocator);
+            service.allocator.destroy(node_builder);
+            service.node_builder = null;
         }
 
         fn init_state(service: *Self, genesis: *const genesis_types.Genesis) !void {
@@ -641,6 +673,7 @@ pub fn Service(comptime IO: type) type {
             lazy.free(service.allocator, service.api.scratch);
             if (service.filters) |filters| service.allocator.destroy(filters);
             if (service.kzg) |memory| lazy.destroy(service.allocator, memory);
+            service.deinit_builder();
             service.deinit_state();
             service.* = undefined;
         }

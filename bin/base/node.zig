@@ -9,6 +9,11 @@
 //! blocks; a 1 GiB byte budget shrinks the window under heavy blocks.
 //! `--rehash-threads N` sets the storage-trie rehash workers (default: one per spare core,
 //! at most 4; 0 hashes on the calling thread).
+//! `--builder.enabled` (L2) routes Engine API payload jobs through the `builder/core` payload
+//! service: base/base runs its builder as a separate `builder` binary only to add
+//! flashblocks; without flashblocks the builder is part of `base node` (docs/lanes/builder.md).
+//! `--builder.rejection-cache-max-capacity` and `--builder.rejection-cache-ttl-secs` follow
+//! base/base `crates/builder/cli/src/args.rs`.
 
 const std = @import("std");
 const base = @import("base");
@@ -24,6 +29,8 @@ const usage =
     \\         [--dev-l1 [--block-time S] [--beacon.port P]]
     \\         [--authrpc.port P --authrpc.jwtsecret FILE] [--log.level LEVEL]
     \\         [--proofs-history [--proofs-history.window BLOCKS]] [--rehash-threads N]
+    \\         [--builder.enabled [--builder.rejection-cache-max-capacity N]
+    \\          [--builder.rejection-cache-ttl-secs S]]
     \\
 ;
 
@@ -42,6 +49,9 @@ pub const Flags = struct {
     proofs_history_window: u32 = node.service.proofs_history_window_default,
     /// Storage-rehash workers; null picks `state_db.rehash_threads_auto` from the cores.
     rehash_threads: ?u32 = null,
+    builder: bool = false,
+    builder_rejection_cache_capacity: u32 = 100_000,
+    builder_rejection_cache_ttl_s: u64 = 1800,
 };
 
 pub fn parse_flags(args: []const []const u8) !Flags {
@@ -53,6 +63,11 @@ pub fn parse_flags(args: []const []const u8) !Flags {
         if (eql(u8, arg, "--dev-l1")) {
             flags.dev_l1 = true;
             i += 1; // A switch takes no value.
+            continue;
+        }
+        if (eql(u8, arg, "--builder.enabled")) {
+            flags.builder = true;
+            i += 1;
             continue;
         }
         if (eql(u8, arg, "--proofs-history")) {
@@ -86,6 +101,13 @@ pub fn parse_flags(args: []const []const u8) !Flags {
             const threads = try std.fmt.parseInt(u32, value, 10);
             if (threads > rehash_threads_max) return error.TooManyRehashThreads;
             flags.rehash_threads = threads;
+        } else if (eql(u8, arg, "--builder.rejection-cache-max-capacity")) {
+            flags.builder_rejection_cache_capacity = try std.fmt.parseInt(u32, value, 10);
+            if (flags.builder_rejection_cache_capacity == 0) return error.InvalidCacheCapacity;
+        } else if (eql(u8, arg, "--builder.rejection-cache-ttl-secs")) {
+            flags.builder_rejection_cache_ttl_s = try std.fmt.parseInt(u64, value, 10);
+            const ttl_s = flags.builder_rejection_cache_ttl_s;
+            if (ttl_s == 0 or ttl_s > ttl_s_max) return error.InvalidCacheTtl;
         } else if (eql(u8, arg, "--log.level")) {
             flags.log_level = std.meta.stringToEnum(log.Level, value) orelse
                 return error.UnknownLogLevel;
@@ -97,6 +119,19 @@ pub fn parse_flags(args: []const []const u8) !Flags {
         return error.AuthrpcNeedsPortAndSecret;
     }
     return flags;
+}
+
+/// Keeps the TTL in nanoseconds far inside u64.
+const ttl_s_max: u64 = 365 * 24 * 60 * 60;
+
+fn builder_config(flags: Flags) ?node.service.NodeBuilderConfig {
+    if (!flags.builder) return null;
+    std.debug.assert(flags.builder_rejection_cache_capacity > 0);
+    std.debug.assert(flags.builder_rejection_cache_ttl_s <= ttl_s_max);
+    return .{
+        .rejection_cache_capacity = flags.builder_rejection_cache_capacity,
+        .rejection_cache_ttl_ns = flags.builder_rejection_cache_ttl_s * std.time.ns_per_s,
+    };
 }
 
 fn parse_ip4(text: []const u8) ![4]u8 {
@@ -176,6 +211,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .jwt_secret = secret,
         .data_path = data_path,
         .proofs_history_window = if (flags.proofs_history) flags.proofs_history_window else 0,
+        .builder = builder_config(flags),
         .limits = limits(flags),
     });
     defer service.deinit();
@@ -232,4 +268,23 @@ test "node: rehash threads flag" {
         error.TooManyRehashThreads,
         parse_flags(&.{ "--chain", "g.json", "--rehash-threads", "17" }),
     );
+}
+
+test "node: builder flags" {
+    const off = try parse_flags(&.{ "--chain", "g.json" });
+    try std.testing.expect(builder_config(off) == null);
+    const on = try parse_flags(&.{
+        "--builder.enabled",                      "--chain", "g.json",
+        "--builder.rejection-cache-max-capacity", "64",      "--builder.rejection-cache-ttl-secs",
+        "30",
+    });
+    const config = builder_config(on).?;
+    try std.testing.expectEqual(@as(u32, 64), config.rejection_cache_capacity);
+    try std.testing.expectEqual(30 * std.time.ns_per_s, config.rejection_cache_ttl_ns);
+    try std.testing.expectError(error.InvalidCacheTtl, parse_flags(&.{
+        "--chain", "g.json", "--builder.rejection-cache-ttl-secs", "0",
+    }));
+    try std.testing.expectError(error.InvalidCacheCapacity, parse_flags(&.{
+        "--chain", "g.json", "--builder.rejection-cache-max-capacity", "0",
+    }));
 }

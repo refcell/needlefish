@@ -62,6 +62,38 @@ pub const BuiltPayload = struct {
     block_value: u256,
 };
 
+/// A block sealed by an external payload builder (`builder/core`), resolved by getPayload.
+/// Slices borrow the builder until its next job.
+pub const SealedPayload = struct {
+    header: Header,
+    block_hash: B256,
+    block_value: u256,
+    transactions: []const []const u8,
+    withdrawals: ?[]const payload.Withdrawal,
+};
+
+pub const Resolved = union(enum) {
+    /// `id` is not the builder's active job.
+    unknown,
+    /// The job's build failed.
+    failed,
+    sealed: SealedPayload,
+};
+
+/// An external payload builder in front of the synchronous `Chain` build: an FCU with
+/// attributes starts its job and returns at once; getPayload resolves the sealed block,
+/// which the chain then imports like any other block (`builder/core` `NodeBuilder`).
+pub const PayloadBuilder = struct {
+    context: *anyopaque,
+    start: *const fn (
+        context: *anyopaque,
+        id: payload.PayloadId,
+        parent_hash: Hash,
+        attributes: *const payload.PayloadAttributes,
+    ) engine.EngineError!void,
+    resolve: *const fn (context: *anyopaque, id: payload.PayloadId) Resolved,
+};
+
 pub const Error = executor_module.Error || block_store.Error || error{
     StagingFull,
     InvalidRecord,
@@ -206,6 +238,8 @@ pub const Chain = struct {
     builds: [builds_max]Built = undefined,
     builds_len: u32 = 0,
     builds_next: u32 = 0,
+    /// When set, payload jobs go to this builder instead of the synchronous `build`.
+    payload_builder: ?PayloadBuilder = null,
 
     /// `db` must already hold the genesis state, whose root `genesis` commits to.
     pub fn init(
@@ -344,22 +378,69 @@ pub const Chain = struct {
         parent: engine.BlockRef,
         attributes: *const payload.PayloadAttributes,
     ) engine.EngineError!void {
+        if (chain.payload_builder) |builder| {
+            return builder.start(builder.context, id, parent.hash.bytes, attributes);
+        }
         const entry = chain.build(id, parent.hash.bytes, attributes) catch |err| switch (err) {
             error.InvalidAttributes, error.InvalidTransaction => {
                 return error.InvalidPayloadAttributes;
             },
             else => return error.InternalError,
         };
+        chain.remember_build(entry);
+    }
+
+    fn remember_build(chain: *Chain, entry: Built) void {
+        assert(chain.builds_next < builds_max);
         chain.builds[chain.builds_next] = entry;
         chain.builds_next = (chain.builds_next + 1) % builds_max;
         chain.builds_len = @min(chain.builds_len + 1, builds_max);
+        assert(chain.builds_len <= builds_max);
     }
 
+    /// The payload `id`: the external builder's active job (sealed and imported now), else
+    /// a build already done.
     pub fn built(chain: *Chain, id: payload.PayloadId) ?Built {
+        if (chain.payload_builder) |builder| switch (builder.resolve(builder.context, id)) {
+            .unknown => {},
+            .failed => return null,
+            .sealed => |*sealed| return chain.import_sealed(id, sealed),
+        };
         for (chain.builds[0..chain.builds_len]) |entry| {
             if (std.mem.eql(u8, &entry.id, &id)) return entry;
         }
         return null;
+    }
+
+    /// Imports an externally sealed block through the regular `insert` path (re-executing
+    /// it, which also checks the builder's roots) and records it as payload `id`.
+    fn import_sealed(chain: *Chain, id: payload.PayloadId, sealed: *const SealedPayload) ?Built {
+        assert(sealed.header.hash().eql(sealed.block_hash));
+        var execution_payload = engine.block.payload_of(
+            &sealed.header,
+            sealed.block_hash,
+            sealed.transactions,
+            sealed.withdrawals,
+        );
+        if (chain.spec.mode == .l2) {
+            execution_payload.withdrawals_root = sealed.header.withdrawals_root;
+        }
+        const requests: []const []const u8 = &.{};
+        const params: engine.NewPayloadParams = .{
+            .parent_beacon_block_root = sealed.header.parent_beacon_block_root,
+            .execution_requests = if (sealed.header.requests_hash != null) requests else null,
+        };
+        const known = chain.store.ref(sealed.block_hash.bytes) != null;
+        if (!known and chain.insert(&execution_payload, &params) != .valid) return null;
+        const entry: Built = .{
+            .id = id,
+            .timestamp = sealed.header.timestamp,
+            .block_hash = sealed.block_hash,
+            .block_value = sealed.block_value,
+        };
+        chain.remember_build(entry);
+        assert(chain.store.ref(sealed.block_hash.bytes) != null);
+        return entry;
     }
 
     // ---- Queries --------------------------------------------------------------------
@@ -712,7 +793,7 @@ pub const Chain = struct {
     /// Brings `db` to the post-state of `target`: roll back to the common ancestor with
     /// the current state, then re-execute stored blocks up to `target`. Checks first, so
     /// a failure leaves the state where it was.
-    fn move_state(chain: *Chain, target: Hash) Error!void {
+    pub fn move_state(chain: *Chain, target: Hash) Error!void {
         if (std.mem.eql(u8, &target, &chain.state_hash)) return;
         if (chain.journal) |journal| {
             // The journal unwinds/applies stored changesets on the shared state.

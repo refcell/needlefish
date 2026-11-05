@@ -49,6 +49,8 @@ pub const Payload = struct {
     block_value: u256,
     /// Every transaction of the block, in order; borrows the builder.
     transactions: []const []const u8,
+    /// The attributes' withdrawals; borrows the service until its next job.
+    withdrawals: ?[]const payload.Withdrawal,
     /// Why the build stopped adding pool transactions.
     stop: Stop,
 };
@@ -175,11 +177,26 @@ pub const Service = struct {
         }
     }
 
-    /// Runs the job's one build with `cutoff_ns` and records the sealed block.
+    /// Advances time without building or expiring anything (an FCU or getPayload arriving
+    /// between ticks): the next job's slot starts here, an early resolve cuts off here.
+    pub fn set_now(service: *Service, now_ns: u64) void {
+        assert(now_ns <= timing.time_ns_max);
+        service.now_ns = @max(service.now_ns, now_ns);
+        assert(service.now_ns >= now_ns);
+    }
+
+    /// Runs the job's one build with `cutoff_ns` and records the sealed block. The chain's
+    /// state may have moved since the job started (a block imported in between): it is
+    /// brought back to the parent first.
     fn seal(service: *Service, job: *Job, cutoff_ns: u64) void {
         assert(job.state == .pending);
         assert(cutoff_ns <= job.slot.cutoff_ns);
         const builder = service.builder;
+        service.chain.move_state(builder.job.parent_hash) catch {
+            job.state = .failed;
+            service.metrics.build_failed.increment();
+            return;
+        };
         const stop = builder.build(service.clock, cutoff_ns) catch {
             job.state = .failed;
             service.metrics.build_failed.increment();
@@ -192,6 +209,7 @@ pub const Service = struct {
             .block_hash = header.hash(),
             .block_value = builder.block_value(),
             .transactions = builder.block_transactions(),
+            .withdrawals = service.attributes.withdrawals,
             .stop = stop,
         };
         job.state = .sealed;

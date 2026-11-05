@@ -468,3 +468,50 @@ test "service: L2 engine API requires a valid JWT" {
     const capabilities = accepted.text[0..accepted.size];
     try testing.expect(std.mem.indexOf(u8, capabilities, "newPayloadV4") != null);
 }
+
+test "service: --builder.enabled routes FCU and getPayload through the payload service" {
+    const fixture = @import("test_fixture.zig");
+    const types = @import("../engine/root.zig").types;
+    var world = try io.SimWorld.init(testing.allocator, .{ .seed = 6 });
+    defer world.deinit();
+    var node_io: io.SimIo = undefined;
+    try io.SimIo.init(&node_io, testing.allocator, &world, .{
+        .host = io.Address.ip4(.{ 10, 0, 0, 1 }, 0),
+    });
+    defer node_io.deinit();
+    var text: [64 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    try devnet.genesis.write_l2_genesis(&writer, &.{ .genesis_timestamp = genesis_time });
+    const parsed = try genesis.parse(testing.allocator, writer.buffered());
+    defer parsed.deinit();
+    var log_buffer: [4096]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const service = try testing.allocator.create(Service);
+    defer testing.allocator.destroy(service);
+    try service.init(testing.allocator, &node_io, &logger, &parsed.value, .{
+        .http_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 9545),
+        .builder = .{
+            .builder = .{ .transactions_max = 64, .transaction_bytes_max = 1 << 14 },
+            .rejection_cache_capacity = 64,
+        },
+        .limits = test_limits,
+    });
+    defer service.deinit();
+    try testing.expect(service.chain.payload_builder != null);
+    const parent = primitives.B256{ .bytes = service.chain.head_hash() };
+    const attributes = fixture.attributes_l2(genesis_time + 1, 3);
+    const version = types.forkchoice_version(&service.spec, attributes.timestamp);
+    const choice = fixture.forkchoice(parent);
+    const updated = try service.engine.forkchoice_updated(version, choice, &attributes);
+    try testing.expectEqual(types.Status.valid, updated.payload_status.status);
+    const builder = service.node_builder.?;
+    try testing.expectEqual(@as(u64, 0), builder.service.metrics.blocks_sealed.get());
+    world.run_for_ns(std.time.ns_per_ms);
+    try testing.expectEqual(@as(u64, 1), builder.service.metrics.blocks_sealed.get());
+    const get_version = types.get_payload_version(&service.spec, attributes.timestamp);
+    const built = try service.engine.get_payload(get_version, updated.payload_id.?);
+    const header = service.chain.header(built.block_hash.bytes).?;
+    try testing.expectEqualSlices(u8, &parent.bytes, &header.parent_hash.bytes);
+    try testing.expectEqual(attributes.timestamp, header.timestamp);
+}

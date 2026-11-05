@@ -29,13 +29,13 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - [x] `builder/core` service core: `forkchoiceUpdated` (attributes) starts a job,
   `tick` builds until the cutoff and seals, `resolve` (getPayload) returns the sealed block
   (sealing at once when early); one job at a time; cancellation on new FCU.
-- [ ] Wire `builder/core` `Service` into the node's Engine API handlers
+- [x] Wire `builder/core` `Service` into the node's Engine API handlers
   (`engine_forkchoiceUpdated` with attributes, `engine_getPayload`) behind a flag, with the
   node's IO clock as the builder `Clock` (coordinate with nf-node via small edits).
 - [ ] 200 ms cadence end to end with nf-consensus and nf-batcher-devnet: sequencer
   requests a payload every 200 ms slot, seals at the offset, inserts; devnet genesis
   activates Denim/subsecond blocks at genesis; `just devnet smoke` passes at 200 ms.
-- [ ] `bin/base builder` subcommand + flags (non-flashblocks subset of base/base
+- [x] `bin/base builder` subcommand + flags (non-flashblocks subset of base/base
   `builder/cli/args.rs`), or fold into `base node` if base/base does not need a separate
   process without flashblocks — decide, record, implement.
 - [ ] DST: builder in the cluster simulator at 200 ms blocks; invariants: every slot gets
@@ -47,6 +47,20 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 ## Decisions
 - 2026-11-05: Flashblocks dropped by the project owner; superseded flashblocks
   decisions are in git history (`git log -- docs/lanes/flashblocks-builder.md`).
+- 2026-11-05: Engine API wiring: `Chain.payload_builder` (an optional vtable) sits in front of
+  the synchronous `Chain` build; `builder/core` `NodeBuilder(IO)` implements it. FCU with
+  attributes starts a job and returns; a zero-delay IO timer ticks the service (build + seal
+  at the 150 ms cutoff), a second timer drops expired jobs. getPayload resolves (sealing at
+  once if unbuilt) and the chain imports the sealed block through its regular `insert`, which
+  re-executes it once (doubles block execution on the sequencer, but verifies the builder's
+  roots and keeps one import path; a direct commit of the builder's state is a later
+  optimisation). A failed build makes getPayload answer `UnknownPayload`; a failed job start
+  answers `InvalidPayloadAttributes`. The old `Chain` build stays the default; the service is
+  opt-in (`--builder.enabled`), L2 only (L1 Prague requests are not carried by the builder).
+- 2026-11-05: No separate `base builder` binary. base/base ships `bin/builder` only to add
+  flashblocks and its extensions on top of the execution node; without flashblocks the
+  builder folds into `base node` behind `--builder.enabled` with the non-flashblocks flags
+  `--builder.rejection-cache-max-capacity` and `--builder.rejection-cache-ttl-secs`.
 - 2026-11-05: `compact_flashblock_metadata` dropped from both feature enums (genesis and
   rollup config): base/base reads it only in the flashblocks payload path.
 - 2026-11-05: single-shot builder runs in one synchronous `build` call (begin block,
@@ -88,6 +102,9 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   the producer's canonical JSON; seeded + fuzz request shapes.
 - 2026-11-05: lane repointed from flashblocks-builder to builder (no flashblocks, native
   200 ms blocks).
+- 2026-11-05: `builder/core` `NodeBuilder(IO)` wires the payload service into the node's Engine
+  API (`Chain.payload_builder`, IO timers, `--builder.enabled` on `base node`); engine-level
+  tests (equals a `Chain` build, early getPayload, expiry) and seeded + fuzz interleavings.
 - 2026-11-05: removed flashblocks, step 1: `execution/flashblocks` (consumer, RPC, pubsub),
   `builder/publish`, flashblock fuzz targets, and `BaseFeature.compact_flashblock_metadata`.
 - 2026-11-05: removed flashblocks, step 2: `common/flashblocks`, `builder/multiplex`, and the
