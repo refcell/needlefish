@@ -432,7 +432,15 @@ pub fn Transport(comptime IO: type) type {
                     }
                     transport.finish_close(link);
                 },
-                .identified, .ping_rtt_ns => {},
+                .identified => {
+                    const slot = link.slot orelse return;
+                    const message = link.connection.remote_identify_message() orelse return;
+                    transport.service.on_identified(slot, message);
+                },
+                .ping_rtt_ns => |rtt_ns| {
+                    const slot = link.slot orelse return;
+                    transport.service.on_ping(slot, rtt_ns);
+                },
             }
         }
 

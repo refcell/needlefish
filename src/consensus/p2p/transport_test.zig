@@ -238,6 +238,14 @@ test "p2p transport: nodes discover, connect over libp2p, and gossip a block" {
     defer cluster.deinit();
     cluster.run(8 * ns_per_s);
     for (cluster.all()) |*node| try std.testing.expect(node.transport.open_count() >= 2);
+    // Identify reached the service: every connected peer reports our agent and meshsub.
+    for (cluster.all()) |*node| {
+        for (&node.service.connected) |*connection| {
+            if (!connection.active) continue;
+            try std.testing.expectEqualStrings("needlefish", connection.info.agent_version.slice());
+            try std.testing.expect(connection.info.protocols_count > 0);
+        }
+    }
     try cluster.publish(2, 7);
     cluster.run(1 * ns_per_s);
     const scratch = try std.testing.allocator.alloc(u8, 10 << 20);

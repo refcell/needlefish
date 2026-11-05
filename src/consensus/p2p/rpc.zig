@@ -3,8 +3,10 @@
 //!
 //! JSON shapes and names follow base/base (camelCase, `peerID`, `nodeID`, `ENR`,
 //! `chainID`, `bannedIPS`, `IPColocationFactor`; connectedness and direction as integers).
-//! Fields this node does not track are reported as zero or empty: identify agent and
-//! protocols (kept by the transport), latency, per-topic score parts, req/resp scores.
+//! Peer agent, protocol version, protocols (up to 8), listen addresses (up to 4), and
+//! latency come from identify and ping. `opp2p_self` reports what base/base reports (agent
+//! `base`, inbound, its protocol list, the local TCP multiaddr). Fields this node does not
+//! track are zero: per-topic score parts and req/resp scores.
 //! Differences: `opp2p_blockPeer` also disconnects the peer (base/base blacklists it in
 //! gossipsub, which drops all its messages), and `opp2p_protectPeer` does not lift
 //! connection limits (only gater limits).
@@ -58,14 +60,32 @@ fn self_info(service: *Service, call: *Call) HandlerError!void {
     try call.params.finish();
     const record = &service.discovery.local_record;
     const peer = peer_id.from_public_key(record.public_key);
+    var info: service_module.PeerInfo = .{ .agent_version = .init("base") };
+    for (self_protocols, 0..) |protocol, index| info.protocols[index] = .init(protocol);
+    info.protocols_count = self_protocols.len;
+    if (multiaddr.from_enr(record)) |address| {
+        info.addresses[0] = address;
+        info.addresses_count = 1;
+    }
     try write_peer_info(service, call.writer, .{
         .peer = peer,
         .node_id = record.node_id(),
         .record = record,
-        .direction = 0,
+        .info = &info,
+        .direction = direction_inbound,
         .score = 0,
         .behaviour_penalty = 0,
     });
+}
+
+/// base/base's reported protocol list for `opp2p_self`.
+const self_protocols = [_][]const u8{
+    "/ipfs/id/push/1.0.0", "/meshsub/1.1.0", "/ipfs/ping/1.0.0", "/meshsub/1.2.0",
+    "/ipfs/id/1.0.0",      "/meshsub/1.0.0", "/floodsub/1.0.0",
+};
+
+comptime {
+    assert(self_protocols.len <= service_module.PeerInfo.protocols_max);
 }
 
 fn peer_count(service: *Service, call: *Call) HandlerError!void {
@@ -264,6 +284,7 @@ const PeerInfo = struct {
     peer: peer_id.PeerId,
     node_id: enr.NodeId,
     record: ?*const enr.Record,
+    info: *const service_module.PeerInfo,
     direction: u8,
     score: f64,
     behaviour_penalty: f64,
@@ -279,6 +300,7 @@ fn write_connected_peer(service: *Service, writer: *json.Writer, slot: router_mo
         .peer = connection.peer,
         .node_id = if (key) |value| enr.node_id_from_public_key(value) else @splat(0),
         .record = null,
+        .info = &connection.info,
         .direction = switch (connection.direction) {
             .inbound => direction_inbound,
             .outbound => direction_outbound,
@@ -295,25 +317,40 @@ fn write_peer_info(service: *Service, writer: *json.Writer, info: PeerInfo) !voi
     try writer.key("peerID");
     try writer.string(info.peer.format(&text));
     try writer.key("nodeID");
-    const hex = std.fmt.bytesToHex(info.node_id, .lower);
-    try writer.string(&hex);
-    try field_string(writer, "userAgent", "");
-    try field_string(writer, "protocolVersion", "");
+    var node_id_text: [2 + 64]u8 = undefined;
+    node_id_text[0..2].* = "0x".*;
+    node_id_text[2..].* = std.fmt.bytesToHex(info.node_id, .lower);
+    try writer.string(&node_id_text);
+    try field_string(writer, "userAgent", info.info.agent_version.slice());
+    try field_string(writer, "protocolVersion", info.info.protocol_version.slice());
     if (info.record) |record| {
         var record_text: [enr.text_length_max]u8 = undefined;
         try field_string(writer, "ENR", enr.encode_text(&record_text, record));
     }
     try writer.key("addresses");
     try writer.begin_array();
+    for (info.info.addresses[0..info.info.addresses_count]) |*address| {
+        var address_text: [multiaddr.text_length_max]u8 = undefined;
+        try writer.string(address.format(&address_text));
+    }
     try writer.end_array();
     try writer.key("protocols");
-    try writer.null_value();
+    if (info.info.protocols_count == 0) {
+        try writer.null_value();
+    } else {
+        try writer.begin_array();
+        for (info.info.protocols[0..info.info.protocols_count]) |*protocol| {
+            try writer.string(protocol.slice());
+        }
+        try writer.end_array();
+    }
     try field_integer(writer, "connectedness", connectedness_connected);
     try field_integer(writer, "direction", info.direction);
     try writer.key("protected");
     try writer.boolean(info.protected);
     try field_integer(writer, "chainID", service.config.rollup.l2_chain_id);
-    try field_integer(writer, "latency", 0);
+    // Nanoseconds, like op-node's Go `time.Duration`; base/base always reports 0.
+    try field_integer(writer, "latency", info.info.latency_ns);
     try writer.key("gossipBlocks");
     try writer.boolean(true);
     try writer.key("scores");

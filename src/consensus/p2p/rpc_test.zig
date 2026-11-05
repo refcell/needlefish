@@ -87,6 +87,10 @@ test "p2p rpc: self, counts, peers, and stats" {
     try expect_contains(self_reply, "\"peerID\":\"16Uiu2");
     try expect_contains(self_reply, "\"ENR\":\"enr:-");
     try expect_contains(self_reply, "\"chainID\":8453");
+    try expect_contains(self_reply, "\"userAgent\":\"base\"");
+    try expect_contains(self_reply, "\"nodeID\":\"0x");
+    try expect_contains(self_reply, "\"addresses\":[\"/ip4/10.0.0.1/tcp/9222/p2p/16Uiu2");
+    try expect_contains(self_reply, "\"/meshsub/1.2.0\"");
     const count = fixture.call(
         \\{"jsonrpc":"2.0","id":2,"method":"opp2p_peerCount","params":[]}
     );
@@ -211,4 +215,54 @@ test "p2p rpc: seeded fuzz of methods and params" {
         try @import("../../utilities/json/root.zig").validate(reply);
         while (fixture.service.pop_command()) |_| {}
     }
+}
+
+test "p2p rpc: peers carry identify and ping data" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var message: @import("libp2p/identify.zig").Identify = .{
+        .agent_version = "op-node/v1.9.0",
+        .protocol_version = "",
+    };
+    message.protocols[0] = "/meshsub/1.1.0";
+    message.protocols_count = 1;
+    const multiaddr = @import("peers/multiaddr.zig");
+    message.listen_addresses[0] = try multiaddr.parse("/ip4/10.0.1.0/tcp/9222");
+    message.listen_addresses_count = 1;
+    const slot = fixture.service.slot_of(&fixture.peers[0]).?;
+    fixture.service.on_ping(slot, 1_500_000);
+    fixture.service.on_identified(slot, &message);
+    const dump = fixture.call(
+        \\{"jsonrpc":"2.0","id":1,"method":"opp2p_peers","params":[true]}
+    );
+    try expect_contains(dump, "\"userAgent\":\"op-node/v1.9.0\"");
+    try expect_contains(dump, "\"addresses\":[\"/ip4/10.0.1.0/tcp/9222\"]");
+    try expect_contains(dump, "\"protocols\":[\"/meshsub/1.1.0\"]");
+    try expect_contains(dump, "\"latency\":1500000");
+    try expect_contains(dump, "\"protocols\":null");
+}
+
+test "p2p rpc: peer info truncates long identify fields" {
+    const long_agent: [200]u8 = @splat('a');
+    var message: @import("libp2p/identify.zig").Identify = .{ .agent_version = &long_agent };
+    for (0..20) |index| message.protocols[index] = "/p";
+    message.protocols_count = 20;
+    const info = service_module.PeerInfo.from_identify(&message);
+    const agent = info.agent_version.slice();
+    try testing.expectEqual(@as(usize, service_module.PeerInfo.text_max), agent.len);
+    try testing.expectEqual(@as(u8, service_module.PeerInfo.protocols_max), info.protocols_count);
+}
+
+fn fuzz_peer_info(_: void, input: []const u8) anyerror!void {
+    const message = @import("libp2p/identify.zig").decode(input) catch return;
+    const info = service_module.PeerInfo.from_identify(&message);
+    try testing.expect(info.protocols_count <= service_module.PeerInfo.protocols_max);
+    try testing.expect(info.addresses_count <= service_module.PeerInfo.addresses_max);
+    try testing.expect(info.agent_version.slice().len <= service_module.PeerInfo.text_max);
+}
+
+test "p2p rpc: fuzz peer info from identify bytes" {
+    const fuzz = @import("../../testing/fuzz.zig");
+    try fuzz.run_bytes({}, fuzz_peer_info, fuzz.Options{ .input_size_max = 4096, .corpus = &.{} });
 }

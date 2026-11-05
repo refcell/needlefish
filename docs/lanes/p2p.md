@@ -49,8 +49,9 @@ behind a small interface and switch later.
 - [x] `metrics.zig`: base/base `base_node_*` gossip/discovery metrics (peer counts, per-version
   topic peers/mesh/subscribed, connections, block validation, bytes) mirrored from `Stats`
   by `Metrics.update` / `Network.update_metrics`; hot paths stay atomic-free.
-- [ ] RPC peer info: fill `userAgent`, `protocolVersion`, `protocols`, `addresses`, and
-  `latency` from the transport's identify and ping state (needs a per-peer info hook).
+- [x] RPC peer info: `Service.on_identified`/`on_ping` (fed by the transport) keep bounded
+  per-peer agent, protocol version, 8 protocols, 4 listen addresses, latency (ns, like
+  op-node); `opp2p_self` reports base/base's agent `base`, protocol list, local multiaddr.
 - [ ] Perf: ChaCha20 now dominates the AEAD (2260 MB/s vs Poly1305 4006 MB/s); try 16-block
   passes or interleaved rounds on NEON.
 - [x] `libp2p`: identify and ping protocols; connection manager (bounded inbound/outbound).
@@ -260,3 +261,4 @@ behind a small interface and switch later.
 - 2026-11-05: transport uses io shutdown_now before close.
 - 2026-11-05: Poly1305 vector path measured (+8%) and dropped; std kept.
 - 2026-11-05: p2p Prometheus metrics.
+- 2026-11-05: RPC peer info from identify and ping.

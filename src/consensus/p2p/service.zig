@@ -28,6 +28,7 @@ const connections = @import("libp2p/connections.zig");
 const enr = @import("peers/enr.zig");
 const ip = @import("peers/ip.zig");
 const multiaddr = @import("peers/multiaddr.zig");
+const identify = @import("libp2p/identify.zig");
 const peer_id = @import("peers/peer_id.zig");
 const secp256k1 = @import("peers/secp256k1.zig");
 const primitives = @import("../../common/primitives/root.zig");
@@ -79,11 +80,64 @@ pub const Stats = struct {
 
 const commands_max = 128;
 
+/// What identify and ping told us about a connected peer, bounded for static storage.
+pub const PeerInfo = struct {
+    pub const text_max = 64;
+    pub const protocols_max = 8;
+    pub const addresses_max = 4;
+
+    agent_version: Text = .{},
+    protocol_version: Text = .{},
+    protocols: [protocols_max]Text = @splat(.{}),
+    protocols_count: u8 = 0,
+    addresses: [addresses_max]multiaddr.Multiaddr = undefined,
+    addresses_count: u8 = 0,
+    latency_ns: u64 = 0,
+
+    /// A string truncated to `text_max` bytes.
+    pub const Text = struct {
+        bytes: [text_max]u8 = undefined,
+        length: u8 = 0,
+
+        pub fn init(value: []const u8) Text {
+            var text: Text = .{};
+            text.length = @intCast(@min(value.len, text_max));
+            @memcpy(text.bytes[0..text.length], value[0..text.length]);
+            return text;
+        }
+
+        pub fn slice(text: *const Text) []const u8 {
+            assert(text.length <= text_max);
+            return text.bytes[0..text.length];
+        }
+    };
+
+    pub fn from_identify(message: *const identify.Identify) PeerInfo {
+        var info: PeerInfo = .{
+            .agent_version = .init(message.agent_version),
+            .protocol_version = .init(message.protocol_version),
+        };
+        for (message.protocol_slice()) |protocol| {
+            if (info.protocols_count == protocols_max) break;
+            info.protocols[info.protocols_count] = .init(protocol);
+            info.protocols_count += 1;
+        }
+        for (message.listen_slice()) |address| {
+            if (info.addresses_count == addresses_max) break;
+            info.addresses[info.addresses_count] = address;
+            info.addresses_count += 1;
+        }
+        assert(info.protocols_count <= protocols_max);
+        return info;
+    }
+};
+
 const Connected = struct {
     active: bool = false,
     peer: peer_id.PeerId = undefined,
     direction: connections.Direction = .inbound,
     disconnecting: bool = false,
+    info: PeerInfo = .{},
 };
 
 pub const Service = struct {
@@ -283,6 +337,22 @@ pub const Service = struct {
         return slot;
     }
 
+    /// Records the peer's identify message (agent, protocols, listen addresses).
+    pub fn on_identified(service: *Service, slot: Slot, message: *const identify.Identify) void {
+        const connection = &service.connected[slot];
+        assert(connection.active);
+        const latency_ns = connection.info.latency_ns;
+        connection.info = .from_identify(message);
+        connection.info.latency_ns = latency_ns;
+    }
+
+    /// Records the latest ping round trip.
+    pub fn on_ping(service: *Service, slot: Slot, rtt_ns: u64) void {
+        const connection = &service.connected[slot];
+        assert(connection.active);
+        connection.info.latency_ns = rtt_ns;
+    }
+
     pub fn on_disconnected(service: *Service, slot: Slot, now_ns: u64) void {
         const connection = &service.connected[slot];
         assert(connection.active);
@@ -291,7 +361,7 @@ pub const Service = struct {
         connection.* = .{};
     }
 
-    fn slot_of(service: *const Service, peer: *const peer_id.PeerId) ?Slot {
+    pub fn slot_of(service: *const Service, peer: *const peer_id.PeerId) ?Slot {
         for (&service.connected, 0..) |*connection, slot| {
             if (connection.active and connection.peer.eql(peer)) return @intCast(slot);
         }
