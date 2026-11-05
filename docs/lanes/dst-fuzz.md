@@ -333,3 +333,9 @@ provably robust.
   real sequencer records a zero state root (reference state root differs), restart skips
   label recovery (safe head not the engine's safe label), power loss without crash (no
   blocks lost): 5/5 caught. Swarm 1..3000 green (ReleaseSafe, 12 shards of 250).
+- 2026-11-05: `fuzz_targets_eip8130_apply.zig`: model-based fuzz of the EIP-8130 config-change
+  apply step (authorize/revoke/epoch/lock batches, malformed payloads incl. dirty uint48
+  expiry, stale/skipped sequences) on real `AccountConfiguration` storage; checks outcome,
+  discount, every actor slot, account state, logs, partial effects of failing batches, and
+  checkpoint revert. Mutants 3/4 caught; the survivor (no inline-self disable on explicit
+  self revoke) is equivalent: an explicit self entry implies the inline self is disabled.
