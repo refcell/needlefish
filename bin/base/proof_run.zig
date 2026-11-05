@@ -170,12 +170,15 @@ pub fn main(init: std.process.Init, flags: Flags) !u8 {
     try boot(&source, &store, flags, rollup_json, l1_config);
     const verdict = try prove(allocator, &store, &source);
     if (flags.out) |path| try write_archive(init, &store, path);
-    std.debug.print("proof: block {d} output root 0x{x} claimed 0x{x}: {s} ({d} preimages)\n", .{
+    const line = "proof: block {d} output root 0x{x} claimed 0x{x}: {s} " ++
+        "({d} preimages, {d} calls)\n";
+    std.debug.print(line, .{
         verdict.outcome.block_number,
         verdict.outcome.output_root,
         verdict.claimed_output_root,
         if (verdict.holds) "holds" else "does not hold",
         store.count(),
+        source.calls,
     });
     return if (verdict.holds) 0 else 1;
 }
