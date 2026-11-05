@@ -162,7 +162,11 @@ pub fn Sender(comptime EndpointType: type) type {
         }
 
         /// Signs and sends the transaction; returns its hash.
-        fn broadcast(self: *Self, request: Request, gas_estimate: u64) endpoint_module.Error![32]u8 {
+        fn broadcast(
+            self: *Self,
+            request: Request,
+            gas_estimate: u64,
+        ) endpoint_module.Error![32]u8 {
             const config = self.config;
             const nonce_raw = try self.l1.call("eth_getTransactionCount", &.{
                 .{ .address = config.from },
