@@ -332,6 +332,7 @@ fn check_field_against_big_ints(comptime F: type, seed: u64) !void {
             a.sub(b).to_int(),
         );
         try testing.expectEqual((@as(Wide, a_int) * b_int) % F.modulus, a.mul(b).to_int());
+        try testing.expectEqual((@as(Wide, a_int) * a_int) % F.modulus, a.square().to_int());
         if (round % 50 == 0 and !a.is_zero()) {
             try testing.expect(a.inverse().mul(a).eql(F.one));
             try testing.expect(a.inverse().eql(a.inverse_constant_time()));

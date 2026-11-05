@@ -389,6 +389,16 @@ fn bench_verify_std(iterations: u32) u64 {
     return accumulator;
 }
 
+fn bench_field_square(comptime F: type) fn (u32) u64 {
+    return struct {
+        fn run(iterations: u32) u64 {
+            var a = F.from_int(0x1234_5678_9abc_def0);
+            for (0..iterations) |_| a = a.square();
+            return a.limbs_value[0];
+        }
+    }.run;
+}
+
 fn bench_field_inverse(comptime F: type, comptime vartime: bool) fn (u32) u64 {
     return struct {
         fn run(iterations: u32) u64 {
@@ -404,6 +414,12 @@ fn bench_field_inverse(comptime F: type, comptime vartime: bool) fn (u32) u64 {
 }
 
 pub const cases = [_]Case{
+    .{ .name = "field/bn254 square", .iterations = 10_000_000, .run = bench_field_square(Bn254Fp) },
+    .{
+        .name = "field/bls12-381 square",
+        .iterations = 10_000_000,
+        .run = bench_field_square(Bls12Fp),
+    },
     .{
         .name = "field/bn254 inverse_constant_time",
         .iterations = 20_000,

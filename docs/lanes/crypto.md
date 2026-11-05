@@ -157,6 +157,10 @@ fallback but hot paths should be our own, optimized implementations.
   generalized from secp256k1/modinv.zig) because every user of the shared field handles
   public data; Fermat stays as `inverse_constant_time` for any future secret use.
 
+- Dedicated Montgomery squaring (SOS: cross products once, doubled, then REDC with collected
+  row carries) measured no faster than `mul(a, a)` on M4 (bls 27.6 vs 26.3 ns, bn254 21.1 vs
+  19.7): latency is dominated by the serial reduction. Not adopted; `square` stays `mul`.
+
 ## Log
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
