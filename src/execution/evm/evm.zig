@@ -388,6 +388,8 @@ pub const Evm = struct {
             .value = call.value,
             .is_static = call.is_static,
             .gas_limit = request.gas_limit,
+            .chain_id = evm.config.chain_id,
+            .timestamp = evm.block.timestamp,
             .out = evm.return_buffer,
         };
         const is_direct = request.kind == .call or request.kind == .staticcall;

@@ -624,3 +624,211 @@ test "op: native string storage round-trips and cleans tails from Cobalt" {
         try testing.expectEqual(@as(u256, 0), try h.storage(target, 9));
     }
 }
+
+const b20 = @import("native_b20.zig");
+const b20_asset = @import("native_b20_asset.zig");
+const token_address: Address = .{ 0xb2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+const holder = primitives.address_from_int(0x401de2);
+
+fn short_string(comptime text: []const u8) u256 {
+    var word: [32]u8 = @splat(0);
+    @memcpy(word[0..text.len], text);
+    word[31] = 2 * text.len;
+    return std.mem.readInt(u256, &word, .big);
+}
+
+fn role_slot(role: u256, account: Address) u256 {
+    const inner = native.mapping_slot(native.u256_word(role), b20.root + 6);
+    return native.mapping_slot(native.address_word(account), inner);
+}
+
+/// A Beryl harness with an initialized asset token: the sender holds the admin and mint roles.
+fn token_setup(h: *Harness) !void {
+    try h.init(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    try h.database.put_account(token_address, 0, 0, &native.marker_code);
+    try h.database.put_storage(token_address, b20.slot_name, short_string("Token"));
+    try h.database.put_storage(token_address, b20.slot_symbol, short_string("TKN"));
+    try h.database.put_storage(token_address, b20.slot_supply_cap, 1_000_000);
+    try h.database.put_storage(token_address, b20_asset.asset_root + 1, b20_asset.wad);
+    try h.database.put_storage(token_address, role_slot(0, sender_address), 1);
+    try h.database.put_storage(token_address, b20.root + 8, 1);
+    try h.database.put_storage(token_address, role_slot(b20.role_mint, sender_address), 1);
+    h.state.reset(h.database.interface());
+}
+
+fn token_input(buffer: []u8, tag: b20_asset.Tag, words: []const u256) []const u8 {
+    buffer[0..4].* = b20_asset.selector_of(tag);
+    for (words, 0..) |word, index| {
+        std.mem.writeInt(u256, buffer[4 + 32 * index ..][0..32], word, .big);
+    }
+    return buffer[0 .. 4 + 32 * words.len];
+}
+
+fn token_call(h: *Harness, tag: b20_asset.Tag, words: []const u256) !transaction.Executed {
+    var buffer: [4 + 32 * 8]u8 = undefined;
+    return native_call(h, token_address, token_input(&buffer, tag, words), 0);
+}
+
+fn output_int(executed: transaction.Executed) u256 {
+    return std.mem.readInt(u256, executed.output[0..32], .big);
+}
+
+test "op: B-20 asset mints, transfers, and enforces balances and the supply cap" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    const minted = try token_call(&h, .mint, &.{ address_int(sender_address), 600 });
+    try testing.expect(minted.status == .success);
+    try testing.expectEqual(@as(usize, 1), minted.logs.len);
+    const supply = try token_call(&h, .total_supply, &.{});
+    try testing.expectEqual(@as(u256, 600), output_int(supply));
+
+    const sent = try token_call(&h, .transfer, &.{ address_int(holder), 250 });
+    try testing.expect(sent.status == .success);
+    try testing.expectEqual(@as(u256, 1), output_int(sent));
+    const holder_balance = try token_call(&h, .balance_of, &.{address_int(holder)});
+    try testing.expectEqual(@as(u256, 250), output_int(holder_balance));
+
+    const short = try token_call(&h, .transfer, &.{ address_int(holder), 351 });
+    try testing.expect(short.status == .revert);
+    try testing.expectEqualSlices(u8, &b20.error_insufficient_balance, short.output[0..4]);
+    try testing.expectEqual(@as(usize, 4 + 96), short.output.len);
+
+    const capped = try token_call(&h, .mint, &.{ address_int(holder), 999_401 });
+    try testing.expect(capped.status == .revert);
+    const exact = try token_call(&h, .mint, &.{ address_int(holder), 999_400 });
+    try testing.expect(exact.status == .success);
+
+    const zero = try token_call(&h, .transfer, &.{ 0, 1 });
+    try testing.expectEqualSlices(u8, &b20.error_invalid_receiver, zero.output[0..4]);
+}
+
+test "op: B-20 asset pause flags, roles, and views" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    // Pausing needs PAUSE_ROLE.
+    var buffer: [4 + 32 * 4]u8 = undefined;
+    const pause_input = token_input(&buffer, .pause, &.{ 0x20, 1, 0 });
+    const denied = try native_call(&h, token_address, pause_input, 0);
+    try testing.expectEqualSlices(u8, &b20.error_unauthorized_account, denied.output[0..4]);
+    const sender = address_int(sender_address);
+    const granted = try token_call(&h, .grant_role, &.{ b20.role_pause, sender });
+    try testing.expect(granted.status == .success);
+    const paused = try native_call(&h, token_address, pause_input, 0);
+    try testing.expect(paused.status == .success);
+    const blocked = try token_call(&h, .transfer, &.{ address_int(holder), 0 });
+    try testing.expectEqualSlices(u8, &b20.error_contract_paused, blocked.output[0..4]);
+    const features = try token_call(&h, .paused_features, &.{});
+    try testing.expectEqual(@as(usize, 96), features.output.len);
+    // Out-of-range enum is a decode failure; empty arrays revert EmptyFeatureSet.
+    const bad_input = token_input(&buffer, .pause, &.{ 0x20, 1, 3 });
+    const bad = try native_call(&h, token_address, bad_input, 0);
+    try testing.expect(bad.status == .revert);
+    const empty_input = token_input(&buffer, .pause, &.{ 0x20, 0 });
+    const empty = try native_call(&h, token_address, empty_input, 0);
+    try testing.expectEqual(@as(usize, 4), empty.output.len);
+
+    const name = try token_call(&h, .name, &.{});
+    try testing.expectEqual(@as(usize, 96), name.output.len);
+    try testing.expectEqualStrings("Token", name.output[64..69]);
+    const decimals = try token_call(&h, .decimals, &.{});
+    try testing.expectEqual(@as(u256, 6), output_int(decimals));
+    const domain = try token_call(&h, .eip712_domain, &.{});
+    try testing.expectEqual(@as(usize, 7 * 32 + 64 + 64 + 32), domain.output.len);
+    try testing.expectEqual(@as(u8, 0x0f), domain.output[0]);
+
+    // Last admin cannot renounce; unknown selectors revert with the bare selector.
+    const renounce = try token_call(&h, .renounce_role, &.{ 0, address_int(sender_address) });
+    try testing.expect(renounce.status == .revert);
+    const unknown = try native_call(&h, token_address, &.{ 0xde, 0xad, 0xbe, 0xef }, 0);
+    try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, unknown.output);
+    const payable = try native_call(&h, token_address, token_input(&buffer, .name, &.{}), 1);
+    try testing.expectEqualSlices(u8, &native.selector_non_payable, payable.output);
+}
+
+test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    var buffer: [4 + 32 * 8]u8 = undefined;
+    // updateName needs METADATA_ROLE; with it the name and its event change.
+    _ = try token_call(&h, .grant_role, &.{ b20.role_metadata, address_int(sender_address) });
+    const abc = short_string("abc") & ~@as(u256, 0xff);
+    const input = token_input(&buffer, .update_name, &.{ 0x20, 3, abc });
+    const renamed = try native_call(&h, token_address, input, 0);
+    try testing.expect(renamed.status == .success);
+    try testing.expectEqual(@as(usize, 2), renamed.logs.len);
+    const name = try token_call(&h, .name, &.{});
+    try testing.expectEqualStrings("abc", name.output[64..67]);
+
+    const operator = try token_call(&h, .update_multiplier, &.{2 * b20_asset.wad});
+    try testing.expectEqualSlices(u8, &b20.error_unauthorized_account, operator.output[0..4]);
+    _ = try token_call(&h, .grant_role, &.{ b20_asset.role_operator, address_int(sender_address) });
+    const doubled = try token_call(&h, .update_multiplier, &.{2 * b20_asset.wad});
+    try testing.expect(doubled.status == .success);
+    const scaled = try token_call(&h, .to_scaled_balance, &.{10});
+    try testing.expectEqual(@as(u256, 20), output_int(scaled));
+
+    const approved = try token_call(&h, .approve, &.{ address_int(holder), 77 });
+    try testing.expect(approved.status == .success);
+    const pair = [2]u256{ address_int(sender_address), address_int(holder) };
+    const allowance = try token_call(&h, .allowance, &pair);
+    try testing.expectEqual(@as(u256, 77), output_int(allowance));
+
+    const owner = address_int(holder);
+    const expired = try token_call(&h, .permit, &.{ owner, owner, 1, 0, 27, 1, 1 });
+    try testing.expect(expired.status == .success or expired.status == .revert);
+    const bad_v = try token_call(&h, .permit, &.{ owner, owner, 1, 1 << 40, 29, 1, 1 });
+    try testing.expect(bad_v.status == .revert);
+    try testing.expectEqual(@as(usize, 4 + 64), bad_v.output.len);
+    try testing.expectEqual(owner, std.mem.readInt(u256, bad_v.output[36..68], .big));
+}
+
+const token_roles = [_]u256{ 0, b20.role_mint, b20.role_pause, b20.role_burn, b20.role_metadata };
+
+/// Argument words that reach deep token paths: pool accounts, small amounts, role and scope
+/// ids, ABI offsets, and occasionally random words.
+fn token_word(prng: *Prng) u256 {
+    return switch (prng.below(6)) {
+        0 => address_int(if (prng.chance(1, 2)) sender_address else holder),
+        1 => prng.below(2_000),
+        2 => token_roles[prng.below(token_roles.len)],
+        3 => b20.PolicyScope.transfer_sender.id(),
+        4 => 0x20 * (1 + prng.below(4)),
+        else => prng.random().int(u256),
+    };
+}
+
+fn fuzz_token(h: *Harness, smith: *testing.Smith) anyerror!void {
+    var prng = Prng.init(smith.value(u64));
+    var buffer: [4 + 32 * 8]u8 = undefined;
+    var words: [8]u256 = undefined;
+    for (&words) |*word| word.* = token_word(&prng);
+    const function = b20_asset.functions[prng.below(b20_asset.functions.len)];
+    const count = prng.below(words.len + 1);
+    var input = token_input(&buffer, function.tag, words[0..count]);
+    if (prng.chance(1, 8)) input = input[0..prng.below(input.len + 1)];
+    const floor = 21_000 + calldata_gas(input) * 10 / 4;
+    const gas_limit = floor + prng.below(120_000);
+    const value: u256 = if (prng.chance(1, 16)) 1 else 0;
+    const executed = try native_call_gas(h, token_address, input, value, gas_limit);
+    try testing.expect(executed.gas_used <= gas_limit);
+    switch (executed.status) {
+        .success => try testing.expect(executed.output.len % 32 == 0),
+        .revert => try testing.expect(executed.output.len == 0 or executed.output.len >= 4),
+        .halt => try testing.expectEqual(gas_limit, executed.gas_used),
+    }
+    const supply = try h.state.storage_value(token_address, b20.slot_total_supply);
+    const cap = try h.state.storage_value(token_address, b20.slot_supply_cap);
+    try testing.expect(supply <= cap);
+}
+
+test "op fuzz: B-20 asset calls keep gas, output, and supply invariants" {
+    const h = try testing.allocator.create(Harness);
+    defer testing.allocator.destroy(h);
+    try token_setup(h);
+    defer h.deinit(testing.allocator);
+    try fuzz.run(h, fuzz_token, .{ .seed = 0x623230, .iterations = 512 });
+}

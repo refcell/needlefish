@@ -22,6 +22,7 @@ const op = @import("op.zig");
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const activation = @import("native_activation.zig");
 const policy = @import("native_policy.zig");
+const b20_asset = @import("native_b20_asset.zig");
 const native_abi = @import("native_abi.zig");
 pub const Address = primitives.Address;
 const B256 = primitives.B256;
@@ -51,6 +52,9 @@ pub const Context = struct {
     value: u256,
     is_static: bool,
     gas_limit: u64,
+    /// Chain id and block timestamp (B-20 permit domain and deadline).
+    chain_id: u64 = 0,
+    timestamp: u64 = 0,
     gas_used: u64 = 0,
     refund: i64 = 0,
     /// Output (or revert data) buffer, the EVM return buffer.
@@ -198,12 +202,32 @@ pub const selector_non_payable = [4]u8{ 0x6f, 0xb1, 0xb0, 0xe9 };
 /// Solidity `Panic(uint256)`.
 pub const error_panic = [4]u8{ 0x4e, 0x48, 0x7b, 0x71 };
 
+pub const B20Variant = enum(u8) { asset = 0, stablecoin = 1 };
+
+/// The B-20 variant of a token address: 0xb2, nine zero bytes, then the discriminant.
+pub fn b20_variant(address: Address) ?B20Variant {
+    if (address[0] != 0xb2) return null;
+    for (address[1..10]) |byte| {
+        if (byte != 0) return null;
+    }
+    return switch (address[10]) {
+        0 => .asset,
+        1 => .stablecoin,
+        else => null,
+    };
+}
+
 /// The native precompile at `address` under `upgrade`, if any.
 pub fn lookup(upgrade: ?op.Upgrade, address: Address) ?Native {
     const active = upgrade orelse return null;
     if (!active.at_least(.beryl)) return null;
     if (std.mem.eql(u8, &address, &activation.address)) return activation.dispatch;
     if (std.mem.eql(u8, &address, &policy.address)) return policy.dispatch;
+    if (b20_variant(address)) |variant| switch (variant) {
+        // Asset V2/V3 (Cobalt/Denim) surfaces are pending; V1 serves every fork for now.
+        .asset => return b20_asset.dispatch,
+        .stablecoin => return null,
+    };
     if (!active.at_least(.cobalt)) return null;
     if (std.mem.eql(u8, &address, &tx_context_address)) return tx_context;
     if (std.mem.eql(u8, &address, &nonce_manager_address)) return nonce_manager;
@@ -389,6 +413,7 @@ test {
     _ = native_abi;
     _ = @import("native_storage.zig");
     _ = @import("native_b20.zig");
+    _ = @import("native_b20_asset.zig");
 }
 
 test "native: nonce manager root is the ERC-7201 slot of base.nonce_manager" {
