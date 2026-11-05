@@ -63,6 +63,11 @@ pub const Config = struct {
     /// The real batcher's txmgr cannot recover such a nonce gap yet (lane notes), so the
     /// swarm enables this only for the model batcher.
     reorg_tx_loss_ppm: u32 = 0,
+    /// Largest frame both batchers write. Below the full size, channels span several L1
+    /// transactions and blocks, and derivation reassembles them in the channel bank.
+    frame_size: u32 = codec.frame_size_full,
+    /// L1 congestion: fewest batcher transactions a block includes (see `L1`).
+    l1_block_txs_min: u8 = nodes.l1_batches_max,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -92,6 +97,10 @@ pub const Config = struct {
         }
         const reorg_tx_loss_ppm: u32 = @intCast(swarm_level(prng, 500_000));
         if (!config.real_batcher) config.reorg_tx_loss_ppm = reorg_tx_loss_ppm;
+        const frame_sizes = [_]u32{ codec.frame_size_full, 1024, 512, 256 };
+        config.frame_size = frame_sizes[@intCast(prng.below(frame_sizes.len))];
+        const txs_min = [_]u8{ nodes.l1_batches_max, 4, 2 };
+        config.l1_block_txs_min = txs_min[@intCast(prng.below(txs_min.len))];
         config.validate();
         return config;
     }
@@ -105,6 +114,10 @@ pub const Config = struct {
         assert(config.disk_fault_ppm <= 1_000_000);
         assert(config.downtime_ns_max > 0);
         assert(config.clock_skew_ns_max <= config.settle_end_ns - config.production_end_ns);
+        assert(config.frame_size >= codec.frame_size_min);
+        assert(config.frame_size <= codec.frame_size_full);
+        assert(config.l1_block_txs_min >= 1);
+        assert(config.l1_block_txs_min <= nodes.l1_batches_max);
     }
 
     pub fn block_count_max(config: Config) u64 {
@@ -114,11 +127,14 @@ pub const Config = struct {
     /// Batcher submissions over the whole run: one per submit interval, doubled for the
     /// immediate submission after each batcher restart.
     pub fn tx_count_max(config: Config) u32 {
-        const batcher = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
+        // Each submission is one channel of up to ~1.1 KiB compressed, one tx per frame.
+        const frames: u64 = 1100 / (config.frame_size - 23) + 2;
+        const submissions = 2 * (config.settle_end_ns / nodes.Batcher.submit_interval_ns) + 16;
+        const batcher = frames * submissions;
         // Chance-per-step injection can exceed the mean; four times it is ample headroom.
         const spam = 4 * config.spam_per_minute * (config.fault_end_ns / (60 * ns_per_s) + 1);
         // The real txmgr appends every attempt, including fee-bump resubmissions.
-        const real = if (config.real_batcher) 8 * (config.settle_end_ns / ns_per_s) else 0;
+        const real = if (config.real_batcher) 8 * frames * (config.settle_end_ns / ns_per_s) else 0;
         return @intCast(batcher + spam + real);
     }
 
@@ -183,17 +199,27 @@ pub const Cluster = struct {
         var network = try nodes.Net.init(allocator, config.network);
         errdefer network.deinit(allocator);
         var l1 = try nodes.L1.init(allocator, config.l1_block_count_max(), config.l1_block_time_ns);
+        l1.block_txs_min = config.l1_block_txs_min;
         errdefer l1.deinit(allocator);
         var sequencer_chain = try nodes.Chain.init(allocator, config.block_count_max());
         errdefer sequencer_chain.deinit(allocator);
-        var batcher = try nodes.Batcher.init(allocator, config.l1_block_count_max());
+        var batcher = try nodes.Batcher.init(
+            allocator,
+            config.l1_block_count_max(),
+            config.frame_size,
+        );
         errdefer batcher.deinit(allocator);
         var tx_pool = try codec.TxPool.init(allocator, config.tx_count_max());
         errdefer tx_pool.deinit(allocator);
-        var attacker = try codec.Encoder.init(allocator, 0x6174_7461_636b_6572);
+        const attacker_seed = 0x6174_7461_636b_6572;
+        var attacker = try codec.Encoder.init(allocator, attacker_seed, codec.frame_size_full);
         errdefer attacker.deinit(allocator);
         const RealBatcher = real_batcher.RealBatcher;
-        const real = if (config.real_batcher) try RealBatcher.create(allocator) else null;
+        const frame_size = config.frame_size;
+        const real = if (config.real_batcher)
+            try RealBatcher.create(allocator, frame_size)
+        else
+            null;
         errdefer if (real) |r| r.destroy(allocator);
         batcher.submitting = real == null;
         var verifiers: [verifier_count_max]nodes.Verifier = undefined;
@@ -425,8 +451,9 @@ pub const Cluster = struct {
             payload.* = cluster.sequencer.chain.payloads[number] +% 1;
         }
         const hashes = cluster.sequencer.chain.hashes[first - 1 ..][0 .. count + 1];
-        const data = cluster.attacker.encode(first, hashes, payloads[0..count]);
-        const tx_index = cluster.tx_pool.append(data) orelse return;
+        const frames = cluster.attacker.encode(first, hashes, payloads[0..count]);
+        assert(frames.len == 1); // The attacker writes full-size frames.
+        const tx_index = cluster.tx_pool.append(frames[0]) orelse return;
         const e = cluster.env(nodes.node_l1);
         cluster.l1.on_message(&e, nodes.node_l1, .{ .batch_submit = .{
             .tx_index = tx_index,
@@ -674,6 +701,25 @@ test "cluster: real batcher service drives the chain to liveness without faults"
     try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
 }
 
+test "cluster: multi-frame channels across congested L1 blocks stay live" {
+    for ([_]bool{ false, true }) |real| {
+        var cluster = try Cluster.init(std.testing.allocator, 5, .{
+            .verifier_count = 2,
+            .crashes_per_minute = 2,
+            .l1_reorgs_per_minute = 1,
+            .real_batcher = real,
+            .frame_size = codec.frame_size_min,
+            .l1_block_txs_min = 2,
+            .fault_end_ns = 120 * ns_per_s,
+            .production_end_ns = 150 * ns_per_s,
+            .settle_end_ns = 450 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        try std.testing.expectEqual(report.sequencer_head, cluster.batcher.confirmed);
+    }
+}
+
 fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
     const fault_end_ns = smith.valueRangeAtMost(u64, 0, 120) * ns_per_s;
     const latency_ns_min = smith.valueRangeAtMost(u64, 1, 100) * std.time.ns_per_ms;
@@ -697,6 +743,8 @@ fn fuzz_cluster(_: void, smith: *std.testing.Smith) anyerror!void {
         .clock_skew_ns_max = smith.valueRangeAtMost(u64, 0, 60) * ns_per_s,
         .l1_reorgs_per_minute = smith.valueRangeAtMost(u32, 0, 10),
         .spam_per_minute = smith.valueRangeAtMost(u32, 0, 20),
+        .frame_size = smith.valueRangeAtMost(u32, 256, codec.frame_size_full),
+        .l1_block_txs_min = smith.valueRangeAtMost(u8, 2, nodes.l1_batches_max),
         .real_batcher = smith.value(bool),
     };
     const evictions_per_minute = smith.valueRangeAtMost(u32, 0, 20);

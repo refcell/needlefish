@@ -12,7 +12,7 @@ provably robust.
   `consensus/protocol` (frames, Channel, decompress, BatchReader, SingleBatch).
 - [x] Sim: verifiers derive through the real `derive` retrieval + frame queue over an
   L1 chain provider; attacker inbox-spam fault; negative test with the sender check off.
-- [ ] Sim: multi-frame channels spread over L1 blocks via the derive lane's channel bank
+- [x] Sim: multi-frame channels spread over L1 blocks via the derive lane's channel bank
   (timeouts, frame loss, reorged frames) once `derive` lands it.
 - [ ] Sim: swap model nodes for real components behind `utilities.io` SimIo as lanes land.
   - [x] Batcher: the real `batcher/service` (txmgr, channel manager, L2 source) runs
@@ -82,6 +82,15 @@ provably robust.
   (geth behaviour). The old model let L1 shrink and lose txs when the mempool was full,
   which produced nonce gaps no real L1 node causes; tx loss becomes its own fault class.
 
+- Multi-frame channels: derivation replays the channel-timeout window (6 L1 blocks) from
+  a fresh derive-lane ChannelBank at every L1 block, over durable copies of processed
+  blocks. Equivalent to a persistent bank (older channels have timed out) except that a
+  frame resubmitted after its channel's first frame left the window can complete a
+  channel the real bank drops; accepted for now, since reorgs and restarts then need no
+  bank snapshots. Granite is on (ready-channel selection). L1 includes up to 8 batcher
+  txs per block, with a congestion knob (2..8) so frames spill across blocks; without it
+  the window mutant (derive the newest block only) survived the swarm.
+
 - Push loop: main lands ~1 commit/min while a full test run takes 2-3 min under load,
   so strict re-test-on-every-reject never wins. After a green full run, if upstream
   commits since the tested base touch none of our files nor build.zig/src/base.zig,
@@ -132,3 +141,6 @@ provably robust.
   reorged parents, L1 heads, closes, drains, and resets; every channel must decode
   to exactly the next accepted blocks, and a final drain must deliver them all.
   Mutation-checked; 200 ms Debug.
+- 2026-11-05: multi-frame channels in the sim (frame size 256..2047 per seed, both
+  batchers) reassembled through the derive lane's ChannelBank over a replayed timeout
+  window; L1 congestion knob. 5000 seeds green; window mutant caught (7/300 seeds).

@@ -19,10 +19,10 @@ const NodeId = network_module.NodeId;
 const codec = @import("codec.zig");
 
 pub const batch_blocks_max = 8;
-pub const l1_batches_max = 4;
+pub const l1_batches_max = 8;
 pub const sync_blocks_max = 16;
 pub const l1_request_burst = 4;
-pub const l1_mempool_max = 16;
+pub const l1_mempool_max = 32;
 pub const pipeline_blocks_max = 32;
 
 pub const node_l1: NodeId = 0;
@@ -202,6 +202,9 @@ pub const L1 = struct {
     next_block_ns: u64,
     mempool: [l1_mempool_capacity]Batch = undefined,
     mempool_count: u8 = 0,
+    /// Congestion: each block includes between this many and `l1_batches_max` batcher
+    /// transactions, so a channel's frames can spill into later blocks.
+    block_txs_min: u8 = l1_batches_max,
     reorgs: u64 = 0,
     /// Mined nonce of the real batcher's account after each block, index = number.
     nonce_after: []u64,
@@ -248,7 +251,12 @@ pub const L1 = struct {
         block.number = number;
         block.parent_hash = l1.blocks[l1.head].hash;
         block.hash = env.prng.int(u64) | 1;
-        l1.nonce_after[number] = l1.include_mempool(block, l1.nonce_after[l1.head]);
+        assert(l1.block_txs_min >= 1 and l1.block_txs_min <= l1_batches_max);
+        const capacity: u8 = if (l1.block_txs_min == l1_batches_max)
+            l1_batches_max
+        else
+            @intCast(env.prng.range(l1.block_txs_min, l1_batches_max));
+        l1.nonce_after[number] = l1.include_mempool(block, l1.nonce_after[l1.head], capacity);
         l1.head = number;
         env.send(node_l1, node_batcher, .{ .l1_block = block.* });
         var verifier: u8 = 0;
@@ -260,7 +268,8 @@ pub const L1 = struct {
     /// Moves includable mempool entries into `block`, in order. Nonce-carrying entries go
     /// in only at the next expected nonce; stale ones (already mined) are dropped and
     /// future ones wait. Returns the mined nonce after the block.
-    fn include_mempool(l1: *L1, block: *L1Block, nonce_start: u64) u64 {
+    fn include_mempool(l1: *L1, block: *L1Block, nonce_start: u64, capacity: u8) u64 {
+        assert(capacity >= 1 and capacity <= l1_batches_max);
         var nonce_next = nonce_start;
         block.batch_count = 0;
         var kept: u8 = 0;
@@ -272,7 +281,7 @@ pub const L1 = struct {
                 const stale = if (batch.nonce) |nonce| nonce < nonce_next else false;
                 if (stale) continue;
                 const ready = if (batch.nonce) |nonce| nonce == nonce_next else true;
-                if (ready and block.batch_count < l1_batches_max) {
+                if (ready and block.batch_count < capacity) {
                     block.batches[block.batch_count] = batch;
                     block.batch_count += 1;
                     if (batch.nonce != null) nonce_next += 1;
@@ -283,7 +292,7 @@ pub const L1 = struct {
                 }
             }
             l1.mempool_count = kept;
-            if (!included_any or block.batch_count == l1_batches_max) break;
+            if (!included_any or block.batch_count == capacity) break;
         }
         assert(nonce_next >= nonce_start);
         assert(block.batch_count <= l1_batches_max);
@@ -508,8 +517,59 @@ pub fn batch_extension(head: u64, batch: codec.Blocks) ?struct { first: u64, las
     return .{ .first = head + 1, .last = last };
 }
 
+/// Durable copies of processed L1 blocks, index = number, and derivation over the
+/// channel-timeout window ending at a block (see `codec.derive_window`).
+pub const L1Store = struct {
+    blocks: []L1Block,
+
+    comptime {
+        assert(l1_batches_max <= codec.transactions_max);
+    }
+
+    pub fn init(allocator: std.mem.Allocator, block_count_max: u64) !L1Store {
+        return .{ .blocks = try allocator.alloc(L1Block, block_count_max + 1) };
+    }
+
+    pub fn deinit(store: *L1Store, allocator: std.mem.Allocator) void {
+        allocator.free(store.blocks);
+        store.* = undefined;
+    }
+
+    /// Stores `block` and derives the window ending at it.
+    pub fn derive(
+        store: *L1Store,
+        decoder: *codec.Decoder,
+        pool: *const codec.TxPool,
+        block: *const L1Block,
+        sender_check: bool,
+    ) codec.Derived {
+        assert(block.number > 0 and block.number < store.blocks.len);
+        store.blocks[block.number] = block.*;
+        const oldest = block.number -| codec.channel_timeout_blocks;
+        const first = @max(oldest, 1);
+        var window: [codec.window_blocks_max]codec.WindowBlock = undefined;
+        const length: usize = @intCast(block.number - first + 1);
+        assert(length <= window.len);
+        for (window[0..length], first..) |*entry, number| {
+            const stored = &store.blocks[number];
+            entry.* = .{
+                .number = number,
+                .hash = stored.hash,
+                .parent_hash = stored.parent_hash,
+                .count = stored.batch_count,
+            };
+            for (stored.batches[0..stored.batch_count], 0..) |batch, index| {
+                entry.tx_indexes[index] = batch.tx_index;
+                entry.senders[index] = batch.sender;
+            }
+        }
+        return codec.derive_window(decoder, pool, window[0..length], sender_check);
+    }
+};
+
 pub const Batcher = struct {
     follower: L1Follower,
+    store: L1Store,
     encoder: codec.Encoder,
     decoder: codec.Decoder,
     /// Confirmed head after each processed L1 block, for rewinds on L1 reorgs.
@@ -530,17 +590,20 @@ pub const Batcher = struct {
     pub const submit_interval_ns: u64 = 6 * std.time.ns_per_s;
     pub const resubmit_timeout_ns: u64 = 60 * std.time.ns_per_s;
 
-    pub fn init(allocator: std.mem.Allocator, l1_block_count_max: u64) !Batcher {
+    pub fn init(allocator: std.mem.Allocator, l1_block_count_max: u64, frame_size: u32) !Batcher {
         var follower = try L1Follower.init(allocator, l1_block_count_max);
         errdefer follower.deinit(allocator);
+        var store = try L1Store.init(allocator, l1_block_count_max);
+        errdefer store.deinit(allocator);
         const confirmed_at = try allocator.alloc(u64, l1_block_count_max + 1);
         errdefer allocator.free(confirmed_at);
         @memset(confirmed_at, 0);
-        var encoder = try codec.Encoder.init(allocator, 0x6261_7463_6865_7200);
+        var encoder = try codec.Encoder.init(allocator, 0x6261_7463_6865_7200, frame_size);
         errdefer encoder.deinit(allocator);
         const decoder = try codec.Decoder.init(allocator);
         return .{
             .follower = follower,
+            .store = store,
             .encoder = encoder,
             .decoder = decoder,
             .confirmed_at = confirmed_at,
@@ -549,6 +612,7 @@ pub const Batcher = struct {
 
     pub fn deinit(batcher: *Batcher, allocator: std.mem.Allocator) void {
         batcher.follower.deinit(allocator);
+        batcher.store.deinit(allocator);
         batcher.encoder.deinit(allocator);
         batcher.decoder.deinit(allocator);
         allocator.free(batcher.confirmed_at);
@@ -572,19 +636,21 @@ pub const Batcher = struct {
         if (batcher.submitted >= sequencer.head) return;
         const count: u8 = @intCast(@min(batch_blocks_max, sequencer.head - batcher.submitted));
         const first = batcher.submitted + 1;
-        const data = batcher.encoder.encode(
+        const frames = batcher.encoder.encode(
             first,
             sequencer.chain.hashes[first - 1 .. first + count],
             sequencer.chain.payloads[first .. first + count],
         );
-        // A full pool ends submissions; the liveness checker reports the stall.
-        const tx_index = env.tx_pool.append(data) orelse return;
-        if (batcher.corrupt_tx == tx_index) {
-            const stored = env.tx_pool.get_mutable(tx_index);
-            stored[stored.len / 2] ^= 0x5a;
-        }
         batcher.submitted += count;
-        env.send(node_batcher, node_l1, .{ .batch_submit = .{ .tx_index = tx_index } });
+        for (frames) |data| {
+            // A full pool ends submissions; the liveness checker reports the stall.
+            const tx_index = env.tx_pool.append(data) orelse return;
+            if (batcher.corrupt_tx == tx_index) {
+                const stored = env.tx_pool.get_mutable(tx_index);
+                stored[stored.len / 2] ^= 0x5a;
+            }
+            env.send(node_batcher, node_l1, .{ .batch_submit = .{ .tx_index = tx_index } });
+        }
     }
 
     pub fn on_message(batcher: *Batcher, env: *const Env, from: NodeId, message: Message) void {
@@ -599,11 +665,9 @@ pub const Batcher = struct {
             batcher.progress_ns = env.now_ns;
         }
         if (!accepted.process) return;
-        for (block.batches[0..block.batch_count]) |batch| {
-            // Like op-batcher, track only our own transactions.
-            if (batch.sender != codec.sender_batcher) continue;
-            const blocks = batcher.decoder.decode(env.tx_pool.get(batch.tx_index)) orelse
-                continue;
+        // Like op-batcher, track only our own transactions (the derive sender filter).
+        const derived = batcher.store.derive(&batcher.decoder, env.tx_pool, &block, true);
+        for (derived.blocks[0..derived.count]) |blocks| {
             if (batch_extension(batcher.confirmed, blocks)) |extension| {
                 batcher.confirmed = extension.last;
                 batcher.progress_ns = env.now_ns;
@@ -617,6 +681,7 @@ pub const Batcher = struct {
         batcher.follower.reset(1);
         batcher.* = .{
             .follower = batcher.follower,
+            .store = batcher.store,
             .encoder = batcher.encoder,
             .decoder = batcher.decoder,
             .confirmed_at = batcher.confirmed_at,
@@ -644,6 +709,7 @@ pub const Verifier = struct {
     safe_head: u64 = 0,
     unsafe_head: u64 = 0,
     follower: L1Follower,
+    store: L1Store,
     decoder: codec.Decoder,
     /// Safe head after each processed L1 block (durable), for rewinds on L1 reorgs.
     safe_at: []u64,
@@ -674,6 +740,8 @@ pub const Verifier = struct {
         errdefer chain.deinit(allocator);
         var follower = try L1Follower.init(allocator, l1_block_count_max);
         errdefer follower.deinit(allocator);
+        var store = try L1Store.init(allocator, l1_block_count_max);
+        errdefer store.deinit(allocator);
         const safe_at = try allocator.alloc(u64, l1_block_count_max + 1);
         errdefer allocator.free(safe_at);
         @memset(safe_at, 0);
@@ -682,6 +750,7 @@ pub const Verifier = struct {
             .id = id,
             .chain = chain,
             .follower = follower,
+            .store = store,
             .decoder = decoder,
             .safe_at = safe_at,
         };
@@ -690,6 +759,7 @@ pub const Verifier = struct {
     pub fn deinit(verifier: *Verifier, allocator: std.mem.Allocator) void {
         verifier.chain.deinit(allocator);
         verifier.follower.deinit(allocator);
+        verifier.store.deinit(allocator);
         verifier.decoder.deinit(allocator);
         allocator.free(verifier.safe_at);
         verifier.* = undefined;
@@ -768,25 +838,16 @@ pub const Verifier = struct {
         } });
     }
 
-    /// Derives one L1 block through the derive lane's retrieval and frame queue.
+    /// Derives one L1 block through the derive lane's retrieval, frame queue, and
+    /// channel bank, replaying the channel-timeout window that ends at it.
     fn derive_l1_block(verifier: *Verifier, env: *const Env, block: *const L1Block) void {
         assert(block.batch_count <= l1_batches_max);
-        var tx_indexes: [l1_batches_max]u32 = undefined;
-        var senders: [l1_batches_max]u8 = undefined;
-        for (block.batches[0..block.batch_count], 0..) |batch, index| {
-            tx_indexes[index] = batch.tx_index;
-            senders[index] = batch.sender;
-        }
-        var provider = codec.BlockProvider.init(
-            block.number,
-            block.hash,
-            block.parent_hash,
+        const derived = verifier.store.derive(
+            &verifier.decoder,
             env.tx_pool,
-            tx_indexes[0..block.batch_count],
-            senders[0..block.batch_count],
+            block,
             verifier.sender_check,
         );
-        const derived = codec.derive_l1_block(&verifier.decoder, &provider);
         verifier.invalid_batches += derived.invalid;
         for (derived.blocks[0..derived.count]) |blocks| verifier.derive(blocks);
     }

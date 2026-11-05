@@ -244,16 +244,15 @@ fn batcher_account() accounts.Account {
     return dev_account.?;
 }
 
-fn service_config() service_module.Config {
+fn service_config(frame_size: u32) service_module.Config {
     const account = batcher_account();
     return .{
         .channels = .{
-            // Single-frame channels: the simulated derivation is stateless per L1 tx.
-            // An input cap below the frame size keeps even incompressible data in one
-            // frame (zlib stored blocks add a few bytes).
+            // At the full frame size an input cap below it keeps every channel in one
+            // frame; smaller frames spread channels over several txs (and L1 blocks).
             .channel = .{
-                .frame_size_max = codec.tx_data_max - 1,
-                .target_frames = 1,
+                .frame_size_max = frame_size,
+                .target_frames = if (frame_size == codec.frame_size_full) 1 else 4,
                 .compression_ratio_percent = 100,
                 .input_bytes_max = 1900,
             },
@@ -280,9 +279,10 @@ pub const RealBatcher = struct {
     service: service_module.Service,
     next_step_ns: u64 = 0,
     restarts: u32 = 0,
+    frame_size: u32 = codec.frame_size_full,
 
     /// Heap-allocated: the transports point back into this struct.
-    pub fn create(allocator: std.mem.Allocator) !*RealBatcher {
+    pub fn create(allocator: std.mem.Allocator, frame_size: u32) !*RealBatcher {
         const batcher = try allocator.create(RealBatcher);
         errdefer allocator.destroy(batcher);
         batcher.backend = .{};
@@ -305,7 +305,9 @@ pub const RealBatcher = struct {
             client.* = try rpc.Client.init(allocator, transport, limits);
             initialized += 1;
         }
-        batcher.service = try service_module.Service.init(allocator, service_config(), @splat(7));
+        batcher.frame_size = frame_size;
+        const config = service_config(frame_size);
+        batcher.service = try service_module.Service.init(allocator, config, @splat(7));
         batcher.next_step_ns = 0;
         batcher.restarts = 0;
         return batcher;
@@ -340,7 +342,7 @@ pub const RealBatcher = struct {
     pub fn restart(batcher: *RealBatcher, allocator: std.mem.Allocator, now_ns: u64) !void {
         batcher.service.deinit(allocator);
         const seed: u8 = @truncate(batcher.restarts +% 8);
-        const config = service_config();
+        const config = service_config(batcher.frame_size);
         batcher.service = try service_module.Service.init(allocator, config, @splat(seed));
         batcher.restarts += 1;
         batcher.next_step_ns = now_ns;

@@ -41,11 +41,20 @@ pub const l2_chain_id = 901;
 pub const tx_data_max = 2048;
 pub const l2_block_time_s = 2;
 pub const l1_block_time_s = 12;
-const frame_size_max = tx_data_max - 1;
+/// Frame sizes: one frame holds a whole model channel at the full size; smaller sizes
+/// spread a channel over several L1 transactions (and often several L1 blocks).
+pub const frame_size_full = tx_data_max - 1;
+pub const frame_size_min = 128;
+pub const frames_max = 24;
+/// Channel timeout in L1 blocks (pre- and post-Granite alike in the model rollup).
+pub const channel_timeout_blocks = 6;
+/// Derivation replays this many L1 blocks: a channel opened earlier has timed out.
+pub const window_blocks_max = channel_timeout_blocks + 1;
+pub const derived_channels_max = window_blocks_max * transactions_max;
 const input_bytes_max = 4096;
 const decompressed_bytes_max = 16 * 1024;
 const scratch_bytes = 256 * 1024;
-const pipeline_scratch_bytes = 64 * 1024;
+const pipeline_scratch_bytes = 1024 * 1024;
 /// Batcher transactions per L1 block the provider exposes.
 pub const transactions_max = 8;
 
@@ -59,7 +68,16 @@ pub fn sender_address(sender: u8) Address {
     return Address.init(@splat(0xb0 | sender));
 }
 
-pub const rollup: protocol.RollupConfig = .{ .batch_inbox_address = batch_inbox };
+/// Granite on from genesis: the channel bank reads any ready channel, not just the head.
+pub const rollup: protocol.RollupConfig = config: {
+    var config: protocol.RollupConfig = .{
+        .batch_inbox_address = batch_inbox,
+        .channel_timeout = channel_timeout_blocks,
+        .granite_channel_timeout = channel_timeout_blocks,
+    };
+    config.upgrades.set(.granite, 0);
+    break :config config;
+};
 
 /// A contiguous run of L2 blocks recovered from one L1 transaction.
 pub const Blocks = struct {
@@ -158,31 +176,43 @@ pub const TxPool = struct {
 
 pub const Encoder = struct {
     manager: manager_module.Manager,
+    /// Copies of the channel's tx data, one frame each.
+    frame_bytes: []u8,
+    frames: [frames_max][]const u8 = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, seed: u64) !Encoder {
+    pub fn init(allocator: std.mem.Allocator, seed: u64, frame_size: u32) !Encoder {
+        assert(frame_size >= frame_size_min and frame_size <= frame_size_full);
         var channel_id_seed: [16]u8 = @splat(0);
         std.mem.writeInt(u64, channel_id_seed[0..8], seed, .big);
-        const manager = try manager_module.Manager.init(allocator, .{
-            .channel = .{ .frame_size_max = frame_size_max, .input_bytes_max = input_bytes_max },
+        var manager = try manager_module.Manager.init(allocator, .{
+            .channel = .{
+                .frame_size_max = frame_size,
+                // Never full by frame count: one encode is one channel.
+                .target_frames = frames_max,
+                .input_bytes_max = input_bytes_max,
+            },
             .batch_bytes_max = 512,
         }, channel_id_seed);
-        return .{ .manager = manager };
+        errdefer manager.deinit(allocator);
+        const frame_bytes = try allocator.alloc(u8, frames_max * tx_data_max);
+        return .{ .manager = manager, .frame_bytes = frame_bytes };
     }
 
     pub fn deinit(encoder: *Encoder, allocator: std.mem.Allocator) void {
         encoder.manager.deinit(allocator);
+        allocator.free(encoder.frame_bytes);
         encoder.* = undefined;
     }
 
-    /// Encodes `payloads.len` blocks starting at `first` as one single-frame channel.
-    /// `hashes[i]` is the hash of block `first - 1 + i` (so it starts at the parent).
-    /// The result borrows the encoder and is valid until the next call.
+    /// Encodes `payloads.len` blocks starting at `first` as one channel, returning its
+    /// tx data (one frame each). `hashes[i]` is the hash of block `first - 1 + i` (so it
+    /// starts at the parent). The result borrows the encoder until the next call.
     pub fn encode(
         encoder: *Encoder,
         first: u64,
         hashes: []const u64,
         payloads: []const u64,
-    ) []const u8 {
+    ) []const []const u8 {
         assert(first > 0 and payloads.len > 0 and payloads.len <= blocks_max);
         assert(hashes.len == payloads.len + 1);
         const manager = &encoder.manager;
@@ -204,23 +234,36 @@ pub const Encoder = struct {
             manager.add_block(&block, 0) catch unreachable;
         }
         manager.close_open();
-        const data = manager.next_tx_data() orelse unreachable; // Closed with batches.
-        assert(!manager.has_pending_frames()); // One frame per channel.
-        assert(data.len <= tx_data_max);
-        return data;
+        var count: usize = 0;
+        while (manager.next_tx_data()) |data| : (count += 1) {
+            // Proof: blocks_max batches compress below frames_max * frame_size_min bytes.
+            assert(count < frames_max);
+            assert(data.len <= tx_data_max);
+            const copy = encoder.frame_bytes[count * tx_data_max ..][0..data.len];
+            @memcpy(copy, data);
+            encoder.frames[count] = copy;
+        }
+        assert(count > 0 and !manager.has_pending_frames());
+        return encoder.frames[0..count];
     }
 };
 
 pub const Decoder = struct {
     /// Decompression allocates a full zlib window (64 KiB) plus the output.
     scratch: []u8,
+    /// Window replay: retrieval, frame queue, and channel bank state.
+    pipeline_scratch: []u8,
 
     pub fn init(allocator: std.mem.Allocator) !Decoder {
-        return .{ .scratch = try allocator.alloc(u8, scratch_bytes) };
+        const scratch = try allocator.alloc(u8, scratch_bytes);
+        errdefer allocator.free(scratch);
+        const pipeline_scratch = try allocator.alloc(u8, pipeline_scratch_bytes);
+        return .{ .scratch = scratch, .pipeline_scratch = pipeline_scratch };
     }
 
     pub fn deinit(decoder: *Decoder, allocator: std.mem.Allocator) void {
         allocator.free(decoder.scratch);
+        allocator.free(decoder.pipeline_scratch);
         decoder.* = undefined;
     }
 
@@ -242,6 +285,16 @@ pub const Decoder = struct {
         channel.add_frame(allocator, frame, .{}) catch return null;
         if (!channel.is_ready()) return null;
         const data = channel.frame_data_alloc(allocator) catch return null;
+        return decoder.decode_channel_with(allocator, data);
+    }
+
+    /// Decodes complete channel data into a contiguous run of model blocks.
+    pub fn decode_channel(decoder: *Decoder, data: []const u8) ?Blocks {
+        var fixed = std.heap.FixedBufferAllocator.init(decoder.scratch);
+        return decoder.decode_channel_with(fixed.allocator(), data);
+    }
+
+    fn decode_channel_with(_: *Decoder, allocator: std.mem.Allocator, data: []const u8) ?Blocks {
         const decompressed = batch_reader.decompress_channel(
             allocator,
             data,
@@ -322,19 +375,67 @@ pub const BlockProvider = struct {
 };
 
 pub const Derived = struct {
-    blocks: [transactions_max]Blocks = undefined,
+    blocks: [derived_channels_max]Blocks = undefined,
     count: u8 = 0,
-    /// Frames from the authorized batcher that failed to decode.
+    /// Batcher payloads in the newest block without a valid frame, plus channels that
+    /// completed in it but failed to decode.
     invalid: u8 = 0,
 };
 
-/// Runs the derive lane's L1 retrieval and frame queue over one L1 block, then decodes
-/// each single-frame channel. Only the batcher's transactions to the inbox survive the
-/// data source filter.
-pub fn derive_l1_block(decoder: *Decoder, provider: *BlockProvider) Derived {
-    var pipeline_memory: [pipeline_scratch_bytes]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&pipeline_memory);
+/// One L1 block as derivation sees it: header words and its inbox transactions.
+pub const WindowBlock = struct {
+    number: u64,
+    hash: u64,
+    parent_hash: u64,
+    tx_indexes: [transactions_max]u32 = undefined,
+    senders: [transactions_max]u8 = undefined,
+    count: u8 = 0,
+};
+
+/// Derives the newest block of `window` (oldest first, at most `window_blocks_max`):
+/// the derive lane's retrieval and frame queue per block feed one channel bank, and
+/// every channel that completes inside the window is decoded. Replaying the window
+/// from an empty bank equals a persistent bank, since a channel opened before it has
+/// timed out, except that a frame resubmitted after its channel's first frame left the
+/// window can complete a channel the persistent bank would have dropped. Channels that
+/// completed in earlier blocks come out again; derivation ignores known blocks.
+pub fn derive_window(
+    decoder: *Decoder,
+    pool: *const TxPool,
+    window: []const WindowBlock,
+    sender_check: bool,
+) Derived {
+    assert(window.len > 0 and window.len <= window_blocks_max);
+    var fixed = std.heap.FixedBufferAllocator.init(decoder.pipeline_scratch);
     const allocator = fixed.allocator();
+    var bank = derive.channel_stage.ChannelBank.init(allocator, &rollup);
+    var derived: Derived = .{};
+    for (window, 0..) |*block, index| {
+        assert(index == 0 or block.number == window[index - 1].number + 1);
+        const newest = index + 1 == window.len;
+        var provider = BlockProvider.init(
+            block.number,
+            block.hash,
+            block.parent_hash,
+            pool,
+            block.tx_indexes[0..block.count],
+            block.senders[0..block.count],
+            sender_check,
+        );
+        ingest_block(allocator, &provider, &bank, &derived, newest);
+        read_channels(decoder, &bank, provider.info, &derived, newest);
+    }
+    return derived;
+}
+
+/// Feeds one block's batcher frames into the bank.
+fn ingest_block(
+    allocator: std.mem.Allocator,
+    provider: *BlockProvider,
+    bank: *derive.channel_stage.ChannelBank,
+    derived: *Derived,
+    newest: bool,
+) void {
     var retrieval = derive.retrieval.Retrieval.init(allocator, &rollup);
     var queue = derive.frame_queue.FrameQueue.init(allocator, &rollup);
     const system_config: protocol.SystemConfig = .{
@@ -342,26 +443,41 @@ pub fn derive_l1_block(decoder: *Decoder, provider: *BlockProvider) Derived {
     };
     // Proof: the provider serves exactly this block, and the scratch fits its data.
     retrieval.reset(provider, provider.info.id(), system_config) catch unreachable;
-    var derived: Derived = .{};
-    for (0..transactions_max * 4 + 2) |_| {
+    for (0..transactions_max * frames_max + 2) |_| {
         const frame = queue.next_frame(&retrieval, provider, provider) catch |err| switch (err) {
             error.Eof => break,
             error.NotEnoughData => {
-                derived.invalid += 1; // A batcher payload that held no valid frame.
+                // A batcher payload that held no valid frame.
+                derived.invalid += @intFromBool(newest);
                 continue;
             },
             else => unreachable, // Proof: provider errors are impossible for this block.
         };
-        if (decoder.decode_frame(frame)) |blocks| {
-            assert(derived.count < transactions_max);
+        // Proof: the scratch holds a window of full blocks (see pipeline_scratch_bytes).
+        bank.ingest_frame(frame, provider.info) catch unreachable;
+    } else unreachable; // Proof: each payload holds at most frames_max frames.
+}
+
+fn read_channels(
+    decoder: *Decoder,
+    bank: *derive.channel_stage.ChannelBank,
+    origin: BlockInfo,
+    derived: *Derived,
+    newest: bool,
+) void {
+    for (0..window_blocks_max * transactions_max * frames_max + 1) |_| {
+        const data = bank.read(origin) catch |err| switch (err) {
+            error.Eof => break,
+            else => unreachable, // Proof: the scratch fits every channel's data.
+        } orelse continue; // A timed-out channel was dropped.
+        if (decoder.decode_channel(data)) |blocks| {
+            assert(derived.count < derived_channels_max);
             derived.blocks[derived.count] = blocks;
             derived.count += 1;
         } else {
-            derived.invalid += 1;
+            derived.invalid += @intFromBool(newest);
         }
-    } else unreachable; // Proof: at most transactions_max payloads of one frame each.
-    assert(derived.count + derived.invalid <= transactions_max * 4);
-    return derived;
+    } else unreachable; // Proof: each read removes a channel; frames bound channels.
 }
 
 fn decode_batches(allocator: std.mem.Allocator, decompressed: []const u8) ?Blocks {
@@ -404,7 +520,7 @@ const Fixture = struct {
             hash.* = prng.int(u64);
             payload.* = prng.int(u64);
         }
-        fixture.encoder = try Encoder.init(testing.allocator, seed);
+        fixture.encoder = try Encoder.init(testing.allocator, seed, frame_size_full);
         errdefer fixture.encoder.deinit(testing.allocator);
         fixture.decoder = try Decoder.init(testing.allocator);
     }
@@ -421,12 +537,13 @@ test "codec: encode then decode round trips every batch size" {
     defer fixture.deinit();
     var count: u8 = 1;
     while (count <= blocks_max) : (count += 1) {
-        const data = fixture.encoder.encode(
+        const frames = fixture.encoder.encode(
             1,
             fixture.hashes[0 .. count + 1],
             fixture.payloads[1..][0..count],
         );
-        const blocks = fixture.decoder.decode(data) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 1), frames.len);
+        const blocks = fixture.decoder.decode(frames[0]) orelse return error.TestUnexpectedResult;
         try testing.expectEqual(@as(u64, 1), blocks.number_first);
         try testing.expectEqual(count, blocks.count);
         const expected = fixture.payloads[1..][0..count];
@@ -441,7 +558,7 @@ fn fuzz_tamper(fixture: *Fixture, smith: *std.testing.Smith) anyerror!void {
         first,
         fixture.hashes[first - 1 ..][0 .. count + 1],
         fixture.payloads[first..][0..count],
-    );
+    )[0];
     var data: [tx_data_max]u8 = undefined;
     @memcpy(data[0..encoded.len], encoded);
     var length: u32 = @intCast(encoded.len);
@@ -484,18 +601,95 @@ test "codec: derive stages keep the batcher's channel and drop an attacker's" {
     defer fixture.deinit();
     var pool = try TxPool.init(testing.allocator, 4);
     defer pool.deinit(testing.allocator);
-    const honest = fixture.encoder.encode(1, fixture.hashes[0..3], fixture.payloads[1..3]);
+    const honest = fixture.encoder.encode(1, fixture.hashes[0..3], fixture.payloads[1..3])[0];
     const honest_index = pool.append(honest).?;
     var forged_payloads = fixture.payloads;
     for (&forged_payloads) |*payload| payload.* +%= 1;
-    const forged = fixture.encoder.encode(1, fixture.hashes[0..3], forged_payloads[1..3]);
+    const forged = fixture.encoder.encode(1, fixture.hashes[0..3], forged_payloads[1..3])[0];
     const forged_index = pool.append(forged).?;
     // Order the attacker first: it must not shadow or displace the batcher's data.
-    const indexes = [_]u32{ forged_index, honest_index };
-    const senders = [_]u8{ sender_attacker, sender_batcher };
-    var provider = BlockProvider.init(5, 0xaa, 0xbb, &pool, &indexes, &senders, true);
-    const derived = derive_l1_block(&fixture.decoder, &provider);
+    var block: WindowBlock = .{ .number = 5, .hash = 0xaa, .parent_hash = 0xbb, .count = 2 };
+    block.tx_indexes[0..2].* = .{ forged_index, honest_index };
+    block.senders[0..2].* = .{ sender_attacker, sender_batcher };
+    const derived = derive_window(&fixture.decoder, &pool, &.{block}, true);
     try testing.expectEqual(@as(u8, 1), derived.count);
     try testing.expectEqual(@as(u8, 0), derived.invalid);
     try testing.expectEqualSlices(u64, fixture.payloads[1..3], derived.blocks[0].payloads[0..2]);
+}
+
+/// Puts each frame of `frames` into its own block of a window starting at L1 block 10,
+/// `stride` blocks apart; `skip` drops one frame (a lost transaction).
+fn spread_window(
+    pool: *TxPool,
+    frames: []const []const u8,
+    stride: u8,
+    skip: ?usize,
+    window: *[window_blocks_max]WindowBlock,
+) []WindowBlock {
+    const length: usize = @min(window_blocks_max, (frames.len - 1) * stride + 1);
+    for (window[0..length], 0..) |*block, index| {
+        const number = 10 + index;
+        block.* = .{ .number = number, .hash = number, .parent_hash = number - 1 };
+    }
+    for (frames, 0..) |frame, index| {
+        if (skip == index) continue;
+        const position = index * stride;
+        if (position >= length) break;
+        const block = &window[position];
+        block.tx_indexes[block.count] = pool.append(frame).?;
+        block.senders[block.count] = sender_batcher;
+        block.count += 1;
+    }
+    return window[0..length];
+}
+
+test "codec: multi-frame channels complete across blocks, not when lost or timed out" {
+    var fixture: Fixture = undefined;
+    try fixture.init(4);
+    defer fixture.deinit();
+    var encoder = try Encoder.init(testing.allocator, 9, frame_size_min);
+    defer encoder.deinit(testing.allocator);
+    var pool = try TxPool.init(testing.allocator, 64);
+    defer pool.deinit(testing.allocator);
+    const hashes = fixture.hashes[0 .. blocks_max + 1];
+    const frames = encoder.encode(1, hashes, fixture.payloads[1..][0..blocks_max]);
+    try testing.expect(frames.len >= 3);
+    var window: [window_blocks_max]WindowBlock = undefined;
+    // One frame per block, all inside the channel timeout: decodes in the last block.
+    if (frames.len <= window_blocks_max) {
+        const blocks = spread_window(&pool, frames, 1, null, &window);
+        const derived = derive_window(&fixture.decoder, &pool, blocks, true);
+        try testing.expectEqual(@as(u8, 1), derived.count);
+        try testing.expectEqual(@as(u8, 0), derived.invalid);
+        const expected = fixture.payloads[1..][0..blocks_max];
+        try testing.expectEqualSlices(u64, expected, derived.blocks[0].payloads[0..blocks_max]);
+        // Without the newest block the channel is still incomplete.
+        const partial = derive_window(&fixture.decoder, &pool, blocks[0 .. blocks.len - 1], true);
+        try testing.expectEqual(@as(u8, 0), partial.count);
+    }
+    // A lost frame never completes the channel; nor does it count as invalid.
+    const lost = spread_window(&pool, frames, 1, 1, &window);
+    const lost_derived = derive_window(&fixture.decoder, &pool, lost, true);
+    try testing.expectEqual(@as(u8, 0), lost_derived.count);
+    try testing.expectEqual(@as(u8, 0), lost_derived.invalid);
+    // First frame in the oldest block, the rest in the newest: still within the timeout.
+    var edge: [window_blocks_max + 1]WindowBlock = undefined;
+    for (&edge, 0..) |*block, index| {
+        block.* = .{ .number = 20 + index, .hash = 20 + index, .parent_hash = 19 + index };
+    }
+    for (frames, 0..) |frame, index| {
+        const block = &edge[if (index == 0) 0 else window_blocks_max - 1];
+        try testing.expect(block.count < transactions_max);
+        block.tx_indexes[block.count] = pool.append(frame).?;
+        block.senders[block.count] = sender_batcher;
+        block.count += 1;
+    }
+    const in_time = derive_window(&fixture.decoder, &pool, edge[0..window_blocks_max], true);
+    try testing.expectEqual(@as(u8, 1), in_time.count);
+    // One block later the first frame left the window: the channel timed out.
+    edge[window_blocks_max] = edge[window_blocks_max - 1];
+    edge[window_blocks_max].number += 1;
+    edge[window_blocks_max - 1].count = 0;
+    const late = derive_window(&fixture.decoder, &pool, edge[1 .. window_blocks_max + 1], true);
+    try testing.expectEqual(@as(u8, 0), late.count);
 }

@@ -99,7 +99,8 @@ fn print_config(config: Config) void {
         "  verifiers={d} latency={d}..{d}ms drop={d}ppm dup={d}ppm crashes/min={d} " ++
             "partitions/min={d} disk_fault={d}ppm downtime_max={d}ms fault_end={d}ms " ++
             "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d} real_batcher={} " ++
-            "evictions/min={d} reorg_tx_loss={d}ppm\n",
+            "evictions/min={d} reorg_tx_loss={d}ppm frame_size={d} " ++
+            "l1_block_txs_min={d}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -117,6 +118,8 @@ fn print_config(config: Config) void {
             config.real_batcher,
             config.mempool_evictions_per_minute,
             config.reorg_tx_loss_ppm,
+            config.frame_size,
+            config.l1_block_txs_min,
         },
     );
 }
