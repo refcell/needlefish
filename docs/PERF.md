@@ -65,6 +65,19 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | flz/compress_length_tx | 920.7 | same tx |
 | l1_fees/tx_l1_cost_fjord | 1143.4 | FastLZ length + fee math |
 
+## EVM (execution/evm)
+
+2026-11-05, Apple M-series laptop, ReleaseFast, `zig build bench -- "evm:"`. One execution per
+op against a freshly reset state (Prague rules).
+
+| case | ns/op | notes |
+|---|---|---|
+| evm/arithmetic_loop_13k_ops | 9624.3 | ~0.74 ns per instruction (threaded dispatch) |
+| evm/keccak256_loop_1000x64B | 171946.2 | ~172 ns per KECCAK256, dominated by the hash |
+| evm/storage_loop_200 | 7591.6 | ~38 ns per cold SSTORE + warm SLOAD pair |
+| evm/call_loop_200_staticcall | 23448.3 | ~117 ns per call frame push/pop |
+| evm/value_transfer_tx | 701.5 | validate, buy gas, warm, settle, state reset |
+
 ## Test suite time
 
 `zig build test` runs on every push of every lane, so its wall time is a shared budget.

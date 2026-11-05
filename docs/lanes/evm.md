@@ -36,7 +36,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   asserts, determinism, gas bounds, no ether creation, and revert atomicity. 300k-iteration
   ReleaseSafe soak clean. The GeneralStateTests are the differential check against the
   reference clients (zero dependencies rules out linking another EVM).
-- [ ] Performance: benchmark snailtracer/erc20 style workloads; aim beyond revm.
+- [x] Performance: micro benchmarks (`evm/bench.zig`, results in docs/PERF.md).
+- [ ] Performance: snailtracer/erc20 contract workloads (needs public bytecode fixtures);
+  compare with revm on the same machine; profile call-frame and keccak paths.
 
 ## Decisions
 - OP Stack: `BlockEnv.op` (rules from `common.l1_fees`) switches on OP semantics; null is plain
@@ -67,6 +69,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: EVM micro benchmarks: 0.74 ns/instruction, 117 ns/call frame, 0.70 us/tx.
 - 2026-11-05: bn254, KZG, BLS12-381 precompiles wired with Base caps; state tests 100%
   (37724 / 37724). `op.Upgrade` carries the full Base upgrade ladder.
 - 2026-11-05: interpreter fuzz harness (`evm_fuzz.zig`), 300k-iteration soak clean.
