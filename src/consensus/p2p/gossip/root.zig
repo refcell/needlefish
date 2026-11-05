@@ -3,6 +3,7 @@
 
 const std = @import("std");
 
+pub const rpc = @import("rpc.zig");
 pub const snappy = @import("snappy.zig");
 
 test {
