@@ -1,7 +1,10 @@
-//! `batcher` group. Mirrors base/base `crates/batcher`. Sub-modules are re-exported
-//! here as they land, e.g. `pub const rlp = @import("rlp/root.zig");`.
+//! `batcher` group. Mirrors base/base `crates/batcher`: turns L2 blocks into channels,
+//! frames, and L1 transactions (calldata or blobs).
 
 const std = @import("std");
+
+pub const frame = @import("frame/root.zig");
+pub const blobs = @import("blobs/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
