@@ -548,7 +548,8 @@ pub const Service = struct {
             unreachable;
         const include_record = challenge.enr_seq < service.local_record.sequence;
         const write_key = keys.initiator_key;
-        const session = service.sessions.put(remote_id, from, write_key, keys.recipient_key, now_ns);
+        const read_key = keys.recipient_key;
+        const session = service.sessions.put(remote_id, from, write_key, read_key, now_ns);
         // A freshly installed session has nonce counter 0, far from exhaustion.
         const nonce = session_module.next_nonce(session, service.random, now_ns).?;
         var outgoing: packet.Outgoing = .{
