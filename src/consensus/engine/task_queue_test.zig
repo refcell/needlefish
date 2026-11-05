@@ -463,6 +463,13 @@ test "seal: fetches, imports, and canonicalizes the payload" {
     try testing.expect(result.completed.seal.eql(info(11)));
     try testing.expect(queue.state.sync_state.unsafe_head.eql(info(11)));
     try testing.expectEqual(task.Version.v2, mock.last_get_payload_version.?);
+    const sealed = queue.take_sealed().?;
+    try testing.expect(sealed.payload.block_hash.eql(info(11).block_info.hash));
+    try testing.expectEqual(
+        chain.fixtures[11].payload().transactions.len,
+        sealed.payload.transactions.len,
+    );
+    try testing.expect(queue.take_sealed() == null);
 
     mock.get_payload_error = error.RpcFailed;
     try queue.enqueue(.{ .seal = .{ .payload_id = @splat(1), .attributes = &attributes } });

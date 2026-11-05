@@ -33,8 +33,10 @@ pub const SealTask = struct {
     phase: enum { get_payload, insert, fallback_build } = .get_payload,
     /// Building the Holocene deposits-only replacement.
     fallback: bool = false,
-    /// The fetched payload; its slices borrow the client until the insert is issued.
+    /// The fetched payload; its slices borrow the client until the owner copies them
+    /// (`envelope_owned`), which the task queue does right after the insert is issued.
     envelope: insert_module.Envelope = undefined,
+    envelope_owned: bool = false,
     insert: InsertTask = undefined,
     build: BuildTask = undefined,
 
@@ -89,6 +91,7 @@ pub const SealTask = struct {
             switch (seal.phase) {
                 .get_payload => {
                     try seal.get_payload(context, client);
+                    seal.envelope_owned = false;
                     seal.insert = .{ .envelope = &seal.envelope, .safety = seal.safety };
                     seal.phase = .insert;
                 },

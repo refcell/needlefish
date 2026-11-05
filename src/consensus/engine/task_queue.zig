@@ -132,6 +132,13 @@ pub const EngineTaskQueue = struct {
     next_sequence: u64 = 0,
     /// The slot whose task is in progress (waiting on the client).
     active: ?u32 = null,
+    /// The last sealed unsafe payload (for gossip), until the next unsafe seal completes.
+    sealed_arena: std.heap.ArenaAllocator,
+    sealed: ?Envelope = null,
+    /// `sealed` holds a payload `take_sealed` has not returned yet.
+    sealed_fresh: bool = false,
+    /// Sealed payloads not kept because copying them ran out of memory.
+    sealed_dropped: u64 = 0,
 
     pub fn init(
         allocator: Allocator,
@@ -148,6 +155,7 @@ pub const EngineTaskQueue = struct {
             .context = context,
             .state = initial_state,
             .options = options,
+            .sealed_arena = .init(allocator),
         };
     }
 
@@ -155,6 +163,7 @@ pub const EngineTaskQueue = struct {
         assert(queue.slots.len == queue.options.capacity);
         assert(queue.count <= queue.slots.len);
         for (queue.slots) |*slot| slot.arena.deinit();
+        queue.sealed_arena.deinit();
         allocator.free(queue.slots);
         queue.* = undefined;
     }
@@ -228,9 +237,13 @@ pub const EngineTaskQueue = struct {
         const kind = std.meta.activeTag(slot.task);
         const completion = run(&slot.task, &queue.context, &queue.state, client) catch |err| {
             assert(queue.state.sync_state.is_ordered());
-            if (err == error.NotAvailable) return .pending;
+            if (err == error.NotAvailable) {
+                own_seal_envelope(slot);
+                return .pending;
+            }
             return .{ .failed = queue.fail(index, kind, err) };
         };
+        if (kind == .seal) queue.keep_sealed(&slot.task.seal, completion.seal);
         queue.release(index);
         assert(queue.state.sync_state.is_ordered());
         return .{ .completed = completion };
@@ -297,6 +310,47 @@ pub const EngineTaskQueue = struct {
             if (!slot.used) return @intCast(index);
         }
         unreachable; // Proof: count < slots.len, so a slot is free.
+    }
+
+    /// The payload of the last unsafe seal, once; valid until the next unsafe seal completes.
+    pub fn take_sealed(queue: *EngineTaskQueue) ?*const Envelope {
+        if (!queue.sealed_fresh) return null;
+        queue.sealed_fresh = false;
+        assert(queue.sealed != null);
+        return &queue.sealed.?;
+    }
+
+    /// Copies a seal task's fetched payload into its slot once the insert is under way: the
+    /// client's result memory is reused by the next response, and the insert may restart.
+    fn own_seal_envelope(slot: *Slot) void {
+        if (slot.task != .seal) return;
+        const seal = &slot.task.seal;
+        if (seal.phase != .insert or seal.envelope_owned) return;
+        const copy = copy_envelope(slot.arena.allocator(), &seal.envelope) catch {
+            // Fetch the payload again rather than insert from borrowed memory.
+            seal.restart();
+            assert(seal.phase == .get_payload);
+            return;
+        };
+        seal.envelope = copy;
+        seal.envelope_owned = true;
+        assert(seal.insert.envelope == &seal.envelope);
+    }
+
+    /// Keeps an unsafe seal's payload for gossip, unless the insert skipped it as stale.
+    fn keep_sealed(queue: *EngineTaskQueue, seal: *const SealTask, head: L2BlockInfo) void {
+        if (seal.safety != .unsafe_payload) return;
+        assert(seal.phase == .insert);
+        if (!head.block_info.hash.eql(seal.envelope.payload.block_hash)) return;
+        queue.sealed = null;
+        queue.sealed_fresh = false;
+        _ = queue.sealed_arena.reset(.{ .retain_with_limit = queue.options.retain_bytes });
+        const copy = copy_envelope(queue.sealed_arena.allocator(), &seal.envelope) catch {
+            queue.sealed_dropped += 1;
+            return;
+        };
+        queue.sealed = copy;
+        queue.sealed_fresh = true;
     }
 
     fn release(queue: *EngineTaskQueue, index: u32) void {

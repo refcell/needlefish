@@ -63,6 +63,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [ ] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
+- Gossiped unsafe blocks: only the block right after the unsafe head is queued; stale and gapped blocks are dropped (no unsafe payload buffer or EL sync yet; derivation fills gaps). An active sequencer ignores gossip.
 - Devnet: the dev L1 JSON-RPC server allowed only 4 connections; each consensus node holds
   two (watcher + provider) and the batcher more, so the verifier's L1 provider was reset
   forever (RecvFailed). Raised to 16 (beacon 8) in `execution/node/service.zig`.
@@ -167,6 +168,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: engine/service: seal tasks own their fetched payload once the insert starts (the polling client reuses result memory); queue keeps the last unsafe sealed payload (`take_sealed`); `Driver.insert_unsafe` queues the gossiped payload right after the unsafe head; `service/gossip_bridge.zig` converts engine <-> gossip payloads.
 - 2026-11-05: rpc: admin_* sequencer control, recover mode, pipeline reset, healthz.
 - 2026-11-05: rpc: optimism_outputAtBlock output roots from Isthmus L2 headers.
 - 2026-11-05: sources: L2 provider full safe blocks (arena slots, TTL) for span checks.

@@ -38,6 +38,7 @@ const ProviderError = derive_errors.ProviderError;
 const Pipeline = pipeline_module.Pipeline;
 const EngineTaskQueue = task_queue.EngineTaskQueue;
 const SyncState = @import("../engine/state.zig").SyncState;
+const InsertEnvelope = @import("../engine/insert_task.zig").Envelope;
 
 pub const Options = struct {
     sequencer: bool = false,
@@ -55,6 +56,9 @@ pub const Stats = struct {
     resets: u64 = 0,
     consolidated: u64 = 0,
     sealed: u64 = 0,
+    /// Gossiped unsafe payloads queued for insertion / ignored (stale, gap, not running).
+    unsafe_queued: u64 = 0,
+    unsafe_ignored: u64 = 0,
     finalized: u64 = 0,
     engine_failures: u64 = 0,
     derivation_failures: u64 = 0,
@@ -247,6 +251,29 @@ pub const Driver = struct {
         driver.sequencer_active = false;
         assert(!driver.sequencer_active);
         return driver.queue.state.sync_state.unsafe_head.block_info.hash;
+    }
+
+    /// Queues a gossiped unsafe payload for insertion (base/base `UnsafePayload` handling).
+    /// Only the payload right after the unsafe head is taken; older ones are stale and later
+    /// ones leave a gap that derivation fills. An active sequencer ignores gossip. Returns
+    /// whether the payload was queued; the queue copies it.
+    pub fn insert_unsafe(driver: *Driver, envelope: *const InsertEnvelope) bool {
+        const unsafe_number = driver.queue.state.sync_state.unsafe_head.block_info.number;
+        const number = envelope.payload.block_number;
+        const wanted = driver.phase == .running and !driver.sequencer_active and
+            number == unsafe_number + 1;
+        if (wanted) {
+            if (driver.queue.enqueue(.{ .insert = .{
+                .envelope = envelope,
+                .drop_invalid = true,
+            } })) {
+                driver.stats.unsafe_queued += 1;
+                return true;
+            } else |err| driver.note(err);
+        }
+        driver.stats.unsafe_ignored += 1;
+        assert(driver.stats.unsafe_ignored > 0);
+        return false;
     }
 
     /// Starts over from startup discovery (engine reset, base/base `ResetRequest`).
@@ -586,6 +613,41 @@ test "driver: sequencer builds and seals the next block on time" {
     try testing.expectEqual(@as(u64, 0), head.l1_origin.number);
     try testing.expect(!driver.building);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+test "driver: a sealed payload inserts into a verifier as its unsafe head" {
+    var sequencer: Scenario = undefined;
+    try sequencer.init(.{ .sequencer = true });
+    defer sequencer.deinit();
+    sequencer.chain.unavailable_from = 3;
+    const driver = &sequencer.driver;
+    for (0..8) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 1);
+    try testing.expect(driver.queue.take_sealed() == null);
+    driver.tick(sequencer.providers(), Scenario.genesis_time + 2);
+    sequencer.arm_payload(&driver.sealing.?);
+    for (0..16) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 2);
+    const sealed = driver.queue.take_sealed().?;
+    try testing.expectEqual(@as(u64, 1), sealed.payload.block_number);
+    try testing.expect(driver.queue.take_sealed() == null);
+    // The sequencer ignores gossip while it sequences.
+    try testing.expect(!driver.insert_unsafe(sealed));
+
+    var verifier: Scenario = undefined;
+    try verifier.init(.{});
+    defer verifier.deinit();
+    verifier.chain.unavailable_from = 3;
+    try testing.expect(!verifier.driver.insert_unsafe(sealed)); // Not running yet.
+    for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 1);
+    try testing.expectEqual(Phase.running, verifier.driver.phase);
+    var gap = sealed.*;
+    gap.payload.block_number = 3;
+    try testing.expect(!verifier.driver.insert_unsafe(&gap));
+    try testing.expect(verifier.driver.insert_unsafe(sealed));
+    for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 2);
+    const head = verifier.driver.sync_state().unsafe_head;
+    try testing.expect(head.block_info.hash.eql(sealed.payload.block_hash));
+    try testing.expectEqual(@as(u64, 1), verifier.driver.stats.unsafe_queued);
+    try testing.expectEqual(@as(u64, 2), verifier.driver.stats.unsafe_ignored);
 }
 
 test "driver: admin sequencer stop and start" {
