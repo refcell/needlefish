@@ -13,6 +13,12 @@
 //! the rollup config is taken from the host as is, and an unknown L1 chain's config comes
 //! from the `l1_config` key (a geth chain config JSON object). Whoever picks a custom
 //! chain's boot values vouches for them, exactly as for the claim itself.
+//!
+//! The proposer (key 8), the intermediate block interval (key 9, required, non-zero) and
+//! the schedule block (key 11, at or above the claim; 0 or absent means the claim) are
+//! commitments of base/base's TEE and ZK proof journals. The fault-proof client samples
+//! intermediate roots at the interval (`intermediate_roots.zig`); the schedule ID that
+//! base/base pins from the schedule block has no consumer here yet.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -54,6 +60,10 @@ pub const Error = preimage.oracle.ReadError || error{
     RollupConfigMismatch,
     MissingL1ChainConfig,
     L1ConfigInvalid,
+    /// The claimed block is below the L2 genesis block.
+    ClaimBeforeGenesis,
+    /// The schedule block (key 11) is below the claimed block.
+    ScheduleBlockBeforeClaim,
 };
 
 /// Largest L1 config JSON accepted.
@@ -106,7 +116,14 @@ pub const BootInfo = struct {
         info.l1_head_number = try read_u64(oracle, .l1_head_number) orelse 0;
         const schedule = try read_u64(oracle, .l2_schedule_block_number) orelse 0;
         info.schedule_block_number = if (schedule == 0) info.claimed_l2_block_number else schedule;
+        if (info.claimed_l2_block_number < info.rollup_config.genesis.l2.number) {
+            return error.ClaimBeforeGenesis;
+        }
+        if (info.schedule_block_number < info.claimed_l2_block_number) {
+            return error.ScheduleBlockBeforeClaim;
+        }
         assert(info.rollup_config.l2_chain_id == info.chain_id);
+        assert(info.intermediate_block_interval > 0);
         return info;
     }
 };
@@ -259,6 +276,23 @@ test "boot: loads devnet inputs with defaults for optional keys" {
     try testing.expectEqual(@as(u64, 0), info.l1_head_number);
     try testing.expectEqual(@as(Address, @splat(0)), info.proposer);
     try testing.expectEqual(chains.devnet.chain_id, info.rollup_config.l2_chain_id);
+}
+
+test "boot: the schedule block may not precede the claim, nor the claim genesis" {
+    var json_buffer: [8192]u8 = undefined;
+    var config = devnet_config();
+    var later: BootStore = .{};
+    try put_u64(&later, .l2_schedule_block_number, 41);
+    try fill_store(&later, &config, &json_buffer);
+    try testing.expectEqual(@as(u64, 41), (try load_from(&later)).schedule_block_number);
+    var early: BootStore = .{};
+    try put_u64(&early, .l2_schedule_block_number, 39);
+    try fill_store(&early, &config, &json_buffer);
+    try testing.expectError(error.ScheduleBlockBeforeClaim, load_from(&early));
+    var genesis: BootStore = .{};
+    config.genesis.l2.number = 41;
+    try fill_store(&genesis, &config, &json_buffer);
+    try testing.expectError(error.ClaimBeforeGenesis, load_from(&genesis));
 }
 
 test "boot: a mainnet config that disagrees with the built-in chain is rejected" {

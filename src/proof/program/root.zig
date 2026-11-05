@@ -5,6 +5,7 @@ const std = @import("std");
 
 pub const boot = @import("boot.zig");
 pub const hint = @import("hint.zig");
+pub const intermediate_roots = @import("intermediate_roots.zig");
 pub const l1_chain_provider = @import("l1_chain_provider.zig");
 pub const l1_blob_provider = @import("l1_blob_provider.zig");
 pub const l2_chain_provider = @import("l2_chain_provider.zig");
@@ -12,6 +13,7 @@ pub const sync = @import("sync.zig");
 
 pub const BootInfo = boot.BootInfo;
 pub const HintType = hint.HintType;
+pub const IntermediateRootSampler = intermediate_roots.Sampler;
 pub const L1ChainProvider = l1_chain_provider.L1ChainProvider;
 pub const L1BlobProvider = l1_blob_provider.L1BlobProvider;
 pub const L2ChainProvider = l2_chain_provider.L2ChainProvider;

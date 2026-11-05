@@ -179,6 +179,8 @@ fn check(inputs: *const Inputs, result: Error!boot.BootInfo) !void {
                 if (err == error.RollupConfigInvalid or err == error.RollupConfigMismatch or
                     err == error.MissingL1ChainConfig) return;
                 if (err == error.InvalidBootValue or err == error.BufferTooSmall) return;
+                if (err == error.ClaimBeforeGenesis) return;
+                if (err == error.ScheduleBlockBeforeClaim) return;
                 return err;
             };
             return testing.expect(inputs.chain == .devnet);
@@ -207,6 +209,10 @@ fn check_tail(inputs: *const Inputs, claim_block: u64, result: Error!boot.BootIn
     const schedule = u64_outcome(inputs.schedule) catch |err| {
         return testing.expectError(err, result);
     } orelse 0;
+    const schedule_expected = if (schedule == 0) claim_block else schedule;
+    if (schedule_expected < claim_block) {
+        return testing.expectError(error.ScheduleBlockBeforeClaim, result);
+    }
     const info = try result;
     try testing.expectEqualSlices(u8, slice(&inputs.hashes[0]), &info.l1_head);
     try testing.expectEqualSlices(u8, slice(&inputs.hashes[1]), &info.agreed_l2_output_root);
@@ -218,7 +224,6 @@ fn check_tail(inputs: *const Inputs, claim_block: u64, result: Error!boot.BootIn
     try testing.expectEqual(proposer, info.proposer);
     try testing.expectEqual(interval, info.intermediate_block_interval);
     try testing.expectEqual(l1_head_number, info.l1_head_number);
-    const schedule_expected = if (schedule == 0) claim_block else schedule;
     try testing.expectEqual(schedule_expected, info.schedule_block_number);
 }
 

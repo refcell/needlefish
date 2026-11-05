@@ -4,7 +4,9 @@
 //! Prologue: load the boot info, find the agreed safe head from the agreed output root,
 //! open the oracle-backed L1 / blob / L2 providers, the stateless builder and the
 //! derivation pipeline. Driver: derive and execute up to the claimed block (or until L1
-//! runs out). Epilogue: the claim holds iff the computed output root equals it.
+//! runs out). Epilogue: the claim holds iff the computed output root equals it. The
+//! output root of every derived block can be sampled at the boot's intermediate block
+//! interval (`Options.intermediate`), as base/base's TEE and ZK provers do.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -67,6 +69,11 @@ pub const Options = struct {
     /// Owned by the caller (about 1 MiB together).
     kzg_settings: *const kzg.blob.Settings,
     kzg_workspace: *kzg.blob.Workspace,
+    /// Caller-owned. When set, reset to the boot interval (key 9) and fed the output root
+    /// of every derived block: the intermediate roots base/base's provers commit
+    /// (`execute_with_intermediates` + `IntermediateRootSampler`). The claim does not
+    /// depend on them; `finish` reports an empty or partial range.
+    intermediate: ?*program.IntermediateRootSampler = null,
 };
 
 pub const Error = driver_module.driver.Error || program.boot.Error || program.sync.Error ||
@@ -89,7 +96,8 @@ pub fn run(allocator: Allocator, client: Client.Io, options: Options) Error!Outc
     defer allocator.destroy(state);
     try state.init(allocator, client, &boot, safe_hash, options);
     defer state.deinit(allocator);
-    return state.run(&boot);
+    if (options.intermediate) |sampler| sampler.* = .init(boot.intermediate_block_interval);
+    return state.run(&boot, options.intermediate);
 }
 
 /// The epilogue: true when the computed output root is the claimed one.
@@ -232,7 +240,11 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    fn run(self: *Client, boot: *const program.BootInfo) Error!Outcome {
+    fn run(
+        self: *Client,
+        boot: *const program.BootInfo,
+        sampler: ?*program.IntermediateRootSampler,
+    ) Error!Outcome {
         const safe_number = self.tip.info.block_info.number;
         if (boot.claimed_l2_block_number < safe_number) return error.InvalidClaimedBlock;
         var driver: driver_module.Driver = .{
@@ -244,6 +256,7 @@ pub const Client = struct {
             .builder = &self.builder,
             .resolver = &self.resolver,
             .tip = self.tip,
+            .sampler = sampler,
         };
         if (boot.claimed_l2_block_number > safe_number) {
             try driver.reset();

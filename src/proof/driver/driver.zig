@@ -54,6 +54,8 @@ pub const Driver = struct {
     tip: Tip,
     /// Set when L1 ran out before the target.
     exhausted: bool = false,
+    /// Fed the output root of every block the driver derives, when set.
+    sampler: ?*program.IntermediateRootSampler = null,
 
     /// Resets the pipeline to the safe head `tip`.
     pub fn reset(self: *Driver) Error!void {
@@ -161,6 +163,7 @@ pub const Driver = struct {
         self.l2.set_head(block_info);
         self.l2.remember(info, system_config);
         self.tip = .{ .info = info, .header = header.*, .output_root = output_root };
+        if (self.sampler) |sampler| sampler.push(output_root);
         assert(self.tip.info.block_info.number == block_info.number);
     }
 };
