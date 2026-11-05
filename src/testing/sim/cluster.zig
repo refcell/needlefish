@@ -3,7 +3,8 @@
 //! schedule, and every network decision, so a failing seed is a complete bug report.
 //!
 //! Phases:
-//!   1. faults:  [0, fault_end)          crashes, partitions, drops, disk faults
+//!   1. faults:  [0, fault_end)          crashes, partitions (group and one-way), drops,
+//!                                       disk faults, clock skew, L1 reorgs
 //!   2. heal:    fault_end               restart everything, heal partitions, stop drops
 //!   3. drain:   [fault_end, settle_end) sequencer stops at production_end; then
 //!               liveness requires every verifier to reach the sequencer head, safe and
@@ -110,6 +111,7 @@ pub const Report = struct {
     steps: u64 = 0,
     crashes: u64 = 0,
     partitions: u64 = 0,
+    asymmetric_partitions: u64 = 0,
     disk_faults: u64 = 0,
     l1_reorgs: u64 = 0,
     sequencer_head: u64 = 0,
@@ -303,12 +305,30 @@ pub const Cluster = struct {
                 cluster.heal_ns = null;
             }
         } else if (prng.chance(cluster.config.partitions_per_minute, steps_per_minute)) {
-            var group: [network_module.node_count_max]u8 = @splat(0);
-            for (&group) |*g| g.* = @intFromBool(prng.chance(1, 2));
-            cluster.network.partition(group);
+            cluster.inject_partition(prng);
             cluster.heal_ns = cluster.now_ns + prng.range(step_ns, cluster.config.downtime_ns_max);
             cluster.report.partitions += 1;
         }
+    }
+
+    /// Half symmetric group splits, half asymmetric: random one-way link cuts, which
+    /// model a node that can send but not receive (or the reverse).
+    fn inject_partition(cluster: *Cluster, prng: *Prng) void {
+        const node_count = nodes.node_verifier_first + cluster.config.verifier_count;
+        if (prng.chance(1, 2)) {
+            var group: [network_module.node_count_max]u8 = @splat(0);
+            for (&group) |*g| g.* = @intFromBool(prng.chance(1, 2));
+            cluster.network.partition(group);
+            return;
+        }
+        var from: NodeId = 0;
+        while (from < node_count) : (from += 1) {
+            var to: NodeId = 0;
+            while (to < node_count) : (to += 1) {
+                if (from != to and prng.chance(1, 4)) cluster.network.block_link(from, to);
+            }
+        }
+        cluster.report.asymmetric_partitions += 1;
     }
 
     fn heal_all(cluster: *Cluster) void {

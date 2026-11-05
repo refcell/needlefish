@@ -15,6 +15,10 @@ const Prng = @import("../prng.zig").Prng;
 pub const NodeId = u8;
 pub const node_count_max = 8;
 
+comptime {
+    assert(node_count_max <= 8); // Network.blocked: one bit per destination in a u8.
+}
+
 pub const Config = struct {
     latency_ns_min: u64 = 1 * std.time.ns_per_ms,
     latency_ns_max: u64 = 50 * std.time.ns_per_ms,
@@ -51,8 +55,9 @@ pub fn Network(comptime Message: type) type {
         heap: []Packet,
         count: u32 = 0,
         sequence: u64 = 0,
-        /// Nodes in different groups cannot exchange packets.
-        group: [node_count_max]u8 = @splat(0),
+        /// Bit `to` of `blocked[from]` cuts the directed link from -> to. Symmetric
+        /// partitions cut both directions; asymmetric faults cut one.
+        blocked: [node_count_max]u8 = @splat(0),
         stats: Stats = .{},
 
         pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -110,7 +115,7 @@ pub fn Network(comptime Message: type) type {
                 if (network.heap[0].deliver_ns > now_ns) return null;
                 const packet = network.pop();
                 assert(packet.deliver_ns <= now_ns);
-                if (network.group[packet.from] != network.group[packet.to]) {
+                if (network.is_blocked(packet.from, packet.to)) {
                     network.stats.dropped_partition += 1;
                     continue;
                 }
@@ -120,16 +125,35 @@ pub fn Network(comptime Message: type) type {
             return null;
         }
 
+        /// Symmetric partition: nodes in different groups cannot exchange packets.
         pub fn partition(network: *Self, group: [node_count_max]u8) void {
-            network.group = group;
+            for (&network.blocked, 0..) |*blocked, from| {
+                blocked.* = 0;
+                for (group, 0..) |to_group, to| {
+                    if (group[from] != to_group) blocked.* |= @as(u8, 1) << @intCast(to);
+                }
+            }
+            assert(network.partitioned() == !std.mem.allEqual(u8, &group, group[0]));
+        }
+
+        /// Asymmetric fault: cut only the directed link from -> to.
+        pub fn block_link(network: *Self, from: NodeId, to: NodeId) void {
+            assert(from < node_count_max and to < node_count_max);
+            assert(from != to);
+            network.blocked[from] |= @as(u8, 1) << @intCast(to);
+            assert(network.is_blocked(from, to));
+        }
+
+        pub fn is_blocked(network: *const Self, from: NodeId, to: NodeId) bool {
+            return network.blocked[from] & (@as(u8, 1) << @intCast(to)) != 0;
         }
 
         pub fn heal(network: *Self) void {
-            network.group = @splat(0);
+            network.blocked = @splat(0);
         }
 
         pub fn partitioned(network: *const Self) bool {
-            for (network.group) |g| if (g != 0) return true;
+            for (network.blocked) |blocked| if (blocked != 0) return true;
             return false;
         }
 
@@ -210,6 +234,22 @@ test "network: partition drops cross-group packets" {
     try std.testing.expectEqual(@as(u64, 8), packet.message);
     try std.testing.expect(network.pop_due(std.math.maxInt(u64)) == null);
     try std.testing.expectEqual(@as(u64, 1), network.stats.dropped_partition);
+}
+
+test "network: one-way link cut drops only that direction" {
+    var prng = Prng.init(4);
+    var network = try TestNetwork.init(std.testing.allocator, .{});
+    defer network.deinit(std.testing.allocator);
+    network.block_link(0, 1);
+    try std.testing.expect(network.partitioned());
+    network.send(&prng, 0, 0, 1, 7);
+    network.send(&prng, 0, 1, 0, 8);
+    const packet = network.pop_due(std.math.maxInt(u64)).?;
+    try std.testing.expectEqual(@as(u64, 8), packet.message);
+    try std.testing.expect(network.pop_due(std.math.maxInt(u64)) == null);
+    try std.testing.expectEqual(@as(u64, 1), network.stats.dropped_partition);
+    network.heal();
+    try std.testing.expect(!network.partitioned());
 }
 
 test "network: full network drops and counts" {

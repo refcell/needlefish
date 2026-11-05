@@ -69,11 +69,12 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
         .{ seed, report.steps, report.sequencer_head, report.l1_head },
     );
     std.debug.print(
-        "  crashes={d} partitions={d} disk_faults={d} l1_reorgs={d} sent={d} delivered={d} " ++
-            "dropped={d}\n",
+        "  crashes={d} partitions={d} (one-way {d}) disk_faults={d} l1_reorgs={d} sent={d} " ++
+            "delivered={d} dropped={d}\n",
         .{
-            report.crashes, report.partitions, report.disk_faults, report.l1_reorgs,
-            n.sent,         n.delivered,       dropped,
+            report.crashes,     report.partitions, report.asymmetric_partitions,
+            report.disk_faults, report.l1_reorgs,  n.sent,
+            n.delivered,        dropped,
         },
     );
 }

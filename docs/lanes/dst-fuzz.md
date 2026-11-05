@@ -80,3 +80,5 @@ provably robust.
   undecodable batches; corrupt-batcher negative test (mutation-checked).
 - 2026-11-05: fuzz target for the comptime RLP codec (canonical re-encoding of anything
   accepted, value round trip, mutated and raw input).
+- 2026-11-05: asymmetric (one-way) link cuts in the sim network; half of partition
+  faults are now random directed cuts. 5000 seeds green.
