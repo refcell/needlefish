@@ -51,6 +51,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: node/service: Service(IO) owns the whole node, eth HTTP server, dev-L1 slot miner (one block per slot through the Engine API, head=safe=finalized) and beacon API; blob sidecars captured from the pool before FCU prunes them. SimIo e2e tests.
 - 2026-11-05: ChainSpec from genesis config, genesis loader into StateDb; test proves our L1/L2 genesis hashes equal the devnet rollup.json anchors. Decision: blobSchedule not parsed yet, standard Cancun/Prague params used.
 - 2026-11-05: eth/net/web3 JSON-RPC (`src/execution/rpc/eth.zig`): values, state (head only), blocks, txs, receipts, sendRawTransaction, call/estimateGas (executor simulate), getLogs, feeHistory (zero rewards). Chain tx-hash index (bounded ring). Shared node test fixture.
 - 2026-11-05: chain backend for Engine(Chain): payload import (header checks, execution, root checks, rollback on mismatch), forkchoice canonicalization with state moves (undo rollback + re-execution, depth 256), payload builder (attributes txs + txpool, blob sidecars stripped), pool pruning. Decisions: reorged-out txs are not re-injected into the pool; L1 gas limit stays at the parent's when building.

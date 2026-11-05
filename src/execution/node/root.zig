@@ -14,6 +14,11 @@ pub const Chain = chain.Chain;
 pub const test_fixture = @import("test_fixture.zig");
 pub const genesis = @import("genesis.zig");
 pub const beacon = @import("beacon.zig");
+pub const service = @import("service.zig");
+pub const Service = service.Service;
+test {
+    _ = @import("service_test.zig");
+}
 
 test {
     std.testing.refAllDecls(@This());
