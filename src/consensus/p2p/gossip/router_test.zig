@@ -65,8 +65,8 @@ const Cluster = struct {
 
     fn connect(cluster: *Cluster, a: usize, b: usize) void {
         if (a == b or cluster.slots[a][b] != null) return;
-        cluster.slots[a][b] = cluster.routers[a].add_peer(test_peer_id(b), true, null).?;
-        cluster.slots[b][a] = cluster.routers[b].add_peer(test_peer_id(a), false, null).?;
+        cluster.slots[a][b] = cluster.routers[a].add_peer(test_peer_id(b), true, null, 0).?;
+        cluster.slots[b][a] = cluster.routers[b].add_peer(test_peer_id(a), false, null, 0).?;
     }
 
     fn connect_random(cluster: *Cluster, degree: usize, prng: *Prng) void {
@@ -190,6 +190,7 @@ test "router: IHAVE and IWANT deliver messages without a mesh" {
     config.d = 0;
     config.d_low = 0;
     config.d_score = 0;
+    config.d_out = 0;
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
     try cluster.init(2, 9, config);
@@ -209,7 +210,7 @@ test "router: graft during backoff is penalized and pruned" {
     var router = try Router.init(std.testing.allocator, scored_config(), prng.random());
     defer router.deinit(std.testing.allocator);
     _ = try router.subscribe(topic_name);
-    const slot = router.add_peer(test_peer_id(1), false, null).?;
+    const slot = router.add_peer(test_peer_id(1), false, null, 0).?;
     var message: rpc.RpcDefault = undefined;
     message.reset();
     try message.add_subscription(.{ .subscribe = true, .topic_id = topic_name });
@@ -233,6 +234,53 @@ test "router: graft during backoff is penalized and pruned" {
     try std.testing.expectEqual(@as(usize, 1), message.prune_slice().len);
 }
 
+test "router: reconnecting keeps a bad score until retention expires" {
+    var prng = Prng.init(2);
+    var router = try Router.init(std.testing.allocator, scored_config(), prng.random());
+    defer router.deinit(std.testing.allocator);
+    _ = try router.subscribe(topic_name);
+    var slot = router.add_peer(test_peer_id(5), false, null, 0).?;
+    router.peer(slot).counters.behaviour_penalty = 20;
+    router.heartbeat(1);
+    const bad = router.peer_score_value(slot);
+    try std.testing.expect(bad < 0);
+    router.remove_peer(slot, 2);
+    slot = router.add_peer(test_peer_id(5), false, null, 3).?;
+    router.heartbeat(4);
+    try std.testing.expect(router.peer_score_value(slot) < 0);
+    const retain_ns = router.config.peer_params.?.retain_score_ns;
+    router.remove_peer(slot, 5);
+    slot = router.add_peer(test_peer_id(5), false, null, 6 + retain_ns).?;
+    router.heartbeat(7 + retain_ns);
+    try std.testing.expectEqual(@as(f64, 0), router.peer_score_value(slot));
+}
+
+test "router: mesh keeps the outbound quota when trimmed" {
+    var prng = Prng.init(3);
+    var router = try Router.init(std.testing.allocator, scored_config(), prng.random());
+    defer router.deinit(std.testing.allocator);
+    _ = try router.subscribe(topic_name);
+    var message: rpc.RpcDefault = undefined;
+    message.reset();
+    try message.add_subscription(.{ .subscribe = true, .topic_id = topic_name });
+    try message.add_graft(topic_name);
+    var buffer: [4096]u8 = undefined;
+    const frame = message.encode(&buffer);
+    var outbound: u64 = 0;
+    for (0..20) |index| {
+        const is_outbound = index >= 17;
+        const slot = router.add_peer(test_peer_id(index), is_outbound, null, 0).?;
+        if (is_outbound) outbound |= @as(u64, 1) << @intCast(slot);
+        try router.on_rpc(slot, frame, 0);
+    }
+    for (0..50) |round| {
+        router.heartbeat(round * 500 * ns_per_ms);
+        const mesh = router.mesh_peers(0);
+        try std.testing.expect(@popCount(mesh) <= 12);
+        try std.testing.expect(@popCount(mesh & outbound) >= 2);
+    }
+}
+
 const FuzzContext = struct {};
 
 fn fuzz_on_rpc(_: FuzzContext, input: []const u8) anyerror!void {
@@ -240,7 +288,7 @@ fn fuzz_on_rpc(_: FuzzContext, input: []const u8) anyerror!void {
     var router = try Router.init(std.testing.allocator, scored_config(), prng.random());
     defer router.deinit(std.testing.allocator);
     _ = try router.subscribe(topic_name);
-    const slot = router.add_peer(test_peer_id(3), true, null).?;
+    const slot = router.add_peer(test_peer_id(3), true, null, 0).?;
     router.on_rpc(slot, input, 0) catch {};
     while (router.pop_event()) |event| router.validate(&event.id, .accept);
     router.heartbeat(500 * ns_per_ms);

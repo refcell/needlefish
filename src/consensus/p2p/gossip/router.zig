@@ -38,6 +38,8 @@ pub const Config = struct {
     d_high: u32 = 12,
     d_lazy: u32 = 6,
     d_score: u32 = 4,
+    /// Outbound peers kept in each mesh (libp2p `mesh_outbound_min`).
+    d_out: u32 = 2,
     heartbeat_interval_ns: u64 = 500 * ns_per_ms,
     seen_ttl_ns: u64 = 130 * 500 * ns_per_ms,
     prune_backoff_ns: u64 = 60 * ns_per_s,
@@ -73,6 +75,13 @@ const events_max = 256;
 const no_source: Slot = std.math.maxInt(Slot);
 
 const Promise = struct { id: Id, deadline_ns: u64 };
+
+const Retained = struct {
+    used: bool = false,
+    id: peer_id.PeerId = undefined,
+    counters: peer_score.Counters = .{},
+    expires_ns: u64 = 0,
+};
 
 const Peer = struct {
     active: bool = false,
@@ -162,10 +171,12 @@ pub const Router = struct {
     id_slices: *[limits.message_ids_max][]const u8,
     heartbeats: u64 = 0,
     last_decay_ns: u64 = 0,
+    retained: [peers_max]Retained = @splat(.{}),
 
     pub fn init(allocator: std.mem.Allocator, config: Config, random: std.Random) !Router {
         assert(config.d_low <= config.d and config.d <= config.d_high);
         assert(config.d_high < peers_max and config.d_score <= config.d);
+        assert(config.d_out <= config.d / 2);
         const peers = try allocator.alloc(Peer, peers_max);
         errdefer allocator.free(peers);
         @memset(peers, .{});
@@ -236,31 +247,63 @@ pub const Router = struct {
 
     // Peers.
 
+    /// Adds a connected peer. A peer that reconnects within `retain_score` gets its old
+    /// score counters back, so disconnecting does not launder a bad score.
     pub fn add_peer(
         router: *Router,
         id: peer_id.PeerId,
         outbound: bool,
         address: ?ip.Address,
+        now_ns: u64,
     ) ?Slot {
         const slot = for (router.peers, 0..) |*candidate, index| {
             if (!candidate.active) break index;
         } else return null;
         const target = &router.peers[slot];
         target.* = .{ .active = true, .id = id, .outbound = outbound, .address = address };
+        // `retain` copied the counters after leaving every mesh.
         target.send_subscriptions = router.subscribed_count() > 0;
+        for (&router.retained) |*retained| {
+            if (!retained.used or !retained.id.eql(&id)) continue;
+            retained.used = false;
+            if (now_ns < retained.expires_ns) target.counters = retained.counters;
+        }
+        for (&target.counters.topics) |*counter| assert(!counter.in_mesh);
         assert(target.queue_count == 0);
         return @intCast(slot);
     }
 
-    pub fn remove_peer(router: *Router, slot: Slot) void {
+    pub fn remove_peer(router: *Router, slot: Slot, now_ns: u64) void {
         const target = router.peer(slot);
         var topic: u8 = 0;
         while (topic < router.topics_count) : (topic += 1) {
             if (in_set(router.mesh[topic], slot)) router.mesh_remove(slot, topic);
         }
         for (router.deliveries_slice_mut()) |*delivery| delivery.peers &= ~bit(slot);
+        if (router.config.peer_params) |params| {
+            router.retain(target, now_ns + params.retain_score_ns);
+        }
         target.* = .{};
         assert(!target.active);
+    }
+
+    /// Keeps a departed peer's counters; when full, replaces the soonest-expiring entry.
+    fn retain(router: *Router, target: *const Peer, expires_ns: u64) void {
+        var victim: usize = 0;
+        for (&router.retained, 0..) |*retained, index| {
+            if (!retained.used) {
+                victim = index;
+                break;
+            }
+            if (retained.expires_ns < router.retained[victim].expires_ns) victim = index;
+        }
+        router.retained[victim] = .{
+            .used = true,
+            .id = target.id,
+            .counters = target.counters,
+            .expires_ns = expires_ns,
+        };
+        assert(router.retained[victim].used);
     }
 
     pub fn peer(router: *const Router, slot: Slot) *Peer {
@@ -520,7 +563,12 @@ pub const Router = struct {
             if (raw.len != seen_cache.id_length) continue;
             const id: *const Id = raw[0..seen_cache.id_length];
             const entry = router.cache.find(id) orelse continue;
-            if (entry.validated) target.enqueue(id);
+            if (!entry.validated) continue;
+            // Retransmission limit 1: never send a peer a message it sent us or got.
+            const delivery = router.find_delivery(id) orelse continue;
+            if (in_set(delivery.peers, slot)) continue;
+            delivery.peers |= bit(slot);
+            target.enqueue(id);
         }
     }
 
@@ -713,10 +761,41 @@ pub const Router = struct {
         } else if (size > config.d_high) {
             router.trim_mesh(topic, now_ns);
         }
+        router.ensure_outbound_quota(topic, now_ns);
         if (router.heartbeats % config.opportunistic_graft_ticks == 0) {
             router.opportunistic_graft(topic, now_ns);
         }
-        assert(@popCount(router.mesh[topic]) <= config.d_high or size > config.d_high);
+        assert(router.mesh[topic] & ~router.active_set() == 0);
+    }
+
+    fn outbound_set(router: *const Router) PeerSet {
+        var set: PeerSet = 0;
+        for (router.peers, 0..) |*target, slot| {
+            if (target.active and target.outbound) set |= bit(@intCast(slot));
+        }
+        return set;
+    }
+
+    fn active_set(router: *const Router) PeerSet {
+        var set: PeerSet = 0;
+        for (router.peers, 0..) |*target, slot| {
+            if (target.active) set |= bit(@intCast(slot));
+        }
+        return set;
+    }
+
+    /// Grafts outbound peers until the mesh holds at least `d_out` of them (an attacker
+    /// controls who dials us, not whom we dial).
+    fn ensure_outbound_quota(router: *Router, topic: u8, now_ns: u64) void {
+        const outbound = router.outbound_set();
+        const have = @popCount(router.mesh[topic] & outbound);
+        if (@popCount(router.mesh[topic]) < router.config.d_low) return;
+        if (have >= router.config.d_out) return;
+        const available = router.graftable(topic, now_ns, 0) & outbound;
+        var picked = router.pick_random(available, router.config.d_out - have);
+        while (picked != 0) : (picked &= picked - 1) {
+            router.graft_peer(@intCast(@ctz(picked)), topic, now_ns);
+        }
     }
 
     /// Topic peers not in the mesh, out of backoff, with score >= `threshold`.
@@ -739,11 +818,25 @@ pub const Router = struct {
         }
         const others = router.mesh[topic] & ~keep;
         keep |= router.pick_random(others, router.config.d - @popCount(keep));
+        keep = router.swap_in_outbound(topic, keep);
         var prune = router.mesh[topic] & ~keep;
         while (prune != 0) : (prune &= prune - 1) {
             router.prune_peer(@intCast(@ctz(prune)), topic, now_ns);
         }
         assert(@popCount(router.mesh[topic]) == router.config.d);
+    }
+
+    /// Replaces random inbound members of `keep` with outbound mesh peers until `keep`
+    /// holds `d_out` outbound peers (or no outbound peer is left).
+    fn swap_in_outbound(router: *Router, topic: u8, keep: PeerSet) PeerSet {
+        const outbound = router.outbound_set();
+        const have = @popCount(keep & outbound);
+        if (have >= router.config.d_out) return keep;
+        const wanted = router.config.d_out - have;
+        const added = router.pick_random(router.mesh[topic] & outbound & ~keep, wanted);
+        const removed = router.pick_random(keep & ~outbound, @popCount(added));
+        assert(@popCount(removed) == @popCount(added));
+        return (keep & ~removed) | added;
     }
 
     fn best_peer(router: *const Router, set: PeerSet) ?PeerSet {
