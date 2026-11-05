@@ -24,6 +24,8 @@ pub const Kind = enum {
     /// `uint8[]` of enum values up to `enumeration_max`.
     enumeration_array,
     uint256_array,
+    /// `bytes[]`: element offsets are relative to the word after the length.
+    bytes_array,
 
     fn is_array(kind: Kind) bool {
         return switch (kind) {
@@ -60,6 +62,17 @@ pub const Arguments = struct {
     array: Array = .{ .words = &.{} },
     /// Dynamic payload per argument: array words or string bytes.
     dynamic: [arguments_max][]const u8 = @splat(&.{}),
+    /// Element counts of `bytes[]` arguments.
+    counts: [arguments_max]u32 = @splat(0),
+
+    /// Element `item` of a decoded `bytes[]` argument (validated during decoding).
+    pub fn bytes_item(arguments: *const Arguments, index: usize, item: u32) []const u8 {
+        return bytes_element(arguments.dynamic[index], item).?;
+    }
+
+    pub fn bytes_count(arguments: *const Arguments, index: usize) u32 {
+        return arguments.counts[index];
+    }
 
     pub fn bytes(arguments: *const Arguments, index: usize) []const u8 {
         return arguments.dynamic[index];
@@ -106,6 +119,12 @@ pub fn decode_arguments(
             return null;
         };
         arguments.words[index] = head;
+        if (kind == .bytes_array) {
+            const area = decode_bytes_array(data, head, &arguments.counts[index], failure) orelse
+                return null;
+            arguments.dynamic[index] = area;
+            continue;
+        }
         if (kind == .string) {
             arguments.dynamic[index] = decode_dynamic(data, head, 1, failure) orelse return null;
             continue;
@@ -136,6 +155,46 @@ fn as_offset(word: *const [32]u8) ?u64 {
         if (byte != 0) return null;
     }
     return std.mem.readInt(u64, word[24..32], .big);
+}
+
+/// `bytes[]`: returns the element area (after the length word) once every element decodes.
+fn decode_bytes_array(
+    data: []const u8,
+    head: *const [32]u8,
+    count: *u32,
+    failure: *native.DecodeFailure,
+) ?[]const u8 {
+    const offset = as_offset(head) orelse {
+        failure.* = .{ .offset = head.* };
+        return null;
+    };
+    if (offset > data.len or data.len - offset < 32) {
+        failure.* = .overrun;
+        return null;
+    }
+    const length_word = data[@intCast(offset)..][0..32];
+    const length = as_offset(length_word) orelse {
+        failure.* = .{ .offset = length_word.* };
+        return null;
+    };
+    const area = data[@intCast(offset + 32)..];
+    if (length > area.len / 32) {
+        failure.* = .overrun;
+        return null;
+    }
+    var item: u32 = 0;
+    while (item < length) : (item += 1) {
+        const head_item = area[32 * @as(usize, item) ..][0..32];
+        _ = decode_dynamic(area, head_item, 1, failure) orelse return null;
+    }
+    count.* = @intCast(length);
+    return area;
+}
+
+fn bytes_element(area: []const u8, item: u32) ?[]const u8 {
+    var failure: native.DecodeFailure = .overrun;
+    const head = area[32 * @as(usize, item) ..][0..32];
+    return decode_dynamic(area, head, 1, &failure);
 }
 
 /// Follow an offset to a length-prefixed payload of `length * element_size` bytes.
@@ -191,7 +250,7 @@ fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) 
             const element = elements.word(@intCast(index));
             if (!zero(element[0..31]) or element[31] > enumeration_max) break false;
         } else true,
-        .uint256_array => true,
+        .uint256_array, .bytes_array => true,
         .string => std.unicode.utf8ValidateSlice(elements.words),
     };
 }

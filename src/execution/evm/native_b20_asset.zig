@@ -48,6 +48,10 @@ const error_invalid_multiplier = [4]u8{ 0x6f, 0x12, 0xf3, 0xdc };
 const error_length_mismatch = [4]u8{ 0xab, 0x8b, 0x67, 0xc6 };
 const error_empty_batch = [4]u8{ 0xc2, 0xe5, 0x34, 0x7d };
 const error_invalid_metadata_key = [4]u8{ 0x86, 0xea, 0x3a, 0xbb };
+const error_announcement_id_used = [4]u8{ 0xd1, 0x0b, 0x3c, 0x9e };
+const error_announcement_in_progress = [4]u8{ 0x5c, 0x5f, 0x08, 0x29 };
+const error_internal_call_malformed = [4]u8{ 0x4e, 0x2f, 0x14, 0x3e };
+const error_internal_call_failed = [4]u8{ 0xb2, 0x88, 0xa1, 0x27 };
 
 fn topic(comptime hex: []const u8) B256 {
     return comptime primitives.hex_to_b256(hex);
@@ -77,6 +81,10 @@ const event_domain_changed =
     topic("0a6387c9ea3628b88a633bb4f3b151770f70085117a15f9bf3787cda53f13d31");
 const event_multiplier_updated =
     topic("4dbe4840d7465bd162f67814cea0b519567a2e0e578bcde61e7f4ced361e5a3d");
+const event_announcement =
+    topic("ccebf8218a62875909564adef86a6f4df81503cb617221e793357d62f8e813f7");
+const event_end_announcement =
+    topic("96d64dafe2c790596430196b982ad1da3221cb3b0f4e6e2df77f2e4f71a90037");
 const event_extra_metadata_updated =
     topic("d7bb345be29e78d635203d40fe0567e7ef19d5cd5cc5fcd25f768b8063e82aa1");
 
@@ -118,15 +126,75 @@ fn initialized(context: *Context) Error!bool {
 pub fn route(context: *Context, input: []const u8, privileged: bool) Error![]const u8 {
     const selector = native.selector_of(input);
     const function = find(selector) orelse return context.revert_selector(selector);
+    if (function.tag != .announce) return execute(context, function, input, privileged);
+    const arguments = try decode(context, function, input);
+    try announce(context, &arguments, privileged);
+    return &.{};
+}
+
+fn decode(context: *Context, function: *const Function, input: []const u8) Error!Arguments {
     assert(input.len >= 4);
+    assert(std.mem.eql(u8, input[0..4], &function.selector));
     var failure: native.DecodeFailure = .overrun;
     const kinds = function.kinds;
-    const arguments = abi.decode_arguments(input[4..], kinds, enumeration_max, &failure) orelse
-        return context.revert_decode(selector, function.parameters, failure);
+    return abi.decode_arguments(input[4..], kinds, enumeration_max, &failure) orelse
+        return context.revert_decode(function.selector, function.parameters, failure);
+}
+
+/// Every call except `announce` (which runs its internal calls through here).
+fn execute(
+    context: *Context,
+    function: *const Function,
+    input: []const u8,
+    privileged: bool,
+) Error![]const u8 {
+    assert(function.tag != .announce);
+    const arguments = try decode(context, function, input);
     if (try view(context, function.tag, &arguments)) |output| return output;
     if (try movement(context, function.tag, &arguments, privileged)) |output| return output;
     try administration(context, function.tag, &arguments, privileged);
     return &.{};
+}
+
+/// announce(internalCalls, id, description, uri): mark the id, emit, run each internal call
+/// with the outer privilege (any revert becomes InternalCallFailed), then EndAnnouncement.
+fn announce(context: *Context, arguments: *const Arguments, privileged: bool) Error!void {
+    if (!privileged) try b20.ensure_role(context, context.caller, role_operator);
+    const id = arguments.bytes(1);
+    const id_slot = string_slot(id, base_announcement_ids);
+    if (try context.sload(id_slot) != 0) {
+        const length = encode_dynamic(context.out[4..], &.{}, &.{id});
+        context.out[0..4].* = error_announcement_id_used;
+        return context.revert(context.out[0 .. 4 + length]);
+    }
+    try context.sstore(id_slot, 1);
+    const fields = [3][]const u8{ id, arguments.bytes(2), arguments.bytes(3) };
+    const length = encode_dynamic(context.out, &.{}, &fields);
+    const topics = [2]B256{ event_announcement, address_word(context.caller) };
+    try context.emit(&topics, context.out[0..length]);
+    var item: u32 = 0;
+    while (item < arguments.bytes_count(0)) : (item += 1) {
+        try internal_call(context, arguments.bytes_item(0, item), privileged);
+    }
+    const end_length = encode_dynamic(context.out, &.{}, &.{id});
+    try context.emit(&.{event_end_announcement}, context.out[0..end_length]);
+}
+
+fn internal_call(context: *Context, call: []const u8, privileged: bool) Error!void {
+    if (call.len < 4) return revert_with_bytes(context, error_internal_call_malformed, call);
+    const function = find(call[0..4].*) orelse
+        return revert_with_bytes(context, error_internal_call_failed, call);
+    if (function.tag == .announce) return context.revert_selector(error_announcement_in_progress);
+    _ = execute(context, function, call, privileged) catch |err| switch (err) {
+        error.Revert => return revert_with_bytes(context, error_internal_call_failed, call),
+        else => |other| return other,
+    };
+}
+
+fn revert_with_bytes(context: *Context, selector: [4]u8, bytes: []const u8) error{Revert} {
+    const length = encode_dynamic(context.out[4..], &.{}, &.{bytes});
+    context.out[0..4].* = selector;
+    return context.revert(context.out[0 .. 4 + length]);
 }
 
 // ------------------------------------------------------------------ output encoding
@@ -777,6 +845,7 @@ pub const Tag = enum {
     batch_mint,
     extra_metadata,
     update_extra_metadata,
+    announce,
 };
 
 pub const functions = [_]Function{
@@ -1145,5 +1214,11 @@ pub const functions = [_]Function{
         .selector = .{ 0xb2, 0x85, 0x1e, 0xf5 },
         .parameters = "(string,string)",
         .kinds = &.{ .string, .string },
+    },
+    .{
+        .tag = .announce,
+        .selector = .{ 0x59, 0x51, 0x35, 0xdd },
+        .parameters = "(bytes[],string,string,string)",
+        .kinds = &.{ .bytes_array, .string, .string, .string },
     },
 };

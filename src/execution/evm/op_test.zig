@@ -832,3 +832,59 @@ test "op fuzz: B-20 asset calls keep gas, output, and supply invariants" {
     defer h.deinit(testing.allocator);
     try fuzz.run(h, fuzz_token, .{ .seed = 0x623230, .iterations = 512 });
 }
+
+/// announce([call], id, "d", "u") with one internal call of up to 68 bytes.
+fn announce_input(buffer: []u8, call: []const u8, id: u256) []const u8 {
+    assert(call.len <= 68);
+    var words: [16]u256 = @splat(0);
+    words[0] = 4 * 32; // internalCalls
+    words[1] = 10 * 32; // id
+    words[2] = 12 * 32; // description
+    words[3] = 14 * 32; // uri
+    words[4] = 1; // one call
+    words[5] = 32; // element offset (relative to after the length)
+    words[6] = call.len;
+    // words 7..9 hold the call bytes (filled below).
+    words[10] = 1;
+    words[11] = id;
+    words[12] = 1;
+    words[13] = short_string("d") & ~@as(u256, 0xff);
+    words[14] = 1;
+    words[15] = short_string("u") & ~@as(u256, 0xff);
+    const input = token_input(buffer, .announce, &words);
+    @memcpy(buffer[4 + 7 * 32 ..][0..call.len], call);
+    return input;
+}
+
+const assert = std.debug.assert;
+
+test "op: B-20 asset announce runs internal calls atomically" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    const sender = address_int(sender_address);
+    _ = try token_call(&h, .grant_role, &.{ b20_asset.role_operator, sender });
+    var call_buffer: [4 + 32 * 2]u8 = undefined;
+    const mint_call = token_input(&call_buffer, .mint, &.{ address_int(holder), 5 });
+    var buffer: [4 + 32 * 16]u8 = undefined;
+    const id = short_string("x") & ~@as(u256, 0xff);
+    const announced = try native_call(&h, token_address, announce_input(&buffer, mint_call, id), 0);
+    try testing.expect(announced.status == .success);
+    try testing.expectEqual(@as(usize, 3), announced.logs.len);
+    const balance_after = try token_call(&h, .balance_of, &.{address_int(holder)});
+    try testing.expectEqual(@as(u256, 5), output_int(balance_after));
+
+    const reused = try native_call(&h, token_address, announce_input(&buffer, mint_call, id), 0);
+    try testing.expect(reused.status == .revert);
+    try testing.expectEqual(@as(usize, 4 + 96), reused.output.len);
+
+    const fresh = short_string("y") & ~@as(u256, 0xff);
+    const short_input = announce_input(&buffer, mint_call[0..3], fresh);
+    const malformed = try native_call(&h, token_address, short_input, 0);
+    try testing.expect(malformed.status == .revert);
+    try testing.expectEqual(@as(usize, 4 + 96), malformed.output.len);
+    const over_cap = token_input(&call_buffer, .mint, &.{ address_int(holder), 1 << 100 });
+    const failed = try native_call(&h, token_address, announce_input(&buffer, over_cap, fresh), 0);
+    try testing.expect(failed.status == .revert);
+    try testing.expectEqual(@as(usize, 4 + 64 + 96), failed.output.len);
+}

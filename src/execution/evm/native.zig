@@ -70,7 +70,8 @@ pub const Context = struct {
     /// Revert with `data` (an ABI-encoded error, a bare selector, or empty).
     pub fn revert(context: *Context, data: []const u8) error{Revert} {
         assert(data.len <= context.out.len);
-        @memcpy(context.out[0..data.len], data);
+        // Data already encoded in place at the start of `out` needs no copy.
+        if (data.ptr != context.out.ptr) @memmove(context.out[0..data.len], data);
         context.revert_len = @intCast(data.len);
         return error.Revert;
     }
