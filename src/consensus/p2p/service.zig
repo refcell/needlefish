@@ -27,6 +27,7 @@ const gater_module = @import("peers/gater.zig");
 const connections = @import("libp2p/connections.zig");
 const enr = @import("peers/enr.zig");
 const ip = @import("peers/ip.zig");
+const observations = @import("observations.zig");
 const multiaddr = @import("peers/multiaddr.zig");
 const identify = @import("libp2p/identify.zig");
 const peer_id = @import("peers/peer_id.zig");
@@ -97,6 +98,10 @@ pub const Stats = struct {
     inbound_refused: u64 = 0,
     dial_errors: [std.meta.fieldNames(DialError).len]u64 = @splat(0),
     inbound_errors: [std.meta.fieldNames(InboundError).len]u64 = @splat(0),
+    /// Peer scores and connection ages, observed on every ping and disconnect (base/base
+    /// `peer_scores`, `gossip_peer_connection_duration_seconds`).
+    peer_scores: observations.Scores = .{},
+    connection_durations: observations.Durations = .{},
     banned: u64 = 0,
     invalid_rpcs: u64 = 0,
 };
@@ -161,6 +166,7 @@ const Connected = struct {
     direction: connections.Direction = .inbound,
     disconnecting: bool = false,
     info: PeerInfo = .{},
+    connected_ns: u64 = 0,
 };
 
 pub const Service = struct {
@@ -383,7 +389,12 @@ pub const Service = struct {
             service.limits.close(peer, direction);
             return error.RouterFull;
         };
-        service.connected[slot] = .{ .active = true, .peer = peer, .direction = direction };
+        service.connected[slot] = .{
+            .active = true,
+            .peer = peer,
+            .direction = direction,
+            .connected_ns = now_ns,
+        };
         return slot;
     }
 
@@ -396,16 +407,25 @@ pub const Service = struct {
         connection.info.latency_ns = latency_ns;
     }
 
-    /// Records the latest ping round trip.
-    pub fn on_ping(service: *Service, slot: Slot, rtt_ns: u64) void {
+    /// Records the latest ping round trip and observes the peer's score and age.
+    pub fn on_ping(service: *Service, slot: Slot, rtt_ns: u64, now_ns: u64) void {
         const connection = &service.connected[slot];
         assert(connection.active);
         connection.info.latency_ns = rtt_ns;
+        service.observe_peer(slot, now_ns);
+    }
+
+    fn observe_peer(service: *Service, slot: Slot, now_ns: u64) void {
+        const connection = &service.connected[slot];
+        assert(connection.active);
+        service.stats.connection_durations.observe_ns(now_ns -| connection.connected_ns);
+        service.stats.peer_scores.observe(service.gossip.router.peer_score_value(slot));
     }
 
     pub fn on_disconnected(service: *Service, slot: Slot, now_ns: u64) void {
         const connection = &service.connected[slot];
         assert(connection.active);
+        service.observe_peer(slot, now_ns);
         service.limits.close(connection.peer, connection.direction);
         service.gossip.router.remove_peer(slot, now_ns);
         connection.* = .{};

@@ -14,6 +14,7 @@ pub const options = @import("options.zig");
 pub const network = @import("network.zig");
 pub const rpc = @import("rpc.zig");
 pub const metrics = @import("metrics.zig");
+pub const observations = @import("observations.zig");
 
 test {
     std.testing.refAllDecls(@This());

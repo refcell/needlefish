@@ -14,6 +14,7 @@ const metrics = @import("../../utilities/metrics/root.zig");
 const service_module = @import("service.zig");
 const router_module = @import("gossip/router.zig");
 const validity = @import("gossip/validity.zig");
+const observations = @import("observations.zig");
 
 const Service = service_module.Service;
 const Counter = metrics.Counter;
@@ -80,9 +81,11 @@ pub const Metrics = struct {
     block_version: [versions.len]Counter = @splat(.{}),
     p2p_bytes_received: Counter = .{},
     p2p_bytes_sent: Counter = .{},
+    peer_scores: metrics.Histogram = .init(&observations.score_bounds),
+    connection_duration: metrics.Histogram = .init(&observations.duration_bounds_s),
 
     pub const entries_count = 9 + 4 * versions.len + connection_types.len + reasons.len +
-        dial_errors.len + inbound_errors.len;
+        dial_errors.len + inbound_errors.len + 2;
 
     /// Registers every metric. `registry` is a `*metrics.Registry(capacity)`; `metrics`
     /// must not move afterwards.
@@ -127,6 +130,16 @@ pub const Metrics = struct {
             });
         }
         try self.register_validation(registry);
+        try registry.register(.{
+            .name = "base_node_peer_scores",
+            .help = "Observations of peer scores in the gossipsub mesh",
+            .metric = .{ .histogram = &self.peer_scores },
+        });
+        try registry.register(.{
+            .name = "base_node_gossip_peer_connection_duration_seconds",
+            .help = "Duration of peer connections in seconds",
+            .metric = .{ .histogram = &self.connection_duration },
+        });
         try registry.counter("base_node_p2p_bytes_received", "Bytes received on p2p " ++
             "TCP connections", &self.p2p_bytes_received);
         try registry.counter(
@@ -202,6 +215,8 @@ pub const Metrics = struct {
         store(&self.block_validation_success, gossip.stats.accepted);
         store(&self.p2p_bytes_received, transport.bytes_received);
         store(&self.p2p_bytes_sent, transport.bytes_sent);
+        copy_histogram(&self.peer_scores, &service.stats.peer_scores);
+        copy_histogram(&self.connection_duration, &service.stats.connection_durations);
         assert(self.block_validation_total.get() >= self.block_validation_success.get());
     }
 };
@@ -251,6 +266,16 @@ fn topic_peers(service: *const Service, topic: u8) i64 {
     }
     assert(count >= 0);
     return count;
+}
+
+/// Copies plain service buckets into a histogram cell with the same bounds.
+fn copy_histogram(histogram: *metrics.Histogram, buckets: anytype) void {
+    const bounds = @TypeOf(buckets.*).upper_bounds;
+    assert(histogram.bounds.len == bounds.len);
+    assert(buckets.count >= histogram.count.load(.monotonic));
+    for (buckets.counts, 0..) |count, index| histogram.counts[index].store(count, .monotonic);
+    histogram.count.store(buckets.count, .monotonic);
+    histogram.sum_nano.store(buckets.sum_nano, .monotonic);
 }
 
 /// Counters mirror monotonic stats, so a store never moves them backwards.

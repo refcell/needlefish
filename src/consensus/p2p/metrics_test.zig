@@ -33,6 +33,7 @@ test "p2p metrics: register, update, and render" {
     fixture.service.gossip.stats.failed[@backingInt(validity.Reason.invalid_signer)] = 1;
     fixture.service.gossip.stats.versions[2] = 4;
     fixture.service.stats.dial_errors[@backingInt(DialError.blocked_subnet)] = 2;
+    fixture.service.on_ping(0, 1000, 45 * std.time.ns_per_s);
     cells.update(fixture.service, .{ .accepted = 1, .dialed = 2, .bytes_received = 120 });
 
     var buffer: [16 * 1024]u8 = undefined;
@@ -48,6 +49,12 @@ test "p2p metrics: register, update, and render" {
     try expect_contains(text, "base_node_dial_peer_error{type=\"blocked_subnet\"} 2\n");
     try expect_contains(text, "base_node_inbound_connection_error{type=\"blocked_peer\"} 0\n");
     try expect_contains(text, "base_node_p2p_bytes_received 120\n");
+    try expect_contains(text, "# TYPE base_node_peer_scores histogram\n");
+    try expect_contains(text, "base_node_peer_scores_count 1\n");
+    try expect_contains(
+        text,
+        "base_node_gossip_peer_connection_duration_seconds_bucket{le=\"60\"} 1\n",
+    );
     try expect_contains(text, "base_node_block_topic_subscribed{version=\"v1\"} 1\n");
     try expect_contains(text, "# TYPE base_node_block_topic_peers gauge\n");
 }

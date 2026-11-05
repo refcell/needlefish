@@ -44,8 +44,9 @@ behind a small interface and switch later.
   service/gater refusal reasons. Fixed with it: the transport passed a null remote address, so
   inbound gater address/subnet blocks and IP colocation scoring never applied; it now passes
   `io.peer_address` for accept and connect.
-- [ ] metrics parity: `peer_scores` and `gossip_peer_connection_duration_seconds` histograms,
-  observed on disconnect.
+- [x] metrics parity: `peer_scores` and `gossip_peer_connection_duration_seconds` histograms,
+  observed on every ping and on disconnect (as base/base) into plain service buckets
+  (`observations.zig`), copied into `metrics.Histogram` by `update`.
 - [ ] metrics parity: `gossip_event{type}`, `block_topic_retirements_total{version}`,
   `block_topic_blocked_total{version,direction}`.
 - [ ] DST: discovery-only swarm (16 nodes, one ENR bootnode, no enode dial) converges over SimIo
@@ -296,3 +297,4 @@ behind a small interface and switch later.
 - 2026-11-05: discv5 runs over io UDP (SimIo + kqueue/io_uring).
 - 2026-11-05: validation failure reasons and block versions as labeled metrics.
 - 2026-11-05: dial/inbound error reasons; transport now passes real peer IPs to the gater.
+- 2026-11-05: peer score and connection duration histograms.

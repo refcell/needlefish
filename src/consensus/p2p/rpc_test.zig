@@ -231,7 +231,7 @@ test "p2p rpc: peers carry identify and ping data" {
     message.listen_addresses[0] = try multiaddr.parse("/ip4/10.0.1.0/tcp/9222");
     message.listen_addresses_count = 1;
     const slot = fixture.service.slot_of(&fixture.peers[0]).?;
-    fixture.service.on_ping(slot, 1_500_000);
+    fixture.service.on_ping(slot, 1_500_000, 3 * std.time.ns_per_s);
     fixture.service.on_identified(slot, &message);
     const dump = fixture.call(
         \\{"jsonrpc":"2.0","id":1,"method":"opp2p_peers","params":[true]}
