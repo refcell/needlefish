@@ -33,6 +33,10 @@ Owns `src/utilities/*`. This lane unblocks everyone: land the IO interface early
   lane's polled datagram pool, with `World.datagram_stats`); polled `*_now` calls stay.
 
 ## Decisions
+- base/base `crates/utilities` coverage: `tx-manager` lives in the batcher lane
+  (`src/batcher/txmgr`); `runtime` (tokio spawner/clock/cancellation, deterministic runtime)
+  is covered by `io` + `time` + `SimIo`; `reth-cli` is reth node glue (execution lane);
+  `test-utils` maps to `src/testing`. `optimism-rpc` is skipped (see log).
 - IO API (`src/utilities/io`): caller-owned `IO.Completion` (init with `.{}`), typed calls
   `io.op(*Ctx, ctx, callback, &completion, args...)`, callback
   `fn (ctx: *Ctx, c: *IO.Completion, result: io.ResultType(IO.Fd, .op)) void`. Callbacks run
