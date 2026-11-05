@@ -5,6 +5,7 @@ const assert = std.debug.assert;
 const primitives = @import("primitives.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
+const op = @import("op.zig");
 
 pub const BlockEnv = struct {
     number: u64 = 0,
@@ -18,6 +19,8 @@ pub const BlockEnv = struct {
     prevrandao: B256 = primitives.b256_zero,
     /// EIP-4844 blob base fee, derived from the header's excess blob gas.
     blob_base_fee: u256 = 1,
+    /// OP Stack / Base rules for this block; null runs plain Ethereum semantics.
+    op: ?op.Context = null,
 };
 
 /// Per-transaction values visible to the interpreter.

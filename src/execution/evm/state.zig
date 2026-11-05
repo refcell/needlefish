@@ -505,6 +505,14 @@ pub const State = struct {
         slot.epoch = account.storage_epoch;
     }
 
+    /// Present value of a slot without warming it, for system reads (OP L1Block fees).
+    pub fn storage_value(state: *State, address: Address, slot: u256) Error!u256 {
+        const account = try state.load(address);
+        const cached = try state.slot_for(account, slot);
+        assert(cached.epoch == account.storage_epoch);
+        return cached.present;
+    }
+
     pub const SlotAccess = struct { slot: *Slot, is_cold: bool };
 
     /// Load and warm a storage slot of `account`.

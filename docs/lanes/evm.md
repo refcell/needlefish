@@ -5,12 +5,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 
 ## Backlog
 - [x] Core interpreter: stack (fixed 1024), memory (bounded, expansion gas), bytecode analysis (jumpdest bitmap, cached), dispatch via tail-call/computed-goto style switch; all opcodes through Cancun/Prague/Osaka (PUSH0, MCOPY, TLOAD/TSTORE, BLOBHASH, BLOBBASEFEE, CLZ...).
-- [ ] Gas schedule per fork, warm/cold access lists (EIP-2929), refunds (EIP-3529), SSTORE net metering (EIP-2200), call gas 63/64, init-code limits (EIP-3860).
+- [x] Gas schedule per fork, warm/cold access lists (EIP-2929), refunds (EIP-3529), SSTORE net metering (EIP-2200), call gas 63/64, init-code limits (EIP-3860).
 - [x] `Host`/state interface (account, storage, code, block hashes, logs, journal with revert checkpoints) — define here as a small Zig interface; trie-db lane implements the backend. Include an in-memory backend for tests.
 - [x] CALL/CALLCODE/DELEGATECALL/STATICCALL/CREATE/CREATE2/SELFDESTRUCT (EIP-6780) with explicit frame stack (no recursion), max depth 1024.
 - [x] Transaction-level execution: intrinsic gas, nonce/balance checks, EIP-1559 fee handling, blob txs, EIP-7702 authorizations, access lists, coinbase/base-fee payments.
-- [ ] OP-stack semantics: deposit tx processing (mint, no fee, gas accounting by fork, failed-deposit nonce bump), L1 cost charging to L1FeeVault, BaseFeeVault/SequencerFeeVault, operator fee (Isthmus), Base-specific changes in base/base.
-- [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas.
+- [x] OP-stack semantics: deposit tx processing (mint, no fee, gas accounting by fork, failed-deposit nonce bump), L1 cost charging to L1FeeVault, BaseFeeVault/SequencerFeeVault, operator fee (Isthmus), Base-specific changes in base/base.
+- [ ] Base fork precompile changes: RIP-7212 P256VERIFY at Fjord (3450 gas) before Azul's Osaka
+  pricing; BN254 pairing input caps (Granite 112687, Jovian 81984 bytes); BLS MSM/pairing caps
+  (Isthmus/Jovian); Canyon CREATE2-deployer and Everest nonce-manager state transitions.
+- [ ] Base native precompiles (Beryl+: activation/policy registries, B20 factory; Cobalt:
+  tx-context 0x8130..aa02, 2D nonce manager 0x8130..aa01) and EIP-8130 (Everest, type 0x79).
+- [ ] Precompile dispatch wired to `common.crypto` with per-fork sets and gas. Done: ecrecover,
+  sha256, ripemd160, identity, modexp, blake2f, p256verify. Missing: bn254 (0x06-0x08),
+  KZG point evaluation (0x0a), BLS12-381 (0x0b-0x11).
 - [x] ethereum/tests GeneralStateTests runner (`just vectors`), pass rate tracked in this file.
   Run: `just vectors`, extract `fixtures_general_state_tests.tgz` into `.cache/vectors/state`, then
   `zig build statetest -Doptimize=ReleaseSafe -- .cache/vectors/state/GeneralStateTests`.
@@ -20,6 +27,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Performance: benchmark snailtracer/erc20 style workloads; aim beyond revm.
 
 ## Decisions
+- OP Stack: `BlockEnv.op` (rules from `common.l1_fees`) switches on OP semantics; null is plain
+  Ethereum. L1Block params are read from state per non-deposit tx (`op.load_params`), so the
+  L1 attributes deposit at the top of the block is visible. Deposits always use the Regolith
+  model (Base launched with Regolith active, as base/base notes); pre-Regolith gas rules are
+  not implemented. `TxEnv.envelope` carries the EIP-2718 bytes for the L1 fee.
 - revm architecture: `State` (journaled cache, `state.zig`) over a `Database` vtable that the
   trie-db lane implements; `MemoryDatabase` backs tests. The interpreter talks to the concrete
   `State` (no vtable on the hot path).
@@ -43,6 +55,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - Precompiles not yet implemented fail the call (tracked under the precompile item).
 
 ## Log
+- 2026-11-05: OP Stack handler: deposits (mint, halted deposit -> revert all but mint and
+  nonce, full gas), L1/operator fees in the balance check, vault routing (base fee credited to
+  BaseFeeVault, not burned), operator fee refund for unused gas.
 - 2026-11-05: tx execution, GeneralStateTests runner (96.0%), crypto-backed precompiles,
   EIP-7610 collisions.
 - 2026-11-05: core interpreter, gas schedule, journaled state, frame stack, CREATE/CALL

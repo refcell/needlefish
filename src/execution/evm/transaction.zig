@@ -14,6 +14,7 @@ const state_module = @import("state.zig");
 const evm_module = @import("evm.zig");
 const precompiles = @import("precompiles.zig");
 const Fork = @import("fork.zig").Fork;
+const op = @import("op.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const Evm = evm_module.Evm;
@@ -58,6 +59,12 @@ pub const TxEnv = struct {
     blob_hashes: []const B256 = &.{},
     max_fee_per_blob_gas: u256 = 0,
     authorization_list: []const Authorization = &.{},
+    /// OP Stack: the EIP-2718 encoded transaction, priced for the L1 data fee.
+    envelope: []const u8 = &.{},
+    /// Deposit (0x7e): wei minted to the caller from L1, kept even if execution fails.
+    mint: u128 = 0,
+    /// Deposit: legacy system-transaction flag, rejected since Regolith.
+    is_system_transaction: bool = false,
 };
 
 pub const Invalid = enum {
@@ -82,6 +89,7 @@ pub const Invalid = enum {
     blob_fee_too_low,
     authorization_empty,
     authorization_create,
+    deposit_system_transaction,
 };
 
 pub const Executed = struct {
@@ -147,7 +155,7 @@ fn type_supported(comptime fork: Fork, tx_type: TxType) bool {
         .eip1559 => fork.at_least(.london),
         .eip4844 => fork.at_least(.cancun),
         .eip7702 => fork.at_least(.prague),
-        .deposit => false,
+        .deposit => true, // Gated on `BlockEnv.op` in `transact_deposit`.
     };
 }
 
@@ -199,6 +207,7 @@ fn validate_and_buy_gas(
     comptime fork: Fork,
     evm: *Evm,
     tx: *const TxEnv,
+    fees: ?*const op.Fees,
 ) state_module.Error!?Invalid {
     const sender = try evm.state.load(tx.caller);
     if (sender.info.has_code()) {
@@ -209,11 +218,14 @@ fn validate_and_buy_gas(
     if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
     if (tx.nonce < sender.info.nonce) return .nonce_too_low;
     if (tx.nonce > sender.info.nonce) return .nonce_too_high;
+    // OP Stack: the L1 data fee and the upfront operator fee count toward the balance.
+    const op_cost: u512 = if (fees) |f| @as(u512, f.l1) + f.operator_charge else 0;
     const max_cost = @as(u512, tx.gas_limit) * tx.gas_price + tx.value +
-        @as(u512, blob_gas(tx)) * tx.max_fee_per_blob_gas;
+        @as(u512, blob_gas(tx)) * tx.max_fee_per_blob_gas + op_cost;
     if (max_cost > sender.info.balance) return .insufficient_funds;
     const price = effective_gas_price(tx, evm.block.base_fee);
-    const upfront = @as(u256, tx.gas_limit) * price + blob_gas(tx) * evm.block.blob_base_fee;
+    const gas_cost = @as(u512, tx.gas_limit) * price + blob_gas(tx) * evm.block.blob_base_fee;
+    const upfront: u256 = @intCast(gas_cost + op_cost);
     try evm.state.set_balance(sender, sender.info.balance - upfront);
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce + 1);
     try evm.state.touch(sender);
@@ -276,11 +288,25 @@ pub fn transact(evm: *Evm, fork: Fork, tx: *const TxEnv) evm_module.Error!Result
     };
 }
 
+const checkpoint_zero = state_module.Checkpoint{
+    .journal_len = 0,
+    .logs_len = 0,
+    .log_data_len = 0,
+};
+
 pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
+    if (tx.tx_type == .deposit) return transact_deposit(fork, evm, tx);
     if (validate_env(fork, evm, tx)) |invalid| return .{ .invalid = invalid };
     evm.state.begin_transaction();
-    if (try validate_and_buy_gas(fork, evm, tx)) |invalid| {
-        evm.state.revert(.{ .journal_len = 0, .logs_len = 0, .log_data_len = 0 });
+    var fees_storage: op.Fees = undefined;
+    var fees: ?*const op.Fees = null;
+    if (evm.block.op) |context| {
+        const params = try op.load_params(evm.state, context.rules);
+        fees_storage = op.Fees.compute(params, context.rules, tx.envelope, tx.gas_limit);
+        fees = &fees_storage;
+    }
+    if (try validate_and_buy_gas(fork, evm, tx, fees)) |invalid| {
+        evm.state.revert(checkpoint_zero);
         return .{ .invalid = invalid };
     }
     evm.tx = .{
@@ -292,7 +318,20 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
     var authorization_refund: u64 = 0;
     if (fork.at_least(.prague)) authorization_refund = try apply_authorizations(evm, tx);
     const intrinsic = intrinsic_gas(fork, tx);
-    const outcome = try evm.execute_fork(fork, .{
+    const outcome = try execute_top(fork, evm, tx, intrinsic);
+    const accounted = account_gas(fork, tx, outcome, intrinsic, authorization_refund);
+    try pay_fees(fork, evm, tx, accounted.gas_used, fees);
+    return .{ .executed = finish(fork, evm, outcome, accounted) };
+}
+
+fn execute_top(
+    comptime fork: Fork,
+    evm: *Evm,
+    tx: *const TxEnv,
+    intrinsic: Intrinsic,
+) evm_module.Error!evm_module.Outcome {
+    assert(intrinsic.gas <= tx.gas_limit);
+    return evm.execute_fork(fork, .{
         .kind = if (tx.to == null) .create else .call,
         .caller = tx.caller,
         .target = tx.to orelse primitives.address_zero,
@@ -300,18 +339,71 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
         .input = tx.data,
         .gas_limit = tx.gas_limit - intrinsic.gas,
     });
-    return .{ .executed = try settle(fork, evm, tx, outcome, intrinsic, authorization_refund) };
 }
 
-/// Apply refunds, the calldata floor, the sender reimbursement, and the tip.
-fn settle(
+/// OP Stack deposit (0x7e): no signature, nonce, or fee checks; the mint is credited
+/// first. A halt reverts everything except the mint and nonce bump and consumes the
+/// whole gas limit (base/base `handler.rs` `catch_error`).
+fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
+    assert(tx.tx_type == .deposit);
+    const context = evm.block.op orelse return .{ .invalid = .type_not_supported };
+    if (context.rules.at_least(.regolith) and tx.is_system_transaction) {
+        return .{ .invalid = .deposit_system_transaction };
+    }
+    evm.state.begin_transaction();
+    const intrinsic = intrinsic_gas(fork, tx);
+    if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
+        return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };
+    }
+    const sender = try evm.state.load(tx.caller);
+    try evm.state.set_balance(sender, sender.info.balance +| tx.mint);
+    if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);
+    try evm.state.touch(sender);
+    evm.tx = .{ .origin = tx.caller, .gas_price = 0, .blob_hashes = &.{} };
+    try warm_addresses(fork, evm, tx);
+    const outcome = try execute_top(fork, evm, tx, intrinsic);
+    if (outcome.status == .halt) {
+        return .{ .executed = try fail_deposit(fork, evm, tx, outcome.exit) };
+    }
+    const accounted = account_gas(fork, tx, outcome, intrinsic, 0);
+    return .{ .executed = finish(fork, evm, outcome, accounted) };
+}
+
+fn fail_deposit(
     comptime fork: Fork,
     evm: *Evm,
+    tx: *const TxEnv,
+    exit: evm_module.Exit,
+) evm_module.Error!Executed {
+    assert(tx.tx_type == .deposit);
+    evm.state.revert(checkpoint_zero);
+    const sender = try evm.state.load(tx.caller);
+    try evm.state.set_nonce(sender, sender.info.nonce +| 1);
+    try evm.state.set_balance(sender, sender.info.balance +| tx.mint);
+    try evm.state.touch(sender);
+    assert(evm.state.transaction_logs().len == 0);
+    evm.state.finalize_transaction(fork);
+    return .{
+        .status = .halt,
+        .exit = exit,
+        .gas_used = tx.gas_limit,
+        .gas_refunded = 0,
+        .output = &.{},
+        .created = null,
+        .logs = &.{},
+    };
+}
+
+const Accounted = struct { gas_used: u64, refund: u64 };
+
+/// Apply the refund cap and the calldata floor.
+fn account_gas(
+    comptime fork: Fork,
     tx: *const TxEnv,
     outcome: evm_module.Outcome,
     intrinsic: Intrinsic,
     authorization_refund: u64,
-) evm_module.Error!Executed {
+) Accounted {
     assert(outcome.gas_remaining <= tx.gas_limit - intrinsic.gas);
     const gas_spent = tx.gas_limit - outcome.gas_remaining;
     const refund_counter: i64 = outcome.gas_refund + @as(i64, @intCast(authorization_refund));
@@ -320,21 +412,54 @@ fn settle(
     var gas_used = gas_spent - refund;
     if (fork.at_least(.prague)) gas_used = @max(gas_used, intrinsic.floor);
     assert(gas_used <= tx.gas_limit);
+    return .{ .gas_used = gas_used, .refund = refund };
+}
+
+/// Reimburse unused gas and pay the tip; on the OP Stack also refund the unused operator
+/// fee and credit the base fee, L1 fee, and operator fee vaults (the base fee is not burned).
+fn pay_fees(
+    comptime fork: Fork,
+    evm: *Evm,
+    tx: *const TxEnv,
+    gas_used: u64,
+    fees: ?*const op.Fees,
+) evm_module.Error!void {
+    assert(gas_used <= tx.gas_limit);
     const price = effective_gas_price(tx, evm.block.base_fee);
-    const sender = try evm.state.load(tx.caller);
-    const reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
-    try evm.state.set_balance(sender, sender.info.balance + reimbursement);
+    var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
+    var operator_used: u256 = 0;
+    if (fees) |f| {
+        operator_used = f.operator_used(evm.block.op.?.rules, tx.envelope, gas_used);
+        reimbursement += f.operator_charge - operator_used;
+    }
+    try credit(evm, tx.caller, reimbursement, false);
     const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
-    const coinbase = try evm.state.load(evm.block.coinbase);
-    try evm.state.set_balance(coinbase, coinbase.info.balance + @as(u256, gas_used) * tip_per_gas);
-    try evm.state.touch(coinbase);
+    try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
+    const f = fees orelse return;
+    try credit(evm, op.l1_fee_vault, f.l1, true);
+    try credit(evm, op.base_fee_vault, evm.block.base_fee * gas_used, true);
+    try credit(evm, op.operator_fee_vault, operator_used, true);
+}
+
+fn credit(evm: *Evm, address: Address, amount: u256, touch: bool) evm_module.Error!void {
+    const account = try evm.state.load(address);
+    try evm.state.set_balance(account, account.info.balance + amount);
+    if (touch) try evm.state.touch(account);
+}
+
+fn finish(
+    comptime fork: Fork,
+    evm: *Evm,
+    outcome: evm_module.Outcome,
+    accounted: Accounted,
+) Executed {
     const logs = evm.state.transaction_logs();
     evm.state.finalize_transaction(fork);
     return .{
         .status = outcome.status,
         .exit = outcome.exit,
-        .gas_used = gas_used,
-        .gas_refunded = refund,
+        .gas_used = accounted.gas_used,
+        .gas_refunded = accounted.refund,
         .output = outcome.output,
         .created = outcome.created,
         .logs = logs,
