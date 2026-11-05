@@ -7,7 +7,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Fast incremental state root: sorted batch updates, parallel hashing of subtries, cached branch nodes.
 - [ ] Storage engine (own design, TigerBeetle-inspired): append-only data file + fixed-size block grid or LSM, checksummed blocks, crash-safe superblock, all disk I/O through `utilities.io` (io_uring on Linux), static memory budget. Flat account/storage tables + history for reorgs.
 - [x] State provider implementing the evm `Host` backend: accounts, storage, code-by-hash, block hashes; overlay/journal for pending block execution; commit + state root.
-- [ ] Block/receipt/header storage and canonical chain indices; reorg (unwind) support.
+- [x] Block/receipt/header storage and canonical chain indices; reorg (unwind) support.
 - [ ] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
 - [ ] Benchmarks: state root of N updates, random reads, commit latency. (trie cases landed in
   `trie/bench.zig`; commit latency waits on the storage engine)
@@ -36,6 +36,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - `Changeset` (`db/changeset.zig`) is the unit of commit, unwind, and journaling: old+new
   values, wipes spelled out per slot, sorted, canonical binary encoding (fuzzed).
 - Code is content-addressed and never deleted on unwind.
+- `ChainStore` keeps block contents as opaque bytes (header/body/receipts/changeset) in a
+  fixed FIFO byte ring (bounded memory; older blocks are the storage engine's job), with
+  hash/tx indices and a canonical ring. Reorgs: `plan_reorg` -> caller unwinds/applies
+  state from stored changesets -> `set_head`. Side branches are executed by unwinding to the
+  fork point (no historical-state overlay yet).
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 
 ## Log
@@ -45,4 +50,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   account/storage proofs), differential-tested against HashBuilder.
 - 2026-11-05: state provider: State + block Overlay (O(1) wipes via epochs), canonical
   Changeset codec, unwind; tested with replica replay and multi-block reorgs.
+- 2026-11-05: ChainStore: block ring, canonical index, tx lookup, reorg plans; reorg test
+  moves State purely from stored changesets.
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
