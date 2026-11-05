@@ -14,6 +14,12 @@ for name in base sepolia_base zeronet_base; do
       "https://raw.githubusercontent.com/base/base/main/crates/common/chains/res/genesis/$name.json"
   fi
 done
+# execution-spec-tests state fixtures (Frontier through Osaka) for `zig build statetest`.
+if [ ! -d .cache/vectors/eest/fixtures/state_tests ]; then
+  mkdir -p .cache/vectors/eest
+  curl -fsSL "https://github.com/ethereum/execution-spec-tests/releases/download/v5.4.0/fixtures_stable.tar.gz" \
+    | tar -xz -C .cache/vectors/eest fixtures/state_tests
+fi
 # Public snailtracer bytecode (revm bench fixture) for the evm bench.
 mkdir -p .cache/vectors/bench
 if [ ! -f .cache/vectors/bench/snailtracer.hex ]; then

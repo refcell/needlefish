@@ -161,6 +161,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-05: EEST v5.4.0 state tests 44039/44039 (Frontier through Osaka) and
+  GeneralStateTests 37724/37724. The runner now parses `authorizationList` (authority
+  recovered locally, low-s), and a 7702 delegation to a precompile or native runs empty code
+  (revm semantics). Run: `zig build statetest -Doptimize=ReleaseSafe --
+  .cache/vectors/eest/fixtures/state_tests`.
 - 2026-11-05: snailtracer bench (fetched public fixture) and EIP-8130 simulation.
 - 2026-11-05: EIP-8130 execution: nonce manager storage, journaled code installs, the
   enshrined executor (`eip8130_execute.zig`), end-to-end tests and an executor fuzz.

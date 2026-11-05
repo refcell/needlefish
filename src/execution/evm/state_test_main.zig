@@ -52,7 +52,11 @@ pub fn main(init: std.process.Init) !u8 {
     }
     var database = evm.MemoryDatabase.init(gpa);
     defer database.deinit();
-    var state = try evm.State.init(gpa, database.interface(), .{});
+    // Pre-Osaka fixtures run up to 120M gas in one transaction: ~1.2M TSTOREs at 100 gas.
+    var state = try evm.State.init(gpa, database.interface(), .{
+        .transient_slots_max = 1 << 21,
+        .journal_entries_max = 1 << 22,
+    });
     defer state.deinit(gpa);
     // Some fixtures (1 MB calldata at depth 1024) need ~1 GB of frame memory; the
     // buffers are virtual until touched.

@@ -16,6 +16,7 @@ const MemoryDatabase = @import("memory_db.zig").MemoryDatabase;
 const Fork = @import("fork.zig").Fork;
 const trie = @import("../trie/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
+const consensus = @import("../../common/consensus/root.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const Value = std.json.Value;
@@ -266,6 +267,34 @@ fn hash_list(arena: std.mem.Allocator, value: Value) Error![]B256 {
     return hashes;
 }
 
+/// EIP-7702 tuples. The authority is recovered here (low-s, y parity 0 or 1) rather than
+/// taken from the fixture's `signer`, so invalid signatures exercise the skip path.
+fn authorization_list(arena: std.mem.Allocator, value: Value) Error![]transaction.Authorization {
+    if (value != .array) return error.InvalidFixture;
+    const items = try arena.alloc(transaction.Authorization, value.array.items.len);
+    for (value.array.items, items) |item, *out| {
+        const nonce = try u256_field(item, "nonce");
+        const y_parity = try u256_field(item, "yParity");
+        const signed = consensus.Authorization{
+            .chain_id = try u256_field(item, "chainId"),
+            .address = .init(try parse_fixed(20, try string_of(field(item, "address")))),
+            // An out-of-range nonce is never valid; `maxInt` makes the executor skip it.
+            .nonce = std.math.cast(u64, nonce) orelse std.math.maxInt(u64),
+            .y_parity = std.math.cast(u8, y_parity) orelse 2,
+            .r = try u256_field(item, "r"),
+            .s = try u256_field(item, "s"),
+        };
+        const authority = signed.recover_authority(consensus.recover_address);
+        out.* = .{
+            .chain_id = signed.chain_id,
+            .address = signed.address.bytes,
+            .nonce = signed.nonce,
+            .authority = if (authority) |found| found.bytes else null,
+        };
+    }
+    return items;
+}
+
 fn tx_env(arena: std.mem.Allocator, fixture: Value, index: Index) Error!transaction.TxEnv {
     const tx = field(fixture, "transaction") orelse return error.InvalidFixture;
     const to_text = try string_of(field(tx, "to"));
@@ -298,6 +327,10 @@ fn tx_env(arena: std.mem.Allocator, fixture: Value, index: Index) Error!transact
         result.tx_type = .eip4844;
         result.blob_hashes = try hash_list(arena, hashes);
         result.max_fee_per_blob_gas = try u256_field(tx, "maxFeePerBlobGas");
+    }
+    if (field(tx, "authorizationList")) |list| {
+        result.tx_type = .eip7702;
+        result.authorization_list = try authorization_list(arena, list);
     }
     if (result.tx_type != .legacy) result.chain_id = 1;
     return result;

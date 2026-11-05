@@ -329,3 +329,48 @@ test "transaction: create transaction deploys at sender nonce address" {
     try std.testing.expectEqualSlices(u8, &expected, &executed.created.?);
     try std.testing.expectEqual(@as(u64, 6), (try h.state.load(caller)).info.nonce);
 }
+
+fn designator(target: Address) [@import("bytecode.zig").delegation_len]u8 {
+    const bytecode = @import("bytecode.zig");
+    var code: [bytecode.delegation_len]u8 = undefined;
+    code[0..3].* = bytecode.delegation_prefix;
+    code[3..23].* = target;
+    return code;
+}
+
+test "evm: a delegated EOA runs its delegate's code" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const authority = primitives.address_from_int(0x07e8);
+    try h.database.put_account(other, 0, 1, comptime return_word(&[_]u8{ op.PUSH1, 0x77 }));
+    try h.database.put_account(authority, 0, 1, &designator(other));
+    const outcome = try h.call(.prague, authority, &.{}, 200_000);
+    try std.testing.expectEqual(evm_module.Status.success, outcome.status);
+    try std.testing.expectEqual(@as(u256, 0x77), primitives.b256_to_u256(outcome.output[0..32].*));
+}
+
+test "evm: a delegation to a precompile runs empty code, not the precompile" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const authority = primitives.address_from_int(0x07e7);
+    const identity = primitives.address_from_int(0x04);
+    try h.database.put_account(authority, 0, 1, &designator(identity));
+    // Top-level call: the identity precompile would echo the input.
+    const direct = try h.call(.prague, authority, "echo", 200_000);
+    try std.testing.expectEqual(evm_module.Status.success, direct.status);
+    try std.testing.expectEqual(@as(usize, 0), direct.output.len);
+    try std.testing.expectEqual(@as(u64, 200_000), direct.gas_remaining);
+    // Inner CALL(gas, authority, 0, 0, 0, 0, 32): success and no return data.
+    const code = [_]u8{
+        op.PUSH1, 32,        op.PUSH1,          0,        op.PUSH1, 0,         op.PUSH1, 0,
+        op.PUSH1, 0,         op.PUSH2,          0x07,     0xe7,     op.GAS,    op.CALL,  op.PUSH1,
+        0,        op.SSTORE, op.RETURNDATASIZE, op.PUSH1, 1,        op.SSTORE, op.STOP,
+    };
+    try h.database.put_account(contract, 0, 1, &code);
+    const inner = try h.call(.prague, contract, &.{}, 200_000);
+    try std.testing.expectEqual(evm_module.Status.success, inner.status);
+    try std.testing.expectEqual(@as(u256, 1), try h.storage(contract, 0));
+    try std.testing.expectEqual(@as(u256, 0), try h.storage(contract, 1));
+}
