@@ -146,10 +146,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
   sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
   (`--rehash-threads`, auto min(cores - 1, 4); db/commit sim cpu p50 7.81 -> 6.79 ms, PERF.md)
-- [ ] History memory budget at 200 ms blocks: measure bytes per retained block in
+- [x] History memory budget at 200 ms blocks: measure bytes per retained block in
   `history.Store` (storage-heavy and typical blocks), express the window as wall-clock span
   at 5 blocks/s, add a byte budget (`Config.history_bytes_max`) that shrinks the window
   (pruning oldest) instead of dropping history on overflow; record in docs/PERF.md.
+  (`history.Config.bytes_max`, `Store.fit_budget`/`bytes_used`/`window_shrinks`,
+  `db/history_bench.zig`; typical 2.82 MiB/block, heavy 4.68 MiB/block; node default
+  window 300 = 60 s, `Limits.history_bytes_max` 1 GiB; see Decisions, PERF.md)
 - [ ] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
   `eth_getProof` with many storage keys at an older block walks the history trie once per
   key; reuse `path_targets` + `history.Store.walk_paths` for one sorted walk per trie.
@@ -608,6 +611,32 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   flashblocks). Trie/db budgets assume 5 blocks/s: commit latency must stay well under the
   200 ms slot (seal at 150 ms), and block-count windows (history, retention, pruning) cover
   5x fewer seconds than at 1 s blocks; size them in blocks from the desired wall-clock span.
+- History byte budget (`history.Config.bytes_max`; the backlog's `Config.history_bytes_max`,
+  kept on the store config the database already takes, plus `Limits.history_bytes_max` in
+  the node): `Store.bytes_used` counts occupied paths and versions at fixed unit sizes
+  (`small_version_bytes` 196, `large_version_bytes` 682, `path_bytes` 147: record, encoding
+  slot, free-stack entry, index entry). After a commit writes its block and moves the window,
+  `fit_budget` drains the prune queue (garbage first), then moves the oldest block forward one
+  at a time and prunes what it shadowed until the store fits: the window stays contiguous
+  and ends at the head, grows back one block per commit, and proofs below it return the
+  existing `BlockOutOfWindow`. Only when the head block alone (its state's nodes) is above the
+  budget does the commit return `HistoryFull` (window shrunk to that block), and `reset`
+  refuses such a state too; the database then drops history as before (`history_drops`,
+  `history_off`). Capacity exhaustion keeps its old atomic refusal (not turned into shrinking):
+  the node sizes the version pools at the budget's worth of each class plus one block, so
+  the budget binds first. Pools and path arrays are lazily committed (`lazy_alloc`) and hand
+  out never-used slots from a bump index before recycling LIFO, so resident memory follows
+  the peak occupancy (about the budget), not the capacity; the path hash index is still
+  allocated eagerly, so node paths are capped at min(sizing rule, budget / (path + small
+  version)). Rebuild on open needs nothing new: its `commit_block`s shrink the same way (it
+  may replay blocks that are pruned again right away; bounded by the window).
+- Node history defaults: base/base defaults to 15 days (6 480 000 blocks at 200 ms) because
+  its proofs store is on disk (RocksDB/MDBX); needlefish's window is in memory, where 15 days
+  of typical blocks is ~17 TiB (14.1 MiB/s measured). Default `--proofs-history.window` is
+  300 blocks = 60 s at 200 ms (`service.proofs_history_span_s`, `block_time_ms`), enough for
+  proving the recent head; the 1 GiB budget holds the devnet-scale 100k-account state
+  (79 MiB) plus 300 typical blocks (~925 MiB) and shrinks to ~202 blocks (40 s) under
+  sustained storage-heavy blocks. A longer window needs a disk-backed store (not done).
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -760,3 +789,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   unchanged within noise (7.8-8.2 -> 7.4-7.8 ms, load ~25). Seeded differential vs
   `StateTrie.has_storage` (genesis puts, overlay blocks with destroys/wipes/discards,
   unwinds, snapshot reloads) and a fuzz.
+- 2026-11-05: history byte budget: `history.Config.bytes_max` shrinks the window (oldest
+  pruned first) instead of dropping history; lazily committed pools. Measured
+  (`db/history_bench.zig`, 100k accounts): typical block 8 025 versions = 2.82 MiB, heavy
+  15 309 = 4.68 MiB, state 78.7 MiB; history commit p50 12 / 34 ms. Node: window 300 (60 s),
+  budget 1 GiB. Tests: seeded store workloads with reorgs under a budget (window contiguous at
+  head, in-window proofs equal the unwound state, pruned blocks out of window), a state over
+  the budget is refused, and a database workload with crash/reopen under a budget (no
+  `history_drops`, rebuilt window within the budget).

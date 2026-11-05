@@ -34,6 +34,8 @@ const Prng = @import("../../testing/prng.zig").Prng;
 pub const witness = @import("witness_bench.zig");
 /// Read-path benchmarks (`read_bench.zig`), run by `bench_main.zig`.
 pub const read = @import("read_bench.zig");
+/// History store bytes per retained block (`history_bench.zig`), run by `bench_main.zig`.
+pub const history = @import("history_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -694,6 +696,7 @@ fn delete_scratch(io: std.Io) void {
 test {
     _ = witness;
     _ = read;
+    _ = history;
 }
 
 test "bench: cases are well formed" {

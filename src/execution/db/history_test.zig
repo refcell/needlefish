@@ -539,6 +539,83 @@ fn fuzz_decoders(_: void, smith: *testing.Smith) anyerror!void {
     check_decoders(input[0..length]);
 }
 
+/// Window invariants under a byte budget: contiguous, ending at `head`, within both the
+/// block window and the budget; the block below the oldest is out of window.
+fn expect_budget_window(harness: *Harness, head: u64, bytes_max: u64) !void {
+    const window = harness.store.window().?;
+    try testing.expectEqual(head, window.head);
+    try testing.expect(window.oldest <= window.head);
+    try testing.expect(window.head - window.oldest < harness.store.config.window_blocks);
+    try testing.expect(harness.store.usage().bytes <= bytes_max);
+    if (window.oldest == 0) return;
+    var proof: StateTrie.AccountProof = .{};
+    try testing.expectError(
+        error.BlockOutOfWindow,
+        harness.store.prove_account(window.oldest - 1, address_of(1), &proof),
+    );
+}
+
+test "history: a byte budget shrinks the window instead of dropping history" {
+    for (0..2) |seed| {
+        var prng = Prng.init(0xb0d9e7 + seed);
+        var harness: Harness = undefined;
+        try harness.init(sized_config(window_blocks, block_versions_max));
+        defer harness.deinit();
+        // A state near its largest (every account and slot written), so its growth cannot
+        // outrun the budget, then room for it and a few blocks: 10 blocks cannot fit.
+        for (0..addresses_max * slots_max) |_| try random_write(&prng, &harness.overlay);
+        _ = try harness.overlay.commit(harness.changeset(0));
+        try harness.store.reset(&harness.state.state_trie, 0);
+        const bytes_max = 2 * harness.store.bytes_used();
+        harness.store.config.bytes_max = bytes_max;
+        var head: u64 = 0;
+        var window_min: u64 = window_blocks;
+        for (0..120) |_| {
+            const oldest = harness.store.window().?.oldest;
+            if (head > oldest and prng.chance(1, 6)) {
+                head = try harness.reorg(&prng, head);
+            } else {
+                head += 1;
+                try harness.commit_writes(&prng, head, prng.range(10, 40));
+            }
+            try expect_budget_window(&harness, head, bytes_max);
+            const window = harness.store.window().?;
+            const length = window.head - window.oldest + 1;
+            if (head > window_blocks) window_min = @min(window_min, length);
+            const index = prng.below(addresses_max + 1);
+            try expect_matches_live(&harness.store, &harness.state, head, index, harness.proofs);
+        }
+        try testing.expect(harness.store.window_shrinks > 0);
+        try testing.expect(window_min < window_blocks);
+        // Every block left in the window still serves proofs equal to the unwound state.
+        try harness.sweep();
+    }
+}
+
+test "history: a state above the byte budget is refused" {
+    // The unit sizes docs/PERF.md and the lane decisions quote.
+    try testing.expectEqual(@as(u64, 196), history.small_version_bytes);
+    try testing.expectEqual(@as(u64, 682), history.large_version_bytes);
+    try testing.expectEqual(@as(u64, 147), history.path_bytes);
+    var prng = Prng.init(0xb0d9);
+    var harness: Harness = undefined;
+    try harness.init(sized_config(4, block_versions_max));
+    defer harness.deinit();
+    try start(&harness, &prng);
+    const state_bytes = harness.store.bytes_used();
+    // The head state alone does not fit: the commit shrinks to that block and refuses.
+    harness.store.config.bytes_max = state_bytes / 2;
+    try testing.expectError(error.HistoryFull, harness.commit_writes(&prng, 1, 1));
+    const window = harness.store.window().?;
+    try testing.expectEqual(window.oldest, window.head);
+    // A reset under the same budget keeps no history at all.
+    try testing.expectError(error.HistoryFull, harness.store.reset(&harness.state.state_trie, 1));
+    try testing.expect(harness.store.window() == null);
+    harness.store.config.bytes_max = null;
+    try harness.store.reset(&harness.state.state_trie, 1);
+    try testing.expectEqual(@as(u64, 1), harness.store.window().?.head);
+}
+
 test "history: fuzz node and value decoders" {
     try testing.fuzz({}, fuzz_decoders, .{});
 }

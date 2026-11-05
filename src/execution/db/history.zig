@@ -23,6 +23,7 @@ const assert = std.debug.assert;
 
 const trie = @import("../trie/root.zig");
 const changeset_module = @import("changeset.zig");
+const lazy_alloc = @import("../../utilities/lazy_alloc/root.zig");
 const rlp = trie.rlp;
 const nibbles_module = trie.nibbles;
 const StateTrie = trie.StateTrie;
@@ -42,6 +43,11 @@ pub const Config = struct {
     large_versions_max: u32,
     /// Queued versions `commit_block` prunes before writing a block (see "Sizing").
     prune_per_commit: u32,
+    /// Byte budget of retained history (`Store.bytes_used`); null = only the capacities
+    /// above bound it. A commit that leaves the store above the budget prunes the oldest
+    /// blocks until it fits, so the effective window shrinks below `window_blocks` instead
+    /// of history being dropped (see "Byte budget" on `Store`).
+    bytes_max: ?u64 = null,
 };
 
 pub const Error = error{
@@ -121,6 +127,19 @@ const Version = struct {
 
 const Path = struct { key: Key, head: u32 };
 
+/// Bytes one occupied slot holds, as `Store.bytes_used` counts them: a version record, its
+/// encoding slot, and its free-stack entry; a path record, its free-stack entry, and its
+/// `path_index` entry (key, value, one metadata byte; the index's load-factor slack is
+/// static capacity, not counted).
+pub const small_version_bytes: u64 = @sizeOf(Version) + small_bytes + @sizeOf(u32);
+pub const large_version_bytes: u64 = @sizeOf(Version) + large_bytes + @sizeOf(u32);
+pub const path_bytes: u64 = @sizeOf(Path) + @sizeOf(u32) + @sizeOf(Key) + @sizeOf(u32) + 1;
+
+comptime {
+    assert(small_version_bytes < large_version_bytes);
+    assert(path_bytes > @sizeOf(Key));
+}
+
 const BlockEntry = struct {
     number: u64,
     state_root: Hash,
@@ -147,9 +166,14 @@ pub const Usage = struct {
     large_versions: u32,
     /// Versions at or before the oldest block that `prune_step` has not examined yet.
     prune_queue: u32,
+    /// `Store.bytes_used`: what `Config.bytes_max` bounds.
+    bytes: u64,
 };
 
-/// A free list of version slots of one size class.
+/// Version slots of one size class: slots are handed out from a never-used tail (`fresh`)
+/// and recycled through a LIFO free stack, so only slots ever used are touched. The arrays
+/// are lazily committed (`lazy_alloc`): resident memory follows the peak occupancy, not the
+/// capacity, which lets `Config.bytes_max` bound memory below the configured capacity.
 fn Pool(comptime bytes: u32) type {
     return struct {
         const Self = @This();
@@ -157,48 +181,68 @@ fn Pool(comptime bytes: u32) type {
         data: [][bytes]u8,
         free: []u32,
         free_len: u32,
+        /// Slots `[fresh, len)` were never handed out since the last `clear`.
+        fresh: u32,
 
         fn init(allocator: std.mem.Allocator, count: u32) !Self {
-            const versions = try allocator.alloc(Version, count);
-            errdefer allocator.free(versions);
-            const data = try allocator.alloc([bytes]u8, count);
-            errdefer allocator.free(data);
-            const free = try allocator.alloc(u32, count);
-            var self: Self = .{ .versions = versions, .data = data, .free = free, .free_len = 0 };
+            const versions = try lazy_alloc.alloc(allocator, Version, count);
+            errdefer lazy_alloc.free(allocator, versions);
+            const data = try lazy_alloc.alloc(allocator, [bytes]u8, count);
+            errdefer lazy_alloc.free(allocator, data);
+            const free = try lazy_alloc.alloc(allocator, u32, count);
+            var self: Self = .{
+                .versions = versions,
+                .data = data,
+                .free = free,
+                .free_len = 0,
+                .fresh = 0,
+            };
             self.clear();
             return self;
         }
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            allocator.free(self.free);
-            allocator.free(self.data);
-            allocator.free(self.versions);
+            lazy_alloc.free(allocator, self.free);
+            lazy_alloc.free(allocator, self.data);
+            lazy_alloc.free(allocator, self.versions);
             self.* = undefined;
         }
 
         fn clear(self: *Self) void {
-            for (self.free, 0..) |*slot, index| slot.* = @intCast(self.free.len - 1 - index);
-            self.free_len = @intCast(self.free.len);
+            self.free_len = 0;
+            self.fresh = 0;
+        }
+
+        /// Slots `take` can still hand out.
+        fn available(self: *const Self) u32 {
+            assert(self.fresh <= self.versions.len);
+            return self.free_len + (@as(u32, @intCast(self.versions.len)) - self.fresh);
         }
 
         fn take(self: *Self) u32 {
-            assert(self.free_len > 0);
-            self.free_len -= 1;
-            const index = self.free[self.free_len];
+            assert(self.available() > 0);
+            if (self.free_len > 0) {
+                self.free_len -= 1;
+                const index = self.free[self.free_len];
+                assert(index < self.fresh);
+                return index;
+            }
+            const index = self.fresh;
+            self.fresh += 1;
             assert(index < self.versions.len);
             return index;
         }
 
         fn give(self: *Self, index: u32) void {
-            assert(index < self.versions.len);
-            assert(self.free_len < self.free.len);
+            assert(index < self.fresh);
+            assert(self.free_len < self.fresh);
             self.free[self.free_len] = index;
             self.free_len += 1;
         }
 
         fn used(self: *const Self) u32 {
-            assert(self.free_len <= self.free.len);
-            return @as(u32, @intCast(self.free.len)) - self.free_len;
+            assert(self.free_len <= self.fresh);
+            return self.fresh - self.free_len;
         }
     };
 }
@@ -270,12 +314,23 @@ const Drain = struct {
 /// version class to that bound and `commit_block` never fails with `HistoryFull`. As a
 /// fallback, a block that does not fit drains the whole queue (bounded by the version
 /// capacity) and is tried once more.
+///
+/// Byte budget: `Config.bytes_max` bounds `bytes_used` (occupied paths and versions at their
+/// `*_bytes` unit sizes). The arrays are lazily committed and slots are recycled LIFO, so
+/// resident memory follows peak occupancy; size the capacities above the budget (plus one
+/// block of B) and the budget binds first. A commit that ends above the budget prunes the
+/// oldest blocks (`fit_budget`): the effective window (`window`) shrinks, proofs at blocks
+/// that left it return `BlockOutOfWindow`, and history is only dropped when the head state
+/// alone is above the budget.
 pub const Store = struct {
     config: Config,
     path_index: std.AutoHashMapUnmanaged(Key, u32),
     paths: []Path,
     path_free: []u32,
     path_free_len: u32,
+    /// Path slots `[paths_fresh, paths_max)` were never used since the last `clear` (as
+    /// `Pool.fresh`: only used slots are touched, the arrays are lazily committed).
+    paths_fresh: u32,
     /// Paths removed from `path_index` since its last rehash (tombstone cleanup).
     paths_removed: u32,
     small: Pool(small_bytes),
@@ -289,6 +344,8 @@ pub const Store = struct {
     prune_count: u32,
     bury_stack: []BuryFrame,
     bury_len: u32,
+    /// Blocks that left the window early to fit `Config.bytes_max` (since `init`).
+    window_shrinks: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Store {
         assert(config.window_blocks > 0);
@@ -296,10 +353,10 @@ pub const Store = struct {
         var path_index: std.AutoHashMapUnmanaged(Key, u32) = .empty;
         try path_index.ensureTotalCapacity(allocator, config.paths_max);
         errdefer path_index.deinit(allocator);
-        const paths = try allocator.alloc(Path, config.paths_max);
-        errdefer allocator.free(paths);
-        const path_free = try allocator.alloc(u32, config.paths_max);
-        errdefer allocator.free(path_free);
+        const paths = try lazy_alloc.alloc(allocator, Path, config.paths_max);
+        errdefer lazy_alloc.free(allocator, paths);
+        const path_free = try lazy_alloc.alloc(allocator, u32, config.paths_max);
+        errdefer lazy_alloc.free(allocator, path_free);
         var small = try Pool(small_bytes).init(allocator, config.small_versions_max);
         errdefer small.deinit(allocator);
         var large = try Pool(large_bytes).init(allocator, config.large_versions_max);
@@ -313,6 +370,7 @@ pub const Store = struct {
             .paths = paths,
             .path_free = path_free,
             .path_free_len = 0,
+            .paths_fresh = 0,
             .paths_removed = 0,
             .small = small,
             .large = large,
@@ -324,6 +382,7 @@ pub const Store = struct {
             .prune_count = 0,
             .bury_stack = bury_stack,
             .bury_len = 0,
+            .window_shrinks = 0,
         };
         self.clear();
         return self;
@@ -334,16 +393,16 @@ pub const Store = struct {
         allocator.free(self.blocks);
         self.large.deinit(allocator);
         self.small.deinit(allocator);
-        allocator.free(self.path_free);
-        allocator.free(self.paths);
+        lazy_alloc.free(allocator, self.path_free);
+        lazy_alloc.free(allocator, self.paths);
         self.path_index.deinit(allocator);
         self.* = undefined;
     }
 
     fn clear(self: *Store) void {
         self.path_index.clearRetainingCapacity();
-        for (self.path_free, 0..) |*slot, index| slot.* = @intCast(self.path_free.len - 1 - index);
-        self.path_free_len = @intCast(self.path_free.len);
+        self.path_free_len = 0;
+        self.paths_fresh = 0;
         self.paths_removed = 0;
         self.small.clear();
         self.large.clear();
@@ -365,13 +424,29 @@ pub const Store = struct {
         return .{ .oldest = oldest, .head = head };
     }
 
+    /// Bytes held by occupied paths and versions (see `small_version_bytes`).
+    pub fn bytes_used(self: *const Store) u64 {
+        const paths: u64 = self.paths_fresh - self.path_free_len;
+        const bytes = paths * path_bytes + @as(u64, self.small.used()) * small_version_bytes +
+            @as(u64, self.large.used()) * large_version_bytes;
+        assert(bytes <= self.bytes_capacity());
+        return bytes;
+    }
+
+    /// `bytes_used` with every slot occupied.
+    pub fn bytes_capacity(self: *const Store) u64 {
+        return self.paths.len * path_bytes + self.small.versions.len * small_version_bytes +
+            self.large.versions.len * large_version_bytes;
+    }
+
     pub fn usage(self: *const Store) Usage {
-        assert(self.path_free_len <= self.paths.len);
+        assert(self.path_free_len <= self.paths_fresh);
         return .{
-            .paths = @as(u32, @intCast(self.paths.len)) - self.path_free_len,
+            .paths = self.paths_fresh - self.path_free_len,
             .small_versions = self.small.used(),
             .large_versions = self.large.used(),
             .prune_queue = self.prune_count,
+            .bytes = self.bytes_used(),
         };
     }
 
@@ -432,10 +507,22 @@ pub const Store = struct {
         if (id & large_bit != 0) self.large.give(id & ~large_bit) else self.small.give(id);
     }
 
+    fn paths_available(self: *const Store) u32 {
+        assert(self.paths_fresh <= self.paths.len);
+        return self.path_free_len + (@as(u32, @intCast(self.paths.len)) - self.paths_fresh);
+    }
+
     fn new_path(self: *Store, key: *const Key) u32 {
-        assert(self.path_free_len > 0);
-        self.path_free_len -= 1;
-        const id = self.path_free[self.path_free_len];
+        assert(self.paths_available() > 0);
+        var id: u32 = undefined;
+        if (self.path_free_len > 0) {
+            self.path_free_len -= 1;
+            id = self.path_free[self.path_free_len];
+            assert(id < self.paths_fresh);
+        } else {
+            id = self.paths_fresh;
+            self.paths_fresh += 1;
+        }
         self.paths[id] = .{ .key = key.*, .head = none };
         self.path_index.putAssumeCapacityNoClobber(key.*, id);
         return id;
@@ -443,7 +530,7 @@ pub const Store = struct {
 
     fn free_path(self: *Store, id: u32) void {
         assert(self.paths[id].head == none);
-        assert(self.path_free_len < self.path_free.len);
+        assert(self.path_free_len < self.paths_fresh);
         const removed = self.path_index.remove(self.paths[id].key);
         assert(removed);
         self.path_free[self.path_free_len] = id;
@@ -473,13 +560,26 @@ pub const Store = struct {
         // The snapshot block is the oldest: its versions are base versions.
         self.blocks[0].versions = none;
         self.blocks[0].versions_tail = none;
+        // One state alone above the budget: nothing to shrink, no history.
+        if (self.over_budget()) {
+            self.blocks_len = 0;
+            return error.HistoryFull;
+        }
         assert(self.window().?.head == number);
+    }
+
+    fn over_budget(self: *const Store) bool {
+        const bytes_max = self.config.bytes_max orelse return false;
+        return self.bytes_used() > bytes_max;
     }
 
     /// Records block `number` (`head + 1`) from the nodes `state_trie` rehashed since the
     /// previous `commit_block`, `reset`, or `unwind_to`, then moves the oldest block forward
-    /// once the window is full. Atomic: on any error (`HistoryFull`) the store keeps its
-    /// window and the trie keeps its change marks, so the call can be retried.
+    /// once the window is full, then fits the byte budget (`fit_budget`). Atomic when the
+    /// block does not fit the capacities (`HistoryFull`): the store keeps its window and the
+    /// trie keeps its change marks, so the call can be retried. A budget the head block's
+    /// state alone exceeds also returns `HistoryFull`, after the block is written and the
+    /// window shrank to that one block (callers drop history then, see `fit_budget`).
     pub fn commit_block(self: *Store, state_trie: *StateTrie, number: u64) Error!void {
         const current = self.window() orelse return error.NotInitialized;
         if (number != current.head + 1) return error.NotNextBlock;
@@ -493,7 +593,30 @@ pub const Store = struct {
         var drain: Drain = .{};
         try state_trie.visit_nodes(.drain, &drain);
         if (self.blocks_len > self.config.window_blocks) self.advance_oldest();
+        try self.fit_budget();
         assert(self.window().?.head == number);
+    }
+
+    /// Byte budget: while the store is above `Config.bytes_max`, drains the prune queue
+    /// (garbage first), then moves the oldest block forward one at a time and prunes what it
+    /// shadowed. The window stays contiguous and ends at the head; it grows back by one block
+    /// per commit while there is room. `HistoryFull` when even the head block alone (its
+    /// state's nodes) is above the budget. Bounded: one drain plus one shrink per block.
+    fn fit_budget(self: *Store) error{HistoryFull}!void {
+        if (!self.over_budget()) return;
+        var steps: u32 = 0;
+        while (self.over_budget()) : (steps += 1) {
+            assert(steps <= 2 * self.config.window_blocks + 1);
+            if (self.prune_count > 0) {
+                _ = self.prune_step(self.prune_count);
+                assert(self.prune_count == 0);
+                continue;
+            }
+            if (self.blocks_len == 1) return error.HistoryFull;
+            self.advance_oldest();
+            self.window_shrinks += 1;
+        }
+        assert(self.blocks_len >= 1 and !self.over_budget());
     }
 
     /// Writes block `number` as the new head, or nothing on error.
@@ -519,8 +642,9 @@ pub const Store = struct {
     }
 
     /// The oldest block leaves; the next one becomes the oldest and queues its versions.
+    /// Runs when the window overflows by one block, or earlier to fit the byte budget.
     fn advance_oldest(self: *Store) void {
-        assert(self.blocks_len == self.config.window_blocks + 1);
+        assert(self.blocks_len > 1 and self.blocks_len <= self.config.window_blocks + 1);
         assert(self.block_at(0).versions == none);
         self.blocks_start = @intCast((self.blocks_start + 1) % self.blocks.len);
         self.blocks_len -= 1;
@@ -677,9 +801,9 @@ pub const Store = struct {
         const needed = self.needs_version(&key, visit.encoding);
         if (!needed.version) return;
         // Check every resource before taking any, so a failure leaves nothing behind.
-        if (needed.path_id == null and self.path_free_len == 0) return error.HistoryFull;
-        if (length <= small_bytes and self.small.free_len == 0) return error.HistoryFull;
-        if (length > small_bytes and self.large.free_len == 0) return error.HistoryFull;
+        if (needed.path_id == null and self.paths_available() == 0) return error.HistoryFull;
+        if (length <= small_bytes and self.small.available() == 0) return error.HistoryFull;
+        if (length > small_bytes and self.large.available() == 0) return error.HistoryFull;
         const path_id = needed.path_id orelse self.new_path(&key);
         var id: u32 = undefined;
         if (length <= small_bytes) {
@@ -732,7 +856,7 @@ pub const Store = struct {
         }
         // An unreachable node is never visited, so it has no version in this block.
         assert(head.block < number);
-        if (self.small.free_len == 0) return error.HistoryFull;
+        if (self.small.available() == 0) return error.HistoryFull;
         self.link_version(path_id, self.small.take(), number, 0);
         return true;
     }

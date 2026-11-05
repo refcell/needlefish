@@ -139,6 +139,12 @@ pub const Limits = struct {
     /// Trie node versions one block writes to the historical window, at most; sizes the
     /// window (see `db.history.Store` "Sizing") together with the state trie bounds.
     history_versions_per_block: u32 = 1 << 10,
+    /// Byte budget of the historical window (`db.history.Config.bytes_max`): above it the
+    /// oldest blocks are pruned early (the window shrinks) instead of history being
+    /// dropped. 1 GiB holds a 100k-account state (79 MiB) plus the default 300-block
+    /// window of typical blocks (2.8 MiB each, ~925 MiB); storage-heavy blocks (4.7 MiB)
+    /// shrink it to ~200 blocks (40 s). See docs/PERF.md "db history memory".
+    history_bytes_max: u64 = 1 << 30,
     /// `debug_executionWitness` buffers (null disables it); see `witness_config` for the
     /// derived fields. Every large buffer is reserved at init and committed on first touch
     /// (`lazy_alloc`); only the hash-map indexes are written at init (their metadata in
@@ -264,24 +270,48 @@ pub const Limits = struct {
     }
 };
 
-/// Sizes the historical window so `commit_block` never runs out (`db.history.Store`
-/// "Sizing"): every live trie node once, plus `window` blocks of the per-block bound.
-/// Dense branches (large versions) are at most a quarter of either.
+/// Base's native L2 block time (AGENTS.md rule 10): 5 blocks per second.
+pub const block_time_ms = 200;
+/// Default `--proofs-history.window` span. base/base defaults to 15 days (6 480 000 blocks)
+/// because its proofs store is on disk; needlefish keeps the window in memory, where 15
+/// days of typical blocks would be ~17 TiB (14 MiB/s, docs/PERF.md), so it serves the
+/// last minute: enough for proposers and challengers proving the recent chain head.
+pub const proofs_history_span_s = 60;
+pub const proofs_history_window_default: u32 = proofs_history_span_s * 1000 / block_time_ms;
+
+comptime {
+    assert(proofs_history_window_default == 300);
+}
+
+/// Sizes the historical window (`db.history.Store` "Sizing" and "Byte budget"). Versions:
+/// the budget's worth of each size class plus one block of the per-block bound, so the
+/// byte budget binds before a capacity (the pools are lazily committed: unused capacity
+/// is address space only). Paths: every live trie node once plus `window` blocks of the
+/// per-block bound (the sizing rule), capped by the budget's worth of one-version paths;
+/// the path index is allocated eagerly, so it is not oversized.
 pub fn history_config(limits: *const Limits, window: u32) db_module.history.Config {
     assert(window > 0);
+    const history = db_module.history;
     const trie = limits.state.trie;
     const nodes: u64 = @as(u64, trie.account_nodes_max) + trie.storage_nodes_max;
     const per_block: u64 = limits.history_versions_per_block;
     const total = nodes + @as(u64, window) * per_block;
-    assert(total <= std.math.maxInt(u32));
-    const config: db_module.history.Config = .{
+    const budget = limits.history_bytes_max;
+    const small = budget / history.small_version_bytes + per_block;
+    const large = budget / history.large_version_bytes + per_block;
+    const paths = @min(total, budget / (history.path_bytes + history.small_version_bytes) +
+        per_block);
+    // Version ids keep one tag bit (`history.Store`).
+    assert(small < 1 << 31 and large < 1 << 31 and paths <= std.math.maxInt(u32));
+    const config: history.Config = .{
         .window_blocks = window,
-        .paths_max = @intCast(total),
-        .small_versions_max = @intCast(total),
-        .large_versions_max = @intCast(total / 4),
+        .paths_max = @intCast(paths),
+        .small_versions_max = @intCast(small),
+        .large_versions_max = @intCast(large),
         .prune_per_commit = limits.history_versions_per_block,
+        .bytes_max = budget,
     };
-    assert(config.paths_max >= nodes);
+    assert(config.paths_max > 0 and config.small_versions_max > per_block);
     return config;
 }
 

@@ -607,3 +607,52 @@ test "database history: without room for the state, history is off and the head 
         &.{},
     ));
 }
+
+/// Under a byte budget: the window ends at the head, fits the budget, and the block below
+/// its oldest is out of window. Returns whether the budget kept the window short.
+fn expect_budget_window(h: *Harness, bytes_max: u64) !bool {
+    const head = h.db.head_info.number;
+    const store = &h.db.history.?;
+    const window = store.window().?;
+    try testing.expectEqual(head, window.head);
+    try testing.expect(store.usage().bytes <= bytes_max);
+    try testing.expect(window.oldest >= h.expected_oldest(window_blocks));
+    if (window.oldest == 0) return false;
+    try testing.expectError(error.BlockOutOfWindow, h.db.proof_at(
+        window.oldest - 1,
+        address_of(1),
+        &.{},
+        &h.proofs.account,
+        &.{},
+        &.{},
+    ));
+    return window.oldest > h.expected_oldest(window_blocks);
+}
+
+test "database history: a byte budget shrinks the window, also when rebuilt on open" {
+    var config = base_config;
+    // The state grows to ~40 KiB of nodes and a full window to ~60 KiB.
+    const bytes_max: u64 = 52 * 1024;
+    config.history.?.bytes_max = bytes_max;
+    const h = try Harness.create(0xb0d9, config);
+    defer h.destroy();
+    try h.format();
+    var shrunk = false;
+    var cycle: u32 = 0;
+    while (cycle < 3) : (cycle += 1) {
+        for (0..40) |round| {
+            try h.step();
+            if (try expect_budget_window(h, bytes_max)) shrunk = true;
+            if (round % 8 == 7) try h.sweep();
+        }
+        const head = h.db.head_info;
+        try h.crash_and_reopen();
+        try testing.expect(head.eql(h.db.head_info));
+        if (try expect_budget_window(h, bytes_max)) shrunk = true;
+        try h.sweep();
+    }
+    try testing.expect(shrunk);
+    // Shrinking is not a drop: history was never discarded.
+    try testing.expectEqual(@as(u64, 0), h.db.history_drops);
+    try testing.expect(!h.db.history_off);
+}

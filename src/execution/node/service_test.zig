@@ -20,6 +20,8 @@ const genesis_time: u64 = 1_700_000_000; // SimIo's default realtime start.
 const block_time_s: u64 = 2;
 
 const test_limits: service_module.Limits = .{
+    // Small history pools for the tests (they are lazily committed either way).
+    .history_bytes_max = 16 << 20,
     .state = .{
         .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 8192 },
         .code_bytes_max = 1 << 16,

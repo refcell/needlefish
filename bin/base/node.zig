@@ -4,8 +4,9 @@
 //! the node follows the chain in `--chain` and serves eth JSON-RPC (and the Engine API on
 //! `--authrpc.port`). With `--datadir` the state and chain persist in `DIR/node.db` (a
 //! journal plus checkpoints) and a restart resumes from it; without it state is in memory.
-//! `--proofs-history` keeps the last `--proofs-history.window` blocks (default 256) of
-//! trie nodes in memory, so state reads and eth_getProof work at older blocks.
+//! `--proofs-history` keeps the last `--proofs-history.window` blocks (default 300: 60 s of
+//! 200 ms blocks) of trie nodes in memory, so state reads and eth_getProof work at older
+//! blocks; a 1 GiB byte budget shrinks the window under heavy blocks.
 //! `--rehash-threads N` sets the storage-trie rehash workers (default: one per spare core,
 //! at most 4; 0 hashes on the calling thread).
 
@@ -38,7 +39,7 @@ pub const Flags = struct {
     jwt_secret_path: ?[]const u8 = null,
     log_level: log.Level = .info,
     proofs_history: bool = false,
-    proofs_history_window: u32 = 256,
+    proofs_history_window: u32 = node.service.proofs_history_window_default,
     /// Storage-rehash workers; null picks `state_db.rehash_threads_auto` from the cores.
     rehash_threads: ?u32 = null,
 };

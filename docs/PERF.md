@@ -415,6 +415,39 @@ Remaining verifier cost is two keccaks over the payload (payload hash, transacti
 different preimages, both required) at ~980 MB/s (`common/crypto/keccak`, crypto lane) and
 two decompressions (message id, validation; ~20 µs each).
 
+## 2026-11-05 db history memory at 200 ms blocks (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/history` (`db/history_bench.zig`). State: the db
+bench state (100k accounts, 1k contracts x 64 slots: 227 620 trie nodes). A `history.Store`
+with a 64-block window is reset at that state, then 128 `bench.write_block` blocks are
+committed (distinct existing accounts and slots); the second 64 are measured with the window
+full and pruning in steady state. Bytes = `Store.bytes_used` (occupied paths and versions at
+their unit sizes: small version 196 B, large version 682 B, path 147 B including its index
+entry). Typical block = ~200 transactions (1k account + 1k slot writes); heavy = 1k + 4k.
+
+| Block | versions/block | bytes/block | at 5 blocks/s | state | steady (64 blocks) | commit p50 / max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| typical 1k acct + 1k slot | 8 025 | 2.82 MiB | 14.1 MiB/s, 846 MiB/min | 78.7 MiB | 259.0 MiB | 11.9-13.1 / 19.9-36.4 ms |
+| heavy 1k acct + 4k slot | 15 309 | 4.68 MiB | 23.4 MiB/s, 1.37 GiB/min | 78.7 MiB | 378.3 MiB | 33.7 / 116.6 ms |
+
+Rewritten paths repeat block to block (paths 227 620 before and after the run): a block adds
+versions, not paths. Budget check: with `bytes_max` = state + half the steady window, the next
+64 commits keep a 32-block window (95 early prunes, one per commit after the first drain),
+bytes always at or under the budget. Max commit times include first-touch page faults of the
+lazily committed pools and are noisy (two runs: 19.9 and 36.4 ms typical).
+
+Window as wall-clock span (state + span x bytes/block, this state):
+
+| Span | Blocks | typical | heavy |
+| --- | ---: | ---: | ---: |
+| 12.8 s | 64 | 259 MiB | 378 MiB |
+| 60 s (node default) | 300 | 925 MiB | 1.45 GiB -> 1 GiB budget keeps ~202 blocks (40 s) |
+| 15 days (base/base default, on disk) | 6 480 000 | ~17.4 TiB | ~28.9 TiB |
+
+Node defaults from this: `--proofs-history.window` 300 (60 s at 200 ms) and
+`Limits.history_bytes_max` 1 GiB. The history commit (~12 ms typical, ~34 ms heavy) runs on top
+of the block apply + root (~8 ms heavy) inside the 200 ms slot.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
