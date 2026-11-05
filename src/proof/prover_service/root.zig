@@ -7,6 +7,7 @@ const std = @import("std");
 
 pub const protocol = @import("protocol.zig");
 pub const codec = @import("codec.zig");
+pub const store = @import("store.zig");
 
 test {
     std.testing.refAllDecls(@This());
