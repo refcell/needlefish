@@ -94,6 +94,12 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   count); the proposer exporter moved onto it; `challenger/exporter.zig` (driver, bond and
   anchor counters as `base_challenger_*`, ready while scans succeed) checked in the seeded
   sim; `base challenger --health.* --metrics.*` like the proposer (`bin/base/telemetry.zig`).
+- [ ] `proof/prover-service-metrics`: `prover_service.*` counters (requests by outcome,
+  completed by status, stuck/retried, worker failures) over `proof.telemetry`; health and
+  metrics on `base prover-service` and `base prover-worker`.
+- [ ] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
+  COSE_Sign1 attestation documents, X.509 chain to the AWS Nitro root (std
+  `crypto.Certificate`), P-384 ECDSA signature, PCRs, and the `VerifierJournal` ABI.
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
   output-root validator, TEE/ZK dispute attempt state machine with ZK fallback, proof
   manager, bond resolve/unlock/withdraw, anchor updater, `Driver.tick(now)` over
