@@ -113,19 +113,14 @@ fn find(selector: [4]u8) ?*const Function {
 pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
     if (context.value != 0) return context.revert_selector(native.selector_non_payable);
     try context.charge_calldata(input);
-    if (!try initialized(context)) return context.revert(&.{});
+    if (!try context.account_has_code(context.address)) return context.revert(&.{});
     return route(context, input, false);
-}
-
-fn initialized(context: *Context) Error!bool {
-    const account = try context.state.load(context.address);
-    return account.info.has_code();
 }
 
 /// Decode and run one call; factory init calls use `privileged = true`.
 pub fn route(context: *Context, input: []const u8, privileged: bool) Error![]const u8 {
     const selector = native.selector_of(input);
-    const function = find(selector) orelse return context.revert_selector(selector);
+    const function = find(selector) orelse return context.revert_unknown(selector);
     if (function.tag != .announce) return execute(context, function, input, privileged);
     const arguments = try decode(context, function, input);
     try announce(context, &arguments, privileged);
@@ -306,7 +301,7 @@ fn view_extension(context: *Context, tag: Tag, arguments: *const Arguments) Erro
             const scope = try supported_scope(context, arguments.uint256(0));
             return write_u256(context, try b20.policy_id(context, scope));
         },
-        .multiplier => return write_u256(context, try context.sload(slot_multiplier)),
+        .multiplier => return write_u256(context, try multiplier(context)),
         .domain_separator => return native.write_word(context, try domain_separator(context)),
         .eip712_domain => return try eip712_domain(context),
         .to_scaled_balance => {
@@ -348,14 +343,14 @@ fn decimals(context: *Context) Error!u8 {
     return if (value == 0) decimals_min else value;
 }
 
+/// The multiplier; an unset (zero) slot reads as WAD.
 fn multiplier(context: *Context) Error!u256 {
     const value = try context.sload(slot_multiplier);
-    if (value == 0) return context.revert_word(native.error_panic, word(0x12));
-    return value;
+    return if (value == 0) wad else value;
 }
 
 fn to_scaled(context: *Context, balance: u256) Error!u256 {
-    const product = std.math.mul(u256, balance, try context.sload(slot_multiplier)) catch
+    const product = std.math.mul(u256, balance, try multiplier(context)) catch
         return b20.overflow(context);
     return product / wad;
 }

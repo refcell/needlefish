@@ -60,6 +60,9 @@ pub const Context = struct {
     /// Output (or revert data) buffer, the EVM return buffer.
     out: []u8,
     revert_len: u32 = 0,
+    /// The last revert was a custom error (or empty); false for panics, decode failures, and
+    /// unknown selectors, which B-20 factory init calls report as InitCallFailed.
+    revert_custom: bool = true,
 
     pub fn charge(context: *Context, cost: u64) error{OutOfGas}!void {
         assert(context.gas_used <= context.gas_limit);
@@ -73,6 +76,7 @@ pub const Context = struct {
         // Data already encoded in place at the start of `out` needs no copy.
         if (data.ptr != context.out.ptr) @memmove(context.out[0..data.len], data);
         context.revert_len = @intCast(data.len);
+        context.revert_custom = true;
         return error.Revert;
     }
 
@@ -105,9 +109,13 @@ pub const Context = struct {
     /// `__initialize`: install the one-byte `0xef` marker code (G_codedeposit, plus G_create
     /// and the code-hash cost when the account had no code). Existing code is kept.
     pub fn install_marker(context: *Context) Error!void {
+        return context.install_marker_at(context.address);
+    }
+
+    pub fn install_marker_at(context: *Context, address: Address) Error!void {
         if (context.is_static) return context.revert(&.{});
         try context.charge(gas.code_deposit_byte);
-        const account = try context.state.load(context.address);
+        const account = try context.state.load(address);
         if (account.info.has_code()) return;
         try context.charge(gas.create + keccak256_gas + gas.keccak256_word);
         try context.state.set_code(account, &marker_code);
@@ -143,7 +151,24 @@ pub const Context = struct {
                 .{&word},
             ) catch unreachable,
         }
-        return context.revert(writer.buffered());
+        context.revert(writer.buffered()) catch {};
+        context.revert_custom = false;
+        return error.Revert;
+    }
+
+    /// An unknown selector reverts with the bare selector.
+    pub fn revert_unknown(context: *Context, selector: [4]u8) error{Revert} {
+        context.revert_selector(selector) catch {};
+        context.revert_custom = false;
+        return error.Revert;
+    }
+
+    /// Metered account read (EIP-2929: 100, plus 2500 when cold); reports whether it has code.
+    pub fn account_has_code(context: *Context, address: Address) Error!bool {
+        const access = try context.state.access(address);
+        try context.charge(gas.warm_storage_read);
+        if (access.is_cold) try context.charge(gas.cold_account_access_extra);
+        return access.account.info.has_code();
     }
 
     pub fn sload_at(context: *Context, address: Address, slot: u256) Error!u256 {
@@ -159,7 +184,9 @@ pub const Context = struct {
         var buffer: [36]u8 = undefined;
         buffer[0..4].* = selector;
         buffer[4..36].* = word;
-        return context.revert(&buffer);
+        context.revert(&buffer) catch {};
+        context.revert_custom = !std.mem.eql(u8, &selector, &error_panic);
+        return error.Revert;
     }
 
     pub fn tload_unmetered(context: *Context, slot: u256) u256 {

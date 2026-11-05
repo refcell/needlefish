@@ -21,6 +21,7 @@ pub const Kind = enum {
     uint8,
     /// UTF-8 `string`; invalid UTF-8 fails the tuple type check.
     string,
+    bytes,
     /// `uint8[]` of enum values up to `enumeration_max`.
     enumeration_array,
     uint256_array,
@@ -125,7 +126,7 @@ pub fn decode_arguments(
             arguments.dynamic[index] = area;
             continue;
         }
-        if (kind == .string) {
+        if (kind == .string or kind == .bytes) {
             arguments.dynamic[index] = decode_dynamic(data, head, 1, failure) orelse return null;
             continue;
         }
@@ -250,7 +251,7 @@ fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) 
             const element = elements.word(@intCast(index));
             if (!zero(element[0..31]) or element[31] > enumeration_max) break false;
         } else true,
-        .uint256_array, .bytes_array => true,
+        .uint256_array, .bytes_array, .bytes => true,
         .string => std.unicode.utf8ValidateSlice(elements.words),
     };
 }
