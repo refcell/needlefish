@@ -23,7 +23,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   get/insert/delete with root recomputation, list walker for tx/receipt tries (port
   `node.rs`, `list_walker.rs`). Differential test against `src/execution/trie` roots;
   fuzz insert/delete sequences.
-- [ ] `proof/executor`: stateless L2 block executor over an oracle-backed state DB
+- [x] `proof/executor`: stateless L2 block executor over an oracle-backed state DB
   (trie DB with account/storage/code fetch via hints), building header + receipts and
   checking the output root (port `executor/src/{builder,db}`). Test: re-execute a block
   built by the node lane from a witness and match its state root.
@@ -63,8 +63,22 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   hash-verified, cached in a fixed arena), a lenient generic node decoder, and the list
   walker. The walker decodes each leaf key back to its index (canonical, unique,
   contiguous `0..n`) instead of relying on DFS order plus the Rust index-0 swap.
+- `proof/executor` reuses the node's block executor (new `executor.Backend` hook,
+  `Executor.init_backend`) over the trie-db lane's `SparseState` (new `Fallback` hook
+  for nodes/codes/block hashes, `account_storage_root`). The oracle fallback fetches
+  codes and headers after `l2-code` / `l2-block-header` hints and walks BLOCKHASH from
+  the parent hash through keccak-verified headers (never trusts witness headers). Header
+  assembly mirrors the node's `Chain.child_header`/`seal`; the e2e test rebuilds
+  node-built L2 blocks and must match their hashes, so drift is caught. Per-account
+  `l2-account-proof` hints are not sent: the `l2-payload-witness` hint prefetches all.
+- Push retries: the full suite runs once; after a rejected push, rebase and run a
+  compile check plus `-Dtest-filter=proof` (main moves every ~80 s, faster than the
+  ~3 min suite; upstream commits were green on main). Pushes go from a separate local
+  worktree so development continues meanwhile.
 
 ## Log
+- 2026-11-05: `proof/executor` landed (stateless builder, oracle fallback, output root;
+  e2e rebuild of node-built L2 blocks over the in-process oracle).
 - 2026-11-05: `proof/mpt` landed (oracle resolver, node decode, list walker, differential
   tests vs `execution/trie`). The differential fuzz found a `SparseTrie` crash (branch
   collapsing into a witness extension with an unloaded child); fixed in `sparse.zig`.
