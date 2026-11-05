@@ -21,6 +21,14 @@ provably robust.
     startup discovery) as the first verifier's consensus client (`sim/real_verifier.zig`).
   - [x] Sequencer: the real driver in sequencer mode producing the L2 chain
     (`sim/real_sequencer.zig`, `Config.real_sequencer`).
+  - [ ] Execution: the execution lane's engine (Engine API handlers, payload builder, EVM,
+    state db) behind the real verifier/sequencer drivers instead of the sim engine, with
+    disk faults on its durable db.
+  - [ ] P2P: the consensus p2p gossip stack (envelope encode/validate, signer checks)
+    carrying unsafe blocks over the sim network instead of model messages.
+- [ ] Sim: drop the `BUG(batcher)` gates (admin ops, reorg tx loss, `evict_reorged`) when
+  the batcher tracks confirmation depth and re-queues reorged frames (reported to
+  nf-batcher-devnet).
 - [x] Sim: drop the `real_verifier_fragile` fault gate once the derive lane fixes the
   reset loop at safe-head origin `genesis.l1 + 1` (see notes).
 - [x] Sim: L1 transaction-loss faults: mempool evictions and reorgs that lose orphaned txs.
