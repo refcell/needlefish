@@ -107,8 +107,14 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/e2e-fuzz`: seeded random e2e scenarios (1..6 blocks, epoch split, batch and
   data kind, invalid last-block tx, interval, right or wrong claim) proven against the
   node, with intermediate roots checked; 12 seeds in `zig build test`.
-- [ ] `proof/prover-service`: port `prover-service` + `worker` (proof request JSON-RPC
-  contract, job lifecycle) with the native host as the in-process prover backend.
+- [x] `proof/prover-service`: port `prover-service` + `worker` (proof request JSON-RPC
+  contract, job lifecycle) with the native host as the in-process prover backend
+  (`src/proof/prover_service/`: protocol + strict codec, bounded job store, router
+  service, requester/worker clients, proposer `Prover`, worker tick, native backend).
+- [ ] `proof/prover-service-bin`: `base prover-service` / `base prover-worker` commands
+  (HTTP listen, flags) and the proposer wired to `ProposerProver`.
+- [ ] `proof/prover-service-native-e2e`: native backend proving a real range end to end
+  (SimIo node RPC + `RpcSource`), proof bytes replayed with `base proof replay`.
 
 ## Decisions
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
@@ -268,6 +274,28 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - 2026-11-05: proposer native prover (witness archive as initData), e2e replayed.
 - 2026-11-05: proposer checks the proof L1 head against the finalized L2 origin.
 - 2026-11-05: proposer config (flags + validation) and dry-run submitter.
+- Prover service job store is a bounded in-memory table (fixed `jobs_max`, per-job proof
+  and root buffers allocated at init) instead of Postgres: same lifecycle (queued ->
+  claimed with lease and heartbeat -> succeeded/failed/cancelled), claim order (start
+  block, then creation), reclaim of expired leases up to the retry budget, idempotent
+  `proveBlockRange` keyed by session id, and the same error codes and messages. Jobs do
+  not survive a restart. Time comes from an injected `Clock`; expiry runs per request.
+- Prover service leaves out: `deleteProofsByTeeSigner` (needs the TEE signer registry),
+  `ExecutionStats`, metrics, the status poller (backends here finish inside `start`, so
+  there is no external session to poll), and the SP1 cluster/network and Nitro enclave
+  backends. Worker runs one job at a time (base/base's default) as a `tick` state machine;
+  base/base's async retry/backoff is the caller's tick loop.
+- Prover worker native backend proves `compressed` range requests with the native host
+  and returns the recorded witness archive as the proof bytes: not succinct, but anyone
+  can re-check the claim with `base proof replay`. TEE requests are `Unsupported` there
+  (the worker abandons them); the proposer side still speaks the TEE result shape
+  (`ProposerProver` turns an AWS Nitro result into the 130-byte `initData`).
+- `proof/rpc` `Endpoint` params gained a `raw_json` variant so the prover clients send
+  codec-encoded request objects as the single param.
+
+## Log
+- 2026-11-05: `proof/prover-service`: protocol/codec, bounded job store, JSON-RPC
+  service, clients, proposer `Prover`, worker tick, native backend, SimIo e2e.
 - 2026-11-05: `proof/proposer-txmgr`: proposer tx submitter with revert classification.
 - 2026-11-05: `proof/proposer-adapters`: RPC `Chain` for the proposer, canned-RPC tests.
 - 2026-11-05: `proof/proposer` first slice: intervals, recovery walk, dispatcher/collector
