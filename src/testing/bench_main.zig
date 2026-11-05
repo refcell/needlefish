@@ -14,6 +14,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     const filter: ?[]const u8 = args.next();
     bench.run_cases(init.io, base.common.crypto.bench.cases, filter);
+    bench.run_cases(init.io, base.common.consensus.bench.cases, filter);
     bench.run_cases(init.io, bench.cases, filter);
     bench.run_cases(init.io, base.execution.trie.bench.cases, filter);
     bench.run_cases(init.io, base.consensus.p2p.bench.cases, filter);

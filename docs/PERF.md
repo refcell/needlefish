@@ -50,3 +50,17 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
   can keep running 20k seeds per push.
 - Hashing: match or beat std at every size (single-message keccak is within 5% today).
+
+## 2026-11-05 primitives (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+| Case | ns/op | Notes |
+| --- | ---: | --- |
+| consensus/tx_encode_1559_512b | 64.0 | ~650-byte signed EIP-1559 tx |
+| consensus/tx_decode_1559_512b | 98.4 | strict canonical, zero copy |
+| consensus/tx_hash_1559_512b | 834.6 | streamed into keccak, ~1.2 ns/byte |
+| consensus/tx_signing_hash_1559_512b | 813.2 | |
+| consensus/tx_recover_sender | 32138.1 | crypto lane secp256k1 ecrecover + keccak |
+| consensus/header_hash_prague | 919.1 | all optional fields present |
+| consensus/receipt_encode_empty | 9.7 | |
+| flz/compress_length_tx | 920.7 | same tx |
+| l1_fees/tx_l1_cost_fjord | 1143.4 | FastLZ length + fee math |

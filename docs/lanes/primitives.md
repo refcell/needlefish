@@ -14,7 +14,7 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - [x] `chains`: Base mainnet/sepolia + devnet chain configs and hardfork activation schedule (Bedrock → Canyon → Delta → Ecotone → Fjord → Granite → Holocene → Isthmus → Jovian and any Base-specific forks in base/base).
 - [x] `genesis`: genesis JSON parse/write (std.json allowed or own), alloc handling, genesis block/header + state root via trie lane interface.
 - [x] L1 fee calculation (`l1-fees`: Bedrock, Ecotone, Fjord FastLZ `flz`, operator fee, DA footprint).
-- [ ] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
+- [x] Benchmarks: rlp encode/decode, tx hash, sender recovery throughput.
 
 ## Decisions
 - Fixed-size types are `extern struct { bytes: [N]u8 }` (`Address`, `B256`, `Bloom`) so they have
@@ -65,3 +65,4 @@ Reference: base/base `crates/common/*`, alloy-primitives, alloy-consensus, op-al
 - 2026-11-05: pooled EIP-4844 network form (v0 sidecar, EIP-7594 v1 cell proofs), `PooledTx`.
 - 2026-11-05: EIP-8130 tx type (encode/decode, hashes, sender/payer recovery, validation).
 - 2026-11-05: 0x79 wired into `TxType`/`Envelope`/`Receipt`; other lanes reject it for now.
+- 2026-11-05: benchmarks (`common/consensus/bench.zig`, results in docs/PERF.md).
