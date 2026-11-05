@@ -192,6 +192,13 @@ pub fn IoStorageType(comptime IO: type) type {
         /// callbacks of every operation that had finished when the tick began delivering.
         pub fn tick(self: *Self) void {
             self.io.tick() catch |err| std.debug.panic("io_storage: io tick: {t}", .{err});
+            self.process();
+        }
+
+        /// The part of `tick` that does not run the IO loop: submits waiting operations
+        /// and delivers finished ones. Safe to call from inside an IO callback (where a
+        /// re-entrant `io.tick` is not).
+        pub fn process(self: *Self) void {
             self.dispatch_waiting();
             // Detach first: callbacks may submit, and those complete in a later tick.
             var ready = self.ready;

@@ -2,7 +2,8 @@
 //!
 //! `--dev-l1` runs a standalone auto-mining L1 chain with a minimal beacon API; without it
 //! the node follows the chain in `--chain` and serves eth JSON-RPC (and the Engine API on
-//! `--authrpc.port`). State is in memory: `--datadir` is created but not yet used.
+//! `--authrpc.port`). With `--datadir` the state and chain persist in `DIR/node.db` (a
+//! journal plus checkpoints) and a restart resumes from it; without it state is in memory.
 
 const std = @import("std");
 const base = @import("base");
@@ -104,7 +105,12 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     const cwd = Io.Dir.cwd();
-    if (flags.datadir) |datadir| try cwd.createDirPath(init.io, datadir);
+    var data_path_buffer: [4096]u8 = undefined;
+    var data_path: ?[]const u8 = null;
+    if (flags.datadir) |datadir| {
+        try cwd.createDirPath(init.io, datadir);
+        data_path = try std.fmt.bufPrint(&data_path_buffer, "{s}/node.db", .{datadir});
+    }
     const text = try cwd.readFileAlloc(init.io, flags.chain.?, init.gpa, .limited(256 << 20));
     defer init.gpa.free(text);
     const parsed = try base.common.genesis.parse(init.gpa, text);
@@ -132,6 +138,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .beacon_address = if (flags.dev_l1) beacon_address(flags) else null,
         .authrpc_address = authrpc_address(flags),
         .jwt_secret = secret,
+        .data_path = data_path,
     });
     defer service.deinit();
     _ = try service.start();

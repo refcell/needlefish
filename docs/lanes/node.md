@@ -27,7 +27,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] `engine`: Engine API v2–v4 (+OP extensions): forkchoiceUpdated, newPayload, getPayload, JWT auth, exchangeCapabilities.
 - [x] `rpc`: eth_* (chainId, blockNumber, getBalance, getCode, getStorageAt, getTransactionCount, call, estimateGas, sendRawTransaction, getBlockBy*, getTransactionBy*, getTransactionReceipt, getLogs, feeHistory, gasPrice, maxPriorityFeePerGas, getProof), net_*, web3_*, debug basics, optimism-specific methods used by op tooling.
 - [x] `bin/node`: CLI flags like base/base node; `--dev-l1` mode = standalone L1 dev chain that auto-mines every `--block-time` seconds and serves a minimal beacon blob sidecar API (`/eth/v1/beacon/blob_sidecars/{slot}`, genesis, spec) so the devnet needs no external L1.
-- [ ] Persistence + restart, reorg handling via forkchoice.
+- [x] Persistence + restart, reorg handling via forkchoice.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 
 ## Decisions
@@ -55,6 +55,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: `base node --datadir DIR` persists state and chain in `DIR/node.db` (journal + A/B checkpoints, io_storage over the node's IO) and resumes from it after a restart or crash; storage callbacks run from a 2 ms IO timer. Integration addition in the trie-db lane (additive): `IoStorage.process()` = `tick()` without the re-entrant `io.tick` (calling `tick` from an IO callback corrupted the kqueue completed queue). devnet.sh unchanged: cold `up` already wipes the datadirs, so a stale chain is never reopened (and would be refused: format id carries the genesis hash).
 - 2026-11-05: durable node state (`node/durable.zig`): the trie-db `db.database` owns the State, StateDb executes on it (`init_shared`), the chain journals each stored block right after execution and moves state on reorgs via database head moves (stored changesets, no re-execution). Restart restores the canonical retained blocks into the BlockStore (`Chain.restore`). Integration addition in the trie-db lane (additive): `Database.commit_applied` (insert + head move for a block whose changeset the caller already applied, one block_and_head entry; replay goes through the normal path). Decisions: the format id carries the genesis hash prefix (a datadir from another chain is refused); side branches are not restored after a restart (only the canonical retained chain); checkpoints are requested once the journal is half full.
 - 2026-11-05: incident: a local smoke test ran `pkill -f "base node"` and also killed another lane's running devnet ELs (`.devnet/`). Rule for this lane: smoke tests kill their own PIDs only, never by pattern.
 - 2026-11-05: StateDb now wraps the trie-db lane's `db.State` (flat tables for EVM reads + StateTrie for roots/proofs); commits go through `db.Overlay` into a `db.Changeset`, and the last blocks' encoded changesets sit in a bounded byte ring for rollback (replaces the bespoke undo journal). Step 1 of persistence: the same changesets are what `db.database` journals.

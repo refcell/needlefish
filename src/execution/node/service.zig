@@ -27,6 +27,9 @@ const state_db = @import("state_db.zig");
 const chain_module = @import("chain.zig");
 const genesis_loader = @import("genesis.zig");
 const beacon_module = @import("beacon.zig");
+const durable_module = @import("durable.zig");
+const db_module = @import("../db/root.zig");
+const io_storage = @import("../db/storage/io_storage.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const kzg_blob = @import("../../common/crypto/kzg/root.zig").blob;
 
@@ -71,6 +74,10 @@ pub const Options = struct {
     /// Verify blob transaction KZG proofs on submission (needs ~1.1 MiB and a setup
     /// decode at startup; L1 mode only, since L2 has no blob transactions).
     verify_blob_proofs: bool = true,
+    /// Durable state file (journal + checkpoints); null keeps everything in memory.
+    data_path: ?[]const u8 = null,
+    /// Distinguishes formats of the same file (low 64 bits of the format id).
+    format_nonce: u64 = 0,
     limits: Limits = .{},
 };
 
@@ -121,6 +128,27 @@ pub const Limits = struct {
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
     },
     rpc_scratch_bytes: u32 = 4 << 20,
+    /// Durable database layout; `state` and `changeset` are derived from `state` above.
+    durable: db_module.database.Config = .{
+        .engine = .{
+            .journal_size_bytes = 64 << 20,
+            .checkpoint_zone_size_bytes = 48 << 20,
+            .entry_body_size_max = 2 << 20,
+        },
+        .state = undefined,
+        .chain = .{
+            .blocks_max = 1024,
+            .bytes_max = 16 << 20,
+            .transactions_max = 1 << 16,
+            .canonical_max = 1 << 16,
+            .reorg_depth_max = 64,
+        },
+        .changeset = undefined,
+        .queue_entries_max = 8,
+        .checkpoint_staging_bytes = 40 << 20,
+    },
+    /// Storage callbacks run from a timer at this interval.
+    storage_tick_ns: u64 = 2 * std.time.ns_per_ms,
     engine: engine_rpc.Limits = .{},
     authrpc_http: http.server.Options = .{
         .connections_max = 4,
@@ -136,6 +164,8 @@ pub fn Service(comptime IO: type) type {
         const HttpServer = http.Server(IO, *Self, handle_rpc);
         const BeaconServer = http.Server(IO, *Self, handle_beacon);
         const AuthServer = http.Server(IO, *Self, handle_authrpc);
+        const Storage = io_storage.IoStorageType(IO);
+        const DurableState = durable_module.Durable(Storage);
 
         allocator: std.mem.Allocator,
         io: *IO,
@@ -155,6 +185,10 @@ pub fn Service(comptime IO: type) type {
         beacon: ?beacon_module.Beacon = null,
         beacon_server: ?BeaconServer = null,
         miner_completion: IO.Completion = .{},
+        storage: ?*Storage = null,
+        storage_fd: ?IO.Fd = null,
+        durable: ?*DurableState = null,
+        storage_completion: IO.Completion = .{},
         blocks_mined: u64 = 0,
         mine_failures: u64 = 0,
 
@@ -191,11 +225,19 @@ pub fn Service(comptime IO: type) type {
         }
 
         fn init_state(service: *Self, genesis: *const genesis_types.Genesis) !void {
+            if (service.options.data_path) |path| return service.init_durable(genesis, path);
             const allocator = service.allocator;
-            const limits = &service.options.limits;
-            service.db = try StateDb.init(allocator, limits.state);
+            service.db = try StateDb.init(allocator, service.options.limits.state);
             errdefer service.db.deinit(allocator);
             const header = try genesis_loader.load(allocator, &service.db, genesis);
+            try service.init_execution(&header, false);
+        }
+
+        /// Executor, pool, chain and engine over `db`, which holds genesis (or, when
+        /// `restoring`, a recovered head).
+        fn init_execution(service: *Self, header: *const consensus.Header, restoring: bool) !void {
+            const allocator = service.allocator;
+            const limits = &service.options.limits;
             const spec = &service.spec;
             service.executor = try Executor.init(allocator, spec, &service.db, limits.executor);
             errdefer service.executor.deinit(allocator);
@@ -203,17 +245,123 @@ pub fn Service(comptime IO: type) type {
             pool_config.block_gas_limit = service.spec.gas_limit;
             service.pool = try txpool.Pool.init(allocator, pool_config);
             errdefer service.pool.deinit(allocator);
+            var chain_config = limits.chain;
+            chain_config.restoring = restoring;
             service.chain = try Chain.init(
                 allocator,
                 &service.spec,
                 &service.db,
                 &service.executor,
-                &header,
-                limits.chain,
+                header,
+                chain_config,
             );
             service.chain.pool = &service.pool;
             service.engine = Engine.init(&service.spec, &service.chain);
             assert(service.chain.head_hash().len == 32);
+        }
+
+        /// Opens (or formats) the durable state file, then bootstraps genesis into it or
+        /// restores the retained chain, and starts the storage tick.
+        fn init_durable(
+            service: *Self,
+            genesis: *const genesis_types.Genesis,
+            path: []const u8,
+        ) !void {
+            const allocator = service.allocator;
+            const limits = &service.options.limits;
+            var config = limits.durable;
+            config.state = StateDb.state_config(limits.state);
+            config.changeset = .{
+                .accounts_max = limits.state.block_accounts_max,
+                .storage_max = limits.state.block_slots_max,
+                .codes_max = limits.state.block_codes_max,
+                .code_bytes_max = limits.state.block_code_bytes_max,
+            };
+            const header = try genesis_header(allocator, genesis);
+            const fd = try service.io.open_file(path, .create);
+            service.storage_fd = fd;
+            const storage = try allocator.create(Storage);
+            errdefer allocator.destroy(storage);
+            storage.* = try Storage.init(allocator, service.io, fd, .{
+                .size_bytes = config.engine.size_bytes(),
+            });
+            service.storage = storage;
+            const hash = header.hash().bytes;
+            const nonce = service.options.format_nonce;
+            const durable = try DurableState.create(allocator, storage, config, hash, nonce);
+            service.durable = durable;
+            try service.open_durable();
+            const fresh = !durable.has_head();
+            if (fresh) _ = try durable.bootstrap(allocator, genesis, &header);
+            service.db = try StateDb.init_shared(allocator, limits.state, durable.state());
+            try service.init_execution(&header, !fresh);
+            if (!fresh) try service.restore_chain();
+            service.chain.journal = durable.journal();
+            service.logger.log(.info, "node", "durable state ready", .{
+                .fresh = fresh,
+                .head = service.chain.store.ref(service.chain.head_hash()).?.number,
+            });
+            service.schedule_storage_tick();
+        }
+
+        fn genesis_header(
+            allocator: std.mem.Allocator,
+            genesis: *const genesis_types.Genesis,
+        ) !consensus.Header {
+            const root = try genesis.compute_state_root(allocator);
+            if (genesis.state_root) |expected| {
+                if (!std.mem.eql(u8, &expected.bytes, &root.bytes)) return error.StateRootMismatch;
+            }
+            return genesis.header(allocator, root);
+        }
+
+        /// Drives the storage until the database is open (startup only).
+        fn open_durable(service: *Self) !void {
+            const durable = service.durable.?;
+            durable.start();
+            var waited_ms: u32 = 0;
+            while (durable.phase == .opening or durable.phase == .formatting) : (waited_ms += 1) {
+                if (waited_ms == 600_000) return error.DurableOpenTimeout;
+                try service.io.run_for_ns(std.time.ns_per_ms);
+                service.storage.?.tick();
+                durable.poll();
+            }
+            if (durable.phase != .ready) {
+                service.logger.log(.err, "node", "durable state open failed", .{
+                    .reason = if (durable.start_error) |e| @errorName(e) else "unknown",
+                });
+                return error.DurableOpenFailed;
+            }
+        }
+
+        fn restore_chain(service: *Self) !void {
+            const allocator = service.allocator;
+            const durable = service.durable.?;
+            const blocks_max = durable.database.config.chain.blocks_max;
+            const records = try allocator.alloc([]const u8, blocks_max);
+            defer allocator.free(records);
+            for (durable.retained(records)) |record| try service.chain.restore(record);
+        }
+
+        fn schedule_storage_tick(service: *Self) void {
+            const delay_ns = service.options.limits.storage_tick_ns;
+            const completion = &service.storage_completion;
+            service.io.timeout(*Self, service, on_storage_tick, completion, delay_ns);
+        }
+
+        fn on_storage_tick(
+            service: *Self,
+            completion: *IO.Completion,
+            result: io_module.TimeoutError!void,
+        ) void {
+            assert(completion == &service.storage_completion);
+            result catch |err| {
+                const name = @errorName(err);
+                service.logger.log(.warn, "node", "storage tick failed", .{ .err = name });
+            };
+            service.storage.?.process(); // Inside an IO callback: no re-entrant io.tick.
+            service.durable.?.poll();
+            service.schedule_storage_tick();
         }
 
         fn init_servers(service: *Self, genesis_time: u64) !void {
@@ -284,6 +432,12 @@ pub fn Service(comptime IO: type) type {
             service.pool.deinit(allocator);
             service.executor.deinit(allocator);
             service.db.deinit(allocator);
+            if (service.durable) |durable| durable.destroy(allocator);
+            if (service.storage) |storage| {
+                storage.deinit(allocator);
+                allocator.destroy(storage);
+            }
+            if (service.storage_fd) |fd| service.io.close_now(fd);
         }
 
         /// Binds the servers and, in dev mode, starts the miner. Returns the RPC address.

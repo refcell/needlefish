@@ -118,6 +118,50 @@ test "service: dev L1 mines one block per slot and serves eth_blockNumber" {
     try testing.expectEqualStrings("\"0x3\"", answer.text[0..answer.size]);
 }
 
+test "service: durable dev L1 restarts from its synced state file" {
+    const harness = try Harness.create_with(true);
+    defer harness.destroy();
+    _ = try harness.service.start();
+    harness.world.run_for_ns(7 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 3), harness.service.blocks_mined);
+    // Let the journal reach the disk, then lose everything that is not synced.
+    harness.world.run_for_ns(std.time.ns_per_s / 2);
+    const head_hash = harness.service.chain.head_hash();
+    const root = try harness.service.db.root();
+    try harness.restart();
+    try testing.expectEqualSlices(u8, &head_hash, &harness.service.chain.head_hash());
+    try testing.expectEqualSlices(u8, &root, &(try harness.service.db.root()));
+    try testing.expect(harness.service.chain.store.canonical_hash(1) != null);
+    // Mining continues on the restored head (one block per slot from here).
+    _ = try harness.service.start();
+    harness.world.run_for_ns(4 * std.time.ns_per_s);
+    try testing.expect(harness.service.blocks_mined >= 1);
+    try testing.expectEqual(@as(u64, 0), harness.service.mine_failures);
+    const head = harness.service.chain.header(harness.service.chain.head_hash()).?;
+    try testing.expect(head.number > 3);
+    try harness.restart();
+    try testing.expectEqual(head.number, harness.service.chain.header(
+        harness.service.chain.head_hash(),
+    ).?.number);
+}
+
+const durable_file = "node.db";
+
+const durable_limits: service_module.Limits = limits: {
+    var limits = test_limits;
+    limits.durable.engine = .{
+        .journal_size_bytes = 128 * 4096,
+        .checkpoint_zone_size_bytes = 96 * 4096,
+        .entry_body_size_max = 16 * 4096,
+        .checkpoint_block_size = 4 * 4096,
+    };
+    limits.durable.chain.blocks_max = 64;
+    limits.durable.chain.bytes_max = 256 * 1024;
+    limits.durable.checkpoint_staging_bytes = 96 * 4096;
+    limits.storage_tick_ns = std.time.ns_per_ms;
+    break :limits limits;
+};
+
 const Harness = struct {
     world: io.SimWorld,
     node_io: io.SimIo,
@@ -126,14 +170,22 @@ const Harness = struct {
     memory: log.MemorySink,
     logger: log.Logger,
     service: Service,
+    durable: bool,
+    /// Restarts so far; shifts the ports because a dead process's listeners linger.
+    restarts: u16 = 0,
 
     fn create() !*Harness {
+        return create_with(false);
+    }
+
+    fn create_with(durable: bool) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
         harness.world = try io.SimWorld.init(testing.allocator, .{ .seed = 11 });
         errdefer harness.world.deinit();
-        const host = io.Address.ip4(.{ 10, 0, 0, 1 }, 0);
-        try io.SimIo.init(&harness.node_io, testing.allocator, &harness.world, .{ .host = host });
+        harness.durable = durable;
+        harness.restarts = 0;
+        try harness.init_io();
         errdefer harness.node_io.deinit();
         var text: [64 * 1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&text);
@@ -142,17 +194,60 @@ const Harness = struct {
         errdefer harness.parsed.deinit();
         harness.memory = .{ .buffer = &harness.log_buffer };
         harness.logger = .{ .sink = harness.memory.sink() };
+        try harness.init_service();
+        return harness;
+    }
+
+    fn init_io(harness: *Harness) !void {
+        const host = io.Address.ip4(.{ 10, 0, 0, 1 }, 0);
+        try io.SimIo.init(&harness.node_io, testing.allocator, &harness.world, .{
+            .host = host,
+            .disk = .{ .files_max = 2, .file_size_max = 2 << 20 },
+        });
+    }
+
+    fn init_service(harness: *Harness) !void {
         const parsed = &harness.parsed.value;
         const node_io = &harness.node_io;
         try harness.service.init(testing.allocator, node_io, &harness.logger, parsed, .{
-            .http_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 8545),
+            .http_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 8545 + harness.restarts),
             .dev_l1 = true,
             .block_time_s = block_time_s,
-            .beacon_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 5052),
+            .beacon_address = io.Address.ip4(.{ 10, 0, 0, 1 }, 5052 + harness.restarts),
             .verify_blob_proofs = false, // Fake proofs; KZG is covered in release tests.
-            .limits = test_limits,
+            .limits = if (harness.durable) durable_limits else test_limits,
+            .data_path = if (harness.durable) durable_file else null,
         });
-        return harness;
+    }
+
+    /// A process crash and restart: only synced bytes of the state file survive.
+    fn restart(harness: *Harness) !void {
+        const file = durable_file_of(&harness.node_io).?;
+        const size: usize = @intCast(file.size_durable);
+        const saved = try testing.allocator.dupe(u8, file.durable[0..size]);
+        defer testing.allocator.free(saved);
+        harness.service.deinit();
+        harness.node_io.deinit();
+        try harness.init_io();
+        const fd = try harness.node_io.open_file(durable_file, .create);
+        harness.node_io.close_now(fd);
+        const fresh = durable_file_of(&harness.node_io).?;
+        @memcpy(fresh.durable[0..size], saved);
+        @memcpy(fresh.current[0..size], saved);
+        fresh.size_durable = size;
+        fresh.size_current = size;
+        harness.memory = .{ .buffer = &harness.log_buffer };
+        harness.restarts += 1;
+        try harness.init_service();
+    }
+
+    fn durable_file_of(node_io: *io.SimIo) ?*@TypeOf(node_io.files[0]) {
+        for (node_io.files) |*file| {
+            if (file.used and std.mem.eql(u8, file.name[0..file.name_len], durable_file)) {
+                return file;
+            }
+        }
+        return null;
     }
 
     fn destroy(harness: *Harness) void {
