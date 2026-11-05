@@ -29,6 +29,8 @@ pub const Config = struct {
     /// DA throttling of the L2 block builder (`miner_setMaxDASize`); off by default here,
     /// `base batcher` enables it like base/base.
     throttle: throttle.Config = .{ .strategy = .off },
+    /// Start with block ingestion stopped (base/base `--stopped`); see `start`.
+    stopped: bool = false,
 };
 
 pub const Clients = struct {
@@ -54,7 +56,11 @@ pub const Report = struct {
     resets: u32 = 0,
     da_backlog_bytes: u64 = 0,
     throttle: throttle.Outcome = .idle,
+    stopped: bool = false,
 };
+
+/// base/base `BatcherStatus` (admin_getBatcherStatus).
+pub const Status = struct { stopped: bool, in_flight: u32, da_backlog_bytes: u64 };
 
 pub const Error = rpc.Error || source.Error || txmgr.Error;
 
@@ -69,6 +75,8 @@ pub const Service = struct {
     safe_seen_at_l1: u64,
     throttle: throttle.Throttle,
     backlog: throttle.BacklogEstimate,
+    stopped: bool,
+    last_da_backlog_bytes: u64,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, channel_id_seed: [16]u8) !Service {
         assert(config.blocks_per_step_max > 0);
@@ -88,6 +96,8 @@ pub const Service = struct {
             .safe_seen_at_l1 = 0,
             .throttle = .init(config.throttle),
             .backlog = .{},
+            .stopped = config.stopped,
+            .last_da_backlog_bytes = 0,
         };
     }
 
@@ -102,14 +112,19 @@ pub const Service = struct {
         var report: Report = .{};
         report.heads = try read_heads(clients);
         service.channels.on_l1_head(report.heads.l1);
-        if (report.heads.safe_known) service.watch_safe_head(report.heads, &report);
-        try service.load_blocks(clients, report.heads, &report);
+        report.stopped = service.stopped;
         report.da_backlog_bytes = service.backlog.backlog_bytes(
             report.heads.unsafe_l2,
             report.heads.safe_l2,
         );
-        report.throttle = service.throttle.update(clients.l2, report.da_backlog_bytes, now_ms);
-        try service.submit_frames(clients.l1, now_ms, &report);
+        service.last_da_backlog_bytes = report.da_backlog_bytes;
+        // Stopped: no ingestion or submission; in-flight txs are still confirmed.
+        if (!service.stopped) {
+            if (report.heads.safe_known) service.watch_safe_head(report.heads, &report);
+            try service.load_blocks(clients, report.heads, &report);
+            report.throttle = service.throttle.update(clients.l2, report.da_backlog_bytes, now_ms);
+            try service.submit_frames(clients.l1, now_ms, &report);
+        }
         report.txs_confirmed = try service.txs.poll(clients.l1, now_ms);
         if (service.txs.needs_reset(now_ms)) {
             // A lost nonce: drop the waiting txs and reload from safe + 1, which requeues
@@ -120,6 +135,37 @@ pub const Service = struct {
         }
         assert(report.txs_submitted <= service.txs.slots.len);
         return report;
+    }
+
+    /// Stops block ingestion and drops the encoding pipeline (base/base `on_admin_stop`).
+    /// In-flight transactions are still tracked to confirmation.
+    pub fn stop(service: *Service) void {
+        if (service.stopped) return;
+        service.channels.reset();
+        service.stopped = true;
+        assert(service.channels.next_block_number() == null);
+    }
+
+    /// Restarts ingestion from the safe head (base/base `on_admin_start`).
+    pub fn start(service: *Service) void {
+        if (!service.stopped) return;
+        service.channels.reset();
+        service.stopped = false;
+        assert(!service.channels.has_pending_frames());
+    }
+
+    /// Closes the open channel now so its frames go out on the next step.
+    pub fn flush(service: *Service) error{Stopped}!void {
+        if (service.stopped) return error.Stopped;
+        if (!service.channels.has_pending_frames()) service.channels.close_open();
+    }
+
+    pub fn status(service: *const Service) Status {
+        return .{
+            .stopped = service.stopped,
+            .in_flight = service.txs.pending_count(),
+            .da_backlog_bytes = service.last_da_backlog_bytes,
+        };
     }
 
     /// Resets when the safe head stalls behind blocks we already loaded.

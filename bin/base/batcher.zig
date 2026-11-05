@@ -3,7 +3,7 @@
 const std = @import("std");
 const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
-const MetricsServer = @import("batcher_metrics.zig").MetricsServer;
+const Servers = @import("batcher_servers.zig").Servers;
 
 const Io = std.Io;
 const batcher = base.batcher;
@@ -14,6 +14,7 @@ const usage =
     \\         [--poll-interval-ms MS] [--metrics.port P] [--data-availability calldata|blobs]
     \\         [--compression brotli|zlib] [--no-throttle]
     \\         [--throttle-strategy off|step|linear|quadratic]
+    \\         [--admin-port P [--admin-addr IP]] [--stopped]
     \\
 ;
 
@@ -31,6 +32,11 @@ const Flags = struct {
     compression: batcher.comp.Algorithm = .brotli,
     /// Serve Prometheus metrics on this port (op-batcher `--metrics.port`).
     metrics_port: ?u16 = null,
+    /// Admin JSON-RPC API (base/base `--admin-port`, `--admin-addr`, default loopback).
+    admin_port: ?u16 = null,
+    admin_address: base.utilities.io.Address = .loopback(0),
+    /// Start with ingestion stopped until `admin_startBatcher` (base/base `--stopped`).
+    stopped: bool = false,
     /// DA throttling of the sequencer (base/base default: quadratic).
     throttle_strategy: batcher.throttle.Strategy = .quadratic,
 };
@@ -44,8 +50,8 @@ fn parse_flags(args: []const []const u8) !Flags {
     const eql = std.mem.eql;
     while (i < args.len) {
         const arg = args[i];
-        if (eql(u8, arg, "--no-throttle")) {
-            flags.throttle_strategy = .off;
+        if (eql(u8, arg, "--no-throttle") or eql(u8, arg, "--stopped")) {
+            if (eql(u8, arg, "--stopped")) flags.stopped = true else flags.throttle_strategy = .off;
             i += 1; // A switch takes no value.
             continue;
         }
@@ -74,6 +80,10 @@ fn parse_flags(args: []const []const u8) !Flags {
                 batcher.txmgr.DataAvailability,
                 value,
             ) orelse return error.UnknownDataAvailability;
+        } else if (eql(u8, arg, "--admin-port")) {
+            flags.admin_port = try std.fmt.parseInt(u16, value, 10);
+        } else if (eql(u8, arg, "--admin-addr")) {
+            flags.admin_address = try base.utilities.io.Address.parse(value);
         } else if (eql(u8, arg, "--throttle-strategy")) {
             flags.throttle_strategy = std.meta.stringToEnum(batcher.throttle.Strategy, value) orelse
                 return error.UnknownThrottleStrategy;
@@ -134,6 +144,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         // 30 L1 blocks without safe-head progress: resubmit from the safe head.
         .stall_l1_blocks = 30,
         .throttle = .{ .strategy = flags.throttle_strategy },
+        .stopped = flags.stopped,
     }, seed);
     defer service.deinit(init.gpa);
     return run(init, flags, &service, l1_url, l2_url);
@@ -167,11 +178,9 @@ fn run(
     std.debug.print("batcher: started on L1 chain {d}\n", .{service.txs.config.chain_id});
     var metrics: batcher.metrics.Metrics = .{};
     try metrics.register();
-    var metrics_server: MetricsServer = undefined;
-    const serving = if (flags.metrics_port) |port|
-        start_metrics(&metrics_server, init.gpa, &metrics, port)
-    else
-        false;
+    var admin: batcher.admin.Admin = .{ .service = service };
+    var servers: Servers = undefined;
+    const serving = start_servers(&servers, init.gpa, flags, &metrics, &admin);
     var throttle_logged: batcher.throttle.Outcome = .idle;
     while (true) {
         const now_ms: u64 = @intCast(Io.Clock.awake.now(init.io).toMilliseconds());
@@ -184,7 +193,7 @@ fn run(
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
         }
         if (serving) {
-            try metrics_server.serve_for(flags.poll_interval_ms);
+            try servers.serve_for(flags.poll_interval_ms);
         } else {
             try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
         }
@@ -207,19 +216,27 @@ fn log_throttle(outcome: batcher.throttle.Outcome, last: *batcher.throttle.Outco
     }
 }
 
-/// Metrics are optional: a bind failure is logged and batching continues without them.
-fn start_metrics(
-    server: *MetricsServer,
+/// Starts the optional HTTP endpoints. Each failure is logged and only disables that
+/// endpoint: batching never depends on them. Returns false when none is serving.
+fn start_servers(
+    servers: *Servers,
     allocator: std.mem.Allocator,
+    flags: Flags,
     metrics: *batcher.metrics.Metrics,
-    port: u16,
+    admin: *batcher.admin.Admin,
 ) bool {
-    server.start(allocator, metrics, port) catch |err| {
-        std.debug.print("batcher: metrics disabled, port {d}: {t}\n", .{ port, err });
+    if (flags.metrics_port == null and flags.admin_port == null) return false;
+    servers.init() catch |err| {
+        std.debug.print("batcher: HTTP endpoints disabled: {t}\n", .{err});
         return false;
     };
-    std.debug.print("batcher: metrics on :{d}/metrics\n", .{port});
-    return true;
+    if (flags.metrics_port) |port| _ = servers.serve_metrics(allocator, metrics, port);
+    if (flags.admin_port) |port| {
+        var address = flags.admin_address;
+        address.port = port;
+        _ = servers.serve_admin(allocator, admin, address);
+    }
+    return servers.active();
 }
 
 fn log_report(report: batcher.service.Report) void {
@@ -262,6 +279,13 @@ test "batcher: flags" {
     try std.testing.expectEqual(.zlib, switched.compression);
     const linear = [_][]const u8{ "--throttle-strategy", "linear" };
     try std.testing.expectEqual(.linear, (try parse_flags(&linear)).throttle_strategy);
+    const admin = [_][]const u8{ "--stopped", "--admin-port", "7301", "--admin-addr", "0.0.0.0" };
+    const admin_flags = try parse_flags(&admin);
+    try std.testing.expect(admin_flags.stopped);
+    try std.testing.expectEqual(@as(?u16, 7301), admin_flags.admin_port);
+    try std.testing.expectEqual(@as(u8, 0), admin_flags.admin_address.bytes[0]);
+    const bad_addr = [_][]const u8{ "--admin-addr", "localhost" };
+    try std.testing.expectError(error.InvalidAddress, parse_flags(&bad_addr));
     const dangling = [_][]const u8{"--l1"};
     try std.testing.expectError(error.MissingValue, parse_flags(&dangling));
     const bad = [_][]const u8{ "--data-availability", "carrier-pigeon" };

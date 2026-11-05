@@ -50,6 +50,19 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher/rpc`: JSON-RPC client over an injected transport (HTTP in bin, canned in tests).
 - [ ] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
+- [x] `batcher/admin`: base/base admin JSON-RPC (start/stop/flush/status/throttle info) and
+  `--stopped`, `--admin-port`, `--admin-addr`; one event loop serves admin + metrics.
+- [ ] `batcher`: `--num-confirmations` (free a slot only N blocks after inclusion), `--min-tip-cap`,
+  `--min-basefee`, `--max-pending-transactions` (base/base txmgr flags).
+- [ ] `batcher`: `--sub-safety-margin`: close channels before `max_channel_duration` would let
+  the channel time out on L1 (base/base `sub_safety_margin`).
+- [ ] `batcher`: `admin_setThrottleController` (replace strategy/config at runtime).
+- [ ] `batcher`: `--sequencer-urls`: pick the active sequencer among several L2/rollup endpoints
+  (base/base `sequencers.rs`).
+- [ ] `batcher`: startup recent-tx check (`--check-recent-txs-depth`): skip resubmitting data
+  already on L1 after a restart (base/base `recent_txs.rs`).
+- [ ] `batcher`: `--wait-node-sync` (wait until the rollup node's L1 head catches up).
+- [ ] DST: a sim scenario driving admin stop/start/flush on the real batcher.
 
 ## Draft devnet contract
 - L1: `node --dev-l1` (auto-mine, 2s blocks?), HTTP :8545, beacon API :5052.
@@ -125,3 +138,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   restarted batcher replaces untracked pooled txs instead of adopting them (an adopted tx that
   L1 evicts left a gap nothing re-sent). An underpriced same-nonce send bumps and resends on
   the next poll. Test: restart with pooled txs, then eviction (mutation-checked).
+- 2026-11-05: batcher admin API; backlog extended with remaining base/base batcher features.

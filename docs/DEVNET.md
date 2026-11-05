@@ -104,6 +104,9 @@ Each binary must accept at least the flags below. Lanes may add more.
   text (`base_batcher_*` heads, pending txs, DA backlog, and activity counters).
   DA throttling (base/base defaults, quadratic; `--throttle-strategy`, `--no-throttle`) pushes
   `miner_setMaxDASize` to the L2 EL; a builder without that method disables it.
+  `--admin-port P [--admin-addr IP]` serves base/base's admin JSON-RPC (`admin_startBatcher`,
+  `admin_stopBatcher`, `admin_flushBatcher`, `admin_getBatcherStatus`,
+  `admin_getThrottleController`); `--stopped` starts with ingestion stopped.
 
 ## Smoke test
 
