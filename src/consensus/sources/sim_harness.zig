@@ -73,7 +73,9 @@ pub const FakeRpc = struct {
     pub const Entry = struct {
         method: []const u8,
         params_contain: []const u8 = "",
-        result: []const u8,
+        result: []const u8 = "null",
+        /// When set, answers with this raw JSON-RPC error object instead of `result`.
+        rpc_error: ?[]const u8 = null,
     };
 
     entries: [32]Entry = undefined,
@@ -114,19 +116,21 @@ pub const FakeRpc = struct {
         @memcpy(fake.last_authorization[0..header_size], header[0..header_size]);
         fake.last_authorization_size = header_size;
         const parsed = parse(request.body) catch return response.fail(400);
-        const result = fake.lookup(parsed.method, parsed.params);
-        response.writer().print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{s}}}", .{
-            parsed.id, result,
+        const entry = fake.lookup(parsed.method, parsed.params);
+        const member = if (entry.rpc_error != null) "error" else "result";
+        const value = entry.rpc_error orelse entry.result;
+        response.writer().print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"{s}\":{s}}}", .{
+            parsed.id, member, value,
         }) catch return response.fail(500);
     }
 
-    fn lookup(fake: *const FakeRpc, method: []const u8, params: []const u8) []const u8 {
+    fn lookup(fake: *const FakeRpc, method: []const u8, params: []const u8) Entry {
         for (fake.entries[0..fake.count]) |entry| {
             if (!std.mem.eql(u8, entry.method, method)) continue;
             if (std.mem.indexOf(u8, params, entry.params_contain) == null) continue;
-            return entry.result;
+            return entry;
         }
-        return "null";
+        return .{ .method = method };
     }
 
     const Parsed = struct { id: []const u8, method: []const u8, params: []const u8 };

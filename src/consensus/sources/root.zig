@@ -14,10 +14,15 @@ pub const L1Provider = l1_provider.L1Provider;
 pub const beacon_json = @import("beacon_json.zig");
 pub const blob_provider = @import("blob_provider.zig");
 pub const BlobProvider = blob_provider.BlobProvider;
+pub const engine_json = @import("engine_json.zig");
+pub const l2_block = @import("l2_block.zig");
+pub const engine_client = @import("engine_client.zig");
+pub const EngineClient = engine_client.EngineClient;
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("l1_json_test.zig");
     _ = @import("l1_provider_test.zig");
     _ = @import("blob_provider_test.zig");
+    _ = @import("engine_test.zig");
 }
