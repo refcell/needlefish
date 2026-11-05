@@ -38,6 +38,8 @@ pub const consolidation_request_address: Address =
 pub const system_call_gas: u64 = 30_000_000;
 const gas_per_blob: u64 = 1 << 17;
 
+const access_list_module = @import("access_list.zig");
+
 fn hex20(comptime text: []const u8) Address {
     return comptime primitives.hex.decode_array(20, text) catch unreachable;
 }
@@ -350,6 +352,9 @@ pub const Executor = struct {
         gas: ?u64 = null,
         value: u256 = 0,
         data: []const u8 = &.{},
+        access_list: []const evm.transaction.AccessListItem = &.{},
+        /// Receives the warm accounts and slots of an executed call (eth_createAccessList).
+        collect: ?*access_list_module.Collector = null,
     };
 
     pub const Simulated = union(enum) {
@@ -394,12 +399,23 @@ pub const Executor = struct {
             .data = call.data,
             .nonce = caller.info.nonce,
             .chain_id = executor.spec.chain_id,
+            .access_list = call.access_list,
         };
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         const executed = switch (result) {
             .invalid => |reason| return .{ .invalid = reason },
             .executed => |executed| executed,
         };
+        if (call.collect) |collector| {
+            const context: access_list_module.Context = .{
+                .spec = executor.spec,
+                .timestamp = block.timestamp,
+                .from = call.from,
+                .to = call.to,
+                .coinbase = block.beneficiary,
+            };
+            collector.collect(executor.state, &context);
+        }
         const output = try executor.alloc(u8, executed.output.len);
         @memcpy(output, executed.output);
         return .{ .executed = .{

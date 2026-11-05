@@ -445,6 +445,37 @@ test "eth: send raw transaction, mine, receipt, logs and nonce" {
     try testing.expectEqualStrings("\"result\":[]", logs);
 }
 
+test "eth: eth_createAccessList lists touched accounts and slots beyond the pre-warmed set" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // PUSH1 5 SLOAD POP PUSH1 0x44 BALANCE POP STOP.
+    const toucher = [_]u8{ 0x60, 0x05, 0x54, 0x50, 0x60, 0x44, 0x31, 0x50, 0x00 };
+    var contract: [20]u8 = @splat(0);
+    contract[19] = 0x33;
+    try h.node.db.put_account(contract, 0, 1, &toucher);
+    // PUSH1 1 SLOAD PUSH0 PUSH0 REVERT.
+    const reverter = [_]u8{ 0x60, 0x01, 0x54, 0x5f, 0x5f, 0xfd };
+    var failing: [20]u8 = @splat(0);
+    failing[19] = 0x35;
+    try h.node.db.put_account(failing, 0, 1, &reverter);
+    _ = try h.mine(12);
+    const call = "[{\"to\":\"0x0000000000000000000000000000000000000033\"}]";
+    const text = try h.request("eth_createAccessList", call);
+    const zeros_31: [62]u8 = @splat('0');
+    const zeros_19: [38]u8 = @splat('0');
+    const expected = "\"result\":{\"accessList\":[{\"address\":\"0x" ++ zeros_19 ++
+        "33\",\"storageKeys\":[\"0x" ++ zeros_31 ++ "05\"]},{\"address\":\"0x" ++ zeros_19 ++
+        "44\",\"storageKeys\":[]}],\"gasUsed\":\"0x6d06\"}";
+    try testing.expectEqualStrings(expected, text);
+    // Plain transfers touch nothing beyond the pre-warmed set.
+    const plain = try h.request("eth_createAccessList", "[{\"to\":" ++ address_target ++ "}]");
+    try testing.expectEqualStrings("\"result\":{\"accessList\":[],\"gasUsed\":\"0x5208\"}", plain);
+    const revert_call = "[{\"to\":\"0x0000000000000000000000000000000000000035\"},\"latest\"]";
+    const reverted = try h.request("eth_createAccessList", revert_call);
+    try expect_contains(reverted, "\"error\":\"execution reverted\"}");
+    try expect_contains(try h.request("eth_createAccessList", "[{\"to\":1}]"), "error");
+}
+
 test "eth: call and estimate gas" {
     const h = try Harness.create();
     defer h.destroy();
@@ -683,6 +714,7 @@ const method_names = [_][]const u8{
     "eth_config",
     "debug_executePayload",
     "debug_proofsSyncStatus",
+    "eth_createAccessList",
 };
 const param_pieces = [_][]const u8{
     "\"latest\"",

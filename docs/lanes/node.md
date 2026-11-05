@@ -32,7 +32,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   admin_dropTransaction, admin_dropSenderTransactions.
 - [x] rpc: eth_config (EIP-7910 fork config: current/next/last, blob schedule, precompiles,
   system contracts).
-- [ ] rpc: eth_createAccessList (needs an access-list inspector from the evm).
+- [x] rpc: eth_createAccessList (warm-set collection after simulation, iterated to a fixpoint).
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
@@ -74,6 +74,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_createAccessList without an evm inspector: `Executor.Call.collect` reads the evm state's EIP-2929 warm marks (accounts and slots with `warm_tx == tx_id`) right after the simulated transaction (`node/access_list.zig`). Excluded: from, to, coinbase (Shanghai+), active precompiles, Base native warm contracts, contracts created by the call; slots are kept for every address (so `to` appears with its slots, as geth). Iterated until the list repeats, at most 8 runs. Deviations from geth: reverted frames' accesses are not listed (the evm un-warms them), and the request's `accessList` is not the starting point. Result `{accessList, gasUsed, error?}`, sorted by address and slot.
 - 2026-11-05: debug_executePayload(parent, attributes) builds the block with `Chain.build_block` (as a payload build, no payload id or forkchoice change; stored as a side block) and returns the witness via the new `node.witness.built_witness`, which unwinds from the state at the built block (one changeset; durable DB head is at the block too), then `ensure_head_state`. Attributes decode into the API scratch with the engine parser. debug_proofsSyncStatus reports `{earliest, latest}` of the history window (`Chain.history_window`, journal hook `history_window` on durable nodes), null/null without history.
 - 2026-11-05: eth_config (EIP-7910) as reth's handler plus base/base's L2 sanitizing (zero blob schedule; system contracts only beacon roots from Ecotone and history storage from Isthmus). Forks are the distinct schedule times; fork id is EIP-2124 CRC32 over genesis hash plus times after genesis (no block forks on our chains; `Chain.genesis_timestamp` added). Decision: when no fork is active yet we return "no active timestamp fork found" instead of reth's fallback to the last fork. No DEPOSIT_CONTRACT_ADDRESS: the dev chains configure none.
 - 2026-11-05: perf profile after pipelining: the executing thread finishes early and spends ~half its samples helping recovery, so block time is bounded by secp256k1 ecrecover throughput (~30 us each, crypto lane) plus ~5% thread spawn; no large lever left in this lane. Added miner/base/admin pool methods (base/base shapes: `[maxTx, maxBlock]`, `{"status":"Known"|"Unknown"}`, drop returns hashes lowest nonce first); `miner_setGasLimit` caps pool selection, not the header gas limit, as base/base's standard builder.

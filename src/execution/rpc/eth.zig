@@ -41,7 +41,8 @@ pub const Api = struct {
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
-    @import("txpool.zig").methods ++ @import("eth_config.zig").methods;
+    @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
+    @import("access_list.zig").methods;
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
@@ -564,12 +565,12 @@ fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.
 /// A call request with the state it runs against. The block is resolved before the
 /// call object is parsed, so call data of a historical call stays clear of the proof
 /// buffers at the scratch tail.
-const CallRequest = struct {
+pub const CallRequest = struct {
     message: node.executor.Executor.Call,
     view: state_view.View,
 };
 
-fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
+pub fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
     const call_raw = try call.params.raw();
     const view = try state_view.resolve(api, call, try call.params.optional_raw());
     const space = switch (view) {
@@ -582,7 +583,7 @@ fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
 }
 
 /// Where the proof buffers of a historical call start (aligned, at the scratch tail).
-fn proof_tail_offset(api: *Api) ?usize {
+pub fn proof_tail_offset(api: *Api) ?usize {
     const size = @sizeOf(eth_proof.Scratch);
     if (api.scratch.len < size + @alignOf(eth_proof.Scratch)) return null;
     const base = @intFromPtr(api.scratch.ptr);
@@ -599,7 +600,7 @@ fn view_header(api: *Api, view: state_view.View) consensus.Header {
     };
 }
 
-fn simulate(
+pub fn simulate(
     api: *Api,
     call: *Call,
     request: CallRequest,
@@ -833,6 +834,7 @@ pub fn block_logs(
 
 test {
     _ = @import("eth_config.zig");
+    _ = @import("access_list.zig");
     _ = @import("eth_test.zig");
     _ = @import("debug_test.zig");
     _ = @import("debug_http_test.zig");
