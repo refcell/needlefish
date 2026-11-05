@@ -52,6 +52,7 @@ pub const SequencerClients = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         entries: []const Entry,
+        timeout_ms: u64,
     ) !void {
         assert(entries.len > 0 and entries.len <= sequencers.sequencers_max);
         clients.* = .{ .has_rollup = entries[0].rollup != null };
@@ -59,6 +60,8 @@ pub const SequencerClients = struct {
         for (entries) |entry| {
             assert((entry.rollup != null) == clients.has_rollup);
             try clients.init_entry(allocator, io, entry);
+            clients.l2_http[clients.count - 1].timeout_ms = timeout_ms;
+            clients.rollup_http[clients.count - 1].timeout_ms = timeout_ms;
         }
         assert(clients.count == entries.len);
     }

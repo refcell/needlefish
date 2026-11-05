@@ -19,6 +19,7 @@ const usage =
     \\         [--min-tip-cap GWEI] [--min-basefee GWEI] [--max-pending-transactions N]
     \\         base/base names: --l1-rpc-url --poll-interval S --data-availability-type
     \\         --max-blobs-per-tx N --resubmission-timeout S --max-calldata-size-bytes N
+    \\         --network-timeout S (0 disables)
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
     \\         [--no-force-blobs-when-throttling]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
@@ -75,6 +76,8 @@ const Flags = struct {
     /// Calldata mode: send blobs while DA throttling is active (base/base default on;
     /// `--no-force-blobs-when-throttling` turns it off).
     force_blobs_when_throttling: bool = true,
+    /// Per-request RPC timeout (base/base `--network-timeout`, seconds); 0 disables it.
+    network_timeout_ms: u64 = 10 * std.time.ms_per_s,
 };
 
 /// Largest L1 transaction payload (op-batcher `MaxL1TxSize` default).
@@ -224,11 +227,12 @@ fn run(
     const limits: batcher.rpc.Limits = .{};
     var l1_http = HttpTransport.init(init.gpa, init.io, l1_url);
     defer l1_http.deinit();
+    l1_http.timeout_ms = flags.network_timeout_ms;
     var l1 = try batcher.rpc.Client.init(init.gpa, l1_http.transport(), limits);
     defer l1.deinit(init.gpa);
     const endpoints = try init.gpa.create(sequencer_clients.SequencerClients);
     defer init.gpa.destroy(endpoints);
-    try endpoints.init(init.gpa, init.io, entries);
+    try endpoints.init(init.gpa, init.io, entries, flags.network_timeout_ms);
     defer endpoints.deinit(init.gpa);
     var leader = endpoints.tracker();
     var active_count: u8 = 1;
@@ -366,6 +370,10 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
         const seconds = try parse(u64, value, 10);
         if (seconds == 0 or seconds > 3600) return error.InvalidPollInterval;
         flags.poll_interval_ms = seconds * std.time.ms_per_s;
+    } else if (eql(u8, arg, "--network-timeout")) {
+        const seconds = try parse(u64, value, 10);
+        if (seconds > 3600) return error.InvalidNetworkTimeout;
+        flags.network_timeout_ms = seconds * std.time.ms_per_s;
     } else if (eql(u8, arg, "--data-availability-type")) {
         const blobs = eql(u8, value, "blobs") or eql(u8, value, "blob");
         if (!blobs and !eql(u8, value, "calldata")) return error.UnknownDataAvailability;
@@ -610,6 +618,11 @@ test "batcher: flags" {
     try std.testing.expectEqual(@as(u64, 90000), throttle_flags.throttle.block_size_upper_limit);
     const inverted = [_][]const u8{ "--throttle-full-threshold", "1" };
     try std.testing.expectError(error.InvalidThrottleConfig, parse_flags(&inverted));
+    try std.testing.expectEqual(@as(u64, 10_000), (try parse_flags(&.{})).network_timeout_ms);
+    const timeout_off = [_][]const u8{ "--network-timeout", "0" };
+    try std.testing.expectEqual(@as(u64, 0), (try parse_flags(&timeout_off)).network_timeout_ms);
+    const timeout_big = [_][]const u8{ "--network-timeout", "3601" };
+    try std.testing.expectError(error.InvalidNetworkTimeout, parse_flags(&timeout_big));
     const no_force = [_][]const u8{"--no-force-blobs-when-throttling"};
     try std.testing.expect(!(try parse_flags(&no_force)).force_blobs_when_throttling);
     try std.testing.expect((try parse_flags(&.{})).force_blobs_when_throttling);
@@ -622,6 +635,7 @@ test "batcher: flags" {
 
 test {
     _ = sequencer_clients;
+    _ = @import("http_transport.zig");
 }
 
 const fuzz_flag_names = [_][]const u8{
@@ -641,6 +655,7 @@ const fuzz_flag_names = [_][]const u8{
     "--throttle-full-threshold",
     "--throttle-tx-size-lower-limit",
     "--no-force-blobs-when-throttling",
+    "--network-timeout",
 };
 const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "calldata", "x", "" };
 
@@ -648,6 +663,7 @@ const fuzz_flag_values = [_][]const u8{ "0", "1", "6", "7", "64", "blobs", "call
 fn check_flag_invariants(flags: Flags) !void {
     try std.testing.expect(flags.blobs_per_tx >= 1 and flags.blobs_per_tx <= 6);
     try std.testing.expect(flags.poll_interval_ms > 0);
+    try std.testing.expect(flags.network_timeout_ms <= 3600 * std.time.ms_per_s);
     try std.testing.expect(flags.resubmit_after_ms > 0);
     try std.testing.expect(flags.calldata_bytes_max >= 64);
     try std.testing.expect(flags.calldata_bytes_max <= tx_data_bytes_max);

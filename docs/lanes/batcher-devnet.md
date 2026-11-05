@@ -67,7 +67,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `batcher`: base/base flag names as aliases (`--l1-rpc-url`, `--poll-interval` seconds,
   `--data-availability-type`, `--resubmission-timeout`, `--max-blobs-per-tx`,
   `--max-calldata-size-bytes`).
-- [ ] `batcher`: `--network-timeout` (needs a request timeout in the HTTP transport).
+- [x] `batcher`: `--network-timeout` (needs a request timeout in the HTTP transport).
 - [ ] `batcher`: `--compressed-size-target` (close the channel once compressed output passes
   the target, keeping the batch that reached it).
 - [x] `batcher`: throttle threshold/limit flags (`--throttle-{start,full}-threshold`,
@@ -183,3 +183,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   beacon served only `blob_sidecars` while consensus requests `/eth/v1/beacon/blobs/{slot}`;
   added that endpoint (versioned-hash filter) to `execution/node/beacon.zig` as an
   integration fix. Verifier then derived from blobs (safe head 40).
+- 2026-11-05: `--network-timeout S` (default 10, 0 disables): std.http.Client has no timeout,
+  so HttpTransport races the fetch against a sleep with `std.Io.Select`, cancels a late fetch
+  (fails as TransportFailed, retried next step) and replaces the client so no cancelled
+  connection is reused. Without Io concurrency it falls back to no timeout. Smoke passes.
