@@ -28,12 +28,14 @@ const ns_per_ms = std.time.ns_per_ms;
 const ns_per_s = std.time.ns_per_s;
 const chain_id = 8453;
 const nodes = 4;
+const nodes_max = 8;
 const port = 9222;
 const frame_size_max = 256 * 1024;
 const beacon_root: primitives.B256 = .{ .bytes = @splat(0xbb) };
 
 const Node = struct {
     io: SimIo,
+    secret: secp256k1.SecretKey,
     service: *Service,
     transport: Transport,
     record: enr.Record,
@@ -42,16 +44,23 @@ const Node = struct {
 
 const Cluster = struct {
     world: World,
-    nodes: [nodes]Node,
+    storage: [nodes_max]Node,
+    count: usize,
     rollup: rollup_config.RollupConfig,
     sequencer_secret: [32]u8,
     tx_storage: [512]u8 = undefined,
 
     fn init(cluster: *Cluster, seed: u64) !void {
-        return cluster.init_options(seed, 0);
+        return cluster.init_options(seed, nodes, 0);
     }
 
-    fn init_options(cluster: *Cluster, seed: u64, reset_ppm: u32) !void {
+    fn all(cluster: *Cluster) []Node {
+        return cluster.storage[0..cluster.count];
+    }
+
+    fn init_options(cluster: *Cluster, seed: u64, count: usize, reset_ppm: u32) !void {
+        assert(count >= 2 and count <= nodes_max);
+        cluster.count = count;
         const allocator = std.testing.allocator;
         cluster.rollup = .{ .l2_chain_id = chain_id };
         cluster.rollup.upgrades.set(.ecotone, 0);
@@ -63,11 +72,12 @@ const Cluster = struct {
             .latency_max_ns = 20 * ns_per_ms,
             .pipe_size_bytes = 64 * 1024,
             .reset_ppm = reset_ppm,
+            .connections_max = 128,
         });
         var key_prng = Prng.init(seed ^ 0x6b65_7973);
-        for (&cluster.nodes, 0..) |*node, index| try cluster.init_node(node, index, &key_prng);
-        for (cluster.nodes[1..]) |*node| {
-            node.service.add_boot_record(&cluster.nodes[0].record, node.io.now_realtime_ns());
+        for (cluster.all(), 0..) |*node, index| try cluster.init_node(node, index, &key_prng);
+        for (cluster.all()[1..]) |*node| {
+            node.service.add_boot_record(&cluster.storage[0].record, node.io.now_realtime_ns());
         }
     }
 
@@ -89,6 +99,15 @@ const Cluster = struct {
         try SimIo.init(&node.io, allocator, &cluster.world, .{
             .host = io_module.Address.ip4(host, 0),
         });
+        node.secret = secret;
+        try cluster.start_node(node, index);
+    }
+
+    /// Creates the node's service and transport on its (possibly crashed) SimIo.
+    fn start_node(cluster: *Cluster, node: *Node, index: usize) !void {
+        const allocator = std.testing.allocator;
+        const secret = node.secret;
+        const host = node.record.ip4().?;
         node.prng = Prng.init(index + 101);
         const signer: primitives.Address = .{
             .bytes = try common_secp256k1.address(cluster.sequencer_secret),
@@ -113,10 +132,21 @@ const Cluster = struct {
         try node.transport.start();
     }
 
+    /// Crashes a node (pending IO vanishes, peers see resets) and boots it again fresh.
+    fn crash_restart(cluster: *Cluster, index: usize) !void {
+        const node = &cluster.storage[index];
+        node.io.crash();
+        node.transport.deinit();
+        node.service.destroy(std.testing.allocator);
+        try cluster.start_node(node, index);
+        const boot = &cluster.storage[if (index == 0) 1 else 0].record;
+        node.service.add_boot_record(boot, node.io.now_realtime_ns());
+    }
+
     fn deinit(cluster: *Cluster) void {
-        for (&cluster.nodes) |*node| node.transport.stop();
+        for (cluster.all()) |*node| node.transport.stop();
         cluster.world.run_for_ns(100 * ns_per_ms);
-        for (&cluster.nodes) |*node| {
+        for (cluster.all()) |*node| {
             node.transport.deinit();
             node.service.destroy(std.testing.allocator);
             node.io.deinit();
@@ -124,24 +154,25 @@ const Cluster = struct {
         cluster.world.deinit();
     }
 
-    fn node_of_host(cluster: *const Cluster, address: [4]u8) ?usize {
-        for (&cluster.nodes, 0..) |*node, index| {
+    fn node_of_host(cluster: *Cluster, address: [4]u8) ?usize {
+        for (cluster.all(), 0..) |*node, index| {
             if (std.mem.eql(u8, &node.record.ip4().?, &address)) return index;
         }
         return null;
     }
 
     fn deliver_datagrams(cluster: *Cluster) void {
-        for (&cluster.nodes) |*from| {
+        for (cluster.all()) |*from| {
             while (from.service.pop_datagram()) |datagram| {
                 const to = cluster.node_of_host(datagram.endpoint.address.ip4) orelse continue;
-                if (cluster.world.partitioned(from.io.index, cluster.nodes[to].io.index)) continue;
+                const target = &cluster.storage[to];
+                if (cluster.world.partitioned(from.io.index, target.io.index)) continue;
                 const source: disc.table.Endpoint = .{
                     .address = .{ .ip4 = from.record.ip4().? },
                     .port = 9000,
                 };
-                const now = cluster.nodes[to].io.now_realtime_ns();
-                cluster.nodes[to].service.on_datagram(source, datagram.slice(), now);
+                const now = cluster.storage[to].io.now_realtime_ns();
+                cluster.storage[to].service.on_datagram(source, datagram.slice(), now);
             }
         }
     }
@@ -151,7 +182,7 @@ const Cluster = struct {
         while (elapsed_ns < duration_ns) : (elapsed_ns += 10 * ns_per_ms) {
             cluster.world.run_for_ns(10 * ns_per_ms);
             cluster.deliver_datagrams();
-            for (&cluster.nodes) |*node| node.transport.execute_commands();
+            for (cluster.all()) |*node| node.transport.execute_commands();
         }
     }
 
@@ -170,7 +201,7 @@ const Cluster = struct {
         var result: ssz.ExecutionPayload = .{
             .version = .v3,
             .block_number = number,
-            .timestamp = cluster.nodes[0].io.now_realtime_ns() / ns_per_s,
+            .timestamp = cluster.storage[0].io.now_realtime_ns() / ns_per_s,
             .gas_limit = 30_000_000,
             .base_fee_per_gas = 1,
             .extra_data = "base",
@@ -181,16 +212,20 @@ const Cluster = struct {
     }
 
     fn publish(cluster: *Cluster, from: usize, number: u64) !void {
+        return cluster.publish_signed(from, number, cluster.sequencer_secret);
+    }
+
+    fn publish_signed(cluster: *Cluster, from: usize, number: u64, secret: [32]u8) !void {
         const value = try cluster.payload(number);
-        const node = &cluster.nodes[from];
+        const node = &cluster.storage[from];
         const now = node.io.now_realtime_ns();
-        _ = try node.service.publish_block(cluster.sequencer_secret, beacon_root, value, now);
+        _ = try node.service.publish_block(secret, beacon_root, value, now);
         node.transport.execute_commands();
         node.transport.pump_all();
     }
 
     fn received(cluster: *Cluster, index: usize, number: u64, scratch: []u8) bool {
-        const envelope = cluster.nodes[index].service.pop_block(scratch) orelse return false;
+        const envelope = cluster.storage[index].service.pop_block(scratch) orelse return false;
         return envelope.payload.block_number == number;
     }
 };
@@ -201,12 +236,12 @@ test "p2p transport: nodes discover, connect over libp2p, and gossip a block" {
     try cluster.init(1);
     defer cluster.deinit();
     cluster.run(8 * ns_per_s);
-    for (&cluster.nodes) |*node| try std.testing.expect(node.transport.open_count() >= 2);
+    for (cluster.all()) |*node| try std.testing.expect(node.transport.open_count() >= 2);
     try cluster.publish(2, 7);
     cluster.run(1 * ns_per_s);
     const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
     defer std.testing.allocator.free(scratch);
-    for (0..nodes) |index| {
+    for (0..cluster.count) |index| {
         if (index == 2) continue;
         try std.testing.expect(cluster.received(index, 7, scratch));
     }
@@ -219,9 +254,10 @@ test "p2p transport: a partitioned node gets the block after the partition heals
     defer cluster.deinit();
     cluster.run(8 * ns_per_s);
     const isolated = 3;
-    for (0..nodes) |index| {
+    for (0..cluster.count) |index| {
         if (index == isolated) continue;
-        cluster.world.partition(cluster.nodes[index].io.index, cluster.nodes[isolated].io.index);
+        const peer_index = cluster.storage[index].io.index;
+        cluster.world.partition(peer_index, cluster.storage[isolated].io.index);
     }
     try cluster.publish(0, 9);
     cluster.run(1 * ns_per_s);
@@ -238,7 +274,7 @@ test "p2p transport: a partitioned node gets the block after the partition heals
 test "p2p transport: blocks keep flowing through random connection resets" {
     const cluster = try std.testing.allocator.create(Cluster);
     defer std.testing.allocator.destroy(cluster);
-    try cluster.init_options(5, 5_000);
+    try cluster.init_options(5, nodes, 5_000);
     defer cluster.deinit();
     const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
     defer std.testing.allocator.free(scratch);
@@ -249,14 +285,81 @@ test "p2p transport: blocks keep flowing through random connection resets" {
         try cluster.publish(0, number + 1);
         cluster.run(2 * ns_per_s);
         for (1..nodes) |index| {
-            while (cluster.nodes[index].service.pop_block(scratch)) |_| delivered[index] += 1;
+            while (cluster.storage[index].service.pop_block(scratch)) |_| delivered[index] += 1;
         }
     }
     var resets: u64 = 0;
-    for (&cluster.nodes) |*node| resets += node.transport.stats.closed;
+    for (cluster.all()) |*node| resets += node.transport.stats.closed;
     try std.testing.expect(resets > 0);
     for (delivered[1..]) |count| try std.testing.expectEqual(@as(u32, blocks), count);
-    for (&cluster.nodes) |*node| try std.testing.expect(node.transport.open_count() >= 2);
+    for (cluster.all()) |*node| try std.testing.expect(node.transport.open_count() >= 2);
+}
+
+test "p2p transport: a node gossiping badly signed blocks is banned by its peers" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(6);
+    defer cluster.deinit();
+    cluster.run(8 * ns_per_s);
+    const attacker = 3;
+    var wrong_secret: [32]u8 = @splat(0);
+    wrong_secret[31] = 9;
+    for (0..4) |number| {
+        try cluster.publish_signed(attacker, number + 1, wrong_secret);
+        cluster.run(500 * ns_per_ms);
+    }
+    cluster.run(16 * ns_per_s);
+    const attacker_id = cluster.storage[attacker].record.node_id();
+    for (cluster.all()[0..attacker]) |*node| {
+        try std.testing.expect(node.service.stats.banned >= 1);
+        const now = node.io.now_realtime_ns();
+        try std.testing.expect(node.service.discovery.is_banned(attacker_id, now));
+        try std.testing.expect(node.transport.open_count() >= 1);
+    }
+    try std.testing.expectEqual(@as(u32, 0), cluster.storage[attacker].transport.open_count());
+    // The honest nodes still gossip valid blocks among themselves.
+    try cluster.publish(0, 50);
+    cluster.run(1 * ns_per_s);
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    try std.testing.expect(cluster.received(1, 50, scratch));
+    try std.testing.expect(cluster.received(2, 50, scratch));
+}
+
+test "p2p transport: a crashed node restarts, reconnects, and receives blocks" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(7);
+    defer cluster.deinit();
+    cluster.run(8 * ns_per_s);
+    try cluster.crash_restart(2);
+    cluster.run(10 * ns_per_s);
+    try std.testing.expect(cluster.storage[2].transport.open_count() >= 2);
+    try cluster.publish(0, 77);
+    cluster.run(1 * ns_per_s);
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    for (1..cluster.count) |index| try std.testing.expect(cluster.received(index, 77, scratch));
+}
+
+test "p2p transport: eight nodes with resets gossip every block (slow)" {
+    if (!build_options.slow_tests) return error.SkipZigTest;
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init_options(8, nodes_max, 2_000);
+    defer cluster.deinit();
+    const scratch = try std.testing.allocator.alloc(u8, 10 << 20);
+    defer std.testing.allocator.free(scratch);
+    cluster.run(12 * ns_per_s);
+    var delivered: [nodes_max]u32 = @splat(0);
+    for (0..10) |number| {
+        try cluster.publish(0, number + 1);
+        cluster.run(2 * ns_per_s);
+        for (1..cluster.count) |index| {
+            while (cluster.storage[index].service.pop_block(scratch)) |_| delivered[index] += 1;
+        }
+    }
+    for (delivered[1..cluster.count]) |count| try std.testing.expectEqual(@as(u32, 10), count);
 }
 
 test "p2p transport: seed sweep, every node gets every block (slow)" {
@@ -271,7 +374,7 @@ test "p2p transport: seed sweep, every node gets every block (slow)" {
         cluster.run(8 * ns_per_s);
         try cluster.publish(seed % nodes, seed);
         cluster.run(1 * ns_per_s);
-        for (0..nodes) |index| {
+        for (0..cluster.count) |index| {
             if (index == seed % nodes) continue;
             if (!cluster.received(index, seed, scratch)) {
                 std.debug.print("seed {d}: node {d} missed the block\n", .{ seed, index });
