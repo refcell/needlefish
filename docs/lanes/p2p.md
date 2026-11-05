@@ -75,8 +75,11 @@ behind a small interface and switch later.
   (chain defaults when none given), exposes `publish_block`/`pop_block`/`peer_count`.
   Consensus lane: `p2p.network.Network(IO).init(...)`, `start()`, then call
   `pop_block` each loop; sequencer calls `publish_block`.
-- [ ] `--p2p.bootnodes-file` / `--p2p.bootstore`: persist and reload peers via
-  `peers/store.zig` once the binary reads files.
+- [x] Bootstore: `Network.load_bootstore(contents)` seeds discovery from the stored
+  records; `save_bootstore(output)` merges the discovery table and returns JSON for the
+  binary to write every 60 s. `--p2p.bootstore`/`--p2p.no-bootstore` parsed. Store
+  replaces a node's record only with a higher sequence.
+- [ ] `--p2p.bootnodes-file`: the binary reads it and passes lines as bootnodes.
 - [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
   (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
 - [x] Perf: noise transport seal+open 338 -> 710 MB/s with `libp2p/chacha_poly.zig`
@@ -240,3 +243,4 @@ behind a small interface and switch later.
 - 2026-11-05: DST attacker/crash/8-node scenarios.
 - 2026-11-05: `--p2p.*` options and embeddable `Network(IO)`.
 - 2026-11-05: yamux go-away handling and graceful disconnects.
+- 2026-11-05: bootstore persistence through `Network`.
