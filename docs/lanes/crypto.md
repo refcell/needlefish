@@ -52,8 +52,9 @@ fallback but hot paths should be our own, optimized implementations.
   none): advisor review + a dudect-style timing smoke test on fixed vs random secrets.
 - [x] sha256 ARMv8 SHA2: already in place (`sha256.hardware_accelerated`, sha256h/h2 asm +
   su0/su1 intrinsics); closed by inspection.
-- [ ] secp256k1 batch ecrecover for block sender recovery: shared batch inversion of the
-  final Z across N signatures (expected ~5%); only if the node lane recovers in batches.
+- [x] secp256k1 batch ecrecover: deferred. Senders are recovered one envelope at a time via
+  `tx.Envelope.recover_sender(recoverer)`; a batch API (~5% from a shared inversion) is only
+  worth adding if block import starts recovering in batches.
 - [x] ecdh via constant-time GLV: deferred by decision. ECDH runs once per discv5 session
   handshake; ~11us saving does not justify a constant-time lambda split (current
   `split_lambda` is not audited for secret inputs).
