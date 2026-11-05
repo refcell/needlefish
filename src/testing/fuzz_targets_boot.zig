@@ -171,7 +171,6 @@ fn check(inputs: *const Inputs, result: Error!boot.BootInfo) !void {
     _ = u64_outcome(inputs.chain_id) catch |err| {
         return testing.expectError(err, result);
     } orelse return testing.expectError(error.InvalidBootValue, result);
-    if (inputs.chain == .unknown) return testing.expectError(error.UnknownChainId, result);
     switch (inputs.config_text) {
         .garbage => return testing.expectError(error.RollupConfigInvalid, result),
         .flipped => {
@@ -186,6 +185,8 @@ fn check(inputs: *const Inputs, result: Error!boot.BootInfo) !void {
         },
         .valid => {},
     }
+    // An unknown chain id is a custom chain; its (devnet) rollup config names another id.
+    if (inputs.chain == .unknown) return testing.expectError(error.RollupConfigMismatch, result);
     if (inputs.chain == .mainnet) return testing.expectError(error.RollupConfigMismatch, result);
     return check_tail(inputs, claim_block, result);
 }
