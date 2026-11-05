@@ -89,6 +89,11 @@ fallback but hot paths should be our own, optimized implementations.
   and arm64 passes natively. Verdict: Rosetta 2 AVX emulation bug, not a needlefish or LLVM
   defect; no code change. The c-kzg EIP-7594 vectors are the regression test (run them under
   qemu for x86_64_v3).
+- [x] Wycheproof vectors (C2SP, Apache-2.0) in `wycheproof_tests.zig`: secp256k1 ECDSA P1363
+  SHA-256 (234 tests), secp256r1 ECDSA P1363 SHA-256 (241, EIP-7951 semantics), secp256k1
+  ECDH on raw points (495, incl. 21 invalid-curve / invalid-point rejections). Converted by
+  `etc/scripts/crypto-wycheproof.py` into `vectors/*.txt` (~250 KB); non-64-byte P1363
+  signatures and ASN.1/wrong-curve ECDH cases are dropped (not expressible in the raw API).
 - [x] secp256r1 / P256VERIFY (RIP-7212 / EIP-7951): `p256.verify`, `p256.precompile_p256verify`.
 - [x] Benchmarks for each (see "Bench snapshot"); remaining known gaps vs blst/libsecp-class C:
   BLS G2 mul and MSM, modexp large-operand inner loops, keccak single-message (parity only).
@@ -378,3 +383,4 @@ input decoding and one inversion), p256 under RIP-7212 pricing (13.8), kzg point
 - 2026-11-05: crypto suite passes on x86_64 (baseline and x86_64_v3) under Rosetta.
 - 2026-11-05: x86_64_v3 cells failure traced to Rosetta (qemu -cpu max passes all kzg tests for v3 ReleaseSafe/ReleaseFast); documented the qemu path.
 - 2026-11-05: full crypto suite x86_64_v3 ReleaseSafe under qemu -cpu max: 262/262 pass (incl. heavy KZG/cells); blob fuzz 20K runs clean.
+- 2026-11-05: Wycheproof ECDSA (secp256k1, P-256) and secp256k1 ECDH vectors, all pass.

@@ -23,5 +23,6 @@ pub const precompile_p256verify = p256.precompile_p256verify;
 pub const bn254 = @import("bn254/root.zig");
 
 test {
+    _ = @import("wycheproof_tests.zig");
     std.testing.refAllDecls(@This());
 }
