@@ -19,8 +19,10 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [ ] `batcher/channel`: channel manager (block queue, timeouts, tx tracking, reorgs).
 - [ ] `batcher/txdata`: EIP-1559 / EIP-4844 tx building + signing, tx manager.
 - [ ] `batcher`: L2 block source (RPC), channel builder, frame encoding, compression (zlib/brotli own impl or std), span batches, calldata + blob (EIP-4844) submission via tx manager (nonce, fee bumping, resubmission), throttling.
-- [ ] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`.
-- [ ] Smoke test: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
+- [x] `etc/devnet/devnet.just`: `up`, `down`, `status`, `logs`, `smoke`, `reset` — native processes (no Docker required), pids/logs under `.devnet/`; skips components not built yet.
+- [x] Smoke script `etc/devnet/smoke.sh` (needs `base devnet transfer`).
+- [ ] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
+- [ ] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
 - [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
 
 ## Draft devnet contract
@@ -49,3 +51,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   against the brotli CLI).
 - 2026-11-05: ChannelOut with fuzzed reassembly through the consensus Channel.
 - 2026-11-05: dev accounts (BIP39/32), portal stub, genesis/rollup writers, `base devnet init`.
+- 2026-11-05: devnet.sh supervisor (bash 3.2 compatible) + smoke.sh.
