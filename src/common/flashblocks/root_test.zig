@@ -146,3 +146,148 @@ test "flashblocks: fuzz" {
         }
     }.run, .{});
 }
+
+const brotli_encoder = @import("../../batcher/comp/brotli.zig");
+
+fn random_bytes(arena: std.mem.Allocator, prng: *Prng, length_max: u64) ![]u8 {
+    const bytes = try arena.alloc(u8, prng.range(0, length_max));
+    prng.fill(bytes);
+    return bytes;
+}
+
+fn random_fixed(comptime T: type, prng: *Prng) T {
+    var value: T = undefined;
+    prng.fill(&value.bytes);
+    return value;
+}
+
+/// A structurally arbitrary flashblock: every field random, `base` and the optional
+/// `blob_gas_used` present or absent.
+fn random_flashblock(arena: std.mem.Allocator, prng: *Prng) !flashblocks.Flashblock {
+    const B256 = @FieldType(flashblocks.Delta, "state_root");
+    const Address = @FieldType(flashblocks.Withdrawal, "address");
+    const transactions = try arena.alloc([]const u8, prng.range(0, 6));
+    for (transactions) |*transaction| transaction.* = try random_bytes(arena, prng, 200);
+    const withdrawals = try arena.alloc(flashblocks.Withdrawal, prng.range(0, 4));
+    for (withdrawals) |*withdrawal| withdrawal.* = .{
+        .index = prng.int(u64),
+        .validator_index = prng.int(u64),
+        .address = random_fixed(Address, prng),
+        .amount_gwei = prng.int(u64),
+    };
+    const base: ?flashblocks.PayloadBase = if (prng.chance(1, 2)) .{
+        .parent_beacon_block_root = random_fixed(B256, prng),
+        .parent_hash = random_fixed(B256, prng),
+        .fee_recipient = random_fixed(Address, prng),
+        .prev_randao = random_fixed(B256, prng),
+        .block_number = prng.int(u64),
+        .gas_limit = prng.int(u64),
+        .timestamp = prng.int(u64),
+        .extra_data = try random_bytes(arena, prng, 32),
+        .base_fee_per_gas = prng.int(u256),
+    } else null;
+    var payload_id: [8]u8 = undefined;
+    prng.fill(&payload_id);
+    return .{
+        .payload_id = payload_id,
+        .index = prng.int(u64),
+        .base = base,
+        .diff = .{
+            .state_root = random_fixed(B256, prng),
+            .receipts_root = random_fixed(B256, prng),
+            .logs_bloom = random_fixed(@FieldType(flashblocks.Delta, "logs_bloom"), prng),
+            .gas_used = prng.int(u64),
+            .block_hash = random_fixed(B256, prng),
+            .transactions = transactions,
+            .withdrawals = withdrawals,
+            .withdrawals_root = random_fixed(B256, prng),
+            .blob_gas_used = if (prng.chance(1, 2)) prng.int(u64) else null,
+        },
+        .metadata = .{
+            .block_number = prng.int(u64),
+            .prev_flashblock_id = .{ .block_number = prng.int(u64), .index = prng.int(u64) },
+        },
+    };
+}
+
+fn expect_flashblock_equal(a: flashblocks.Flashblock, b: flashblocks.Flashblock) !void {
+    try testing.expectEqualSlices(u8, &a.payload_id, &b.payload_id);
+    try testing.expectEqual(a.index, b.index);
+    try testing.expectEqual(a.base == null, b.base == null);
+    if (a.base) |base| {
+        try testing.expectEqualDeep(base.parent_hash, b.base.?.parent_hash);
+        try testing.expectEqual(base.base_fee_per_gas, b.base.?.base_fee_per_gas);
+        try testing.expectEqualSlices(u8, base.extra_data, b.base.?.extra_data);
+    }
+    try testing.expect(a.diff.block_hash.eql(b.diff.block_hash));
+    try testing.expect(a.diff.logs_bloom.eql(b.diff.logs_bloom));
+    try testing.expectEqual(a.diff.gas_used, b.diff.gas_used);
+    try testing.expectEqual(a.diff.blob_gas_used, b.diff.blob_gas_used);
+    try testing.expectEqual(a.diff.transactions.len, b.diff.transactions.len);
+    for (a.diff.transactions, b.diff.transactions) |x, y| try testing.expectEqualSlices(u8, x, y);
+    try testing.expectEqualDeep(a.diff.withdrawals, b.diff.withdrawals);
+    try testing.expectEqualDeep(a.metadata, b.metadata);
+}
+
+/// Encode → decode → encode is byte-exact, plain and brotli.
+fn round_trip(seed: u64, encoder: *brotli_encoder.Encoder) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = Prng.init(seed);
+    const original = try random_flashblock(arena, &prng);
+    const json = try flashblocks.encode_json(original, try arena.alloc(u8, 16 * 1024));
+    const decoded = try flashblocks.decode_message(arena, json);
+    try expect_flashblock_equal(original, decoded);
+    const again = try flashblocks.encode_json(decoded, try arena.alloc(u8, json.len));
+    try testing.expectEqualSlices(u8, json, again);
+    const compressed_buffer = try arena.alloc(u8, flashblocks.brotli_bound(json.len));
+    const compressed = try flashblocks.encode_brotli(encoder, json, compressed_buffer);
+    try testing.expect(compressed.len <= compressed_buffer.len);
+    const from_brotli = try flashblocks.decode_message(arena, compressed);
+    const third = try flashblocks.encode_json(from_brotli, try arena.alloc(u8, json.len));
+    try testing.expectEqualSlices(u8, json, third);
+}
+
+test "flashblocks: seeded fuzz encode round trip is byte exact" {
+    var encoder = try brotli_encoder.Encoder.init(testing.allocator, 16 * 1024);
+    defer encoder.deinit(testing.allocator);
+    var prng = Prng.init(0xf1a5_e4c0);
+    for (0..200) |_| try round_trip(prng.int(u64), &encoder);
+}
+
+test "flashblocks: encode rejects a small buffer and stored brotli fallback fits" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const flashblock = try flashblocks.decode_message(arena, v0_4_1_json);
+    var tiny: [64]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, flashblocks.encode_json(flashblock, &tiny));
+    try testing.expectError(error.OutputTooSmall, flashblocks.encode_json(flashblock, tiny[0..1]));
+    // Random bytes inside a JSON string do not compress: the stored form must still fit.
+    var prng = Prng.init(7);
+    var text: [3000]u8 = undefined;
+    for (&text) |*byte| byte.* = "0123456789abcdef"[prng.below(16)];
+    text[0] = '{';
+    text[text.len - 1] = '}';
+    var encoder = try brotli_encoder.Encoder.init(testing.allocator, text.len);
+    defer encoder.deinit(testing.allocator);
+    const out = try arena.alloc(u8, flashblocks.brotli_bound(text.len));
+    const stream = try flashblocks.encode_brotli(&encoder, &text, out);
+    const decompressed = try @import("../../consensus/protocol/brotli.zig").decompress(
+        arena,
+        stream,
+        flashblocks.max_decompressed_bytes,
+    );
+    try testing.expectEqualSlices(u8, &text, decompressed);
+}
+
+test "flashblocks: fuzz encode round trip" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
+            var encoder = try brotli_encoder.Encoder.init(testing.allocator, 16 * 1024);
+            defer encoder.deinit(testing.allocator);
+            try round_trip(smith.value(u64), &encoder);
+        }
+    }.run, .{});
+}

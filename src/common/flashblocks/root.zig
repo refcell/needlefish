@@ -11,6 +11,9 @@ const primitives = @import("../primitives/root.zig");
 const rpc_json = @import("../rpc_types/json.zig");
 // The brotli decoder is the consensus lane's (channel decompression); flashblocks reuse it.
 const brotli = @import("../../consensus/protocol/brotli.zig");
+// The brotli encoder is the batcher lane's (channel compression); flashblocks reuse it.
+const brotli_encoder = @import("../../batcher/comp/brotli.zig");
+const comp = @import("../../batcher/comp/root.zig");
 
 const hex = primitives.hex;
 const Address = primitives.Address;
@@ -313,6 +316,48 @@ fn write_delta(w: *Writer, delta: Delta) rpc_json.Error!void {
     try object.fixed("withdrawals_root", delta.withdrawals_root);
     try object.optional_quantity("blob_gas_used", delta.blob_gas_used);
     try object.end();
+}
+
+pub const EncodeError = error{OutputTooSmall};
+
+/// Encodes the plain JSON message the base/base publisher sends (a WebSocket text frame).
+/// Returns a slice of `out`; the result round-trips byte-exactly through `decode_message`.
+pub fn encode_json(flashblock: Flashblock, out: []u8) EncodeError![]u8 {
+    if (out.len < 2) return error.OutputTooSmall;
+    var w: Writer = .fixed(out);
+    write_json(&w, flashblock) catch return error.OutputTooSmall;
+    const text = w.buffered();
+    assert(text.len >= 2 and text[0] == '{' and text[text.len - 1] == '}');
+    return text;
+}
+
+/// Worst-case size of `encode_brotli` output for `json_length` input bytes.
+pub fn brotli_bound(json_length: u64) u64 {
+    return comp.brotli_bound(json_length);
+}
+
+/// Compresses an encoded JSON message into a bare brotli stream (no channel version
+/// byte), compressed when that fits in `out`, else stored. `out` must hold
+/// `brotli_bound(json.len)` bytes for the stored fallback to always fit.
+pub fn encode_brotli(
+    encoder: *brotli_encoder.Encoder,
+    json: []const u8,
+    out: []u8,
+) EncodeError![]u8 {
+    assert(json.len <= max_decompressed_bytes);
+    assert(json.len <= encoder.input_bytes_max);
+    const stored_length: usize = @intCast(@min(out.len, brotli_bound(json.len)));
+    if (stored_length < 2) return error.OutputTooSmall;
+    // Incompressible input can expand past the stored form; cap the attempt there.
+    if (encoder.compress(json, out[0 .. stored_length - 1])) |stream| {
+        assert(stream.len < stored_length);
+        return stream;
+    } else |_| {}
+    const channel = try comp.brotli_compress_stored(json, out[0..stored_length]);
+    assert(channel.len >= 2);
+    // Drop the channel version byte: flashblock messages are bare brotli streams.
+    std.mem.copyForwards(u8, out[0 .. channel.len - 1], channel[1..]);
+    return out[0 .. channel.len - 1];
 }
 
 test {

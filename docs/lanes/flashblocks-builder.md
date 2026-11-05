@@ -15,7 +15,7 @@ EVM lane. All sockets and timers go through `src/utilities/io` so the cluster si
 can drive the builder and the flashblocks consumer.
 
 ## Backlog
-- [ ] `common/flashblocks` encoder: JSON (and brotli, if the compressor exists, else
+- [x] `common/flashblocks` encoder: JSON (and brotli, if the compressor exists, else
   plain JSON) encode of `FlashblocksPayloadV1`, byte-exact round trip with the decoder;
   seeded + `std.testing.fuzz` round-trip tests.
 - [ ] `builder/publish`: bounded broadcast ring of encoded flashblocks, WebSocket
@@ -53,5 +53,10 @@ can drive the builder and the flashblocks consumer.
   sequence for a block replays to exactly the sealed block.
 
 ## Decisions
+- Wire format published is plain JSON text (base/base `publisher.rs` sends `Utf8Bytes`);
+  `encode_brotli` exists for consumers/tests and emits a bare brotli stream (no channel
+  version byte), reusing the batcher lane's encoder.
 
 ## Log
+- 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
+  seeded + `std.testing.fuzz` tests.
