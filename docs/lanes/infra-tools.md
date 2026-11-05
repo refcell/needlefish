@@ -28,7 +28,7 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   bounded per-client send queues that drop slow clients (port `websocket-proxy/src/*`).
   Sim test: 1 upstream, N clients, one slow client is dropped, others see every message
   in order. Fuzz the filter/auth parsers.
-- [ ] `infra/roxy`: HTTP JSON-RPC server scaffold with health endpoint, then a
+- [x] `infra/roxy`: HTTP JSON-RPC server scaffold with health endpoint, then a
   load-balancing RPC proxy over N upstreams with health checks, retry, and method
   allowlist (port `roxy`, extend toward base/base's intent). Sim test with a failing
   upstream.
@@ -71,6 +71,24 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
   accounts 2,3,4,8,9 so the devnet's role accounts (0,1,5,6,7) keep their nonces.
 - Deviation from base/base: "nonce too low" before any publish also resets the nonce cache
   so the next send refetches the chain nonce instead of failing the same way.
+- roxy (base/base ships only the scaffold): the http server gained deferred responses
+  (`defer_response`/`resume_deferred`, 504 on `io_timeout_ns`, 503 on stop) so a handler can
+  wait on an upstream without blocking. Per upstream a fixed pool of http clients, one request
+  each; a bounded pending set (full: 503 at once, no queueing beyond it).
+- roxy retries transport errors and 5xx on a different upstream (at most `--retries` + 1
+  sends, never the same upstream twice), including non-idempotent methods, like ProxyD; with
+  no upstream left the last 5xx is forwarded as-is, a transport failure becomes 502 + -32603.
+- roxy passive health: `failures_to_eject` consecutive failures eject for a backoff doubling
+  per ejection in a row (capped); re-admitted on probation (one failure re-ejects). All
+  ejected: fail open to the earliest-returning one; a success there re-admits at once.
+  No active `eth_chainId` probe yet (the fail-open traffic acts as the probe).
+- roxy allowlist: methods are matched after JSON unescaping and with ASCII-case-insensitive
+  `method`/`id` keys (geth's encoding/json accepts `"Method"`); duplicate `method` keys are
+  invalid. A batch with any disallowed entry is rejected whole: every entry gets -32601
+  (allowed entries say why). Parse errors get -32700, bad shapes -32600, batches over 100
+  -32600. Without an allowlist bodies are forwarded unparsed.
+- roxy flags: `BASE_ROXY_*` env prefix (base/base uses `ROXY_LISTEN_ADDR`); upstreams are
+  `http://IPv4:PORT` only (no DNS, no TLS), matching the other `bin/base` tools.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -83,3 +101,6 @@ every tool runs in the simulator. Bounded queues, static allocation after startu
 - 2026-11-05: load_test (pacer, workload, metrics, runner + fake-chain sim) and
   `base load-test`; against `base node --dev-l1` (1 s blocks, 5 tx/s): 49/49 confirmed,
   p50 1085 ms.
+- 2026-11-05: `infra/roxy` + `base roxy`: deferred http responses, allowlist, method
+  extractor, upstream pool (all fuzzed), proxy with retries/ejection; SimIo tests with 3 fake
+  upstreams; smoke-tested against a local HTTP upstream (incl. a 200 KB response).
