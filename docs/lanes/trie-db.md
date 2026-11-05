@@ -9,8 +9,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] State provider implementing the evm `Host` backend: accounts, storage, code-by-hash, block hashes; overlay/journal for pending block execution; commit + state root.
 - [x] Block/receipt/header storage and canonical chain indices; reorg (unwind) support.
 - [x] Fault injection tests on the simulated disk (torn writes, corruption, crash at any point) — state must recover to last committed block.
-- [ ] Benchmarks: state root of N updates, random reads, commit latency. (trie cases landed in
-  `trie/bench.zig`; commit latency waits on the storage engine)
+- [x] Benchmarks: state root of N updates, random reads, commit latency. (`trie/bench.zig`;
+  `db/bench.zig`: block apply+root, changeset codec, commit-until-durable p50/p99, checkpoint)
 - [x] Durable database facade (`db/database.zig`): journal block/head entries, state moves
   only on head moves, checkpoints = State snapshot + chain blocks, crash-recovery tests.
 - [x] Real storage backend over `utilities.io` (io_uring/kqueue): `db/storage/io_storage.zig`.
@@ -18,6 +18,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Batch keccak (crypto lane's SIMD batch, 74 vs 146 ns) for sibling nodes in
   `update_cache`.
 - [ ] Compact node layout (packed paths, out-of-line values).
+- [ ] Storage-heavy block root is slow: 1k accounts + 4k slots over 100k accounts = 13 ms
+  (vs 2 ms for 1k accounts alone). Profile storage trie rehash/creation and fix.
+- [ ] One fsync per `execute_and_commit`: journal block + head as one entry (now 2 fsyncs,
+  ~7.5 ms durability cost per block).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -76,6 +80,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - Publishing under contention: after a green `zig build test` on base B, a rejected push is
   retried without re-testing only when B..origin/main touches none of trie/db/evm/common/
   build.zig/base.zig (tidy still runs); anything else re-tests.
+- `db/bench.zig`: commit latency is a closed loop (wait durable, then next block) with its
+  own runner for percentiles (`run_commit`, takes `std.Io` for the clock); the OS case uses a
+  scratch file under `.zig-cache/tmp/needlefish-db-bench`, deleted afterwards. Journal sized
+  so rounds never trigger automatic checkpoints; checkpoints are timed separately.
 - Trie node stores path/children/value inline (simple, ~300 B/node); compact later.
 - Batched rehash: `TrieType` collects dirty nodes with their depth (explicit stack), hashes
   deepest level first, sorts each level by encoding length, and feeds equal-length encodings of
@@ -103,4 +111,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-05: trie benchmarks: 1k-account state block on 100k accounts in 2.0 ms.
 - 2026-11-05: IoStorage over utilities.io; engine end to end over a short-IO double, SimIo
   (16 crash seeds), and kqueue/io_uring on a real temp file.
+<<<<<<< HEAD
 - 2026-11-05: batch keccak in the trie rehash: 1k-account state block 1.98 -> 1.60 ms.
+=======
+- 2026-11-05: db benchmarks: 1k acct + 4k slot block on 100k accounts: 13 ms apply+root,
+  21 ms commit until durable (kqueue + F_FULLFSYNC), 40 ms checkpoint of a 17 MB state.
+>>>>>>> eedeb33 (perf(db): add block apply, changeset codec, and commit latency benchmarks)

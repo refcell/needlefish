@@ -43,6 +43,34 @@ Dirty nodes are rehashed level by level (deepest first) and equal-length encodin
 | trie/block 1k puts+root on 100k | 1 730 830 | 1 308 295 | -24% (after runs 1.31-1.41 ms) |
 | trie/state block 1k accounts | 1 977 875 | 1 602 292 | -19% (after runs 1.60-1.65 ms) |
 
+## 2026-11-05 db (aarch64-macos, Apple M4 Pro, 48 GB, internal SSD, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/` (whole db run ~8 s). Block = 1k account writes
+(nonce+balance) + 4k storage writes on distinct existing keys, over 100k accounts (1k
+contracts x 64 slots). Changeset of one block: 629 018 bytes.
+
+| Case | ns/op | MB/s | Notes |
+| --- | ---: | ---: | --- |
+| db/block 1k acct+4k slot apply+root | 13 294 208 | | overlay writes + build_changeset + State.apply + root, in memory |
+| db/changeset encode 1k acct+4k slot | 50 326 | 12 499 | |
+| db/changeset decode 1k acct+4k slot | 215 150 | 2 924 | strict canonical decode |
+
+Commit loop (`run_commit`, own runner): 128 blocks in 4 rounds of 32, a timed checkpoint after
+setup and after each round (5 samples, so p99 = max). Each block waits until its head entry
+is durable before the next starts (2 journal entries, 2 fsyncs per block). Overlay writes are
+outside the clock. "cpu" = `execute_and_commit` returning; "durable" = head entry fsynced.
+
+| Storage | cpu p50 | cpu p99 | durable p50 | durable p99 | checkpoint p50 | checkpoint max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SimStorage (1-tick latency) | 13.5 ms | 17.9 ms | 13.6 ms | 18.0 ms | 14.6 ms | 16.6 ms |
+| IoStorage, kqueue, temp file, F_FULLFSYNC | 13.4 ms | 16.5 ms | 21.0 ms | 26.0 ms | 40.2 ms | 53.1 ms |
+
+Checkpoint = 17.1 MB (100k-account snapshot + 4 retained blocks): serialize + write + sync +
+superblock copies. Takeaways: commit CPU (~13 ms) is the in-memory block cost; the state root
+for 4k storage writes dominates (trie/state block 1k accounts alone is 2.0 ms). Durability
+adds ~7.5 ms (two full fsyncs of ~630 KB). Second run on the same machine: cpu p50 13.1-13.8
+ms, durable p50 21.0 ms, checkpoint p50 41.1 ms; sim p99 swings 18-27 ms (noise, laptop).
+
 ## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 | Case | ns/op | MB/s | Notes |
