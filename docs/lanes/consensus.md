@@ -95,6 +95,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Subsecond (Denim) blocks follow base/base timing: build at the parent's timestamp, `getPayload` at T - 50 ms. Pre-Denim blocks keep build-at-T, seal-on-payload-id (base/base builds one slot early); the devnet runs Denim from genesis so this only affects legacy chains.
 - Admin and dev RPC are off by default like base/base (unmerged modules answer -32601). The devnet sequencer passes `--rpc.enable-admin` because the batcher finds the leader with `admin_sequencerActive`.
 - Admin errors follow base/base exactly (codes and redacted messages) even where ours were more descriptive; reasons go to the log instead.
 - WebSocket RPC listens on its own port (default 7546) because the HTTP server cannot upgrade; ids are numbers and notifications use the subscribe method name, like jsonrpsee; only changes after subscribing are sent.
@@ -221,6 +222,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: sequencer: native 200 ms cadence: driver ticks in ms; subsecond blocks build from the parent's timestamp and seal 150 ms into the slot (base/base `block_seal_target`); stop discards a waiting payload.
 - 2026-11-05: rpc: `admin_*` only with `--rpc.enable-admin`, `dev_*` (and the engine queue ws subscription) only with `--rpc.dev-enabled`, else -32601; devnet sequencer enables admin for the batcher's leader check.
 - 2026-11-05: rpc: WebSocket requests use the node's merged router (opp2p_* included); devnet verifier serves metrics and smoke checks the safe-head metric (not run: ports held by another devnet).
 - 2026-11-05: rpc: admin error codes and idempotent start/stop match base/base.

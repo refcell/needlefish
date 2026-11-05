@@ -788,7 +788,7 @@ pub const RealVerifier = struct {
             else
                 null,
         };
-        verifier.driver.tick(providers, view.now_ns / std.time.ns_per_s);
+        verifier.driver.tick(providers, view.now_ns / std.time.ns_per_ms);
     }
 
     /// The driver's safe head, or null during startup discovery (heads not yet known).

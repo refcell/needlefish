@@ -869,10 +869,10 @@ pub fn Node(comptime IO: type) type {
             node.message_passer.tick();
             node.polling.tick();
             if (node.blobs) |blobs| blobs.tick();
-            const now_s = node.io.now_realtime_ns() / std.time.ns_per_s;
+            const now_ms = node.io.now_realtime_ns() / std.time.ns_per_ms;
             // Startup may need the checkpoints, so the driver waits until they are read.
             const checkpoints_ready = if (node.checkpoints) |store| store.loaded != null else true;
-            if (checkpoints_ready) node.driver.tick(node.providers(), now_s);
+            if (checkpoints_ready) node.driver.tick(node.providers(), now_ms);
             if (node.network) |network| {
                 node.tick_signer(network);
                 node.tick_gossip(network);

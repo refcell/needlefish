@@ -18,6 +18,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("../protocol/root.zig");
+const task = @import("../engine/task.zig");
 const derive_errors = @import("../derive/errors.zig");
 const pipeline_module = @import("../derive/pipeline.zig");
 const attributes_module = @import("../derive/attributes.zig");
@@ -160,8 +161,14 @@ pub const Driver = struct {
     consolidating: ?BlockInfo = null,
     /// Sequencer attributes waiting for their payload id (build) or seal.
     sealing: ?AttributesWithParent = null,
-    /// A build or seal task is queued.
+    /// A build or seal task is queued, or a built payload waits for its seal time.
     building: bool = false,
+    /// The built payload waiting for `seal_at_ms` (subsecond slots seal 150 ms in).
+    seal_payload: ?task.PayloadId = null,
+    /// Wall clock (ms) at which the payload being built is sealed (`engine_getPayload`).
+    seal_at_ms: u64 = 0,
+    /// Wall clock (ms) of the current tick.
+    now_ms: u64 = 0,
     /// Runtime sequencer switch (`admin_startSequencer`/`admin_stopSequencer`).
     sequencer_active: bool = false,
     /// Wall clock (seconds) of the last EL sync probe.
@@ -223,8 +230,10 @@ pub const Driver = struct {
         return driver.queue.state.sync_state;
     }
 
-    /// One step of every state machine; `now_s` is the wall clock in seconds.
-    pub fn tick(driver: *Driver, providers: anytype, now_s: u64) void {
+    /// One step of every state machine; `now_ms` is the wall clock in milliseconds.
+    pub fn tick(driver: *Driver, providers: anytype, now_ms: u64) void {
+        driver.now_ms = now_ms;
+        const now_s = now_ms / std.time.ms_per_s;
         switch (driver.phase) {
             .starting => driver.start(providers),
             .resetting => driver.reset_pipeline(providers),
@@ -239,7 +248,7 @@ pub const Driver = struct {
                 driver.derive(providers);
                 if (driver.phase != .running) return;
                 driver.finalize(providers.l1_finalized);
-                if (driver.sequencer_active) driver.sequence(providers, now_s);
+                if (driver.sequencer_active) driver.sequence(providers, now_ms);
             },
         }
         assert(driver.queue.state.sync_state.is_ordered());
@@ -310,11 +319,16 @@ pub const Driver = struct {
         assert(driver.sequencer_active);
     }
 
-    /// `admin_stopSequencer`: stop building; returns the unsafe head to resume from. A block
-    /// already being built is still sealed. Stopping a stopped sequencer only returns the head.
+    /// `admin_stopSequencer`: stop building; returns the unsafe head to resume from. A seal
+    /// already queued still completes; a built payload waiting for its seal time is discarded
+    /// (base/base drops `next_payload`). Stopping a stopped sequencer only returns the head.
     pub fn stop_sequencer(driver: *Driver) error{NotSequencer}!Hash {
         if (!driver.options.sequencer) return error.NotSequencer;
         driver.sequencer_active = false;
+        if (driver.seal_payload != null) {
+            driver.drop_sealing();
+            driver.building = false;
+        }
         assert(!driver.sequencer_active);
         return driver.queue.state.sync_state.unsafe_head.block_info.hash;
     }
@@ -425,6 +439,22 @@ pub const Driver = struct {
     fn drop_sealing(driver: *Driver) void {
         if (driver.sealing) |*attributes| attributes.deinit(driver.allocator);
         driver.sealing = null;
+        driver.seal_payload = null;
+        assert(driver.sealing == null);
+    }
+
+    /// Queues the seal (`engine_getPayload` + insert) of the waiting payload.
+    fn enqueue_seal(driver: *Driver) void {
+        const payload_id = driver.seal_payload.?;
+        assert(driver.building);
+        const request: task_queue.Request = .{ .seal = .{
+            .payload_id = payload_id,
+            .attributes = &driver.sealing.?,
+        } };
+        driver.queue.enqueue(request) catch {
+            driver.building = false; // Queue full: drop the block, build again.
+        };
+        driver.drop_sealing(); // The seal task copied the attributes.
     }
 
     fn step_engine(driver: *Driver, providers: anytype) void {
@@ -452,15 +482,14 @@ pub const Driver = struct {
                 driver.stats.consolidated += 1;
             },
             .build => |payload_id| {
-                const attributes = &driver.sealing.?;
-                const request: task_queue.Request = .{ .seal = .{
-                    .payload_id = payload_id,
-                    .attributes = attributes,
-                } };
-                driver.queue.enqueue(request) catch {
-                    driver.building = false; // Queue full: drop the block, build again.
-                };
-                driver.drop_sealing();
+                assert(driver.sealing != null);
+                if (!driver.sequencer_active) { // Stopped while building: discard.
+                    driver.drop_sealing();
+                    driver.building = false;
+                    return;
+                }
+                driver.seal_payload = payload_id;
+                if (driver.now_ms >= driver.seal_at_ms) driver.enqueue_seal();
             },
             .seal => {
                 driver.building = false;
@@ -528,11 +557,14 @@ pub const Driver = struct {
         driver.queue.enqueue(.{ .finalize = number }) catch {};
     }
 
-    fn sequence(driver: *Driver, providers: anytype, now_s: u64) void {
-        if (driver.building) return;
+    fn sequence(driver: *Driver, providers: anytype, now_ms: u64) void {
+        if (driver.building) {
+            if (driver.seal_payload != null and now_ms >= driver.seal_at_ms) driver.enqueue_seal();
+            return;
+        }
         const head = driver.queue.state.sync_state.unsafe_head;
-        const next_time = driver.rollup.l2_block_timestamp(head.block_info.number + 1);
-        if (now_s < next_time) return;
+        const slot = block_slot(driver.rollup, head.block_info.number + 1);
+        if (now_ms < slot.build_at_ms) return;
         const outcome = sequencer_build.build_on(
             &driver.selector,
             &driver.builder,
@@ -558,6 +590,7 @@ pub const Driver = struct {
                     return;
                 };
                 driver.building = true;
+                driver.seal_at_ms = slot.seal_at_ms;
             },
             .deferred, .awaiting_l1_origin => {},
             .reset => driver.request_reset(),
@@ -565,9 +598,37 @@ pub const Driver = struct {
     }
 };
 
+/// base/base `DEFAULT_SEAL_OFFSET`: subsecond blocks request the payload 150 ms into the slot.
+pub const seal_offset_ms: u64 = 150;
+
+pub const BlockSlot = struct { build_at_ms: u64, seal_at_ms: u64 };
+
+/// When the sequencer starts building block `number` and when it seals it. A subsecond block
+/// (base/base `block_seal_target`) builds from its parent's timestamp and seals at
+/// `T - (200 ms - 150 ms)`; an earlier block builds at its own timestamp and seals as soon
+/// as the engine returns the payload id.
+pub fn block_slot(rollup: *const RollupConfig, number: u64) BlockSlot {
+    assert(number > 0);
+    const target_ms = rollup.l2_block_timestamp_ms(number);
+    const interval_ms = protocol.rollup_config.DenimTimestampSchedule.denim_block_interval_ms;
+    comptime assert(seal_offset_ms < interval_ms);
+    if (!rollup.is_feature_active(.subsecond_blocks, target_ms / std.time.ms_per_s)) {
+        return .{ .build_at_ms = target_ms, .seal_at_ms = target_ms };
+    }
+    const parent_ms = rollup.l2_block_timestamp_ms(number - 1);
+    const seal_at_ms = target_ms -| (interval_ms - seal_offset_ms);
+    assert(parent_ms <= seal_at_ms);
+    return .{ .build_at_ms = parent_ms, .seal_at_ms = seal_at_ms };
+}
+
 // ------------------------------------------------------------------------ tests
 
 const testing = std.testing;
+const Prng = @import("../../testing/prng.zig").Prng;
+
+fn ms(seconds: u64) u64 {
+    return seconds * std.time.ms_per_s;
+}
 const TestChain = @import("../derive/test_chain.zig").TestChain;
 const MockEngine = @import("../engine/mock_engine.zig").MockEngine;
 const SystemConfig = protocol.system_config.SystemConfig;
@@ -701,7 +762,7 @@ test "driver: starts from genesis, synchronizes, and resets the pipeline" {
     try scenario.init(.{});
     defer scenario.deinit();
     const driver = &scenario.driver;
-    for (0..16) |_| driver.tick(scenario.providers(), Scenario.genesis_time);
+    for (0..16) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time));
     try testing.expectEqual(Phase.running, driver.phase);
     try testing.expect(scenario.mock.forkchoice_calls >= 1);
     const safe_hash = driver.sync_state().safe_head.block_info.hash;
@@ -717,7 +778,7 @@ test "driver: derivation waits for EL sync and probes the engine meanwhile" {
     scenario.mock.forkchoice_status = .syncing;
     const driver = &scenario.driver;
     const start_s = Scenario.genesis_time + 2;
-    for (0..32) |_| driver.tick(scenario.providers(), start_s);
+    for (0..32) |_| driver.tick(scenario.providers(), ms(start_s));
     try testing.expectEqual(Phase.running, driver.phase);
     try testing.expect(!driver.queue.state.el_sync_finished);
     try testing.expectEqual(@as(u64, 1), driver.stats.el_sync_probes);
@@ -726,14 +787,14 @@ test "driver: derivation waits for EL sync and probes the engine meanwhile" {
     try testing.expect(!driver.building);
     try testing.expectEqual(@as(u32, 0), scenario.mock.build_calls);
     const calls = scenario.mock.forkchoice_calls;
-    driver.tick(scenario.providers(), start_s + 1); // Inside the probe interval.
+    driver.tick(scenario.providers(), ms(start_s + 1)); // Inside the probe interval.
     try testing.expectEqual(calls, scenario.mock.forkchoice_calls);
-    for (0..4) |_| driver.tick(scenario.providers(), start_s + 2);
+    for (0..4) |_| driver.tick(scenario.providers(), ms(start_s + 2));
     try testing.expectEqual(@as(u64, 2), driver.stats.el_sync_probes);
     try testing.expect(scenario.mock.forkchoice_calls > calls);
     // The engine finishes syncing: the next probe confirms it and the sequencer builds.
     scenario.mock.forkchoice_status = .valid;
-    for (0..8) |_| driver.tick(scenario.providers(), start_s + 4);
+    for (0..8) |_| driver.tick(scenario.providers(), ms(start_s + 4));
     try testing.expect(driver.queue.state.el_sync_finished);
     try testing.expectEqual(@as(u64, 3), driver.stats.el_sync_probes);
     try testing.expect(driver.building or scenario.mock.build_calls >= 1);
@@ -745,7 +806,7 @@ test "driver: verifier derives empty blocks past the sequencing window" {
     try scenario.init(.{});
     defer scenario.deinit();
     const driver = &scenario.driver;
-    for (0..32) |_| driver.tick(scenario.providers(), Scenario.genesis_time);
+    for (0..32) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time));
     // No batches: once the window expires the pipeline derives deposit-only blocks, which
     // the engine does not have, so consolidation builds them.
     try testing.expect(driver.consolidating != null);
@@ -759,18 +820,82 @@ test "driver: sequencer builds and seals the next block on time" {
     defer scenario.deinit();
     scenario.chain.unavailable_from = 3; // L1 data stops before the window expires.
     const driver = &scenario.driver;
-    for (0..8) |_| driver.tick(scenario.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time + 1));
     try testing.expectEqual(Phase.running, driver.phase);
     try testing.expectEqual(@as(u32, 0), scenario.mock.build_calls);
-    driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    driver.tick(scenario.providers(), ms(Scenario.genesis_time + 2));
     try testing.expect(driver.building);
     scenario.arm_payload(&driver.sealing.?);
-    for (0..16) |_| driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    for (0..16) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time + 2));
     try testing.expectEqual(@as(u64, 1), driver.stats.sealed);
     const head = driver.sync_state().unsafe_head;
     try testing.expectEqual(@as(u64, 1), head.block_info.number);
     try testing.expectEqual(@as(u64, 0), head.l1_origin.number);
     try testing.expect(!driver.building);
+    try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+test "driver: block slots build at the parent time and seal 150 ms into subsecond slots" {
+    var rollup: RollupConfig = .{ .block_time = 2 };
+    rollup.genesis = .{ .l2 = .{ .number = 0 }, .l2_time = 1000 };
+    // Before Denim: build at the block's own timestamp and seal right away.
+    const legacy = block_slot(&rollup, 3);
+    try testing.expectEqual(@as(u64, 1_006_000), legacy.build_at_ms);
+    try testing.expectEqual(legacy.build_at_ms, legacy.seal_at_ms);
+    rollup.upgrades.set(.denim, 1004); // Block 2 (t = 1004 s) is the first Denim block.
+    try testing.expect(rollup.is_feature_active(.subsecond_blocks, 1004));
+    const first = block_slot(&rollup, 3); // 1004.2 s, parent at 1004.0 s.
+    try testing.expectEqual(@as(u64, 1_004_000), first.build_at_ms);
+    try testing.expectEqual(@as(u64, 1_004_150), first.seal_at_ms);
+    const later = block_slot(&rollup, 10);
+    try testing.expectEqual(later.build_at_ms + seal_offset_ms, later.seal_at_ms);
+    try testing.expectEqual(rollup.l2_block_timestamp_ms(10) - 50, later.seal_at_ms);
+    // Seeded: every subsecond slot opens at the parent and seals inside its own 200 ms.
+    var prng = Prng.init(0x5107);
+    for (0..256) |_| {
+        const number = 3 + prng.below(1_000_000);
+        const slot = block_slot(&rollup, number);
+        try testing.expectEqual(rollup.l2_block_timestamp_ms(number - 1), slot.build_at_ms);
+        try testing.expect(slot.seal_at_ms < rollup.l2_block_timestamp_ms(number));
+    }
+}
+
+test "driver: subsecond sequencer holds the payload until 150 ms into the slot" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{ .sequencer = true });
+    defer scenario.deinit();
+    scenario.chain.unavailable_from = 3;
+    scenario.rollup.upgrades.set(.denim, Scenario.genesis_time);
+    const driver = &scenario.driver;
+    const slot_start = ms(Scenario.genesis_time); // Block 1 is due at +200 ms.
+    for (0..8) |_| driver.tick(scenario.providers(), slot_start);
+    try testing.expect(driver.building);
+    // L1 info, then the BaseTimeUpdateTx deposit carrying the 200 ms part.
+    const transactions = driver.sealing.?.attributes.transactions;
+    try testing.expectEqual(@as(usize, 2), transactions.len);
+    const base_time = try attributes_module.encode_base_time(testing.allocator, 1, 200);
+    defer testing.allocator.free(base_time);
+    try testing.expectEqualSlices(u8, base_time, transactions[1]);
+    scenario.arm_payload(&driver.sealing.?);
+    for (0..16) |_| driver.tick(scenario.providers(), slot_start + 149);
+    try testing.expect(driver.seal_payload != null); // Built, not sealed yet.
+    try testing.expectEqual(@as(u64, 0), driver.stats.sealed);
+    for (0..16) |_| driver.tick(scenario.providers(), slot_start + 150);
+    try testing.expectEqual(@as(u64, 1), driver.stats.sealed);
+    try testing.expectEqual(@as(u64, 1), driver.sync_state().unsafe_head.block_info.number);
+    // Block 2 builds right away (its parent's slot has passed); stopping discards it.
+    const head = driver.sync_state().unsafe_head;
+    scenario.chain.add_l2_block(head);
+    scenario.chain.add_system_config(head.block_info.hash, scenario.rollup.genesis.system_config.?);
+    for (0..8) |_| driver.tick(scenario.providers(), slot_start + 200);
+    try testing.expect(driver.building);
+    scenario.arm_payload(&driver.sealing.?);
+    for (0..8) |_| driver.tick(scenario.providers(), slot_start + 201);
+    try testing.expect(driver.seal_payload != null);
+    _ = try driver.stop_sequencer();
+    try testing.expect(!driver.building and driver.sealing == null);
+    for (0..8) |_| driver.tick(scenario.providers(), slot_start + 400);
+    try testing.expectEqual(@as(u64, 1), driver.stats.sealed);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
 }
 
@@ -780,11 +905,11 @@ test "driver: a sealed payload inserts into a verifier as its unsafe head" {
     defer sequencer.deinit();
     sequencer.chain.unavailable_from = 3;
     const driver = &sequencer.driver;
-    for (0..8) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| driver.tick(sequencer.providers(), ms(Scenario.genesis_time + 1));
     try testing.expect(driver.queue.take_sealed() == null);
-    driver.tick(sequencer.providers(), Scenario.genesis_time + 2);
+    driver.tick(sequencer.providers(), ms(Scenario.genesis_time + 2));
     sequencer.arm_payload(&driver.sealing.?);
-    for (0..16) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 2);
+    for (0..16) |_| driver.tick(sequencer.providers(), ms(Scenario.genesis_time + 2));
     const sealed = driver.queue.take_sealed().?;
     try testing.expectEqual(@as(u64, 1), sealed.payload.block_number);
     try testing.expect(driver.queue.take_sealed() == null);
@@ -796,13 +921,13 @@ test "driver: a sealed payload inserts into a verifier as its unsafe head" {
     defer verifier.deinit();
     verifier.chain.unavailable_from = 3;
     try testing.expect(!verifier.driver.insert_unsafe(sealed)); // Not running yet.
-    for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| verifier.driver.tick(verifier.providers(), ms(Scenario.genesis_time + 1));
     try testing.expectEqual(Phase.running, verifier.driver.phase);
     var stale = sealed.*;
     stale.payload.block_number = 0;
     try testing.expect(!verifier.driver.insert_unsafe(&stale));
     try testing.expect(verifier.driver.insert_unsafe(sealed));
-    for (0..8) |_| verifier.driver.tick(verifier.providers(), Scenario.genesis_time + 2);
+    for (0..8) |_| verifier.driver.tick(verifier.providers(), ms(Scenario.genesis_time + 2));
     const head = verifier.driver.sync_state().unsafe_head;
     try testing.expect(head.block_info.hash.eql(sealed.payload.block_hash));
     try testing.expectEqual(@as(u64, 1), verifier.driver.stats.unsafe_queued);
@@ -816,13 +941,13 @@ fn seal_two(arena: Allocator) ![2]InsertEnvelope {
     defer sequencer.deinit();
     sequencer.chain.unavailable_from = 3;
     const driver = &sequencer.driver;
-    for (0..8) |_| driver.tick(sequencer.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| driver.tick(sequencer.providers(), ms(Scenario.genesis_time + 1));
     var sealed: [2]InsertEnvelope = undefined;
     for (&sealed, 0..) |*envelope, index| {
         const now_s = Scenario.genesis_time + 2 * (index + 1);
-        driver.tick(sequencer.providers(), now_s);
+        driver.tick(sequencer.providers(), ms(now_s));
         sequencer.arm_payload(&driver.sealing.?);
-        for (0..16) |_| driver.tick(sequencer.providers(), now_s);
+        for (0..16) |_| driver.tick(sequencer.providers(), ms(now_s));
         envelope.* = try task_queue.copy_envelope(arena, driver.queue.take_sealed().?);
         // The next build reads its parent's block and system config from the chain.
         const head = driver.sync_state().unsafe_head;
@@ -843,26 +968,26 @@ test "driver: follow mode inserts source blocks and promotes labels without deri
     try follower.init(.{ .follow = true });
     defer follower.deinit();
     const driver = &follower.driver;
-    for (0..32) |_| driver.tick(follower.providers(), Scenario.genesis_time + 1);
+    for (0..32) |_| driver.tick(follower.providers(), ms(Scenario.genesis_time + 1));
     try testing.expectEqual(Phase.running, driver.phase);
     // Past the sequencing window a verifier would derive and build; a follower does not.
     try testing.expect(driver.consolidating == null);
     try testing.expectEqual(@as(u32, 0), follower.mock.build_calls);
     try testing.expect(driver.insert_unsafe(&sealed[0]));
-    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 2);
+    for (0..8) |_| driver.tick(follower.providers(), ms(Scenario.genesis_time + 2));
     const first = driver.sync_state().unsafe_head;
     try testing.expectEqual(@as(u64, 1), first.block_info.number);
     try testing.expect(driver.insert_unsafe(&sealed[1]));
-    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    for (0..8) |_| driver.tick(follower.providers(), ms(Scenario.genesis_time + 4));
     const second = driver.sync_state().unsafe_head;
     try testing.expectEqual(@as(u64, 2), second.block_info.number);
     // Finalized ahead of safe is held back until safe catches up.
     try testing.expect(driver.promote_labels(first, second));
-    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    for (0..8) |_| driver.tick(follower.providers(), ms(Scenario.genesis_time + 4));
     try testing.expectEqual(@as(u64, 1), driver.sync_state().safe_head.block_info.number);
     try testing.expectEqual(@as(u64, 0), driver.sync_state().finalized_head.block_info.number);
     try testing.expect(driver.promote_labels(second, first));
-    for (0..8) |_| driver.tick(follower.providers(), Scenario.genesis_time + 4);
+    for (0..8) |_| driver.tick(follower.providers(), ms(Scenario.genesis_time + 4));
     const state = driver.sync_state();
     try testing.expect(state.safe_head.block_info.hash.eql(second.block_info.hash));
     try testing.expect(state.local_safe_head.block_info.hash.eql(second.block_info.hash));
@@ -885,14 +1010,14 @@ test "driver: out-of-order gossip waits in the unsafe buffer for its parent" {
     defer verifier.deinit();
     verifier.chain.unavailable_from = 3;
     const driver = &verifier.driver;
-    for (0..8) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| driver.tick(verifier.providers(), ms(Scenario.genesis_time + 1));
     try testing.expectEqual(Phase.running, driver.phase);
     try testing.expect(driver.insert_unsafe(&sealed[1]));
     try testing.expectEqual(@as(u64, 1), driver.stats.unsafe_buffered);
-    for (0..4) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 4);
+    for (0..4) |_| driver.tick(verifier.providers(), ms(Scenario.genesis_time + 4));
     try testing.expectEqual(@as(u64, 0), driver.sync_state().unsafe_head.block_info.number);
     try testing.expect(driver.insert_unsafe(&sealed[0]));
-    for (0..16) |_| driver.tick(verifier.providers(), Scenario.genesis_time + 4);
+    for (0..16) |_| driver.tick(verifier.providers(), ms(Scenario.genesis_time + 4));
     const head = driver.sync_state().unsafe_head;
     try testing.expect(head.block_info.hash.eql(sealed[1].payload.block_hash));
     try testing.expectEqual(@as(u32, 0), driver.unsafe_buffer.count);
@@ -907,16 +1032,16 @@ test "driver: admin sequencer stop and start" {
     defer scenario.deinit();
     scenario.chain.unavailable_from = 3;
     const driver = &scenario.driver;
-    for (0..8) |_| driver.tick(scenario.providers(), Scenario.genesis_time + 1);
+    for (0..8) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time + 1));
     const head = try driver.stop_sequencer();
     try testing.expect(head.eql(scenario.rollup.genesis.l2.hash));
     try testing.expect((try driver.stop_sequencer()).eql(head)); // Idempotent.
-    driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    driver.tick(scenario.providers(), ms(Scenario.genesis_time + 2));
     try testing.expect(!driver.building);
     try testing.expectError(error.UnsafeHeadMismatch, driver.start_sequencer(.zero));
     try driver.start_sequencer(head);
     try driver.start_sequencer(.zero); // Already active: no effect, no head check.
-    driver.tick(scenario.providers(), Scenario.genesis_time + 2);
+    driver.tick(scenario.providers(), ms(Scenario.genesis_time + 2));
     try testing.expect(driver.building);
     var verifier: Scenario = undefined;
     try verifier.init(.{});
@@ -929,10 +1054,10 @@ test "driver: engine reset severity restarts discovery" {
     try scenario.init(.{});
     defer scenario.deinit();
     const driver = &scenario.driver;
-    for (0..16) |_| driver.tick(scenario.providers(), Scenario.genesis_time);
+    for (0..16) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time));
     driver.request_reset();
     try testing.expectEqual(Phase.starting, driver.phase);
-    for (0..16) |_| driver.tick(scenario.providers(), Scenario.genesis_time);
+    for (0..16) |_| driver.tick(scenario.providers(), ms(Scenario.genesis_time));
     try testing.expectEqual(Phase.running, driver.phase);
     try testing.expectEqual(@as(u64, 1), driver.stats.resets);
 }
@@ -952,7 +1077,7 @@ fn run_fuzz(bytes: []const u8) !void {
         if (byte & 0x80 != 0) scenario.chain.unavailable_from = byte % 8;
         if (byte & 0x40 != 0) scenario.chain.unavailable_from = std.math.maxInt(u64);
         if (scenario.driver.sealing) |*sealing| scenario.arm_payload(sealing);
-        scenario.driver.tick(scenario.providers(), now_s);
+        scenario.driver.tick(scenario.providers(), ms(now_s));
     }
     try testing.expectEqual(@as(u64, 0), scenario.driver.stats.critical_errors);
     try testing.expect(scenario.driver.sync_state().is_ordered());

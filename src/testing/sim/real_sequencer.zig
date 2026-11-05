@@ -154,8 +154,8 @@ pub const RealSequencer = struct {
             .l1_finalized = if (view.l1_reachable) l1.info(confirmed) else null,
         };
         const capacity = sequencer.engine.blocks.len - 1;
-        const now_s_max = codec.rollup.l2_block_timestamp(capacity);
-        sequencer.driver.tick(providers, @min(view.now_ns / std.time.ns_per_s, now_s_max));
+        const now_ms_max = codec.rollup.l2_block_timestamp_ms(capacity);
+        sequencer.driver.tick(providers, @min(view.now_ns / std.time.ns_per_ms, now_ms_max));
     }
 
     pub fn safe_number(sequencer: *const RealSequencer) u64 {
