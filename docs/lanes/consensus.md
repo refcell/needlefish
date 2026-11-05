@@ -18,7 +18,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
 - [ ] `derive`: (split below) pipeline stages (L1 traversal, retrieval calldata/blobs, frame queue, channel bank/assembler, channel reader with zlib+brotli decompression (own implementations or std.compress), batch stream/queue, attributes queue), resets, Holocene semantics. Fuzz all decoders.
   - [x] blob codec, error kinds, provider contracts, L1 traversal
   - [x] data sources (calldata, blobs), L1 retrieval, frame queue (Holocene pruning)
-  - [ ] channel bank / assembler / reader
+  - [x] channel bank / assembler / provider (Holocene switch)
+  - [ ] channel reader (decode owned batches)
   - [ ] batch stream, batch queue, batch validator
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
   - [ ] attributes queue, pipeline core (step, reset, signals)
@@ -59,7 +60,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   when an activation block is built. `PayloadAttributes` reuses the execution lane's
   `Withdrawal` and converts to its engine type with `engine()`.
 
+- Decoded batches own an arena (`OwnedBatch`) holding a copy of their bytes, so they outlive
+  the channel's decompressed buffer.
+
 ## Log
+- 2026-11-05: derive: channel bank (Granite ready selection, size prune), assembler, provider.
 - 2026-11-05: derive: calldata/blob data source, L1 retrieval, frame queue + Holocene prune.
 - 2026-11-05: stateful attributes builder (Denim BaseTime/gas scaling), upgrade txs.
 - 2026-11-05: derive: blob codec, error kinds, provider contracts, L1 traversal.
