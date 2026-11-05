@@ -23,7 +23,7 @@ provably robust.
   nonce gaps (see notes); today they are drawn only where txmgr can survive them.
 - [x] Fix `fuzz.zig` seeded Smith: narrow ints/bools/ranges/eos nearly always return the
   minimum (8 random bytes per value, out-of-range falls back to min); re-check targets.
-- [ ] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
+- [x] Trim `fuzz_targets_p2p` disc-service target (2.7 s Debug; budget is ~1 s per test).
 - [ ] Sim: byzantine batcher modes beyond corruption (out-of-order and duplicate channels,
   oversize frames) once the channel bank exists.
 - [ ] Audit every lane for missing fuzz targets and add them (rlp, tx decode, json, http, frames, batches, trie, evm).
@@ -122,3 +122,4 @@ provably robust.
 - 2026-11-05: L1 tx-loss faults (mempool evictions, reorgs that lose orphaned txs) in the
   swarm; 3000 seeds green. Found: a fresh txmgr adopts `pending` nonces and cannot
   recover an evicted one (noted for the batcher lane).
+- 2026-11-05: disc-service fuzz target trimmed to 32 seeded iterations (was 2.7 s).

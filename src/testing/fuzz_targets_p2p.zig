@@ -839,7 +839,8 @@ fn fuzz_service(fixture: *const ServiceFixture, smith: *Smith) anyerror!void {
 
 test "fuzz_targets_p2p: disc service keeps bounded tables under fuzzed traffic" {
     const fixture = try ServiceFixture.init();
-    try fuzz.run(&fixture, fuzz_service, .{ .iterations = 96, .input_size_max = 8192 });
+    // 32 seeded iterations keep this under ~1 s in Debug; coverage runs go deeper.
+    try fuzz.run(&fixture, fuzz_service, .{ .iterations = 32, .input_size_max = 8192 });
 }
 
 // ------------------------------------------------------------------ libp2p framing
