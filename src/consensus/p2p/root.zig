@@ -7,6 +7,7 @@ pub const gossip = @import("gossip/root.zig");
 pub const peers = @import("peers/root.zig");
 pub const disc = @import("disc/root.zig");
 pub const libp2p = @import("libp2p/root.zig");
+pub const bench = @import("bench.zig");
 
 test {
     std.testing.refAllDecls(@This());

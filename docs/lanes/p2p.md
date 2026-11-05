@@ -49,7 +49,10 @@ behind a small interface and switch later.
 - [ ] `Service`: one state machine tying disc + libp2p + gossip; publish signed unsafe
   blocks (sequencer), deliver validated blocks to consensus; DST of a 5-node cluster
   gossiping blocks with partitions/latency.
-- [ ] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths.
+- [x] Benchmarks: handshake/sec, gossip msgs/sec, allocation-free hot paths
+  (`src/consensus/p2p/bench.zig`, numbers in docs/PERF.md).
+- [ ] Perf: noise transport at 338 MB/s seal+open is std ChaCha20-Poly1305; profile and
+  consider a vectorized ChaCha20 if transport throughput matters at block sizes.
 
 ## Decisions
 - Lives under `src/consensus/p2p/` (matches base/base `crates/consensus/*`), owned by this
@@ -139,3 +142,4 @@ behind a small interface and switch later.
 - 2026-11-05: router follow-ups: score retention, outbound quota, IWANT resend limit.
 - 2026-11-05: `libp2p` multistream-select, noise XX, yamux (worker, 736304d..eb8d70c).
 - 2026-11-05: `libp2p` identify, ping, connection limits.
+- 2026-11-05: p2p benchmarks (handshake, transport, snappy, rpc, seen, router).

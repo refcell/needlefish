@@ -33,6 +33,18 @@ How to add a case: put a `cases` table next to the hot code (fields `name`, `ite
 | trie/ordered root 200x200B | 70 763 | tx/receipt root shape |
 | trie/state block 1k accounts | 2 013 084 | StateTrie, 100k accounts |
 
+## 2026-11-05 p2p (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+| Case | ns/op | MB/s | Notes |
+| --- | ---: | ---: | --- |
+| p2p/noise XX handshake | 757 468 | | ~1 300 handshakes/s per core; secp256k1 sign+verify dominate |
+| p2p/noise transport seal+open 64 KiB | 193 878 | 338 | std ChaCha20-Poly1305 |
+| p2p/snappy compress 128 KiB | 77 974 | 1 681 | semi-compressible payload |
+| p2p/snappy decompress 128 KiB | 20 618 | 6 357 | |
+| p2p/gossip rpc decode 128 KiB publish | 21 | | zero-copy: cost is independent of payload size |
+| p2p/gossip seen insert | 5.7 | | open addressing, 8192 ids |
+| p2p/gossip publish+drain to 8 peers | 64 539 | 2 031 | id hash + 8 framed RPCs (copy per peer) |
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
