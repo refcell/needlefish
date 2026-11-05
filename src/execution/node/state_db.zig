@@ -5,6 +5,10 @@
 //!
 //! Persistence arrives with the trie-db storage engine; until then the node keeps state
 //! in memory (enough for the devnet).
+//!
+//! Every commit also records an undo journal (previous account and slot values) in a
+//! bounded ring, so the last blocks can be rolled back: a block whose roots do not
+//! match, or a reorg to a recent ancestor.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -24,11 +28,19 @@ pub const Config = struct {
     },
     code_bytes_max: u32 = 64 << 20,
     codes_max: u32 = 1 << 14,
+    undo_entries_max: u32 = 1 << 18,
 };
 
-pub const Error = state_trie.Error || error{CodeStoreFull};
+pub const Error = state_trie.Error || error{ CodeStoreFull, UndoUnavailable };
 
 const CodeRef = struct { offset: u32, len: u32 };
+
+const Undo = union(enum) {
+    /// First entry of every committed block.
+    block,
+    account: struct { key: Hash, previous: ?state_trie.Account },
+    slot: struct { key: Hash, slot_hash: Hash, previous: u256 },
+};
 const block_hash_window = 256;
 
 pub const StateDb = struct {
@@ -39,6 +51,14 @@ pub const StateDb = struct {
     code_len: u32 = 0,
     block_hashes: [block_hash_window]Hash = undefined,
     block_numbers: [block_hash_window]?u64 = @splat(null),
+    undo: []Undo,
+    /// Monotonic ring positions: entries `[undo_tail, undo_head)` are live.
+    undo_head: u64 = 0,
+    undo_tail: u64 = 0,
+    /// Committed blocks whose undo entries are complete and still in the ring.
+    undo_blocks: u32 = 0,
+    /// The block being committed lost undo entries (ring overflow or a storage wipe).
+    undo_lost: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateDb {
         assert(config.codes_max > 0);
@@ -49,7 +69,11 @@ pub const StateDb = struct {
         try codes.ensureTotalCapacity(allocator, config.codes_max);
         errdefer codes.deinit(allocator);
         const code_bytes = try allocator.alloc(u8, config.code_bytes_max);
+        errdefer allocator.free(code_bytes);
+        assert(config.undo_entries_max > 1);
+        const undo = try allocator.alloc(Undo, config.undo_entries_max);
         return .{
+            .undo = undo,
             .trie = trie,
             .codes = codes,
             .codes_max = config.codes_max,
@@ -58,6 +82,7 @@ pub const StateDb = struct {
     }
 
     pub fn deinit(db: *StateDb, allocator: std.mem.Allocator) void {
+        allocator.free(db.undo);
         allocator.free(db.code_bytes);
         db.codes.deinit(allocator);
         db.trie.deinit(allocator);
@@ -162,10 +187,12 @@ pub const StateDb = struct {
 
     /// Applies every change cached in `state` during a block, then empties the cache.
     pub fn commit(db: *StateDb, state: *evm.State) Error!void {
+        db.undo_begin_block();
         var accounts = state.accounts.valueIterator();
         while (accounts.next()) |account| {
             if (!account.dirty) continue;
             const key = keccak256(&account.address);
+            db.undo_push(.{ .account = .{ .key = key, .previous = db.trie.get_account(key) } });
             if (!account.in_database) {
                 try db.trie.delete_account(key);
                 continue;
@@ -180,12 +207,79 @@ pub const StateDb = struct {
                 .balance = account.info.balance,
                 .code_hash = account.info.code_hash,
             });
-            if (account.storage_cleared) try db.trie.wipe_storage(key);
+            if (account.storage_cleared) {
+                const had_storage = !std.mem.eql(u8, &db.trie.storage_root(key), &empty_root);
+                if (had_storage) db.undo_lost = true;
+                try db.trie.wipe_storage(key);
+            }
         }
         try db.commit_slots(state);
+        db.undo_end_block();
         state.accounts.clearRetainingCapacity();
         state.slots.clearRetainingCapacity();
         state.code_store_len = 0;
+    }
+
+    fn undo_begin_block(db: *StateDb) void {
+        db.undo_lost = false;
+        db.undo_push(.block);
+    }
+
+    fn undo_end_block(db: *StateDb) void {
+        if (db.undo_lost) {
+            // A block without full undo cannot be reverted, nor can anything before it.
+            db.undo_tail = db.undo_head;
+            db.undo_blocks = 0;
+        } else {
+            db.undo_blocks += 1;
+        }
+        assert(db.undo_head - db.undo_tail <= db.undo.len);
+    }
+
+    fn undo_push(db: *StateDb, entry: Undo) void {
+        if (db.undo_lost) return;
+        if (db.undo_head - db.undo_tail == db.undo.len) db.undo_evict_oldest();
+        if (db.undo_lost) return;
+        db.undo[db.undo_head % db.undo.len] = entry;
+        db.undo_head += 1;
+    }
+
+    /// Drops the oldest committed block's entries; marks loss if only the current is left.
+    fn undo_evict_oldest(db: *StateDb) void {
+        if (db.undo_blocks == 0) {
+            db.undo_lost = true;
+            return;
+        }
+        assert(db.undo[db.undo_tail % db.undo.len] == .block);
+        db.undo_tail += 1;
+        while (db.undo[db.undo_tail % db.undo.len] != .block) db.undo_tail += 1;
+        db.undo_blocks -= 1;
+        assert(db.undo_tail < db.undo_head);
+    }
+
+    /// How many of the most recent commits `rollback` can revert.
+    pub fn undo_depth(db: *const StateDb) u32 {
+        return db.undo_blocks;
+    }
+
+    /// Reverts the most recent committed block.
+    pub fn rollback(db: *StateDb) Error!void {
+        if (db.undo_blocks == 0) return error.UndoUnavailable;
+        assert(db.undo_head > db.undo_tail);
+        while (true) {
+            db.undo_head -= 1;
+            switch (db.undo[db.undo_head % db.undo.len]) {
+                .block => break,
+                .slot => |slot| try db.trie.set_storage(slot.key, slot.slot_hash, slot.previous),
+                .account => |account| if (account.previous) |previous| {
+                    try db.trie.set_account(account.key, previous);
+                } else {
+                    try db.trie.delete_account(account.key);
+                },
+            }
+            assert(db.undo_head > db.undo_tail);
+        }
+        db.undo_blocks -= 1;
     }
 
     fn commit_slots(db: *StateDb, state: *evm.State) Error!void {
@@ -197,10 +291,15 @@ pub const StateDb = struct {
             // Writes from before a storage wipe belong to a dead incarnation.
             if (kv.value_ptr.epoch != account.storage_epoch) continue;
             const key = keccak256(&kv.key_ptr.address);
-            try db.trie.set_storage(key, slot_key(kv.key_ptr.slot), kv.value_ptr.present);
+            const slot_hash = slot_key(kv.key_ptr.slot);
+            const previous = db.trie.get_storage(key, slot_hash);
+            db.undo_push(.{ .slot = .{ .key = key, .slot_hash = slot_hash, .previous = previous } });
+            try db.trie.set_storage(key, slot_hash, kv.value_ptr.present);
         }
     }
 };
+
+const empty_root = @import("../trie/node.zig").empty_root;
 
 fn slot_key(slot: u256) Hash {
     var bytes: [32]u8 = undefined;
@@ -284,4 +383,60 @@ test "state_db: block hash ring" {
     db.set_block_hash(300, h);
     try testing.expectEqualSlices(u8, &h, &(try db.database().block_hash(300)));
     try testing.expectEqualSlices(u8, &@as(Hash, @splat(0)), &(try db.database().block_hash(44)));
+}
+
+/// Applies random balance/nonce/storage changes as one block through the evm State.
+fn random_block(prng: *Prng, db: *StateDb, state: *evm.State) !void {
+    state.begin_transaction();
+    const changes = prng.range(1, 6);
+    for (0..changes) |_| {
+        const account = try state.load(test_address(@intCast(prng.below(8))));
+        try state.set_balance(account, prng.below(1000) + 1);
+        try state.set_nonce(account, prng.below(5));
+        try state.touch(account);
+        if (prng.chance(1, 2)) {
+            const access = try state.storage_access(account, prng.below(4));
+            try state.storage_write(account, access.slot, prng.below(3));
+        }
+    }
+    state.finalize_transaction(.prague);
+    try db.commit(state);
+}
+
+fn rollback_scenario(prng: *Prng) !void {
+    var config = small_config();
+    config.undo_entries_max = 64;
+    var db = try StateDb.init(testing.allocator, config);
+    defer db.deinit(testing.allocator);
+    var state = try evm.State.init(testing.allocator, db.database(), small_limits);
+    defer state.deinit(testing.allocator);
+    var roots: [16]Hash = undefined;
+    roots[0] = try db.root();
+    const blocks = prng.range(1, 15);
+    for (1..blocks + 1) |index| {
+        try random_block(prng, &db, &state);
+        roots[index] = try db.root();
+    }
+    var index = blocks;
+    while (db.undo_depth() > 0) : (index -= 1) {
+        try db.rollback();
+        try testing.expectEqualSlices(u8, &roots[index - 1], &(try db.root()));
+    }
+    try testing.expectError(error.UndoUnavailable, db.rollback());
+}
+
+const Prng = @import("../../testing/prng.zig").Prng;
+
+test "state_db: rollback restores previous roots" {
+    var prng = Prng.init(0x5d);
+    for (0..32) |_| try rollback_scenario(&prng);
+}
+
+fn fuzz_rollback(_: void, smith: *testing.Smith) anyerror!void {
+    var prng = Prng.init(smith.value(u64));
+    try rollback_scenario(&prng);
+}
+
+test "state_db: fuzz rollback" {
+    try testing.fuzz({}, fuzz_rollback, .{});
 }
