@@ -56,7 +56,9 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] L2Provider `l2_block_by_number` (full safe blocks via `l2_block_full`) so span
     batches overlapping the safe chain decide instead of waiting
   - [x] devnet smoke green (sequencer produces blocks, verifier safe head follows)
-  - [ ] optimism_outputAtBlock via eth_getProof of the L2ToL1MessagePasser
+  - [x] optimism_outputAtBlock from Isthmus headers (`withdrawalsRoot` = message passer
+    storage root)
+  - [ ] optimism_outputAtBlock before Isthmus via eth_getProof of the L2ToL1MessagePasser
 
 ## Decisions
 - Devnet: the dev L1 JSON-RPC server allowed only 4 connections; each consensus node holds
@@ -163,6 +165,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: optimism_outputAtBlock output roots from Isthmus L2 headers.
 - 2026-11-05: sources: L2 provider full safe blocks (arena slots, TTL) for span checks.
 - 2026-11-05: devnet smoke green; driver/L1 failure logging; L1 server connection limit.
 - 2026-11-05: service: node runs the driver over real providers (`base consensus`).

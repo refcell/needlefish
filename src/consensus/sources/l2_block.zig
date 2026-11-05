@@ -12,6 +12,7 @@ const header_json = @import("header_json.zig");
 const protocol = @import("../protocol/root.zig");
 
 const L2BlockInfo = protocol.block.L2BlockInfo;
+const B256 = @import("../../common/primitives/root.zig").B256;
 const RollupConfig = protocol.rollup_config.RollupConfig;
 const SystemConfig = protocol.system_config.SystemConfig;
 const l2_system_config = @import("../protocol/l2_system_config.zig");
@@ -32,6 +33,10 @@ pub const Error = header_json.DecodeError || error{
 pub const L2Block = struct {
     info: L2BlockInfo,
     system_config: SystemConfig,
+    state_root: B256 = .zero,
+    /// From Isthmus on: the L2ToL1MessagePasser storage root (the output root's
+    /// `messagePasserStorageRoot`).
+    withdrawals_root: ?B256 = null,
 };
 
 /// Decodes `L2BlockInfo` plus the block's system config (base/base `to_system_config`).
@@ -48,7 +53,12 @@ pub fn decode_with_system_config(raw: []const u8, rollup: *const RollupConfig) E
     if (try l2_system_config.genesis_system_config(rollup, fields)) |config| {
         const info = try decode(raw, &rollup.genesis);
         assert(info.sequence_number == 0);
-        return .{ .info = info, .system_config = config };
+        return .{
+            .info = info,
+            .system_config = config,
+            .state_root = decoded.header.state_root,
+            .withdrawals_root = decoded.header.withdrawals_root,
+        };
     }
     var input_buffer: [protocol.l1_info.calldata_length_max]u8 = undefined;
     const input = try first_deposit_input(raw, &input_buffer);
@@ -60,7 +70,12 @@ pub fn decode_with_system_config(raw: []const u8, rollup: *const RollupConfig) E
         .sequence_number = l1_block.sequence_number,
     };
     assert(info.block_info.hash.eql(decoded.hash));
-    return .{ .info = info, .system_config = config };
+    return .{
+        .info = info,
+        .system_config = config,
+        .state_root = decoded.header.state_root,
+        .withdrawals_root = decoded.header.withdrawals_root,
+    };
 }
 
 fn first_deposit_input(

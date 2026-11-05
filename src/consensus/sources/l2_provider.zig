@@ -201,17 +201,27 @@ pub fn L2Provider(comptime IO: type) type {
         // L2 chain-provider contract.
 
         pub fn l2_block_info_by_number(provider: *Self, number: u64) ProviderError!L2BlockInfo {
-            const info = try provider.keyed(.{ .number = number });
-            assert(info.block_info.number == number);
-            return info;
+            const block = try provider.keyed(.{ .number = number });
+            assert(block.info.block_info.number == number);
+            return block.info;
         }
 
         /// The labeled head (`latest`, `safe`, `finalized`) as the execution engine sees it.
         pub fn l2_block_info_by_label(provider: *Self, label: Label) ProviderError!L2BlockInfo {
-            return provider.keyed(.{ .label = label });
+            const block = try provider.keyed(.{ .label = label });
+            return block.info;
         }
 
-        fn keyed(provider: *Self, key: Request) ProviderError!L2BlockInfo {
+        /// The cached block summary (info, system config, state and withdrawals roots) by
+        /// number or label, for output roots.
+        pub fn l2_block_ref(provider: *Self, key: Request) ProviderError!l2_block.L2Block {
+            assert(key == .number or key == .label);
+            const block = try provider.keyed(key);
+            assert(key != .number or block.info.block_info.number == key.number);
+            return block;
+        }
+
+        fn keyed(provider: *Self, key: Request) ProviderError!l2_block.L2Block {
             assert(key.expires());
             const now_ns = provider.io.now_monotonic_ns();
             for (provider.numbers) |*entry| {
@@ -225,7 +235,7 @@ pub fn L2Provider(comptime IO: type) type {
                     continue;
                 };
                 entry.used = provider.touch();
-                return block.block.info;
+                return block.block;
             }
             return provider.miss(key);
         }

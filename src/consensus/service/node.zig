@@ -19,6 +19,7 @@ const protocol = @import("../protocol/root.zig");
 const rollup_rpc = @import("../rpc/rollup.zig");
 const safedb = @import("../safedb/root.zig");
 const l2_provider = @import("../sources/l2_provider.zig");
+const l2_block = @import("../sources/l2_block.zig");
 const l1_watcher = @import("l1_watcher.zig");
 const driver_module = @import("driver.zig");
 const l1_provider = @import("../sources/l1_provider.zig");
@@ -122,6 +123,26 @@ pub fn BlobView(comptime IO: type) type {
             return provider.blobs(block, hashes);
         }
     };
+}
+
+/// The version-0 output root of `block`; pre-Isthmus blocks carry no storage root.
+pub fn output_of(
+    rollup: *const RollupConfig,
+    block: *const l2_block.L2Block,
+) error{NotAvailable}!rollup_rpc.OutputAtBlock {
+    const timestamp = block.info.block_info.timestamp;
+    if (!rollup.is_active(.isthmus, timestamp)) return error.NotAvailable;
+    const storage_root = block.withdrawals_root orelse return error.NotAvailable;
+    const result: rollup_rpc.OutputAtBlock = .{
+        .block_ref = block.info,
+        .output = .{
+            .state_root = block.state_root,
+            .bridge_storage_root = storage_root,
+            .block_hash = block.info.block_info.hash,
+        },
+    };
+    assert(result.output.block_hash.eql(block.info.block_info.hash));
+    return result;
 }
 
 pub fn Node(comptime IO: type) type {
@@ -429,13 +450,26 @@ pub fn Node(comptime IO: type) type {
             return from_context(context).sync_status();
         }
 
+        /// Output roots from the engine's block headers: from Isthmus on the header's
+        /// `withdrawalsRoot` is the message passer storage root. Earlier blocks need
+        /// `eth_getProof` of the message passer and are reported as not available.
         fn backend_output_at_block(
             context: *anyopaque,
             tag: rollup_rpc.BlockTag,
         ) error{ NotAvailable, NotFound }!rollup_rpc.OutputAtBlock {
-            _ = from_context(context);
-            _ = tag;
-            return error.NotAvailable; // Needs `eth_getProof` of the message passer.
+            const node = from_context(context);
+            const key: l2_provider.Request = switch (tag) {
+                .number => |number| .{ .number = number },
+                .earliest => .{ .number = node.rollup.genesis.l2.number },
+                .latest, .pending => .{ .label = .latest },
+                .safe => .{ .label = .safe },
+                .finalized => .{ .label = .finalized },
+            };
+            const block = node.l2.l2_block_ref(key) catch |err| return switch (err) {
+                error.NotFound => error.NotFound,
+                else => error.NotAvailable,
+            };
+            return output_of(node.rollup, &block);
         }
 
         fn backend_safe_db(context: *anyopaque) ?*const safedb.SafeDB {
@@ -498,5 +532,46 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     try testing.expect(std.mem.indexOf(u8, out.buffered(), "\"unsafe_l2\":{\"hash\"") != null);
     while (node.busy()) {
         harness.world.run_for_ns(std.time.ns_per_s / 10);
+    }
+}
+
+test "node: output roots from Isthmus headers" {
+    var rollup: RollupConfig = .{ .block_time = 2 };
+    rollup.upgrades.set(.isthmus, 100);
+    var block: l2_block.L2Block = .{
+        .info = .{ .block_info = .{ .number = 9, .timestamp = 100, .hash = .init(@splat(9)) } },
+        .system_config = .{},
+        .state_root = .init(@splat(1)),
+        .withdrawals_root = .init(@splat(2)),
+    };
+    const output = try output_of(&rollup, &block);
+    try testing.expect(output.output.bridge_storage_root.eql(.init(@splat(2))));
+    try testing.expect(output.output.state_root.eql(.init(@splat(1))));
+    try testing.expectEqual(@as(u64, 9), output.block_ref.block_info.number);
+    block.info.block_info.timestamp = 98;
+    try testing.expectError(error.NotAvailable, output_of(&rollup, &block));
+    block.info.block_info.timestamp = 100;
+    block.withdrawals_root = null;
+    try testing.expectError(error.NotAvailable, output_of(&rollup, &block));
+}
+
+test "node: output roots seeded fuzz, available iff Isthmus and a storage root" {
+    var prng = @import("../../testing/prng.zig").Prng.init(0x0a7);
+    for (0..256) |_| {
+        var rollup: RollupConfig = .{ .block_time = 2 };
+        const isthmus_time = prng.below(1000);
+        rollup.upgrades.set(.isthmus, isthmus_time);
+        const timestamp = prng.below(1000);
+        const has_root = prng.chance(1, 2);
+        const block: l2_block.L2Block = .{
+            .info = .{ .block_info = .{ .number = timestamp, .timestamp = timestamp } },
+            .system_config = .{},
+            .withdrawals_root = if (has_root) .init(@splat(3)) else null,
+        };
+        const available = timestamp >= isthmus_time and has_root;
+        if (output_of(&rollup, &block)) |output| {
+            try testing.expect(available);
+            try testing.expect(output.output.bridge_storage_root.eql(.init(@splat(3))));
+        } else |_| try testing.expect(!available);
     }
 }
