@@ -655,7 +655,9 @@ pub const Evm = struct {
     fn analyze_frame_code(evm: *Evm, code: []const u8, hash: ?B256) Error!bytecode.Analyzed {
         const code_hash = hash orelse return evm.arena.analyze_code(code);
         if (evm.code_cache.get(&code_hash)) |analyzed| {
-            assert(std.mem.eql(u8, analyzed.original(), code));
+            assert(analyzed.len == code.len);
+            // A full compare costs a pass over the code; keep it to safe builds.
+            if (std.debug.runtime_safety) assert(std.mem.eql(u8, analyzed.original(), code));
             return analyzed;
         }
         return evm.code_cache.put(&code_hash, code) orelse evm.arena.analyze_code(code);

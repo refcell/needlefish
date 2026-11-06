@@ -194,6 +194,18 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   cores; published AArch64 work (Becker-Kannwischer 2022) gains from SHA3/NEON mainly
   with multi-state batching, which the crypto lane already offers. Not rewriting keccak-f;
   the lever is batching witness hashes through the crypto batch path (db lane).
+- [x] Replay profile at ~860 Mgas/s (active samples, idle threads excluded): keccak ~27%
+  (witness/trie), `interpreter.run` self ~18%, secp256k1 ~11% (sender recovery in the
+  executor; the ecrecover precompile ~2%), `push_frame` ~5.6%, division ~4%; `slot_for`
+  under `run` is ~11% inclusive but nearly all cold database reads (db lane). In
+  `push_frame`, the cached-code equality assert still ran in ReleaseFast (~1.8%, as
+  `mem.eqlBytes`): now only under `runtime_safety`: replay 859 -> ~870 Mgas/s.
+- [x] Coverage vs base/base (`crates/common/evm`): Everest's NonceManager stub, Canyon,
+  EIP-8130 committed phases, and B-20 stablecoin all have counterparts; `beryl_metrics`
+  is telemetry. No gap found.
+- [ ] Performance: attribute `interpreter.run` self time (~18% of replay) per opcode
+  (an opt-in per-opcode cycle counter in the bench build, since `sample` addresses are
+  not stable across the bench's processes) and specialize the hottest handlers.
 - [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
   account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
   account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a
