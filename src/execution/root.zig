@@ -13,6 +13,7 @@ pub const node = @import("node/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const evm = @import("evm/root.zig");
 pub const import = @import("import/root.zig");
+pub const p2p = @import("p2p/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
