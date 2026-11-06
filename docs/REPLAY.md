@@ -93,9 +93,13 @@ standard archive-node calls (all public, keyless):
 | `eth_getBlockByNumber(n, true)` | `base.drpc.org` | header and transactions |
 | `eth_getBlockReceipts(n)` | `base.drpc.org` | canonical receipts |
 | `debug_traceBlockByNumber(n, prestateTracer)` | `base.drpc.org` | touched accounts, slots, code |
-| same, `diffMode` | `base.drpc.org` | which accounts and slots each block changed |
 | `eth_getProof(account, slots, n - 1)` | `base-mainnet.public.blastapi.io` | pre-state trie nodes |
 | `eth_getProof(account, slots, n)` | `base-mainnet.public.blastapi.io` | post-state values and nodes |
+
+The keys a block changed are those whose verified pre and post proof values differ: the
+prestate trace already lists every touched key, so no `diffMode` trace is fetched (it would
+double the trace download, and it reports per-transaction changes, including slots a block
+wrote and then restored).
 
 `base replay fetch [--count n] [--from block]` makes these calls (headers and proofs in
 paced batches of 16, retries with backoff on rate limits), saves each result under
@@ -117,7 +121,6 @@ Raw directory layout (each file is the exact JSON-RPC `result`):
 <raw dir>/<n>/block.json               eth_getBlockByNumber(n, true)
 <raw dir>/<n>/receipts.json            eth_getBlockReceipts(n)
 <raw dir>/<n>/prestate.json            prestateTracer
-<raw dir>/<n>/prestate_diff.json       prestateTracer, diffMode
 <raw dir>/<n>/proofs_pre.json          eth_getProof at n - 1, every touched key
 <raw dir>/<n>/proofs_post.json         eth_getProof at n, same keys
 <raw dir>/<n>/proofs_extra.json        optional: eth_getProof at n - 1, extra keys

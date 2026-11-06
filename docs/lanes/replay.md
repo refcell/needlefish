@@ -81,6 +81,7 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 - [x] Collect missing keys of every failing block per round (probe mode replays past
   failed blocks).
 - [x] Pinned 100-block window check: `just replay-check` (53775088..53775187).
+- [x] Fetch cost: drop the diffMode trace; changed keys come from pre/post proofs.
 - [ ] (blocked) Third pinned window from an older fork era (pre-Isthmus, e.g. block
   29000000): keyless endpoints cannot serve it. drpc's free plan mostly times out tracing
   old blocks (one success: a 91 MB prestate trace, the next block timed out); blastapi
@@ -119,6 +120,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-06: no more diffMode trace: changed keys = touched keys whose verified pre and
+  post proof values differ. Halves trace downloads (a fresh 10-block fetch: 73 s, 10/10).
+  The cached 100-block window re-imports 420 bytes smaller: 5 slots the per-transaction
+  diff listed were restored by block end; replay-check stays 100/100.
 
 - 2026-11-06: decision: no older-era window for now (see backlog); fork coverage beyond the
   current era stays with the EVM/state test vectors.

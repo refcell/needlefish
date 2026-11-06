@@ -305,12 +305,6 @@ fn fetch_block(f: *Fetcher, number: u64) !void {
             .method = "debug_traceBlockByNumber",
             .params = "[{s},{{\"tracer\":\"prestateTracer\"}}]",
         },
-        .{
-            .file = "prestate_diff.json",
-            .method = "debug_traceBlockByNumber",
-            .params = "[{s},{{\"tracer\":\"prestateTracer\"," ++
-                "\"tracerConfig\":{{\"diffMode\":true}}}}]",
-        },
     };
     inline for (steps) |step| {
         const path = try std.fmt.allocPrint(f.alloc(), "{s}/{s}", .{ name, step.file });
@@ -351,7 +345,7 @@ const Keys = struct {
 /// Every account and slot the block's traces show (pre-state and changes).
 fn touched_keys(f: *Fetcher, name: []const u8, keys: *Keys) !void {
     const arena = f.alloc();
-    const files = [_][]const u8{ "prestate.json", "prestate_diff.json" };
+    const files = [_][]const u8{"prestate.json"};
     for (files) |file| {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ name, file });
         const traces = try json.parseFromSliceLeaky(json.Value, arena, try f.read(path), .{});

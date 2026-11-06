@@ -140,7 +140,6 @@ pub fn import_blocks(init: std.process.Init, dir: Io.Dir, archive: *Archive, win
             .block = try read(init, block_dir, arena, "block.json"),
             .receipts = try read(init, block_dir, arena, "receipts.json"),
             .prestate = try read(init, block_dir, arena, "prestate.json"),
-            .prestate_diff = try read(init, block_dir, arena, "prestate_diff.json"),
             .proofs_pre = try read(init, block_dir, arena, "proofs_pre.json"),
             .proofs_post = try read(init, block_dir, arena, "proofs_post.json"),
             .proofs_extra = try read_optional(init, block_dir, arena, "proofs_extra.json"),

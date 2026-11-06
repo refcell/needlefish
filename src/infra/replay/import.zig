@@ -6,7 +6,6 @@
 //!     <n>/block.json            eth_getBlockByNumber(n, true)
 //!     <n>/receipts.json         eth_getBlockReceipts(n)
 //!     <n>/prestate.json         debug_traceBlockByNumber(n, prestateTracer)
-//!     <n>/prestate_diff.json    debug_traceBlockByNumber(n, prestateTracer diffMode)
 //!     <n>/proofs_pre.json       [eth_getProof(account, slots, n - 1)] per touched account
 //!     <n>/proofs_post.json      [eth_getProof(account, slots, n)] same keys
 //!
@@ -27,6 +26,7 @@ const object = @import("../../consensus/sources/json_object.zig");
 const db = @import("../../execution/db/root.zig");
 const trie = @import("../../execution/trie/root.zig");
 const archive_module = @import("archive.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 
 const Archive = archive_module.Archive;
 const Hash = [32]u8;
@@ -87,7 +87,6 @@ pub const BlockFiles = struct {
     block: []const u8,
     receipts: []const u8,
     prestate: []const u8,
-    prestate_diff: []const u8,
     proofs_pre: []const u8,
     proofs_post: []const u8,
     /// Optional `eth_getProof` results at the parent for keys no trace shows (the pre-block
@@ -161,7 +160,7 @@ pub fn add_block(
     const posts = try parse(arena, files.proofs_post);
     try check_proofs(arena, posts, post_root);
     try derive_siblings(allocator, arena, archive, seen, posts);
-    try add_changes(arena, archive, files.prestate_diff, posts);
+    try add_changes(arena, archive, try parse(arena, files.proofs_pre), posts);
     return post_root;
 }
 
@@ -439,38 +438,41 @@ fn check_slot_leaf(leaf: ?[]const u8, value: u256) Error!void {
     if (decoded != value) return error.Inconsistent;
 }
 
-/// The canonical post-state of every account and slot the block changed: the keys come from
-/// the diff trace, the values from the verified post proofs.
-fn add_changes(
-    arena: std.mem.Allocator,
-    archive: *Archive,
-    raw_diff: []const u8,
-    posts: Value,
-) Error!void {
+/// The canonical post-state of every account and slot the block changed. The prestate trace
+/// lists every key the block touched and both proof lists cover exactly those keys, so a key
+/// changed when its verified pre and post values differ (what a diff-mode trace reports,
+/// without fetching one). The values come from the post proofs.
+fn add_changes(arena: std.mem.Allocator, archive: *Archive, pres: Value, posts: Value) Error!void {
     var changed: std.AutoArrayHashMapUnmanaged(Address, std.AutoArrayHashMapUnmanaged(u256, void)) =
         .empty;
-    const traces = try parse(arena, raw_diff);
-    if (traces != .array) return error.Malformed;
-    for (traces.array.items) |trace| {
-        const result = try field(trace, "result");
-        for ([_][]const u8{ "pre", "post" }) |side| {
-            if (result != .object) return error.Malformed;
-            const accounts = result.object.get(side) orelse continue;
-            if (accounts != .object) return error.Malformed;
-            for (accounts.object.keys(), accounts.object.values()) |key, account| {
-                const address = try hex_fixed(20, key);
-                const slots = try changed.getOrPut(arena, address);
-                if (!slots.found_existing) slots.value_ptr.* = .empty;
-                if (account != .object) return error.Malformed;
-                const storage = account.object.get("storage") orelse continue;
-                if (storage != .object) return error.Malformed;
-                for (storage.object.keys()) |slot_key| {
-                    try slots.value_ptr.put(arena, try hex_quantity_key(slot_key), {});
-                }
-            }
+    if (pres != .array or posts != .array) return error.Malformed;
+    if (pres.array.items.len != posts.array.items.len) return error.Inconsistent;
+    for (posts.array.items) |post| {
+        const address = try fixed(20, try field(post, "address"));
+        const pre = try find_proof(pres, address);
+        var slots: std.AutoArrayHashMapUnmanaged(u256, void) = .empty;
+        const storage = try field(post, "storageProof");
+        if (storage != .array) return error.Malformed;
+        for (storage.array.items) |entry| {
+            const key = std.mem.readInt(u256, &try fixed(32, try field(entry, "key")), .big);
+            const value = try quantity(u256, try field(entry, "value"));
+            if (value != try find_slot(pre, key)) try slots.put(arena, key, {});
         }
+        const account_changed = !same_account(try proven_account(pre), try proven_account(post));
+        assert(slots.count() == 0 or account_changed); // A changed slot changes storageHash.
+        if (!account_changed) continue;
+        try changed.put(arena, address, slots);
     }
+    assert(changed.count() <= posts.array.items.len);
     try emit_changes(archive, &changed, posts);
+}
+
+fn same_account(a: Proven, b: Proven) bool {
+    if (a.exists != b.exists) return false;
+    if (!a.exists) return true;
+    return a.info.nonce == b.info.nonce and a.info.balance == b.info.balance and
+        std.mem.eql(u8, &a.info.code_hash, &b.info.code_hash) and
+        std.mem.eql(u8, &a.storage_root, &b.storage_root);
 }
 
 fn emit_changes(
@@ -601,4 +603,130 @@ fn data(arena: std.mem.Allocator, value: Value) Error![]u8 {
     const out = try arena.alloc(u8, (text.len - 2) / 2);
     _ = std.fmt.hexToBytes(out, text[2..]) catch return error.Malformed;
     return out;
+}
+
+const ChangeAccount = struct {
+    nonce: u64,
+    balance: u64,
+    storage_byte: u8,
+    slots: [4]u8,
+};
+
+/// One `eth_getProof` result per account (no proof nodes: `add_changes` reads values only).
+fn proofs_json(arena: std.mem.Allocator, accounts: []const ChangeAccount) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll("[");
+    for (accounts, 0..) |account, index| {
+        try out.writer.print("{s}{{\"address\":\"0x{x:0>40}\",\"nonce\":\"0x{x}\"," ++
+            "\"balance\":\"0x{x}\",\"codeHash\":\"0x{x:0>64}\",\"storageHash\":\"0x{x}\"," ++
+            "\"accountProof\":[],\"storageProof\":[", .{
+            if (index == 0) "" else ",",
+            index + 1,
+            account.nonce,
+            account.balance,
+            @as(u256, 0x11),
+            @as([32]u8, @splat(account.storage_byte)),
+        });
+        for (account.slots, 0..) |value, slot| {
+            try out.writer.print("{s}{{\"key\":\"0x{x:0>64}\",\"value\":\"0x{x}\"," ++
+                "\"proof\":[]}}", .{ if (slot == 0) "" else ",", slot, value });
+        }
+        try out.writer.writeAll("]}");
+    }
+    try out.writer.writeAll("]");
+    return out.written();
+}
+
+const changes_test_config: Archive.Config = .{
+    .witness = .{
+        .state_nodes_max = 4,
+        .state_bytes_max = 256,
+        .codes_max = 1,
+        .code_bytes_max = 64,
+        .keys_max = 1,
+        .headers_max = 1,
+        .header_bytes_max = 64,
+    },
+    .transactions_max = 1,
+    .transaction_bytes_max = 64,
+    .accounts_max = 64,
+    .slots_max = 256,
+};
+
+/// Runs `add_changes` and checks its output against the accounts and slots that differ.
+fn check_changes(pre: []const ChangeAccount, post: []const ChangeAccount) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var archive = try Archive.init(std.testing.allocator, changes_test_config);
+    defer archive.deinit(std.testing.allocator);
+    try archive.begin_block();
+    const pres = try parse(arena, try proofs_json(arena, pre));
+    const posts = try parse(arena, try proofs_json(arena, post));
+    try add_changes(arena, &archive, pres, posts);
+    var account_index: usize = 0;
+    var slot_index: usize = 0;
+    const accounts = archive.block_accounts(0);
+    const slots = archive.block_slots(0);
+    for (pre, post, 0..) |a, b, index| {
+        if (a.nonce == b.nonce and a.balance == b.balance and a.storage_byte == b.storage_byte) {
+            continue;
+        }
+        const address = accounts[account_index].address;
+        try std.testing.expectEqual(@as(u8, @intCast(index + 1)), address[19]);
+        try std.testing.expectEqual(b.nonce, accounts[account_index].info.?.nonce);
+        account_index += 1;
+        for (a.slots, b.slots, 0..) |x, y, slot| {
+            if (x == y) continue;
+            try std.testing.expectEqual(@as(u256, slot), slots[slot_index].slot);
+            try std.testing.expectEqual(@as(u256, y), slots[slot_index].value);
+            slot_index += 1;
+        }
+    }
+    try std.testing.expectEqual(account_index, accounts.len);
+    try std.testing.expectEqual(slot_index, slots.len);
+}
+
+test "add_changes keeps exactly the accounts and slots whose proven values differ" {
+    const pre = [_]ChangeAccount{
+        .{ .nonce = 1, .balance = 5, .storage_byte = 0x21, .slots = .{ 1, 2, 3, 4 } },
+        .{ .nonce = 1, .balance = 5, .storage_byte = 0x21, .slots = .{ 1, 2, 3, 4 } },
+        .{ .nonce = 1, .balance = 5, .storage_byte = 0x21, .slots = .{ 1, 2, 3, 4 } },
+    };
+    const post = [_]ChangeAccount{
+        // Unchanged (a slot written and restored within the block also lands here).
+        .{ .nonce = 1, .balance = 5, .storage_byte = 0x21, .slots = .{ 1, 2, 3, 4 } },
+        // Balance only.
+        .{ .nonce = 1, .balance = 6, .storage_byte = 0x21, .slots = .{ 1, 2, 3, 4 } },
+        // One slot (and so the storage root).
+        .{ .nonce = 1, .balance = 5, .storage_byte = 0x22, .slots = .{ 1, 9, 3, 4 } },
+    };
+    try check_changes(&pre, &post);
+}
+
+test "add_changes: seeded fuzz against a reference diff" {
+    var prng = Prng.init(0x7265_706c_6179);
+    for (0..256) |_| {
+        var pre: [6]ChangeAccount = undefined;
+        var post: [6]ChangeAccount = undefined;
+        const count: usize = @intCast(prng.range(1, 6));
+        for (pre[0..count], post[0..count]) |*a, *b| {
+            a.* = .{
+                .nonce = prng.below(3),
+                .balance = prng.below(3),
+                .storage_byte = 0x20,
+                .slots = undefined,
+            };
+            for (&a.slots) |*slot| slot.* = @intCast(prng.below(3));
+            b.* = a.*;
+            if (prng.chance(1, 3)) b.nonce += 1;
+            if (prng.chance(1, 3)) b.balance = prng.below(3);
+            for (&b.slots) |*slot| {
+                if (prng.chance(1, 4)) slot.* = @intCast(prng.below(3));
+            }
+            // A changed slot changes the storage root.
+            if (!std.mem.eql(u8, &a.slots, &b.slots)) b.storage_byte = 0x21;
+        }
+        try check_changes(pre[0..count], post[0..count]);
+    }
 }
