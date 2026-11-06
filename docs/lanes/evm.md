@@ -120,10 +120,13 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   caller and the target account when it is also the code account: call loop 23.5 ->
   ~18.6-22.2 us (noisy, load ~25). A fold+fmix64 hash context for `State.accounts`
   measured no gain and was dropped (twice now; the map itself is not the cost).
-- [ ] Performance: memmove in the storage loop (~13% of samples): find the copy (Slot/Account
-  by value, state reset) and remove it.
-- [ ] Fuzz: differential fuzz of memory/copy opcodes (MLOAD/MSTORE/MSTORE8/MCOPY/
-  CALLDATACOPY/CODECOPY/RETURNDATACOPY) against a byte-array reference model.
+- [x] Performance: memmove in the storage loop: gone with `StorageKeyContext` (it was the
+  auto context copying keys). What remains is `slot_for` + key compare at ~26 ns per access,
+  about one cache miss into the 2^18-entry slot table that static allocation pre-sizes; not
+  worth a locality hash that would favor sequential slots over real keccak layouts.
+- [x] Fuzz: differential fuzz of memory/copy opcodes (`memory_fuzz.zig`: MSTORE/MSTORE8/
+  MLOAD/MCOPY/CALLDATACOPY/CALLDATALOAD/CODECOPY against a byte-array model, final bytes and
+  MSIZE). RETURNDATACOPY needs a callee and is covered by the state tests.
 - [x] Performance: the interpreter runs on the frame in place instead of a local copy:
   call loop 27.0 -> 23.6 us, snailtracer 21.6 -> 21.0 ms, arithmetic unchanged (same-load
   A/B). Call-loop profile before: interpreter 35%, account-map lookup ~25%, frame
