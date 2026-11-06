@@ -595,6 +595,7 @@ pub fn Service(comptime IO: type) type {
                 .scratch = try lazy.alloc(allocator, u8, limits.rpc_scratch_bytes),
             };
             errdefer lazy.free(allocator, service.api.scratch);
+            service.api.storage_range = .of_chain(&service.chain);
             const sync_timeout_ms = limits.send_raw_tx_sync_timeout_ms;
             assert(sync_timeout_ms > 0);
             assert(sync_timeout_ms * std.time.ns_per_ms < limits.http.io_timeout_ns or

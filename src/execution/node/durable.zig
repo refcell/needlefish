@@ -223,6 +223,7 @@ pub fn Durable(comptime Storage: type) type {
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
                 .proofs = if (self.database.history != null) proofs else null,
+                .storage_range = if (self.database.history != null) storage_range else null,
                 .history_window = if (self.database.history != null) history_window else null,
             };
         }
@@ -276,6 +277,26 @@ pub fn Durable(comptime Storage: type) type {
                 return error.HistoryUnavailable;
             if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
             return database.proofs_at(number, address, slots, account_proof, set);
+        }
+
+        /// `debug_storageRangeAt` from the database (head trie or history window); the
+        /// canonical index decides as for `proof`.
+        fn storage_range(
+            context: *anyopaque,
+            hash: Hash,
+            number: u64,
+            address_hash: Hash,
+            start_key: Hash,
+            max: u32,
+            out: []db_module.history.StorageEntry,
+        ) db_module.database.ProofError!db_module.history.StorageRange {
+            const self = from(context);
+            assert(self.phase == .ready);
+            const database = &self.database;
+            const canonical = database.chain.canonical_hash(number) orelse
+                return error.HistoryUnavailable;
+            if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+            return database.storage_range_at(number, address_hash, start_key, max, out);
         }
 
         /// From the history window when it holds the block's parent (state untouched), else

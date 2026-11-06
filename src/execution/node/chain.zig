@@ -197,6 +197,17 @@ pub const Journal = struct {
         account_proof: *StateTrie.AccountProof,
         set: *db_history.ProofSet,
     ) db_database.ProofError!?db_history.AccountState = null,
+    /// `debug_storageRangeAt` at canonical block `hash` (`Database.storage_range_at`); null
+    /// when the journal keeps no history.
+    storage_range: ?*const fn (
+        context: *anyopaque,
+        hash: Hash,
+        number: u64,
+        address_hash: Hash,
+        start: Hash,
+        max: u32,
+        out: []db_history.StorageEntry,
+    ) db_database.ProofError!db_history.StorageRange = null,
     /// The journal's history window (oldest and newest block); null when it keeps none.
     history_window: ?*const fn (context: *anyopaque) ?HistoryWindow = null,
 };
@@ -852,6 +863,37 @@ pub const Chain = struct {
             return error.HistoryUnavailable; // The window holds another branch there.
         }
         return store.get_proofs(number, address, slots, account_proof, set);
+    }
+
+    /// `debug_storageRangeAt` on the state after block `hash` (number `number`): the
+    /// account's slots in hashed-key order from `start` (inclusive), at most
+    /// `min(max, out.len)` into `out`, and the next key. The head reads the live trie; older
+    /// canonical blocks come from the history window (as `proofs_at`).
+    pub fn storage_range_at(
+        chain: *Chain,
+        hash: Hash,
+        number: u64,
+        address_hash: Hash,
+        start: Hash,
+        max: u32,
+        out: []db_history.StorageEntry,
+    ) db_database.ProofError!db_history.StorageRange {
+        if (chain.journal) |journal| {
+            const range = journal.storage_range orelse return error.HistoryUnavailable;
+            return range(journal.context, hash, number, address_hash, start, max, out);
+        }
+        if (std.mem.eql(u8, &hash, &chain.state_hash)) {
+            return chain.db.trie().storage_range(address_hash, start, max, out);
+        }
+        const store = chain.history orelse return error.HistoryUnavailable;
+        const canonical = chain.store.canonical_hash(number) orelse
+            return error.HistoryUnavailable;
+        if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+        const header_at = chain.header(hash) orelse return error.HistoryUnavailable;
+        if (!chain.history_has(number, header_at.state_root.bytes)) {
+            return error.HistoryUnavailable; // The window holds another branch there.
+        }
+        return store.storage_range(number, &address_hash, &start, max, out);
     }
 
     /// The block number `number` is served from the window when the window holds that

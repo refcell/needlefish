@@ -1815,6 +1815,7 @@ test "eth: fuzz debug_traceBlock input" {
 }
 
 const StorageRangeFake = struct {
+    hash: [32]u8 = @splat(0),
     number: u64 = 0,
     address_hash: [32]u8 = @splat(0),
     start: [32]u8 = @splat(0),
@@ -1822,6 +1823,7 @@ const StorageRangeFake = struct {
 
     fn range(
         context: *anyopaque,
+        hash: [32]u8,
         number: u64,
         address_hash: [32]u8,
         start: [32]u8,
@@ -1829,9 +1831,15 @@ const StorageRangeFake = struct {
         out: []rpc_storage_range.Leaf,
     ) anyerror!rpc_storage_range.Range {
         const fake: *StorageRangeFake = @ptrCast(@alignCast(context));
-        fake.* = .{ .number = number, .address_hash = address_hash, .start = start, .max = max };
+        fake.* = .{
+            .hash = hash,
+            .number = number,
+            .address_hash = address_hash,
+            .start = start,
+            .max = max,
+        };
         const leaves = [_]rpc_storage_range.Leaf{
-            .{ .key_hash = @splat(0x11), .key = @splat(0x01), .value = 5 },
+            .{ .key_hash = @splat(0x11), .value = 5 },
             .{ .key_hash = @splat(0x22), .value = 0x100 },
         };
         const count = @min(out.len, leaves.len);
@@ -1879,8 +1887,8 @@ test "eth: debug_storageRangeAt reads block-boundary states through the source" 
     try testing.expectEqual(@as(u16, 0xabcd), std.mem.readInt(u16, fake.start[30..32], .big));
     const address = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
     try testing.expectEqualSlices(u8, &primitives.keccak256(&address).bytes, &fake.address_hash);
-    try expect_contains(text, "\"0x" ++ hex_11 ++ "\":{\"key\":\"0x" ++ hex_01 ++
-        "\",\"value\":\"0x" ++ zeros_62 ++ "05\"}");
+    try expect_contains(text, "\"0x" ++ hex_11 ++ "\":{\"key\":null" ++
+        ",\"value\":\"0x" ++ zeros_62 ++ "05\"}");
     try expect_contains(text, "\"0x" ++ hex_22 ++ "\":{\"key\":null");
     try expect_contains(text, "\"nextKey\":\"0x" ++ hex_33 ++ "\"");
     // Past the last transaction: the block's own state; the range ends.
@@ -1928,4 +1936,34 @@ fn fuzz_start_key(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: fuzz debug_storageRangeAt start keys" {
     try testing.fuzz({}, fuzz_start_key, .{});
+}
+
+test "eth: debug_storageRangeAt reads the head trie and the history window" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    h.api.storage_range = .of_chain(h.api.chain);
+    var block_buffer: [4096]u8 = undefined;
+    _ = try traced_block(h, &block_buffer); // Block 2 calls the counter: slot 0 becomes 1.
+    const record_hash = h.api.chain.state_hash;
+    const before = try storage_range_request(h, .{ .bytes = record_hash }, 0, "", 8);
+    try expect_contains(before, "{\"storage\":{},\"nextKey\":null}");
+    const after = try storage_range_request(h, .{ .bytes = record_hash }, 1, "", 8);
+    const slot_hash = primitives.keccak256(&@as([32]u8, @splat(0))).bytes;
+    var expected: [256]u8 = undefined;
+    try expect_contains(after, try std.fmt.bufPrint(
+        &expected,
+        "{{\"storage\":{{\"0x{x}\":{{\"key\":null,\"value\":\"0x{s}01\"}}}},\"nextKey\":null}}",
+        .{ &slot_hash, zeros_62 },
+    ));
+    // Past the only slot: an empty range.
+    var start: [64]u8 = undefined;
+    var past = slot_hash;
+    past[31] +%= 1;
+    const tail = try std.fmt.bufPrint(&start, "{x}", .{&past});
+    const empty = try storage_range_request(h, .{ .bytes = record_hash }, 1, tail, 8);
+    try expect_contains(empty, "\"storage\":{}");
 }

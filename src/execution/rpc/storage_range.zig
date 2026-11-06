@@ -12,6 +12,8 @@ const primitives = @import("../../common/primitives/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const eth = @import("eth.zig");
+const db = @import("../db/root.zig");
+const node = @import("../node/root.zig");
 
 const Api = eth.Api;
 const Call = rpc.Call;
@@ -20,31 +22,50 @@ const HandlerError = rpc.HandlerError;
 /// Most leaves returned by one call.
 pub const results_max: u32 = 1024;
 
-pub const Leaf = struct {
-    key_hash: [32]u8,
-    /// The slot key, when its preimage is known.
-    key: ?[32]u8 = null,
-    value: u256,
-};
-
-pub const Range = struct {
-    count: u32,
-    /// Hashed key of the first leaf after the returned ones; null at the end.
-    next: ?[32]u8,
-};
+/// A slot by hashed key; preimages are not kept, so `key` is reported null (as geth
+/// without preimages).
+pub const Leaf = db.history.StorageEntry;
+/// `count` leaves copied, and the hashed key after them (null at the end).
+pub const Range = db.history.StorageRange;
 
 /// Storage leaves of the state after block `number` (head or within the history window).
 pub const Source = struct {
     context: *anyopaque,
     range: *const fn (
         context: *anyopaque,
+        hash: [32]u8,
         number: u64,
         address_hash: [32]u8,
         start: [32]u8,
         max: u32,
         out: []Leaf,
     ) anyerror!Range,
+
+    /// The node's chain: head from the live trie, older blocks from the history window.
+    pub fn of_chain(chain: *node.chain.Chain) Source {
+        return .{ .context = chain, .range = chain_range };
+    }
 };
+
+fn chain_range(
+    context: *anyopaque,
+    hash: [32]u8,
+    number: u64,
+    address_hash: [32]u8,
+    start: [32]u8,
+    max: u32,
+    out: []Leaf,
+) anyerror!Range {
+    const chain: *node.chain.Chain = @ptrCast(@alignCast(context));
+    const range = chain.storage_range_at(hash, number, address_hash, start, max, out) catch |err|
+        switch (err) {
+            // An absent account has no storage (geth answers an empty range).
+            error.UnknownAccount => return .{ .count = 0, .next = null },
+            else => return err,
+        };
+    assert(range.count <= @min(max, out.len));
+    return range;
+}
 
 pub const methods = [_]rpc.Method(*Api){
     .{ .name = "debug_storageRangeAt", .handler = storage_range_at },
@@ -78,17 +99,29 @@ fn storage_range_at(api: *Api, call: *Call) HandlerError!void {
     const count = transactions_in(&record.transactions);
     const number = record.header.number;
     var state_number = number;
+    var state_hash = block_hash;
     if (transaction_index == 0 and count > 0) {
         if (number == 0) return call.fail(rpc.code.invalid_params, "genesis has no parent");
         state_number = number - 1;
+        state_hash = record.header.parent_hash.bytes;
     } else if (transaction_index < count) {
         return call.fail(rpc.code.invalid_params, "state between transactions is unsupported");
     }
     const out = leaves_in(api.scratch, @min(max_result, results_max));
     const address_hash = primitives.keccak256(&address).bytes;
-    const range = source.range(source.context, state_number, address_hash, start, @intCast(
-        out.len,
-    ), out) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+    api.chain.ensure_head_state() catch {
+        return call.fail(rpc.code.internal_error, "head state unavailable");
+    };
+    const max: u32 = @intCast(out.len);
+    const range = source.range(
+        source.context,
+        state_hash,
+        state_number,
+        address_hash,
+        start,
+        max,
+        out,
+    ) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
     if (range.count > out.len) return call.fail(rpc.code.internal_error, "range overflow");
     try write_range(call.writer, out[0..range.count], range.next);
 }
@@ -132,7 +165,7 @@ pub fn write_range(writer: *json.Writer, leaves: []const Leaf, next: ?[32]u8) Ha
         try writer.key(&name);
         try writer.begin_object();
         try writer.key("key");
-        if (leaf.key) |key| try writer.data(&key) else try writer.null_value();
+        try writer.null_value();
         try writer.key("value");
         var value: [32]u8 = undefined;
         std.mem.writeInt(u256, &value, leaf.value, .big);

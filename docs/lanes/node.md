@@ -67,7 +67,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   eth_getHeaderByNumber, eth_getHeaderByHash.
 - [x] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer).
 - [x] rpc: debug_storageRangeAt handler behind `Api.storage_range` (rpc/storage_range.zig).
-- [ ] wire `Api.storage_range` to trie-db's `Database.storage_range_at` once it lands.
+- [x] wire `Api.storage_range` to trie-db's storage ranges (`Chain.storage_range_at`).
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -106,6 +106,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: debug_storageRangeAt wired: `Chain.storage_range_at(hash, number, ...)` reads the head from the live trie, older canonical blocks from the history window (same canonical/branch checks as `proofs_at`), and durable datadirs through a new `Journal.storage_range` hook (`Database.storage_range_at`). The service sets `Api.storage_range = .of_chain`. Absent account -> empty range (geth). Leaves are the db's `StorageEntry` (preimage always null). The durable hook is a thin pass-through without its own test.
 - 2026-11-06: debug_storageRangeAt: handler + `storage_range.Source` interface (number, address hash, start, max, out -> {count, next}), matching trie-db's announced `Database.storage_range_at`. Block-boundary states only: txIndex 0 = parent state, txIndex >= tx count = the block's state, in between rejected (would need re-execution). keyStart left-padded (geth BytesToHash); maxResult as JSON int or hex, capped at 1024. Null source -> "storage ranges are unavailable".
 - 2026-11-06: debug_storageRangeAt deferred: the trie/db expose no ordered (hashed-key) storage-leaf iterator, and those files are trie-db's; asked trie-db for `storage_range(account_hash, start_hash, max) -> leaves + next`.
 - 2026-11-06: debug_traceBlock(rlp, options): decodes the block into the first quarter of the RPC scratch, requires its parent in the store and history window, and shares `trace_block` (header + transaction decoder + reserved scratch prefix) with debug_traceBlockBy*; output is byte-identical to the stored-block trace for both tracers.
