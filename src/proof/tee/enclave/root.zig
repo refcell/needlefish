@@ -16,8 +16,14 @@ pub const protocol = @import("protocol.zig");
 pub const transport = @import("transport.zig");
 pub const nsm = @import("nsm.zig");
 pub const oracle = @import("oracle.zig");
+pub const server = @import("server.zig");
+pub const handler = @import("handler.zig");
+pub const client = @import("client.zig");
 
 pub const Signer = crypto.Signer;
+pub const Server = server.Server;
+pub const Handler = handler.Handler;
+pub const Client = client.Client;
 pub const Nsm = nsm.Nsm;
 
 /// The enclave's vsock port (base/base `VSOCK_PORT`).
@@ -25,4 +31,5 @@ pub const vsock_port: u32 = 8000;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("link_test.zig");
 }
