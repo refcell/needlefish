@@ -53,11 +53,11 @@ allocation after startup.
 - [x] `infra/sidecrush`: block-production health sidecar (port `sidecrush`): poll the EL
   head, flag stalls and slow blocks against the 200 ms cadence, metrics + health endpoints,
   `base sidecrush`. SimIo tests for stall, recovery, and RPC failure.
-- [ ] `infra/load_test` key stream + chain prep: derive N sender keys from a seed, fund them
+- [x] `infra/load_test` key stream + chain prep: derive N sender keys from a seed, fund them
   in batches from a funder account through the tx manager, deploy workload contracts
   (ERC-20, storage, looper) from hand-assembled bytecode (port `workload/{key_stream,
   chain_prep,accounts}.rs`). Lets the devnet load test exceed 10 dev accounts.
-- [ ] `infra/load_test` payloads: `storage`, `precompile`, `looper` (gas-heavy), and a real
+- [x] `infra/load_test` payloads: `storage`, `precompile`, `looper` (gas-heavy), and a real
   ERC-20 transfer against the deployed token (port `payloads/*`); `--json` report.
 - [x] `infra/roxy` rate limits: per-client token buckets (bounded table, idlest evicted),
   client IPs through `utilities/trusted_proxy`, 429 + JSON-RPC -32016 like proxyd.
@@ -181,6 +181,28 @@ allocation after startup.
   with reason `flashblock event types are not supported`.
 - audit bounds `event_id` to 256 bytes and only indexes bundle ids/hashes up to 256 bytes;
   base/base leaves them unbounded. The retired write RPCs answer -32601.
+- load-test key stream: key i of seed s is keccak256("needlefish/load-test/key-stream/v1" || s ||
+  i || attempt) as a secp256k1 scalar (reject zero/>= n, next attempt). Random access, unlike
+  base/base's seeded `StdRng` stream; `--senders N` uses `--seed` for both keys and payloads.
+- load-test contracts are hand-assembled (a tiny comptime assembler with labels) instead of
+  base/base's solc artifacts: a minimal ERC-20 (transfer/balanceOf, open `mint` faucet, balance
+  at slot = address, `Transfer` logs), a storage writer (`[first_slot, count, value]`, no
+  selector), and a looper (`[iterations]`, 40 gas each). Deployed with CREATE from the funder
+  (base/base uses CREATE2 via a deployer); addresses come from `create_address(funder,
+  completion.nonce)` and are checked with `eth_getCode` against the expected runtime.
+- load-test prep: deploy (only when the mix needs contracts) -> verify code -> fund
+  (`--fund-wei`, key-stream senders only) and mint to each sender, one funder driver with a
+  sliding window of 16 unconfirmed txs. Senders are funded every run (no balance check, unlike
+  base/base). Any failed or reverted prep tx, or a 300 s timeout, fails the run without load.
+- load-test payloads: `precompile` calls ecrecover (a real signature by a seed-derived key),
+  sha256, identity, and modexp directly from the EOA (base/base can route through a looper
+  contract); `storage` writes fresh slots from a random 64-bit start. Gas limits are the
+  EIP-7623 calldata floor plus the exact execution cost (asserted against needlefish's EVM);
+  modexp uses a fixed 10000 bound. `erc20_transfer` now requires the deployed token (the
+  fixed-address placeholder is gone). `--json` prints one JSON line on stdout.
+- tx_manager `Candidate.to` and `txdata.Request.to` are optional: null sends a contract
+  creation (estimateGas omits `to`; blob candidates must have a recipient).
+- load-test senders_max is 64 (each sender owns a driver: about 140 KB of buffers).
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -224,3 +246,9 @@ allocation after startup.
 - 2026-11-05: `base audit` archiver: Vector NDJSON ingest (idempotent by event_id), the five
   `base_getTransactionEvents*`/`getRejected*` queries, metrics/health, segment durability;
   live: duplicate batch answered `duplicate`, restart replayed events, torn tail truncated.
+- 2026-11-05: load-test key stream, chain prep (deploy + verify + fund + mint through the tx
+  manager), hand-assembled ERC-20/storage/looper contracts executed in the EVM in tests,
+  `storage`/`precompile`/`looper`/real `erc20_transfer` payloads, `--senders`, `--json`;
+  tx_manager contract creation. Devnet: smoke passes (step 5 now deploys and runs the contract
+  mix, 99/99, 0 reverted); `--senders 50` at 100 tx/s for 20 s with all six payloads: 50
+  funded + 50 minted, 1996/1996 confirmed, 0 reverted, p50 399 ms, p99 669 ms.
