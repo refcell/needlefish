@@ -15,6 +15,7 @@ const primitives = @import("../../common/primitives/root.zig");
 pub const slab = @import("slab.zig");
 pub const validate = @import("validate.zig");
 pub const validity = @import("validity.zig");
+pub const validity_store = @import("validity_store.zig");
 pub const eip8130 = @import("eip8130.zig");
 
 pub const Address = primitives.Address;

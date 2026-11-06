@@ -50,7 +50,22 @@ pub const Sink = struct {
         transaction: *const txpool.Tx,
         predicates: []const validity.Predicate,
     ) anyerror!void,
+
+    /// Pools transactions with their predicates (`txpool.validity_store.PoolSink`). Wire
+    /// it only where the builder enforces `Store.admits`.
+    pub fn of_pool_sink(sink: *txpool.validity_store.PoolSink) Sink {
+        return .{ .context = sink, .submit = pool_sink_submit };
+    }
 };
+
+fn pool_sink_submit(
+    context: *anyopaque,
+    transaction: *const txpool.Tx,
+    predicates: []const validity.Predicate,
+) anyerror!void {
+    const sink: *txpool.validity_store.PoolSink = @ptrCast(@alignCast(context));
+    return sink.submit(transaction, predicates);
+}
 
 const Options = struct {
     predicates: [validity.predicates_max + 1]validity.Predicate = undefined,

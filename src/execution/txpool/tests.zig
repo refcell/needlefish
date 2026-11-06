@@ -280,3 +280,148 @@ fn fuzz_pool(_: void, smith: *testing.Smith) anyerror!void {
 test "txpool: fuzz" {
     try testing.fuzz({}, fuzz_pool, .{});
 }
+
+// ---- Validity store ----------------------------------------------------------------
+
+const validity_store = txpool.validity_store;
+const ValidityPredicate = txpool.validity.Predicate;
+
+fn rich_account(_: *anyopaque, _: [20]u8) txpool.Account {
+    return rich;
+}
+
+/// A reader whose every balance is `balance.*`.
+fn reader_balance(context: *anyopaque, _: [20]u8) anyerror!u256 {
+    const balance: *const u256 = @ptrCast(@alignCast(context));
+    return balance.*;
+}
+
+fn reader_zero_nonce(_: *anyopaque, _: [20]u8) anyerror!u64 {
+    return 0;
+}
+
+fn reader_zero_storage(_: *anyopaque, _: [20]u8, _: u256) anyerror!u256 {
+    return 0;
+}
+
+fn balance_reader(balance: *const u256) txpool.validity.Reader {
+    return .{
+        .context = @constCast(balance),
+        .balance = reader_balance,
+        .nonce = reader_zero_nonce,
+        .storage = reader_zero_storage,
+    };
+}
+
+/// `block_number <= expiry` and `balance(1) >= minimum`.
+fn validity_predicates(expiry: u64, minimum: u256) [2]ValidityPredicate {
+    return .{
+        .{ .kind = .block_number, .operator = .less_than_or_equal, .value = expiry },
+        .{
+            .kind = .balance,
+            .operator = .greater_than_or_equal,
+            .value = minimum,
+            .address = address(1).bytes,
+        },
+    };
+}
+
+test "validity store: the pool sink pools with predicates; prune evicts expired ones" {
+    var pool = try Pool.init(testing.allocator, small_config(16));
+    defer pool.deinit(testing.allocator);
+    var store = try validity_store.Store.init(testing.allocator, 2, 128);
+    defer store.deinit(testing.allocator);
+    var context: u8 = 0;
+    var sink: validity_store.PoolSink = .{
+        .pool = &pool,
+        .store = &store,
+        .accounts = .{ .context = &context, .account = rich_account },
+    };
+    const first = make_tx(1, 0, 100, 2);
+    try sink.submit(&first, &validity_predicates(10, 50));
+    try testing.expect(pool.get(first.hash) != null);
+    try testing.expectEqual(@as(usize, 2), store.get(first.hash).?.len);
+    var balance: u256 = 50;
+    try testing.expect(try store.admits(first.hash, balance_reader(&balance), .{
+        .block_number = 10,
+    }));
+    balance = 49;
+    const context_10: txpool.validity.Context = .{ .block_number = 10 };
+    try testing.expect(!try store.admits(first.hash, balance_reader(&balance), context_10));
+    try testing.expect(try store.admits(B256.zero, balance_reader(&balance), context_10));
+    // A second, then a third: the store is full and the third is not left pooled.
+    const second = make_tx(2, 0, 100, 2);
+    try sink.submit(&second, &validity_predicates(20, 0));
+    const third = make_tx(3, 0, 100, 2);
+    try testing.expectError(error.StoreFull, sink.submit(&third, &validity_predicates(20, 0)));
+    try testing.expect(pool.get(third.hash) == null);
+    var eip8130 = make_tx(4, 0, 100, 2);
+    eip8130.tx_type = 0x79;
+    const refused = sink.submit(&eip8130, &validity_predicates(20, 0));
+    try testing.expectError(error.Eip8130Unsupported, refused);
+    // Block 11: the first expired (evicted from the pool); the second stays.
+    try testing.expectEqual(@as(u32, 1), store.prune(&pool, 11));
+    try testing.expect(pool.get(first.hash) == null and store.get(first.hash) == null);
+    try testing.expect(store.get(second.hash) != null);
+    // Mined elsewhere: the entry goes without an eviction.
+    try testing.expect(pool.remove(second.hash));
+    try testing.expectEqual(@as(u32, 0), store.prune(&pool, 12));
+    try testing.expectEqual(@as(u32, 0), store.count());
+    try verify(&pool);
+}
+
+fn validity_store_scenario(seed: u64) !void {
+    var prng = Prng.init(seed);
+    // A small arena forces compactions.
+    var store = try validity_store.Store.init(testing.allocator, 8, 64);
+    defer store.deinit(testing.allocator);
+    var hashes: [8]B256 = undefined;
+    var counts: [8]u32 = undefined;
+    var live: u32 = 0;
+    for (0..200) |step| {
+        if (live > 0 and prng.chance(1, 3)) {
+            const index = prng.below(live);
+            try testing.expect(store.remove(hashes[index]));
+            live -= 1;
+            hashes[index] = hashes[live];
+            counts[index] = counts[live];
+        } else {
+            var predicates: [64]ValidityPredicate = undefined;
+            const count: u32 = @intCast(prng.range(1, 24));
+            var hash = B256.zero;
+            std.mem.writeInt(u64, hash.bytes[0..8], step + 1, .big);
+            for (predicates[0..count], 0..) |*predicate, index| {
+                predicate.* = .{ .kind = .nonce, .operator = .equal, .value = step * 64 + index };
+            }
+            store.insert(hash, predicates[0..count]) catch |err| {
+                try testing.expectEqual(error.StoreFull, err);
+                continue;
+            };
+            hashes[live] = hash;
+            counts[live] = count;
+            live += 1;
+        }
+        try testing.expectEqual(live, store.count());
+        // Every live entry still reads back its own predicates after compactions.
+        for (hashes[0..live], counts[0..live]) |hash, count| {
+            const stored = store.get(hash).?;
+            try testing.expectEqual(@as(usize, count), stored.len);
+            const step_of = std.mem.readInt(u64, hash.bytes[0..8], .big) - 1;
+            for (stored, 0..) |predicate, index| {
+                try testing.expectEqual(@as(u256, step_of * 64 + index), predicate.value);
+            }
+        }
+    }
+}
+
+test "validity store: seeded fuzz of inserts, removes and compactions" {
+    for (0..8) |seed| try validity_store_scenario(seed);
+}
+
+fn fuzz_validity_store(_: void, smith: *testing.Smith) anyerror!void {
+    try validity_store_scenario(smith.value(u64));
+}
+
+test "validity store: fuzz" {
+    try testing.fuzz({}, fuzz_validity_store, .{});
+}

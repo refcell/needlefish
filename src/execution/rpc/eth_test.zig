@@ -2088,3 +2088,36 @@ const rpc_insert_validated = @import("insert_validated.zig");
 test "eth: fuzz base_insertValidatedTransaction entries" {
     try testing.fuzz({}, fuzz_validated_item, .{});
 }
+
+fn chain_account(context: *anyopaque, address: [20]u8) txpool.Account {
+    const h: *Harness = @ptrCast(@alignCast(context));
+    const account = h.node.db.get_account(address) orelse return .{ .nonce = 0, .balance = 0 };
+    return .{ .nonce = account.nonce, .balance = account.balance };
+}
+
+test "eth: base_sendRawTransactionValidity through the pool sink stores the predicates" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try txpool.validity_store.Store.init(testing.allocator, 4, 256);
+    defer store.deinit(testing.allocator);
+    var sink: txpool.validity_store.PoolSink = .{
+        .pool = h.api.pool.?,
+        .store = &store,
+        .accounts = .{ .context = h, .account = chain_account },
+    };
+    h.api.validity_sink = .of_pool_sink(&sink);
+    var buffer: [256]u8 = undefined;
+    const raw = try transfer_raw(&buffer, 0);
+    const predicates = "[{\"type\":\"block_number\",\"params\":" ++
+        "{\"op\":\"<=\",\"value\":\"0x10\"}}]";
+    try expect_contains(try validity_request(h, raw, predicates), "\"result\":\"0x");
+    const hash = primitives.keccak256(raw);
+    try testing.expect(h.api.pool.?.get(hash) != null);
+    try testing.expectEqual(@as(usize, 1), store.get(hash).?.len);
+    // The same transaction again: the pool refuses it and the store keeps one entry.
+    try expect_contains(try validity_request(h, raw, predicates), "AlreadyKnown");
+    try testing.expectEqual(@as(u32, 1), store.count());
+    // Past block 0x10 it is evicted from both.
+    try testing.expectEqual(@as(u32, 1), store.prune(h.api.pool.?, 0x11));
+    try testing.expect(h.api.pool.?.get(hash) == null);
+}
