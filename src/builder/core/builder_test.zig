@@ -136,6 +136,23 @@ fn expect_chain_equal(
     const header = follower.chain.header(hash.bytes).?;
     try testing.expectEqualSlices(u8, &header.state_root.bytes, &sealed.state_root.bytes);
     try testing.expectEqualSlices(u8, &root_before, &(try harness.node.db.root()));
+    try expect_senders(builder);
+}
+
+/// The builder's senders match the senders recovered from the sealed transactions
+/// (zero for deposits), so the sequencer's import may skip ecrecover.
+fn expect_senders(builder: *const BlockBuilder) !void {
+    const transactions = builder.block_transactions();
+    const senders = builder.block_senders();
+    try testing.expectEqual(transactions.len, senders.len);
+    for (transactions, senders) |raw, sender| {
+        const envelope = try consensus.tx.Envelope.decode(raw);
+        const expected = if (envelope == .deposit)
+            primitives.Address.zero
+        else
+            envelope.recover_sender(consensus.recover_address).?;
+        try testing.expectEqualSlices(u8, &expected.bytes, &sender.bytes);
+    }
 }
 
 test "builder: attribute transactions first, then the pool; equals a Chain build" {

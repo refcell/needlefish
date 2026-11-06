@@ -36,6 +36,7 @@ const Chain = chain_module.Chain;
 const Header = consensus.Header;
 const Hash = [32]u8;
 const Building = executor_module.Executor.Building;
+const consensus_deposit_type: u8 = @backingInt(consensus.tx.TxType.deposit);
 
 pub const Error = chain_module.Error || error{
     MissingParentBeaconBlockRoot,
@@ -100,6 +101,9 @@ pub const BlockBuilder = struct {
     config: Config,
     best: best_txs.BestTxs,
     transactions: [][]const u8,
+    /// The sender of each transaction in `transactions` (zero for deposits), handed to the
+    /// sequencer's import so it skips ecrecover. Valid while `senders_known`.
+    senders: []primitives.Address,
     bytes: []u8,
     select_buffer: []*const txpool.Tx,
     extra_data: [chainspec.basefee.jovian_extra_data_size]u8 = undefined,
@@ -114,6 +118,9 @@ pub const BlockBuilder = struct {
     /// Attribute transactions at the front of `transactions`.
     forced_count: u32 = 0,
     count: u32 = 0,
+    /// False when a forced transaction is not a deposit: its sender is not recovered here,
+    /// so the import recovers every sender itself.
+    senders_known: bool = true,
     bytes_len: u32 = 0,
     da_used_bytes: u64 = 0,
     fees: u256 = 0,
@@ -132,6 +139,8 @@ pub const BlockBuilder = struct {
         errdefer best.deinit(allocator);
         const transactions = try allocator.alloc([]const u8, config.transactions_max);
         errdefer allocator.free(transactions);
+        const senders = try allocator.alloc(primitives.Address, config.transactions_max);
+        errdefer allocator.free(senders);
         const bytes = try allocator.alloc(u8, config.transaction_bytes_max);
         errdefer allocator.free(bytes);
         const select_buffer = try allocator.alloc(*const txpool.Tx, config.select_max);
@@ -139,6 +148,7 @@ pub const BlockBuilder = struct {
             .config = config,
             .best = best,
             .transactions = transactions,
+            .senders = senders,
             .bytes = bytes,
             .select_buffer = select_buffer,
         };
@@ -147,6 +157,7 @@ pub const BlockBuilder = struct {
     pub fn deinit(builder: *BlockBuilder, allocator: std.mem.Allocator) void {
         allocator.free(builder.select_buffer);
         allocator.free(builder.bytes);
+        allocator.free(builder.senders);
         allocator.free(builder.transactions);
         builder.best.deinit(allocator);
         builder.* = undefined;
@@ -220,6 +231,15 @@ pub const BlockBuilder = struct {
         return builder.transactions[0..builder.count];
     }
 
+    /// The sender of every transaction of the sealed block, in order (zero for deposits), or
+    /// empty when not all are known (the import then recovers them).
+    pub fn block_senders(builder: *const BlockBuilder) []const primitives.Address {
+        assert(builder.state == .sealed);
+        assert(builder.count <= builder.senders.len);
+        if (!builder.senders_known) return &.{};
+        return builder.senders[0..builder.count];
+    }
+
     /// The sealed block's header (what `getPayload` returns).
     pub fn sealed_header(builder: *const BlockBuilder) *const Header {
         assert(builder.state == .sealed);
@@ -242,7 +262,12 @@ pub const BlockBuilder = struct {
     fn apply_forced(builder: *BlockBuilder, building: *Building) Error!void {
         assert(building.count == 0);
         const executor = builder.chain.executor;
-        for (builder.transactions[0..builder.forced_count]) |raw| {
+        builder.senders_known = true;
+        const forced = builder.transactions[0..builder.forced_count];
+        for (forced, builder.senders[0..builder.forced_count]) |raw, *sender| {
+            assert(raw.len > 0);
+            sender.* = primitives.Address.zero;
+            if (raw[0] != consensus_deposit_type) builder.senders_known = false;
             try executor.apply(building, raw);
             builder.best.mark_committed(&.{primitives.keccak256(raw)});
         }
@@ -283,6 +308,7 @@ pub const BlockBuilder = struct {
                 continue;
             }
             if (!try builder.try_apply(building, tx, raw)) continue;
+            builder.senders[builder.count] = tx.sender;
             builder.append(raw);
             builder.best.mark_current_committed();
             builder.da_used_bytes += da_bytes;

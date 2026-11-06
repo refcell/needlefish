@@ -49,6 +49,9 @@ pub const Payload = struct {
     block_value: u256,
     /// Every transaction of the block, in order; borrows the builder.
     transactions: []const []const u8,
+    /// The sender of each transaction (zero for deposits), or empty when not all are
+    /// known; borrows the builder.
+    senders: []const primitives.Address,
     /// The attributes' withdrawals; borrows the service until its next job.
     withdrawals: ?[]const payload.Withdrawal,
     /// Why the build stopped adding pool transactions.
@@ -266,6 +269,7 @@ pub const Service = struct {
             .block_hash = header.hash(),
             .block_value = builder.block_value(),
             .transactions = builder.block_transactions(),
+            .senders = builder.block_senders(),
             .withdrawals = service.attributes.withdrawals,
             .stop = stop,
         };
