@@ -13,6 +13,10 @@
 //!   imports the sealed block through its regular insert path.
 //! - A second IO timer ticks at the sealed job's expiry to drop it unresolved.
 //!
+//! With `Config.resource_metering.enabled` it also owns the builder's resource metering
+//! (`metering/builder_metering.zig`: schedule, metering store, metrics) and installs the
+//! driver on the block builder; disabled, nothing is allocated and builds are unmetered.
+//!
 //! Time is the IO's monotonic clock, for both the timers and the in-build cutoff reads.
 //! All IO goes through `IO` (production backend or `SimIo`). Pinned once `init` ran.
 
@@ -27,6 +31,7 @@ const best_txs = @import("best_txs.zig");
 const builder_module = @import("builder.zig");
 const service_module = @import("service.zig");
 const timing = @import("timing.zig");
+const builder_metering = @import("../metering/builder_metering.zig");
 
 const Chain = chain_module.Chain;
 const BlockBuilder = builder_module.BlockBuilder;
@@ -39,6 +44,10 @@ pub const Config = struct {
     rejection_cache_capacity: u32 = best_txs.rejection_cache_capacity_default,
     /// base/base `--builder.rejection-cache-ttl-secs`.
     rejection_cache_ttl_ns: u64 = best_txs.rejection_cache_ttl_ns_default,
+    /// `--builder.enable-resource-metering` and `--payload.resource-metering-schedule`.
+    resource_metering: Metering = .{},
+
+    pub const Metering = builder_metering.Config;
 };
 
 pub fn NodeBuilder(comptime IO: type) type {
@@ -50,6 +59,8 @@ pub fn NodeBuilder(comptime IO: type) type {
         cache: best_txs.RejectionCache,
         builder: BlockBuilder,
         service: Service,
+        /// Resource metering, when enabled.
+        metering: ?*builder_metering.BuilderMetering = null,
         build_completion: IO.Completion = .{},
         build_armed: bool = false,
         expiry_completion: IO.Completion = .{},
@@ -85,6 +96,8 @@ pub fn NodeBuilder(comptime IO: type) type {
                 config.builder,
             );
             errdefer node_builder.builder.deinit(allocator);
+            try node_builder.init_metering(allocator, config.resource_metering);
+            errdefer node_builder.deinit_metering(allocator);
             const clock = builder_module.Clock.of(Self, node_builder);
             node_builder.service = try Service.init(
                 &node_builder.builder,
@@ -106,9 +119,33 @@ pub fn NodeBuilder(comptime IO: type) type {
         pub fn deinit(node_builder: *Self, allocator: std.mem.Allocator) void {
             assert(node_builder.chain.payload_builder.?.context == @as(*anyopaque, node_builder));
             node_builder.chain.payload_builder = null;
+            node_builder.deinit_metering(allocator);
             node_builder.builder.deinit(allocator);
             node_builder.cache.deinit(allocator);
             node_builder.* = undefined;
+        }
+
+        fn init_metering(
+            node_builder: *Self,
+            allocator: std.mem.Allocator,
+            config: builder_metering.Config,
+        ) builder_metering.Error!void {
+            assert(node_builder.metering == null);
+            if (!config.enabled) return;
+            const metering = try allocator.create(builder_metering.BuilderMetering);
+            errdefer allocator.destroy(metering);
+            try metering.init(allocator, config);
+            node_builder.metering = metering;
+            node_builder.builder.resource = &metering.driver;
+            assert(node_builder.builder.resource != null);
+        }
+
+        fn deinit_metering(node_builder: *Self, allocator: std.mem.Allocator) void {
+            const metering = node_builder.metering orelse return;
+            node_builder.builder.resource = null;
+            metering.deinit(allocator);
+            allocator.destroy(metering);
+            node_builder.metering = null;
         }
 
         /// The builder `Clock`: the IO's monotonic time.

@@ -31,6 +31,10 @@ const Harness = struct {
     builder: NodeBuilder,
 
     fn create() !*Harness {
+        return create_with(.{});
+    }
+
+    fn create_with(metering: node_builder_module.Config.Metering) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
         harness.world = try io.SimWorld.init(testing.allocator, .{ .seed = 7 });
@@ -44,6 +48,7 @@ const Harness = struct {
         try harness.builder.init(testing.allocator, &harness.sim, &harness.node.chain, .{
             .builder = .{ .transactions_max = 64, .transaction_bytes_max = 1 << 14 },
             .rejection_cache_capacity = 64,
+            .resource_metering = metering,
         });
         return harness;
     }
@@ -149,6 +154,44 @@ test "node builder: FCU returns first, the timer builds, getPayload equals a Cha
     const head = try harness.forkchoice_updated(built.block_hash, null);
     try testing.expectEqual(types.Status.valid, head.payload_status.status);
     try testing.expectEqualSlices(u8, &built.block_hash.bytes, &harness.node.chain.head_hash());
+}
+
+test "node builder: resource metering from config throttles the block budget" {
+    const harness = try Harness.create_with(.{
+        .enabled = true,
+        .store_capacity = 16,
+        .schedule_json =
+        \\{"version":1,"dimensions":[{"name":"cpu","blockLimit":42000,"baseGasWeight":1,
+        \\"dryRun":false}]}
+        ,
+    });
+    defer harness.destroy();
+    var buffers: [6][256]u8 = undefined;
+    try harness.submit_pool(&buffers);
+    const metering = harness.builder.metering.?;
+    const pool = &harness.node.pool;
+    for (1..fixture.senders + 1) |from| {
+        const sender = pool.sender_of(fixture.address_of(@intCast(from))).?;
+        var iterator = pool.sender_transactions(sender);
+        while (iterator.next()) |item| {
+            metering.store.insert(item.tx.hash, .{
+                .total_gas_used = 21_000,
+                .total_execution_time_us = 1,
+                .sample = .init(21_000),
+            }, harness.world.now_ns);
+        }
+    }
+    const attributes = fixture.attributes_l2(2, 0xfe);
+    const updated = try harness.forkchoice_updated(genesis(harness), &attributes);
+    harness.world.run_for_ns(ns_per_ms);
+    const built = try harness.get_payload(updated.payload_id.?, attributes.timestamp);
+    var list: [64][]const u8 = undefined;
+    const transactions = try block_transactions(harness.node, built.block_hash, &list);
+    try testing.expectEqual(@as(usize, 2), transactions.len);
+    const expected = try follower_build(&attributes, transactions);
+    try testing.expectEqualSlices(u8, &expected.bytes, &built.block_hash.bytes);
+    try testing.expect(metering.metrics.throttled[0][1].get() > 0);
+    try testing.expectEqual(@as(u64, 0), metering.metrics.throttled[0][0].get());
 }
 
 test "node builder: getPayload before the timer seals at once with the forced txs" {

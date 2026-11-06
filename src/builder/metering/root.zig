@@ -20,6 +20,8 @@ const metrics = @import("../../utilities/metrics/root.zig");
 pub const schedule = @import("schedule.zig");
 pub const sample = @import("sample.zig");
 pub const resource = @import("resource.zig");
+pub const resource_metrics = @import("resource_metrics.zig");
+pub const builder_metering = @import("builder_metering.zig");
 
 pub const Sample = sample.Sample;
 
@@ -375,4 +377,6 @@ test {
     _ = schedule;
     _ = sample;
     _ = resource;
+    _ = resource_metrics;
+    _ = builder_metering;
 }

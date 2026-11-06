@@ -75,9 +75,12 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
     the executor's post-transaction state, replacing the simulated `STATE_*` rows (kept today).
   - [ ] Feed `MeteringStore` samples: `base_setMeteringInformation` / `base_meterBundle`
     results (per-tx `opcodeGas`) into `Metering.sample` (nothing inserts samples yet).
-  - [ ] Flags and metrics: `--builder.enable-resource-metering` plus a schedule file path
-    (an empty file fails closed, `EmptySchedule`), `ResourceMeteringMetrics` (limit hits by
-    dimension/scope/enforced, calculation failures, throttled per build).
+  - [x] Flags and metrics: `--builder.enable-resource-metering` plus
+    `--payload.resource-metering-schedule FILE` (an empty schedule fails closed,
+    `EmptySchedule`), `ResourceMeteringMetrics` (limit hits by dimension/scope/enforced,
+    calculation failures), per-build counters in `ResourceMetering.build`.
+  - [ ] Export `ResourceMeteringMetrics.register` (and the metering-store metrics) on the
+    node's Prometheus endpoint once `base node` has a metrics registry (nf-node).
 - [ ] Sequencer self-import cost (from the `builder:` bench: build 20 ms CPU, self-import 55 ms
   wall at 2610 txs): the node re-recovers every sender and re-executes the sealed block. Hand
   the builder's known senders (it already skips ecrecover via `known_sender`) to the import, or
@@ -132,7 +135,8 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   cluster's 200 ms mode is the dst-fuzz lane's backlog item; the cluster only has to forward
   events and replay hashes. A getPayload arriving after the slot end is counted
   (`resolves_late`), not a violation: under injected network delay it is the consensus side's
-  lateness, and the service still answers without waiting.- 2026-11-05: resource-metering schedules are bounded for static allocation: 128 dimensions
+  lateness, and the service still answers without waiting.
+- 2026-11-05: resource-metering schedules are bounded for static allocation: 128 dimensions
   (base/base), 512 rules per dimension (base/base) and `Config.rules_max` (default 4096) rules
   in total (needlefish only; over it is `TooManyOperations`). JSON integers must be plain
   decimal u64 (no sign, fraction or exponent), matching serde's u64 for every file base/base
@@ -145,6 +149,12 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   receipts) so an unmetered build reads the injected clock exactly as before. Until the
   executor reports post-state counts the executed sample keeps the simulated `STATE_*` rows
   (closer than dropping them), and executed-only overruns are counted, not excluded.
+- 2026-11-05: resource-metering flags follow base/base names (`--builder.enable-resource-metering`,
+  `--payload.resource-metering-schedule`) on `base node`, effective only with
+  `--builder.enabled`; the schedule file is read by the binary (1 MiB cap) only when metering is
+  enabled (base/base warns and ignores it otherwise), and `NodeBuilder` allocates the schedule,
+  the metering store and the metrics only when enabled. "Throttled per build" has no base/base
+  metric (it is an info log); needlefish keeps it in `ResourceMetering.build`.
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -209,3 +219,7 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - 2026-11-05: sealed payloads carry the builder's senders (zero for deposits; empty when a
   forced tx is not a deposit), so the sequencer's self-import skips ecrecover (nf-node
   `SealedPayload.senders`).
+- 2026-11-05: resource-metering flags on `base node` and `NodeBuilder`
+  (`metering/builder_metering.zig`, base/base `from_parts`), `ResourceMeteringMetrics` with
+  base/base names and labels; tests for config, metrics rendering, flag parsing, and a
+  metered `NodeBuilder` build over `SimIo`.
