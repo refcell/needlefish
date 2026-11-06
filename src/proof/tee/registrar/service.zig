@@ -110,6 +110,25 @@ fn flag_of(name: []const u8) Error!Flag {
 
 /// Parses flag/value pairs (`--metrics.enabled` takes no value) and validates them.
 pub fn parse(args: []const []const u8) Error!RegistrarConfig {
+    return parse_with_env(args, null);
+}
+
+/// `parse`, taking the signer key from `env_private_key` (`BASE_REGISTRAR_PRIVATE_KEY`, as
+/// base/base) when no flag names a signer, so the key need not appear in argv.
+pub fn parse_with_env(
+    args: []const []const u8,
+    env_private_key: ?[]const u8,
+) Error!RegistrarConfig {
+    var config = try parse_flags(args);
+    if (config.private_key == null and config.dev_key_index == null) {
+        if (env_private_key) |text| config.private_key = try fixed(32, text);
+    }
+    try validate(&config);
+    assert(config.private_key != null or config.dev_key_index != null);
+    return config;
+}
+
+fn parse_flags(args: []const []const u8) Error!RegistrarConfig {
     var config: RegistrarConfig = .{};
     var index: usize = 0;
     while (index < args.len) {
@@ -124,7 +143,6 @@ pub fn parse(args: []const []const u8) Error!RegistrarConfig {
         index += 2;
     }
     assert(index == args.len);
-    try validate(&config);
     return config;
 }
 
@@ -243,6 +261,23 @@ fn fuzz_parse(_: void, smith: *testing.Smith) anyerror!void {
     const config = parse(args[0..count]) catch return;
     try testing.expect(config.poll_interval_s > 0);
     try testing.expect(config.l1_rpc_url.len > 0);
+}
+
+test "registrar config: the signer key may come from the environment" {
+    const required_args = [_][]const u8{
+        "--l1-rpc-url",                  "http://127.0.0.1:8545",
+        "--tee-prover-registry-address", "0x00000000000000000000000000000000000000a5",
+        "--prover-endpoints",            "http://127.0.0.1:8000",
+    };
+    const key = "0x0101010101010101010101010101010101010101010101010101010101010101";
+    try testing.expectError(error.MissingFlag, parse_with_env(&required_args, null));
+    const config = try parse_with_env(&required_args, key);
+    try testing.expectEqual(@as(u8, 1), config.private_key.?[31]);
+    try testing.expectError(error.InvalidValue, parse_with_env(&required_args, "0x12"));
+    // A flag-named signer wins over the environment.
+    const with_dev = required_args ++ [_][]const u8{ "--dev-key-index", "2" };
+    const dev = try parse_with_env(&with_dev, key);
+    try testing.expectEqual(@as(?[32]u8, null), dev.private_key);
 }
 
 test "registrar config: fuzz parse" {

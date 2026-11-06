@@ -27,7 +27,8 @@ const Telemetry = telemetry_servers.Servers(registrar.metrics.Exporter);
 
 const usage =
     \\usage: base registrar --l1-rpc-url <url> --tee-prover-registry-address <addr>
-    \\         --prover-endpoints <url,url> (--private-key <hex> | --dev-key-index <n>)
+    \\         --prover-endpoints <url,url> [--private-key <hex> | --dev-key-index <n>]
+    \\         (prefer BASE_REGISTRAR_PRIVATE_KEY=<hex> to keep the key out of argv)
     \\         [--max-attestation-age-secs 3300] [--poll-interval-secs 30]
     \\         [--prover-timeout-secs 30] [--instance-cache-ttl-cycles 5]
     \\         [--max-tx-retries 3] [--tx-retry-delay-secs 5] [--ticks-max n]
@@ -137,7 +138,8 @@ const Process = struct {
 };
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
-    const config = registrar.service.parse(args) catch |err| {
+    const env_key = init.environ_map.get("BASE_REGISTRAR_PRIVATE_KEY");
+    const config = registrar.service.parse_with_env(args, env_key) catch |err| {
         std.debug.print("registrar: {t}\n{s}", .{ err, usage });
         return 2;
     };
