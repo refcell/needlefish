@@ -121,6 +121,10 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: fourth pinned window in `just replay-check`: 53864562..53864581 (311 txs,
+  56.6 Mgas, 1 gap round) 20/20. Left the ~60 ms digest check as is: it is the archive's
+  integrity check, and a faster checksum would need another format version.
+
 - 2026-11-06: decision: archive format v2 stores the body uncompressed (v1 deflate still
   reads; the committed fixture stays v1). Deflate saved 17% (52.7 -> 43.7 MB) but inflating
   cost ~230 of ~450 ms load: a 100-block `replay run` went 0.72 s -> 0.45 s wall. Baseline

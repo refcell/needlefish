@@ -9,7 +9,8 @@ root or block hash would differ.
 just replay                # fetch the latest 10 blocks from public RPC, replay offline
 just replay 100            # the latest 100 blocks (about 15 minutes from a cold cache)
 just replay 100 53750445   # a pinned window: the same blocks every run
-just replay-check          # pinned windows 53775088 (+100), 53811190 (+20), 53840091 (+10)
+just replay-check          # 4 pinned windows: 53775088 (+100), 53811190 (+20),
+                           # 53840091 (+10), 53864562 (+20)
 just replay-run            # replay the committed 10-block archive (no network)
 ```
 
@@ -25,6 +26,7 @@ block, and Mgas/s. `just replay-check` on an Apple M-series laptop under load (l
 | 53775088..53775187 | 100 | 1571 | 271.9 Mgas | 274-280 ms | 2.7-2.8 ms | 972-991 Mgas/s |
 | 53811190..53811209 | 20 | 314 | 70.6 Mgas | 71-79 ms | 3.6-4.0 ms | 894-991 Mgas/s |
 | 53840091..53840100 | 10 | 221 | 31.5 Mgas | 34-38 ms | 3.4-3.8 ms | 837-927 Mgas/s |
+| 53864562..53864581 | 20 | 311 | 56.6 Mgas | 65 ms (1 run) | 3.2 ms | 872 Mgas/s |
 
 Before sender prefetch the first two windows ran at 820-907 Mgas/s. Loading the 100-block
 archive (read, digest check, parse, witness index) adds about 180 ms to a run: 0.45 s wall

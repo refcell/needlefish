@@ -84,13 +84,14 @@ replay count='10' from='':
     zig-out/bin/base replay run .cache/replay/latest.nfrp
 
 # Pinned mainnet windows: 100 blocks 53775088..53775187 (1571 txs), 20 blocks
-# 53811190..53811209 (314 txs) and 10 blocks 53840091..53840100 (221 txs). Every block's
-# state root, receipts root, logs bloom, gas used and hash must match. Fetches once, then
-# from the cache.
+# 53811190..53811209 (314 txs), 10 blocks 53840091..53840100 (221 txs) and 20 blocks
+# 53864562..53864581 (311 txs). Every block's state root, receipts root, logs bloom, gas
+# used and hash must match. Fetches once, then from the cache.
 replay-check:
     just replay 100 53775088
     just replay 20 53811190
     just replay 10 53840091
+    just replay 20 53864562
 
 # Replay a saved archive offline (default: the committed 10-block fixture)
 replay-run archive='src/infra/replay/testdata/base-mainnet-53715983-10.nfrp':
