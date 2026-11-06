@@ -46,6 +46,9 @@ const Flags = struct {
     from: ?u64 = null,
     cache: []const u8 = ".cache/replay",
     out: []const u8 = replay_cli.default_archive,
+    /// Archive proofs endpoint (`eth_getProof`, batched); another public keyless endpoint
+    /// when the default one rate-limits.
+    proof_url: []const u8 = proof_url,
 };
 
 fn parse(args: []const []const u8) !Flags {
@@ -61,6 +64,8 @@ fn parse(args: []const []const u8) !Flags {
             flags.cache = value;
         } else if (std.mem.eql(u8, args[index], "--out")) {
             flags.out = value;
+        } else if (std.mem.eql(u8, args[index], "--proof-url")) {
+            flags.proof_url = value;
         } else return error.InvalidArguments;
     }
     if (index != args.len) return error.InvalidArguments;
@@ -177,7 +182,7 @@ const Fetcher = struct {
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse(args) catch {
         std.debug.print("usage: base replay fetch [--count <n>] [--from <block>] " ++
-            "[--cache <dir>] [--out <archive>]\n", .{});
+            "[--cache <dir>] [--out <archive>] [--proof-url <url>]\n", .{});
         return 2;
     };
     const gpa = init.gpa;
@@ -189,7 +194,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .init = init,
         .arena = .init(gpa),
         .trace = .{ .http = .init(gpa, init.io, trace_url), .response = response },
-        .proof = .{ .http = .init(gpa, init.io, proof_url), .response = proof_response },
+        .proof = .{ .http = .init(gpa, init.io, flags.proof_url), .response = proof_response },
         .dir = undefined,
         .flags = flags,
     };
@@ -390,29 +395,71 @@ fn prove(f: *Fetcher, keys: *Keys, at: u64) ![]u8 {
         }
     };
     keys.map.sort(Sort{ .keys = keys.map.keys() });
-    const params = try arena.alloc([]const u8, keys.map.count());
-    for (keys.map.keys(), keys.map.values(), params) |address, *slots, *param| {
+    // One call per `proof_slots_max` slots of an account; `owners` maps calls to accounts.
+    var params: std.ArrayList([]const u8) = .empty;
+    var owners: std.ArrayList(u32) = .empty;
+    for (keys.map.keys(), keys.map.values(), 0..) |address, *slots, owner| {
         slots.sort(Sort{ .keys = slots.keys() });
-        var text: Io.Writer.Allocating = .init(arena);
-        try text.writer.print("[\"{s}\",[", .{address});
-        for (slots.keys(), 0..) |slot, index| {
-            try text.writer.print("{s}\"{s}\"", .{ if (index == 0) "" else ",", slot });
+        // An account without slots still gets one call.
+        var first: usize = 0;
+        while (first == 0 or first < slots.count()) : (first += proof_slots_max) {
+            const part = slots.keys()[first..@min(first + proof_slots_max, slots.count())];
+            try params.append(arena, try proof_param(arena, address, part, at));
+            try owners.append(arena, @intCast(owner));
         }
-        try text.writer.print("],\"0x{x}\"]", .{at});
-        param.* = text.written();
     }
-    var out: Io.Writer.Allocating = .init(arena);
-    try out.writer.writeAll("[");
+    const results = try arena.alloc(json.Value, params.items.len);
     var start: usize = 0;
-    while (start < params.len) : (start += batch_max) {
-        const chunk = params[start..@min(start + batch_max, params.len)];
-        const results = try f.batch(&f.proof, "eth_getProof", chunk);
+    while (start < params.items.len) : (start += batch_max) {
+        const chunk = params.items[start..@min(start + batch_max, params.items.len)];
+        @memcpy(results[start..][0..chunk.len], try f.batch(&f.proof, "eth_getProof", chunk));
         // Public endpoints meter compute units per second: pace the batches.
         try f.init.io.sleep(.fromMilliseconds(250), .awake);
-        for (results, 0..) |result, index| {
-            if (start + index > 0) try out.writer.writeAll(",");
-            try json.Stringify.value(result, .{}, &out.writer);
+    }
+    return merge_proofs(arena, results, owners.items);
+}
+
+/// Endpoints cap the slots of one `eth_getProof` (1024 is common).
+const proof_slots_max = 1024;
+
+fn proof_param(
+    arena: std.mem.Allocator,
+    address: []const u8,
+    slots: []const []const u8,
+    at: u64,
+) ![]u8 {
+    var text: Io.Writer.Allocating = .init(arena);
+    try text.writer.print("[\"{s}\",[", .{address});
+    for (slots, 0..) |slot, index| {
+        try text.writer.print("{s}\"{s}\"", .{ if (index == 0) "" else ",", slot });
+    }
+    try text.writer.print("],\"0x{x}\"]", .{at});
+    return text.written();
+}
+
+/// One proof per account: a split account's later parts add their storage proofs to its
+/// first part (the account proof is the same).
+fn merge_proofs(arena: std.mem.Allocator, results: []json.Value, owners: []const u32) ![]u8 {
+    assert(results.len == owners.len);
+    var out: Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll("[");
+    var index: usize = 0;
+    while (index < results.len) {
+        var merged = results[index];
+        if (merged != .object) return error.MalformedResponse;
+        const storage = merged.object.getPtr("storageProof") orelse return error.MalformedResponse;
+        if (storage.* != .array) return error.MalformedResponse;
+        var next = index + 1;
+        while (next < results.len and owners[next] == owners[index]) : (next += 1) {
+            if (results[next] != .object) return error.MalformedResponse;
+            const more = results[next].object.get("storageProof") orelse
+                return error.MalformedResponse;
+            if (more != .array) return error.MalformedResponse;
+            try storage.array.appendSlice(more.array.items);
         }
+        if (index > 0) try out.writer.writeAll(",");
+        try json.Stringify.value(merged, .{}, &out.writer);
+        index = next;
     }
     try out.writer.writeAll("]");
     return out.written();

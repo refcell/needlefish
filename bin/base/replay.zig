@@ -28,6 +28,7 @@ const assert = std.debug.assert;
 pub const default_archive = "replay.nfrp";
 const usage =
     \\usage: base replay fetch [--count <n>] [--from <block>] [--cache <dir>] [--out <archive>]
+    \\                         [--proof-url <url>]
     \\       base replay import <raw dir> [--out <archive>]
     \\       base replay run [<archive>] [--blocks <n>] [--plain] [--recovery-threads <n>]
     \\       base replay bench <archive> [<warm runs>] [--recovery-threads <n>]
