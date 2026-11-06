@@ -212,6 +212,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   last N blocks, compared against the re-execution path in tests) so the head skips
   re-execution; or the wider keccak batch from the sparse-apply item above.
 
+- [x] Trie-only root check against Base mainnet, independent of the EVM: `replay-roots`
+  (`bin/replay-roots`, logic in `db/replay_roots.zig`; `zig build replay-roots -- DIR [BLOCK]`).
+  Seeds a `SparseState` from the parent's `eth_getProof` nodes (every proof verified
+  against the parent and block roots), applies the post values as a `Changeset` through
+  `SparseState.apply`, and compares the state root and every account's leaf and storage
+  root; rebuilds the receipts root (`consensus.receipt`, deposit nonce + receipt version)
+  and the transactions root (`rpc_types.transaction.parse_transaction`, hash-checked) with
+  the ordered trie. Result on 10 Denim-era blocks 53715983..53715992: receipts and
+  transactions roots OK 10/10; state root OK 9/10, 53715985 INCOMPLETE (collapse into an
+  unproven branch, see Decisions). No trie mismatch found.
+
 ## Decisions
 - Bulk load on open (`LoadMode.bulk`, default): the snapshot fills the flat tables only;
   `State.build_trie` then hashes every key in SIMD batches, groups the slots by account
@@ -668,6 +679,27 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   keys are keccak digests, so the map hash is their first eight bytes. As deterministic as
   the unseeded `AutoContext` it replaces, and digests are equally grindable under both.
 
+- `replay-roots` seeding: `eth_getProof` proves only touched keys, so a delete whose
+  branch collapses needs the surviving sibling's preimage from nowhere (every one of the 10
+  blocks hits this). Seeds are tried in order: parent proofs, plus block proofs, plus
+  derived preimages: every path suffix of every block-proof leaf and extension, because the
+  block's exclusion proof of the deleted key ends at the node the sibling merged into
+  (the same node with the branch nibble, or extension path, prepended). The node store keys
+  candidates by keccak256, so only an exact hash match is ever used: no trust is added.
+  A sibling that is itself a branch cannot be derived (the block holds only an extension
+  pointing at it): that stays INCOMPLETE (53715985: storage of 0xde16..8369, slot
+  0x328a..936f 0x12 -> 0 collapses into branch 38d497bf..b9ef). Fix would need that node from
+  a real witness (`debug_executionWitness`) or a proof of a key under it.
+- `replay-roots` also needs the keys of the block-start system calls, which per-tx traces
+  never name: EIP-2935 (block hash at `(number - 1) % 8191` in `0x0000f908..2935`) and
+  EIP-4788 (`timestamp % 8191` and `+ 8191` in `0x000f3df6..beac02`). Without them all
+  post accounts matched but every state root differed. The binary folds in optional
+  `<block>/proofs_system_{pre,post}.json` (same `eth_getProof` shape) via `merge_proofs`.
+  Note at 200 ms blocks the 4788 slots change only on the first block of each second.
+- Receipts JSON is converted with the consensus encoder after checking the reported bloom
+  against the logs; the withdrawals root (Isthmus: the L2ToL1MessagePasser storage root) is
+  not checked: that account is untouched in these blocks, so no proof of it is fetched.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -1009,3 +1041,8 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   and usage, proofs of every address at every window block; with history, a byte budget,
   and without), `build_sorted` vs inserts (seeded, one-node-short pool, fuzz), table unwind
   + rebuild vs trie unwind (serial and threaded).
+- 2026-11-06: `replay-roots` on Base mainnet 53715983..53715992: receipts and
+  transactions roots 10/10 OK; state roots 9/10 OK (seeded with derived collapse siblings),
+  53715985 INCOMPLETE (branch sibling); no trie mismatch. Tests: synthetic diff (collapse
+  into an unproven leaf completes only with derived seeding), unproven branch stays
+  incomplete with the right missing node, proof tampering, proof merge, receipts root.

@@ -9,6 +9,7 @@
 //! - `witness_codec`: canonical witness encoding and its keccak256 preimage view (proof lane).
 //! - `witness_json`: the witness's `debug_executionWitness` JSON shape and exact length.
 //! - `witness_diff`: compare two witnesses down to accounts and slots (`witness-diff` tool).
+//! - `replay_roots`: trie-only state/receipts/transactions root check from RPC proofs.
 
 const std = @import("std");
 pub const storage = @import("storage/root.zig");
@@ -27,6 +28,7 @@ pub const witness_block = @import("witness_block.zig");
 pub const witness_codec = @import("witness_codec.zig");
 pub const witness_diff = @import("witness_diff.zig");
 pub const witness_json = @import("witness_json.zig");
+pub const replay_roots = @import("replay_roots.zig");
 pub const database = @import("database.zig");
 pub const bench = @import("bench.zig");
 
@@ -50,6 +52,7 @@ test {
     _ = @import("witness_block_test.zig");
     _ = @import("witness_codec_test.zig");
     _ = @import("witness_header_test.zig");
+    _ = @import("replay_roots_test.zig");
     _ = @import("database_test.zig");
     _ = @import("database_history_test.zig");
 }

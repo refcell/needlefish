@@ -16,6 +16,7 @@ const std = @import("std");
 const binaries = [_][]const u8{
     "base",
     "witness-diff",
+    "replay-roots",
 };
 
 pub fn build(b: *std.Build) void {
@@ -180,6 +181,10 @@ fn add_binaries(
         run.addPassthruArgs();
         const run_step = b.step(b.fmt("run-{s}", .{name}), b.fmt("Run {s}", .{name}));
         run_step.dependOn(&run.step);
+        if (std.mem.eql(u8, name, "replay-roots")) {
+            b.step(name, "Check state/receipts/transactions roots: replay-roots -- DIR [BLOCK]")
+                .dependOn(&run.step);
+        }
     }
 
     // Binary tests (each main.zig may hold integration tests).
