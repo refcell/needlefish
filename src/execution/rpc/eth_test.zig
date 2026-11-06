@@ -1098,3 +1098,29 @@ test "eth: pre-Osaka calls without gas default to the block gas limit" {
     const env = chain_module.env_of(&head);
     try testing.expectEqual(head.gas_limit, h.node.chain.executor.default_call_gas(&env));
 }
+
+test "eth: getTransactionCount reads EIP-8130 channel nonces by nonce key" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const native = @import("../evm/native.zig");
+    const owner = fixture.address_of(1).bytes;
+    const slot = native.nonce_slot(owner, 5);
+    try h.node.db.put_account(native.nonce_manager_address, 0, 0, &.{0x00});
+    try h.node.db.put_storage(native.nonce_manager_address, slot, 7);
+    const prefix = "[\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"latest\"";
+    try testing.expectEqualStrings("\"result\":\"0x7\"", try h.request(
+        "eth_getTransactionCount",
+        prefix ++ ",\"0x5\"]",
+    ));
+    // Key zero (or none) is the protocol nonce; an unused channel is zero.
+    try testing.expectEqualStrings("\"result\":\"0x0\"", try h.request(
+        "eth_getTransactionCount",
+        prefix ++ ",\"0x0\"]",
+    ));
+    try testing.expectEqualStrings("\"result\":\"0x0\"", try h.request(
+        "eth_getTransactionCount",
+        prefix ++ ",\"0x6\"]",
+    ));
+    const max_key = ",\"0x" ++ @as([64]u8, @splat('f')) ++ "\"]";
+    try expect_contains(try h.request("eth_getTransactionCount", prefix ++ max_key), "-32602");
+}

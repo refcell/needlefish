@@ -13,6 +13,7 @@ const txpool = @import("../txpool/root.zig");
 const node = @import("../node/root.zig");
 const format = @import("format.zig");
 const debug = @import("debug.zig");
+const native = @import("../evm/native.zig");
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -278,7 +279,18 @@ fn get_transaction_count(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
     const tag = try call.params.optional_raw();
     const pending = if (tag) |t| std.mem.eql(u8, t, "\"pending\"") else false;
+    // Base EIP-8130: a non-zero `nonce_key` reads the 2D channel nonce from the Nonce
+    // Manager (canonical state only, no pending delta); `nonce_key_max` is not a channel.
+    const nonce_key = try call.params.optional_quantity(u256) orelse 0;
+    try call.params.finish();
+    if (nonce_key == consensus.eip8130.nonce_key_max) return error.InvalidParams;
     const view = try state_view.resolve(api, call, if (pending) null else tag);
+    if (nonce_key != 0) {
+        const manager = native.nonce_manager_address;
+        const slot = native.nonce_slot(address, nonce_key);
+        const channel = try state_view.storage(api, call, view, manager, slot);
+        return call.writer.quantity(@as(u64, @truncate(channel)));
+    }
     const account = try state_view.account(api, call, view, address);
     var nonce = if (account) |a| a.nonce else 0;
     if (pending) if (api.pool) |pool| {

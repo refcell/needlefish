@@ -52,6 +52,15 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
 - [x] rpc: eth_call/estimateGas default gas capped to the EIP-7825 tx gas cap (2^24) post-Osaka
   (reth `RPC_DEFAULT_GAS_CAP` min tx cap); `base basectl denim` hit gas_cap_exceeded.
+- [x] rpc: eth_getTransactionCount `nonce_key` (EIP-8130 channel nonce from the Nonce Manager).
+- [ ] rpc: EIP-8130 eth_call/eth_estimateGas for 0x79 requests (base/base eip8130-rpc: one
+  read-only `eip8130_simulate` run; estimate searches only the call pool).
+- [ ] rpc: base_meterBlockByHash/Number, base_meterBundle (per-transaction gas and execution
+  time; base/base metering crate).
+- [ ] rpc: debug_traceTransaction/traceCall/traceBlockByNumber (callTracer, prestateTracer);
+  needs an evm call-frame hook (asked nf-evm 2026-11-05).
+- [ ] rpc: base_sendRawTransactionValidity (validity predicates; needs pool storage and
+  builder enforcement, cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
 - [x] rpc: filters (eth_newFilter/newBlockFilter/newPendingTransactionFilter,
@@ -88,6 +97,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_getTransactionCount takes base/base's optional third `nonce_key`: non-zero reads `nonces[address][key]` from the Nonce Manager at the requested block (no pending delta, as base/base); `nonce_key_max` is invalid params. The handler now rejects a fourth param. Profiling also sent perf findings to nf-evm (precompile warming loads ~20 accounts per tx, ~5%) and nf-trie-db (single-threaded account-trie rehash is half of `Overlay.commit`); tx/receipt roots (~0.35 ms per 500 txs) not worth overlapping.
 - 2026-11-05: Sequencer self-import skips sender recovery: `SealedPayload.senders` (one per transaction, any address for deposits; empty recovers) set `Executor.given_senders` for the import (builder lane request; the builder fills it). Bench: 500 transfers 5.2 ms with parallel recovery, 1.6 ms with given senders. Committing the builder's post-state directly was not chosen: the builder runs on its own state.
 - 2026-11-05: Calls without `gas` (eth_call, eth_estimateGas, eth_createAccessList, eth_simulateV1) default to the block gas limit capped at 2^24 from Osaka on (`Executor.default_call_gas`, as reth caps RPC call gas to the EIP-7825 tx cap). An explicit gas above the cap still fails `gas_cap_exceeded`.
 - 2026-11-05: Durable mode no longer unwinds and re-applies every built/imported block (dst-fuzz: 3 journal entries per block, sequencer lag in the sim). An executed block stays `Chain.pending` (state holds it, journal does not) until a state move needs it: the adopting FCU journals it (one entry, no state movement), a child or a move away journals it first, a crash drops it (reth persists only canonical blocks). Shared-file edit (db): `Database.hold_checkpoints`, since a checkpoint snapshot would capture the unjournaled state; `Journal.hold_checkpoints` wires it.
