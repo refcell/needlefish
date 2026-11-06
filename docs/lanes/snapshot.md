@@ -19,10 +19,17 @@ outside the repository.
 - [x] Read-only MDBX reader (meta choice, B-tree walk, large pages, DUPSORT sub-pages and
   nested trees), checked against a file real libmdbx wrote (`etc/import/mdbx_fixture.c`)
   and libmdbx's own dump; seeded fuzz of damaged files.
-- [ ] reth table decoders (Compact): plain or hashed accounts, storage, bytecodes, the
-  snapshot block header and the 256 hashes below it.
-- [ ] `base snapshot import`: stream the snapshot into the needlefish store, recompute the
-  state root, require it to equal the snapshot block's header `stateRoot`.
+- [x] reth table decoders (Compact): hashed accounts, storage entries, bytecodes, stage
+  checkpoints (`import/reth.zig`); `HashedAccounts` + `HashedStorages` streamed into the root
+  (`import/hashed_state.zig`, seeded differential against `StateTrie`, mutation-checked).
+- [x] `base snapshot-import --db mdbx.dat`: reads `Metadata["storage_settings"]` and
+  `StageCheckpoints["Finish"]`, recomputes the state root, requires it to equal the header
+  `stateRoot` of that block (fetched over RPC, bound to its hash, or `--state-root`), and
+  checks the streamed item counts against the table descriptors.
+- [ ] Run it on the Sepolia snapshot (download, verify the manifest's blake3 of `mdbx.dat`,
+  extract, import).
+- [ ] Stream the snapshot into the needlefish store (needs M2 phases 2b and 3).
+- [ ] The 256 block hashes below the snapshot block (headers static file or RPC).
 - [ ] Spot-check 10,000 random accounts and slots against public RPC at the snapshot block.
 
 ## Decisions
