@@ -38,11 +38,14 @@ pub const Api = struct {
     witness: ?*node.witness.Generator = null,
     /// Polling filters (eth_newFilter and friends); null disables them.
     filters: ?*filters_module.Filters = null,
+    /// eth_sendRawTransactionSync's hand-off to the transport; null disables the method.
+    sync: ?*send_sync.Request = null,
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
     @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
-    @import("access_list.zig").methods ++ @import("simulate.zig").methods;
+    @import("access_list.zig").methods ++ @import("simulate.zig").methods ++ send_sync.methods;
+const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
@@ -422,8 +425,14 @@ fn nth_transaction(record: node.chain.Record, index: u32) []const u8 {
 fn get_transaction_receipt(api: *Api, call: *Call) HandlerError!void {
     const tx_hash = try call.params.fixed(32);
     try call.params.finish();
-    const location = api.chain.find_transaction(tx_hash) orelse return call.writer.null_value();
-    try block_receipts(api, call.writer, location.block_hash, location.index);
+    if (!try write_receipt(api, call.writer, tx_hash)) try call.writer.null_value();
+}
+
+/// Writes the receipt of canonical transaction `tx_hash`; false (nothing written) if unknown.
+pub fn write_receipt(api: *Api, w: *json.Writer, tx_hash: Hash) HandlerError!bool {
+    const location = api.chain.find_transaction(tx_hash) orelse return false;
+    try block_receipts(api, w, location.block_hash, location.index);
+    return true;
 }
 
 fn get_block_receipts(api: *Api, call: *Call) HandlerError!void {
@@ -505,9 +514,16 @@ fn receipt_context(
 }
 
 fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
-    const half = api.scratch.len / 2;
-    const raw = try call.params.data(api.scratch[0..half]);
+    const raw = try call.params.data(api.scratch[0 .. api.scratch.len / 2]);
     try call.params.finish();
+    const hash = try add_raw(api, call, raw);
+    try call.writer.data(&hash);
+}
+
+/// Validates `raw` (decoded into the first half of the scratch) and adds it to the pool.
+pub fn add_raw(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+    const half = api.scratch.len / 2;
+    assert(raw.len <= half);
     const pool = api.pool orelse {
         return call.fail(rpc.code.server_error, "transaction pool disabled");
     };
@@ -537,7 +553,7 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
         return call.fail(rpc.code.server_error, @errorName(err));
     };
     if (api.filters) |filters| filters.note_pending(validated.tx.hash.bytes);
-    try call.writer.data(&validated.tx.hash.bytes);
+    return validated.tx.hash.bytes;
 }
 
 // ---- Calls ------------------------------------------------------------------------
@@ -846,6 +862,7 @@ test {
     _ = @import("access_list.zig");
     _ = @import("simulate.zig");
     _ = @import("eth_test.zig");
+    _ = @import("send_sync.zig");
     _ = @import("debug_test.zig");
     _ = @import("debug_http_test.zig");
     _ = @import("debug_large_test.zig");

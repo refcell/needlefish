@@ -46,8 +46,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   record in docs/PERF.md (`node/bench_engine.zig`: 11.7 ms per 10.5 Mgas slot).
 - [x] rpc: Denim `timestampMs` on blocks, `blockTimestampMs` on transactions and logs.
 - [x] Durable-mode slot bench (cost of `settle_head` unwind + re-apply per slot): within noise.
-- [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
-  timeout; needs async handler support in the rpc router).
+- [x] rpc: eth_sendRawTransactionSync (EIP-7966) over the HTTP server's deferred responses.
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
 - [x] rpc: eth_simulateV1 (multi-block, state/block overrides, fee-free; see Log).
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
@@ -87,6 +86,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: eth_sendRawTransactionSync (`rpc/send_sync.zig`). The router stays synchronous: the handler submits and records the hash in `Api.sync`; `handle_rpc` parks the connection (`defer_response`) in a 64-slot waiter table swept every 10 ms; answers with the canonical receipt, or error 4 with the hash as data (EIP-7966, reth message). Max wait 25 s (reth: 30 s), under the HTTP server's 30 s parked-connection timeout; a positive `timeoutMs` (number or quantity) only shortens it. Refused before submission in a batch, with an id over 64 bytes, or when the table is full; notifications are submitted, not parked.
 - 2026-11-05: Denim RPC timestamps as base/base `rpc-types`: blocks get `timestampMs`, transactions and logs (incl. receipt logs, eth_getLogs) get `blockTimestampMs`, from the validated tx[1] BaseTime deposit (`format.timestamp_ms`), omitted otherwise. Not ported: base/base's 256-entry LRU (decoding tx[1] per request is cheap) and pending-block timestamps (no pending block here).
 - 2026-11-05: (reported by dst-fuzz) durable restart resumed on the last executed block, not the forkchoice head. Fix: `Chain.settle_head` keeps the database head at the forkchoice head at rest in durable mode. After a payload build (`start_build`) or a valid newPayload stores a non-head block, its changeset is unwound immediately; the adopting FCU re-applies it. Side builds (`build_block`, debug_executePayload/witness) keep the state at the built block as before. Safe/finalized labels are still not persisted (no database label API); recorded for later.
 - 2026-11-05: 200 ms slot bench (`node/bench_engine.zig`, Denim spec, 500 transfers = 10.5 Mgas forced via attributes, builder + follower, recovery threads as `base node`): 56 ms -> 11.7 ms per slot (build ~6 ms, import ~6 ms, adopting FCUs ~0.15 ms; Apple M-series, ReleaseFast). Fixes: forkchoice pool pruning recovered every included sender again (~17 ms per FCU per node); the executor now reports senders (`Executed.senders`) and Chain keeps the last 4 blocks' senders (`RecentSenders`). The build path recovers forced attribute transactions in parallel (`Executor.apply_list`, shared with `execute_block`).

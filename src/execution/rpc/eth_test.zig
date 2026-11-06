@@ -16,6 +16,7 @@ const eth_config = @import("eth_config.zig");
 const chainspec = @import("../chainspec/root.zig");
 const history_module = @import("../db/history.zig");
 const eth = @import("eth.zig");
+const send_sync = @import("send_sync.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const engine_types = @import("../engine/root.zig").types;
@@ -858,6 +859,7 @@ const method_names = [_][]const u8{
     "eth_getStorageAt",
     "eth_getTransactionReceipt",
     "eth_sendRawTransaction",
+    "eth_sendRawTransactionSync",
     "eth_getBlockByHash",
     "eth_getProof",
     "miner_setMaxDASize",
@@ -999,4 +1001,73 @@ test "eth: pre-Denim blocks carry no millisecond timestamps" {
     _ = try h.mine(12);
     const block = try h.request("eth_getBlockByNumber", "[\"0x1\",true]");
     try testing.expect(std.mem.indexOf(u8, block, "timestampMs") == null);
+}
+
+fn transfer_raw(buffer: []u8, nonce: u64) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = nonce,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 21_000,
+        .to = .{ .call = fixture.address_of(9) },
+        .value = 77,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+fn send_sync_raw(h: *Harness, raw: []const u8, timeout: []const u8) ![]const u8 {
+    var body: [1024]u8 = undefined;
+    const format = request_prefix_format ++
+        "eth_sendRawTransactionSync\",\"params\":[\"0x{x}\"{s}]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{ raw, timeout });
+    var out: std.Io.Writer = .fixed(&h.out);
+    _ = eth.Router.handle(&h.api, request, &out);
+    try json.validate(out.buffered());
+    return out.buffered();
+}
+
+test "eth: sendRawTransactionSync hands a single call's transaction to the transport" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var raw_buffer: [256]u8 = undefined;
+    const raw = try transfer_raw(&raw_buffer, 0);
+    // No transport support: the method is unavailable and nothing is submitted.
+    try expect_contains(try send_sync_raw(h, raw, ""), "unavailable");
+    try testing.expectEqual(@as(u32, 0), h.node.pool.count());
+    var request: send_sync.Request = .{ .timeout_ms_max = 25_000 };
+    h.api.sync = &request;
+    // A batch (or no free slot) is refused before submission.
+    request.prepare(false, true);
+    try expect_contains(try send_sync_raw(h, raw, ""), "in a batch");
+    request.prepare(true, false);
+    try expect_contains(try send_sync_raw(h, raw, ""), "too many pending");
+    try testing.expectEqual(@as(u32, 0), h.node.pool.count());
+    try testing.expect(request.hash == null);
+    // A shorter requested timeout applies; the hash is the fallback result.
+    request.prepare(true, true);
+    try expect_contains(try send_sync_raw(h, raw, ",500"), "\"result\":\"0x");
+    try testing.expectEqual(@as(u32, 1), h.node.pool.count());
+    try testing.expectEqualSlices(u8, &primitives.keccak256(raw).bytes, &request.hash.?);
+    try testing.expectEqual(@as(u64, 500), request.timeout_ms);
+    // A longer one is capped; the second (nonce 1) transaction also enters the pool.
+    const next = try transfer_raw(&raw_buffer, 1);
+    request.prepare(true, true);
+    try expect_contains(try send_sync_raw(h, next, ",\"0xf4240\""), "\"result\":\"0x");
+    try testing.expectEqual(@as(u64, 25_000), request.timeout_ms);
+    // Invalid transactions fail like eth_sendRawTransaction and are not parked.
+    request.prepare(true, true);
+    try expect_contains(try send_sync_raw(h, next, ""), "\"error\"");
+    try testing.expect(request.hash == null);
+    // Once mined, the receipt the transport answers with is the canonical one.
+    _ = try h.mine(12);
+    var out: std.Io.Writer = .fixed(&h.out);
+    const hash = primitives.keccak256(raw).bytes;
+    try testing.expect(send_sync.write_included(&h.api, &out, "7", hash));
+    try json.validate(out.buffered());
+    try expect_contains(out.buffered(), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{");
+    try expect_contains(out.buffered(), "\"status\":\"0x1\"");
 }

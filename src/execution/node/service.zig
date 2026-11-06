@@ -16,10 +16,14 @@ const payload = @import("../payload/root.zig");
 const txpool = @import("../txpool/root.zig");
 const engine_module = @import("../engine/root.zig");
 const eth = @import("../rpc/eth.zig");
+const send_sync = @import("../rpc/send_sync.zig");
+const rpc = @import("../../utilities/rpc/root.zig");
 const filters_module = @import("../rpc/filters.zig");
 const engine_rpc = @import("../rpc/engine.zig");
 const jwt = @import("../../utilities/jwt/root.zig");
 const http = @import("../../utilities/http/root.zig");
+/// Parked eth_sendRawTransactionSync calls (each holds an HTTP connection).
+const sync_waiters_max = 64;
 const io_module = @import("../../utilities/io/root.zig");
 const log = @import("../../utilities/log/root.zig");
 const Executor = @import("executor.zig").Executor;
@@ -212,6 +216,12 @@ pub const Limits = struct {
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
     },
     rpc_scratch_bytes: u32 = 4 << 20,
+    /// eth_sendRawTransactionSync: the longest wait for inclusion (reth's default is 30 s;
+    /// kept under the HTTP server's 30 s `io_timeout_ns`, which drops parked connections).
+    send_raw_tx_sync_timeout_ms: u64 = 25_000,
+    /// How often parked eth_sendRawTransactionSync calls are checked (a 200 ms block is
+    /// answered within this much of becoming canonical).
+    send_raw_tx_sync_poll_ns: u64 = 10 * std.time.ns_per_ms,
     /// Durable database layout; `state` and `changeset` are derived from `state` above.
     durable: db_module.database.Config = .{
         .engine = .{
@@ -331,6 +341,7 @@ pub fn Service(comptime IO: type) type {
         const Storage = io_storage.IoStorageType(IO);
         const DurableState = durable_module.Durable(Storage);
         const NodeBuilder = node_builder_module.NodeBuilder(IO);
+        const SyncWaiters = send_sync.Waiters(http.Deferred, sync_waiters_max);
 
         allocator: std.mem.Allocator,
         io: *IO,
@@ -357,6 +368,10 @@ pub fn Service(comptime IO: type) type {
         durable: ?*DurableState = null,
         storage_completion: IO.Completion = .{},
         node_builder: ?*NodeBuilder = null,
+        sync_request: send_sync.Request = .{ .timeout_ms_max = 1 },
+        sync_waiters: SyncWaiters = .{},
+        sync_completion: IO.Completion = .{},
+        sync_timer_armed: bool = false,
         blocks_mined: u64 = 0,
         mine_failures: u64 = 0,
 
@@ -570,6 +585,12 @@ pub fn Service(comptime IO: type) type {
                 .scratch = try lazy.alloc(allocator, u8, limits.rpc_scratch_bytes),
             };
             errdefer lazy.free(allocator, service.api.scratch);
+            const sync_timeout_ms = limits.send_raw_tx_sync_timeout_ms;
+            assert(sync_timeout_ms > 0);
+            assert(sync_timeout_ms * std.time.ns_per_ms < limits.http.io_timeout_ns or
+                limits.http.io_timeout_ns == 0);
+            service.sync_request = .{ .timeout_ms_max = sync_timeout_ms };
+            service.api.sync = &service.sync_request;
             const filters = try allocator.create(filters_module.Filters);
             filters.* = .{};
             service.filters = filters;
@@ -723,8 +744,83 @@ pub fn Service(comptime IO: type) type {
             response: *http.ResponseBuilder,
         ) void {
             if (request.method != .POST) return response.fail(405);
+            const id = send_sync.request_id(request.body);
+            service.sync_request.prepare(id != null, !service.sync_waiters.full());
             const outcome = eth.Router.handle(&service.api, request.body, response.writer());
             if (outcome == .empty) response.status = 204;
+            const hash = service.sync_request.hash orelse return;
+            // A notification (no id) gets no answer: nothing to park.
+            if (outcome != .response or std.mem.eql(u8, id.?, "null")) return;
+            const token = response.defer_response();
+            const now_ns = service.io.now_monotonic_ns();
+            const timeout_ms = service.sync_request.timeout_ms;
+            service.sync_waiters.add(token, hash, now_ns, timeout_ms, id.?);
+            service.schedule_sync_poll();
+        }
+
+        // ---- eth_sendRawTransactionSync waiters -------------------------------------
+
+        fn schedule_sync_poll(service: *Self) void {
+            if (service.sync_timer_armed) return;
+            assert(service.sync_waiters.count > 0);
+            service.sync_timer_armed = true;
+            const delay_ns = service.options.limits.send_raw_tx_sync_poll_ns;
+            const completion = &service.sync_completion;
+            service.io.timeout(*Self, service, on_sync_poll, completion, delay_ns);
+        }
+
+        fn on_sync_poll(
+            service: *Self,
+            completion: *IO.Completion,
+            result: io_module.TimeoutError!void,
+        ) void {
+            assert(completion == &service.sync_completion);
+            assert(service.sync_timer_armed);
+            service.sync_timer_armed = false;
+            result catch return; // Canceled at shutdown: the server answers parked calls.
+            const now_ns = service.io.now_monotonic_ns();
+            service.sync_waiters.sweep(now_ns, service, sync_alive, sync_included, sync_finish);
+            if (service.sync_waiters.count > 0) service.schedule_sync_poll();
+        }
+
+        fn sync_alive(service: *Self, token: http.Deferred) bool {
+            return service.http_server.deferred_valid(token);
+        }
+
+        fn sync_included(service: *Self, hash: [32]u8) bool {
+            return service.chain.find_transaction(hash) != null;
+        }
+
+        const SyncAnswer = struct {
+            service: *Self,
+            slot: *const SyncWaiters.Slot,
+            outcome: SyncWaiters.Outcome,
+        };
+
+        fn sync_finish(
+            service: *Self,
+            slot: *const SyncWaiters.Slot,
+            outcome: SyncWaiters.Outcome,
+        ) void {
+            const answer: SyncAnswer = .{ .service = service, .slot = slot, .outcome = outcome };
+            const resumed = service.http_server.resume_deferred(slot.token, answer, write_sync);
+            assert(resumed); // `sync_alive` held just before, in the same callback.
+        }
+
+        fn write_sync(answer: SyncAnswer, response: *http.ResponseBuilder) void {
+            const slot = answer.slot;
+            const out = response.writer();
+            const id = slot.id_text();
+            switch (answer.outcome) {
+                .included => if (send_sync.write_included(&answer.service.api, out, id, slot.hash))
+                    return,
+                .timed_out => {
+                    send_sync.write_timed_out(out, id, slot.hash, slot.timeout_ms) catch {};
+                    return;
+                },
+            }
+            const message = "receipt too large";
+            rpc.write_error(out, id, rpc.code.internal_error, message) catch response.fail(500);
         }
 
         fn handle_beacon(

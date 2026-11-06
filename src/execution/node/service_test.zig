@@ -542,3 +542,109 @@ test "service: --builder.enabled routes FCU and getPayload through the payload s
     try testing.expectEqualSlices(u8, &parent.bytes, &header.parent_hash.bytes);
     try testing.expectEqual(attributes.timestamp, header.timestamp);
 }
+
+const SyncOutcome = struct {
+    done: bool = false,
+    error_code: i64 = 0,
+    text: [512]u8 = undefined,
+    size: usize = 0,
+
+    fn on_result(
+        outcome: *SyncOutcome,
+        client: *rpc.Client(io.SimIo),
+        result: rpc.client.Error!rpc.client.Result,
+    ) void {
+        _ = client;
+        outcome.done = true;
+        const value = result catch return;
+        const text = switch (value) {
+            .ok => |ok| ok,
+            .rpc_error => |failure| blk: {
+                outcome.error_code = failure.code;
+                break :blk failure.data;
+            },
+        };
+        outcome.size = @min(text.len, outcome.text.len);
+        @memcpy(outcome.text[0..outcome.size], text[0..outcome.size]);
+    }
+
+    fn contains(outcome: *const SyncOutcome, needle: []const u8) bool {
+        return std.mem.indexOf(u8, outcome.text[0..outcome.size], needle) != null;
+    }
+};
+
+const SyncParams = struct {
+    raw: []const u8,
+    timeout_ms: ?u64,
+
+    fn write(params: SyncParams, writer: *json.Writer) json.Writer.WriteError!void {
+        try writer.data(params.raw);
+        if (params.timeout_ms) |timeout_ms| try writer.integer(timeout_ms);
+    }
+};
+
+fn dev_transfer(buffer: []u8, nonce: u64) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = 900,
+        .nonce = nonce,
+        .max_priority_fee_per_gas = 1_000_000_000,
+        .max_fee_per_gas = 100_000_000_000,
+        .gas_limit = 21_000,
+        .to = .{ .call = .{ .bytes = @splat(0x77) } },
+        .value = 1,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, devnet.accounts.derive_dev(0).private_key);
+    return envelope.encode_to(buffer);
+}
+
+test "service: eth_sendRawTransactionSync answers with the receipt or times out" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const service = &harness.service;
+    var client_io: io.SimIo = undefined;
+    const client_host = io.Address.ip4(.{ 10, 0, 0, 2 }, 0);
+    try io.SimIo.init(&client_io, testing.allocator, &harness.world, .{ .host = client_host });
+    defer client_io.deinit();
+    const bound = try service.start();
+    var client = try rpc.Client(io.SimIo).init(testing.allocator, &client_io, bound, .{
+        .send_buffer_size = 4096,
+        .recv_buffer_size = 16 * 1024,
+        .limits = .{ .head_size_max = 1024, .body_size_max = 8 * 1024 },
+    }, 1024);
+    defer client.deinit();
+    const method = "eth_sendRawTransactionSync";
+    var raw_buffer: [256]u8 = undefined;
+
+    // Parked until the next dev L1 block (2 s slots), then answered with the receipt.
+    var included: SyncOutcome = .{};
+    const first: SyncParams = .{ .raw = try dev_transfer(&raw_buffer, 0), .timeout_ms = null };
+    const on_result = SyncOutcome.on_result;
+    try client.call(*SyncOutcome, &included, on_result, method, first, SyncParams.write);
+    harness.world.run_for_ns(std.time.ns_per_s / 2);
+    try testing.expect(!included.done);
+    try testing.expectEqual(@as(u32, 1), service.sync_waiters.count);
+    harness.world.run_for_ns(2 * std.time.ns_per_s);
+    try testing.expect(included.done);
+    try testing.expectEqual(@as(i64, 0), included.error_code);
+    try testing.expect(included.contains("\"blockNumber\":\"0x1\""));
+    try testing.expect(included.contains("\"status\":\"0x1\""));
+    try testing.expectEqual(@as(u32, 0), service.sync_waiters.count);
+
+    // A nonce gap is never mined: error 4 after the requested 300 ms, the hash as data.
+    var timed_out: SyncOutcome = .{};
+    const gapped = try dev_transfer(&raw_buffer, 5);
+    const second: SyncParams = .{ .raw = gapped, .timeout_ms = 300 };
+    try client.call(*SyncOutcome, &timed_out, on_result, method, second, SyncParams.write);
+    harness.world.run_for_ns(std.time.ns_per_s / 5);
+    try testing.expect(!timed_out.done);
+    harness.world.run_for_ns(std.time.ns_per_s / 5);
+    try testing.expect(timed_out.done);
+    try testing.expectEqual(@as(i64, 4), timed_out.error_code);
+    var hash_text: [66]u8 = undefined;
+    const hash = primitives.keccak256(gapped).bytes;
+    try testing.expect(timed_out.contains(try std.fmt.bufPrint(&hash_text, "0x{x}", .{&hash})));
+    try testing.expectEqual(@as(u32, 0), service.sync_waiters.count);
+    try testing.expectEqual(@as(u32, 1), service.pool.count()); // Still pooled.
+}
