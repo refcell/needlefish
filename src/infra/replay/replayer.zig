@@ -40,6 +40,24 @@ const keccak256 = trie.node.keccak256;
 pub const l2_to_l1_message_passer: Address =
     primitives.hex.decode_array(20, "4200000000000000000000000000000000000016") catch unreachable;
 
+/// The stand-in for an opaque branch: two all-zero child hashes and fifteen empty items
+/// (fourteen children and the value). Its shape is all a collapse reads. It is never hashed:
+/// a clean node keeps its real reference.
+/// `rlp([0xa0 ++ 32 x 0, 0xa0 ++ 32 x 0, "", ..., ""])`.
+pub const opaque_branch: [2 + 2 * 33 + 15]u8 = blk: {
+    var bytes: [2 + 2 * 33 + 15]u8 = undefined;
+    bytes[0] = 0xf8; // List, one length byte (payload 56..255 bytes).
+    bytes[1] = 2 * 33 + 15;
+    var offset: usize = 2;
+    for (0..2) |_| {
+        bytes[offset] = 0xa0;
+        @memset(bytes[offset + 1 ..][0..32], 0);
+        offset += 33;
+    }
+    @memset(bytes[offset..], 0x80);
+    break :blk bytes;
+};
+
 /// The EVM serves BLOCKHASH for the 256 most recent ancestors.
 pub const block_hash_window = 256;
 /// Gap entries kept per kind; more are counted, not kept.
@@ -230,7 +248,7 @@ pub const Outcome = struct {
     }
 
     pub fn check(outcome: *const Outcome, which: Check) bool {
-        return outcome.passed & (@as(u16, 1) << @backingInt(which)) != 0;
+        return outcome.passed & (@as(u16, 1) << @as(u4, @intCast(@backingInt(which)))) != 0;
     }
 
     /// The first check that failed, in check order.
@@ -294,7 +312,8 @@ pub const Replayer = struct {
         errdefer self.sparse.deinit(allocator);
         self.changeset = try db.Changeset.init(allocator, config.changeset);
         errdefer self.changeset.deinit(allocator);
-        self.header_hashes = try allocator.alloc(Hash, archive.witness.headers.count);
+        const hashes = archive.ancestors_len + archive.block_count;
+        self.header_hashes = try allocator.alloc(Hash, hashes);
         errdefer allocator.free(self.header_hashes);
         self.transaction_views = try allocator.alloc([]const u8, config.executor.transactions_max);
         errdefer allocator.free(self.transaction_views);
@@ -314,17 +333,19 @@ pub const Replayer = struct {
 
     /// Binds the sparse state to the first block's parent and loads every node and code.
     fn load(self: *Replayer) Error!void {
-        const witness = &self.archive.witness;
-        for (0..witness.headers.count) |index| {
-            self.header_hashes[index] = keccak256(witness.headers.get(@intCast(index)));
+        const archive = self.archive;
+        const witness = &archive.witness;
+        const ancestors = archive.ancestors[0..archive.ancestors_len];
+        @memcpy(self.header_hashes[0..ancestors.len], ancestors);
+        for (0..archive.block_count) |index| {
+            const header = archive.block_header(@intCast(index));
+            self.header_hashes[archive.ancestors_len + index] = keccak256(header);
         }
-        self.first_number = db.witness.header_number(witness.headers.get(0)) catch
-            return error.InvalidArchive;
-        const parent_rlp = self.archive.parent_header();
-        const parent = db.witness.header_link(parent_rlp) catch return error.InvalidArchive;
-        self.sparse.reset(parent.state_root, .{
-            .number = parent.number,
-            .hash = keccak256(parent_rlp),
+        self.first_number = archive.first_ancestor_number();
+        const parent_number = self.first_number + archive.ancestors_len - 1;
+        self.sparse.reset(archive.parent_state_root, .{
+            .number = parent_number,
+            .hash = archive.parent_hash(),
         });
         self.sparse.set_fallback(self.fallback());
         for (0..witness.state.count) |index| {
@@ -335,7 +356,7 @@ pub const Replayer = struct {
         }
         try self.sparse.verify_headers();
         self.executor.state.reset(self.database());
-        assert(std.mem.eql(u8, &self.sparse.state_root(), &parent.state_root));
+        assert(std.mem.eql(u8, &self.sparse.state_root(), &archive.parent_state_root));
     }
 
     pub fn done(self: *const Replayer) bool {
@@ -414,6 +435,8 @@ pub const Replayer = struct {
             if (self.sparse.account_storage_root(l2_to_l1_message_passer)) |root| {
                 sealed.withdrawals_root = .{ .bytes = root };
             } else |_| {
+                // The witness lacks the message passer's account: ask the fetcher for it.
+                self.gaps.account(l2_to_l1_message_passer);
                 sealed.withdrawals_root = .{ .bytes = @splat(0) };
             }
         }
@@ -513,8 +536,14 @@ pub const Replayer = struct {
         return @ptrCast(@alignCast(context));
     }
 
+    /// An opaque branch resolves to a stand-in branch: the trie only checks its kind (a
+    /// collapse turns its parent into an extension over it) and keeps its real hash as the
+    /// reference, since nothing in the archive reads below it (a real preimage, when any
+    /// block's proof has one, is in the node store and wins over the fallback).
     fn fallback_node(context: *anyopaque, hash: *const Hash) ?[]const u8 {
-        from(context).gaps.node(hash.*);
+        const self = from(context);
+        if (self.archive.is_opaque(hash)) return &opaque_branch;
+        self.gaps.node(hash.*);
         return null;
     }
 

@@ -11,7 +11,9 @@
 //!
 //! Body:
 //!
-//!     chain_id u64 | block_count u32 | witness_bytes u32 | witness | block_count x block
+//!     chain_id u64 | block_count u32 | witness_bytes u32 | witness |
+//!     parent_state_root [32] | ancestor_count u32 | ancestor_count x hash [32] |
+//!     opaque_count u32 | opaque_count x hash [32] | block_count x block
 //!     block = tx_count u32 | tx_count x (tx_bytes u32 | tx) |
 //!             tx_count x receipt | account_count u32 | account_count x account |
 //!             slot_count u32 | slot_count x slot
@@ -21,10 +23,15 @@
 //!
 //! `witness` is the canonical `NFWT` encoding (`db/witness_codec.zig`): `state` holds the
 //! pre-state trie nodes every block needs (deduplicated across blocks), `codes` the bytecodes
-//! read, `keys` is empty, and `headers` is a contiguous run of RLP headers, oldest first: the
-//! ancestors BLOCKHASH may read, the parent of the first replayed block, then the replayed
-//! blocks themselves (always the last `block_count` headers). Transactions are EIP-2718
-//! encodings. Receipts, accounts and slots are the canonical chain's results, used only for
+//! read, `keys` is empty, and `headers` holds exactly the replayed blocks' RLP headers, a
+//! hash-linked run, oldest first. `ancestors` are the hashes of the blocks just below the
+//! first one, oldest first, ending at its parent (the first header's parent hash): what
+//! BLOCKHASH reads. `parent_state_root` is the parent's state root, the pre-state of the
+//! replay. Ancestor hashes are trusted input (a wrong one only fails a replay that reads it).
+//! Transactions are EIP-2718 encodings. `opaque` lists hashes of branch nodes whose preimage
+//! no public endpoint serves and that the replay only keeps by reference: the surviving child
+//! of a branch that collapses when a key is deleted (strictly ascending; see `replayer.zig`).
+//! Receipts, accounts and slots are the canonical chain's results, used only for
 //! first-difference diagnostics (the header roots are the pass/fail check): the receipt of
 //! each transaction, and the post-block value of every account and slot the block changed
 //! (`present = 0`: the account was deleted). Accounts ascend strictly by address, slots by
@@ -51,6 +58,8 @@ pub const version: u32 = 1;
 pub const frame_bytes = 4 + 4 + 8 + 32;
 /// Largest body a decoder accepts.
 pub const body_bytes_max: u64 = 1 << 31;
+/// Ancestor hashes BLOCKHASH can read (the EVM's window).
+pub const ancestors_max: u32 = 256;
 /// Largest block range one archive holds.
 pub const blocks_max: u32 = 1024;
 /// Body bytes before the witness: chain id, block count, witness size.
@@ -117,6 +126,13 @@ pub const Archive = struct {
     account_starts: []u32,
     slot_starts: []u32,
     block_count: u32 = 0,
+    /// Opaque branch hashes, strictly ascending.
+    opaque_branches: []Hash,
+    opaque_len: u32 = 0,
+    parent_state_root: Hash = @splat(0),
+    /// Hashes of the blocks below the first replayed block, ending at its parent.
+    ancestors: []Hash,
+    ancestors_len: u32 = 0,
 
     pub const Config = struct {
         witness: Witness.Config,
@@ -124,11 +140,12 @@ pub const Archive = struct {
         transaction_bytes_max: u32,
         accounts_max: u32,
         slots_max: u32,
+        opaque_max: u32 = 4096,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Archive {
         assert(config.transactions_max > 0 and config.transaction_bytes_max > 0);
-        assert(config.witness.headers_max >= 2);
+        assert(config.witness.headers_max >= 1);
         var witness = try Witness.init(allocator, config.witness);
         errdefer witness.deinit(allocator);
         var transactions = try ByteList.init(
@@ -143,6 +160,10 @@ pub const Archive = struct {
         errdefer allocator.free(accounts);
         const slots = try allocator.alloc(SlotPost, @max(config.slots_max, 1));
         errdefer allocator.free(slots);
+        const opaque_hashes = try allocator.alloc(Hash, @max(config.opaque_max, 1));
+        errdefer allocator.free(opaque_hashes);
+        const ancestors = try allocator.alloc(Hash, ancestors_max);
+        errdefer allocator.free(ancestors);
         const starts = try allocator.alloc(u32, 3 * (blocks_max + 1));
         @memset(starts, 0);
         return .{
@@ -154,11 +175,15 @@ pub const Archive = struct {
             .block_starts = starts[0 .. blocks_max + 1],
             .account_starts = starts[blocks_max + 1 ..][0 .. blocks_max + 1],
             .slot_starts = starts[2 * (blocks_max + 1) ..],
+            .opaque_branches = opaque_hashes,
+            .ancestors = ancestors,
         };
     }
 
     pub fn deinit(self: *Archive, allocator: std.mem.Allocator) void {
         allocator.free(self.block_starts.ptr[0 .. 3 * (blocks_max + 1)]);
+        allocator.free(self.ancestors);
+        allocator.free(self.opaque_branches);
         allocator.free(self.slots);
         allocator.free(self.accounts);
         allocator.free(self.receipts);
@@ -173,6 +198,9 @@ pub const Archive = struct {
         self.transactions.clear();
         self.accounts_len = 0;
         self.slots_len = 0;
+        self.opaque_len = 0;
+        self.ancestors_len = 0;
+        self.parent_state_root = @splat(0);
         self.block_count = 0;
         assert(self.block_starts[0] == 0 and self.account_starts[0] == 0);
     }
@@ -216,19 +244,59 @@ pub const Archive = struct {
         self.slot_starts[self.block_count] = self.slots_len;
     }
 
+    /// Adds an opaque branch hash (kept sorted, duplicates ignored).
+    pub fn add_opaque(self: *Archive, hash: Hash) error{WitnessFull}!void {
+        if (self.is_opaque(&hash)) return;
+        if (self.opaque_len == self.opaque_branches.len) return error.WitnessFull;
+        var position = self.opaque_len;
+        while (position > 0 and hash_less(&hash, &self.opaque_branches[position - 1])) {
+            self.opaque_branches[position] = self.opaque_branches[position - 1];
+            position -= 1;
+        }
+        self.opaque_branches[position] = hash;
+        self.opaque_len += 1;
+        assert(self.is_opaque(&hash));
+    }
+
+    pub fn is_opaque(self: *const Archive, hash: *const Hash) bool {
+        const list = self.opaque_branches[0..self.opaque_len];
+        var low: usize = 0;
+        var high: usize = list.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            switch (std.mem.order(u8, &list[middle], hash)) {
+                .eq => return true,
+                .lt => low = middle + 1,
+                .gt => high = middle,
+            }
+        }
+        return false;
+    }
+
     /// The RLP header of replayed block `index` (0 = first).
     pub fn block_header(self: *const Archive, index: u32) []const u8 {
         assert(index < self.block_count);
-        const headers = &self.witness.headers;
-        assert(headers.count > self.block_count);
-        return headers.get(headers.count - self.block_count + index);
+        assert(self.witness.headers.count == self.block_count);
+        return self.witness.headers.get(index);
     }
 
-    /// The RLP header of the parent of the first replayed block.
-    pub fn parent_header(self: *const Archive) []const u8 {
-        const headers = &self.witness.headers;
-        assert(headers.count > self.block_count);
-        return headers.get(headers.count - self.block_count - 1);
+    /// The hash of the first replayed block's parent.
+    pub fn parent_hash(self: *const Archive) Hash {
+        assert(self.ancestors_len > 0);
+        return self.ancestors[self.ancestors_len - 1];
+    }
+
+    /// The number of the first ancestor (the first replayed block's number minus the count).
+    pub fn first_ancestor_number(self: *const Archive) u64 {
+        assert(self.ancestors_len > 0 and self.block_count > 0);
+        const first = witness_module.header_number(self.block_header(0)) catch unreachable;
+        return first - self.ancestors_len;
+    }
+
+    pub fn add_ancestor(self: *Archive, hash: Hash) error{WitnessFull}!void {
+        if (self.ancestors_len == self.ancestors.len) return error.WitnessFull;
+        self.ancestors[self.ancestors_len] = hash;
+        self.ancestors_len += 1;
     }
 
     pub fn transaction_count(self: *const Archive, index: u32) u32 {
@@ -263,7 +331,8 @@ pub const Archive = struct {
 
     /// Body bytes of everything after the witness.
     fn blocks_bytes(self: *const Archive) u64 {
-        var size: u64 = 12 * @as(u64, self.block_count);
+        var size: u64 = 4 + 32 * @as(u64, self.opaque_len) + 12 * @as(u64, self.block_count);
+        size += 32 + 4 + 32 * @as(u64, self.ancestors_len);
         const total = self.transactions_total();
         size += (4 + receipt_bytes) * @as(u64, total);
         for (0..total) |index| size += self.transactions.get(@intCast(index)).len;
@@ -280,7 +349,8 @@ pub fn encode_body(
     witness_config: Witness.Config,
 ) EncodeError![]u8 {
     assert(archive.block_count > 0);
-    assert(archive.witness.headers.count > archive.block_count);
+    assert(archive.witness.headers.count == archive.block_count);
+    assert(archive.ancestors_len > 0);
     var encoder = try codec.Encoder.init(allocator, witness_config);
     defer encoder.deinit(allocator);
     const witness_bytes = try encoder.encoded_size(&archive.witness);
@@ -293,6 +363,11 @@ pub fn encode_body(
     writer.int(u32, archive.block_count);
     writer.int(u32, witness_bytes);
     writer.offset += try encoder.encode(&archive.witness, body[writer.offset..][0..witness_bytes]);
+    writer.bytes(&archive.parent_state_root);
+    writer.int(u32, archive.ancestors_len);
+    for (archive.ancestors[0..archive.ancestors_len]) |hash| writer.bytes(&hash);
+    writer.int(u32, archive.opaque_len);
+    for (archive.opaque_branches[0..archive.opaque_len]) |hash| writer.bytes(&hash);
     for (0..archive.block_count) |block| write_block(&writer, archive, @intCast(block));
     assert(writer.offset == body.len);
     return body;
@@ -341,9 +416,12 @@ pub fn decode_body(body: []const u8, out: *Archive) DecodeError!void {
     if (block_count == 0 or block_count > blocks_max) return error.NonCanonical;
     try codec.decode(try reader.take(witness_bytes), &out.witness);
     if (out.witness.keys.count != 0) return error.NonCanonical;
-    if (out.witness.headers.count <= block_count) return error.NonCanonical;
+    if (out.witness.headers.count != block_count) return error.NonCanonical;
     try check_header_run(&out.witness.headers);
     out.chain_id = chain_id;
+    out.parent_state_root = (try reader.take(32))[0..32].*;
+    try read_ancestors(&reader, out);
+    try read_opaque(&reader, out);
     for (0..block_count) |_| try read_block(&reader, out);
     if (reader.remaining() != 0) return error.NonCanonical;
     assert(out.block_count == block_count);
@@ -374,6 +452,35 @@ fn read_block(reader: *Reader, out: *Archive) DecodeError!void {
     }
     try read_accounts(reader, out);
     try read_slots(reader, out);
+}
+
+fn read_ancestors(reader: *Reader, out: *Archive) DecodeError!void {
+    const count = try reader.int(u32);
+    if (count == 0 or count > ancestors_max) return error.NonCanonical;
+    for (0..count) |_| {
+        out.add_ancestor((try reader.take(32))[0..32].*) catch unreachable; // Bounded above.
+    }
+    const link = witness_module.header_link(out.witness.headers.get(0)) catch
+        return error.NonCanonical;
+    if (!std.mem.eql(u8, &link.parent_hash, &out.parent_hash())) return error.NonCanonical;
+    if (link.number < count) return error.NonCanonical;
+}
+
+fn read_opaque(reader: *Reader, out: *Archive) DecodeError!void {
+    const count = try reader.int(u32);
+    if (count > reader.remaining() / 32) return error.Truncated;
+    if (count > out.opaque_branches.len) return error.NonCanonical;
+    for (0..count) |index| {
+        const hash = (try reader.take(32))[0..32].*;
+        const previous = if (index > 0) &out.opaque_branches[index - 1] else null;
+        if (previous != null and !hash_less(previous.?, &hash)) return error.NonCanonical;
+        out.opaque_branches[index] = hash;
+    }
+    out.opaque_len = count;
+}
+
+fn hash_less(a: *const Hash, b: *const Hash) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 fn read_accounts(reader: *Reader, out: *Archive) DecodeError!void {
@@ -431,7 +538,7 @@ pub fn slot_less(a: *const SlotPost, b: *const SlotPost) bool {
 /// The headers must be hash-linked: each one's parent hash is keccak256 of the previous
 /// one. (The codec already checked they decode and strictly ascend by number.)
 fn check_header_run(headers: *const ByteList) DecodeError!void {
-    assert(headers.count >= 2);
+    assert(headers.count >= 1);
     var previous = keccak256(headers.get(0));
     var previous_number = witness_module.header_number(headers.get(0)) catch
         return error.NonCanonical;

@@ -22,6 +22,7 @@ const fee_jobs = @import("fee_jobs.zig");
 const roxy = @import("roxy.zig");
 const basectl = @import("basectl.zig");
 const audit = @import("audit.zig");
+const replay = @import("replay.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -48,6 +49,7 @@ const usage =
     \\  roxy       JSON-RPC reverse proxy: load balancing, retries, method allowlist
     \\  basectl    operator commands: sync-status, block, txpool, doctor, ...
     \\  audit      transaction-event audit archiver: Vector ingest, JSON-RPC queries
+    \\  replay     replay real Base blocks offline and check every header field
     \\
 ;
 
@@ -71,6 +73,7 @@ test {
     _ = roxy;
     _ = basectl;
     _ = audit;
+    _ = replay;
     _ = @import("metrics_server.zig");
 }
 
@@ -156,6 +159,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "audit")) {
         return try audit.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "replay")) {
+        return try replay.main(init, args);
     }
     return null;
 }

@@ -14,6 +14,7 @@ const fuzz = @import("../../testing/fuzz.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const Archive = archive_module.Archive;
+const keccak256 = @import("../../execution/trie/root.zig").node.keccak256;
 
 const witness_config: db.witness.Witness.Config = .{
     .state_nodes_max = 32,
@@ -34,13 +35,19 @@ const config: Archive.Config = .{
 };
 
 /// An archive over headers 1..`header_count` of a test chain: the last `blocks` are the
-/// replayed blocks, each with `block + 1` transactions.
+/// replayed blocks, each with `block + 1` transactions, and the rest are ancestors.
 fn build(archive: *Archive, chain: *HeaderChain, header_count: u32, blocks: u32) !void {
     assert(blocks < header_count);
     archive.clear();
     archive.chain_id = 8453;
     chain.build(header_count, @splat(0x77));
-    for (chain.headers()) |header| try archive.witness.headers.append(header);
+    const headers = chain.headers();
+    const ancestors = header_count - blocks;
+    for (headers[0..ancestors]) |header| try archive.add_ancestor(keccak256(header));
+    for (headers[ancestors..]) |header| try archive.witness.headers.append(header);
+    archive.parent_state_root = @splat(0x55);
+    try archive.add_opaque(@splat(0xbb));
+    try archive.add_opaque(@splat(0xaa));
     try archive.witness.state.append(&.{ 0xc2, 0x01, 0x02 });
     try archive.witness.state.append(&.{ 0xc1, 0x05 });
     try archive.witness.codes.append(&.{ 0x60, 0x00 });
@@ -85,8 +92,13 @@ test "replay archive: round trip through body and frame" {
     try testing.expectEqual(@as(u64, 8453), decoded.chain_id);
     try testing.expectEqual(@as(u32, 3), decoded.block_count);
     try testing.expectEqual(@as(u32, 6), decoded.transactions_total());
-    try testing.expectEqualSlices(u8, chain.headers()[2], decoded.parent_header());
+    try testing.expectEqualSlices(u8, &keccak256(chain.headers()[2]), &decoded.parent_hash());
+    try testing.expectEqual(@as(u64, 1), decoded.first_ancestor_number());
     try testing.expectEqualSlices(u8, chain.headers()[5], decoded.block_header(2));
+    try testing.expectEqual(@as(u32, 2), decoded.opaque_len);
+    try testing.expect(decoded.is_opaque(&@as([32]u8, @splat(0xaa))));
+    try testing.expect(!decoded.is_opaque(&@as([32]u8, @splat(0xcc))));
+    try testing.expectEqual(@as(u8, 0x55), decoded.parent_state_root[0]);
     try testing.expectEqual(@as(u32, 3), decoded.transaction_count(2));
     try testing.expectEqualSlices(u8, &.{ 0x02, 2, 1 }, decoded.transaction(2, 1));
     try testing.expectEqual(@as(u64, 42_000), decoded.block_receipts(1)[1].cumulative_gas_used);
@@ -152,8 +164,8 @@ test "replay archive: the body is strict" {
     defer allocator.free(mutated);
     std.mem.writeInt(u32, mutated[8..12], 0, .little);
     try testing.expectError(error.NonCanonical, archive_module.decode_body(mutated, &out));
-    // As many blocks as headers: no parent header left.
-    std.mem.writeInt(u32, mutated[8..12], 4, .little);
+    // More blocks than headers.
+    std.mem.writeInt(u32, mutated[8..12], 3, .little);
     try testing.expect(std.meta.isError(archive_module.decode_body(mutated, &out)));
 }
 
@@ -178,10 +190,11 @@ test "replay archive: headers must be hash-linked" {
     defer archive.deinit(allocator);
     var chain: HeaderChain = .{};
     try build(&archive, &chain, 4, 1);
-    // Rebuild the header list with a gap (headers 1, 2, 4): the codec accepts ascending
-    // numbers, the archive requires a contiguous, linked run.
+    // Two replayed blocks with a gap (headers 2 and 4): the codec accepts ascending numbers,
+    // the archive requires a contiguous, linked run.
+    try archive.begin_block();
     archive.witness.headers.clear();
-    for ([_]usize{ 0, 1, 3 }) |index| try archive.witness.headers.append(chain.headers()[index]);
+    for ([_]usize{ 1, 3 }) |index| try archive.witness.headers.append(chain.headers()[index]);
     const body = try archive_module.encode_body(allocator, &archive, witness_config);
     defer allocator.free(body);
     var out = try Archive.init(allocator, config);
