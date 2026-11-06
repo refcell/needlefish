@@ -9,6 +9,7 @@ pub const metering = @import("metering.zig");
 pub const trace = @import("trace.zig");
 pub const prestate = @import("prestate.zig");
 pub const validity = @import("validity.zig");
+pub const account = @import("account.zig");
 pub const eth = @import("eth.zig");
 pub const engine_json = @import("engine_json.zig");
 pub const engine = @import("engine.zig");

@@ -54,7 +54,7 @@ pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_m
     @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
     @import("access_list.zig").methods ++ @import("simulate.zig").methods ++ send_sync.methods ++
     @import("metering.zig").methods ++ @import("trace.zig").methods ++
-    @import("validity.zig").methods;
+    @import("validity.zig").methods ++ @import("account.zig").methods;
 const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");

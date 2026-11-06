@@ -1627,3 +1627,94 @@ test "eth: seeded fuzz of eth_call storage overrides" {
         }));
     }
 }
+
+const sender_at = "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\"";
+const empty_storage_root =
+    "\"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421\"";
+
+test "eth: eth_getAccount, eth_getAccountInfo and eth_getHeaderBy* read accounts and headers" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const before = try h.mine(12);
+    var buffer: [256]u8 = undefined;
+    try expect_contains(try send_raw(h, try transfer_raw(&buffer, 0)), "\"result\":\"0x");
+    const after = try h.mine(24);
+    const account = try h.request("eth_getAccount", "[" ++ sender_at ++ ",\"latest\"]");
+    try expect_contains(account, "\"nonce\":\"0x1\"");
+    try expect_contains(account, "\"storageRoot\":" ++ empty_storage_root);
+    // The block before the transfer, from the history window.
+    var body: [256]u8 = undefined;
+    const old = try h.request_runtime(try std.fmt.bufPrint(
+        &body,
+        request_prefix_format ++ "eth_getAccount\",\"params\":[" ++ sender_at ++
+            ",\"0x{x}\"]}}",
+        .{&before.bytes},
+    ));
+    try expect_contains(old, "\"nonce\":\"0x0\"");
+    const code_hash = primitives.keccak256(&counter_code).bytes;
+    var expected: [96]u8 = undefined;
+    const contract = try h.request("eth_getAccount", "[" ++ counter_at ++ ",\"latest\"]");
+    try expect_contains(contract, try std.fmt.bufPrint(&expected, "\"codeHash\":\"0x{x}\"", .{
+        &code_hash,
+    }));
+    const absent = "[\"0x00000000000000000000000000000000000000aa\",\"latest\"]";
+    try expect_contains(try h.request("eth_getAccount", absent), "\"result\":null");
+    const info = try h.request("eth_getAccountInfo", "[" ++ counter_at ++ ",\"latest\"]");
+    try expect_contains(info, "\"code\":\"" ++ counter_hex ++ "\"");
+    try expect_contains(
+        try h.request("eth_getAccountInfo", absent),
+        "{\"balance\":\"0x0\",\"nonce\":\"0x0\",\"code\":\"0x\"}",
+    );
+    // Headers: the block's header fields without a body.
+    const header = try h.request("eth_getHeaderByNumber", "[\"latest\"]");
+    const hash_field = try std.fmt.bufPrint(&expected, "\"hash\":\"0x{x}\"", .{&after.bytes});
+    try expect_contains(header, hash_field);
+    try testing.expect(std.mem.indexOf(u8, header, "transactions\"") == null);
+    const by_hash = try h.request_runtime(try std.fmt.bufPrint(
+        &body,
+        request_prefix_format ++ "eth_getHeaderByHash\",\"params\":[\"0x{x}\"]}}",
+        .{&after.bytes},
+    ));
+    try expect_contains(by_hash, hash_field);
+    try expect_contains(try h.request("eth_getHeaderByNumber", "[\"0x99\"]"), "\"result\":null");
+}
+
+test "eth: seeded fuzz of eth_getAccount against eth_getBalance" {
+    var prng = Prng.init(0x6163);
+    const h = try Harness.create();
+    defer h.destroy();
+    for (0..32) |_| {
+        // Mostly low addresses (dev accounts and precompiles live there), sometimes random.
+        var address: [20]u8 = @splat(0);
+        if (prng.chance(1, 2)) prng.fill(&address) else address[19] = @intCast(prng.below(16));
+        var body: [256]u8 = undefined;
+        // Responses share the harness buffer: keep a copy before the next request.
+        var account_copy: [1024]u8 = undefined;
+        const account_text = try h.request_runtime(try std.fmt.bufPrint(
+            &body,
+            request_prefix_format ++ "eth_getAccount\",\"params\":[\"0x{x}\"]}}",
+            .{&address},
+        ));
+        @memcpy(account_copy[0..account_text.len], account_text);
+        const account = account_copy[0..account_text.len];
+        const balance = try h.request_runtime(try std.fmt.bufPrint(
+            &body,
+            request_prefix_format ++ "eth_getBalance\",\"params\":[\"0x{x}\"]}}",
+            .{&address},
+        ));
+        const value_start = std.mem.indexOf(u8, balance, "\"result\":").? + 9;
+        const value = balance[value_start .. balance.len - 1];
+        if (std.mem.indexOf(u8, account, "\"result\":null") == null) {
+            var expected: [96]u8 = undefined;
+            const field = try std.fmt.bufPrint(&expected, "\"balance\":{s}", .{value});
+            try expect_contains(account, field);
+        } else try testing.expectEqualStrings("\"0x0\"", value);
+    }
+}

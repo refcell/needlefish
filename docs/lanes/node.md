@@ -63,6 +63,10 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   predicates + `matches`, `Api.validity_sink`).
 - [x] rpc: eth_call/eth_estimateGas/debug_traceCall state and block overrides (geth 3rd
   param; reuse the eth_simulateV1 override code).
+- [x] rpc: reth account/header reads: eth_getAccount, eth_getAccountInfo,
+  eth_getHeaderByNumber, eth_getHeaderByHash.
+- [ ] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer) and
+  debug_storageRangeAt.
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -101,6 +105,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: rpc parity: eth_getAccount ({balance, nonce, codeHash, storageRoot} or null; head storage root from the trie, historical from `proof_at`), eth_getAccountInfo ({balance, nonce, code}, zeros when absent), eth_getHeaderByNumber/Hash (header fields + timestampMs, `size` = header RLP length) in rpc/account.zig. admin_drop* already existed (base/base uses the admin namespace).
 - 2026-11-06: parallel sender recovery in the replay path: `base replay` (bin/base/replay.zig, nf-replay's binary, small additive `replayer_config`) and the replay bench set `recovery_threads` = min(cores-1, 7) like `base node`; the library default stays 0 (deterministic tests/sim). ~5% faster (6.46 -> 6.16 ms/block). Test: the mainnet fixture replays with 3 workers and every check passes.
 - 2026-11-06: trie-db f1da5dbd sizes a code grid in `init_durable` when `grid_block_count` is 0, so `--datadir` directories written before it fail to open with LayoutMismatch. devnet.sh already wipes component datadirs on a fresh start (kept only while running or with DEVNET_KEEP=1, which then needs a manual wipe). No grid-less fallback requested.
 - 2026-11-06: replay bench after the evm code-analysis cache: 6.11 ms/block, 762 Mgas/s (was 379). Remaining time is keccak/sparse trie (replay backend, trie-db), interpreter (evm) and serial sender recovery (replayer config; production recovers in parallel); no node-owned hotspot left in this profile. Gigagas item stays open.
