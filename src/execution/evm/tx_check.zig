@@ -49,7 +49,18 @@ pub const Chain = struct {
     fork: Fork,
     op: ?op.Context,
     chain_id: u64,
+    /// Canonical headers (`number`, `hash`) answering BLOCKHASH; null leaves the database's
+    /// synthetic hashes.
+    headers: ?Value = null,
 };
+
+fn load_block_hashes(database: *MemoryDatabase, headers: Value) Error!void {
+    if (headers != .array) return error.BlockFileInvalid;
+    for (headers.array.items) |header| {
+        const hash = try parse_fixed(32, try string_of(field(header, "hash")));
+        try database.put_block_hash(try u64_field(header, "number"), hash);
+    }
+}
 
 const field = state_test.field;
 const string_of = state_test.string_of;
@@ -111,14 +122,22 @@ pub fn load_prestate(database: *MemoryDatabase, arena: std.mem.Allocator, pre: V
                 return error.BlockFileInvalid,
             else => return error.BlockFileInvalid,
         };
-        try database.put_account(address, try u256_field_or(account, "balance"), nonce, code);
-        const storage = field(account, "storage") orelse continue;
-        if (storage != .object) return error.BlockFileInvalid;
-        var slots = storage.object.iterator();
-        while (slots.next()) |slot| {
-            const value = try parse_u256(try string_of(slot.value_ptr.*));
-            try database.put_storage(address, try parse_u256(slot.key_ptr.*), value);
-        }
+        const balance = try u256_field_or(account, "balance");
+        // The tracer lists an account that does not exist as an empty one; loading it would
+        // make it exist (an EIP-7702 authority would then earn the existing-account refund).
+        if (balance == 0 and nonce == 0 and code.len == 0) continue;
+        try database.put_account(address, balance, nonce, code);
+        try load_storage(database, address, field(account, "storage"));
+    }
+}
+
+fn load_storage(database: *MemoryDatabase, address: Address, storage: ?Value) Error!void {
+    const slots_value = storage orelse return;
+    if (slots_value != .object) return error.BlockFileInvalid;
+    var slots = slots_value.object.iterator();
+    while (slots.next()) |slot| {
+        const value = try parse_u256(try string_of(slot.value_ptr.*));
+        if (value != 0) try database.put_storage(address, try parse_u256(slot.key_ptr.*), value);
     }
 }
 
@@ -236,6 +255,7 @@ fn check_transaction(
 ) Error!bool {
     var database = MemoryDatabase.init(arena);
     try load_prestate(&database, arena, pre);
+    if (chain.headers) |headers| try load_block_hashes(&database, headers);
     checker.state.reset(database.interface());
     checker.evm.state = checker.state;
     const tx_value = try tx_env(arena, tx);

@@ -147,6 +147,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   53715983-53715992: 253/253. With nf-replay's return-data fix (`a1fe2ae3`) reverted it
   flags 8+ transactions, starting at 53715983 tx 3. `call_fuzz.zig` now also checks that a
   callee sees RETURNDATASIZE 0 after an earlier call (it missed that bug before).
+  Audit 3: the 100-block window (79 fetched blocks) plus the first 10: 1630/1630. The first
+  run flagged 5; all were tool gaps, not EVM bugs: BLOCKHASH needs the fetcher's
+  `headers.json` (now loaded), and prestateTracer lists a nonexistent EIP-7702 authority as
+  an empty account, which must not be loaded (it would earn the 12500 existing-account
+  refund).
 - [x] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const evm.Tracer`
   (null: one branch per frame). `enter(TraceFrame{kind: call|callcode|delegatecall|
   staticcall|create|create2|selfdestruct, from, to, value, gas, input, depth})` is matched by

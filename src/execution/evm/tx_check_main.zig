@@ -2,7 +2,8 @@
 //!
 //! Runs each transaction of real Base blocks alone on its `prestateTracer` pre-state and
 //! compares status, gas used, and logs with the canonical receipts (see `tx_check.zig`).
-//! Block directories hold `block.json`, `prestate.json`, and `receipts.json`. Exits
+//! Block directories hold `block.json`, `prestate.json`, and `receipts.json`; a sibling
+//! `headers.json` supplies BLOCKHASH answers. Exits
 //! non-zero on any mismatch.
 
 const std = @import("std");
@@ -30,6 +31,11 @@ fn report(context_opaque: *anyopaque, mismatch: tx_check.Mismatch) void {
 fn read_json(io: Io, arena: std.mem.Allocator, dir: Io.Dir, name: []const u8) !std.json.Value {
     const bytes = try dir.readFileAlloc(io, name, arena, .limited(512 << 20));
     return std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+}
+
+/// The fetcher's `headers.json` beside the block directories, when present.
+fn read_headers(io: Io, arena: std.mem.Allocator, dir: Io.Dir) ?std.json.Value {
+    return unwrap(read_json(io, arena, dir, "../headers.json") catch return null);
 }
 
 fn unwrap(value: std.json.Value) std.json.Value {
@@ -79,6 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
             .fork = node.executor.evm_fork(spec.spec_at(timestamp)),
             .op = node.executor_op.context(&spec, timestamp),
             .chain_id = spec.chain_id,
+            .headers = read_headers(io, arena, dir),
         };
         const summary = try tx_check.check_block(&checker, arena, block, chain);
         total.transactions += summary.transactions;
