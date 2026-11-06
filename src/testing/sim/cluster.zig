@@ -280,6 +280,8 @@ pub const Cluster = struct {
     /// Real verifier safe head floor; reset on its restarts and on L1 reorgs.
     real_safe_floor: u64 = 0,
     real_reorgs_seen: u64 = 0,
+    /// Real verifier resets (startup discovery again, e.g. after a detected L1 reorg).
+    real_resets_seen: u64 = 0,
     allocator: std.mem.Allocator,
     verifiers: [verifier_count_max]nodes.Verifier,
     /// Per node: time at which a crashed node restarts, or null when up. L1 never crashes.
@@ -858,8 +860,13 @@ pub const Cluster = struct {
         const node = nodes.node_verifier_first;
         if (verifier.check(&cluster.sequencer)) |reason| return cluster.fail(reason, node);
         const safe = (verifier.safe_head() orelse return).block_info.number;
-        if (cluster.l1.reorgs != cluster.real_reorgs_seen) {
+        // An L1 reorg may lower the safe head: right away, or at the driver's later reset
+        // once derivation detects it (non-canonical origins, or orphaned batch data:
+        // `driver.SafeCheck`).
+        const resets = verifier.driver.stats.resets;
+        if (cluster.l1.reorgs != cluster.real_reorgs_seen or resets != cluster.real_resets_seen) {
             cluster.real_reorgs_seen = cluster.l1.reorgs;
+            cluster.real_resets_seen = resets;
             cluster.real_safe_floor = safe;
         }
         if (safe < cluster.real_safe_floor) {

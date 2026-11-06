@@ -696,6 +696,10 @@ pub const RealVerifier = struct {
     fn start(verifier: *RealVerifier) !void {
         verifier.safe_db = try SafeDB.init(verifier.allocator, safe_db_capacity);
         errdefer verifier.safe_db.deinit(verifier.allocator);
+        try verifier.init_driver();
+    }
+
+    fn init_driver(verifier: *RealVerifier) !void {
         try verifier.driver.init(
             verifier.allocator,
             &verifier.rollup,
@@ -712,15 +716,17 @@ pub const RealVerifier = struct {
 
     /// Crash-restart of the node: all driver state is lost; the engine keeps its chain
     /// and labels, minus its unflushed writes on a disk fault (`blocks_lost` non-null),
-    /// and startup discovery rebuilds the heads from them.
+    /// and startup discovery rebuilds the heads from them. The safedb survives, as with
+    /// `--safedb.path` (fsynced after each change), so startup can tell which safe heads
+    /// canonical L1 still supports (`driver.SafeCheck`).
     pub fn restart(verifier: *RealVerifier, blocks_lost: ?u64) !void {
-        verifier.stop();
+        verifier.driver.deinit();
         if (verifier.exec) |exec| {
             // A disk fault is power loss on the execution db's storage.
             try exec.restart(if (blocks_lost == null) .none else .power);
             verifier.checked = 0;
         } else if (blocks_lost) |count| verifier.engine.lose_unflushed(count);
-        try verifier.start();
+        try verifier.init_driver();
         verifier.restarts += 1;
         verifier.sequencer_head_known = 0;
         verifier.sync_ns = 0;
@@ -817,7 +823,7 @@ pub const RealVerifier = struct {
     /// The first block to request from the sequencer when the unsafe head lags the gossip
     /// seen, at most once per `sync_timeout_ns`; null when nothing is missing.
     pub fn sync_request(verifier: *RealVerifier, now_ns: u64) ?u64 {
-        if (verifier.driver.phase != .running) return null;
+        if (verifier.driver.phase != .running or verifier.driver.queue.len() > 0) return null;
         const unsafe = verifier.unsafe_number();
         if (verifier.sequencer_head_known <= unsafe) return null;
         if (now_ns < verifier.sync_ns + sync_timeout_ns) return null;
@@ -985,6 +991,9 @@ pub const RealVerifier = struct {
         verifier: *const RealVerifier,
         exec: *const real_execution.ExecEngine,
     ) ?[]const u8 {
+        // While resetting, discovery's heads (a safe head lowered by a reorg) reach the
+        // engine with the startup forkchoice update; the views agree once running.
+        if (verifier.driver.phase != .running or verifier.driver.queue.len() > 0) return null;
         const state = verifier.driver.sync_state();
         if (!state.unsafe_head.block_info.hash.eql(exec.label_hash(.latest))) {
             return "real verifier unsafe head is not its engine's head";

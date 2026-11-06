@@ -230,6 +230,12 @@ pub fn L1Provider(comptime IO: type) type {
             return provider.miss(.{ .kind = .block_by_number, .number = number });
         }
 
+        /// Drops every cached by-number result (after a reorg moved the numbers).
+        pub fn forget_numbers(provider: *Self) void {
+            for (provider.numbers) |*entry| entry.used = 0;
+            assert(provider.numbers.len == 0 or provider.numbers[0].used == 0);
+        }
+
         pub fn l1_header_by_hash(provider: *Self, hash: B256) ProviderError!L1Header {
             if (provider.header_entry(hash)) |entry| return entry.header;
             return provider.miss(.{ .kind = .header_by_hash, .hash = hash });

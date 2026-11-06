@@ -31,6 +31,7 @@ const SafeDB = @import("../safedb/root.zig").SafeDB;
 const OriginSelector = @import("../sequencer/origin.zig").OriginSelector;
 const sequencer_build = @import("../sequencer/build.zig");
 
+const BlockId = protocol.block.BlockId;
 const BlockInfo = protocol.block.BlockInfo;
 const L2BlockInfo = protocol.block.L2BlockInfo;
 const Hash = protocol.block.Hash;
@@ -74,6 +75,8 @@ pub const Phase = enum { starting, resetting, running };
 
 pub const Stats = struct {
     resets: u64 = 0,
+    /// Startups whose safe label canonical L1 no longer supported (see `SafeCheck`).
+    safe_unwinds: u64 = 0,
     consolidated: u64 = 0,
     sealed: u64 = 0,
     /// Gossiped unsafe payloads queued for insertion / buffered ahead of the head / ignored
@@ -95,6 +98,8 @@ pub const Stats = struct {
 fn FinderClient(comptime Providers: type) type {
     return struct {
         providers: Providers,
+        /// What canonical L1 supports of the safe label (see `SafeCheck`).
+        safe_check: SafeCheck = .{ .done = true },
 
         const Self = @This();
 
@@ -105,7 +110,15 @@ fn FinderClient(comptime Providers: type) type {
             // The L2 provider's label enum lists latest, safe, finalized in the same order.
             const l2 = self.providers.l2;
             const result = l2.l2_block_info_by_label(@fromBackingInt(@intCast(@backingInt(label))));
-            return optional(L2BlockInfo, result);
+            const block = try optional(L2BlockInfo, result);
+            if (label != .safe) return block;
+            assert(self.safe_check.done);
+            // No recorded L1 block is canonical: fall back to the finalized head.
+            if (self.safe_check.unsupported) return null;
+            const cap = self.safe_check.cap orelse return block;
+            const labeled = block orelse return null;
+            if (labeled.block_info.number <= cap.number) return labeled;
+            return self.l2_block_info_by_hash(cap.hash);
         }
 
         pub fn l2_block_info_by_hash(self: Self, hash: Hash) ProviderError!?L2BlockInfo {
@@ -143,6 +156,24 @@ fn FinderClient(comptime Providers: type) type {
     };
 }
 
+/// Before startup discovery the driver checks the safedb against canonical L1: the newest
+/// entry whose L1 block is still canonical caps the engine's safe label at that entry's safe
+/// head. An L1 reorg can orphan the blocks that carried the batch data of a safe head whose
+/// L1 origin stays canonical; base/base discovery keeps such a safe label, and the batcher,
+/// which posts from the safe head, would never post those blocks again.
+pub const SafeCheck = struct {
+    /// Entries left to check, newest first (null: not started).
+    remaining: ?u32 = null,
+    done: bool = false,
+    /// The newest safe head that canonical L1 still supports.
+    cap: ?BlockId = null,
+    /// Entries exist but none of their L1 blocks is canonical.
+    unsupported: bool = false,
+};
+
+/// L1 lookups per tick for the safedb check.
+const safe_check_lookups_max = 16;
+
 fn optional(comptime T: type, result: ProviderError!T) ProviderError!?T {
     return result catch |err| switch (err) {
         error.NotFound => null,
@@ -157,6 +188,7 @@ pub const Driver = struct {
     safe_db: *SafeDB,
     phase: Phase = .starting,
     finder: sync_start.StartFinder,
+    safe_check: SafeCheck = .{},
     queue: EngineTaskQueue,
     pipeline: Pipeline,
     finalizer: Finalizer,
@@ -261,7 +293,11 @@ pub const Driver = struct {
     }
 
     fn start(driver: *Driver, providers: anytype) void {
-        const client: FinderClient(@TypeOf(providers)) = .{ .providers = providers };
+        if (!driver.check_safe_db(providers)) return;
+        const client: FinderClient(@TypeOf(providers)) = .{
+            .providers = providers,
+            .safe_check = driver.safe_check,
+        };
         const found = driver.finder.step(client) catch |err| {
             if (err == error.NotAvailable) return;
             driver.note(err);
@@ -270,18 +306,59 @@ pub const Driver = struct {
             return;
         } orelse return;
         driver.queue.clear();
+        // A capped safe head never drops below the finalized head.
+        const unwound = found.safe_head.block_info.number < found.finalized_head.block_info.number;
+        const safe_head = if (unwound) found.finalized_head else found.safe_head;
         driver.queue.state.sync_state = .{
             .unsafe_head = found.unsafe_head,
-            .local_safe_head = found.safe_head,
-            .safe_head = found.safe_head,
+            .local_safe_head = safe_head,
+            .safe_head = safe_head,
             .finalized_head = found.finalized_head,
         };
         driver.queue.enqueue(.{ .synchronize = .{} }) catch unreachable; // Proof: cleared.
         driver.selector.reset();
         driver.finalizer.clear();
-        driver.safe_db.safe_head_reset(found.safe_head);
+        driver.safe_db.safe_head_reset(safe_head);
         driver.phase = .resetting;
         assert(driver.queue.len() == 1);
+    }
+
+    /// Runs the safedb check (`SafeCheck`); true when done. Lookups that fail for other
+    /// reasons than data in flight end the check without a cap (base/base behavior).
+    fn check_safe_db(driver: *Driver, providers: anytype) bool {
+        const check = &driver.safe_check;
+        if (check.done) return true;
+        const db = driver.safe_db;
+        if (check.remaining == null) {
+            check.remaining = db.count;
+            // By-number lookups are cached briefly; the reorg may have just moved them.
+            const L1 = @typeInfo(@TypeOf(providers.l1)).pointer.child;
+            if (@hasDecl(L1, "forget_numbers")) providers.l1.forget_numbers();
+        }
+        var lookups: u32 = 0;
+        while (check.remaining.? > 0 and lookups < safe_check_lookups_max) : (lookups += 1) {
+            const entry = db.entries[check.remaining.? - 1];
+            const result = providers.l1.l1_block_info_by_number(entry.l1_block.number);
+            const block = optional(BlockInfo, result) catch |err| {
+                if (err == error.NotAvailable) return false;
+                driver.note(err);
+                check.done = true;
+                return true;
+            };
+            if (block) |canonical| if (canonical.hash.eql(entry.l1_block.hash)) {
+                check.cap = entry.safe_head;
+                check.done = true;
+                if (check.remaining.? < db.count) driver.stats.safe_unwinds += 1;
+                return true;
+            };
+            check.remaining.? -= 1;
+        }
+        if (check.remaining.? > 0) return false;
+        check.done = true;
+        check.unsupported = db.count > 0;
+        if (check.unsupported) driver.stats.safe_unwinds += 1;
+        assert(check.cap == null);
+        return true;
     }
 
     /// base/base `probe_el_sync`: a forced forkchoice update of the current state, since the
@@ -432,6 +509,7 @@ pub const Driver = struct {
         driver.building = false;
         driver.consolidating = null;
         driver.finder = .init(driver.rollup);
+        driver.safe_check = .{};
         driver.phase = .starting;
         assert(driver.queue.len() == 0);
     }
@@ -804,6 +882,92 @@ test "driver: starts from genesis, synchronizes, and resets the pipeline" {
     try testing.expect(safe_hash.eql(scenario.rollup.genesis.l2.hash));
     try testing.expect(driver.pipeline.origin() != null);
     try testing.expectEqual(@as(u64, 0), driver.stats.critical_errors);
+}
+
+/// Adds L2 blocks 1..6 on epoch 0 and labels latest = safe = 6; the safedb records
+/// L2 block 2 as derived from L1 block 2 and block 6 from L1 block 5 (with `orphaned`
+/// entries carrying a hash that is not canonical).
+fn add_reorg_history(scenario: *Scenario, orphaned: []const bool) !void {
+    assert(orphaned.len == 2);
+    var parent = scenario.rollup.genesis.l2;
+    var last: L2BlockInfo = undefined;
+    for (1..7) |number| {
+        var hash: Hash = .zero;
+        hash.bytes[0] = 0x51;
+        hash.bytes[1] = @intCast(number);
+        last = .{
+            .block_info = .{
+                .hash = hash,
+                .number = number,
+                .parent_hash = parent.hash,
+                .timestamp = Scenario.genesis_time + 2 * number,
+            },
+            .l1_origin = scenario.chain.blocks[0].id(),
+        };
+        scenario.chain.add_l2_block(last);
+        parent = last.block_info.id();
+    }
+    scenario.l2.heads[@backingInt(sync_start.Label.latest)] = last;
+    scenario.l2.heads[@backingInt(sync_start.Label.safe)] = last;
+    const recorded = [_]struct { l1: u64, l2: u64 }{ .{ .l1 = 2, .l2 = 2 }, .{ .l1 = 5, .l2 = 6 } };
+    for (recorded, orphaned) |entry, gone| {
+        var l1_block = scenario.chain.blocks[entry.l1].id();
+        if (gone) l1_block.hash.bytes[31] ^= 0xff; // Its data went with an L1 reorg.
+        const safe_head = (try scenario.chain.l2_block_info_by_number(entry.l2)).block_info;
+        scenario.safe_db.insert(.{ .l1_block = l1_block, .safe_head = safe_head.id() });
+    }
+}
+
+fn run_startup(scenario: *Scenario) void {
+    var rounds: u32 = 0;
+    while (scenario.driver.phase == .starting and rounds < 64) : (rounds += 1) {
+        scenario.driver.tick(scenario.providers(), ms(Scenario.genesis_time + 20));
+    }
+    assert(scenario.driver.phase != .starting);
+}
+
+test "driver: startup unwinds a safe head whose L1 data a reorg orphaned" {
+    const cases = [_]struct { orphaned: [2]bool, safe: u64, unwinds: u64 }{
+        .{ .orphaned = .{ false, false }, .safe = 6, .unwinds = 0 },
+        .{ .orphaned = .{ false, true }, .safe = 2, .unwinds = 1 },
+        .{ .orphaned = .{ true, true }, .safe = 0, .unwinds = 1 }, // Finalized (genesis).
+    };
+    for (cases) |case| {
+        var scenario: Scenario = undefined;
+        try scenario.init(.{});
+        defer scenario.deinit();
+        try add_reorg_history(&scenario, &case.orphaned);
+        run_startup(&scenario);
+        const state = scenario.driver.sync_state();
+        try testing.expectEqual(case.safe, state.safe_head.block_info.number);
+        try testing.expectEqual(case.safe, state.local_safe_head.block_info.number);
+        try testing.expectEqual(@as(u64, 6), state.unsafe_head.block_info.number);
+        try testing.expectEqual(case.unwinds, scenario.driver.stats.safe_unwinds);
+        // The safedb no longer claims safe heads above the unwound one.
+        for (scenario.safe_db.entries[0..scenario.safe_db.count]) |entry| {
+            try testing.expect(entry.safe_head.number <= case.safe);
+        }
+    }
+}
+
+test "driver: the safedb check runs again after a reset" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{});
+    defer scenario.deinit();
+    try add_reorg_history(&scenario, &.{ false, false });
+    run_startup(&scenario);
+    try testing.expectEqual(@as(u64, 6), scenario.driver.sync_state().safe_head.block_info.number);
+    // Derivation records block 6 from L1 block 5 again, and a reorg then orphans it. (The
+    // startup reset recorded safe head 6 at its L1 origin 0, as base/base does; the
+    // newer canonical entry, L1 block 2, decides first.)
+    var orphaned = scenario.chain.blocks[5].id();
+    orphaned.hash.bytes[31] ^= 0xff;
+    const head = scenario.driver.sync_state().safe_head.block_info.id();
+    scenario.safe_db.insert(.{ .l1_block = orphaned, .safe_head = head });
+    scenario.driver.request_reset();
+    run_startup(&scenario);
+    try testing.expectEqual(@as(u64, 2), scenario.driver.sync_state().safe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 1), scenario.driver.stats.safe_unwinds);
 }
 
 test "driver: derivation waits for EL sync and probes the engine meanwhile" {
