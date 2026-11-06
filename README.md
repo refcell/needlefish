@@ -13,6 +13,15 @@ L2 blocks are full blocks at Base's native 200 ms subsecond cadence; there are n
 It is a ground-up port of the public [base/base](https://github.com/base/base) repository and
 keeps its layout, so every crate there has an obvious home here.
 
+<p align="center">
+  <img src="docs/assets/demo.gif" width="800"
+    alt="just replay fetches the latest 10 Base mainnet blocks and replays them offline">
+</p>
+
+`just replay` fetches the latest 10 Base mainnet blocks and the state they touch from public
+RPC, re-executes them offline, and checks every header field against the chain
+([docs/REPLAY.md](docs/REPLAY.md), [video](docs/assets/demo.mp4)).
+
 > [!WARNING]
 > Pre-alpha. Components are landing daily and the devnet is being assembled now. Do not run it
 > against a real network or with real funds.

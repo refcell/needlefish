@@ -90,7 +90,7 @@ pub const View = struct {
         view.totals.exec_ns += exec_ns;
         if (outcome.ok()) view.totals.passed += 1;
         const root = &outcome.computed_state_root;
-        try view.out.print("  {s}{d:<10}{s} {d:>4} {d:>7.2}M {d:>6.1}ms  {s}{x}..{x}{s} ", .{
+        try view.out.print("  {s}{d:<10}{s} {d:>4} {d:>7.2}M {d:>6.1}ms  {s}{x}..{x}{s}      ", .{
             s.cyan(),
             outcome.number,
             s.reset(),
