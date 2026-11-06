@@ -431,3 +431,5 @@ allocation after startup.
   the run continues, empty window is a no-op, paused fails, dry run sends nothing; base/base's
   window, scan, and unrelated-sender cases ported. No devnet run: the stand-in portal cannot
   prove (the binary exits 1 at "reading portal contracts" against dev-l1).
+- 2026-11-05: paused for replay focus (root coordinator, owner decision). In flight: roxy consensus
+  follow-ups worker told to push if green or keep WIP on a local branch; resume on request.
