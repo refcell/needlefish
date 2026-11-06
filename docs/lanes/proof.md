@@ -170,6 +170,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   verifies attestations (`tee/nitro`), plans and submits TEE signer registrations.
 
 ## Decisions
+- No port of base/base `zk/utils` `BootInfoStruct`: SP1 reads it from its public values
+  through serde, and we run no zkVM, so it would have no consumer. Revisit with a zkVM.
+- The live devnet has no EIP-2935 contract, so leaps there fall back to the parent walk;
+  the leap path is covered by `program/eip2935.zig` and the host `eth_getProof` test.
 - TEE enclave: no vsock or `/dev/nsm` (std has neither, no libc): the link runs over any
   `std.Io` stream and NSM is an interface. Frames longer than the caller's buffer and proofs
   with more than 512 intermediate roots are refused (base/base caps neither). Local mode
