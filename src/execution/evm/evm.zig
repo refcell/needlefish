@@ -304,7 +304,7 @@ pub const Evm = struct {
         const checkpoint = evm.state.checkpoint();
         const account = try evm.state.load(address);
         if (request.kind != .delegatecall) {
-            const from = try evm.state.load(caller_address);
+            const from = try evm.caller_account(parent, caller_address);
             if (!try evm.state.transfer(from, account, request.value)) {
                 evm.state.revert(checkpoint);
                 return failed(request.gas_limit, .revert);
@@ -319,7 +319,10 @@ pub const Evm = struct {
             const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
             return evm.run_native(contract, request, checkpoint, call);
         }
-        const code_account = try evm.state.load(request.code_address);
+        const code_account = if (std.mem.eql(u8, &request.code_address, &address))
+            account
+        else
+            try evm.state.load(request.code_address);
         const code = try evm.state.code(code_account);
         if (code.len == 0) {
             return .{ .done = .{
@@ -344,6 +347,18 @@ pub const Evm = struct {
             .checkpoint = checkpoint,
         }, parent);
         return .frame;
+    }
+
+    /// The caller is normally the parent frame, which already holds a stable pointer to its
+    /// account; only top-level calls look it up.
+    fn caller_account(evm: *Evm, parent: ?*Frame, caller_address: Address) Error!*Account {
+        if (parent) |frame| {
+            if (std.mem.eql(u8, &frame.address, &caller_address)) {
+                assert(std.mem.eql(u8, &frame.account.address, &caller_address));
+                return frame.account;
+            }
+        }
+        return evm.state.load(caller_address);
     }
 
     fn run_precompile(

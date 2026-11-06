@@ -116,8 +116,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   1.44 -> 1.41 us (same-load A/B). Kept `std.HashMapUnmanaged` (not a custom flat table) so
   other lanes' `iterator`/`count`/`clearRetainingCapacity` uses are unchanged. The db
   lane's overlay `SlotKey` map still uses `AutoContext` and could adopt the same context.
-- [ ] Performance: account map — `State.accounts` lookups are ~25% of the call loop;
-  try caching the last-loaded account per frame (code address, caller) before a new map.
+- [x] Performance: account map — `start_call` reuses the parent frame's account for the
+  caller and the target account when it is also the code account: call loop 23.5 ->
+  ~18.6-22.2 us (noisy, load ~25). A fold+fmix64 hash context for `State.accounts`
+  measured no gain and was dropped (twice now; the map itself is not the cost).
 - [ ] Performance: memmove in the storage loop (~13% of samples): find the copy (Slot/Account
   by value, state reset) and remove it.
 - [ ] Fuzz: differential fuzz of memory/copy opcodes (MLOAD/MSTORE/MSTORE8/MCOPY/
