@@ -329,6 +329,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: executor accepts Denim same-second children; live Denim devnet proof holds, replays, rejects a wrong claim.
 - 2026-11-05: backlog extended with primitives and the TEE enclave, host and registrar.
 - 2026-11-05: AWS Nitro attestation verifier (CBOR, COSE_Sign1, X.509, P-384, journal ABI).
 - 2026-11-05: ScheduleId pinned at boot (golden value matches base/base).

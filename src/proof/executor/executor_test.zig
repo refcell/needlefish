@@ -253,3 +253,25 @@ test "executor: output root from parts" {
     const actual = builder_module.output_root_from_parts(zero, zero, block_hash);
     try testing.expectEqualSlices(u8, &expected, &actual);
 }
+
+test "executor: Denim children may share their parent's second" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const genesis = harness.node.chain.head_hash();
+    const parent = harness.node.chain.header(genesis).?;
+    try harness.host.put_header(parent);
+    var attributes = fixture.attributes_l2(parent.timestamp, 0xfe);
+    attributes.no_tx_pool = true;
+    const before = harness.builder.build_block(&parent, genesis, &attributes);
+    try testing.expectError(error.InvalidAttributes, before);
+    // With Denim active the same-second child passes the timestamp check and goes on to
+    // need the parent state, which this test leaves unserved.
+    var denim = spec.*;
+    for (&denim.upgrades) |*activation| {
+        if (activation.* != null) activation.* = 0;
+    }
+    denim.upgrades[@backingInt(chainspec.Upgrade.denim)] = 0;
+    harness.builder.spec = &denim;
+    const after = harness.builder.build_block(&parent, genesis, &attributes);
+    try testing.expectError(error.StateUnavailable, after);
+}

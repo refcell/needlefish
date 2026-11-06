@@ -171,7 +171,10 @@ pub const Builder = struct {
         parent_hash: Hash,
         attributes: *const payload.PayloadAttributes,
     ) Error!Outcome {
-        if (attributes.timestamp <= parent.timestamp) return error.InvalidAttributes;
+        // Denim's 200 ms blocks share their parent's whole-second timestamp.
+        if (!self.spec.timestamp_follows(parent.timestamp, attributes.timestamp)) {
+            return error.InvalidAttributes;
+        }
         try self.send_witness_hint(parent_hash, attributes);
         self.open_state(parent, parent_hash);
         var child = try self.child_header(parent, parent_hash, attributes);
