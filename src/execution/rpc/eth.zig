@@ -15,6 +15,7 @@ const format = @import("format.zig");
 const debug = @import("debug.zig");
 const native = @import("../evm/native.zig");
 const op_receipt = @import("op_receipt.zig");
+const eip8130_call = @import("eip8130_call.zig");
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -677,6 +678,7 @@ pub fn simulate(
 }
 
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
+    if (try eip8130_request(api, call, .call)) return;
     const request = try parse_call_request(api, call);
     switch (try simulate(api, call, request)) {
         .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
@@ -687,8 +689,23 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     }
 }
 
+/// Serves an EIP-8130 request (`eip8130_call`); false (params untouched) for a plain one.
+fn eip8130_request(
+    api: *Api,
+    call: *Call,
+    mode: eip8130_call.Mode,
+) HandlerError!bool {
+    var peek = call.params;
+    const call_raw = try peek.raw();
+    if (!eip8130_call.is_request(call_raw)) return false;
+    const view = try state_view.resolve(api, call, try peek.optional_raw());
+    try eip8130_call.handle(api, call, call_raw, view, mode);
+    return true;
+}
+
 /// Binary search for the smallest gas limit that succeeds, bounded by the block limit.
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
+    if (try eip8130_request(api, call, .estimate)) return;
     var request = try parse_call_request(api, call);
     const header = view_header(api, request.view);
     var env = node.chain.env_of(&header);

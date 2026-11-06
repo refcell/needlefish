@@ -1124,3 +1124,43 @@ test "eth: getTransactionCount reads EIP-8130 channel nonces by nonce key" {
     const max_key = ",\"0x" ++ @as([64]u8, @splat('f')) ++ "\"]";
     try expect_contains(try h.request("eth_getTransactionCount", prefix ++ max_key), "-32602");
 }
+
+test "eth: EIP-8130 eth_call and eth_estimateGas simulate 0x79 requests" {
+    everest_spec.upgrades = @splat(0);
+    const h = try Harness.create_for(&everest_spec);
+    defer h.destroy();
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const reverter = primitives.hex.decode_array(20, reverter_at[3..43]) catch unreachable;
+    try h.node.db.put_account(reverter, 0, 0, &.{ 0x5f, 0x5f, 0xfd });
+    const from = "\"from\":" ++ address_one;
+    const phases = ",\"calls\":[[{\"to\":" ++ counter_at ++ ",\"data\":\"0x\"}]]";
+    const one = "\"0x0000000000000000000000000000000000000000000000000000000000000001\"";
+    try expect_contains(try h.request("eth_call", "[{" ++ from ++ phases ++ "},\"latest\"]"), one);
+    // A single call from `to`, made EIP-8130 by `nonceKey`.
+    const single = "[{" ++ from ++ ",\"to\":" ++ counter_at ++ ",\"nonceKey\":\"0x7\"}]";
+    try expect_contains(try h.request("eth_call", single), one);
+    const estimate = try h.request("eth_estimateGas", "[{" ++ from ++ phases ++ "}]");
+    try expect_contains(estimate, "\"result\":\"0x");
+    const reverts = "[{" ++ from ++ ",\"type\":\"0x79\",\"to\":" ++ reverter_at ++ "}]";
+    try expect_contains(try h.request("eth_call", reverts), "execution reverted");
+    try expect_contains(try h.request("eth_estimateGas", reverts), "execution reverted");
+    // Invalid requests.
+    const both = "[{" ++ from ++ ",\"to\":" ++ counter_at ++ phases ++ "}]";
+    try expect_contains(try h.request("eth_call", both), "CallsAndSingleCall");
+    const no_sender = "[{\"nonceKey\":\"0x1\",\"to\":" ++ counter_at ++ "}]";
+    try expect_contains(try h.request("eth_call", no_sender), "MissingSender");
+    const mismatch = "[{" ++ from ++ ",\"sender\":" ++ counter_at ++ phases ++ "}]";
+    try expect_contains(try h.request("eth_call", mismatch), "SenderFromMismatch");
+    // A plain request still takes the plain path.
+    try expect_contains(try h.request("eth_call", "[{\"to\":" ++ counter_at ++ "}]"), one);
+}
+
+test "eth: EIP-8130 requests are refused before Everest" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const request = "[{\"from\":" ++ address_one ++ ",\"type\":\"0x79\",\"to\":" ++
+        address_target ++ "}]";
+    try expect_contains(try h.request("eth_call", request), "not active before Everest");
+}

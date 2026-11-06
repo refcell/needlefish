@@ -532,6 +532,62 @@ pub const Executor = struct {
         } };
     }
 
+    /// A read-only EIP-8130 simulation (`eth_call` / `eth_estimateGas` for a 0x79 request).
+    pub const Eip8130Call = struct {
+        signed: *const consensus.tx.eip8130.Signed,
+        /// The EIP-2718 encoding of `signed` (priced for intrinsic gas).
+        envelope: []const u8,
+        from: Address,
+        mode: evm.eip8130_simulate.Mode,
+    };
+
+    pub const Eip8130Simulated = union(enum) {
+        /// The transaction is rejected (the error's name), as pool admission would.
+        rejected: []const u8,
+        executed: struct { success: bool, gas: u64, output: []const u8 },
+    };
+
+    /// Runs `call` in `block` over `database` (null: the committed state) and discards every
+    /// change. The output borrows the scratch arena until the next call.
+    pub fn simulate_eip8130(
+        executor: *Executor,
+        block: *const BlockEnv,
+        call: Eip8130Call,
+        database: ?evm.state.Database,
+    ) Error!Eip8130Simulated {
+        assert(call.envelope.len > 0 and call.envelope[0] == 0x79);
+        executor.abort_block();
+        executor.arena.reset();
+        const saved = executor.state.database;
+        if (database) |other| executor.state.database = other;
+        defer executor.state.database = saved;
+        defer executor.abort_block();
+        executor.set_block_env(block);
+        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
+        const tx = eip8130_env(call.signed, call.envelope);
+        const request: evm.eip8130_simulate.Request = .{ .from = call.from, .mode = call.mode };
+        const simulated = switch (fork) {
+            inline else => |comptime_fork| evm.eip8130_simulate.simulate(
+                comptime_fork,
+                executor.machine,
+                &tx,
+                request,
+            ),
+        } catch |err| {
+            inline for (comptime @typeInfo(evm.evm.Error).error_set.error_names.?) |name| {
+                if (err == @field(anyerror, name)) return @field(anyerror, name);
+            }
+            return .{ .rejected = @errorName(err) };
+        };
+        const output = try executor.alloc(u8, simulated.output.len);
+        @memcpy(output, simulated.output);
+        return .{ .executed = .{
+            .success = !simulated.reverted,
+            .gas = simulated.gas,
+            .output = output,
+        } };
+    }
+
     /// Drops every uncommitted change (failed block).
     pub fn abort_block(executor: *Executor) void {
         executor.state.accounts.clearRetainingCapacity();
