@@ -87,3 +87,19 @@ test "sync: the safe head comes from the output root preimage" {
     try testing.expectError(error.InvalidOutputRootPreimage, OutputRoot.decode(&bad));
     try testing.expectError(error.InvalidOutputRootPreimage, OutputRoot.decode(encoded[0..96]));
 }
+
+test "sync: fuzz output root preimages round trip" {
+    const fuzz = @import("../../testing/fuzz.zig");
+    try fuzz.run({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var bytes: [output_root_preimage_bytes + 8]u8 = undefined;
+            const length = smith.index(bytes.len + 1);
+            smith.bytes(bytes[0..length]);
+            if (smith.index(2) == 0) @memset(bytes[0..@min(length, 32)], 0);
+            const root = OutputRoot.decode(bytes[0..length]) catch return;
+            try testing.expectEqual(@as(usize, output_root_preimage_bytes), length);
+            const encoded = root.encode();
+            try testing.expectEqualSlices(u8, bytes[0..length], &encoded);
+        }
+    }.one, .{ .iterations = 3000 });
+}

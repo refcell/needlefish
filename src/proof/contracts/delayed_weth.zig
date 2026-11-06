@@ -54,3 +54,26 @@ test "delayed weth: calls and returns" {
     try testing.expectEqual(@as(?u64, null), claimable_at(.{ .amount = 0, .timestamp = 0 }, 60));
     try testing.expectEqual(@as(u64, 5), try decode_delay_seconds(&data));
 }
+
+test "delayed weth: fuzz the return decoders" {
+    const fuzz = @import("../../testing/fuzz.zig");
+    try fuzz.run({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var data: [96]u8 = undefined;
+            const length = smith.index(data.len);
+            smith.bytes(data[0..length]);
+            if (smith.index(2) == 0) @memset(data[0..@min(length, 24)], 0);
+            if (decode_delay_seconds(data[0..length])) |_| {
+                try testing.expect(length >= 32);
+            } else |_| {}
+            const withdrawal = decode_withdrawal(data[0..length]) catch return;
+            try testing.expect(length >= 64);
+            const delay_seconds = smith.value(u64);
+            const at = claimable_at(withdrawal, delay_seconds) orelse {
+                try testing.expectEqual(@as(u64, 0), withdrawal.timestamp);
+                return;
+            };
+            try testing.expect(at >= withdrawal.timestamp);
+        }
+    }.one, .{ .iterations = 3000 });
+}

@@ -84,3 +84,18 @@ test "anchor state registry: calls and returns" {
     };
     try testing.expect(preflight.permanently_ineligible());
 }
+
+test "anchor state registry: fuzz the anchor root decoder" {
+    const fuzz = @import("../../testing/fuzz.zig");
+    try fuzz.run({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var data: [96]u8 = undefined;
+            const length = smith.index(data.len);
+            smith.bytes(data[0..length]);
+            if (smith.index(2) == 0 and length >= 64) @memset(data[32..56], 0);
+            const anchor = decode_anchor_root(data[0..length]) catch return;
+            try testing.expect(length >= 64);
+            try testing.expectEqualSlices(u8, data[0..32], &anchor.root);
+        }
+    }.one, .{ .iterations = 3000 });
+}

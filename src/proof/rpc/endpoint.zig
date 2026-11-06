@@ -269,3 +269,23 @@ test "endpoint: JSON value helpers" {
     try testing.expectEqual(@as(Hash, @splat(0)), try parse_hash(zero));
     try testing.expectError(error.CallFailed, parse_hash("\"0x00\""));
 }
+
+test "endpoint: fuzz the JSON value helpers" {
+    const fuzz = @import("../../testing/fuzz.zig");
+    try fuzz.run({}, struct {
+        fn one(_: void, smith: *std.testing.Smith) anyerror!void {
+            var text: [80]u8 = undefined;
+            const length = smith.index(text.len);
+            smith.bytes(text[0..length]);
+            if (smith.index(2) == 0 and length >= 2) {
+                text[0] = '"';
+                text[length - 1] = '"';
+            }
+            const raw = text[0..length];
+            if (parse_quantity(raw)) |_| try testing.expect(raw[0] == '"') else |_| {}
+            if (parse_hash(raw)) |_| try testing.expectEqual(@as(usize, 68), length) else |_| {}
+            _ = parse_number(raw) catch {};
+            _ = member(raw, &.{"result"}) catch {};
+        }
+    }.one, .{ .iterations = 3000 });
+}
