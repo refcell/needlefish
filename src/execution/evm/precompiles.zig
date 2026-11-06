@@ -423,3 +423,65 @@ test "precompiles: BLS caps under Base and failures consume all gas" {
     try std.testing.expectEqual(Status.failure, empty.status);
     try std.testing.expectEqual(@as(u64, 100_000), empty.gas_used);
 }
+
+/// Public Wycheproof secp256r1 vectors (embedded by the crypto lane, Apache-2.0): `K` lines
+/// carry the key, `T` lines hash, r, s, and the verdict.
+const wycheproof_p256 = @embedFile("../../common/crypto/vectors/wycheproof_ecdsa_secp256r1.txt");
+
+fn hex_field(comptime length: usize, fields: *std.mem.TokenIterator(u8, .scalar)) ![length]u8 {
+    var out: [length]u8 = undefined;
+    const text = fields.next() orelse return error.BadVector;
+    if (text.len != 2 * length) return error.BadVector;
+    _ = try std.fmt.hexToBytes(&out, text);
+    return out;
+}
+
+/// Run one vector through P256VERIFY: 32-byte 1 when valid, empty when not, fixed gas.
+fn expect_p256(
+    comptime fork: Fork,
+    upgrade: ?op.Upgrade,
+    input: *const [160]u8,
+    valid: bool,
+) !void {
+    const run = lookup(fork, upgrade, primitives.address_from_int(0x100)).?;
+    const cost: u64 = if (fork.at_least(.osaka)) 6900 else 3450;
+    var out: [32]u8 = undefined;
+    const result = run(input, 100_000, test_buffers(&out));
+    try std.testing.expectEqual(Status.success, result.status);
+    try std.testing.expectEqual(cost, result.gas_used);
+    try std.testing.expectEqual(@as(u32, if (valid) 32 else 0), result.output_len);
+    if (valid) try std.testing.expectEqual(@as(u256, 1), std.mem.readInt(u256, &out, .big));
+    const short = run(input, cost - 1, test_buffers(&out));
+    try std.testing.expectEqual(Status.out_of_gas, short.status);
+}
+
+test "precompiles: P256VERIFY on the Wycheproof secp256r1 vectors (Fjord and Osaka)" {
+    var key: ?[64]u8 = null;
+    var count: u32 = 0;
+    var valid_count: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, wycheproof_p256, '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const tag = fields.next() orelse return error.BadVector;
+        if (std.mem.eql(u8, tag, "K")) {
+            key = try hex_field(64, &fields);
+            continue;
+        }
+        try std.testing.expectEqualStrings("T", tag);
+        var input: [160]u8 = undefined;
+        input[0..32].* = try hex_field(32, &fields);
+        input[32..64].* = try hex_field(32, &fields);
+        input[64..96].* = try hex_field(32, &fields);
+        input[96..160].* = key orelse return error.BadVector;
+        const verdict = fields.next() orelse return error.BadVector;
+        const valid = std.mem.eql(u8, verdict, "1");
+        try std.testing.expect(valid or std.mem.eql(u8, verdict, "0"));
+        try expect_p256(.cancun, .fjord, &input, valid);
+        try expect_p256(.osaka, .denim, &input, valid);
+        count += 1;
+        valid_count += @intFromBool(valid);
+    }
+    try std.testing.expect(count >= 230);
+    try std.testing.expect(valid_count > 0 and valid_count < count);
+}

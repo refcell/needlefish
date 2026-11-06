@@ -260,9 +260,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   model over random 0..64-byte base/exponent and 0..32-byte modulus (leading zeros, zero
   lengths, zero/one moduli) at Byzantium/Berlin/Osaka; one gas short of the charge fails
   with all gas consumed. Gas formulas stay covered by crypto-lane vectors and EEST.
-- [ ] Vectors: P256VERIFY (RIP-7212, used on Base) against the public Wycheproof
-  ecdsa_secp256r1_sha256 vectors (fetched into `.cache`), checking the 32-byte output and
-  the fixed gas.
+- [x] Vectors: P256VERIFY (RIP-7212, used on Base) against the public Wycheproof
+  secp256r1 vectors the crypto lane already embeds (~350 cases), through the precompile at
+  Fjord (3450 gas) and Osaka (6900 gas): 32-byte 1 when valid, empty when not, fixed gas,
+  out of gas one short.
 - [ ] Fuzz: EIP-7702 delegation chains: random authorizations (valid, wrong chain, bad
   nonce, self-sponsored, re-delegation, clearing) against a model of the resulting code,
   nonces, and the 12500/25000 refund.
