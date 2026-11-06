@@ -115,6 +115,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: second pinned window in `just replay-check`: 53811190..53811209 (314 txs,
+  70.6 Mgas, 1 gap round) 20/20.
+
 - 2026-11-06: unit test for replaying past a failed block: the fixture without its pre-state
   root node; normal mode stops after block 1, probe mode replays all 10 recording gaps.
 
