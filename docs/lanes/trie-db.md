@@ -1199,6 +1199,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - Keccak-bound items go to the crypto lane: a 4-lane `@Vector(4, u64)` batch on 128-bit NEON
   needs ~50 vector registers for the 25-lane state (32 available) and likely spills; the real
   win is ARMv8.2 SHA3 (EOR3/BCAX/RAX1/XAR), a consensus-critical change to their file.
+- Account maps (`State.account_table`, `Overlay.accounts`) use `db/address_map.zig`: the same
+  Wyhash as `std.AutoHashMap` (same distribution for attacker-chosen addresses), with equality
+  as one `u160` compare instead of `std.meta.eql`'s byte loop. Lookup 22-26 -> 17-19 ns on
+  200k random addresses (nf-evm profile: account map ~19% of `evm: block`).
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -1505,3 +1509,4 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   estimate vs forced starts 1/3/9/20/34 blocks, 7 budgets from none and 1 GiB to below one
   state, 2 seeds x 3 crash/reopen cycles each; digest of window, usage, prune queue, proofs
   of every address at every block); mutation `>` -> `>=` in the shrink check fails it.
+- 2026-11-06: address_map: u160 equality context for the db account maps (lookup ~25% faster).

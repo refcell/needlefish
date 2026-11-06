@@ -12,6 +12,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const state_module = @import("state.zig");
+const address_map = @import("address_map.zig");
 const changeset_module = @import("changeset.zig");
 const State = state_module.State;
 const SlotKey = state_module.SlotKey;
@@ -41,14 +42,14 @@ const OverlaySlot = struct { value: u256, epoch: u32 };
 
 pub const Overlay = struct {
     base: *State,
-    accounts: std.AutoHashMapUnmanaged(Address, OverlayAccount),
+    accounts: address_map.Map(OverlayAccount),
     slots: std.AutoHashMapUnmanaged(SlotKey, OverlaySlot),
     new_codes: []Hash,
     new_codes_len: u32 = 0,
     config: Config,
 
     pub fn init(allocator: std.mem.Allocator, base: *State, config: Config) !Overlay {
-        var accounts: std.AutoHashMapUnmanaged(Address, OverlayAccount) = .empty;
+        var accounts: address_map.Map(OverlayAccount) = .empty;
         try accounts.ensureTotalCapacity(allocator, config.accounts_max);
         errdefer accounts.deinit(allocator);
         var slots: std.AutoHashMapUnmanaged(SlotKey, OverlaySlot) = .empty;

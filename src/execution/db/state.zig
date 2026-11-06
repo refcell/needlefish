@@ -16,6 +16,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const changeset_module = @import("changeset.zig");
+const address_map = @import("address_map.zig");
 const trie = @import("../trie/root.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
 const node = trie.node;
@@ -231,7 +232,7 @@ pub const AccountEntry = struct {
 };
 
 pub const State = struct {
-    account_table: std.AutoHashMapUnmanaged(Address, AccountEntry),
+    account_table: address_map.Map(AccountEntry),
     storage_table: std.AutoHashMapUnmanaged(SlotKey, u256),
     code_table: std.AutoHashMapUnmanaged(Hash, CodeRef),
     code_arena: []u8,
@@ -247,7 +248,7 @@ pub const State = struct {
     trie_stale: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !State {
-        var account_table: std.AutoHashMapUnmanaged(Address, AccountEntry) = .empty;
+        var account_table: address_map.Map(AccountEntry) = .empty;
         try account_table.ensureTotalCapacity(allocator, config.accounts_max);
         errdefer account_table.deinit(allocator);
         var storage_table: std.AutoHashMapUnmanaged(SlotKey, u256) = .empty;

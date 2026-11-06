@@ -14,6 +14,7 @@
 const std = @import("std");
 pub const storage = @import("storage/root.zig");
 
+pub const address_map = @import("address_map.zig");
 pub const changeset = @import("changeset.zig");
 pub const state = @import("state.zig");
 pub const overlay = @import("overlay.zig");
