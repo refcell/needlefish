@@ -39,6 +39,7 @@ pub const WorkerStats = struct {
     abandoned: u64 = 0,
     lost: u64 = 0,
     heartbeats: u64 = 0,
+    not_ready: u64 = 0,
 
     pub const descriptions = .{
         .ticks = "Worker loop ticks.",
@@ -47,6 +48,7 @@ pub const WorkerStats = struct {
         .abandoned = "Jobs abandoned after a backend failure.",
         .lost = "Jobs given up because the lease was lost, expired or cancelled.",
         .heartbeats = "Lease heartbeats sent.",
+        .not_ready = "Discovery rounds skipped because the backend was not ready to claim.",
     };
 };
 

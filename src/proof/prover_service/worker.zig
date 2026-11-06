@@ -39,6 +39,9 @@ pub const Backend = struct {
         start: *const fn (context: *anyopaque, job: *const protocol.ProofJob) BackendError!void,
         poll: *const fn (context: *anyopaque) BackendError!?protocol.ProofResult,
         cancel: *const fn (context: *anyopaque) void,
+        /// base/base `ClaimedProofJobHandler::ready_to_claim`: false skips discovery this
+        /// tick (a TEE backend with no valid enclave signer). Absent: always ready.
+        ready: ?*const fn (context: *anyopaque) bool = null,
     };
 
     pub fn start(backend: Backend, job: *const protocol.ProofJob) BackendError!void {
@@ -52,6 +55,11 @@ pub const Backend = struct {
 
     pub fn cancel(backend: Backend) void {
         backend.vtable.cancel(backend.context);
+    }
+
+    pub fn ready(backend: Backend) bool {
+        const ready_fn = backend.vtable.ready orelse return true;
+        return ready_fn(backend.context);
     }
 };
 
@@ -80,6 +88,8 @@ pub const Stats = struct {
     /// Jobs given up because the lease was lost, expired or cancelled.
     lost: u64 = 0,
     heartbeats: u64 = 0,
+    /// Discovery rounds skipped because the backend was not ready to claim.
+    not_ready: u64 = 0,
 };
 
 pub fn Worker(comptime IO: type) type {
@@ -123,6 +133,10 @@ pub fn Worker(comptime IO: type) type {
             assert(worker.state == .idle);
             if (now_ns < worker.poll_next_ns) return;
             worker.poll_next_ns = now_ns + worker.config.poll_interval_ns;
+            if (!worker.backend.ready()) {
+                worker.stats.not_ready += 1;
+                return;
+            }
             const config = &worker.config;
             const response = worker.client.get_next_proof(&.{
                 .worker_id = config.worker_id,
