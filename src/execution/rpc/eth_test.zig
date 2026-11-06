@@ -1967,3 +1967,124 @@ test "eth: debug_storageRangeAt reads the head trie and the history window" {
     const empty = try storage_range_request(h, .{ .bytes = record_hash }, 1, tail, 8);
     try expect_contains(empty, "\"storage\":{}");
 }
+
+fn validated_entry(out: []u8, sender: []const u8, raw: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(out, "{{\"sender\":{s},\"raw\":\"0x{x}\"}}", .{ sender, raw });
+}
+
+fn insert_request(h: *Harness, method: []const u8, params: []const u8) ![]const u8 {
+    var body: [4096]u8 = undefined;
+    const format = request_prefix_format ++ "{s}\",\"params\":[{s}]}}";
+    return h.request_runtime(try std.fmt.bufPrint(&body, format, .{ method, params }));
+}
+
+test "eth: base_insertValidatedTransaction pools forwarded transactions by their sender" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    const raw = try transfer_raw(&buffer, 0);
+    var entry: [512]u8 = undefined;
+    const one = "base_insertValidatedTransaction";
+    const text = try validated_entry(&entry, sender_at, raw);
+    try expect_contains(try insert_request(h, one, text), "\"result\":null");
+    const hash = primitives.keccak256(raw);
+    try testing.expect(h.api.pool.?.get(hash) != null);
+    const again = try insert_request(h, one, text);
+    try expect_contains(again, "-32603");
+    try expect_contains(again, "pool rejected transaction: already imported");
+    // The sender is trusted: an unfunded one is refused by the pool's balance check.
+    const unfunded = "\"0x00000000000000000000000000000000000000aa\"";
+    var raw_buffer: [256]u8 = undefined;
+    const other = try validated_entry(&entry, unfunded, try transfer_raw(&raw_buffer, 1));
+    try expect_contains(try insert_request(h, one, other), "InsufficientFunds");
+    const extension = "{\"sender\":" ++ sender_at ++ ",\"raw\":\"0x01\",\"extra\":1}";
+    const refused = try insert_request(h, one, extension);
+    try expect_contains(refused, "transaction extensions are disabled");
+    try expect_contains(try insert_request(h, one, "{\"raw\":\"0x01\"}"), "-32602");
+}
+
+test "eth: base_insertValidatedTransactions answers each entry and parses all first" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffers: [2][256]u8 = undefined;
+    const first = try transfer_raw(&buffers[0], 0);
+    const second = try transfer_raw(&buffers[1], 1);
+    var entries: [3][512]u8 = undefined;
+    var params: [2048]u8 = undefined;
+    const batch = "base_insertValidatedTransactions";
+    // A malformed entry fails the call; nothing before it was inserted.
+    const malformed = try std.fmt.bufPrint(&params, "[{s},{{\"raw\":\"0x01\"}}]", .{
+        try validated_entry(&entries[0], sender_at, first),
+    });
+    try expect_contains(try insert_request(h, batch, malformed), "\"error\"");
+    try testing.expect(h.api.pool.?.get(primitives.keccak256(first)) == null);
+    const mixed = try std.fmt.bufPrint(&params, "[{s},{s},{s}]", .{
+        try validated_entry(&entries[0], sender_at, first),
+        try validated_entry(&entries[1], sender_at, first),
+        try validated_entry(&entries[2], sender_at, second[0 .. second.len - 1]),
+    });
+    const text = try insert_request(h, batch, mixed);
+    try expect_contains(text, "\"result\":[null,{\"code\":-32603");
+    try expect_contains(text, "already imported\"},{\"code\":-32602");
+    try expect_contains(text, "invalid transaction: ");
+    try expect_contains(try insert_request(h, batch, "[]"), "\"result\":[]");
+}
+
+test "eth: seeded fuzz of base_insertValidatedTransactions against a pool model" {
+    var prng = Prng.init(0x6976);
+    const h = try Harness.create();
+    defer h.destroy();
+    var next_nonce: u64 = 0;
+    for (0..8) |_| {
+        var buffers: [6][256]u8 = undefined;
+        var entries: [6][512]u8 = undefined;
+        var params: [4096]u8 = undefined;
+        var stream: std.Io.Writer = .fixed(&params);
+        var expected: [6]enum { added, duplicate, invalid } = undefined;
+        const count = prng.range(1, 6);
+        try stream.writeAll("[");
+        for (0..count) |index| {
+            if (index > 0) try stream.writeAll(",");
+            const pick = prng.below(3);
+            const nonce = if (pick == 1 and next_nonce > 0) next_nonce - 1 else next_nonce;
+            var raw = try transfer_raw(&buffers[index], nonce);
+            if (pick == 2) raw = raw[0 .. raw.len - 1];
+            expected[index] = if (pick == 2) .invalid else if (nonce < next_nonce)
+                .duplicate
+            else
+                .added;
+            if (expected[index] == .added) next_nonce += 1;
+            try stream.writeAll(try validated_entry(&entries[index], sender_at, raw));
+        }
+        try stream.writeAll("]");
+        const text = try insert_request(h, "base_insertValidatedTransactions", stream.buffered());
+        var nulls: usize = 0;
+        var duplicates: usize = 0;
+        var invalids: usize = 0;
+        for (expected[0..count]) |want| switch (want) {
+            .added => nulls += 1,
+            .duplicate => duplicates += 1,
+            .invalid => invalids += 1,
+        };
+        try testing.expectEqual(nulls, count_of(text, "null"));
+        try testing.expectEqual(duplicates, count_of(text, "already imported"));
+        try testing.expectEqual(invalids, count_of(text, "invalid transaction"));
+    }
+}
+
+fn fuzz_validated_item(_: void, smith: *testing.Smith) anyerror!void {
+    const bytes = smith.value([64]u8);
+    const length = smith.value(u8) % bytes.len;
+    var scanner = json.Scanner.init(bytes[0..length]);
+    var space: [64]u8 = undefined;
+    const first = scanner.next() catch return;
+    if (first.tag != .object_begin) return;
+    const item = rpc_insert_validated.parse_item(&scanner, &space) catch return;
+    try testing.expect(item.raw.len > 0);
+}
+
+const rpc_insert_validated = @import("insert_validated.zig");
+
+test "eth: fuzz base_insertValidatedTransaction entries" {
+    try testing.fuzz({}, fuzz_validated_item, .{});
+}

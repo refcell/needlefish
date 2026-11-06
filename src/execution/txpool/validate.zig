@@ -18,6 +18,7 @@ const txpool = @import("root.zig");
 const eip8130_pool = @import("eip8130.zig");
 
 const B256 = primitives.B256;
+const Address = primitives.Address;
 const Envelope = consensus.Envelope;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -38,6 +39,8 @@ pub const ValidateError = consensus.tx.DecodeError || error{
     TooManyBlobs,
     EmptyAuthorizationList,
     InvalidSignature,
+    /// An EIP-8130 transaction does not belong to the sender the caller vouched for.
+    SenderMismatch,
     IntrinsicGasTooLow,
     InitCodeTooLarge,
     GasLimitExceeded,
@@ -72,10 +75,27 @@ pub fn validate(
     timestamp: u64,
     recoverer: consensus.Recoverer,
 ) ValidateError!Validated {
+    return validate_known(raw, scratch, spec, timestamp, recoverer, null);
+}
+
+/// `validate` with the sender already recovered by a trusted caller
+/// (`base_insertValidatedTransaction`): no signature recovery. EIP-8130 transactions are
+/// still admitted in full and must name the same sender.
+pub fn validate_known(
+    raw: []const u8,
+    scratch: []u8,
+    spec: *const chainspec.ChainSpec,
+    timestamp: u64,
+    recoverer: consensus.Recoverer,
+    known_sender: ?Address,
+) ValidateError!Validated {
     const pooled = try decode_pooled(raw, scratch);
     const envelope = pooled.envelope;
     if (envelope == .eip8130) {
         const admitted = try eip8130_pool.admit(raw, envelope.eip8130, spec, timestamp, recoverer);
+        if (known_sender) |sender| {
+            if (!sender.eql(admitted.tx.sender)) return error.SenderMismatch;
+        }
         return .{ .tx = admitted.tx, .envelope = envelope, .sidecar = null, .lane = admitted.lane };
     }
     try check_type(envelope, spec, timestamp);
@@ -86,7 +106,8 @@ pub fn validate(
     if (envelope == .eip4844) try check_sidecar(envelope, pooled.sidecar, spec, timestamp);
     const signature = envelope.signature().?;
     if (!signature.is_in_range() or !signature.is_low_s()) return error.InvalidSignature;
-    const sender = envelope.recover_sender(recoverer) orelse return error.InvalidSignature;
+    const sender = known_sender orelse
+        envelope.recover_sender(recoverer) orelse return error.InvalidSignature;
     return .{
         .tx = .{
             .hash = envelope.hash(),

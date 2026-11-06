@@ -68,6 +68,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer).
 - [x] rpc: debug_storageRangeAt handler behind `Api.storage_range` (rpc/storage_range.zig).
 - [x] wire `Api.storage_range` to trie-db's storage ranges (`Chain.storage_range_at`).
+- [x] rpc: base_insertValidatedTransaction(s) (builder ingress of pre-validated txs).
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -106,6 +107,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: base_insertValidatedTransaction / base_insertValidatedTransactions (rpc/insert_validated.zig): `{sender, raw, metering?}` pooled with the given sender (no signature recovery, `validate.validate_known`; EIP-8130 still admitted in full and must match the sender, else SenderMismatch). Batch <= 1024, parsed in full before any insert, one result each (null or {code,message}). Errors follow base/base: parse -32602, validation -32602 "invalid transaction: X", pool -32603 "pool rejected transaction: X" ("already imported" for duplicates). Extensions refused (base default); metering accepted and ignored (builder owns the cache). `eth.add_raw_checked` returns failures for per-entry reporting.
 - 2026-11-06: prefetched sender recovery: two pipeline slots in the executor; `next_transactions` (set by the caller) starts the next block's recovery on the pool after the current block's transactions are applied (always on the pool: `Pipeline.start_with(.., 1)`), and the next `execute_block` adopts it when given the same slice, else cancels it (`cancel_prefetch`, also at deinit). Replayer (nf-replay's file, small edit): two parity halves of `transaction_views`, prefills block i+1. Replay 888 -> 931 Mgas/s. The live node does not prefetch (it does not know the next block).
 - 2026-11-06: durable storage-range test (head + history window, nextKey paging, absent account, non-canonical hash, no-history config, seeded start/limit model). It found that durable nodes without history left `Journal.storage_range` null, so even head reads failed; the hook is now always set (the database serves the head without history).
 - 2026-11-06: replay profile for node-owned costs outside the EVM: none above 6% (main-thread sender recovery 6%, batch size 1/2/8 within noise; receipts root, bloom, decode < 1% each). Remaining non-EVM time is the replay backend (commit 7%, witness loading 7%, storage reads 9%), reported to nf-replay. Details in PERF.md.

@@ -57,7 +57,7 @@ pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_m
     @import("access_list.zig").methods ++ @import("simulate.zig").methods ++ send_sync.methods ++
     @import("metering.zig").methods ++ @import("trace.zig").methods ++
     @import("validity.zig").methods ++ @import("account.zig").methods ++
-    @import("storage_range.zig").methods;
+    @import("storage_range.zig").methods ++ @import("insert_validated.zig").methods;
 const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
@@ -551,26 +551,46 @@ fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
 
 /// Validates `raw` (decoded into the first half of the scratch) and adds it to the pool.
 pub fn add_raw(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+    return switch (add_raw_checked(api, raw, null)) {
+        .added => |hash| hash,
+        .failed => |failure| call.fail(failure.code, failure.message),
+    };
+}
+
+pub const AddFailure = struct {
+    code: i32,
+    /// What failed (a static error name or message).
+    message: []const u8,
+    /// Set when the pool refused the transaction (as opposed to validation).
+    pool_error: ?anyerror = null,
+};
+
+pub const AddResult = union(enum) { added: Hash, failed: AddFailure };
+
+/// `add_raw` reporting its failure instead of answering the call; `known_sender` skips
+/// signature recovery for a caller that already recovered it.
+pub fn add_raw_checked(api: *Api, raw: []const u8, known_sender: ?primitives.Address) AddResult {
     const half = api.scratch.len / 2;
     assert(raw.len <= half);
     const pool = api.pool orelse {
-        return call.fail(rpc.code.server_error, "transaction pool disabled");
+        return fail_add(rpc.code.server_error, "transaction pool disabled");
     };
     const head = head_header(api);
-    const validated = txpool.validate.validate(
+    const validated = txpool.validate.validate_known(
         raw,
         api.scratch[half..],
         api.spec,
         head.timestamp + 1,
         api.chain.executor.recoverer,
-    ) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+        known_sender,
+    ) catch |err| return fail_add(rpc.code.server_error, @errorName(err));
     if (validated.sidecar != null) {
         if (api.kzg) |verifier| txpool.validate.verify_blob_proofs(raw, verifier) catch |err| {
-            return call.fail(rpc.code.server_error, @errorName(err));
+            return fail_add(rpc.code.server_error, @errorName(err));
         };
     }
     api.chain.ensure_head_state() catch {
-        return call.fail(rpc.code.internal_error, "head state unavailable");
+        return fail_add(rpc.code.internal_error, "head state unavailable");
     };
     const account: txpool.Account = if (validated.lane) |lane|
         api.chain.lane_account(lane)
@@ -579,10 +599,17 @@ pub fn add_raw(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
     else
         .{ .nonce = 0, .balance = 0 };
     _ = pool.add(validated.tx, account) catch |err| {
-        return call.fail(rpc.code.server_error, @errorName(err));
+        var failure = fail_add(rpc.code.server_error, @errorName(err)).failed;
+        failure.pool_error = err;
+        return .{ .failed = failure };
     };
     if (api.filters) |filters| filters.note_pending(validated.tx.hash.bytes);
-    return validated.tx.hash.bytes;
+    return .{ .added = validated.tx.hash.bytes };
+}
+
+fn fail_add(code: i32, message: []const u8) AddResult {
+    assert(message.len > 0);
+    return .{ .failed = .{ .code = code, .message = message } };
 }
 
 // ---- Calls ------------------------------------------------------------------------
