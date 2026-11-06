@@ -12,6 +12,7 @@ pub const planner = @import("planner.zig");
 pub const crl = @import("crl.zig");
 pub const registration_tasks = @import("registration_tasks.zig");
 pub const reconciler = @import("reconciler.zig");
+pub const prover = @import("prover.zig");
 
 pub const P384Hints = hints.P384Hints;
 pub const AttestationPlanner = planner.AttestationPlanner;
