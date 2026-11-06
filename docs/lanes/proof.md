@@ -159,8 +159,8 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   replays the returned archive offline to the node's root.
 
 ## Decisions
-- Boot pins the schedule ID like base/base but skips its Zenith and Everest refusals: our
-  `Upgrade` set has no Zenith and the executor runs every upgrade it knows.
+- Boot pins the schedule ID like base/base, refusing Zenith active by the claim (dropping it
+  after), but skips the Everest refusal: our executor is the node's, which runs EIP-8130.
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
   `Pump` (one host server step) when a client read would block, so client and host
   interleave deterministically on one thread. Channel writes are all-or-nothing over a

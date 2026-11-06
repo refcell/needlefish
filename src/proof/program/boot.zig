@@ -65,6 +65,8 @@ pub const Error = preimage.oracle.ReadError || error{
     ClaimBeforeGenesis,
     /// The schedule block (key 11) is below the claimed block.
     ScheduleBlockBeforeClaim,
+    /// Zenith, which the schedule ID does not commit, is active by the claimed block.
+    UncommittedZenithUpgrade,
 };
 
 /// Largest L1 config JSON accepted.
@@ -125,6 +127,13 @@ pub const BootInfo = struct {
         }
         if (info.schedule_block_number < info.claimed_l2_block_number) {
             return error.ScheduleBlockBeforeClaim;
+        }
+        // Zenith is not contract-backed: refused inside the proven range, dropped after it.
+        const claim_timestamp =
+            info.rollup_config.l2_block_timestamp(info.claimed_l2_block_number);
+        if (info.rollup_config.upgrades.get(.zenith)) |zenith| {
+            if (zenith <= claim_timestamp) return error.UncommittedZenithUpgrade;
+            info.rollup_config.upgrades.set(.zenith, null);
         }
         const schedule_timestamp =
             info.rollup_config.l2_block_timestamp(info.schedule_block_number);
@@ -385,4 +394,18 @@ fn fuzz_parse(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "boot: fuzz config parsing" {
     try fuzz.run({}, fuzz_parse, .{ .iterations = 1024 });
+}
+
+test "boot: Zenith is refused by the claim and dropped after it" {
+    var json_buffer: [8192]u8 = undefined;
+    var config = devnet_config();
+    config.upgrades.set(.zenith, std.math.maxInt(u32));
+    var future: BootStore = .{};
+    try fill_store(&future, &config, &json_buffer);
+    const info = try load_from(&future);
+    try testing.expectEqual(@as(?u64, null), info.rollup_config.upgrades.get(.zenith));
+    config.upgrades.set(.zenith, config.genesis.l2_time);
+    var active: BootStore = .{};
+    try fill_store(&active, &config, &json_buffer);
+    try testing.expectError(error.UncommittedZenithUpgrade, load_from(&active));
 }
