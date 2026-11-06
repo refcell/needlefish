@@ -175,6 +175,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [ ] `proof/bin-tee`: base/base `bin/prover/{nitro-enclave,nitro-host}`: `base nitro-enclave`
   (local-mode enclave server; TCP in place of vsock) and `base nitro-host` (host server feeding
   enclaves, `enclave_*` and `prover_prove` JSON-RPC), plus a devnet smoke: TEE proof of a range.
+  Done: `base nitro-enclave` (smoke: listens, drops a malformed frame, keeps serving).
 
 ## Decisions
 - Not ported: base/base `bin/challenger-e2e` (forks L1 into Anvil for a K8s job); the
@@ -349,6 +350,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: registrar prover client, TEE registry/CertManager bindings, `base nitro-enclave`.
 - 2026-11-05: registrar pure logic (planner, P-384 hints, CRL, reconciler, tasks).
 - 2026-11-05: proof primitives (config hash goldens for 4 chains, journal, proof bytes) and the TEE enclave (signer, bincode link, server, e2e).
 - 2026-11-05: executor accepts Denim same-second children; live Denim devnet proof holds, replays, rejects a wrong claim.
