@@ -444,13 +444,19 @@ fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn trace_call(api: *Api, call: *Call) HandlerError!void {
-    const request = try eth.parse_call_request(api, call);
-    const options = try options_of(call, try call.params.optional_raw());
+    var request = try eth.parse_call_request(api, call);
+    const config = try call.params.optional_raw();
+    const options = try options_of(call, config);
     try call.params.finish();
-    // The recorder sits between the parsed call data and the proof tail.
-    const data = request.message.data;
-    const base = @intFromPtr(api.scratch.ptr);
-    const data_end = if (data.len == 0) 0 else @intFromPtr(data.ptr) - base + data.len;
+    // geth reads `stateOverrides` and `blockOverrides` from the trace config.
+    const state_overrides = json.find_path(config.?, &.{"stateOverrides"}) catch
+        return error.InvalidParams;
+    const block_overrides = json.find_path(config.?, &.{"blockOverrides"}) catch
+        return error.InvalidParams;
+    try eth.set_overrides(api, call, &request, state_overrides, block_overrides);
+    // The recorder sits between the request's scratch (call data, override code) and the
+    // proof tail.
+    const data_end = eth.scratch_used(api, &request);
     const end = switch (request.view) {
         .head => api.scratch.len,
         .historical => eth.proof_tail_offset(api).?, // Checked by `parse_call_request`.

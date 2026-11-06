@@ -59,6 +59,8 @@ const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
+const simulate_module = @import("simulate.zig");
+const evm = @import("../evm/root.zig");
 
 const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
@@ -615,6 +617,66 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
 pub const CallRequest = struct {
     message: node.executor.Executor.Call,
     view: state_view.View,
+    /// Raw geth `stateOverrides` / `blockOverrides` objects (see `set_overrides`).
+    state_overrides: ?[]const u8 = null,
+    block_overrides: ?[]const u8 = null,
+    /// Scratch after the call data for override code (hex decodes to half its text).
+    override_space: []u8 = &.{},
+};
+
+fn present(raw: ?[]const u8) ?[]const u8 {
+    const text = raw orelse return null;
+    return if (std.mem.eql(u8, text, "null")) null else text;
+}
+
+/// The scratch end usable by a call request (the proof buffers sit past it in a
+/// historical view).
+fn request_scratch_end(api: *Api, view: state_view.View) usize {
+    return switch (view) {
+        .head => api.scratch.len,
+        .historical => proof_tail_offset(api).?, // Checked when the request was parsed.
+    };
+}
+
+/// Scratch bytes a parsed request occupies (call data, then override code space).
+pub fn scratch_used(api: *Api, request: *const CallRequest) usize {
+    const base = @intFromPtr(api.scratch.ptr);
+    const space = request.override_space;
+    if (space.len > 0) return @intFromPtr(space.ptr) - base + space.len;
+    const data = request.message.data;
+    return if (data.len == 0) 0 else @intFromPtr(data.ptr) - base + data.len;
+}
+
+/// Attaches state and block overrides (raw JSON, "null" or absent for none).
+pub fn set_overrides(
+    api: *Api,
+    call: *Call,
+    request: *CallRequest,
+    state_overrides: ?[]const u8,
+    block_overrides: ?[]const u8,
+) HandlerError!void {
+    request.block_overrides = present(block_overrides);
+    request.state_overrides = present(state_overrides);
+    const state = request.state_overrides orelse return;
+    const start = scratch_used(api, request);
+    const end = request_scratch_end(api, request.view);
+    const size = state.len / 2 + 32;
+    if (start + size > end) return call.fail(rpc.code.invalid_params, "overrides too large");
+    request.override_space = api.scratch[start..][0..size];
+}
+
+const Overrides = struct {
+    raw: []const u8,
+    space: []u8,
+    failure: ?simulate_module.OverrideError = null,
+
+    fn run(context: *anyopaque, state: *evm.State) void {
+        const overrides: *Overrides = @ptrCast(@alignCast(context));
+        simulate_module.apply_state_overrides(state, overrides.space, overrides.raw) catch |err|
+            {
+                overrides.failure = err;
+            };
+    }
 };
 
 pub fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
@@ -657,13 +719,35 @@ pub fn simulate(
     env.number += 1;
     env.timestamp += 1;
     env.parent_hash = header.hash().bytes;
+    if (request.block_overrides) |raw| try simulate_module.apply_block_overrides(call, &env, raw);
+    var message = request.message;
+    var overrides: Overrides = .{ .raw = "", .space = request.override_space };
+    if (request.state_overrides) |raw| {
+        overrides.raw = raw;
+        message.prepare = .{ .context = &overrides, .run = Overrides.run };
+    }
+    const simulated = try simulate_in(api, call, request.view, &env, message);
+    if (overrides.failure) |failure| switch (failure) {
+        error.InvalidParams => return error.InvalidParams,
+        else => return call.fail(rpc.code.invalid_params, "invalid state override"),
+    };
+    return simulated;
+}
+
+fn simulate_in(
+    api: *Api,
+    call: *Call,
+    view: state_view.View,
+    env: *const node.executor.BlockEnv,
+    message: node.executor.Executor.Call,
+) HandlerError!node.executor.Executor.Simulated {
     const executor = api.chain.executor;
-    const block = switch (request.view) {
+    const block = switch (view) {
         .head => {
             api.chain.ensure_head_state() catch {
                 return call.fail(rpc.code.internal_error, "head state unavailable");
             };
-            return executor.simulate(&env, request.message) catch |err| {
+            return executor.simulate(env, message) catch |err| {
                 return call.fail(rpc.code.internal_error, @errorName(err));
             };
         },
@@ -678,7 +762,7 @@ pub fn simulate(
         .account_proof = &proofs.account,
         .storage_proof = &proofs.storage,
     };
-    return executor.simulate_on(&env, request.message, history.database()) catch |err| {
+    return executor.simulate_on(env, message, history.database()) catch |err| {
         if (history.failure) |failure| return eth_proof.fail_history(call, failure);
         return call.fail(rpc.code.internal_error, @errorName(err));
     };
@@ -686,7 +770,11 @@ pub fn simulate(
 
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
     if (try eip8130_request(api, call, .call)) return;
-    const request = try parse_call_request(api, call);
+    var request = try parse_call_request(api, call);
+    const state_overrides = try call.params.optional_raw();
+    const block_overrides = try call.params.optional_raw();
+    try call.params.finish();
+    try set_overrides(api, call, &request, state_overrides, block_overrides);
     switch (try simulate(api, call, request)) {
         .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
         .executed => |executed| {
@@ -714,6 +802,10 @@ fn eip8130_request(
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     if (try eip8130_request(api, call, .estimate)) return;
     var request = try parse_call_request(api, call);
+    const state_overrides = try call.params.optional_raw();
+    const block_overrides = try call.params.optional_raw();
+    try call.params.finish();
+    try set_overrides(api, call, &request, state_overrides, block_overrides);
     const header = view_header(api, request.view);
     var env = node.chain.env_of(&header);
     env.timestamp += 1; // As `simulate` runs it: in the next block.

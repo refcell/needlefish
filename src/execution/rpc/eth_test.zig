@@ -1564,3 +1564,66 @@ test "eth: prestateTracer keeps accounts and slots touched by reverted frames" {
     try expect_contains(text, counter_at ++ ":{");
     try expect_contains(text, "\"storage\":{\"0x" ++ zeros_62 ++ "00\":" ++ word_zero);
 }
+
+const override_target = "\"0x0000000000000000000000000000000000007777\"";
+
+test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block overrides" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const call = "[{\"to\":" ++ override_target ++ "},\"latest\",";
+    // PUSH1 42, return it as a word.
+    const code_42 = "{" ++ override_target ++ ":{\"code\":\"0x602a5f5260205ff3\"}}";
+    const word_42 = "\"result\":\"0x" ++ zeros_62 ++ "2a\"";
+    try expect_contains(try h.request("eth_call", call ++ code_42 ++ "]"), word_42);
+    // Not persisted: the address has no code afterwards.
+    try expect_contains(try h.request("eth_call", call ++ "null]"), "\"result\":\"0x\"");
+    // SLOAD(0) with a stateDiff slot.
+    const slot = "{" ++ override_target ++ ":{\"code\":\"0x5f545f5260205ff3\",\"stateDiff\":" ++
+        "{\"0x" ++ zeros_62 ++ "00\":\"0x" ++ zeros_62 ++ "07\"}}}";
+    const word_7 = "\"result\":\"0x" ++ zeros_62 ++ "07\"";
+    try expect_contains(try h.request("eth_call", call ++ slot ++ "]"), word_7);
+    // NUMBER under a block override.
+    const number = "{" ++ override_target ++ ":{\"code\":\"0x435f5260205ff3\"}}";
+    const word_99 = "\"result\":\"0x" ++ zeros_62 ++ "99\"";
+    const block = ",{\"number\":\"0x99\"}]";
+    try expect_contains(try h.request("eth_call", call ++ number ++ block), word_99);
+    // eth_estimateGas runs the overridden code on every step.
+    const estimate = try h.request("eth_estimateGas", call ++ code_42 ++ "]");
+    try testing.expect(std.mem.indexOf(u8, estimate, "\"result\":\"0x5208\"") == null);
+    try expect_contains(estimate, "\"result\":\"0x5");
+    // debug_traceCall reads the overrides from its config.
+    const traced = try h.request(
+        "debug_traceCall",
+        call ++ "{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ code_42 ++ "}]",
+    );
+    try expect_contains(traced, "\"output\":\"0x" ++ zeros_62 ++ "2a\"");
+    // Malformed overrides are invalid params.
+    const bad = "{" ++ override_target ++ ":{\"colour\":\"0x01\"}}]";
+    try expect_contains(try h.request("eth_call", call ++ bad), "-32602");
+    try expect_contains(try h.request("eth_call", call ++ "null,{\"bogus\":1}]"), "-32602");
+}
+
+test "eth: seeded fuzz of eth_call storage overrides" {
+    var prng = Prng.init(0x6f76);
+    const h = try Harness.create();
+    defer h.destroy();
+    for (0..32) |_| {
+        const value = prng.int(u64);
+        const slot_index = prng.below(4);
+        var body: [1024]u8 = undefined;
+        const format = request_prefix_format ++ "eth_call\",\"params\":[{{\"to\":" ++
+            override_target ++ ",\"data\":\"0x{x:0>64}\"}},\"latest\",{{" ++ override_target ++
+            ":{{\"code\":\"0x5f35545f5260205ff3\",\"stateDiff\":{{\"0x{x:0>64}\":" ++
+            "\"0x{x:0>64}\"}}}}}}]}}";
+        // CALLDATALOAD(0) is the slot read; only the overridden slot holds `value`.
+        const read = if (prng.chance(1, 2)) slot_index else slot_index + 1;
+        const text = try h.request_runtime(
+            try std.fmt.bufPrint(&body, format, .{ read, slot_index, value }),
+        );
+        var expected: [96]u8 = undefined;
+        const want: u64 = if (read == slot_index) value else 0;
+        try expect_contains(text, try std.fmt.bufPrint(&expected, "\"result\":\"0x{x:0>64}\"", .{
+            want,
+        }));
+    }
+}

@@ -229,7 +229,7 @@ fn simulate_block(
 
 const Position = struct { block: u64, index: u64 };
 
-fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) HandlerError!void {
+pub fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) HandlerError!void {
     var members = try Members.init(raw);
     while (try members.next(16)) |member| {
         if (std.mem.eql(u8, member.value, "null")) continue;
@@ -251,9 +251,9 @@ fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) HandlerEr
     }
 }
 
-const OverrideError = HandlerError || evm.state.Error;
+pub const OverrideError = HandlerError || evm.state.Error;
 
-fn apply_state_overrides(state: *evm.State, space: []u8, raw: []const u8) OverrideError!void {
+pub fn apply_state_overrides(state: *evm.State, space: []u8, raw: []const u8) OverrideError!void {
     var accounts = try Members.init(raw);
     while (try accounts.next(overrides_max)) |entry| {
         const text = entry.key;

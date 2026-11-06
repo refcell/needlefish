@@ -509,6 +509,9 @@ pub const Executor = struct {
         /// Sees the state right after the call executes, before it is discarded
         /// (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
+        /// Runs on the fresh state before the call (eth_call state overrides); it may fail
+        /// through its own context, which the caller checks.
+        prepare: ?Inspect = null,
     };
 
     pub const Inspect = struct {
@@ -619,6 +622,7 @@ pub const Executor = struct {
         var free_block = block.*;
         free_block.base_fee = 0;
         executor.set_block_env(&free_block);
+        if (call.prepare) |prepare| prepare.run(prepare.context, executor.state);
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         const caller = try executor.state.load(call.from);
         const tx: TxEnv = .{
