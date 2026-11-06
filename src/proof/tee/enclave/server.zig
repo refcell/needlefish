@@ -78,6 +78,10 @@ pub const Server = struct {
     tee_image_hash: Hash,
     nsm: ?nsm_module.Nsm,
     limits: Limits = .{},
+    /// Local mode only: sign for a chain without a pinned config hash (a devnet) by hashing
+    /// the boot rollup config. Never in an enclave: the pinned hash is what binds the image
+    /// to its chains, so base/base refuses unknown chains outright.
+    derive_unknown_chain_config: bool = false,
 
     /// Enclave mode: PCR0 must be a 48-byte SHA-384 measurement.
     pub fn init_enclave(nsm: nsm_module.Nsm) InitError!Server {
@@ -110,6 +114,21 @@ pub const Server = struct {
         assert(server.is_local_mode());
         assert(std.mem.allEqual(u8, &server.tee_image_hash, 0));
         return server;
+    }
+
+    /// The pinned config hash of `boot`'s chain, or with `derive_unknown_chain_config` in local
+    /// mode the canonical hash of its rollup config.
+    fn config_hash_of(server: *const Server, boot: *const program.BootInfo) ProveError!Hash {
+        assert(!server.derive_unknown_chain_config or server.is_local_mode());
+        if (primitives.config_hash_for_chain(boot.chain_id)) |hash| return hash;
+        if (!server.derive_unknown_chain_config or !server.is_local_mode()) {
+            return error.UnsupportedChain;
+        }
+        var config = primitives.PerChainConfig.from_rollup_config(&boot.rollup_config) orelse
+            return error.UnsupportedChain;
+        config.force_defaults();
+        assert(config.chain_id == boot.rollup_config.l2_chain_id);
+        return config.hash();
     }
 
     pub fn is_local_mode(server: *const Server) bool {
@@ -160,8 +179,7 @@ pub const Server = struct {
         defer harness.deinit(allocator);
         var scratch: [program.boot.rollup_config_bytes_max]u8 = undefined;
         const boot = try program.BootInfo.load(harness.oracle_reader(), &scratch);
-        const config_hash = primitives.config_hash_for_chain(boot.chain_id) orelse
-            return error.UnsupportedChain;
+        const config_hash = try server.config_hash_of(&boot);
         const sampler = try allocator.create(program.IntermediateRootSampler);
         defer allocator.destroy(sampler);
         var run_options = options;
@@ -232,6 +250,31 @@ test "enclave server: local mode" {
     try testing.expectEqual(signer.address, server.signer_address());
     var out: [64]u8 = undefined;
     try testing.expectError(error.Unavailable, server.signer_attestation(.{}, &out));
+}
+
+test "enclave server: unknown chains need the local-mode opt in" {
+    const chains = @import("../../../common/chains/root.zig");
+    const signer = try crypto.Signer.from_bytes(&@as([32]u8, @splat(0x11)));
+    var server: Server = .init_local(signer);
+    var boot: program.BootInfo = undefined;
+    boot.chain_id = chains.devnet.chain_id;
+    boot.rollup_config = primitives.PerChainConfig.from_chain_config(&chains.devnet)
+        .to_rollup_config();
+    // A built-in chain uses its pinned hash, which the derived one reproduces.
+    const pinned = primitives.config_hash_for_chain(chains.devnet.chain_id).?;
+    try testing.expectEqual(pinned, try server.config_hash_of(&boot));
+    server.derive_unknown_chain_config = true;
+    try testing.expectEqual(pinned, try server.config_hash_of(&boot));
+    // A local devnet chain: refused by default, hashed from its rollup config when opted in.
+    boot.chain_id = 901;
+    boot.rollup_config.l2_chain_id = 901;
+    server.derive_unknown_chain_config = false;
+    try testing.expectError(error.UnsupportedChain, server.config_hash_of(&boot));
+    server.derive_unknown_chain_config = true;
+    const derived = try server.config_hash_of(&boot);
+    try testing.expect(!std.mem.eql(u8, &derived, &pinned));
+    boot.rollup_config.genesis.system_config = null;
+    try testing.expectError(error.UnsupportedChain, server.config_hash_of(&boot));
 }
 
 test "enclave server: enclave mode hashes PCR0 and draws its key from the NSM" {
