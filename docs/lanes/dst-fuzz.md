@@ -348,3 +348,6 @@ provably robust.
   real-sequencer liveness now asks for a full catch-up or, when an outage ending at healing
   leaves more backlog than the window covers, 1 block/s after healing; real execution gets
   4 blocks of slack (build, unwind, re-apply per block). Seeds 345/346/41144/42284 fixed.
+- 2026-11-05: nf-node c47babca keeps executed blocks pending in memory (no unwind/re-apply):
+  restored the strict real-sequencer liveness check (full catch-up, slack 2). Swarm 1-3000
+  and 40000-44999: all pass except 44150/44794 (safe-head lag, handed to the 200 ms work).
