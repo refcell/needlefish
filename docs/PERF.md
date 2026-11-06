@@ -894,6 +894,12 @@ witness backend, best of 30, setup untimed.
 13%, interpreter 9%, sparse trie (replay backend only) ~6%, secp256k1 recovery ~5%. The
 code-analysis cache is the largest lever for the gigagas/s target (sent to nf-evm).
 
+After nf-evm's code-analysis cache (51a037d5): **6.11 ms/block, 762 Mgas/s** (2.0x).
+`push_frame` fell from 40% to ~7% of samples. Remaining (of ~610 collapsed samples):
+keccak ~30% (mostly the replay-only sparse trie and witness backend), sparse trie/witness
+~15%, secp256k1 sender recovery ~10% (serial here; the production node recovers on up to
+7 threads), interpreter ~17%.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
