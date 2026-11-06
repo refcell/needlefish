@@ -14,6 +14,7 @@ const node = @import("../node/root.zig");
 const format = @import("format.zig");
 const debug = @import("debug.zig");
 const native = @import("../evm/native.zig");
+const op_receipt = @import("op_receipt.zig");
 
 const Hash = [32]u8;
 const Call = rpc.Call;
@@ -468,8 +469,10 @@ fn block_receipts(api: *Api, w: *json.Writer, hash: Hash, only: ?u32) HandlerErr
     var index: u32 = 0;
     var previous_gas: u64 = 0;
     var log_index: u64 = 0;
+    var first: []const u8 = &.{};
     while (!transactions.is_empty()) : (index += 1) {
         const raw = transactions.bytes() catch unreachable;
+        if (index == 0) first = raw;
         const encoded = receipts.bytes() catch unreachable; // Stored by the chain.
         const value = consensus.Receipt.decode(encoded) catch unreachable;
         defer previous_gas = value.cumulative_gas_used;
@@ -480,6 +483,7 @@ fn block_receipts(api: *Api, w: *json.Writer, hash: Hash, only: ?u32) HandlerErr
             .log_index = log_index,
         });
         context.inclusion.timestamp_ms = block_ms;
+        context.op = op_receipt.fields(api.spec, record.header.timestamp, first, raw);
         try format.receipt(w, value, context);
     }
 }

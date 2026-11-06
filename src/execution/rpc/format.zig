@@ -9,6 +9,7 @@ const consensus = @import("../../common/consensus/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const node = @import("../node/root.zig");
 const evm = @import("../evm/root.zig");
+const op_receipt = @import("op_receipt.zig");
 
 const Hash = [32]u8;
 const Writer = json.Writer;
@@ -255,6 +256,8 @@ pub const ReceiptContext = struct {
     first_log_index: u64,
     blob_gas_used: u64,
     blob_gas_price: ?u128,
+    /// L2: the OP fee fields (`op_receipt`).
+    op: ?op_receipt.Fields = null,
 };
 
 pub fn receipt(w: *Writer, value: consensus.Receipt, context: ReceiptContext) WriteError!void {
@@ -273,10 +276,15 @@ pub fn receipt(w: *Writer, value: consensus.Receipt, context: ReceiptContext) Wr
     try field_quantity(w, "type", @as(u8, @backingInt(value.tx_type)));
     try field_quantity(w, "status", @as(u8, @intFromBool(value.status)));
     try field_data(w, "logsBloom", &value.logs_bloom.bytes);
-    if (context.blob_gas_price) |price| {
+    // Jovian: `blobGasUsed` is the DA footprint, on every transaction.
+    const da_footprint = if (context.op) |op| op.da_footprint else null;
+    if (da_footprint) |footprint| {
+        try field_quantity(w, "blobGasUsed", footprint);
+    } else if (context.blob_gas_price != null) {
         try field_quantity(w, "blobGasUsed", context.blob_gas_used);
-        try field_quantity(w, "blobGasPrice", price);
     }
+    if (context.blob_gas_price) |price| try field_quantity(w, "blobGasPrice", price);
+    if (context.op) |op| try op_receipt.write(w, op);
     if (value.deposit_nonce) |nonce| try field_quantity(w, "depositNonce", nonce);
     if (value.deposit_receipt_version) |version| {
         try field_quantity(w, "depositReceiptVersion", version);
