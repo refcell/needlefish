@@ -42,6 +42,8 @@ pub const steady = @import("steady_bench.zig");
 pub const witness_rpc = @import("witness_rpc_bench.zig");
 /// `Database.open` end to end, per step (`restart_bench.zig`).
 pub const restart = @import("restart_bench.zig");
+/// In-memory bytes per account, slot, and trie node (`footprint_bench.zig`).
+pub const footprint = @import("footprint_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -651,6 +653,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     }
     steady.run(io, filter);
     restart.run(io, filter);
+    footprint.run(io, filter);
 }
 
 fn run_commit_sim(

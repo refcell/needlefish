@@ -833,6 +833,30 @@ and u128 words (8 address bytes + slot summary, re-sorting runs whose 8-byte pre
 several addresses): 15% slower. Compares were not the cost; pdqsort's branchy passes were.
 Not parallel: the account dirty-node collect and the top two levels (a few hundred nodes).
 
+## 2026-11-06 db state memory footprint (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/footprint` (`db/footprint_bench.zig`). A `State`
+filled with `put_account` / `put_storage` and hashed; every byte counted by a counting
+allocator around `State.init`, and each hash table rebuilt at exactly its live count
+("tight"). Per account = account table + `StateTrie.entries` + account-trie nodes; per slot =
+storage table + storage-trie nodes. Input for docs/design/disk-state.md.
+
+| Shape | acct nodes/acct | slot nodes/slot | B/account | B/slot | tight | reserved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100k acct, 1k x 64 slots | 1.386 | 1.391 | 591.4 | 357.2 | 78.2 MiB | 119.7 MiB |
+| 1M acct, 10k x 64 slots | 1.359 | 1.391 | 779.5 | 317.5 | 937.2 MiB | 1353.2 MiB |
+| 10k acct, 100 x 10k slots | 1.388 | 1.389 | 672.3 | 361.8 | 351.4 MiB | 530.0 MiB |
+
+Unit sizes: account table bucket 117 B, `entries` bucket 129 B, storage table bucket 97 B,
+account pool node 194 B (152 + 34 cached ref + 8 order), storage pool node 114 B (72 + 34 +
+8). Tables round capacity to a power of two at <= 80% load, so B/entry swings 1.25-2.5x the
+bucket; at exactly 80% load the floor is 573 B/account and 280 B/slot. History adds ~299 B
+per trie node when on; the checkpoint image 92 B/account and 84 B/slot.
+
+Takeaways: at a Base-mainnet-like 500M accounts + 2B slots the in-memory state is ~0.8-1.0 TiB
+(+~0.9 TiB history, ~200 GiB per checkpoint image), and the `u32` node index and the `u32`
+checkpoint staging size break first. Design response: docs/design/disk-state.md.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

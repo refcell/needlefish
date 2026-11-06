@@ -230,7 +230,38 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   transactions roots OK 10/10; state root OK 9/10, 53715985 INCOMPLETE (collapse into an
   unproven branch, see Decisions). No trie mismatch found.
 
+- [x] Disk-backed state design + in-memory footprint measurement: bytes per account, slot,
+  and trie node at 100k and 1M accounts, extrapolated to Base-mainnet scale; LSM forest on a
+  block grid chosen over a CoW B+tree and an append-only node log; phased plan.
+  (`docs/design/disk-state.md`, `db/footprint_bench.zig` `-- db/footprint`, docs/PERF.md
+  "db state memory footprint")
+- [ ] Disk state phase 1: grid + free set + immutable sorted tables (writer, reader, point
+  lookup, range scan, checksums) over `Storage`, superblock v3 naming a manifest, block reuse
+  only after no retained checkpoint references a block; first user: the code store (code log
+  + table index), taking `code_arena` out of RAM and out of the checkpoint image. DST faults.
+- [ ] Disk state phase 2: hashed account and storage LSM trees (memtables, leveled compaction
+  paced per durable commit, filters on all but the last level, fences, static block cache);
+  `State` reads through them; checkpoints stop serializing the flat tables. Differential test
+  against the in-memory `State`.
+- [ ] Disk state phase 3: trie branch store keyed (owner, path) and a sparse state root over
+  it with a bounded node cache (top account-trie levels pinned); drop the full in-memory node
+  pools; manifest-only checkpoints, open without a trie rebuild.
+- [ ] Disk state phase 4: `eth_getProof` and `debug_executionWitness` walks over the store;
+  batched io_uring prefetch (senders, recipients, access lists, changed trie paths); meet the
+  read-path targets in docs/design/disk-state.md section 6 at 200 ms blocks.
+- [ ] Disk state phase 5: history on disk as an (owner, path, block) tree pruned by
+  compaction; base/base's 15-day window; no history rebuild on open.
+- [ ] Disk state phase 6: scale proof on a synthetic 100M+ entry state, then state import from
+  a public snapshot.
+
 ## Decisions
+- Disk-backed state (docs/design/disk-state.md): a TigerBeetle-style LSM forest on a block
+  grid inside the engine file, hashed keys only (accounts, storage, trie branches by
+  (owner, path), codes), leaves derived from records, sparse root over the branch tree,
+  compaction paced per commit (DST), checkpoints write a manifest and free set instead of
+  the state. Chosen over a CoW B+tree (~10x write amplification for uniformly random hashed
+  keys) and an append-only node log (its key -> offset index does not fit RAM). Measured
+  today: 573-780 B per account, 280-362 B per slot in RAM; mainnet scale needs ~0.4-2.4 TiB.
 - Bulk load on open (`LoadMode.bulk`, default): the snapshot fills the flat tables only;
   `State.build_trie` then hashes every key in SIMD batches, groups the slots by account
   (in-place 256-bucket pass on a byte of the address hash, pdq per bucket by address and
@@ -1088,3 +1119,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   5.62 -> 4.40 ms; db/build_changeset (new) 298 -> 227 us; db/block 7.08 -> 6.79 ms.
   Tests: serial vs parallel pools (account + storage caches, change marks) seeded and fuzzed,
   wide account trie with deletions, account and storage sort vs byte-wise sorts.
+- 2026-11-06: disk-backed state design (docs/design/disk-state.md) and the `db/footprint`
+  bench: 591/780 B per account and 357/318 B per slot at 100k/1M accounts (194 B per account
+  trie node, 114 B per storage trie node, ~1.39 nodes per entry); phases 1-6 in the backlog.
