@@ -66,7 +66,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] rpc: reth account/header reads: eth_getAccount, eth_getAccountInfo,
   eth_getHeaderByNumber, eth_getHeaderByHash.
 - [x] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer).
-- [ ] rpc: debug_storageRangeAt (blocked: needs an ordered storage-leaf walk from trie-db).
+- [x] rpc: debug_storageRangeAt handler behind `Api.storage_range` (rpc/storage_range.zig).
+- [ ] wire `Api.storage_range` to trie-db's `Database.storage_range_at` once it lands.
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -105,6 +106,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: debug_storageRangeAt: handler + `storage_range.Source` interface (number, address hash, start, max, out -> {count, next}), matching trie-db's announced `Database.storage_range_at`. Block-boundary states only: txIndex 0 = parent state, txIndex >= tx count = the block's state, in between rejected (would need re-execution). keyStart left-padded (geth BytesToHash); maxResult as JSON int or hex, capped at 1024. Null source -> "storage ranges are unavailable".
 - 2026-11-06: debug_storageRangeAt deferred: the trie/db expose no ordered (hashed-key) storage-leaf iterator, and those files are trie-db's; asked trie-db for `storage_range(account_hash, start_hash, max) -> leaves + next`.
 - 2026-11-06: debug_traceBlock(rlp, options): decodes the block into the first quarter of the RPC scratch, requires its parent in the store and history window, and shares `trace_block` (header + transaction decoder + reserved scratch prefix) with debug_traceBlockBy*; output is byte-identical to the stored-block trace for both tracers.
 - 2026-11-06: gas-sized state tables: `Config.state_gas_basis` (0 = static limits, tests unchanged) sizes the evm state cache's slot/account tables from block gas (slot >= 2,100 gas, account >= 2,600, + per-tx and fixed allowances); `fit_state` (begin_block, simulate) grows them between blocks when a block's gas limit exceeds the basis (at least doubling; never inside an open session or block, where overflow fails StateFull rather than misexecuting). `base node`, `base replay` and the replay bench use 2^26. Replay: 6.08 -> 5.46 ms/block (765 -> 853 Mgas/s).

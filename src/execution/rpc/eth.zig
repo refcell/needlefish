@@ -48,13 +48,16 @@ pub const Api = struct {
     /// Pool storage and builder enforcement for `base_sendRawTransactionValidity`; null
     /// rejects validity transactions.
     validity_sink: ?@import("validity.zig").Sink = null,
+    /// Ordered storage leaves at block boundaries for `debug_storageRangeAt`; null disables it.
+    storage_range: ?@import("storage_range.zig").Source = null,
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
     @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
     @import("access_list.zig").methods ++ @import("simulate.zig").methods ++ send_sync.methods ++
     @import("metering.zig").methods ++ @import("trace.zig").methods ++
-    @import("validity.zig").methods ++ @import("account.zig").methods;
+    @import("validity.zig").methods ++ @import("account.zig").methods ++
+    @import("storage_range.zig").methods;
 const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");

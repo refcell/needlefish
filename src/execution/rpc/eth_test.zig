@@ -1813,3 +1813,119 @@ fn fuzz_trace_block(_: void, smith: *testing.Smith) anyerror!void {
 test "eth: fuzz debug_traceBlock input" {
     try testing.fuzz({}, fuzz_trace_block, .{});
 }
+
+const StorageRangeFake = struct {
+    number: u64 = 0,
+    address_hash: [32]u8 = @splat(0),
+    start: [32]u8 = @splat(0),
+    max: u32 = 0,
+
+    fn range(
+        context: *anyopaque,
+        number: u64,
+        address_hash: [32]u8,
+        start: [32]u8,
+        max: u32,
+        out: []rpc_storage_range.Leaf,
+    ) anyerror!rpc_storage_range.Range {
+        const fake: *StorageRangeFake = @ptrCast(@alignCast(context));
+        fake.* = .{ .number = number, .address_hash = address_hash, .start = start, .max = max };
+        const leaves = [_]rpc_storage_range.Leaf{
+            .{ .key_hash = @splat(0x11), .key = @splat(0x01), .value = 5 },
+            .{ .key_hash = @splat(0x22), .value = 0x100 },
+        };
+        const count = @min(out.len, leaves.len);
+        @memcpy(out[0..count], leaves[0..count]);
+        return .{ .count = @intCast(count), .next = if (max > 2) null else @splat(0x33) };
+    }
+};
+const rpc_storage_range = @import("storage_range.zig");
+const hex_11 = "1111111111111111111111111111111111111111111111111111111111111111";
+const hex_01 = "0101010101010101010101010101010101010101010101010101010101010101";
+const hex_22 = "2222222222222222222222222222222222222222222222222222222222222222";
+const hex_33 = "3333333333333333333333333333333333333333333333333333333333333333";
+const hex_00 = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn storage_range_request(
+    h: *Harness,
+    hash: primitives.B256,
+    index: u64,
+    start: []const u8,
+    max: u32,
+) ![]const u8 {
+    var body: [512]u8 = undefined;
+    const format = request_prefix_format ++ "debug_storageRangeAt\",\"params\":[\"0x{x}\"," ++
+        "\"0x{x}\",\"0x0000000000000000000000000000000000000055\",\"0x{s}\",{d}]}}";
+    return h.request_runtime(try std.fmt.bufPrint(&body, format, .{
+        &hash.bytes, index, start, max,
+    }));
+}
+
+test "eth: debug_storageRangeAt reads block-boundary states through the source" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(12);
+    var buffer: [256]u8 = undefined;
+    try expect_contains(try send_raw(h, try transfer_raw(&buffer, 0)), "\"result\":\"0x");
+    const hash = try h.mine(24);
+    const unavailable = try storage_range_request(h, hash, 0, "", 2);
+    try expect_contains(unavailable, "storage ranges are unavailable");
+    var fake: StorageRangeFake = .{};
+    h.api.storage_range = .{ .context = &fake, .range = StorageRangeFake.range };
+    // txIndex 0: the parent's state; the start key is left-padded to 32 bytes.
+    const text = try storage_range_request(h, hash, 0, "abcd", 2);
+    try testing.expectEqual(@as(u64, 1), fake.number);
+    try testing.expectEqual(@as(u32, 2), fake.max);
+    try testing.expectEqual(@as(u16, 0xabcd), std.mem.readInt(u16, fake.start[30..32], .big));
+    const address = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    try testing.expectEqualSlices(u8, &primitives.keccak256(&address).bytes, &fake.address_hash);
+    try expect_contains(text, "\"0x" ++ hex_11 ++ "\":{\"key\":\"0x" ++ hex_01 ++
+        "\",\"value\":\"0x" ++ zeros_62 ++ "05\"}");
+    try expect_contains(text, "\"0x" ++ hex_22 ++ "\":{\"key\":null");
+    try expect_contains(text, "\"nextKey\":\"0x" ++ hex_33 ++ "\"");
+    // Past the last transaction: the block's own state; the range ends.
+    try expect_contains(try storage_range_request(h, hash, 1, "", 5), "\"nextKey\":null");
+    try testing.expectEqual(@as(u64, 2), fake.number);
+    const middle = try storage_range_request(h, try h.mine(36), 0, "", 1);
+    try expect_contains(middle, "\"result\"");
+    try testing.expectEqual(@as(u64, 3), fake.number); // An empty block's states coincide.
+    const too_long = try storage_range_request(h, hash, 0, "00" ++ hex_00, 1);
+    try expect_contains(too_long, "keyStart is at most 32 bytes");
+    const unknown = try storage_range_request(h, .{ .bytes = @splat(9) }, 0, "", 1);
+    try expect_contains(unknown, "block not found");
+}
+
+test "eth: seeded fuzz of debug_storageRangeAt start keys and limits" {
+    var prng = Prng.init(0x7372);
+    for (0..64) |_| {
+        var bytes: [40]u8 = undefined;
+        prng.fill(&bytes);
+        const length = prng.below(bytes.len + 1);
+        const key = rpc_storage_range.start_key(bytes[0..length]);
+        const max = prng.int(u32);
+        var text: [16]u8 = undefined;
+        const decimal = try std.fmt.bufPrint(&text, "{d}", .{max});
+        try testing.expectEqual(@as(?u64, max), rpc_storage_range.max_result_of(decimal));
+        const hex = try std.fmt.bufPrint(&text, "\"0x{x}\"", .{max});
+        try testing.expectEqual(@as(?u64, max), rpc_storage_range.max_result_of(hex));
+        try testing.expect(rpc_storage_range.max_result_of(text[1..hex.len]) == null);
+        if (length > 32) {
+            try testing.expect(key == null);
+        } else {
+            try testing.expectEqualSlices(u8, bytes[0..length], key.?[32 - length ..]);
+            for (key.?[0 .. 32 - length]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
+}
+
+fn fuzz_start_key(_: void, smith: *testing.Smith) anyerror!void {
+    const bytes = smith.value([40]u8);
+    const length = smith.value(u8) % (bytes.len + 1);
+    const key = rpc_storage_range.start_key(bytes[0..length]);
+    try testing.expectEqual(length > 32, key == null);
+    _ = rpc_storage_range.max_result_of(bytes[0..length]);
+}
+
+test "eth: fuzz debug_storageRangeAt start keys" {
+    try testing.fuzz({}, fuzz_start_key, .{});
+}
