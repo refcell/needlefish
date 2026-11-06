@@ -87,6 +87,9 @@ allocation after startup.
   (proxyd consensus mode); builds on the lag poller.
 - [x] `basectl node-metrics`: port upstream `commands/node_metrics.rs` (the per-node metrics
   shared by the conductor and sequencer views; it does not scrape Prometheus).
+- [ ] `infra/roxy` consensus follow-ups (proxyd parity): answer `eth_blockNumber` locally from
+  the consensus head, clamp `eth_getLogs` `toBlock`/`latest` ranges to it, and match split
+  responses by canonical id (so `1` and `1.0` or re-escaped strings still pair).
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
