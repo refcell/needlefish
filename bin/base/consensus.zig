@@ -265,6 +265,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .time = .{ .context = &os_io, .now_ns = now_ns },
     };
     const p2p_config = try p2p_settings(init, &flags, &rollup, &logger);
+    const addresses = server_addresses(&flags);
     const node = try init.gpa.create(Node);
     defer init.gpa.destroy(node);
     try node.init(init.gpa, &os_io, &logger, &rollup, .{
@@ -272,10 +273,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .l1_beacon = flags.l1_beacon,
         .l2 = flags.l2.?,
         .jwt_secret = secret,
-        .rpc_address = if (flags.rpc_disabled)
-            null
-        else
-            io.Address.ip4(flags.rpc_addr, flags.rpc_port),
+        .rpc_address = addresses.rpc,
         .sequencer = flags.sequencer,
         .driver = .{
             .sequencer = flags.sequencer,
@@ -293,14 +291,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .follow_source = flags.source_l2_rpc,
         .rpc_admin = flags.rpc_admin,
         .rpc_dev = flags.rpc_dev,
-        .ws_address = if (flags.rpc_ws_enabled and !flags.rpc_disabled)
-            io.Address.ip4(flags.rpc_addr, flags.rpc_ws_port)
-        else
-            null,
-        .metrics_address = if (flags.metrics_enabled)
-            io.Address.ip4(flags.metrics_addr, flags.metrics_port)
-        else
-            null,
+        .ws_address = addresses.ws,
+        .metrics_address = addresses.metrics,
     });
     defer node.deinit();
     _ = try node.start();
@@ -312,6 +304,28 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         node.tick();
         try os_io.run_for_ns(10 * std.time.ns_per_ms);
     }
+}
+
+const ServerAddresses = struct { rpc: ?io.Address, ws: ?io.Address, metrics: ?io.Address };
+
+/// Listen addresses of the optional servers; null when off (`--rpc.disabled` turns off
+/// both RPC servers).
+fn server_addresses(flags: *const Flags) ServerAddresses {
+    const rpc_on = !flags.rpc_disabled;
+    const result: ServerAddresses = .{
+        .rpc = if (rpc_on) io.Address.ip4(flags.rpc_addr, flags.rpc_port) else null,
+        .ws = if (rpc_on and flags.rpc_ws_enabled)
+            io.Address.ip4(flags.rpc_addr, flags.rpc_ws_port)
+        else
+            null,
+        .metrics = if (flags.metrics_enabled)
+            io.Address.ip4(flags.metrics_addr, flags.metrics_port)
+        else
+            null,
+    };
+    std.debug.assert(result.ws == null or result.rpc != null);
+    std.debug.assert((result.metrics != null) == flags.metrics_enabled);
+    return result;
 }
 
 /// The upgrade-signal contract to observe: the flag, else the chain's public default.
@@ -427,6 +441,11 @@ test "consensus: flags" {
     try std.testing.expect(!with_ws.rpc_disabled);
     const no_rpc = try parse_flags(&(ws_args ++ [_][]const u8{"--rpc.disabled"}));
     try std.testing.expect(no_rpc.rpc_disabled and no_rpc.rpc_ws_enabled);
+    const no_servers = server_addresses(&no_rpc);
+    try std.testing.expect(no_servers.rpc == null and no_servers.ws == null);
+    const servers = server_addresses(&with_ws);
+    try std.testing.expectEqual(@as(u16, 9546), servers.ws.?.port);
+    try std.testing.expectEqual(@as(u16, 7545), servers.rpc.?.port);
     const admin_args = required ++ [_][]const u8{ "--rpc.enable-admin", "--rpc.dev-enabled" };
     const with_admin = try parse_flags(&admin_args);
     try std.testing.expect(with_admin.rpc_admin and with_admin.rpc_dev);
