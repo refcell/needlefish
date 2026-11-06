@@ -14,6 +14,7 @@ pub const journal = @import("journal.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const free_set = @import("free_set.zig");
 pub const grid = @import("grid.zig");
+pub const table = @import("table.zig");
 pub const engine = @import("engine.zig");
 pub const io_storage = @import("io_storage.zig");
 
@@ -30,6 +31,7 @@ pub const tick_until_idle = engine.tick_until_idle;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("journal_test.zig");
+    _ = @import("table_test.zig");
     _ = @import("engine_test.zig");
     _ = @import("io_storage_test.zig");
 }
