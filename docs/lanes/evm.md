@@ -116,8 +116,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   1.44 -> 1.41 us (same-load A/B). Kept `std.HashMapUnmanaged` (not a custom flat table) so
   other lanes' `iterator`/`count`/`clearRetainingCapacity` uses are unchanged. The db
   lane's overlay `SlotKey` map still uses `AutoContext` and could adopt the same context.
-- [ ] Performance: pass the CALL target's account (already loaded by the interpreter's
-  access check) through `CallRequest` so `start_call` skips its `state.load`.
+- [x] Performance: `CallRequest` carries the target and code accounts the interpreter already
+  loaded, so `start_call` skips both lookups: call loop 19.9 -> 17.9 us (interleaved A/B
+  against origin/main in a scratch worktree).
 - [ ] Fuzz: differential fuzz of CALL-family value/return-data plumbing (CALL, STATICCALL,
   DELEGATECALL, RETURNDATACOPY/SIZE) against a small reference model of two contracts.
 - [ ] Performance: keccak256 loop is ~185 ns per 64-byte hash; compare the crypto lane's

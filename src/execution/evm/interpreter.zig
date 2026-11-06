@@ -640,12 +640,14 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
         cost += gas.new_account;
     }
     var code_address = target;
+    var code_account = access.account;
     if (fork.at_least(.prague)) {
         const code = evm.state.code(access.account) catch |err| return evm.fail(err);
         if (bytecode.delegation_target(code)) |delegate| {
             const delegated = evm.state.access(delegate) catch |err| return evm.fail(err);
             cost += if (delegated.is_cold) gas.cold_account_access else gas.warm_storage_read;
             code_address = delegate;
+            code_account = delegated.account;
         }
     }
     if (f.gas < cost) return .out_of_gas;
@@ -661,6 +663,8 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
         .kind = kind,
         .target = target,
         .code_address = code_address,
+        .target_account = access.account,
+        .code_account = code_account,
         .value = value,
         .input = f.memory.slice(in_range.offset, in_range.size),
         .gas_limit = limit,

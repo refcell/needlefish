@@ -69,6 +69,10 @@ pub const CallRequest = struct {
     gas_limit: u64,
     return_offset: u64 = 0,
     return_size: u64 = 0,
+    /// Accounts the interpreter already loaded for `target` and `code_address` (stable
+    /// pointers into the state cache); null makes `start_call` look them up.
+    target_account: ?*Account = null,
+    code_account: ?*Account = null,
 };
 
 pub const CreateRequest = struct {
@@ -302,7 +306,7 @@ pub const Evm = struct {
         const value = if (request.kind == .delegatecall) parent.?.value else request.value;
         const is_static = request.kind == .staticcall or (parent != null and parent.?.is_static);
         const checkpoint = evm.state.checkpoint();
-        const account = try evm.state.load(address);
+        const account = try evm.call_account(request, parent, address);
         if (request.kind != .delegatecall) {
             const from = try evm.caller_account(parent, caller_address);
             if (!try evm.state.transfer(from, account, request.value)) {
@@ -319,10 +323,12 @@ pub const Evm = struct {
             const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
             return evm.run_native(contract, request, checkpoint, call);
         }
-        const code_account = if (std.mem.eql(u8, &request.code_address, &address))
-            account
-        else
-            try evm.state.load(request.code_address);
+        const code_account = request.code_account orelse
+            if (std.mem.eql(u8, &request.code_address, &address))
+                account
+            else
+                try evm.state.load(request.code_address);
+        assert(std.mem.eql(u8, &code_account.address, &request.code_address));
         const code = try evm.state.code(code_account);
         if (code.len == 0) {
             return .{ .done = .{
@@ -347,6 +353,24 @@ pub const Evm = struct {
             .checkpoint = checkpoint,
         }, parent);
         return .frame;
+    }
+
+    /// The account whose storage the new frame owns: the parent's for CALLCODE and
+    /// DELEGATECALL, the interpreter-loaded target otherwise.
+    fn call_account(
+        evm: *Evm,
+        request: CallRequest,
+        parent: ?*Frame,
+        address: Address,
+    ) Error!*Account {
+        const account = if (parent != null and std.mem.eql(u8, &parent.?.address, &address))
+            parent.?.account
+        else if (request.target_account) |loaded|
+            loaded
+        else
+            try evm.state.load(address);
+        assert(std.mem.eql(u8, &account.address, &address));
+        return account;
     }
 
     /// The caller is normally the parent frame, which already holds a stable pointer to its
