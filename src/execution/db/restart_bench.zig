@@ -127,12 +127,20 @@ pub const Variant = struct {
     name: []const u8,
     load_mode: database.LoadMode,
     rehash_threads: u32,
+    history_rebuild_mode: database.HistoryRebuildMode = .estimate,
 };
 
 pub const variants = [_]Variant{
     .{ .name = "incremental", .load_mode = .incremental, .rehash_threads = 0 },
     .{ .name = "bulk", .load_mode = .bulk, .rehash_threads = 0 },
     .{ .name = "bulk 4 threads", .load_mode = .bulk, .rehash_threads = 4 },
+    // The rebuild before the estimated start: every block of the window (history only).
+    .{
+        .name = "bulk full rebuild",
+        .load_mode = .bulk,
+        .rehash_threads = 0,
+        .history_rebuild_mode = .full,
+    },
 };
 
 const header_size = 64;
@@ -235,6 +243,9 @@ pub const Sample = struct {
     init_ns: u64 = 0,
     open_ns: u64 = 0,
     window_oldest: ?u64 = null,
+    /// Blocks the history rebuild committed, and whether it widened to the full window.
+    history_commits: u64 = 0,
+    history_widens: u64 = 0,
 };
 
 pub fn RunType(comptime Storage: type) type {
@@ -376,6 +387,7 @@ pub fn RunType(comptime Storage: type) type {
             const start = bench.now_ns(self.io);
             self.sample.init_ns = start - init_start;
             db.load_mode = variant.load_mode;
+            db.history_rebuild_mode = variant.history_rebuild_mode;
             db.open_trace = .{ .context = self, .step = on_step };
             self.last_ns = start;
             self.last_cpu_ns = cpu_ns(self.io);
@@ -387,6 +399,8 @@ pub fn RunType(comptime Storage: type) type {
             if (!db.head_info.eql(expected.head)) return error.HeadMismatch;
             const window = if (db.history) |*store| store.window() else null;
             self.sample.window_oldest = if (window) |w| w.oldest else null;
+            self.sample.history_commits = db.history_rebuild_commits;
+            self.sample.history_widens = db.history_rebuild_widens;
             return self.sample;
         }
     };
@@ -413,13 +427,19 @@ fn report(case: Case, variant: Variant, samples: []const Sample) void {
     const open_ns = median(scratch[0..samples.len]);
     for (samples, 0..) |sample, index| scratch[index] = sample.init_ns;
     const init_ns = median(scratch[0..samples.len]);
-    std.debug.print("{s:<30} {s:<16} open {d:>9.1} ms  (init {d:.1} ms, window from {?d})\n", .{
-        case.name,
-        variant.name,
-        @as(f64, @floatFromInt(open_ns)) / 1e6,
-        @as(f64, @floatFromInt(init_ns)) / 1e6,
-        samples[0].window_oldest,
-    });
+    std.debug.print(
+        "{s:<30} {s:<17} open {d:>9.1} ms  (init {d:.1} ms, window from {?d}, " ++
+            "{d} history commits, {d} widens)\n",
+        .{
+            case.name,
+            variant.name,
+            @as(f64, @floatFromInt(open_ns)) / 1e6,
+            @as(f64, @floatFromInt(init_ns)) / 1e6,
+            samples[0].window_oldest,
+            samples[0].history_commits,
+            samples[0].history_widens,
+        },
+    );
     inline for (@typeInfo(OpenStep).@"enum".field_names, 0..) |field_name, step| {
         for (samples, 0..) |sample, index| scratch[index] = sample.steps_ns[step];
         const step_ns = median(scratch[0..samples.len]);
@@ -453,6 +473,7 @@ fn measure(
         @as(f64, @floatFromInt(bench.now_ns(io) - build_start)) / 1e9,
     });
     for (variants) |variant| {
+        if (!case.history and variant.history_rebuild_mode == .full) continue;
         var samples: [samples_max]Sample = undefined;
         for (samples[0..case.samples]) |*sample| {
             sample.* = try run_state.reopen(allocator, variant, &expected);

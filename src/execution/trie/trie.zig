@@ -319,6 +319,21 @@ pub fn TrieType(comptime config: Config) type {
             return @as(u32, @intCast(self.nodes.len)) - self.free_count;
         }
 
+        /// Live branch nodes with at least `children_min` children: one linear pass over the
+        /// pool (no traversal, no encoding). Estimates how many encodings are long.
+        pub fn branch_count(self: *const Self, children_min: u32) u32 {
+            assert(children_min <= 16);
+            var count: u32 = 0;
+            for (self.nodes) |*current| {
+                if (current.kind != .branch) continue;
+                var children: u32 = 0;
+                for (current.body.branch[0..16]) |child| children += @intFromBool(child != none);
+                count += @intFromBool(children >= children_min);
+            }
+            assert(count <= self.node_count());
+            return count;
+        }
+
         fn allocate(self: *Self, kind: Kind) NodeIndex {
             assert(kind != .free);
             assert(self.free_count > 0);

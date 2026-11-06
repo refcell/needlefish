@@ -54,6 +54,8 @@
 //! blocks (`history_rebuild_window`, `Config.history_rebuild_on_open`): it unwinds State in
 //! memory down to the oldest block the window and retention allow, `reset`s history there,
 //! and re-applies the blocks with `commit_block`, ending at the recovered head and root.
+//! Under a byte budget it first tries from the window the budget is estimated to keep, and
+//! re-applies the whole window only when that try's window did not shrink past its start.
 //! A failed history update (`HistoryFull`, a reorg below the window) never fails the
 //! operation: history is dropped and rebuilt at the head (`history_drops`). `proof_at`
 //! serves `eth_getProof` at any block of the window.
@@ -440,6 +442,26 @@ pub const OpenTrace = struct {
 /// path, `snapshot.load_incremental`). Both produce the same tries and roots.
 pub const LoadMode = enum { bulk, incremental };
 
+/// Where `open` starts the history rebuild. `full`: the oldest block the window and
+/// retention allow (re-applies every retained block of the window). `estimate`: where the
+/// byte budget is estimated to cut the window. `keep`: that many blocks below the head
+/// (tests). A try that does not start at the oldest block runs the full rebuild after it
+/// unless its window shrank past its start (see `history_rebuild_window`).
+pub const HistoryRebuildMode = union(enum) { full, estimate, keep: u64 };
+
+/// Newest blocks `history_rebuild_guess` unwinds to estimate a block's history bytes.
+const history_sample_blocks = 8;
+
+/// Sums `history.version_bytes` over visited trie nodes.
+const VersionBytes = struct {
+    bytes: u64 = 0,
+
+    pub fn visit(counter: *VersionBytes, node: StateTrie.NodeVisit) error{}!void {
+        assert(node.encoding.len > 0);
+        counter.bytes += history_module.version_bytes(node.encoding.len);
+    }
+};
+
 pub fn DatabaseType(comptime Storage: type) type {
     return struct {
         const Self = @This();
@@ -505,6 +527,12 @@ pub fn DatabaseType(comptime Storage: type) type {
         open_trace: ?OpenTrace = null,
         /// Snapshot load path at `open` (tests compare both).
         load_mode: LoadMode = .bulk,
+        /// Where `open` starts the history rebuild (tests and benchmarks compare them).
+        history_rebuild_mode: HistoryRebuildMode = .estimate,
+        /// Opens whose first rebuild try kept no shrink and ran the full rebuild too.
+        history_rebuild_widens: u64 = 0,
+        /// Blocks the last open's history rebuild committed to history (every try).
+        history_rebuild_commits: u64 = 0,
         /// Codes in grid tables (null without a grid).
         code_store: ?CodeStore = null,
         /// The wanted checkpoint's code flush ran (or had nothing to do).
@@ -1362,18 +1390,60 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// At open: rebuilds the history window from the retained canonical blocks. Unwinds
         /// State in memory (nothing is journaled, the chain index never moves) through the
-        /// stored changesets down to `history_rebuild_start`, `reset`s history there, then
-        /// re-applies each block with `commit_block`, so the state ends at the recovered head
-        /// (root asserted). Cost: O(window) unwinds, applies, state roots, and history
-        /// commits, plus one O(state) `reset`. Any history failure falls back to `reset` at
-        /// the head; a failed re-apply fails the database (state no longer at the head).
+        /// stored changesets down to a start block, `reset`s history there, then re-applies
+        /// each block with `commit_block`, so the state ends at the recovered head (root
+        /// asserted). The full rebuild starts at `history_rebuild_start`; under a byte budget
+        /// that keeps fewer blocks, most of its commits are pruned again, so it first tries
+        /// the start `history_rebuild_guess` picks. That try ends with the full rebuild's
+        /// window, versions, and bytes whenever its window shrank past its start (see the
+        /// proof below); otherwise the full rebuild runs (`history_rebuild_widens`).
+        ///
+        /// Why a shrink past the start is exact: let m(n) be the oldest start whose window
+        /// to block n fits the budget (`bytes_used` of a pruned window falls as its oldest
+        /// block rises). `fit_budget` drains the prune queue before each shrink, so after
+        /// commit n the oldest block is max(oldest after n - 1, m(n)), and a rebuild from s
+        /// ends at max(s, m(s + 1), ..., m(head)). Every m(n) with n <= s is at most s, so
+        /// when that end is above s, a rebuild from any earlier start ends there too. Both
+        /// stores then hold the pruned window with an empty prune queue (the rebuild never
+        /// overflows `window_blocks`, so only shrinks queue versions, and a shrink ends after
+        /// a drain). A failed try (`HistoryFull`) means the full rebuild fails too: it holds
+        /// a superset of the try's window at every block. The one difference: the full
+        /// rebuild also fails on a block below the try's start whose state alone is above
+        /// the budget (or the capacities); it then keeps only the head, the try keeps more.
+        ///
+        /// Cost: O(window) unwinds, applies, state roots, and history commits, plus one
+        /// O(state) `reset`, per try. Any history failure falls back to `reset` at the head;
+        /// a failed re-apply fails the database (state no longer at the head).
         fn history_rebuild_window(self: *Self) void {
             assert(self.phase == .ready and self.head_info.present);
             assert(!self.history_stale and !self.history_off);
             const store = if (self.history) |*store| store else return;
             if (!self.config.history_rebuild_on_open) return self.history_rebuild();
             const head = self.head_info.number;
-            const start = self.history_rebuild_unwind() orelse return;
+            const lowest = self.history_rebuild_start();
+            self.history_rebuild_commits = 0;
+            const guess = self.history_rebuild_guess(lowest) orelse return;
+            assert(lowest <= guess.start and guess.start <= guess.at and guess.at <= head);
+            if (guess.start == lowest) {
+                const start = self.history_rebuild_unwind(guess.at, lowest) orelse return;
+                _ = self.history_rebuild_apply(store, start);
+                return;
+            }
+            const start = self.history_rebuild_unwind(guess.at, guess.start) orelse return;
+            assert(start > lowest);
+            const kept = self.history_rebuild_apply(store, start) orelse return;
+            if (!kept or store.window().?.oldest > start) return;
+            // No block left the try's window early: the budget may keep older blocks.
+            self.history_rebuild_widens += 1;
+            const full_start = self.history_rebuild_unwind(head, lowest) orelse return;
+            _ = self.history_rebuild_apply(store, full_start);
+        }
+
+        /// `reset`s history at `start` (State holds that block) and re-applies every block
+        /// up to the head. Returns whether history kept a window (false: dropped and reset
+        /// at the head), or null when a re-apply failed the database.
+        fn history_rebuild_apply(self: *Self, store: *history_module.Store, start: u64) ?bool {
+            const head = self.head_info.number;
             assert(start <= head);
             // Every block of the window is canonical by number (the node checks a proof's
             // block against the canonical index), its oldest included.
@@ -1387,40 +1457,96 @@ pub fn DatabaseType(comptime Storage: type) type {
             while (number < head) {
                 number += 1;
                 const hash = self.chain.canonical_hash(number).?;
-                self.apply_block(hash) catch {
-                    self.phase = .failed;
-                    self.open_error = error.ReplayFailed;
-                    return;
-                };
+                self.apply_block(hash) catch return self.history_rebuild_failed();
                 if (!history_ok) continue;
+                self.history_rebuild_commits += 1;
                 store.commit_block(&self.state.state_trie, number) catch {
                     history_ok = false;
                 };
             }
-            const root = self.state.state_root() catch {
-                self.phase = .failed;
-                self.open_error = error.ReplayFailed;
-                return;
-            };
+            const root = self.state.state_root() catch return self.history_rebuild_failed();
             assert(std.mem.eql(u8, &root, &self.head_info.state_root));
             self.trace(.history_apply);
             if (history_ok) {
                 assert(store.window().?.head == head);
-                return;
+                return true;
             }
             self.history_drops += 1;
             self.history_rebuild();
+            return false;
         }
 
-        /// Unwinds State to the window start; returns that block, or null when the trie
-        /// rebuild failed (the database failed). Unwinding the tables and rebuilding the trie
-        /// once costs O(state); unwinding the trie costs a trie update per entry of every
-        /// unwound block (more above a few dozen typical blocks at 100k accounts). The bulk
-        /// load path does the former when the staging buffer can hold the build's scratch.
-        fn history_rebuild_unwind(self: *Self) ?u64 {
+        fn history_rebuild_failed(self: *Self) ?bool {
+            assert(self.phase == .ready);
+            self.phase = .failed;
+            self.open_error = error.ReplayFailed;
+            return null;
+        }
+
+        const RebuildGuess = struct {
+            /// The block to try the rebuild from.
+            start: u64,
+            /// The block State holds (unwound there while sampling); `start <= at`.
+            at: u64,
+        };
+
+        /// Picks where to try the rebuild (`history_rebuild_mode`). `estimate` unwinds the
+        /// newest `history_sample_blocks` blocks through the trie and sums the version bytes
+        /// of the nodes each rehashes (a block's versions, without new paths and tombstones),
+        /// estimates the bytes of a `reset` from the node pools, and keeps the blocks the
+        /// rest of the budget fits plus a quarter and the sample. Any start is sound (the
+        /// try is checked); a good one only saves work. Null when a root failed the database.
+        fn history_rebuild_guess(self: *Self, lowest: u64) ?RebuildGuess {
+            const head = self.head_info.number;
+            assert(lowest <= head);
+            const full: RebuildGuess = .{ .start = lowest, .at = head };
+            switch (self.history_rebuild_mode) {
+                .full => return full,
+                .keep => |keep| return .{ .start = @max(lowest, head -| keep), .at = head },
+                .estimate => {},
+            }
+            const bytes_max = self.config.history.?.bytes_max orelse return full;
+            if (head - lowest < 4 * history_sample_blocks) return full;
+            const trie = &self.state.state_trie;
+            _ = self.state.state_root() catch return self.history_guess_failed();
+            trie.clear_changes();
+            var counter: VersionBytes = .{};
+            var at = head;
+            while (at > head - history_sample_blocks) : (at -= 1) {
+                const view = self.chain.block(self.chain.canonical_hash(at).?).?;
+                self.changeset.decode(view.changeset) catch break;
+                self.state.unwind(&self.changeset) catch break;
+                _ = self.state.state_root() catch return self.history_guess_failed();
+                trie.visit_nodes(.count, &counter) catch |err| switch (err) {};
+                trie.clear_changes();
+            }
+            // An unwind that does not fit: try from the block reached (checked like any).
+            if (at > head - history_sample_blocks) return .{ .start = at, .at = at };
+            const base = history_module.reset_bytes_estimate(trie);
+            const per_block = counter.bytes / history_sample_blocks;
+            if (per_block == 0 or base >= bytes_max) return .{ .start = lowest, .at = at };
+            const fit = (bytes_max - base) / per_block;
+            const keep = fit + fit / 4 + history_sample_blocks;
+            const start = @max(lowest, head -| keep);
+            assert(start <= at);
+            return .{ .start = start, .at = at };
+        }
+
+        fn history_guess_failed(self: *Self) ?RebuildGuess {
+            _ = self.history_rebuild_failed();
+            return null;
+        }
+
+        /// Unwinds State from block `from` (State holds it) to `target`; returns the block
+        /// reached, or null when the trie rebuild failed (the database failed). Unwinding
+        /// the tables and rebuilding the trie once costs O(state); unwinding the trie costs a
+        /// trie update per entry of every unwound block (more above a few dozen typical
+        /// blocks at 100k accounts). The bulk load path does the former when the staging
+        /// buffer can hold the build's scratch.
+        fn history_rebuild_unwind(self: *Self, from: u64, target: u64) ?u64 {
             const scratch_max = State.build_trie_scratch_bytes_max(self.config.state);
             const rebuild = self.load_mode == .bulk and self.staging.len >= scratch_max;
-            const start = self.history_unwind_to(self.history_rebuild_start(), rebuild);
+            const start = self.history_unwind_to(from, target, rebuild);
             self.trace(.history_unwind);
             if (self.state.trie_stale) {
                 assert(rebuild);
@@ -1452,13 +1578,13 @@ pub fn DatabaseType(comptime Storage: type) type {
             return start;
         }
 
-        /// Unwinds State from the head down to block `target`; returns the block it reached
-        /// (higher than `target` when an unwind does not fit: `State.unwind` fails before
-        /// any change, so the state still holds the block above). With `tables_only` the trie
-        /// is left stale (`State.unwind_tables`) for `State.rebuild_trie`.
-        fn history_unwind_to(self: *Self, target: u64, tables_only: bool) u64 {
-            assert(target <= self.head_info.number);
-            var number = self.head_info.number;
+        /// Unwinds State from block `from` down to block `target`; returns the block it
+        /// reached (higher than `target` when an unwind does not fit: `State.unwind` fails
+        /// before any change, so the state still holds the block above). With `tables_only`
+        /// the trie is left stale (`State.unwind_tables`) for `State.rebuild_trie`.
+        fn history_unwind_to(self: *Self, from: u64, target: u64, tables_only: bool) u64 {
+            assert(target <= from and from <= self.head_info.number);
+            var number = from;
             while (number > target) : (number -= 1) {
                 const view = self.chain.block(self.chain.canonical_hash(number).?).?;
                 self.changeset.decode(view.changeset) catch break;

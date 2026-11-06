@@ -179,6 +179,43 @@ comptime {
     assert(path_bytes > @sizeOf(Key));
 }
 
+/// `bytes_used` of one version of an encoding of `length` bytes (a tombstone is small).
+pub fn version_bytes(length: usize) u64 {
+    assert(length <= large_bytes);
+    return if (length <= small_bytes) small_version_bytes else large_version_bytes;
+}
+
+/// Fewest children of a branch whose encoding is above `small_bytes` when every child is a
+/// hash reference (33 bytes; an empty slot is 1 byte, plus the empty value).
+pub const branch_children_large_min: u32 = blk: {
+    var children: u32 = 0;
+    while (children <= 16) : (children += 1) {
+        const payload = 17 + 32 * children;
+        const header = if (payload < 56) 1 else if (payload < 256) 2 else 3;
+        if (payload + header > small_bytes) break :blk children;
+    }
+    unreachable;
+};
+
+comptime {
+    assert(branch_children_large_min > 1 and branch_children_large_min <= 16);
+}
+
+/// `bytes_used` right after `reset` over `state_trie` (a path and a version per node),
+/// estimated without encoding a node: leaves and extensions are small, a branch is large
+/// from `branch_children_large_min` children (short inline children make a few branches
+/// small). One linear pass over both node pools.
+pub fn reset_bytes_estimate(state_trie: *const StateTrie) u64 {
+    const min = branch_children_large_min;
+    const nodes: u64 = @as(u64, state_trie.accounts.node_count()) +
+        state_trie.storage.node_count();
+    const large: u64 = @as(u64, state_trie.accounts.branch_count(min)) +
+        state_trie.storage.branch_count(min);
+    assert(large <= nodes);
+    return nodes * path_bytes + (nodes - large) * small_version_bytes +
+        large * large_version_bytes;
+}
+
 const BlockEntry = struct {
     number: u64,
     state_root: Hash,

@@ -796,6 +796,29 @@ the image. Before this change (incremental, same binary; the old code was identi
 except for a shared branch-encode copy fast path) 100k: 299-540 ms open without history,
 3.2-3.4 s with; 1m: 3.0 s without, 9.5-9.8 s with.
 
+## 2026-11-07 db restart: history rebuild from the budget's window (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/restart 1m sim history"` (same build and
+cases as "db node restart" above; one run of 3 opens per variant, load average ~7). `open`
+now tries the history rebuild from an estimated start (8 newest blocks sampled, `reset`
+estimated from the node pools, fit + 25% + 8 blocks kept) and runs the full rebuild only
+when that try's window did not shrink past its start. `bulk full rebuild` is the old path
+(`HistoryRebuildMode.full`) in the same binary.
+
+| 1m sim history, ms (median) | open | hist unwind | hist trie | hist reset | hist apply | commits | window from |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| bulk full rebuild (before) | 6547 | 69 | 720 | 721 | 3671 | 299 | 280 |
+| bulk | 4231 | 98 | 720 | 726 | 1277 | 114 | 280 |
+| bulk 4 threads | 3264 | 76 | 660 | 460 | 1056 | 114 | 280 |
+| incremental | 5254 | 455 | - | 604 | 1366 | 114 | 280 |
+
+The estimate kept 114 blocks for a window of 86 (no widen). Unwind grows by the 8 sampled
+trie unwinds and roots (~30 ms). At 100k the 1 GiB budget keeps the whole window, so the
+estimate returns the full start: bulk 2375 vs 2372 ms full (unwind 85 vs 53 ms, apply
+1927 vs 1954 ms). What is left at 1m: the bulk trie build after the unwind (720 ms; a trie
+unwind of ~110 blocks is ~450 ms, see the lane backlog), `reset` (O(state)), and 114
+commits at ~11 ms.
+
 ## 2026-11-06 trie parallel account rehash, radix changeset sort (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
 
 `StateTrie.root` now hashes the account trie on the rehash pool too (`rehash_threads` > 0):

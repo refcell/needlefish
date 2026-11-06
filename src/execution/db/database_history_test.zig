@@ -927,3 +927,92 @@ test "database history: bulk and incremental reopen recover the same state and h
         }
     }
 }
+
+/// A window long enough for `HistoryRebuildMode.estimate` to sample (33+ blocks).
+const long_window = 40;
+
+const long_config: database.Config = blk: {
+    var config = base_config;
+    config.engine.journal_size_bytes = 512 * sector_size;
+    config.engine.checkpoint_zone_size_bytes = 256 * sector_size;
+    config.checkpoint_staging_bytes = 768 * 1024;
+    config.chain.blocks_max = 2 * long_window;
+    config.chain.bytes_max = 256 * 1024;
+    config.chain.canonical_max = 256;
+    config.history.?.window_blocks = long_window;
+    config.history.?.paths_max = 16384;
+    config.history.?.small_versions_max = 32768;
+    config.history.?.large_versions_max = 8192;
+    break :blk config;
+};
+
+/// Reopens with `mode`; returns the digest and the blocks the rebuild committed.
+fn reopen_mode(
+    h: *Harness,
+    config: database.Config,
+    mode: database.HistoryRebuildMode,
+) !struct { digest: u64, commits: u64, drops: u64 } {
+    h.db.deinit(testing.allocator);
+    h.db = try Database.init(testing.allocator, &h.sim, config);
+    h.db.history_rebuild_mode = mode;
+    h.overlay.discard();
+    h.overlay.base = &h.db.state;
+    try h.open();
+    try testing.expectEqual(h.db.head_info.state_root, try h.db.state.state_root());
+    return .{
+        .digest = try h.reopen_digest(),
+        .commits = h.db.history_rebuild_commits,
+        .drops = h.db.history_drops,
+    };
+}
+
+/// Crashes at random points of a seeded workload and reopens with the full rebuild (the
+/// reference), the estimated start, and forced starts: each must recover the same window,
+/// usage, and proofs, unless the full rebuild dropped history (a state below the try's
+/// start alone above the budget, see `history_rebuild_window`). Counts the blocks the
+/// estimated rebuilds saved against the full ones and the tries that were widened.
+fn run_rebuild_differential(seed: u64, config: database.Config, totals: *RebuildTotals) !void {
+    const h = try Harness.create(seed, config);
+    defer h.destroy();
+    try h.format();
+    const keeps = [_]u64{ 1, 3, 9, 20, 34 };
+    var cycle: u32 = 0;
+    while (cycle < 3) : (cycle += 1) {
+        for (0..h.prng.range(40, 100)) |_| try h.step();
+        try h.crash_and_reopen();
+        const full = try reopen_mode(h, config, .full);
+        const estimate = try reopen_mode(h, config, .estimate);
+        if (full.drops == 0) try testing.expectEqual(full.digest, estimate.digest);
+        totals.saved += full.commits -| estimate.commits;
+        totals.widens += h.db.history_rebuild_widens;
+        for (keeps) |keep| {
+            const forced = try reopen_mode(h, config, .{ .keep = keep });
+            if (full.drops == 0) try testing.expectEqual(full.digest, forced.digest);
+            totals.widens += h.db.history_rebuild_widens;
+            if (forced.commits < full.commits) totals.forced_saved += 1;
+        }
+    }
+}
+
+const RebuildTotals = struct { saved: u64 = 0, widens: u64 = 0, forced_saved: u64 = 0 };
+
+test "database history: a rebuild from the budget's window equals the full rebuild" {
+    const budgets = [_]?u64{ null, 1 << 30, 120 * 1024, 64 * 1024, 48 * 1024, 24 * 1024, 4096 };
+    var totals: RebuildTotals = .{};
+    for (budgets, 0..) |budget, index| {
+        var config = long_config;
+        config.history.?.bytes_max = budget;
+        for (0..2) |seed| {
+            const seed_full = 0x5eb0_0000 + 16 * index + seed;
+            run_rebuild_differential(seed_full, config, &totals) catch |err| {
+                std.debug.print("rebuild differential: failing seed=0x{x}\n", .{seed_full});
+                return err;
+            };
+        }
+    }
+    // A binding budget let the estimated start skip blocks of the full rebuild, forced
+    // starts both skipped blocks and fell back to the full rebuild.
+    try testing.expect(totals.saved > 0);
+    try testing.expect(totals.forced_saved > 0);
+    try testing.expect(totals.widens > 0);
+}

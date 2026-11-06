@@ -226,11 +226,18 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
   (`db/restart_bench.zig`; bulk trie build from sorted flat tables and table-only history
   unwind; 1m open 3.0 -> 1.1-1.4 s, with history 9.5 -> 5.8-7.5 s; see Decisions, PERF.md)
-- [ ] History rebuild at open re-applies the whole 300-block window even when the byte budget
+- [x] History rebuild at open re-applies the whole 300-block window even when the byte budget
   keeps fewer blocks (1m accounts: 86 kept, ~3 s of the 1m open re-applies blocks pruned
   again). Start the rebuild at the window the budget will keep: a rebuild started later
   that still shrinks ends at the same window (the shrink point is the max over blocks of
   the first start that fits), so try a short window and widen it until no shrink happens.
+  (`Database.history_rebuild_guess`, `HistoryRebuildMode`, `history.reset_bytes_estimate`;
+  one estimated try, then the full rebuild unless it shrank past its start; 1m sim history
+  bulk open 6.5 -> 4.2 s, 299 -> 114 commits, same window; see Decisions, PERF.md)
+- [ ] History rebuild at open: after the estimated start (1m: ~110 blocks) the bulk path
+  still rebuilds the whole trie from the unwound tables (~720 ms at 1m); a trie unwind of
+  that many blocks costs ~450 ms (the incremental variant). Pick the unwind by the entries
+  to unwind against the state size (break-even ~190 typical blocks at 1m, ~60 at 100k).
 - [x] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
   typical and heavy blocks end to end through rpc; provers poll every block, so keep it well
   under the slot (history-sourced path, no state disturbance).
@@ -493,6 +500,28 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   holds `build_trie_scratch_bytes_max` (node: 24.6 MiB of 40 MiB); otherwise the trie unwind.
 - `Database.open_trace` reports each `OpenStep` end to the caller (the bench reads the
   clock; library code never does).
+- History rebuild from the budget's window (`HistoryRebuildMode.estimate`, the default):
+  `open` first tries the rebuild from an estimated start, then runs the full rebuild only
+  when the try's window did not shrink past its start (`history_rebuild_widens`). Exact by
+  this argument: with m(n) the oldest start whose pruned window to n fits the budget,
+  `fit_budget` (which drains the prune queue before every shrink) leaves the oldest block
+  at max(previous oldest, m(n)), so a rebuild from s ends at max(s, m(s+1), ..., m(head));
+  the m(n) below s are at most s, so an end above s is the end of every earlier start. Both
+  stores then hold that pruned window with an empty prune queue (a rebuild never overflows
+  `window_blocks`; a shrink ends after a drain): same window, versions, paths, bytes, and
+  proofs. A try that fails (`HistoryFull`) implies the full rebuild fails (it holds a
+  superset at every block). Accepted difference: the full rebuild also drops history on a
+  block below the try's start whose state alone exceeds the budget or capacities, and then
+  keeps only the head; the try keeps the window (more history, never less). The estimate:
+  unwind the newest 8 blocks through the trie, sum `history.version_bytes` of the nodes each
+  rehashes (a block's versions without new paths and tombstones), estimate a `reset` from
+  the node pools (`reset_bytes_estimate`: leaves and extensions small, branches large from
+  5 children; one linear pass, no encoding), keep `fit + fit / 4 + 8` blocks. Off (full)
+  without a byte budget or below 33 blocks of window. One try, not a doubling search: a
+  failed try costs a second unwind, trie build, and O(state) `reset` (~1.5 s at 1m), more
+  than the commits a wide margin wastes (~11 ms per block at 1m). Chosen over recording
+  per-block history bytes in the journal or checkpoint (a format change for derived data).
+  `HistoryRebuildMode.full` (bench reference) and `.keep` (tests) force the start.
 
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
   switch over then.
@@ -1466,3 +1495,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   Harness loop widened to 10 seeds (~1 s Debug); 64 seeds of `0x77_0000 + i` pass (6.6 s).
 - 2026-11-06: witness `KeyMemo`: cold `SparseState` reads 448 -> 312 ns/key, warm 253 -> 76;
   `node: replay` ~925 -> ~972 Mgas/s (interleaved A/B, same machine).
+
+- 2026-11-07: history rebuild at open starts at the budget's window: one try from an
+  estimated start (8 newest blocks sampled through the trie, `reset` estimated from the node
+  pools), the full rebuild only when the try's window did not shrink past its start. 1m sim
+  history: bulk open 6547 -> 4231 ms (`history_apply` 3671 -> 1277 ms, 299 -> 114 commits,
+  window from 280 either way, no widen); 4 threads 3264 ms; incremental 5254 ms. 100k
+  (budget does not bind): unchanged (+31 ms sampling). Tests: rebuild differential (full vs
+  estimate vs forced starts 1/3/9/20/34 blocks, 7 budgets from none and 1 GiB to below one
+  state, 2 seeds x 3 crash/reopen cycles each; digest of window, usage, prune queue, proofs
+  of every address at every block); mutation `>` -> `>=` in the shrink check fails it.
