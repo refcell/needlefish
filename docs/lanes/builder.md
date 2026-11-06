@@ -223,3 +223,6 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   (`metering/builder_metering.zig`, base/base `from_parts`), `ResourceMeteringMetrics` with
   base/base names and labels; tests for config, metrics rendering, flag parsing, and a
   metered `NodeBuilder` build over `SimIo`.
+- 2026-11-05: paused for replay focus (owner decision). In-flight work: metering RPC
+  (`base_setMeteringInformation` etc.) just started; any WIP is on local branch
+  `wip/metering-rpc` in the worker's worktree, not on main.
