@@ -1545,3 +1545,22 @@ test "eth: base_sendRawTransactionValidity validates and hands off to the sink" 
     try expect_contains(try validity_request(h, &.{ 0x02, 0x01 }, valid), "-32602");
     try testing.expectEqual(@as(u32, 1), recorder.count);
 }
+
+test "eth: prestateTracer keeps accounts and slots touched by reverted frames" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    // CALL(gas, counter, 0, 0, 0, 0, 0); REVERT(0, 0): the counter's warmth is reverted.
+    const caller_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++
+        [_]u8{ 0x5a, 0xf1, 0x5f, 0x5f, 0xfd };
+    try h.node.db.put_account(@splat(0x58), 0, 0, &caller_code);
+    const text = try h.request(
+        "debug_traceCall",
+        "[{\"to\":\"0x5858585858585858585858585858585858585858\"},\"latest\"," ++
+            "{\"tracer\":\"prestateTracer\"}]",
+    );
+    try expect_contains(text, counter_at ++ ":{");
+    try expect_contains(text, "\"storage\":{\"0x" ++ zeros_62 ++ "00\":" ++ word_zero);
+}

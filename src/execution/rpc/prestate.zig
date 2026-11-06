@@ -7,9 +7,12 @@
 //! block live only there), else from the session database. `collect` copies everything
 //! (code included) into bounded scratch, so writing never reads the live state.
 //!
-//! An account is reported when the transaction warmed or changed it; a slot when it was
-//! warmed or changed (system reads such as the L1 fee parameters do not warm). Accounts
-//! and slots touched only inside reverted frames lose their warm stamp and are missed.
+//! An account is reported when the transaction warmed or changed it, or ran as a call
+//! frame; a slot when it was warmed or changed, or read by the transaction in a frame's
+//! account (system reads such as the L1 fee parameters neither warm nor run as frames).
+//! Frames come from the evm call-frame hook (`tracer`), so frames that later revert, whose
+//! warm stamps the revert clears, still count. An account reached only by BALANCE or
+//! EXTCODE* inside a reverted frame is still missed.
 //! Output is sorted by address (and slot). Diff mode reports, as geth, `pre` for changed
 //! accounts that existed (with only their changed slots) and `post` with only changed
 //! fields, so created accounts appear only in `post` and destroyed ones only in `pre`.
@@ -54,6 +57,9 @@ pub const SlotEntry = struct {
 
 const Snapshot = std.AutoHashMapUnmanaged(Address, evm.state.AccountInfo);
 
+/// Distinct frame addresses remembered per transaction; more mark the result `full`.
+pub const frames_max = 512;
+
 pub const Collected = struct {
     accounts: []AccountEntry,
     account_count: u32 = 0,
@@ -67,6 +73,9 @@ pub const Collected = struct {
     full: bool = false,
     /// The database failed while reading a pre-state.
     failed: bool = false,
+    /// Addresses that ran as call frames (from and to) in the traced transaction.
+    frames: [frames_max]Address = undefined,
+    frame_count: u32 = 0,
 
     /// Carves the collector out of `space`; null when it is too small.
     pub fn init(space: []u8) ?Collected {
@@ -91,6 +100,7 @@ pub const Collected = struct {
     pub fn take_snapshot(collected: *Collected, state: *const evm.State) void {
         var fixed: std.heap.FixedBufferAllocator = .init(collected.snapshot_space);
         collected.snapshot = .empty;
+        collected.frame_count = 0;
         const count = state.accounts.count();
         collected.snapshot.ensureTotalCapacity(fixed.allocator(), count) catch {
             collected.full = true;
@@ -148,7 +158,8 @@ pub const Collected = struct {
             const pre = collected.pre_of(state, account.address);
             const post_exists = !account.self_destructed;
             const post = collected.info_of(state, account.info, post_exists);
-            if (account.warm_tx != tx_id and !info_changed(&pre, &post)) continue;
+            const framed = collected.is_frame(&account.address);
+            if (account.warm_tx != tx_id and !framed and !info_changed(&pre, &post)) continue;
             if (collected.account_count == collected.accounts.len) {
                 collected.full = true;
                 return;
@@ -179,7 +190,8 @@ pub const Collected = struct {
         while (slots.next()) |item| {
             const slot = item.value_ptr;
             if (slot.original_tx != tx_id) continue;
-            if (slot.warm_tx != tx_id and slot.present == slot.original) continue;
+            const warm_or_changed = slot.warm_tx == tx_id or slot.present != slot.original;
+            if (!warm_or_changed and !collected.is_frame(&item.key_ptr.address)) continue;
             if (collected.slot_count == collected.slots.len) {
                 collected.full = true;
                 return;
@@ -193,6 +205,38 @@ pub const Collected = struct {
             collected.slot_count += 1;
         }
     }
+
+    fn is_frame(collected: *const Collected, address: *const Address) bool {
+        for (collected.frames[0..collected.frame_count]) |*frame| {
+            if (std.mem.eql(u8, frame, address)) return true;
+        }
+        return false;
+    }
+
+    fn note_frame(collected: *Collected, address: Address) void {
+        if (collected.is_frame(&address)) return;
+        if (collected.frame_count == frames_max) {
+            collected.full = true;
+            return;
+        }
+        collected.frames[collected.frame_count] = address;
+        collected.frame_count += 1;
+    }
+
+    /// The evm hook recording frame addresses; attach it for the traced transaction.
+    pub fn tracer(collected: *Collected) evm.evm.Tracer {
+        return .{ .context = collected, .enter = on_enter, .exit = on_exit, .log = on_log };
+    }
+
+    fn on_enter(context: *anyopaque, frame: evm.evm.TraceFrame) void {
+        const collected: *Collected = @ptrCast(@alignCast(context));
+        collected.note_frame(frame.from);
+        collected.note_frame(frame.to);
+    }
+
+    fn on_exit(_: *anyopaque, _: evm.evm.Outcome) void {}
+
+    fn on_log(_: *anyopaque, _: Address, _: []const [32]u8, _: []const u8) void {}
 
     /// The `Executor.Inspect` hook (debug_traceCall).
     pub fn inspect(collected: *Collected) @import("../node/root.zig").executor.Executor.Inspect {

@@ -719,7 +719,12 @@ fn trace_call_prestate(
         return call.fail(rpc.code.internal_error, "scratch too small");
     var request = request_in;
     request.message.inspect = collected.inspect();
-    switch (try eth.simulate(api, call, request)) {
+    const tracer = collected.tracer();
+    const executor = api.chain.executor;
+    executor.machine.tracer = &tracer;
+    const simulated = eth.simulate(api, call, request);
+    executor.machine.tracer = null;
+    switch (try simulated) {
         .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
         .executed => {},
     }
@@ -783,11 +788,14 @@ fn run_prestate(
     try executor.recover_all(transactions);
     var building = try executor.begin_block(env);
     defer executor.known_sender = null;
+    const tracer = collected.tracer();
+    defer executor.machine.tracer = null;
     if (only == null) try w.begin_array();
     for (transactions, 0..) |raw, index| {
         const traced = only == null or only.? == index;
         if (traced) collected.take_snapshot(executor.state);
         executor.known_sender = executor.senders[index];
+        executor.machine.tracer = if (traced) &tracer else null;
         try executor.apply(&building, raw);
         if (!traced) continue;
         collected.collect(executor.state);
