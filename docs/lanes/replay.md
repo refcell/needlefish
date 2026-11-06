@@ -73,4 +73,25 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Decisions
 
+- 2026-11-05: code lives in `src/execution/replay/` (library, pure, no IO) and
+  `bin/base/replay.zig` (RPC + files + TUI driver). It sits next to the executor and
+  `db/witness.zig` it drives.
+- 2026-11-05: no public endpoint serves `debug_executionWitness`, `debug_getRaw*`,
+  `debug_storageRangeAt`, or batched calls on drpc (blastapi does batch `eth_getProof`).
+  So headers and transactions are re-encoded from JSON and bound by the block hash and
+  `transactionsRoot`; the witness is built from `prestateTracer` keys plus archive
+  `eth_getProof` at each block's parent.
+- 2026-11-05: replay is chained: one `SparseState` over the union of every block's proof
+  nodes and codes, never reset between blocks, so block N+1 runs on needlefish's own
+  post-state of block N (a wrong root would also break the next block). BLOCKHASH is
+  served from the archive's hash-linked header chain (256 ancestors + the blocks).
+- 2026-11-05: branch collapses on deletion need the sibling node, which no proof of a
+  touched key contains. The fetcher replays the archive itself; on a missing node it
+  finds the node's trie path through the pool (child -> parent index up to a state or
+  storage root), grinds an address or slot whose keccak256 has that nibble prefix, fetches
+  its proof at the block's parent, and retries. Bounded rounds.
+- 2026-11-05: archive = `NFRP` frame (version, body size, keccak256 of the body) around a
+  raw-deflate body (std.compress.flate). Body is canonical: nodes and codes sorted by
+  keccak256, no duplicates; the decoder is strict.
+
 ## Log

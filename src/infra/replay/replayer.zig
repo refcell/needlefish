@@ -1,0 +1,570 @@
+//! Offline replay of real blocks over a stateless witness (`archive.Archive`).
+//!
+//! One `SparseState` holds the union of every block's pre-state proof nodes and codes. It is
+//! bound to the parent of the first block and never reset: block N+1 runs on the post-state
+//! needlefish computed for block N, so a wrong root also derails every later block. Each
+//! block runs through the node's block executor (`execution/node/executor.zig`, the same code
+//! the node imports blocks with) over a `Backend` that commits into the sparse tries.
+//!
+//! Checked per block against the canonical header (which `archive` hash-links to the
+//! parent): transactions root, gas used, logs bloom, blob gas used (Jovian DA footprint),
+//! receipts root, state root, the Isthmus withdrawals root (L2ToL1MessagePasser storage
+//! root), and the block hash of the canonical header with every execution result sealed in.
+//!
+//! BLOCKHASH is served from the archive's header chain through the `SparseState` fallback
+//! (only numbers below the block being executed). Reads that hit a gap in the witness are
+//! recorded (`Gaps`): the address or slot of a failed read, and the hash of a trie node or
+//! code the witness lacks. `base replay fetch` uses them to complete an archive.
+
+const std = @import("std");
+const assert = std.debug.assert;
+
+const archive_module = @import("archive.zig");
+const primitives = @import("../../common/primitives/root.zig");
+const consensus = @import("../../common/consensus/root.zig");
+const evm = @import("../../execution/evm/root.zig");
+const chainspec = @import("../../execution/chainspec/root.zig");
+const db = @import("../../execution/db/root.zig");
+const trie = @import("../../execution/trie/root.zig");
+const node_executor = @import("../../execution/node/executor.zig");
+const chain_module = @import("../../execution/node/chain.zig");
+
+const Archive = archive_module.Archive;
+const SparseState = db.witness.SparseState;
+const Executor = node_executor.Executor;
+const Header = consensus.Header;
+const Hash = [32]u8;
+const Address = [20]u8;
+const keccak256 = trie.node.keccak256;
+
+pub const l2_to_l1_message_passer: Address =
+    primitives.hex.decode_array(20, "4200000000000000000000000000000000000016") catch unreachable;
+
+/// The EVM serves BLOCKHASH for the 256 most recent ancestors.
+pub const block_hash_window = 256;
+/// Gap entries kept per kind; more are counted, not kept.
+pub const gaps_max = 256;
+
+pub const Config = struct {
+    sparse: SparseState.Config,
+    changeset: db.changeset.Config,
+    executor: node_executor.Config,
+};
+
+/// Sizes for an archive: every pool fits the whole archive, since nothing is reset.
+pub fn config_for(archive: *const Archive) Config {
+    const witness = &archive.witness;
+    const nodes: u32 = @max(witness.state.count, 1);
+    const blocks: u32 = archive.block_count;
+    var transactions_max: u32 = 1;
+    for (0..blocks) |index| {
+        transactions_max = @max(transactions_max, archive.transaction_count(@intCast(index)));
+    }
+    return .{
+        .sparse = .{
+            .nodes_max = nodes + 1024,
+            .node_bytes_max = byte_list_used(&witness.state) + (1 << 20),
+            .codes_max = @max(witness.codes.count, 1) + 1024 * blocks,
+            .code_bytes_max = byte_list_used(&witness.codes) + (8 << 20),
+            .headers_max = 1,
+            .trie_nodes_max = 4 * nodes + 65536 * blocks,
+            .storage_tries_max = 4096 + 2048 * blocks,
+        },
+        .changeset = .{
+            .accounts_max = 1 << 14,
+            .storage_max = 1 << 16,
+            .codes_max = 1 << 10,
+            .code_bytes_max = 8 << 20,
+        },
+        .executor = .{ .transactions_max = transactions_max },
+    };
+}
+
+fn byte_list_used(list: *const db.witness.ByteList) u32 {
+    return if (list.count == 0) 0 else list.ends[list.count - 1];
+}
+
+pub const SlotKey = struct { address: Address, slot: u256 };
+
+/// What the witness lacked during the last block. Bounded; overflow is counted.
+pub const Gaps = struct {
+    accounts: [gaps_max]Address = undefined,
+    accounts_len: u32 = 0,
+    slots: [gaps_max]SlotKey = undefined,
+    slots_len: u32 = 0,
+    nodes: [gaps_max]Hash = undefined,
+    nodes_len: u32 = 0,
+    codes: [gaps_max]Hash = undefined,
+    codes_len: u32 = 0,
+    block_hashes: [gaps_max]u64 = undefined,
+    block_hashes_len: u32 = 0,
+    dropped: u32 = 0,
+
+    pub fn clear(gaps: *Gaps) void {
+        gaps.* = .{};
+    }
+
+    pub fn empty(gaps: *const Gaps) bool {
+        return gaps.accounts_len + gaps.slots_len + gaps.nodes_len + gaps.codes_len +
+            gaps.block_hashes_len + gaps.dropped == 0;
+    }
+
+    fn push(gaps: *Gaps, comptime T: type, list: []T, len: *u32, item: T) void {
+        for (list[0..len.*]) |existing| {
+            if (std.meta.eql(existing, item)) return;
+        }
+        if (len.* == list.len) {
+            gaps.dropped += 1;
+            return;
+        }
+        list[len.*] = item;
+        len.* += 1;
+    }
+
+    fn account(gaps: *Gaps, address: Address) void {
+        gaps.push(Address, &gaps.accounts, &gaps.accounts_len, address);
+    }
+
+    fn slot(gaps: *Gaps, key: SlotKey) void {
+        gaps.push(SlotKey, &gaps.slots, &gaps.slots_len, key);
+    }
+
+    fn node(gaps: *Gaps, hash: Hash) void {
+        gaps.push(Hash, &gaps.nodes, &gaps.nodes_len, hash);
+    }
+
+    fn code(gaps: *Gaps, hash: Hash) void {
+        gaps.push(Hash, &gaps.codes, &gaps.codes_len, hash);
+    }
+
+    fn block_hash(gaps: *Gaps, number: u64) void {
+        gaps.push(u64, &gaps.block_hashes, &gaps.block_hashes_len, number);
+    }
+};
+
+/// A header field needlefish recomputes, in check order.
+pub const Check = enum(u8) {
+    transactions_root,
+    gas_used,
+    logs_bloom,
+    blob_gas_used,
+    receipts_root,
+    state_root,
+    withdrawals_root,
+    block_hash,
+};
+
+pub const check_count = @typeInfo(Check).@"enum".field_names.len;
+
+/// The first receipt that differs from the canonical one (diagnostics).
+pub const ReceiptDiff = struct {
+    index: u32,
+    expected: archive_module.Receipt,
+    computed: archive_module.Receipt,
+};
+
+/// The first account or slot whose post-block value differs from the canonical chain's.
+pub const StateDiff = union(enum) {
+    account: struct {
+        address: Address,
+        expected: ?db.AccountInfo,
+        computed: ?db.AccountInfo,
+    },
+    slot: struct {
+        address: Address,
+        slot: u256,
+        expected: u256,
+        computed: u256,
+    },
+};
+
+pub const Outcome = struct {
+    number: u64,
+    hash: Hash,
+    transactions: u32,
+    gas_used: u64,
+    expected_state_root: Hash,
+    computed_state_root: Hash,
+    /// Bit `@intFromEnum(check)` set: that field matched.
+    passed: u16 = 0,
+    /// Set when execution itself failed (no roots were computed).
+    failure: ?anyerror = null,
+    /// Index of the transaction execution failed on, if any.
+    failed_transaction: ?u32 = null,
+    receipt_diff: ?ReceiptDiff = null,
+    state_diff: ?StateDiff = null,
+
+    pub fn ok(outcome: *const Outcome) bool {
+        return outcome.failure == null and outcome.passed == all_checks;
+    }
+
+    pub fn check(outcome: *const Outcome, which: Check) bool {
+        return outcome.passed & (@as(u16, 1) << @backingInt(which)) != 0;
+    }
+
+    /// The first check that failed, in check order.
+    pub fn first_failed(outcome: *const Outcome) ?Check {
+        inline for (@typeInfo(Check).@"enum".field_names) |name| {
+            const which = @field(Check, name);
+            if (!outcome.check(which)) return which;
+        }
+        return null;
+    }
+};
+
+const all_checks: u16 = (1 << check_count) - 1;
+
+pub const Error = error{
+    /// The archive's chain id does not match the chain spec.
+    WrongChain,
+    InvalidArchive,
+} || db.witness.Error;
+
+pub const Replayer = struct {
+    spec: *const chainspec.ChainSpec,
+    archive: *const Archive,
+    sparse: SparseState,
+    changeset: db.Changeset,
+    executor: Executor,
+    gaps: Gaps = .{},
+    /// keccak256 of every archive header, in archive order.
+    header_hashes: []Hash,
+    /// Number of the first archive header.
+    first_number: u64,
+    /// The block being executed (BLOCKHASH serves only numbers below it).
+    current_number: u64 = 0,
+    /// Index of the next block to replay.
+    next_block: u32 = 0,
+    /// Why the backend reported `StateUnavailable`.
+    backend_error: ?anyerror = null,
+    /// Scratch: the transactions of the block being replayed.
+    transaction_views: [][]const u8,
+
+    /// The replayer must not move after `init` (the executor's backend points at it).
+    pub fn init(
+        self: *Replayer,
+        allocator: std.mem.Allocator,
+        spec: *const chainspec.ChainSpec,
+        archive: *const Archive,
+        config: Config,
+    ) !void {
+        if (archive.chain_id != spec.chain_id) return error.WrongChain;
+        assert(archive.block_count > 0);
+        self.* = undefined;
+        self.spec = spec;
+        self.archive = archive;
+        self.gaps = .{};
+        self.current_number = 0;
+        self.next_block = 0;
+        self.backend_error = null;
+        self.sparse = try SparseState.init(allocator, config.sparse);
+        errdefer self.sparse.deinit(allocator);
+        self.changeset = try db.Changeset.init(allocator, config.changeset);
+        errdefer self.changeset.deinit(allocator);
+        self.header_hashes = try allocator.alloc(Hash, archive.witness.headers.count);
+        errdefer allocator.free(self.header_hashes);
+        self.transaction_views = try allocator.alloc([]const u8, config.executor.transactions_max);
+        errdefer allocator.free(self.transaction_views);
+        self.executor = try Executor.init_backend(allocator, spec, self.backend(), config.executor);
+        errdefer self.executor.deinit(allocator);
+        try self.load();
+    }
+
+    pub fn deinit(self: *Replayer, allocator: std.mem.Allocator) void {
+        self.executor.deinit(allocator);
+        allocator.free(self.transaction_views);
+        allocator.free(self.header_hashes);
+        self.changeset.deinit(allocator);
+        self.sparse.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Binds the sparse state to the first block's parent and loads every node and code.
+    fn load(self: *Replayer) Error!void {
+        const witness = &self.archive.witness;
+        for (0..witness.headers.count) |index| {
+            self.header_hashes[index] = keccak256(witness.headers.get(@intCast(index)));
+        }
+        self.first_number = db.witness.header_number(witness.headers.get(0)) catch
+            return error.InvalidArchive;
+        const parent_rlp = self.archive.parent_header();
+        const parent = db.witness.header_link(parent_rlp) catch return error.InvalidArchive;
+        self.sparse.reset(parent.state_root, .{
+            .number = parent.number,
+            .hash = keccak256(parent_rlp),
+        });
+        self.sparse.set_fallback(self.fallback());
+        for (0..witness.state.count) |index| {
+            try self.sparse.add_node(witness.state.get(@intCast(index)));
+        }
+        for (0..witness.codes.count) |index| {
+            try self.sparse.add_code(witness.codes.get(@intCast(index)));
+        }
+        try self.sparse.verify_headers();
+        self.executor.state.reset(self.database());
+        assert(std.mem.eql(u8, &self.sparse.state_root(), &parent.state_root));
+    }
+
+    pub fn done(self: *const Replayer) bool {
+        return self.next_block == self.archive.block_count;
+    }
+
+    /// Replays the next block. A block that fails leaves the replayer unusable for the
+    /// blocks after it (their pre-state is wrong), so `done` is then forced.
+    pub fn replay_next(self: *Replayer) Error!Outcome {
+        assert(!self.done());
+        const index = self.next_block;
+        self.next_block += 1;
+        const header_rlp = self.archive.block_header(index);
+        const header = Header.decode(header_rlp) catch return error.InvalidArchive;
+        self.gaps.clear();
+        self.backend_error = null;
+        self.current_number = header.number;
+        var outcome: Outcome = .{
+            .number = header.number,
+            .hash = keccak256(header_rlp),
+            .transactions = self.archive.transaction_count(index),
+            .gas_used = header.gas_used,
+            .expected_state_root = header.state_root.bytes,
+            .computed_state_root = @splat(0),
+        };
+        self.execute(index, &header, &outcome);
+        if (!outcome.ok()) self.next_block = self.archive.block_count;
+        assert(outcome.number == header.number);
+        return outcome;
+    }
+
+    fn execute(self: *Replayer, index: u32, header: *const Header, outcome: *Outcome) void {
+        const count = self.archive.transaction_count(index);
+        const transactions = self.transaction_views[0..count];
+        for (transactions, 0..) |*view, position| {
+            view.* = self.archive.transaction(index, @intCast(position));
+        }
+        // Base blocks carry an empty withdrawals list from Canyon on.
+        const withdrawals: ?[]const @import("../../execution/payload/root.zig").Withdrawal =
+            if (header.withdrawals_root != null) &.{} else null;
+        const env = chain_module.env_of(header);
+        const executed = self.executor.execute_block(&env, transactions, withdrawals) catch |err| {
+            outcome.failure = if (self.sparse.incomplete or !self.gaps.empty())
+                error.WitnessIncomplete
+            else
+                self.backend_error orelse err;
+            outcome.failed_transaction = self.executor.invalid_index;
+            self.sparse.incomplete = false;
+            return;
+        };
+        outcome.computed_state_root = executed.state_root;
+        self.compare(header, transactions, &executed, outcome);
+        if (!outcome.check(.receipts_root) or !outcome.check(.gas_used)) {
+            const expected = self.archive.block_receipts(index);
+            outcome.receipt_diff = diff_receipts(expected, executed.receipts);
+        }
+        if (!outcome.check(.state_root)) outcome.state_diff = self.diff_state(index);
+    }
+
+    /// Checks every recomputed header field and the hash of the header resealed with them.
+    fn compare(
+        self: *Replayer,
+        header: *const Header,
+        transactions: []const []const u8,
+        executed: *const node_executor.Executed,
+        outcome: *Outcome,
+    ) void {
+        var sealed = header.*;
+        sealed.transactions_root = .{ .bytes = trie.ordered.ordered_trie_root(transactions) };
+        sealed.gas_used = executed.gas_used;
+        sealed.logs_bloom = executed.logs_bloom;
+        if (header.blob_gas_used != null) sealed.blob_gas_used = executed.blob_gas_used;
+        sealed.receipts_root = .{ .bytes = executed.receipts_root };
+        sealed.state_root = .{ .bytes = executed.state_root };
+        if (self.spec.is_upgrade_active(.isthmus, header.timestamp)) {
+            if (self.sparse.account_storage_root(l2_to_l1_message_passer)) |root| {
+                sealed.withdrawals_root = .{ .bytes = root };
+            } else |_| {
+                sealed.withdrawals_root = .{ .bytes = @splat(0) };
+            }
+        }
+        const results = [check_count]bool{
+            sealed.transactions_root.eql(header.transactions_root),
+            sealed.gas_used == header.gas_used,
+            sealed.logs_bloom.eql(header.logs_bloom),
+            std.meta.eql(sealed.blob_gas_used, header.blob_gas_used),
+            sealed.receipts_root.eql(header.receipts_root),
+            sealed.state_root.eql(header.state_root),
+            std.meta.eql(sealed.withdrawals_root, header.withdrawals_root),
+            std.mem.eql(u8, &sealed.hash().bytes, &outcome.hash),
+        };
+        for (results, 0..) |passed, bit| {
+            if (passed) outcome.passed |= @as(u16, 1) << @intCast(bit);
+        }
+        assert(outcome.check(.block_hash) == outcome.ok() or outcome.failure != null or
+            !outcome.check(.block_hash));
+    }
+
+    /// The first account or slot (in archive order) whose post-block value differs.
+    fn diff_state(self: *Replayer, index: u32) ?StateDiff {
+        for (self.archive.block_accounts(index)) |expected| {
+            const computed = self.sparse.basic(expected.address) catch continue;
+            const same = if (expected.info != null and computed != null)
+                expected.info.?.eql(computed.?)
+            else
+                expected.info == null and computed == null;
+            if (same) continue;
+            return .{ .account = .{
+                .address = expected.address,
+                .expected = expected.info,
+                .computed = computed,
+            } };
+        }
+        for (self.archive.block_slots(index)) |expected| {
+            const computed = self.sparse.storage(expected.address, expected.slot) catch continue;
+            if (computed == expected.value) continue;
+            return .{ .slot = .{
+                .address = expected.address,
+                .slot = expected.slot,
+                .expected = expected.value,
+                .computed = computed,
+            } };
+        }
+        return null;
+    }
+
+    fn backend(self: *Replayer) node_executor.Backend {
+        return .{
+            .context = self,
+            .database = self.database(),
+            .commit = backend_commit,
+            .root = backend_root,
+        };
+    }
+
+    fn backend_commit(context: *anyopaque, state: *evm.State) node_executor.BackendError!void {
+        const self: *Replayer = @ptrCast(@alignCast(context));
+        self.commit(state) catch |err| {
+            self.backend_error = err;
+            return error.StateUnavailable;
+        };
+    }
+
+    /// Folds the block into the sparse tries, keeps the code it deployed (later blocks may
+    /// call it), and empties the evm cache so the next block reads the new state.
+    fn commit(self: *Replayer, state: *evm.State) !void {
+        try self.sparse.apply_evm(state, &self.changeset);
+        var accounts = state.accounts.valueIterator();
+        while (accounts.next()) |account| {
+            if (!account.dirty or !account.in_database) continue;
+            const code = account.info.code orelse continue;
+            if (code.len == 0) continue;
+            try self.sparse.add_code(code);
+        }
+        state.accounts.clearRetainingCapacity();
+        state.slots.clearRetainingCapacity();
+        state.code_store_len = 0;
+    }
+
+    fn backend_root(context: *anyopaque) node_executor.BackendError!Hash {
+        const self: *Replayer = @ptrCast(@alignCast(context));
+        return self.sparse.state_root();
+    }
+
+    fn fallback(self: *Replayer) SparseState.Fallback {
+        return .{
+            .context = self,
+            .node = fallback_node,
+            .code = fallback_code,
+            .block_hash = fallback_block_hash,
+        };
+    }
+
+    fn from(context: *anyopaque) *Replayer {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn fallback_node(context: *anyopaque, hash: *const Hash) ?[]const u8 {
+        from(context).gaps.node(hash.*);
+        return null;
+    }
+
+    fn fallback_code(context: *anyopaque, hash: *const Hash) ?[]const u8 {
+        from(context).gaps.code(hash.*);
+        return null;
+    }
+
+    /// Ancestors of the block being executed, from the hash-linked archive headers.
+    fn fallback_block_hash(context: *anyopaque, number: u64) ?Hash {
+        const self = from(context);
+        const count = self.header_hashes.len;
+        if (number < self.first_number or number >= self.current_number or
+            number - self.first_number >= count)
+        {
+            self.gaps.block_hash(number);
+            return null;
+        }
+        return self.header_hashes[@intCast(number - self.first_number)];
+    }
+
+    const recording_vtable: evm.state.Database.VTable = .{
+        .basic = database_basic,
+        .code_by_hash = database_code_by_hash,
+        .storage = database_storage,
+        .block_hash = database_block_hash,
+    };
+
+    fn database(self: *Replayer) evm.state.Database {
+        return .{ .context = self, .vtable = &recording_vtable };
+    }
+
+    fn inner(self: *Replayer) evm.state.Database {
+        return self.sparse.database();
+    }
+
+    fn database_basic(
+        context: *anyopaque,
+        address: evm.Address,
+    ) evm.state.Error!?evm.state.AccountInfo {
+        const self = from(context);
+        return self.inner().basic(address) catch |err| {
+            self.gaps.account(address);
+            return err;
+        };
+    }
+
+    fn database_code_by_hash(context: *anyopaque, hash: evm.B256) evm.state.Error![]const u8 {
+        return from(context).inner().code_by_hash(hash);
+    }
+
+    fn database_storage(
+        context: *anyopaque,
+        address: evm.Address,
+        slot: u256,
+    ) evm.state.Error!u256 {
+        const self = from(context);
+        return self.inner().storage(address, slot) catch |err| {
+            self.gaps.slot(.{ .address = address, .slot = slot });
+            return err;
+        };
+    }
+
+    fn database_block_hash(context: *anyopaque, number: u64) evm.state.Error!evm.B256 {
+        return from(context).inner().block_hash(number);
+    }
+};
+
+/// The first receipt whose status, cumulative gas, or log count differs.
+pub fn diff_receipts(
+    expected: []const archive_module.Receipt,
+    computed: []const consensus.Receipt,
+) ?ReceiptDiff {
+    const count = @min(expected.len, computed.len);
+    for (0..count) |index| {
+        const mine: archive_module.Receipt = .{
+            .status = computed[index].status,
+            .cumulative_gas_used = computed[index].cumulative_gas_used,
+            .log_count = computed[index].logs.count,
+        };
+        if (std.meta.eql(mine, expected[index])) continue;
+        return .{ .index = @intCast(index), .expected = expected[index], .computed = mine };
+    }
+    assert(expected.len == computed.len);
+    return null;
+}
