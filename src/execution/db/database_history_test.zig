@@ -437,6 +437,29 @@ const Harness = struct {
             try testing.expectEqual(proofs.values[index] != 0, value != null);
         }
         try self.expect_multi_matches(number, address, account);
+        try self.expect_range_matches(number, address_hash);
+    }
+
+    /// `storage_range_at(number)` equals the live trie (which holds block `number`): the head
+    /// from the live trie, older blocks from history.
+    fn expect_range_matches(self: *Harness, number: u64, address_hash: Hash) !void {
+        const db = &self.db;
+        var live_out: [slots_max + 1]trie.StorageEntry = undefined;
+        var got_out: [slots_max + 1]trie.StorageEntry = undefined;
+        var start: Hash = @splat(0);
+        if (self.prng.chance(1, 2)) self.prng.fill(&start);
+        const max: u32 = @intCast(self.prng.below(slots_max + 2));
+        const live_trie = &db.state.state_trie;
+        const live = live_trie.storage_range(address_hash, start, max, &live_out) catch |err| {
+            const got = db.storage_range_at(number, address_hash, start, max, &got_out);
+            try testing.expectError(err, got);
+            return;
+        };
+        const got = try db.storage_range_at(number, address_hash, start, max, &got_out);
+        try testing.expectEqual(live.count, got.count);
+        try testing.expectEqual(live.next, got.next);
+        const expected = live_out[0..live.count];
+        try testing.expectEqualSlices(trie.StorageEntry, expected, got_out[0..got.count]);
     }
 
     /// `proofs_at` (one storage walk) equals the `proof_at` results just computed.
@@ -652,6 +675,15 @@ test "database history: without history a reopen serves only the head" {
     var set = h.proofs.set_storage.set();
     const proofs_at = h.db.proofs_at(head.number, address_of(1), &.{}, &h.proofs.account, &set);
     try testing.expectError(error.HistoryUnavailable, proofs_at);
+    // Storage ranges: the head from the live trie, older blocks need history.
+    var out: [slots_max]trie.StorageEntry = undefined;
+    const address_hash = trie.node.keccak256(&address_of(1));
+    const zero: Hash = @splat(0);
+    const live = try h.db.state.state_trie.storage_range(address_hash, zero, slots_max, &out);
+    const at_head = try h.db.storage_range_at(head.number, address_hash, zero, slots_max, &out);
+    try testing.expectEqual(live, at_head);
+    const older = h.db.storage_range_at(head.number - 1, address_hash, zero, 1, &out);
+    try testing.expectError(error.HistoryUnavailable, older);
 }
 
 test "database history: a full store drops history and the database stays healthy" {
@@ -730,6 +762,11 @@ fn expect_budget_window(h: *Harness, bytes_max: u64) !bool {
     try testing.expect(store.usage().bytes <= bytes_max);
     try testing.expect(window.oldest >= h.expected_oldest(window_blocks));
     if (window.oldest == 0) return false;
+    var out: [1]trie.StorageEntry = undefined;
+    const address_hash = trie.node.keccak256(&address_of(1));
+    const zero: Hash = @splat(0);
+    const range = h.db.storage_range_at(window.oldest - 1, address_hash, zero, 1, &out);
+    try testing.expectError(error.BlockOutOfWindow, range);
     try testing.expectError(error.BlockOutOfWindow, h.db.proof_at(
         window.oldest - 1,
         address_of(1),

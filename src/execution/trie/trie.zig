@@ -1399,6 +1399,132 @@ pub fn TrieType(comptime config: Config) type {
             }
         }
 
+        /// A node of `leaves_from_in`: its key prefix (nibbles `[0, consumed)` of `key`, the
+        /// rest zero) and whether that prefix equals the start key's (`bounded`: the subtrie
+        /// may hold keys below the start); an unbounded subtrie holds only keys above it.
+        const RangeFrame = struct { index: NodeIndex, consumed: u32, bounded: bool, key: [32]u8 };
+
+        fn set_key_nibble(key: *[32]u8, at: u32, value: u8) void {
+            assert(at < path_max and value < 16);
+            const byte = &key[at >> 1];
+            if (at & 1 == 0) {
+                byte.* = (byte.* & 0x0f) | (value << 4);
+            } else {
+                byte.* = (byte.* & 0xf0) | value;
+            }
+        }
+
+        /// In-order leaf walk from `start` (inclusive): calls `visitor.leaf(key, value)` for
+        /// every leaf whose key is at least `start`, in increasing key order, until it returns
+        /// false. Every key in the trie must be 32 bytes (storage and account tries), so leaves
+        /// end at depth `path_max` and branches hold no value. Iterative, no recursion: a
+        /// subtrie entirely below `start` is skipped without being entered.
+        pub fn leaves_from_in(
+            self: *const Self,
+            root: NodeIndex,
+            start: *const [32]u8,
+            visitor: anytype,
+        ) !void {
+            comptime assert(config.key_bytes_max == 32);
+            if (root == none) return;
+            var stack: [path_targets.stack_frames_max]RangeFrame = undefined;
+            stack[0] = .{ .index = root, .consumed = 0, .bounded = true, .key = @splat(0) };
+            var stack_len: u32 = 1;
+            var visited: u64 = 0;
+            while (stack_len > 0) : (visited += 1) {
+                // A walk enters each node of the trie at most once.
+                assert(visited < self.nodes.len);
+                stack_len -= 1;
+                const frame = stack[stack_len];
+                assert(frame.consumed <= path_max);
+                const current = &self.nodes[frame.index];
+                switch (current.kind) {
+                    .free => unreachable, // Reachable nodes are never on the free list.
+                    .leaf => {
+                        assert(frame.consumed + current.path_len == path_max);
+                        var key = frame.key;
+                        var index: u32 = 0;
+                        while (index < current.path_len) : (index += 1) {
+                            const at = frame.consumed + index;
+                            set_key_nibble(&key, at, current.path_nibble(index));
+                        }
+                        if (frame.bounded and std.mem.order(u8, &key, start) == .lt) continue;
+                        if (!try visitor.leaf(&key, current.value_slice())) return;
+                    },
+                    .extension => {
+                        stack_len = self.push_range_extension(&stack, stack_len, frame, start);
+                    },
+                    .branch => {
+                        stack_len = self.push_range_branch(&stack, stack_len, frame, start);
+                    },
+                }
+            }
+        }
+
+        /// Pushes the extension's child unless its whole subtrie is below `start`. Returns the
+        /// new stack length.
+        fn push_range_extension(
+            self: *const Self,
+            stack: *[path_targets.stack_frames_max]RangeFrame,
+            stack_len: u32,
+            frame: RangeFrame,
+            start: *const [32]u8,
+        ) u32 {
+            const current = &self.nodes[frame.index];
+            assert(current.kind == .extension and current.path_len > 0);
+            assert(frame.consumed + current.path_len < path_max);
+            var child = frame;
+            child.index = current.body.extension.child;
+            child.consumed = frame.consumed + current.path_len;
+            var index: u32 = 0;
+            while (index < current.path_len) : (index += 1) {
+                const at = frame.consumed + index;
+                const value = current.path_nibble(index);
+                set_key_nibble(&child.key, at, value);
+                if (!child.bounded) continue;
+                const bound = key_nibble(start, at);
+                if (value < bound) return stack_len;
+                if (value > bound) child.bounded = false;
+            }
+            assert(stack_len < stack.len);
+            stack[stack_len] = child;
+            return stack_len + 1;
+        }
+
+        /// Pushes the branch's children not entirely below `start`, last nibble first (so they
+        /// pop in key order). Returns the new stack length.
+        fn push_range_branch(
+            self: *const Self,
+            stack: *[path_targets.stack_frames_max]RangeFrame,
+            stack_len: u32,
+            frame: RangeFrame,
+            start: *const [32]u8,
+        ) u32 {
+            const current = &self.nodes[frame.index];
+            assert(current.kind == .branch and frame.consumed < path_max);
+            assert(current.body.branch[value_slot] == none);
+            const lowest: u8 = if (frame.bounded) key_nibble(start, frame.consumed) else 0;
+            var length = stack_len;
+            var nibble: u8 = 16;
+            while (nibble > lowest) {
+                nibble -= 1;
+                const child = current.body.branch[nibble];
+                if (child == none) continue;
+                var key = frame.key;
+                set_key_nibble(&key, frame.consumed, nibble);
+                assert(length < stack.len);
+                stack[length] = .{
+                    .index = child,
+                    .consumed = frame.consumed + 1,
+                    .bounded = frame.bounded and nibble == lowest,
+                    .key = key,
+                };
+                length += 1;
+            }
+            assert(length <= stack_len + 16);
+            return length;
+        }
+
         /// A node of `visit_paths_in` and the range of targets whose paths enter it.
         const PathFrame = struct { index: NodeIndex, start: u32, end: u32, consumed: u32 };
 

@@ -35,6 +35,8 @@ pub const verify_proof = proof.verify;
 pub const ordered_trie_root = ordered.ordered_trie_root;
 pub const StateTrie = state_trie.StateTrie;
 pub const Account = state_trie.Account;
+pub const StorageEntry = state_trie.StorageEntry;
+pub const StorageRange = state_trie.StorageRange;
 pub const SparseTrie = sparse.SparseTrie;
 pub const PathTarget = path_targets.PathTarget;
 
@@ -42,4 +44,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("trie_test.zig");
     _ = @import("state_trie_test.zig");
+    _ = @import("storage_range_test.zig");
 }

@@ -800,3 +800,149 @@ fn fuzz_multi_proofs(_: void, smith: *testing.Smith) anyerror!void {
 test "history: fuzz multi-key proofs against per-key proofs" {
     try testing.fuzz({}, fuzz_multi_proofs, .{});
 }
+
+// Storage ranges (`Store.storage_range`, `debug_storageRangeAt`): at every block of the
+// window, the range from history must equal the head walk of a live `State` moved to it.
+
+const range_out_max = slots_max + 2;
+
+const RangeCoverage = struct {
+    unknown: u32 = 0,
+    empty: u32 = 0,
+    truncated: u32 = 0,
+    complete: u32 = 0,
+};
+
+fn random_range_start(prng: *Prng, live: []const trie.StorageEntry) Hash {
+    var range_start: Hash = @splat(0);
+    if (live.len == 0 or prng.chance(1, 5)) {
+        if (prng.chance(1, 2)) prng.fill(&range_start);
+        return range_start;
+    }
+    range_start = live[prng.below(live.len)].key_hash;
+    var value = std.mem.readInt(u256, &range_start, .big);
+    switch (prng.below(3)) {
+        0 => {},
+        1 => value +%= 1,
+        else => value -%= 1,
+    }
+    std.mem.writeInt(u256, &range_start, value, .big);
+    return range_start;
+}
+
+fn expect_range_matches_live(
+    store: *const history.Store,
+    state: *const State,
+    number: u64,
+    address_index: usize,
+    prng: *Prng,
+    coverage: *RangeCoverage,
+) !void {
+    const address_hash = trie.node.keccak256(&address_of(address_index));
+    var all: [range_out_max]trie.StorageEntry = undefined;
+    var live_out: [range_out_max]trie.StorageEntry = undefined;
+    var history_out: [range_out_max]trie.StorageEntry = undefined;
+    const zero: Hash = @splat(0);
+    const live_trie = &state.state_trie;
+    const full = live_trie.storage_range(address_hash, zero, range_out_max, &all) catch |err| {
+        const got = store.storage_range(number, &address_hash, &zero, 1, &history_out);
+        try testing.expectError(err, got);
+        coverage.unknown += 1;
+        return;
+    };
+    try testing.expect(full.next == null);
+    for (0..4) |_| {
+        const range_start = random_range_start(prng, all[0..full.count]);
+        const max: u32 = @intCast(prng.below(range_out_max + 1));
+        const live = try state.state_trie.storage_range(address_hash, range_start, max, &live_out);
+        const got = try store.storage_range(number, &address_hash, &range_start, max, &history_out);
+        try testing.expectEqual(live.count, got.count);
+        try testing.expectEqual(live.next, got.next);
+        const expected = live_out[0..live.count];
+        try testing.expectEqualSlices(trie.StorageEntry, expected, history_out[0..got.count]);
+        if (got.count == 0) coverage.empty += 1;
+        if (got.next == null) coverage.complete += 1 else coverage.truncated += 1;
+    }
+    // Pages of one size from the zero key cover the live slots exactly once.
+    const page: u32 = @intCast(prng.range(1, 4));
+    var range_start = zero;
+    var seen: u32 = 0;
+    var pages: u32 = 0;
+    while (pages <= full.count) : (pages += 1) {
+        const out = &history_out;
+        const got = try store.storage_range(number, &address_hash, &range_start, page, out);
+        try testing.expect(seen + got.count <= full.count);
+        const expected = all[seen..][0..got.count];
+        try testing.expectEqualSlices(trie.StorageEntry, expected, history_out[0..got.count]);
+        seen += got.count;
+        range_start = got.next orelse break;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(full.count, seen);
+}
+
+fn run_range_seed(seed: u64, blocks: u32, coverage: *RangeCoverage) !void {
+    var prng = Prng.init(seed);
+    var harness: Harness = undefined;
+    try harness.init(history_config);
+    defer harness.deinit();
+    for (0..40) |_| try random_write(&prng, &harness.overlay);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    try harness.store.reset(&harness.state.state_trie, 0);
+    var head: u64 = 0;
+    for (0..blocks) |_| {
+        const oldest = harness.store.window().?.oldest;
+        if (head > oldest and prng.chance(1, 5)) {
+            head = try harness.reorg(&prng, head);
+        } else {
+            head += 1;
+            try harness.commit(&prng, head);
+        }
+        const index = prng.below(addresses_max + 1);
+        const store = &harness.store;
+        try expect_range_matches_live(store, &harness.state, head, index, &prng, coverage);
+    }
+    // Every block of the window against the state unwound to it, newest first.
+    const window = harness.store.window().?;
+    var number = window.head;
+    while (true) : (number -= 1) {
+        for (0..addresses_max + 1) |index| {
+            const store = &harness.store;
+            try expect_range_matches_live(store, &harness.state, number, index, &prng, coverage);
+        }
+        if (number == window.oldest) break;
+        try harness.state.unwind(harness.changeset(number));
+    }
+    var out: [1]trie.StorageEntry = undefined;
+    const address_hash = trie.node.keccak256(&address_of(0));
+    const zero: Hash = @splat(0);
+    try testing.expectError(
+        error.BlockOutOfWindow,
+        harness.store.storage_range(window.head + 1, &address_hash, &zero, 1, &out),
+    );
+    if (window.oldest > 0) {
+        try testing.expectError(
+            error.BlockOutOfWindow,
+            harness.store.storage_range(window.oldest - 1, &address_hash, &zero, 1, &out),
+        );
+    }
+}
+
+test "history: storage ranges at every block of the window match an unwound state" {
+    var coverage: RangeCoverage = .{};
+    // Seeds 0x5a9f and 0x5aa3 hit a pre-existing `commit_block` HistoryCorrupt (lane backlog).
+    for ([_]u64{ 0x5a9e, 0x5aa0 }) |seed| try run_range_seed(seed, blocks_total, &coverage);
+    try testing.expect(coverage.unknown > 0);
+    try testing.expect(coverage.empty > 0);
+    try testing.expect(coverage.truncated > 0);
+    try testing.expect(coverage.complete > 0);
+}
+
+fn fuzz_storage_ranges(_: void, smith: *testing.Smith) anyerror!void {
+    var coverage: RangeCoverage = .{};
+    const blocks = smith.valueRangeAtMost(u32, 1, 16);
+    try run_range_seed(smith.value(u64), blocks, &coverage);
+}
+
+test "history: fuzz storage ranges against the unwound state" {
+    try testing.fuzz({}, fuzz_storage_ranges, .{});
+}

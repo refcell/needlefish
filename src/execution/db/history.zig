@@ -28,6 +28,8 @@ const PathIndex = @import("path_index.zig").PathIndex;
 const IndexSlot = @import("path_index.zig").Slot;
 pub const proof_set = @import("proof_set.zig");
 pub const ProofSet = proof_set.ProofSet;
+pub const StorageEntry = trie.StorageEntry;
+pub const StorageRange = trie.StorageRange;
 const rlp = trie.rlp;
 const nibbles_module = trie.nibbles;
 const StateTrie = trie.StateTrie;
@@ -1665,7 +1667,180 @@ pub const Store = struct {
         const owner: ?Hash = address_hash.*;
         try self.walk_siblings(owner, account.storage_root, slot_hash, number, sink);
     }
+
+    /// `debug_storageRangeAt` at block `number`: the slots of `address_hash`'s storage trie
+    /// in hashed-key order from `start` (inclusive), at most `min(max, out.len)` into `out`,
+    /// plus the next key (`StateTrie.storage_range` on the state of block `number`).
+    /// `UnknownAccount` when the account is absent at `number`; empty when it has no storage.
+    pub fn storage_range(
+        self: *const Store,
+        number: u64,
+        address_hash: *const Hash,
+        start: *const Hash,
+        max: u32,
+        out: []trie.StorageEntry,
+    ) Error!trie.StorageRange {
+        const account = try self.account_at(number, address_hash) orelse
+            return error.UnknownAccount;
+        var collector = trie.state_trie.StorageRangeCollector.init(out, max);
+        try self.walk_range(address_hash.*, account.storage_root, start, number, &collector);
+        const range = collector.result();
+        assert(range.count <= max and range.count <= out.len);
+        return range;
+    }
+
+    /// In-order leaf walk of the storage trie of `owner` at block `number` from `start`
+    /// (`TrieType.leaves_from_in` over history): every node entered is looked up and checked
+    /// against its parent's reference; subtries entirely below `start` are never entered.
+    fn walk_range(
+        self: *const Store,
+        owner: Hash,
+        root: Hash,
+        start: *const Hash,
+        number: u64,
+        collector: *trie.state_trie.StorageRangeCollector,
+    ) Error!void {
+        if (std.mem.eql(u8, &root, &trie.empty_root)) return;
+        var stack: [trie.path_targets.stack_frames_max]RangeFrame = undefined;
+        stack[0] = .{
+            .reference = .{ .hash = root },
+            .consumed = 0,
+            .bounded = true,
+            .key = @splat(0),
+        };
+        var stack_len: u32 = 1;
+        var visited: u64 = 0;
+        while (stack_len > 0) : (visited += 1) {
+            // Each stored node of the trie is entered at most once.
+            assert(visited <= self.versions_total());
+            stack_len -= 1;
+            const frame = stack[stack_len];
+            assert(frame.consumed <= path_nibbles_max);
+            const prefix = trie.Nibbles.from_bytes(&frame.key);
+            const path = prefix.slice()[0..frame.consumed];
+            const bytes = try self.checked_node(owner, path, number, frame.reference);
+            const view = node_view(bytes) catch return error.HistoryCorrupt;
+            switch (view) {
+                .leaf => |*leaf| {
+                    if (!try range_leaf(frame, leaf.path.slice(), leaf.value, start, collector)) {
+                        return;
+                    }
+                },
+                .extension => |*extension| {
+                    stack_len = try push_range_extension(
+                        &stack,
+                        stack_len,
+                        frame,
+                        extension.path.slice(),
+                        extension.child,
+                        start,
+                    );
+                },
+                .branch => |*children| {
+                    stack_len = try push_range_branch(&stack, stack_len, frame, children, start);
+                },
+            }
+        }
+    }
+
+    /// Completes the leaf's key and hands it to `collector` unless it is below `start`;
+    /// returns false once the walk can stop.
+    fn range_leaf(
+        frame: RangeFrame,
+        path: []const u8,
+        value: []const u8,
+        start: *const Hash,
+        collector: *trie.state_trie.StorageRangeCollector,
+    ) Error!bool {
+        // Storage keys are 32-byte hashes: every leaf ends at full depth.
+        if (frame.consumed + path.len != path_nibbles_max) return error.HistoryCorrupt;
+        var key = frame.key;
+        for (path, 0..) |nibble, offset| {
+            set_key_nibble(&key, frame.consumed + @as(u32, @intCast(offset)), nibble);
+        }
+        if (frame.bounded and std.mem.order(u8, &key, start) == .lt) return true;
+        const decoded = decode_storage_value(value) catch return error.HistoryCorrupt;
+        assert(decoded != 0);
+        return collector.add(&key, decoded);
+    }
+
+    /// Pushes the extension's child unless its whole subtrie is below `start`.
+    fn push_range_extension(
+        stack: *[trie.path_targets.stack_frames_max]RangeFrame,
+        stack_len: u32,
+        frame: RangeFrame,
+        path: []const u8,
+        next: Reference,
+        start: *const Hash,
+    ) Error!u32 {
+        assert(path.len > 0);
+        if (frame.consumed + path.len >= path_nibbles_max) return error.HistoryCorrupt;
+        var child: RangeFrame = frame;
+        child.reference = next;
+        child.consumed = frame.consumed + @as(u32, @intCast(path.len));
+        for (path, 0..) |nibble, offset| {
+            const at = frame.consumed + @as(u32, @intCast(offset));
+            set_key_nibble(&child.key, at, nibble);
+            if (!child.bounded) continue;
+            const bound = key_nibble(start, at);
+            if (nibble < bound) return stack_len;
+            if (nibble > bound) child.bounded = false;
+        }
+        assert(stack_len < stack.len);
+        stack[stack_len] = child;
+        return stack_len + 1;
+    }
+
+    /// Pushes the branch's children not entirely below `start`, last nibble first.
+    fn push_range_branch(
+        stack: *[trie.path_targets.stack_frames_max]RangeFrame,
+        stack_len: u32,
+        frame: RangeFrame,
+        children: *const [16]?Reference,
+        start: *const Hash,
+    ) Error!u32 {
+        if (frame.consumed >= path_nibbles_max) return error.HistoryCorrupt;
+        const lowest: u8 = if (frame.bounded) key_nibble(start, frame.consumed) else 0;
+        var length = stack_len;
+        var nibble: u8 = 16;
+        while (nibble > lowest) {
+            nibble -= 1;
+            const reference = children[nibble] orelse continue;
+            var key = frame.key;
+            set_key_nibble(&key, frame.consumed, nibble);
+            assert(length < stack.len);
+            stack[length] = .{
+                .reference = reference,
+                .consumed = frame.consumed + 1,
+                .bounded = frame.bounded and nibble == lowest,
+                .key = key,
+            };
+            length += 1;
+        }
+        assert(length <= stack_len + 16);
+        return length;
+    }
 };
+
+/// A node of `Store.walk_range`: its parent's reference, its key prefix (nibbles
+/// `[0, consumed)` of `key`, the rest zero), and whether that prefix equals the start key's.
+const RangeFrame = struct { reference: Reference, consumed: u32, bounded: bool, key: Hash };
+
+fn set_key_nibble(key: *Hash, at: u32, value: u8) void {
+    assert(at < path_nibbles_max and value < 16);
+    const byte = &key[at >> 1];
+    if (at & 1 == 0) {
+        byte.* = (byte.* & 0x0f) | (value << 4);
+    } else {
+        byte.* = (byte.* & 0xf0) | value;
+    }
+}
+
+fn key_nibble(key: *const Hash, at: u32) u8 {
+    assert(at < path_nibbles_max);
+    const byte = key[at >> 1];
+    return if (at & 1 == 0) byte >> 4 else byte & 0x0f;
+}
 
 /// A node of `Store.walk_paths` (by its parent's reference) and the targets entering it.
 const PathFrame = struct { reference: Reference, start: u32, end: u32, consumed: u32 };
@@ -1745,7 +1920,7 @@ const ProofVisitor = struct {
 
 /// The children of one decoded trie node (`Store.walk_paths`).
 const NodeView = union(enum) {
-    leaf,
+    leaf: struct { path: trie.Nibbles, value: []const u8 },
     extension: struct { path: trie.Nibbles, child: Reference },
     branch: [16]?Reference,
 };
@@ -1768,7 +1943,7 @@ fn node_view(bytes: []const u8) StepError!NodeView {
     };
     if (decoded.leaf) {
         if (items[1].kind != .string or items[1].payload.len == 0) return error.InvalidNode;
-        return .leaf;
+        return .{ .leaf = .{ .path = decoded.path, .value = items[1].payload } };
     }
     if (decoded.path.slice().len == 0) return error.InvalidNode;
     const child = try child_reference(items[1]) orelse return error.InvalidNode;

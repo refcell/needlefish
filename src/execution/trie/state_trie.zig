@@ -83,6 +83,59 @@ pub fn encode_storage_value(value: u256, out: *[33]u8) []u8 {
     return encoder.written();
 }
 
+/// One storage slot of a `storage_range` walk (`debug_storageRangeAt`): the hashed slot key
+/// and its nonzero value. The raw slot key (geth's preimage) is not kept: the flat storage
+/// table is keyed by (address, slot) and has no hash-to-slot index, so callers report null.
+pub const StorageEntry = struct {
+    key_hash: Hash,
+    value: u256,
+};
+
+/// Result of a `storage_range` walk: `count` entries written to the caller's buffer, and the
+/// hashed key of the next slot after them (null when the walk reached the last slot).
+pub const StorageRange = struct {
+    count: u32,
+    next: ?Hash,
+};
+
+/// Collects at most `min(max, out.len)` slots in walk order, then records the next key and
+/// stops the walk. Shared by the head (`StateTrie.storage_range`) and history walks.
+pub const StorageRangeCollector = struct {
+    out: []StorageEntry,
+    limit: u32,
+    count: u32 = 0,
+    next: ?Hash = null,
+
+    pub fn init(out: []StorageEntry, max: u32) StorageRangeCollector {
+        const limit: u32 = @intCast(@min(max, out.len));
+        assert(limit <= max and limit <= out.len);
+        return .{ .out = out, .limit = limit };
+    }
+
+    /// Takes the next slot in key order; returns false once the walk can stop.
+    pub fn add(self: *StorageRangeCollector, key_hash: *const Hash, value: u256) bool {
+        assert(self.next == null and self.count <= self.limit);
+        assert(value != 0);
+        if (self.count > 0) {
+            const last = &self.out[self.count - 1].key_hash;
+            assert(std.mem.order(u8, last, key_hash) == .lt);
+        }
+        if (self.count == self.limit) {
+            self.next = key_hash.*;
+            return false;
+        }
+        self.out[self.count] = .{ .key_hash = key_hash.*, .value = value };
+        self.count += 1;
+        return true;
+    }
+
+    pub fn result(self: *const StorageRangeCollector) StorageRange {
+        assert(self.count <= self.limit);
+        assert(self.next == null or self.count == self.limit);
+        return .{ .count = self.count, .next = self.next };
+    }
+};
+
 pub const StateTrie = struct {
     const Entry = struct {
         account: Account,
@@ -646,6 +699,34 @@ pub const StateTrie = struct {
     ) !void {
         const entry = self.entries.getPtr(address_hash) orelse return;
         try self.storage.visit_paths_in(entry.storage_root, targets, visitor);
+    }
+
+    /// `debug_storageRangeAt` at the head: the account's slots in hashed-key order from
+    /// `start` (inclusive), at most `min(max, out.len)` of them into `out`, and the next key.
+    /// `UnknownAccount` when the account does not exist; an account without storage gives an
+    /// empty range. Reads the trie directly (no flush, no allocation).
+    pub fn storage_range(
+        self: *const StateTrie,
+        address_hash: Hash,
+        start: Hash,
+        max: u32,
+        out: []StorageEntry,
+    ) Error!StorageRange {
+        const entry = self.entries.getPtr(address_hash) orelse return error.UnknownAccount;
+        var collector = StorageRangeCollector.init(out, max);
+        const Leaves = struct {
+            collector: *StorageRangeCollector,
+
+            pub fn leaf(leaves: @This(), key: *const Hash, value: []const u8) error{}!bool {
+                return leaves.collector.add(key, decode_storage_value(value));
+            }
+        };
+        const leaves: Leaves = .{ .collector = &collector };
+        const root_index = entry.storage_root;
+        self.storage.leaves_from_in(root_index, &start, leaves) catch |err| switch (err) {};
+        const range = collector.result();
+        assert(range.count <= max);
+        return range;
     }
 
     /// Hashed siblings along a slot's path in the account's storage trie.

@@ -1012,6 +1012,21 @@ With gas-sized state tables (`Config.state_gas_basis` = 2^26 gas: ~37k slot and 
 entries instead of 2^18 and 2^16, which reserved ~75 MB of slot table): 3 runs each,
 **5.46 ms/block (853 Mgas/s) vs 6.08 ms/block (765 Mgas/s)**, ~10%.
 
+## 2026-11-06 db storage range for `debug_storageRangeAt` (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/history storage range"`: one account with
+10k slots, a 16-block history window (each block rewrites, deletes, and adds 256 of its
+slots) committed twice over, then a range of up to 256 slots from a random start key (251
+entries on average). Medians of 256 iterations, three runs.
+
+| Path | p50 |
+| --- | ---: |
+| head (`StateTrie.storage_range`, live trie) | 26.4-28.5 µs |
+| history at oldest + 1 (`history.Store.storage_range`) | 83.7-89.5 µs |
+
+History looks up every node in the path index and keccak-checks each hashed node against
+its parent (verified-node cache, as the proof walks).
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

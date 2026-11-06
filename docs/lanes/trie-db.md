@@ -174,6 +174,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `Chain.proofs_at` + `Journal.proofs`, historical `rpc/eth_proof.zig`; 1 account + 64 keys
   344-384 -> 48-56 µs, + 256 keys 1307-1314 -> 96-98 µs; docs/PERF.md "db history:
   multi-key"; see Decisions)
+- [x] Ordered storage-leaf walk for `debug_storageRangeAt` (nf-node): slots of one account in
+  hashed-key order from a start key (inclusive), at most `max`, plus the next key, into a
+  caller buffer with no allocation; at the head (`TrieType.leaves_from_in`,
+  `StateTrie.storage_range`) and at any block of the history window
+  (`history.Store.storage_range`), surfaced as `Database.storage_range_at`.
+  (`trie/storage_range_test.zig`, history/database differentials; range of 256 on a 10k-slot
+  account: head 26-29 µs, history 84-90 µs; docs/PERF.md "db storage range"; see Decisions)
+- [ ] `history.Store.commit_block` returns `HistoryCorrupt` from `bury_frames` (an old path
+  has no version at `number - 1`) on some seeds of the `history_test.zig` harness workload
+  with reorgs: `run_seed`-style loops over seeds 0x5a9e + i hit it at i = 24 and 42 (also
+  0x5a9f and 0x5aa3 in the storage-range test's prng stream). Found by the storage-range
+  test, present on main before it; reproduce with the harness loop (40 writes, reset, 32
+  blocks of commits and 1-in-5 reorgs) and fix.
 - [x] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
   117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
   (version allocation, path index probes, node re-encoding) and cut it, or move it off the
@@ -698,6 +711,26 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   the head from the live trie and only sends older blocks here). The RPC carves the set from
   the API scratch after its proof buffers, sized by the request's key count (~1.1 KiB per
   key: 256 keys ~ 290 KiB of the node's 16 MiB scratch).
+- Storage ranges (`debug_storageRangeAt`): an in-order depth-first walk with an explicit
+  stack (`path_targets.stack_frames_max` frames; each frame carries its 32-byte key prefix and
+  a `bounded` flag that is set while the prefix equals the start key's prefix). Children are
+  pushed last nibble first; a child whose prefix sorts below the start's is skipped without
+  being entered, so the walk touches only the start key's path plus the returned leaves and
+  their ancestors. The walk stops at the first leaf after `min(max, out.len)` entries and
+  returns its key as `next` (geth's `nextKey`; `max = 0` returns the first key at or after
+  the start). One `StorageRangeCollector` serves the head and history walks, so both have the
+  same semantics. History checks each node against its parent's reference (as the proof walks
+  do) and maps a malformed node, a leaf not at depth 64, or a branch at depth 64 to
+  `HistoryCorrupt`. Unknown account = `UnknownAccount` (geth errors when the account does not
+  exist); an account without storage = empty range. No preimages: `State.storage_table` is
+  keyed by (address, slot), with no reverse index from hashed slot to slot, and scanning it
+  is O(state), so the node reports `preimage: null` (geth does the same when its preimage
+  store lacks the key). `Database.storage_range_at` reads the head from the live trie, which
+  is cheaper than history and works without history; it reads older blocks from history, and
+  returns `HistoryUnavailable` without history and `BlockOutOfWindow` outside the window. The
+  results are copied out (key hash and `u256` value), so they stay valid after the next head
+  move. `NodeView.leaf` now carries the leaf's path and value, so the existing walks are
+  unchanged.
 - History is not journaled: it is derived data. After a restart the durable database
   rebuilds the window from the retained blocks' changesets (see "History rebuild on open").
   Journaling every node version would multiply the journal volume per block for data the
@@ -1339,3 +1372,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   the 2.7x flat-tree checkpoint: bench overlap with the round's compaction (ReleaseFast
   compiles out its idle assert); after a drain checkpoint p50 13.8 -> 18.2 ms (bytes-bound),
   drain p50 36 ms reported separately.
+
+- 2026-11-06: ordered storage-leaf walk for `debug_storageRangeAt`: `TrieType.leaves_from_in`
+  and `StateTrie.storage_range` (head), `history.Store.storage_range` (any block of the
+  window), `Database.storage_range_at` (head live, older blocks from history). Tests:
+  differential against a sorted model (deletions, start keys at, between, before, and after
+  leaves, max 0/1/exact/larger, short buffers, pagination that covers every slot exactly once),
+  history vs the unwound live state at every block of the window across reorgs, database
+  head/older/out-of-window/no-history cases, and coverage fuzz on both walkers. Bench (range of
+  256 on a 10k-slot account): head 26-29 µs, history 84-90 µs. The test found a
+  `commit_block` `HistoryCorrupt` on some harness seeds that was already on main (backlog).

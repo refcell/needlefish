@@ -29,7 +29,8 @@ const State = state_module.State;
 const Overlay = overlay_module.Overlay;
 const Changeset = changeset_module.Changeset;
 const Shape = bench.Shape;
-const StateTrie = @import("../trie/root.zig").StateTrie;
+const trie = @import("../trie/root.zig");
+const StateTrie = trie.StateTrie;
 
 pub const window_blocks_bench = 64;
 /// L2 blocks per second at Base's native 200 ms block time.
@@ -209,6 +210,7 @@ pub fn run(io: std.Io, filter: ?[]const u8) void {
         print(case.name, &result);
     }
     run_proofs(io, filter);
+    run_ranges(io, filter);
 }
 
 /// `eth_getProof(contract, [k1..kn], older block)` from history: 1 account + n keys of one
@@ -394,6 +396,160 @@ fn print(name: []const u8, result: *const Result) void {
     );
 }
 
+/// `debug_storageRangeAt(contract, random start, 256)` on one account with `slots` slots: the
+/// head from the live trie (`StateTrie.storage_range`) and an older block of the window from
+/// history (`Store.storage_range`). Each block rewrites, deletes, and adds `range_block_slots`
+/// slots of the account.
+pub const range_case_name = "db/history storage range 256 of 10k slots";
+pub const range_slots_bench = 10_000;
+pub const range_max = 256;
+const range_window_blocks = 16;
+const range_block_slots = 256;
+const range_fill_chunk = 2048;
+const range_iterations = 256;
+
+pub const RangeResult = struct {
+    slots: u32,
+    /// Entries returned (min(range_max, slots after the start)), averaged.
+    entries_mean: u32,
+    head_ns_p50: u64,
+    history_ns_p50: u64,
+};
+
+const RangeFixture = struct {
+    state: State,
+    overlay: Overlay,
+    changeset: Changeset,
+    store: history.Store,
+
+    const address = bench.address_of(7);
+
+    fn init(self: *RangeFixture, allocator: std.mem.Allocator, slots: u32) !void {
+        assert(slots > 0);
+        const slots_max = slots + range_window_blocks * range_block_slots;
+        self.state = try State.init(allocator, .{
+            .accounts_max = 4,
+            .storage_slots_max = slots_max,
+            .codes_max = 4,
+            .code_bytes_max = 1024,
+            .account_nodes_max = 64,
+            .storage_nodes_max = 3 * slots_max,
+        });
+        errdefer self.state.deinit(allocator);
+        const overlay_config: overlay_module.Config = .{
+            .accounts_max = 4,
+            .slots_max = range_fill_chunk,
+            .codes_max = 4,
+        };
+        self.overlay = try Overlay.init(allocator, &self.state, overlay_config);
+        errdefer self.overlay.deinit(allocator);
+        self.changeset = try Changeset.init(allocator, .{
+            .accounts_max = 4,
+            .storage_max = range_fill_chunk,
+            .codes_max = 4,
+            .code_bytes_max = 1024,
+        });
+        errdefer self.changeset.deinit(allocator);
+        try self.overlay.set_account(address, .{ .nonce = 1 });
+        var slot: u32 = 0;
+        while (slot < slots) : (slot += 1) {
+            try self.overlay.set_storage(address, slot, @as(u256, slot) + 1);
+            if ((slot + 1) % range_fill_chunk == 0) _ = try self.overlay.commit(&self.changeset);
+        }
+        _ = try self.overlay.commit(&self.changeset);
+        try self.state.state_trie.track_changes(allocator);
+        const nodes = self.state.state_trie.storage.node_count() + 64;
+        const per_block: u32 = 8 * range_block_slots;
+        const total = nodes + range_window_blocks * per_block;
+        self.store = try history.Store.init(allocator, .{
+            .window_blocks = range_window_blocks,
+            .paths_max = total,
+            .small_versions_max = total,
+            .large_versions_max = total / 2,
+            .prune_per_commit = per_block,
+        });
+        errdefer self.store.deinit(allocator);
+        try self.store.reset(&self.state.state_trie, 0);
+    }
+
+    fn deinit(self: *RangeFixture, allocator: std.mem.Allocator) void {
+        self.store.deinit(allocator);
+        self.changeset.deinit(allocator);
+        self.overlay.deinit(allocator);
+        self.state.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// One block of `range_block_slots` writes: new values, deletions, and new slots.
+    fn commit(self: *RangeFixture, prng: *Prng, slots: u32, number: u64) !void {
+        for (0..range_block_slots) |_| {
+            const slot = prng.below(slots + slots / 8);
+            const value: u256 = if (prng.chance(1, 4)) 0 else prng.int(u64) | 1;
+            try self.overlay.set_storage(address, slot, value);
+        }
+        _ = try self.overlay.commit(&self.changeset);
+        try self.store.commit_block(&self.state.state_trie, number);
+    }
+};
+
+pub fn measure_ranges(io: std.Io, allocator: std.mem.Allocator, slots: u32) !RangeResult {
+    const fixture = try allocator.create(RangeFixture);
+    defer allocator.destroy(fixture);
+    try fixture.init(allocator, slots);
+    defer fixture.deinit(allocator);
+    var prng = Prng.init(11);
+    var number: u64 = 0;
+    while (number < 2 * range_window_blocks) {
+        number += 1;
+        try fixture.commit(&prng, slots, number);
+    }
+    const out = try allocator.alloc(trie.StorageEntry, range_max);
+    defer allocator.free(out);
+    const samples = try allocator.alloc(u64, 2 * range_iterations);
+    defer allocator.free(samples);
+    const address_hash = trie.node.keccak256(&RangeFixture.address);
+    const at = fixture.store.window().?.oldest + 1;
+    const live = &fixture.state.state_trie;
+    var entries: u64 = 0;
+    for (0..range_iterations) |index| {
+        var start: [32]u8 = undefined;
+        prng.fill(&start);
+        const head_start = bench.now_ns(io);
+        const head = try live.storage_range(address_hash, start, range_max, out);
+        const head_end = bench.now_ns(io);
+        const older = try fixture.store.storage_range(at, &address_hash, &start, range_max, out);
+        const history_end = bench.now_ns(io);
+        assert(head.count <= range_max and older.count <= range_max);
+        entries += head.count;
+        samples[index] = head_end - head_start;
+        samples[range_iterations + index] = history_end - head_end;
+    }
+    return .{
+        .slots = slots,
+        .entries_mean = @intCast(entries / range_iterations),
+        .head_ns_p50 = median(samples[0..range_iterations]),
+        .history_ns_p50 = median(samples[range_iterations..]),
+    };
+}
+
+fn run_ranges(io: std.Io, filter: ?[]const u8) void {
+    if (!bench.matches(range_case_name, filter)) return;
+    const allocator = std.heap.page_allocator;
+    const result = measure_ranges(io, allocator, range_slots_bench) catch |err| {
+        std.debug.print("{s}: failed: {s}\n", .{ range_case_name, @errorName(err) });
+        return;
+    };
+    std.debug.print(
+        "{s:<44} {d} entries mean: head {d:.1} us, history at oldest+1 {d:.1} us\n",
+        .{
+            range_case_name,
+            result.entries_mean,
+            @as(f64, @floatFromInt(result.head_ns_p50)) / 1e3,
+            @as(f64, @floatFromInt(result.history_ns_p50)) / 1e3,
+        },
+    );
+}
+
 test "history bench: steady state and budget (small shape)" {
     const window = 8;
     const result = try measure(std.testing.io, std.testing.allocator, bench.shape_test, window);
@@ -411,4 +567,11 @@ test "history bench: multi-key proofs (small shape)" {
     const result = try measure_proofs(io, allocator, bench.shape_test, 4, 32);
     try std.testing.expectEqual(@as(u32, 32), result.keys);
     for (proof_cases) |case| try std.testing.expect(bench.matches(case.name, "db/history"));
+}
+
+test "history bench: storage ranges (small account)" {
+    const result = try measure_ranges(std.testing.io, std.testing.allocator, 600);
+    try std.testing.expectEqual(@as(u32, 600), result.slots);
+    try std.testing.expect(result.entries_mean > 0);
+    try std.testing.expect(bench.matches(range_case_name, "db/history"));
 }

@@ -1506,6 +1506,31 @@ pub fn DatabaseType(comptime Storage: type) type {
             return store.get_proofs(number, address, slots, account_proof, set);
         }
 
+        /// `debug_storageRangeAt`: the slots of `address_hash`'s storage trie at block
+        /// `number` in hashed-key order from `start` (inclusive), at most `min(max, out.len)`
+        /// into `out`, plus the next key (null after the last slot). The head is read from
+        /// the live trie (no history needed); older blocks from the history window
+        /// (`BlockOutOfWindow` outside it, `HistoryUnavailable` without history).
+        /// `UnknownAccount` when the account is absent at `number`; an account without
+        /// storage gives an empty range. No allocation.
+        pub fn storage_range_at(
+            self: *Self,
+            number: u64,
+            address_hash: Hash,
+            start: Hash,
+            max: u32,
+            out: []history_module.StorageEntry,
+        ) ProofError!history_module.StorageRange {
+            if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            assert(!self.state.trie_stale);
+            if (number == self.head_info.number) {
+                return self.state.state_trie.storage_range(address_hash, start, max, out);
+            }
+            const store = self.history_tracking() orelse return error.HistoryUnavailable;
+            assert(store.window().?.head == self.head_info.number);
+            return store.storage_range(number, &address_hash, &start, max, out);
+        }
+
         fn proof_live(
             self: *Self,
             address: history_module.Address,
