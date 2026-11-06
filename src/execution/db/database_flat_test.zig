@@ -424,3 +424,59 @@ test "database flat trees: a checkpoint written without flat trees is refused wi
     harness.config = config_off;
     try harness.reopen();
 }
+
+/// Fills `tree` into its replay reserve with a flush pending, as an open whose replay used
+/// the reserve leaves it: tombstones of fresh random keys (absent from `State`, so the trees
+/// still match it).
+fn fill_reserve(tree: *FlatTrees.StorageTree, prng: *Prng) !void {
+    assert(!tree.compaction.active);
+    const limit = tree.config.memtable_entries_max - tree.config.replay_entries_max;
+    var key: [flat_trees_module.storage_key_size]u8 = undefined;
+    if (tree.immutable_memtable().count == 0) {
+        prng.fill(&key);
+        try tree.put_replay(&key, null);
+        try testing.expect(tree.swap());
+    }
+    var puts: u32 = 0;
+    while (tree.mutable_memtable().count <= limit) : (puts += 1) {
+        assert(puts <= tree.config.memtable_entries_max);
+        prng.fill(&key);
+        try tree.put_replay(&key, null);
+    }
+    assert(tree.immutable_memtable().count > 0);
+}
+
+test "database flat trees: a checkpoint waits until a replay-filled reserve is restored" {
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = config_flat.engine.size_bytes(),
+        .seed = 11,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 11, config_flat);
+    defer harness.destroy();
+    try harness.format(0xf1a7_0011);
+    try harness.run(150);
+    try harness.checkpoint();
+    try harness.reopen();
+    try harness.tick_until(Harness.idle);
+    const trees = &harness.db.flat.?;
+    try fill_reserve(&trees.storage, &harness.prng);
+    try testing.expect(!trees.checkpoint_ready());
+    const checkpoints = harness.db.checkpoints_completed;
+    const flushes = trees.storage.stats.flushes;
+    try harness.checkpoint();
+    try testing.expectEqual(checkpoints + 1, harness.db.checkpoints_completed);
+    try testing.expect(trees.storage.stats.flushes > flushes);
+    try testing.expect(trees.checkpoint_ready());
+    try harness.check_flat();
+    try harness.reopen();
+    try harness.check_recovered(harness.submitted);
+    for (0..2) |_| {
+        try harness.run(200);
+        const acknowledged = harness.db.durable_sequence;
+        sim.crash();
+        try harness.reopen();
+        try harness.check_recovered(acknowledged);
+    }
+}

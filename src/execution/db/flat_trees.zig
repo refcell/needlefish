@@ -148,6 +148,9 @@ pub fn FlatTreesType(comptime Storage: type) type {
         /// The callback's context, set by the owner before a scan.
         owner: ?*anyopaque = null,
         scan_callback: ?Callback = null,
+        /// Fires after either tree installs a compaction job while the owner waits for
+        /// `checkpoint_ready` (`checkpoint_prepare`).
+        install_callback: ?Callback = null,
         scan_outcome: ScanOutcome = .loaded,
         stats: Stats = .{},
 
@@ -364,6 +367,35 @@ pub fn FlatTreesType(comptime Storage: type) type {
             if (length == 0) return error.InvalidCheckpoint; // A tree writes its header.
             if (bytes.len - offset - 4 < length) return error.InvalidCheckpoint;
             return bytes[offset + 4 ..][0..length];
+        }
+
+        /// Both trees leave the next replay a full reserve if checkpointed now (`lsm.zig`).
+        pub fn checkpoint_ready(self: *Self) bool {
+            return self.accounts.checkpoint_ready() and self.storage.checkpoint_ready();
+        }
+
+        /// Not `checkpoint_ready` (an open's replay filled into the reserve while a flush was
+        /// pending): lifts compaction pacing until the next commit regrants it, so the pending
+        /// flush installs without commits; `callback` fires after each install.
+        pub fn checkpoint_prepare(self: *Self, callback: Callback) void {
+            assert(self.owner != null);
+            assert(!self.checkpoint_ready());
+            self.install_callback = callback;
+            self.accounts.install_callback = on_accounts_installed;
+            self.storage.install_callback = on_storage_installed;
+            self.compact(std.math.maxInt(u64));
+        }
+
+        fn on_accounts_installed(tree: *AccountTree) void {
+            const self: *Self = @alignCast(@fieldParentPtr("accounts", tree));
+            assert(!tree.compaction.active);
+            if (self.install_callback) |callback| callback(self);
+        }
+
+        fn on_storage_installed(tree: *StorageTree) void {
+            const self: *Self = @alignCast(@fieldParentPtr("storage", tree));
+            assert(!tree.compaction.active);
+            if (self.install_callback) |callback| callback(self);
         }
 
         /// Scans the account tree, then the storage tree; the callback fires with

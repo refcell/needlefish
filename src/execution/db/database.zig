@@ -43,6 +43,9 @@
 //! Their compaction is granted the same per-commit block budget as the code flush; the
 //! checkpoint (version 3) carries both trees after the code table list; open decodes and
 //! scans them in the open pause and replay re-applies the puts through the replay reserve.
+//! A checkpoint waits until both trees are `checkpoint_ready` (a replay that filled into the
+//! reserve while a flush was pending: the flush runs unpaced and installs first), so the next
+//! replay always has a full reserve.
 //!
 //! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
 //! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
@@ -1537,6 +1540,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (self.engine.checkpoint_phase != .idle) return;
             if (!self.code_flush_ready()) return;
             if (self.queue_count > 0 or self.engine.commit_callback != null) return;
+            if (!self.flat_checkpoint_ready()) return;
             self.checkpoint_wanted = false;
             self.code_flushed = false;
             self.staging_len = self.checkpoint_write() catch |err| {
@@ -1549,6 +1553,24 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(blocks > 0);
             // Ready, no commit in flight, and no checkpoint running: checked above.
             self.engine.checkpoint_paced(producer, blocks, on_checkpoint) catch unreachable;
+        }
+
+        /// True when the flat trees (if any) leave the next replay a full reserve; otherwise
+        /// drives their pending flush unpaced and waits (`on_flat_install` retries). The
+        /// install may run inside `checkpoint_prepare` and start the checkpoint there.
+        fn flat_checkpoint_ready(self: *Self) bool {
+            const trees = if (self.flat) |*trees| trees else return true;
+            if (trees.checkpoint_ready()) return true;
+            trees.owner = self;
+            trees.checkpoint_prepare(on_flat_install);
+            return false;
+        }
+
+        fn on_flat_install(trees: *FlatTrees) void {
+            const self: *Self = @ptrCast(@alignCast(trees.owner.?));
+            assert(self.phase == .ready);
+            if (!self.checkpoint_wanted or !trees.checkpoint_ready()) return;
+            self.checkpoint_maybe_start();
         }
 
         /// True once the wanted checkpoint's codes are in tables (or need none); otherwise

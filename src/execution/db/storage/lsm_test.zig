@@ -559,6 +559,70 @@ test "lsm: differential vs a hash map model, 64-byte keys (account ++ slot)" {
     try testing.expect(merges > 0);
 }
 
+/// Puts keys `first..first + count` (normal puts or journal replay puts).
+const PutMode = enum { live, replay };
+
+fn put_keys(
+    comptime Harness: type,
+    tree: *Harness.Tree,
+    first: u32,
+    count: u32,
+    mode: PutMode,
+) !void {
+    assert(count > 0);
+    for (first..first + count) |index| {
+        const key = Harness.key_of(@intCast(index));
+        const value = Harness.value_of(index);
+        switch (mode) {
+            .live => try tree.put(&key, &value),
+            .replay => try tree.put_replay(&key, &value),
+        }
+    }
+}
+
+// The known replay-reserve gap: an open whose replay filled the mutable memtable into the
+// reserve while a flush was pending, then a checkpoint before the first swap. The next
+// replay must still fit `replay_entries_max` distinct new keys.
+test "lsm: a checkpoint after a replay into the reserve leaves a full reserve" {
+    const Harness = HarnessType(32, 8);
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = engine_config.size_bytes(),
+        .seed = 7,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 7, 400, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0x9a70_0001);
+    const tree = &harness.tree;
+    const reserve = tree_config.replay_entries_max;
+    // A live checkpoint: a flush pending, the mutable memtable at the normal limit.
+    try put_keys(Harness, tree, 0, tree_config.flush_entries_min, .live);
+    try testing.expect(tree.swap());
+    try put_keys(Harness, tree, 1000, tree.capacity_free(), .live);
+    try testing.expectEqual(@as(u32, 0), tree.capacity_free());
+    var length = tree.checkpoint_encode(harness.snapshot);
+    // Open: replay fills the reserve (the flush cannot run before the engine is ready).
+    try tree.open_decode(harness.snapshot[0..length]);
+    try put_keys(Harness, tree, 2000, reserve, .replay);
+    try testing.expectEqual(tree_config.memtable_entries_max, tree.mutable_memtable().count);
+    try testing.expect(tree.immutable_memtable().count > 0);
+    // The next checkpoint waits until the pending flush installs (the reserve is restored).
+    try testing.expect(!tree.checkpoint_ready());
+    const flushes = tree.stats.flushes;
+    tree.compact(std.math.maxInt(u64));
+    var ticks: u32 = 0;
+    while (!tree.checkpoint_ready() or tree.compaction.active) : (ticks += 1) {
+        if (ticks > 100_000) return error.Timeout;
+        sim.tick();
+    }
+    try testing.expectEqual(flushes + 1, tree.stats.flushes);
+    // Then an open whose replay writes a full reserve of new keys.
+    length = tree.checkpoint_encode(harness.snapshot);
+    try tree.open_decode(harness.snapshot[0..length]);
+    try put_keys(Harness, tree, 3000, reserve, .replay);
+}
+
 fn fuzz_workload(_: void, smith: *std.testing.Smith) anyerror!void {
     const Harness = HarnessType(32, 8);
     var sim = try SimStorage.init(testing.allocator, .{

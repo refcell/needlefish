@@ -760,6 +760,8 @@ pub fn CompactionType(comptime Tree: type) type {
             self.output_count = 0;
             self.acquired_count = 0;
             self.memtable_stream = false;
+            assert(!self.active and !self.io_pending);
+            if (owner.install_callback) |callback| callback(owner);
         }
     };
 }

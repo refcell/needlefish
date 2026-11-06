@@ -397,9 +397,29 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   table list; open needs the version matching its config (v1/v2 refused with flat trees, v3
   without): no backfill of existing state, so turning the flag on needs a fresh database.
   `Database.idle` waits for tree IO and lookups (an owner freed mid-IO would be called back).
-  Known gap: the replay bound counts distinct keys from the checkpoint on; a checkpoint taken
-  right after an open whose replay filled into the reserve (before the first swap) leaves
-  less than a full reserve for the next replay (put_replay still swaps when it can).
+  Replay-reserve gap (closed): an open whose replay filled the mutable memtable into the
+  reserve while a flush was pending, then a checkpoint before that flush installs, left the
+  next replay less than a full reserve (live had flushed and swapped since; replay cannot),
+  so its replay could hit `error.Busy` (a failed open). Rule: a tree is `checkpoint_ready`
+  when its immutable memtable is empty (replay can swap into a whole memtable) or the
+  mutable one is within the normal-put limit; `checkpoint_encode` asserts it. `Database`
+  starts a checkpoint only when both trees are ready; otherwise `FlatTrees.checkpoint_prepare`
+  lifts compaction pacing (until the next commit regrants it) so the pending flush runs
+  without commits, and an install callback retries the checkpoint. Chosen over forcing a
+  swap (impossible while a flush is pending) or a doubled reserve (chains across opens;
+  memory). A faulted tree (no more compaction) counts as ready so checkpoints never stall
+  forever. Test: `lsm: a checkpoint after a replay into the reserve leaves a full reserve`
+  (failed before with `error.Busy` in the second replay) and a database test that drives
+  the gate (without it `checkpoint_encode`'s assert fires).
+- Flat tree checkpoint cost (2026-11-06 profile): the reported 15.1 -> 40.2 ms was mostly
+  measurement. The bench's `assert(db.idle())` before a checkpoint is compiled out in
+  ReleaseFast, so the timed checkpoint shared ticks with the round's unpaced flat-tree
+  flushes and merges (36 ms p50 drain) and serialized immutable memtables not yet flushed
+  (checkpoints of 24-30 MB). Measured after the drain: 13.8 -> 18.2 ms p50 (serialize
+  2.0 -> 2.2-3.2 ms, stream 11.7 -> 14.8-16.6 ms), proportional to bytes (17.1 vs
+  18.8-24.2 MB: memtable entries up to ~70k per tree). No code change in the checkpoint
+  itself; the bench now drains first and reports the drain on its own. The memtable bytes go
+  away when checkpoints stop carrying memtables (phase 3, scan-free open).
 - Code store read path (why codes are still in RAM after phase 1d): `State.code_by_hash` is synchronous and
   its callers outside the lane (evm `State.code`, which caches the slice in the account for
   the whole block; node `StateDb`, witness, rpc) hold the returned slice for a block or
@@ -1313,3 +1333,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `db/commit sim (zero latency, flat trees)`: execute_and_commit p50 7.20 -> 8.04 ms, until
   durable 7.25 -> 8.46 ms (p99 9.7 -> 16.3 ms, unpaced merges), checkpoint 15 -> 40 ms.
   `State` reads through the trees remain.
+- 2026-11-06: flat trees: closed the replay-reserve gap (a checkpoint waits until both trees
+  are `checkpoint_ready`, driving a pending flush unpaced; asserted in `checkpoint_encode`).
+  Tests: lsm reserve test (failed with `error.Busy` before), database gate test. Profiled
+  the 2.7x flat-tree checkpoint: bench overlap with the round's compaction (ReleaseFast
+  compiles out its idle assert); after a drain checkpoint p50 13.8 -> 18.2 ms (bytes-bound),
+  drain p50 36 ms reported separately.

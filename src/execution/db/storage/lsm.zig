@@ -32,7 +32,10 @@
 //! + `open_scan`) releases the orphans and the job reruns. Blocks of compacted tables are
 //! released through the free set, which reuses them only once no retained checkpoint can
 //! name them. Journal replay after open writes through `put_replay`, which may use the
-//! `replay_entries_max` entries that normal puts keep free.
+//! `replay_entries_max` entries that normal puts keep free. A replay can leave the mutable
+//! memtable past the normal limit while a flush is pending; a checkpoint then would leave the
+//! next replay less than a full reserve, so the owner checkpoints only when
+//! `checkpoint_ready` (asserted by `checkpoint_encode`), driving compaction until it is.
 //!
 //! Static memory: two memtables, per table slot its `Info`, block addresses, and filter (none
 //! for the last level), the job's buffers (`lsm_compaction.zig`), and one table reader.
@@ -168,6 +171,8 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         scan_outcome: ScanOutcome = .loaded,
         /// A table block failed to verify outside open: the tree stops compacting.
         fault: bool = false,
+        /// Called after a compaction job installs (the owner may wait for `checkpoint_ready`).
+        install_callback: ?Callback = null,
         stats: Stats = .{},
 
         pub fn layout_of(config: Config) Layout {
@@ -603,6 +608,19 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
 
         // Checkpoint: header, level counts, tables, memtable entries, orphans.
 
+        /// True when a checkpoint now leaves the next replay `replay_entries_max` free entries:
+        /// the immutable memtable is empty (replay can swap into a whole memtable), or the
+        /// mutable one is within the normal-put limit. False only after a replay that filled
+        /// into the reserve while a flush was pending, until that flush installs. A faulted
+        /// tree no longer compacts, so it never becomes ready: checkpoints go ahead as is.
+        pub fn checkpoint_ready(self: *Tree) bool {
+            const limit = self.config.memtable_entries_max - self.config.replay_entries_max;
+            assert(self.mutable_memtable().count <= self.config.memtable_entries_max);
+            if (self.fault) return true;
+            if (self.immutable_memtable().count == 0) return true;
+            return self.mutable_memtable().count <= limit;
+        }
+
         pub fn checkpoint_size_max(self: *const Tree) u32 {
             const slots = self.layout.slot_base[self.config.levels_count];
             return checkpoint_header_size + slots * info_size +
@@ -624,6 +642,7 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         /// right before `checkpoint`, with no tick between). Returns their length.
         pub fn checkpoint_encode(self: *Tree, out: []u8) u32 {
             assert(self.scan_callback == null);
+            assert(self.checkpoint_ready());
             const size = self.checkpoint_size();
             assert(out.len >= size);
             const orphans = self.compaction.orphans();
