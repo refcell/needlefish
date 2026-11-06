@@ -506,6 +506,14 @@ pub const Executor = struct {
         access_list: []const evm.transaction.AccessListItem = &.{},
         /// Receives the warm accounts and slots of an executed call (eth_createAccessList).
         collect: ?*access_list_module.Collector = null,
+        /// Sees the state right after the call executes, before it is discarded
+        /// (debug_traceCall prestateTracer).
+        inspect: ?Inspect = null,
+    };
+
+    pub const Inspect = struct {
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque, state: *evm.State) void,
     };
 
     pub const Simulated = union(enum) {
@@ -640,6 +648,7 @@ pub const Executor = struct {
             };
             collector.collect(executor.state, &context);
         }
+        if (call.inspect) |inspect| inspect.run(inspect.context, executor.state);
         const output = try executor.alloc(u8, executed.output.len);
         @memcpy(output, executed.output);
         return .{ .executed = .{

@@ -57,7 +57,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   read-only `eip8130_simulate` run; estimate searches only the call pool).
 - [x] rpc: base_meterBlockByHash/Number, base_meterBundle (per-transaction gas and execution
   time; base/base metering crate).
-- [x] rpc: debug_traceTransaction/traceBlockByNumber/traceBlockByHash /traceCall with callTracer (open: prestateTracer);
+- [x] rpc: debug_traceTransaction/traceBlockByNumber/traceBlockByHash /traceCall with callTracer and prestateTracer (diffMode);
   needs an evm call-frame hook (asked nf-evm 2026-11-05).
 - [ ] rpc: base_sendRawTransactionValidity (validity predicates; needs pool storage and
   builder enforcement, cross-lane with nf-builder).
@@ -97,6 +97,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: prestateTracer (+diffMode) for all four debug_trace* methods, no evm hook: after the traced tx, accounts/slots stamped with its tx id (warm or changed) are reported; pre-state from a snapshot of the cache taken before the tx, else the session database; `collect` copies into scratch; block traces stage per-tx JSON in scratch and splice it (`json.Writer.raw`); traceCall uses a new `Executor.Call.inspect` hook. Gap: accounts/slots touched only in reverted frames lose their warm stamp and are missed (geth includes them).
 - 2026-11-05: debug_traceCall: eth_call's parser, view and `eth.simulate` with the recorder on the executor (detached after); recorder space is the scratch between the parsed call data and the proof tail; top gas = request gas or the default call gas.
 - 2026-11-05: debug_traceTransaction / debug_traceBlockByNumber / debug_traceBlockByHash with geth's callTracer (onlyTopCall, withLog) on nf-evm's call-frame hook (d61b345f): re-execution over `HistoryDatabase` at the parent in a session; the RPC drives begin_block/apply per transaction so the tracer attaches only to traced ones; frames recorded flat (depth, copies into a scratch arena, `full` -> error), written nested with an explicit stack. geth semantics: top frame gas = tx gas limit / gas used, failed frames drop their (and descendants') logs, log `position` = prior child calls, revertReason from Error(string). EIP-8130 later phase calls nest under the first. Struct logger and prestateTracer: "only callTracer" (invalid params).
 - 2026-11-05: base_meterBundle({txs}, at most 256, no deposits): runs on the head state in the next block (timestamp +1 as eth_call, base fee capped at 5 Mwei as base/base) in an executor session; each sender starts at its first transaction's nonce (at most 10_000 ahead, else InvalidTransaction), per base/base. Fees are gasUsed * maxFeePerGas and all count as coinbase diff (base/base). Not ported: opcode gas metering, the BaseTime update before the first transaction, base/base's L1-fee validation.

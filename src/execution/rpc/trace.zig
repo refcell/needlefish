@@ -23,6 +23,7 @@ const evm = @import("../evm/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
 const eth_proof = @import("eth_proof.zig");
+const prestate = @import("prestate.zig");
 
 const Api = eth.Api;
 const Call = rpc.Call;
@@ -347,7 +348,12 @@ pub fn write_tree(
 
 // ---- Handlers ---------------------------------------------------------------------
 
-pub const Options = struct { only_top_call: bool = false, with_logs: bool = false };
+pub const Options = struct {
+    tracer: enum { call, prestate } = .call,
+    only_top_call: bool = false,
+    with_logs: bool = false,
+    diff_mode: bool = false,
+};
 
 /// Parses `{"tracer":"callTracer","tracerConfig":{...}}` (absent: an error, since the
 /// default struct logger is not supported).
@@ -358,22 +364,26 @@ pub fn parse_options(raw: ?[]const u8) error{ InvalidParams, Unsupported }!Optio
     if ((scanner.next() catch return error.InvalidParams).tag != .object_begin) {
         return error.InvalidParams;
     }
-    var call_tracer = false;
+    var named = false;
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
         const value = scanner.next() catch return error.InvalidParams;
         if (std.mem.eql(u8, name.bytes, "tracer")) {
             if (value.tag != .string) return error.InvalidParams;
-            call_tracer = std.mem.eql(u8, value.bytes, "callTracer");
-            if (!call_tracer) return error.Unsupported;
+            named = true;
+            if (std.mem.eql(u8, value.bytes, "prestateTracer")) {
+                options.tracer = .prestate;
+            } else if (!std.mem.eql(u8, value.bytes, "callTracer")) {
+                return error.Unsupported;
+            }
         } else if (std.mem.eql(u8, name.bytes, "tracerConfig") and value.tag == .object_begin) {
             try parse_config(&scanner, &options);
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
     }
-    if (!call_tracer) return error.Unsupported;
+    if (!named) return error.Unsupported;
     return options;
 }
 
@@ -387,6 +397,8 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
             options.only_top_call = flag;
         } else if (std.mem.eql(u8, name.bytes, "withLog")) {
             options.with_logs = flag;
+        } else if (std.mem.eql(u8, name.bytes, "diffMode")) {
+            options.diff_mode = flag;
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
@@ -396,7 +408,9 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
 fn options_of(call: *Call, raw: ?[]const u8) HandlerError!Options {
     return parse_options(raw) catch |err| switch (err) {
         error.InvalidParams => return error.InvalidParams,
-        error.Unsupported => return call.fail(rpc.code.invalid_params, "only callTracer"),
+        error.Unsupported => {
+            return call.fail(rpc.code.invalid_params, "only callTracer and prestateTracer");
+        },
     };
 }
 
@@ -442,6 +456,9 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
         .historical => eth.proof_tail_offset(api).?, // Checked by `parse_call_request`.
     };
     if (data_end >= end) return call.fail(rpc.code.internal_error, "scratch too small");
+    if (options.tracer == .prestate) {
+        return trace_call_prestate(api, call, request, api.scratch[data_end..end], options);
+    }
     var recorder = recorder_in(api.scratch[data_end..end]) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     recorder.with_logs = options.with_logs;
@@ -488,12 +505,6 @@ fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) Handl
     const transactions = chain.transactions_buffer[0..run_count];
     const tail = eth.proof_tail_offset(api) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
-    const per_transaction = run_count * (@sizeOf(u32) + @sizeOf(u64)) + 16;
-    if (per_transaction >= tail) return call.fail(rpc.code.internal_error, "scratch too small");
-    const ranges = carve_ranges(api.scratch[0..per_transaction], run_count + 1);
-    var recorder = recorder_in(api.scratch[per_transaction..tail]) orelse
-        return call.fail(rpc.code.internal_error, "scratch too small");
-    recorder.with_logs = options.with_logs;
     chain.ensure_head_state() catch {
         return call.fail(rpc.code.internal_error, "head state unavailable");
     };
@@ -507,6 +518,15 @@ fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) Handl
     };
     const env = node.chain.env_of(&header);
     const database = history.database();
+    if (options.tracer == .prestate) {
+        return trace_prestate(api, call, &env, transactions, only, options, &history, tail);
+    }
+    const per_transaction = run_count * (@sizeOf(u32) + @sizeOf(u64)) + 16;
+    if (per_transaction >= tail) return call.fail(rpc.code.internal_error, "scratch too small");
+    const ranges = carve_ranges(api.scratch[0..per_transaction], run_count + 1);
+    var recorder = recorder_in(api.scratch[per_transaction..tail]) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    recorder.with_logs = options.with_logs;
     execute(chain.executor, &env, transactions, only, &recorder, ranges, database) catch |err| {
         if (history.failure) |failure| return eth_proof.fail_history(call, failure);
         return call.fail(rpc.code.server_error, @errorName(err));
@@ -616,8 +636,12 @@ test "trace: options select callTracer and its config" {
     );
     try testing.expect(parsed.only_top_call and !parsed.with_logs);
     try testing.expectError(error.Unsupported, parse_options(null));
-    try testing.expectError(error.Unsupported, parse_options("{\"tracer\":\"prestateTracer\"}"));
+    try testing.expectError(error.Unsupported, parse_options("{\"tracer\":\"4byteTracer\"}"));
     try testing.expectError(error.Unsupported, parse_options("{}"));
+    const pre = try parse_options(
+        "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}",
+    );
+    try testing.expect(pre.tracer == .prestate and pre.diff_mode);
     try testing.expectError(error.InvalidParams, parse_options("[1]"));
 }
 
@@ -682,4 +706,101 @@ fn fuzz_trace(_: void, smith: *testing.Smith) anyerror!void {
 
 test "trace: fuzz options, revert reasons and trees" {
     try testing.fuzz({}, fuzz_trace, .{});
+}
+
+fn trace_call_prestate(
+    api: *Api,
+    call: *Call,
+    request_in: eth.CallRequest,
+    space: []u8,
+    options: Options,
+) HandlerError!void {
+    var collected = prestate.Collected.init(space) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    var request = request_in;
+    request.message.inspect = collected.inspect();
+    switch (try eth.simulate(api, call, request)) {
+        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .executed => {},
+    }
+    if (collected.failed) return call.fail(rpc.code.internal_error, "state read failed");
+    if (collected.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
+    try prestate.write(call.writer, &collected, options.diff_mode);
+}
+
+/// prestateTracer over a stored block: each traced transaction's result is staged in
+/// scratch as it executes (the state moves on), then written in one piece.
+fn trace_prestate(
+    api: *Api,
+    call: *Call,
+    env: *const node.executor.BlockEnv,
+    transactions: []const []const u8,
+    only: ?u32,
+    options: Options,
+    history: *node.HistoryDatabase,
+    tail: usize,
+) HandlerError!void {
+    const half = tail / 2;
+    var collected = prestate.Collected.init(api.scratch[0..half]) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    var staging: std.Io.Writer = .fixed(api.scratch[half..tail]);
+    var staged: json.Writer = .init(&staging);
+    const executor = api.chain.executor;
+    run_prestate(
+        executor,
+        env,
+        transactions,
+        only,
+        options,
+        &collected,
+        &staged,
+        history.database(),
+    ) catch |err| {
+        if (history.failure) |failure| return eth_proof.fail_history(call, failure);
+        const too_large = "trace exceeds the trace buffers";
+        return switch (err) {
+            error.WriteFailed => call.fail(rpc.code.server_error, too_large),
+            error.TraceFull => call.fail(rpc.code.server_error, too_large),
+            error.StateReadFailed => call.fail(rpc.code.internal_error, "state read failed"),
+            else => call.fail(rpc.code.server_error, @errorName(err)),
+        };
+    };
+    try call.writer.raw(staging.buffered());
+}
+
+fn run_prestate(
+    executor: *node.executor.Executor,
+    env: *const node.executor.BlockEnv,
+    transactions: []const []const u8,
+    only: ?u32,
+    options: Options,
+    collected: *prestate.Collected,
+    w: *json.Writer,
+    database: evm.state.Database,
+) !void {
+    const session = executor.session_begin(database);
+    defer executor.session_end(session);
+    try executor.recover_all(transactions);
+    var building = try executor.begin_block(env);
+    defer executor.known_sender = null;
+    if (only == null) try w.begin_array();
+    for (transactions, 0..) |raw, index| {
+        const traced = only == null or only.? == index;
+        if (traced) collected.take_snapshot(executor.state);
+        executor.known_sender = executor.senders[index];
+        try executor.apply(&building, raw);
+        if (!traced) continue;
+        collected.collect(executor.state);
+        if (collected.full) return error.TraceFull;
+        if (collected.failed) return error.StateReadFailed;
+        if (only == null) {
+            try w.begin_object();
+            try w.key("txHash");
+            try w.data(&primitives.keccak256(raw).bytes);
+            try w.key("result");
+        }
+        try prestate.write(w, collected, options.diff_mode);
+        if (only == null) try w.end_object();
+    }
+    if (only == null) try w.end_array();
 }

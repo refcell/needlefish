@@ -1436,3 +1436,51 @@ test "eth: debug_traceCall traces a call against the head state" {
     try expect_contains(try h.request("eth_call", "[{\"to\":" ++ caller_at ++ "}]"), "result");
     try testing.expect(h.node.chain.executor.machine.tracer == null);
 }
+
+const zeros_62 = "00000000000000000000000000000000000000000000000000000000000000";
+const word_zero = "\"0x" ++ zeros_62 ++ "00\"";
+const word_one = "\"0x" ++ zeros_62 ++ "01\"";
+
+test "eth: debug_trace prestateTracer reports pre-transaction state and diffs" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    _ = try h.mine(12);
+    var buffers: [2][256]u8 = undefined;
+    const first = try contract_call_raw(&buffers[0], 0, counter);
+    const second = try contract_call_raw(&buffers[1], 1, counter);
+    try expect_contains(try send_raw(h, first), "\"result\":\"0x");
+    try expect_contains(try send_raw(h, second), "\"result\":\"0x");
+    const block = try h.mine(24);
+    const sender = "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\":{";
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const second_hash = primitives.keccak256(second).bytes;
+    // The second transaction sees the first one's effects as its pre-state.
+    const pre = try trace_request(h, "debug_traceTransaction", &second_hash, plain);
+    try expect_contains(pre, sender);
+    try expect_contains(pre, "\"nonce\":1");
+    try expect_contains(pre, "\"storage\":{\"0x" ++ zeros_62 ++ "00\":" ++ word_one);
+    const diff = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}";
+    const first_hash = primitives.keccak256(first).bytes;
+    const changes = try trace_request(h, "debug_traceTransaction", &first_hash, diff);
+    const post = changes[std.mem.indexOf(u8, changes, "\"post\"").?..];
+    try expect_contains(changes[0 .. changes.len - post.len], word_zero);
+    try expect_contains(post, word_one);
+    try expect_contains(post, "\"nonce\":1");
+    const by_hash = try trace_request(h, "debug_traceBlockByHash", &block.bytes, plain);
+    try testing.expectEqual(@as(usize, 2), count_of(by_hash, "\"txHash\""));
+    // debug_traceCall runs on the head state, where slot 0 is now 2.
+    const call = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"prestateTracer\"," ++
+            "\"tracerConfig\":{\"diffMode\":true}}]",
+    );
+    try expect_contains(call, "\"0x" ++ zeros_62 ++ "02\"");
+    try expect_contains(call, "\"0x" ++ zeros_62 ++ "03\"");
+}
