@@ -116,11 +116,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   1.44 -> 1.41 us (same-load A/B). Kept `std.HashMapUnmanaged` (not a custom flat table) so
   other lanes' `iterator`/`count`/`clearRetainingCapacity` uses are unchanged. The db
   lane's overlay `SlotKey` map still uses `AutoContext` and could adopt the same context.
-- [ ] Performance: frame entry copies `Frame` by value (`run` local); measure the call loop
-  with a pointer-based frame and keep it if `evm: call loop` improves. Call-loop profile:
-  interpreter 35%, account-map lookup + key compare ~25%, start_call/push_frame/resume ~20%,
-  memmove 10%. A u160-compare hash context for `State.accounts` measured no gain (load ~30)
-  and a custom slot context was slower, so both were dropped.
+- [x] Performance: the interpreter runs on the frame in place instead of a local copy:
+  call loop 27.0 -> 23.6 us, snailtracer 21.6 -> 21.0 ms, arithmetic unchanged (same-load
+  A/B). Call-loop profile before: interpreter 35%, account-map lookup ~25%, frame
+  push/resume ~20%; a u160-compare account-map context measured no gain and was dropped.
 - [x] Fuzz: differential opcode fuzz of the arithmetic family (`arith_fuzz.zig`) (DIV/SDIV/MOD/SMOD/ADDMOD/
   MULMOD/EXP/SIGNEXTEND/shifts) through the interpreter against reference formulas.
 - [x] Performance: compare with revm on the same machine (snailtracer: revm 31-46 ms,

@@ -23,12 +23,12 @@ const Frame = evm_module.Frame;
 const Exit = evm_module.Exit;
 const CallKind = evm_module.CallKind;
 
-/// Run `frame` until it exits. The frame is copied into a local so the hot fields
-/// (pc, gas, stack length) can live in registers, and written back on exit.
+/// Run `frame` in place until it exits.
 pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     @setEvalBranchQuota(100_000);
-    var local = frame.*;
-    const f = &local;
+    // Runs on the frame in place: a local copy (for register promotion) measured ~13% slower
+    // on the call loop and no faster on straight-line code (snailtracer, arithmetic).
+    const f = frame;
     const exit: Exit = loop: {
         dispatch: switch (f.analyzed.code[f.pc]) {
             inline else => |opcode| {
@@ -37,7 +37,6 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
             },
         }
     };
-    frame.* = local;
     assert(frame.stack.len <= 1024);
     return exit;
 }

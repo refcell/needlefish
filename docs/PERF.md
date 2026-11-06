@@ -606,6 +606,7 @@ the shared machine at load average ~35, so treat it as a ceiling:
 | evm: snailtracer | 50 479 625 | before `uint.zig`: LLVM's generic u256 division |
 | evm: snailtracer | 27 078 208 | ~6.1 Ggas/s with Knuth division over 32-bit limbs |
 | evm: snailtracer | 21 813 084 | ~7.6 Ggas/s with 64-bit-limb MLOAD/MSTORE/PUSH loads |
+| evm: snailtracer | 20 983 416 | ~7.9 Ggas/s; interpreter runs on the frame in place |
 
 u256 division microbench (same machine): LLVM's lowering of `u256 / u256` costs ~500 ns
 (u64-sized divisor) and ~230 ns (wide divisor), against ~3 ns for a u256 multiply. DIV, MOD,
