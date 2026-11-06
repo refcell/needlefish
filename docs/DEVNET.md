@@ -104,6 +104,9 @@ Each binary must accept at least the flags below. Lanes may add more.
 - `consensus --rollup-config .devnet/rollup.json --l1 http://127.0.0.1:8545
   --l1-beacon http://127.0.0.1:5052 --l2 http://127.0.0.1:E --l2-jwt .devnet/jwt.hex
   --rpc.port R [--sequencer --sequencer.key-index 5]`
+  Gossip runs as on a real network: each CL has `--p2p.bootstore .devnet/<cl>/bootstore.json`
+  with discv5 on, and the verifier gets the sequencer's ENR (from its "p2p listening" log
+  line) as `--p2p.bootnodes`.
 - `batcher --rollup-config .devnet/rollup.json --l1 http://127.0.0.1:8545
   --l2 http://127.0.0.1:9545 --rollup-rpc http://127.0.0.1:7545 --key-index 6
   --metrics.port 7300 [--data-availability calldata|blobs] [--compression brotli|zlib]`
@@ -141,7 +144,8 @@ Each binary must accept at least the flags below. Lanes may add more.
 2. **Batching.** `base devnet batches` decodes, from batcher transactions to the batch
    inbox, a singular batch with that L2 block's timestamp.
 3. **Derivation.** The verifier's `optimism_syncStatus.safe_l2` reaches the L2 block
-   from step 1, and its hash equals the sequencer's hash for that number.
+   from step 1, and its hash equals the sequencer's hash for that number. The verifier's
+   `opp2p_peerCount` reports `connectedGossip >= 1` (it found the sequencer through discv5).
 4. **Deposits.** A deposit sent to the L1 portal shows up on L2 (the recipient balance
    rises) on both sequencer and verifier.
 

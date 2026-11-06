@@ -159,28 +159,32 @@ patch_rollup() {
 start_consensus() {
   local common=(--rollup-config "$DIR/rollup.json" --l1 "http://127.0.0.1:$PORT_L1_HTTP"
     --l1-beacon "http://127.0.0.1:$PORT_L1_BEACON" --l2-jwt "$DIR/jwt.hex")
-  # Unsafe-block gossip: the verifier dials the sequencer's enode (logged at startup).
-  local p2p=(--p2p.listen.ip 127.0.0.1 --p2p.no-discovery --p2p.no-bootstore)
+  # Unsafe-block gossip as on a real network: discv5 over UDP, seeded by the sequencer's
+  # ENR (logged at startup), with each CL keeping its peers in a bootstore.
+  local p2p=(--p2p.listen.ip 127.0.0.1)
+  mkdir -p "$DIR/seq-cl" "$DIR/ver-cl"
   start seq-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_SEQUENCER_ENGINE" \
     --rpc.port "$PORT_SEQUENCER_RPC" --rpc.enable-admin --sequencer \
     --sequencer.key-index "$SEQUENCER_INDEX" \
-    "${p2p[@]}" --p2p.listen.tcp 9222 --p2p.listen.udp 9223
-  local enode="" tries=0
-  while [ -z "$enode" ] && [ "$tries" -lt 50 ]; do
-    enode=$(grep -o 'enode=enode://[^ ]*' "$DIR/logs/seq-cl.log" 2>/dev/null | head -n1 |
-      sed 's/^enode=//') || true
-    [ -n "$enode" ] || sleep 0.2
+    "${p2p[@]}" --p2p.listen.tcp 9222 --p2p.listen.udp 9223 \
+    --p2p.bootstore "$DIR/seq-cl/bootstore.json"
+  local record="" tries=0
+  while [ -z "$record" ] && [ "$tries" -lt 50 ]; do
+    record=$(grep -o 'enr=enr:[^ ]*' "$DIR/logs/seq-cl.log" 2>/dev/null | head -n1 |
+      sed 's/^enr=//') || true
+    [ -n "$record" ] || sleep 0.2
     tries=$((tries + 1))
   done
   local gossip=()
-  if [ -n "$enode" ]; then
-    gossip=(--p2p.bootnodes "$enode")
+  if [ -n "$record" ]; then
+    gossip=(--p2p.bootnodes "$record")
   else
-    log "ver-cl: sequencer enode not found, starting without a gossip peer"
+    log "ver-cl: sequencer ENR not found, starting without a bootnode"
   fi
   local signer; signer=$("$BASE" devnet account "$SEQUENCER_INDEX")
   start ver-cl consensus "${common[@]}" --l2 "http://127.0.0.1:$PORT_VERIFIER_ENGINE" \
     --rpc.port "$PORT_VERIFIER_RPC" "${p2p[@]}" --p2p.listen.tcp 9232 --p2p.listen.udp 9233 \
+    --p2p.bootstore "$DIR/ver-cl/bootstore.json" \
     --p2p.unsafe.block.signer "$signer" ${gossip[@]+"${gossip[@]}"} \
     --metrics.enabled --metrics.port "${PORT_VERIFIER_METRICS:-7301}"
 }

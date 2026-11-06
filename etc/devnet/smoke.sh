@@ -86,6 +86,15 @@ derived() {
 until_ok "verifier safe head reaches block $block with hash $seq_hash" derived
 ok "verifier derived block $block ($seq_hash)"
 
+# 3a. Gossip: the verifier found the sequencer through discv5 and gossips with it.
+gossip_peer() {
+  local count; count=$(rpc "$VER_CL" opp2p_peerCount '[]' | grep -o '"connectedGossip":[0-9]*' \
+    | cut -d: -f2)
+  [ -n "$count" ] && [ "$count" -ge 1 ]
+}
+until_ok "verifier has a gossip peer (opp2p_peerCount connectedGossip >= 1)" gossip_peer
+ok "verifier gossips with a peer found through discv5"
+
 # 3b. Metrics: the verifier's Prometheus safe-head label reached the block.
 VER_METRICS="http://127.0.0.1:${PORT_VERIFIER_METRICS:-7301}/metrics"
 metrics_safe() {
