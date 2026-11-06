@@ -123,6 +123,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: paused (project paused by owner). Last push: 1ee1bcfb (parallel witness
+  hashing at init); all four pinned windows pass.
+
 - 2026-11-06: `Replayer.init` hashes witness nodes on the recovery-thread count of short-lived
   workers (strided shares), then inserts serially in archive order, so the store is
   identical. 100-block `replay run` 0.45 s -> 0.40 s wall. Seeded fuzz of the strided shares;
