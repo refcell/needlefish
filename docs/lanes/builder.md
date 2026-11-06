@@ -54,6 +54,18 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
     `unreplayed()` at settle.
 - [x] Benchmarks: build+seal latency per 200 ms slot at full gas limit; target well under
   the 150 ms cutoff. Record in docs/PERF.md.
+- [x] `miner_setGasLimit` in pool selection: `BlockBuilder` fills pool transactions only up
+  to `min(Chain.gas_limit_target, block gas limit)` (base/base `GasLimitConfig` in
+  `execute_best_transactions`); the synchronous `Chain` build already did, the builder did not.
+- [ ] Resource metering in tx selection: wire `builder/metering` into `BlockBuilder.apply_best`
+  as base/base `execute_best_transactions` does (`check_simulated_usage` before execution,
+  `check_executed_usage` after, `apply_accounted_usage` on commit, throttled count per build),
+  plus the `resource_metering_*` and `metering_late_arrival_*` metrics of
+  `crates/builder/core/src/metrics.rs`. Off by default, like `enable_resource_metering`.
+- [ ] Sequencer self-import cost (from the `builder:` bench: build 20 ms CPU, self-import 55 ms
+  wall at 2610 txs): the node re-recovers every sender and re-executes the sealed block. Hand
+  the builder's known senders (it already skips ecrecover via `known_sender`) to the import, or
+  commit the builder's state directly; needs the nf-node lane (`Chain.insert`).
 
 ## Decisions
 - 2026-11-05: Flashblocks dropped by the project owner; superseded flashblocks
@@ -155,3 +167,5 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - 2026-11-05: `builder/core` `Service.observer` job events and `SlotAudit` (one block per
   slot or explained skip, seal cutoff inside the slot, verifier replay hashes); model fuzz with
   injected faults; cadence DST now skips slots (cancel, expiry) and runs through the audit.
+- 2026-11-05: `BlockBuilder` honours the `miner_setGasLimit` target (`Chain.gas_limit_target`)
+  for pool transactions; unit test plus the seeded/fuzz builder job draws a target.

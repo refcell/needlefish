@@ -8,8 +8,9 @@
 //! state, the attribute transactions (all must succeed), then best pool transactions in
 //! priority order through the `best_txs` view until the pool snapshot is exhausted, the
 //! injected clock reaches the transaction cutoff (the seal offset into the slot), or the
-//! block runs out of room. Transactions over the remaining gas or DA budget, or failing
-//! execution, are skipped with their sender's later nonces (base/base `skip_current`).
+//! block runs out of room (the gas budget is the `miner_setGasLimit` target when
+//! smaller than the block gas limit). Transactions over the remaining gas or DA budget, or
+//! failing execution, are skipped with their sender's later nonces (base/base `skip_current`).
 //! The block is sealed once: commit, roots, header, then the commit is rolled back so the
 //! chain's state stays at the parent and the node imports the block like any other.
 //! The sealed header is exactly what `Chain` builds from the same transaction list.
@@ -261,6 +262,7 @@ pub const BlockBuilder = struct {
         const pool = chain.pool orelse return .pool_exhausted;
         const selected = pool.select(builder.env.base_fee, builder.select_buffer);
         builder.best.refresh(builder.select_buffer[0..selected]);
+        const gas_budget = builder.pool_gas_budget();
         // Bounded by the snapshot: `next` advances its cursor on every call.
         var offered: usize = 0;
         while (offered <= selected) : (offered += 1) {
@@ -268,7 +270,7 @@ pub const BlockBuilder = struct {
             if (now_ns >= cutoff_ns) return .cutoff;
             const tx = builder.best.next(now_ns) orelse return .pool_exhausted;
             if (builder.count == builder.transactions.len) return .transactions_full;
-            if (building.gas_used +| tx.gas_limit > builder.env.gas_limit) {
+            if (building.gas_used +| tx.gas_limit > gas_budget) {
                 builder.best.mark_invalid(tx.sender, tx.nonce);
                 continue;
             }
@@ -287,6 +289,18 @@ pub const BlockBuilder = struct {
         }
         // Each pass consumed one of at most `selected` snapshot entries or returned.
         unreachable;
+    }
+
+    /// Gas the block may fill with pool transactions: the `miner_setGasLimit` target when
+    /// set and smaller, else the block gas limit (base/base `execute_best_transactions`,
+    /// `GasLimitConfig`). The attribute transactions count against it, as in base/base.
+    fn pool_gas_budget(builder: *const BlockBuilder) u64 {
+        const target = builder.chain.gas_limit_target;
+        const gas_limit = builder.env.gas_limit;
+        const budget = if (target == 0) gas_limit else @min(target, gas_limit);
+        assert(budget <= builder.env.gas_limit);
+        assert(target == 0 or budget <= target);
+        return budget;
     }
 
     /// Applies a pool transaction; false (sender skipped) when it cannot execute.

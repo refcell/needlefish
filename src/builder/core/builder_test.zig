@@ -177,6 +177,25 @@ test "builder: the gas budget skips transactions that do not fit" {
     try expect_chain_equal(harness, &attributes, root_before);
 }
 
+test "builder: the miner_setGasLimit target caps pool transactions" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var buffers: [6][256]u8 = undefined;
+    try harness.submit_pool(6, &buffers);
+    const attributes = fixture.attributes_l2(2, 0xfe);
+    // base/base `GasLimitConfig`: the target applies when below the block gas limit.
+    harness.node.chain.gas_limit_target = 2 * 21_000 + 20_999;
+    const root_before = try harness.node.db.root();
+    try testing.expectEqual(Stop.pool_exhausted, try harness.run(&attributes, 1));
+    try testing.expectEqual(@as(usize, 2), harness.builder.block_transactions().len);
+    try testing.expectEqual(@as(u64, 2 * 21_000), harness.builder.sealed_header().gas_used);
+    try expect_chain_equal(harness, &attributes, root_before);
+    // A target above the block gas limit is capped by it.
+    harness.node.chain.gas_limit_target = attributes.gas_limit.? + 1;
+    try testing.expectEqual(Stop.pool_exhausted, try harness.run(&attributes, 1));
+    try testing.expectEqual(@as(usize, 6), harness.builder.block_transactions().len);
+}
+
 test "builder: the cutoff stops pool transactions; forced transactions always run" {
     const harness = try Harness.create();
     defer harness.destroy();
@@ -258,6 +277,8 @@ fn random_job(prng: *Prng) !u64 {
     attributes.gas_limit = if (prng.chance(1, 4)) 30_000_000 else prng.range(100_000, 600_000);
     attributes.no_tx_pool = prng.chance(1, 8);
     if (prng.chance(1, 3)) harness.node.chain.da_limits = .{ .block_bytes_max = prng.below(2_000) };
+    const gas_target = if (prng.chance(1, 4)) prng.range(21_000, 200_000) else 0;
+    harness.node.chain.gas_limit_target = gas_target;
     harness.clock = .{ .now = prng.below(100), .step_ns = prng.below(10) };
     const cutoff_ns = prng.below(200);
     const root_before = try harness.node.db.root();
@@ -266,6 +287,9 @@ fn random_job(prng: *Prng) !u64 {
     const included = builder.block_transactions().len - deposit_count;
     try testing.expect(builder.sealed_header().gas_used <= attributes.gas_limit.?);
     if (stop == .no_tx_pool) try testing.expectEqual(@as(usize, 0), included);
+    if (gas_target != 0 and deposit_count == 0) {
+        try testing.expect(builder.sealed_header().gas_used <= gas_target);
+    }
     if (stop == .cutoff) try testing.expect(harness.clock.now >= cutoff_ns);
     try expect_chain_equal(harness, &attributes, root_before);
     return included;
