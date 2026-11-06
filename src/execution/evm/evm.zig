@@ -533,6 +533,9 @@ pub const Evm = struct {
             .checkpoint = spec.checkpoint,
             .arena_mark = arena_mark,
         };
+        // A new frame starts with empty return data (EIP-211). The buffer is shared by every
+        // frame; the parent's return data is replaced by this frame's output when it returns.
+        evm.return_len = 0;
         evm.frames_len += 1;
     }
 

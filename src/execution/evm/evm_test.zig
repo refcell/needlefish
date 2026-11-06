@@ -158,6 +158,31 @@ test "evm: nested call returns data and propagates gas" {
     try std.testing.expectEqual(@as(u256, 32), try h.storage(contract, 1));
 }
 
+test "evm: a callee starts with empty return data after an earlier call returned data" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    // `other` stores its initial RETURNDATASIZE in slot (CALLDATASIZE) and returns a word.
+    // An EIP-1167 proxy reads RETURNDATASIZE as a cheap zero, so a stale size corrupts the
+    // calldata it forwards (Base mainnet block 53715983, transaction 3).
+    const callee = [_]u8{
+        op.RETURNDATASIZE, op.CALLDATASIZE, op.SSTORE, op.PUSH1, 0x77, op.PUSH1,  0,
+        op.MSTORE,         op.PUSH1,        32,        op.PUSH1, 0,    op.RETURN,
+    };
+    try h.database.put_account(other, 0, 1, &callee);
+    // CALL(gas, other, 0, 0, 0, 0, 32) with no input, then again with one byte of input.
+    const call_other = [_]u8{ op.PUSH2, 0x07, 0xe7, op.GAS, op.CALL };
+    const first_args = [_]u8{ op.PUSH1, 32, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0 };
+    const second_args = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 1, op.PUSH1, 0, op.PUSH1, 0 };
+    const code = first_args ++ call_other ++ [_]u8{op.POP} ++ second_args ++ call_other ++
+        [_]u8{op.STOP};
+    try h.database.put_account(contract, 0, 1, &code);
+    const outcome = try h.call(.cancun, contract, &.{}, 300_000);
+    try std.testing.expectEqual(evm_module.Status.success, outcome.status);
+    try std.testing.expectEqual(@as(u256, 0), try h.storage(other, 0));
+    try std.testing.expectEqual(@as(u256, 0), try h.storage(other, 1));
+}
+
 test "evm: CREATE deploys runtime code" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);
