@@ -1,0 +1,119 @@
+# Unsafe tip from p2p (Base Sepolia demo)
+
+Goal: stay at the Base Sepolia unsafe tip and execute consecutive blocks on local state.
+Blocks arrive from the consensus p2p network, with no public RPC in the steady-state
+ingestion path. Safe and finalized heads (derivation) are out of scope.
+
+Acceptance: 30 minutes of consecutive, locally executed blocks. Every block's state root,
+receipts root, logs bloom, gas used and block hash must equal its header, and tip lag is
+measured. Skipping a block or re-anchoring counts as failure.
+
+The demo has two halves, which are proven separately and then joined:
+
+1. **Reception (this doc, p2p lane).** Real discv5 discovery and libp2p gossipsub on
+   Sepolia, envelope decoding, sequencer signature check, block hash recomputation, and
+   parent-hash continuity. `base unsafe-watch` does this with no RPC at all.
+2. **Execution (snapshot and sync lanes).** Local state imported from the public snapshot,
+   advanced block by block. Gossip blocks are fed in only once that state reaches the live
+   window (see "Snapshot to tip").
+
+Receiving a valid gossip block is not evidence that it executed. The watcher reports
+reception only.
+
+## `base unsafe-watch`
+
+    base unsafe-watch [--chain base-sepolia|base-mainnet] [--duration <seconds>] [--quiet]
+                      [--p2p.* ...]
+
+- Seeds discovery from the chain's public boot ENRs (base/base `boot.rs`) and dials every
+  Sepolia record (`opstack` ENR key with chain id 84532).
+- Subscribes to the block topic that is live now: `/optimism/84532/3/blocks` (v4). Older
+  topics retire after 60 s, as in base/base.
+- Each accepted block was validated by the gossip handler, with base/base parity. The
+  checks are timestamp window, signature recovery against the unsafe block signer,
+  block-hash recomputation from the payload, v3/v4 field rules, the Denim 200 ms schedule,
+  and the seen-hash limits. The watcher then recovers the signer itself and links the
+  block to its parent hash.
+- It prints one `block` line per block (number, hash, parent, tx count, gas, lag, signer,
+  link) and a `status` line every 10 s. The link is one of `first`, `ok`, `gap`, `reorg`
+  or `stale`.
+- Lag is local wall-clock time minus the block's scheduled time
+  (`RollupConfig.l2_block_timestamp_ms`, the 200 ms Denim schedule).
+
+### Signer source
+
+The unsafe block signer comes from the built-in public chain config
+(`common/chains`). For Sepolia that is `0xb830b99c95Ea32300039624Cb567d324D4b1D83C`, the
+value of the L1 SystemConfig `unsafeBlockSigner` slot. Override it with
+`--p2p.unsafe.block.signer`.
+
+base/base reads the slot from L1 at startup. `base consensus` does the same through
+`SignerWatcher` and polls it, but that needs an L1 RPC. The watcher does not use L1 RPC.
+The check fails closed: after a rotation, new blocks are rejected as `invalid_signer`
+(visible in the `failed:` counters). A block with the wrong signer is never accepted.
+
+### Measured (2026-11-06, behind NAT, no inbound reachability)
+
+- Discovery: discv5 handshakes complete over UDP through NAT. The Sepolia population we
+  can see is small: about 6 to 30 records with the `opstack` key at a time, among many
+  records from other networks.
+- Connections: noise, yamux, identify and meshsub all interoperate with base/base nodes
+  (agent `base`). Many peers accept the TCP connection and then send a yamux go-away
+  within milliseconds; they are at their connection limit (base/base `peers.hi` 30).
+  Peers that keep us but do not need mesh peers PRUNE our GRAFT (backoff 60 s). Because
+  rust-libp2p keeps a connection alive only while it is in the mesh, those peers then
+  close the idle link after about 60 s.
+- Blocks: once the watcher reaches a peer that grafts it, blocks stream at the chain's
+  rate. One run got 159 blocks in about 32 s from one peer: 158 `ok` links, no gaps, no
+  signer mismatches, no validation failures, average lag 82 ms, maximum 910 ms.
+- Cross-check: a scratch rust-libp2p gossipsub client (outside the repo, base/base
+  message-id function), given the same peer list, saw the same thing. Only one of eight
+  peers forwarded blocks, and it was the same peer. So the scarcity is the network's
+  topology, not our stack.
+- Because a node behind NAT gets no inbound peers, the watcher re-dials every known
+  Sepolia record every 10 s (`--p2p.redial.known-interval`, off by default as in
+  base/base). It takes a peer's slot as soon as one frees. The gater's redial limits
+  still apply.
+
+## Snapshot to tip
+
+Gossip only carries the live window. Blocks older than 60 s are rejected
+(`block_age_max_seconds`), and the router's message cache covers 3 heartbeats (1.5 s)
+for IWANT. Gossip cannot fill any historical range.
+
+The public Sepolia state snapshot is at block 55006660. The tip was 55306938 at
+2026-11-06 12:01 ET, so the snapshot is about 300k blocks (about 16.7 h at 5 blocks/s)
+behind, and the gap grows by 5 blocks/s. To join live gossip, the executor must:
+
+1. catch up from the snapshot block to the oldest gossip block still buffered, faster
+   than 5 blocks/s; and
+2. then execute each gossip block in order, starting from the buffered one whose parent
+   is the last executed block.
+
+Peer-based ways to fetch the catch-up range and any missing block:
+
+- **Consensus p2p req/resp: not available.** op-node's `/opstack/req/payload_by_number`
+  is deliberately absent from base/base (`service/tests/actors/network/p2p.rs` asserts it
+  is not advertised), and no Sepolia peer we identified advertises it. Their identify
+  protocols are meshsub 1.0 to 1.2, floodsub, identify, identify push and ping.
+- **Execution p2p (devp2p eth/68 `GetBlockHeaders` / `GetBlockBodies`): viable, not built
+  yet.** reth serves history to any eth peer, and Base Sepolia publishes execution
+  enodes (`common/chains`). Bodies plus headers are exactly the executor's input, and
+  they can be bound to the gossip head by walking parent hashes back. This needs RLPx
+  (ECIES handshake, framing) and the eth wire subprotocol (SYNC_PLAN M8). It is the
+  path that removes RPC from catch-up too.
+- **RPC catch-up: bounded, one-time.** This is what the sync lane plans for M4: trusted
+  L2 RPC blocks, validated by the hash chain back from the target head. It sits outside
+  the steady-state path, but it is rate limited. At 100 blocks per request, 300k blocks
+  is 3,000 requests.
+
+During steady state, a block missed by gossip (a link of `gap`) can only be recovered by
+the same fetch path. The demo counts it as a failure; it does not skip or re-anchor.
+
+## Integration contract (to the executor)
+
+The p2p side hands the executor, in block-number order, payloads that are signed,
+hash-checked and parent-linked. Each one is the block header (re-encoded from the
+payload, its hash equal to `block_hash`), the raw EIP-2718 transactions, and
+`parent_beacon_block_root`. The executor executes block N+1 on top of N, then checks
+state root, receipts root, logs bloom, gas used and block hash against that header.

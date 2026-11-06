@@ -13,6 +13,7 @@ pub const handler = @import("handler.zig");
 pub const ssz_payload = @import("ssz_payload.zig");
 pub const block = @import("block.zig");
 pub const validity = @import("validity.zig");
+pub const archive = @import("archive.zig");
 
 test {
     _ = @import("router_test.zig");

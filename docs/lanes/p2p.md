@@ -36,6 +36,18 @@ behind a small interface and switch later.
 - [x] `libp2p`: TCP transport over utilities/io (`transport.zig`, `Transport(IO)`) feeding
   `p2p.Service`; SimIo cluster tests (discovery -> dial -> libp2p -> block delivery,
   partition heal, 16-seed sweep behind `-Dslow-tests`).
+- [x] Real Base Sepolia interop (`base unsafe-watch`, docs/UNSAFE_TIP.md): discv5 through
+  NAT, noise/yamux/identify/meshsub with base/base nodes, and valid signed v4 blocks
+  received with continuous parent links and about 80 ms average lag. A scratch rust-libp2p
+  client given the same peers saw the same single block-carrying peer. Added interop
+  counters: transport close reasons, router RPC/control counts, and discv5 outbound
+  handshakes.
+- [x] Re-dial known nodes (`--p2p.redial.known-interval`, off by default): behind NAT,
+  busy base/base peers go-away at their connection limit and non-mesh links idle out
+  after 60 s, so a node must keep asking for a slot. Test: redials happen only when
+  enabled, skip connected and other-chain nodes, and wait for the interval after a failure.
+- [ ] Peer-based backfill: base/base has no req/resp. The viable path is devp2p eth/68
+  against reth (SYNC_PLAN M8); see docs/UNSAFE_TIP.md.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.
@@ -524,3 +536,4 @@ behind a small interface and switch later.
 - 2026-11-05: inbound yamux stream negotiation timeout (10 s); many-streams bound test.
 - 2026-11-05: gossip validation parity audit; version-matrix and schedule-replay tests.
 - 2026-11-05: discv5 table refuses stale-record endpoint moves.
+- 2026-11-06: first live Base Sepolia gossip blocks (`base unsafe-watch`); known-node redial.
