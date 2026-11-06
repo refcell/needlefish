@@ -76,6 +76,10 @@ allocation after startup.
   methods to upstreams (e.g. raw-tx sends to the sequencer); retries stay inside the route.
 - [x] `infra/roxy` block-lag exclusion (proxyd `consensus_max_block_lag`): per-upstream
   `eth_blockNumber` polling; upstreams over `--lag-max-blocks` behind are skipped, fail open.
+- [x] `base basectl denim`: Denim activation readiness over one hash-pinned L2 snapshot (port
+  `basectl/src/denim.rs`, which upstream only shows in the TUI): schedule, BaseTime proxy and
+  implementation, tx[1] metadata + receipt, header/storage/getter millis, 200 ms cadence walk,
+  and the 12 HTTP timestamp wire fields; table or `--json`, exit 1 on any fail.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -215,6 +219,48 @@ allocation after startup.
   `ready_at`. The signer is required for every command (`checkWithdrawal` is called from
   it); `--dev-account` uses the public dev mnemonic.
 
+- basectl denim: pure evaluation (`denim.zig`) is separate from RPC gathering
+  (`denim_fetch.zig`). HTTP only: base/base's three WebSocket subscription checks are not
+  ported (no websocket client in basectl). No per-group time budgets or polling cursor either:
+  the command checks one snapshot with the per-request `--timeout-ms`.
+- basectl denim statuses follow base/base `evaluate`: not active -> failed proxy checks are
+  indeterminate, and the metadata/getter checks are omitted. Deviations: (1) JSON-RPC -32601
+  is indeterminate ("method not served") for every wire check, not a failure, matching the
+  other basectl commands (upstream fails on any RPC error); (2) the seven wire object checks
+  are indeterminate before activation (upstream runs them whenever tx[1] decodes), so a
+  pre-Denim snapshot never exits 1; (3) the cadence walk checks `--cadence-blocks` edges
+  (default 20, max 256) instead of upstream's single edge when no cursor is given.
+- basectl denim: the CL is `--rollup-rpc`; empty means Denim not scheduled, but a configured
+  CL that fails is a command error (an unreachable CL must not read as "not scheduled"). A
+  failed pinned state read (code, storage, block receipts) is a command error like upstream's
+  `?`; getter call errors are check failures.
+- basectl denim wire format: state reads pin `{"blockHash":...}` (EIP-1898, as alloy sends
+  `BlockId::Hash`); storage slots go as minimal quantities (`0x0`), as alloy sends a U256.
+  Report JSON keys are snake_case like the other basectl reports (upstream camelCase).
+- basectl denim constants (proxy/implementation code hashes, EIP-1967 slots, packed slot-0
+  millis at byte 30, getter selectors) are tested against `execution/node/base_time.zig`
+  and keccak of the in-tree proxy runtime (`batcher/devnet/base_time_proxy.hex`, identical to
+  base/base `bytecode/proxy.hex`).
+
+## Findings
+- 2026-11-05 `basectl denim` on the 200 ms devnet (sequencer and verifier, Denim at genesis):
+  proxy code hash, proxy admin, implementation (LinkedInitial), metadata, metadata receipt,
+  storage millis part, and the 200 ms cadence (256 edges) pass. Real node defects reported,
+  checks not weakened (execution lane):
+  - Blocks carry no `timestampMs` (`execution/rpc/format.zig` header writer) and
+    transactions/logs/receipts no `blockTimestampMs` (`rpc_types` has the field, nothing sets
+    it): header_timestamp_ms and every served wire check fail.
+  - `eth_getHeaderByHash`/`eth_getHeaderByNumber` are not served (indeterminate).
+  - `eth_call`/`eth_estimateGas` without `gas` fail with `gas_cap_exceeded` (the default gas
+    exceeds the Osaka EIP-7825 tx cap; geth/reth clamp it), so both BaseTime getters fail.
+    With `"gas":"0x30000"` `timestampMs()` returns the expected value.
+  - `eth_newFilter` rejects `blockHash` filters ("blockHash is not supported in filters").
+  - State reads (`eth_getCode`/`eth_getStorageAt`/`eth_getProof`/`eth_call`) are served only
+    at the forkchoice head ("historical state unavailable" even for a 1 s old block), so a
+    hash-pinned multi-read snapshot races the 200 ms head (one verifier run of ~15 runs lost
+    the race: `eth_getCode(BaseTime proxy): rpc error`).
+  - `eth_getStorageAt` rejects a zero-padded 32-byte slot key `0x00…00` as invalid params.
+
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
   sans-IO manager) with unit tests, seeded + std.testing fuzz, and a faulty-L1 sim.
@@ -267,3 +313,7 @@ allocation after startup.
   proof verification, portal calldata, status decider + game search, journal) and
   `base withdrawer initiate|status|prove|finalize|run` (reader, step-driven flow over
   tx_manager, fake L1/L2 tests: prove→finalize, paused, crash resume, initiate).
+- 2026-11-05: `base basectl denim` (denim.zig evaluation + seeded/std.testing fuzz, fetch over
+  the fake transport with hash-pin matching); live on the devnet: 7 pass, 8 fail, 7
+  indeterminate (no logs) / 13 fail with a log-emitting tx, all failures node defects listed
+  under Findings.

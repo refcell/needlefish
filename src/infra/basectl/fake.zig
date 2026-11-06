@@ -21,6 +21,8 @@ pub const FakeTransport = struct {
         /// Answer with a JSON-RPC error object carrying this code instead of `result`.
         error_code: ?i64 = null,
         once: bool = false,
+        /// Match only requests whose body contains this text (pins block parameters).
+        body_contains: []const u8 = "",
     };
 
     pub fn transport(fake: *FakeTransport) rpc.Transport {
@@ -46,6 +48,7 @@ pub const FakeTransport = struct {
         assert(method.len > 0);
         for (fake.answers, 0..) |answer, index| {
             if (fake.used[index] or !std.mem.eql(u8, answer.method, method)) continue;
+            if (std.mem.indexOf(u8, body, answer.body_contains) == null) continue;
             if (answer.once) fake.used[index] = true;
             return write(response, id, answer);
         }

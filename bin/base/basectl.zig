@@ -26,6 +26,7 @@ pub const Command = enum {
     proofs,
     upgrade_readiness,
     doctor,
+    denim,
 
     /// Parses the hyphenated command name (`sync-status`).
     pub fn parse(text: []const u8) ?Command {
@@ -58,6 +59,7 @@ pub const Spec = struct {
     safe_lag_fail_blocks: u64 = 300,
     finalized_lag_warn_blocks: u64 = 2_000,
     finalized_lag_fail_blocks: u64 = 7_200,
+    cadence_blocks: u32 = basectl.denim_fetch.cadence_blocks_default,
 
     pub const help = .{
         .network = "Network label printed in reports",
@@ -81,6 +83,7 @@ pub const Spec = struct {
         .safe_lag_fail_blocks = "doctor: safe head lag that fails",
         .finalized_lag_warn_blocks = "doctor: finalized head lag that warns",
         .finalized_lag_fail_blocks = "doctor: finalized head lag that fails",
+        .cadence_blocks = "denim: parent-child edges the 200 ms cadence walk checks (1..256)",
     };
 };
 
@@ -98,6 +101,7 @@ const usage =
     \\  proofs             recent dispute games (--factory)
     \\  upgrade-readiness  support for scheduled L1 upgrades (exit 1 when not ready)
     \\  doctor             health checks with pass/warn/fail (exit 1 on any fail)
+    \\  denim              Denim readiness at the hash-pinned latest L2 block (exit 1 on any fail)
     \\
 ;
 
@@ -234,6 +238,7 @@ fn run(command: Command, spec: Spec, context: *const types.Context, io: Io, out:
         .proofs => run_proofs(spec, context, out),
         .upgrade_readiness => run_upgrade_readiness(spec, context, out),
         .doctor => run_doctor(spec, context, io, out),
+        .denim => run_denim(spec, context, out),
     };
 }
 
@@ -283,6 +288,20 @@ fn run_upgrade_readiness(spec: Spec, context: *const types.Context, out: *Io.Wri
     return if (fetched.ok.readiness.ready) 0 else 1;
 }
 
+fn run_denim(spec: Spec, context: *const types.Context, out: *Io.Writer) !u8 {
+    const blocks_max = basectl.denim_fetch.cadence_blocks_max;
+    if (spec.cadence_blocks == 0 or spec.cadence_blocks > blocks_max) {
+        std.debug.print("basectl: denim needs --cadence-blocks 1..{d}\n", .{blocks_max});
+        return 2;
+    }
+    const options: basectl.denim_fetch.Options = .{ .cadence_blocks = spec.cadence_blocks };
+    const fetched = basectl.denim_fetch.fetch(context, options);
+    const code = try emit(basectl.denim, fetched, spec, out);
+    if (code != 0) return code;
+    // Any failing check fails the command; indeterminate checks do not.
+    return if (fetched.ok.has_failures()) 1 else 0;
+}
+
 fn sleep_ms(context: *anyopaque, duration_ms: u64) void {
     const io: *const Io = @ptrCast(@alignCast(context));
     io.sleep(.fromMilliseconds(@intCast(duration_ms)), .awake) catch {};
@@ -316,6 +335,7 @@ test "basectl: command names and addresses" {
     try std.testing.expectEqual(Command.sync_status, Command.parse("sync-status").?);
     try std.testing.expectEqual(Command.upgrade_readiness, Command.parse("upgrade-readiness").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("tui"));
+    try std.testing.expectEqual(Command.denim, Command.parse("denim").?);
     const address = (try parse_address("0x" ++ "00000000000000000000000000000000000000ff", "x")).?;
     try std.testing.expectEqual(@as(u8, 0xff), address.bytes[19]);
     try std.testing.expect(valid_url(""));

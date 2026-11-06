@@ -18,6 +18,8 @@ pub const sequencer = @import("sequencer.zig");
 pub const proofs = @import("proofs.zig");
 pub const upgrade_readiness = @import("upgrade_readiness.zig");
 pub const doctor = @import("doctor.zig");
+pub const denim = @import("denim.zig");
+pub const denim_fetch = @import("denim_fetch.zig");
 pub const fake = @import("fake.zig");
 
 pub const Context = types.Context;
@@ -27,4 +29,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("doctor_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("denim_test.zig");
 }
