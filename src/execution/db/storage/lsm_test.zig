@@ -18,9 +18,11 @@ const storage = @import("storage.zig");
 const engine_module = @import("engine.zig");
 const table_module = @import("table.zig");
 const lsm = @import("lsm.zig");
+const lsm_bulk = @import("lsm_bulk.zig");
 const SimStorage = @import("sim_storage.zig").SimStorage;
 const Prng = @import("../../../testing/prng.zig").Prng;
 const fuzz = @import("../../../testing/fuzz.zig");
+const build_options = @import("build_options");
 
 const sector_size = storage.sector_size;
 const Engine = engine_module.EngineType(SimStorage);
@@ -69,6 +71,7 @@ const Spec = struct {
     tree: lsm.Config = tree_config,
     grid_blocks: u64 = grid_blocks,
     zone_blocks: u64 = engine_config.checkpoint_zone_size_bytes / block_size,
+    cache_blocks: u32 = 16,
 
     fn engine(comptime spec: Spec) engine_module.Config {
         var config = engine_config;
@@ -92,6 +95,10 @@ const Counts = struct {
     filter_negatives: u64 = 0,
     /// Synchronous block reads (`get` missing the block cache).
     reads_sync: u64 = 0,
+    merges_last: u64 = 0,
+    cuts_overlap: u64 = 0,
+    /// Merge output tables overlapping more than `growth_factor` tables of the level below.
+    cut_violations: u64 = 0,
 };
 
 fn HarnessType(comptime spec: Spec) type {
@@ -130,6 +137,8 @@ fn HarnessType(comptime spec: Spec) type {
         /// False from a checkpoint start until it completes, and after an open that fell back.
         fallback_intact: bool = true,
         checkpoints: u32 = 0,
+        /// Keys `0..base` were bulk-loaded with their index as the value seed.
+        base: u32 = 0,
         counts: Counts = .{},
 
         fn create(sim: *SimStorage, seed: u64, universe: u32, log_max: u32) !*Harness {
@@ -163,13 +172,29 @@ fn HarnessType(comptime spec: Spec) type {
         }
 
         fn tree_init(self: *Harness) !void {
-            self.cache = try BlockCache.init(testing.allocator, block_size, 16);
+            self.cache = try BlockCache.init(testing.allocator, block_size, spec.cache_blocks);
             errdefer self.cache.deinit(testing.allocator);
             var config = spec.tree;
             config.block_count = spec.grid_blocks;
             self.tree = try Tree.init(testing.allocator, &self.engine.grid.?, &self.cache, config);
             assert(self.tree.checkpoint_size_max() + self.engine.free_set_image.len <=
                 engine_config_spec.checkpoint_zone_size_bytes);
+            self.tree.install_callback = on_install;
+        }
+
+        /// Checks every merge output against the cut rule: it overlaps at most
+        /// `growth_factor` tables of the level below its output.
+        fn on_install(tree: *Tree) void {
+            const self: *Harness = @alignCast(@fieldParentPtr("tree", tree));
+            const compaction = &tree.compaction;
+            if (compaction.kind != .merge) return;
+            const below = compaction.level_out + 1;
+            if (below == tree.config.levels_count) return;
+            for (compaction.outputs[0..compaction.output_count]) |slot| {
+                const info = &tree.slot_infos[slot];
+                _, const count = tree.level_overlap(below, &info.key_min, &info.key_max);
+                if (count > tree.config.growth_factor) self.counts.cut_violations += 1;
+            }
         }
 
         /// A crash: fresh engine, cache, and tree over the same storage.
@@ -230,6 +255,10 @@ fn HarnessType(comptime spec: Spec) type {
         fn model_at(self: *const Harness, sequence: u64) !std.AutoHashMap(u32, u64) {
             var model = std.AutoHashMap(u32, u64).init(testing.allocator);
             errdefer model.deinit();
+            // Bulk-loaded keys `0..base` hold their index, below every logged op.
+            try model.ensureTotalCapacity(self.base);
+            var index: u32 = 0;
+            while (index < self.base) : (index += 1) model.putAssumeCapacity(index, index);
             for (self.log[0..self.log_len]) |op| {
                 if (op.sequence > sequence) continue;
                 if (op.delete) _ = model.remove(op.key) else try model.put(op.key, op.seed);
@@ -425,6 +454,13 @@ fn HarnessType(comptime spec: Spec) type {
         /// Opens, then checks every key against the model at the recovered sequence (and drops
         /// the ops of commits the crash lost).
         fn open(self: *Harness) !engine_module.OpenResult {
+            const result = try self.open_engine();
+            try self.check_all(result.sequence_last);
+            return result;
+        }
+
+        /// Opens and rebuilds the model at the recovered sequence, without reading keys.
+        fn open_engine(self: *Harness) !engine_module.OpenResult {
             self.recovered_len = 0;
             self.engine.open(.{
                 .context = self,
@@ -446,7 +482,6 @@ fn HarnessType(comptime spec: Spec) type {
             self.log_len = kept;
             self.current.deinit();
             self.current = try self.model_at(result.sequence_last);
-            try self.check_all(result.sequence_last);
             return result;
         }
 
@@ -472,6 +507,94 @@ fn HarnessType(comptime spec: Spec) type {
             self.counts.flushes += self.tree.stats.flushes;
             self.counts.orphans_released += self.tree.stats.orphans_released;
             self.counts.filter_negatives += self.tree.stats.filter_negatives;
+            self.counts.merges_last += self.tree.stats.merges_last;
+            self.counts.cuts_overlap += self.tree.stats.cuts_overlap;
+        }
+
+        const Loader = lsm_bulk.BulkLoaderType(Tree);
+        const Load = struct {
+            loader: Loader,
+            done: bool = false,
+
+            fn on_done(loader: *Loader) void {
+                const load: *Load = @alignCast(@fieldParentPtr("loader", loader));
+                load.done = true;
+            }
+        };
+
+        fn key_less(keys: []const Key, a: u32, b: u32) bool {
+            return std.mem.order(u8, &keys[a], &keys[b]) == .lt;
+        }
+
+        /// Bulk-loads keys `0..base` (value seed: the index) in key order into the empty tree.
+        fn bulk_load(self: *Harness, base: u32) !void {
+            assert(base > 0 and base <= self.universe and self.base == 0);
+            const keys = try testing.allocator.alloc(Key, base);
+            defer testing.allocator.free(keys);
+            const order = try testing.allocator.alloc(u32, base);
+            defer testing.allocator.free(order);
+            for (keys, order, 0..) |*key, *position, index| {
+                key.* = key_of(@intCast(index));
+                position.* = @intCast(index);
+            }
+            std.mem.sortUnstable(u32, order, @as([]const Key, keys), key_less);
+            var load: Load = .{ .loader = try Loader.init(testing.allocator, &self.tree) };
+            defer load.loader.deinit(testing.allocator);
+            load.loader.begin();
+            // A repeated key and a smaller key are refused, and nothing is taken.
+            if (base > 1) {
+                try self.bulk_append(&load.loader, keys, order[0..2]);
+                for (order[0..2]) |index| {
+                    const value = value_of(index);
+                    const refused = value_in(&value, index, false).?;
+                    const result = load.loader.append(&keys[index], refused);
+                    try testing.expectError(error.KeyOrder, result);
+                }
+                try self.bulk_append(&load.loader, keys, order[2..]);
+            } else try self.bulk_append(&load.loader, keys, order);
+            load.loader.finish(Load.on_done);
+            try self.wait(&load.done);
+            try load.loader.result;
+            try testing.expect(!self.tree.bulk_active);
+            self.base = base;
+            var index: u32 = 0;
+            while (index < base) : (index += 1) try self.current.put(index, index);
+        }
+
+        fn bulk_append(
+            self: *Harness,
+            loader: *Loader,
+            keys: []const Key,
+            order: []const u32,
+        ) !void {
+            for (order) |index| {
+                const value = value_of(index);
+                const in = value_in(&value, index, false).?;
+                var ticks: u32 = 0;
+                while (true) : (ticks += 1) {
+                    if (ticks > 1000) return error.Timeout;
+                    loader.append(&keys[index], in) catch |err| switch (err) {
+                        error.Busy => {
+                            self.sim.tick();
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    break;
+                }
+            }
+        }
+
+        /// Checkpoints and ticks until the checkpoint is durable.
+        fn checkpoint_wait(self: *Harness) !void {
+            const checkpoints = self.checkpoints;
+            self.checkpoint();
+            var ticks: u32 = 0;
+            while (self.checkpoints == checkpoints) : (ticks += 1) {
+                if (ticks > 1_000_000) return error.Timeout;
+                if (self.engine.checkpoint_paused()) self.engine.checkpoint_grant(self.pace_blocks);
+                self.sim.tick();
+            }
         }
 
         /// Rots the newest checkpoint's first block header, forcing the fallback.
@@ -800,6 +923,250 @@ test "lsm: a flush writes several level-0 tables, cut by records or by data bloc
         .grid_blocks = 1024,
         .zone_blocks = 290,
     }, 960);
+}
+
+/// A tree for bulk loads: a last level of ~21 bulk-loaded tables (room for 38) right below
+/// level 1, whose tables (merged from level 0's random keys) each span the whole key space.
+/// Without the grandparent cut a level-1 merge into the last level would rewrite every table
+/// there, which no job may (`tables_max`), so `start` panics ("the last level is full").
+const spec_bulk: Spec = .{
+    .key_size = 32,
+    .value_size = 8,
+    .tree = .{
+        .block_size = block_size,
+        .block_count = 2048,
+        .memtable_entries_max = 128,
+        .flush_entries_min = 32,
+        .replay_entries_max = 64,
+        .table_records_max = 384,
+        .level0_tables_max = 2,
+        .levels_count = 3,
+        .growth_factor = 8,
+    },
+    .grid_blocks = 2048,
+    .zone_blocks = 8,
+    .cache_blocks = 1024,
+};
+
+/// 1M keys (slow tests): 4096-record tables, three levels with growth 128, so level 1 (2048
+/// records) merges straight into the ~245-table last level within the run.
+const spec_bulk_large: Spec = .{
+    .key_size = 32,
+    .value_size = 8,
+    .tree = .{
+        .block_size = block_size,
+        .block_count = 16_384,
+        .memtable_entries_max = 1024,
+        .flush_entries_min = 256,
+        .replay_entries_max = 64,
+        .table_records_max = 4096,
+        .level0_tables_max = 2,
+        .levels_count = 3,
+        .growth_factor = 128,
+    },
+    .grid_blocks = 16_384,
+    .zone_blocks = 32,
+    .cache_blocks = 2048,
+};
+
+const BulkRun = struct {
+    base: u32,
+    rounds: u32,
+    steps: u32,
+    /// The last level holds more tables than one merge may rewrite (the panic shape).
+    wide: bool = false,
+    /// Compaction blocks granted per commit (0: random, 2 to 8).
+    budget: u64 = 0,
+};
+
+/// Bulk-loads keys `0..base`, checkpoints, then runs rounds of random puts and deletes over
+/// the same keys with compaction and checkpoints, each round ending in a crash and a reopen
+/// that checks every key against the model.
+fn run_bulk(comptime spec: Spec, seed: u64, run: BulkRun) !Counts {
+    const Harness = HarnessType(spec);
+    var prng = Prng.init(seed);
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = spec.engine().size_bytes(),
+        .seed = seed,
+        .latency_ticks_max = @intCast(prng.range(1, 3)),
+    });
+    defer sim.deinit(testing.allocator);
+    const log_max = run.rounds * run.steps * ops_per_commit_max;
+    const harness = try Harness.create(&sim, prng.int(u64), run.base, log_max);
+    defer harness.destroy();
+    harness.budget = if (run.budget > 0) run.budget else prng.range(2, 8);
+    try harness.format_and_open(0xb01c_0000 + seed);
+    try harness.bulk_load(run.base);
+    const last = spec.tree.levels_count - 1;
+    // More tables than a merge may rewrite with the level it reads from.
+    const count = harness.tree.level_count[last];
+    if (run.wide) try testing.expect(2 * count + 1 > harness.tree.layout.tables_max[last]);
+    try harness.checkpoint_wait();
+    var round: u32 = 0;
+    while (round < run.rounds) : (round += 1) {
+        for (0..run.steps) |_| try harness.step(choice_of(&prng), prng.int(u64));
+        harness.note_crash();
+        sim.crash();
+        try harness.reinit();
+        const result = try harness.open();
+        try testing.expect(!result.checkpoint_fallback);
+    }
+    harness.counts.reads_sync = sim.stats.reads_sync;
+    return harness.counts;
+}
+
+fn expect_bulk_counts(counts: Counts) !void {
+    // Merges reached the bulk-loaded last level, their outputs were cut at grandparent
+    // overlap, and no output overlaps more than `growth_factor` tables below it.
+    try testing.expect(counts.merges_last > 0);
+    try testing.expect(counts.cuts_overlap > 0);
+    try testing.expectEqual(@as(u64, 0), counts.cut_violations);
+}
+
+test "lsm: bulk load, then puts, deletes, merges into the last level, crashes, reopens" {
+    var total: Counts = .{};
+    for (0..3) |seed| {
+        const counts = run_bulk(spec_bulk, 500 + seed, .{
+            .base = 8000,
+            .rounds = 4,
+            .steps = 2500,
+            .wide = true,
+        }) catch |err| {
+            std.debug.print("lsm bulk: failing seed={d}\n", .{500 + seed});
+            return err;
+        };
+        total.merges += counts.merges;
+        total.merges_last += counts.merges_last;
+        total.cuts_overlap += counts.cuts_overlap;
+        total.cut_violations += counts.cut_violations;
+    }
+    try expect_bulk_counts(total);
+}
+
+test "lsm: bulk load 1M records, then rounds of writes with crashes (slow)" {
+    if (!build_options.slow_tests) return error.SkipZigTest;
+    const counts = try run_bulk(spec_bulk_large, 600, .{
+        .base = 1_000_000,
+        .rounds = 3,
+        .steps = 30_000,
+        // A merge into the last level rewrites up to `growth_factor` tables of 24 blocks.
+        .budget = 128,
+    });
+    try expect_bulk_counts(counts);
+}
+
+/// 65-byte keys, values up to 1000 bytes: tables cut by data blocks.
+const spec_bulk_variable: Spec = .{
+    .key_size = 65,
+    .value_size = 1000,
+    .variable = true,
+    .tree = .{
+        .block_size = block_size,
+        .block_count = 1024,
+        .memtable_entries_max = 64,
+        .flush_entries_min = 16,
+        .replay_entries_max = 8,
+        .table_records_max = 4096,
+        .level0_tables_max = 2,
+        .levels_count = 3,
+        .growth_factor = 8,
+    },
+    .grid_blocks = 1024,
+    .zone_blocks = 64,
+    .cache_blocks = 64,
+};
+
+test "lsm: bulk load of variable values cuts tables by data blocks, then TreeFull" {
+    const Harness = HarnessType(spec_bulk_variable);
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = spec_bulk_variable.engine().size_bytes(),
+        .seed = 41,
+        .latency_ticks_max = 3,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 41, 1500, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0xb01c_0041);
+    try harness.bulk_load(1500);
+    const tree = &harness.tree;
+    const last = spec_bulk_variable.tree.levels_count - 1;
+    var records: u64 = 0;
+    var cut_blocks: u32 = 0;
+    for (tree.level_list(last)) |slot| {
+        const info = &tree.slot_infos[slot];
+        try testing.expect(info.data_block_count <= tree.layout.data_blocks_max);
+        if (info.data_block_count == tree.layout.data_blocks_max) cut_blocks += 1;
+        records += info.record_count;
+    }
+    try testing.expectEqual(@as(u64, 1500), records);
+    try testing.expect(cut_blocks > 0);
+    var index: u32 = 0;
+    while (index < 1500) : (index += 1) try harness.expect_lookup(index, index);
+    try harness.checkpoint_wait();
+    try harness.reinit();
+    _ = try harness.open();
+    // A load past the last level's slots fails, sticky, and still finishes.
+    tree.reset();
+    var load: Harness.Load = .{ .loader = try Harness.Loader.init(testing.allocator, tree) };
+    defer load.loader.deinit(testing.allocator);
+    load.loader.begin();
+    var key: Harness.Key = @splat(0);
+    var value: Harness.Value = @splat(0xab);
+    var failed = false;
+    var appended: u32 = 0;
+    while (appended < 1_000_000 and !failed) : (appended += 1) {
+        std.mem.writeInt(u32, key[0..4], appended, .big);
+        load.loader.append(&key, &value) catch |err| switch (err) {
+            error.Busy => sim.tick(),
+            error.TreeFull, error.NoSpace => failed = true,
+            else => return err,
+        };
+    }
+    try testing.expect(failed and load.loader.stats.busy > 0);
+    load.loader.finish(Harness.Load.on_done);
+    try harness.wait(&load.done);
+    try testing.expect(!tree.bulk_active);
+    _ = load.loader.result catch return;
+    return error.TestExpectedError;
+}
+
+test "lsm: a rotted last-level block is found by get, not by open" {
+    const Harness = HarnessType(spec_bulk);
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = spec_bulk.engine().size_bytes(),
+        .seed = 31,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 31, 3000, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0xb01c_0031);
+    try harness.bulk_load(3000);
+    try harness.checkpoint_wait();
+    const tree = &harness.tree;
+    const last = spec_bulk.tree.levels_count - 1;
+    const slots = tree.level_list(last);
+    try testing.expect(slots.len >= 4);
+    const slot = slots[slots.len / 2];
+    const key_rotten = tree.slot_infos[slot].key_min;
+    const key_healthy = tree.slot_infos[slots[0]].key_max;
+    const address = tree.table_blocks(slot)[1];
+    const rotten: usize = @intCast(harness.engine.grid.?.offset_of(address) + 200);
+    sim.durable[rotten] ^= 0x08;
+    sim.memory[rotten] ^= 0x08;
+    sim.crash();
+    try harness.reinit();
+    // Open does not read the last level: it loads the checkpoint (no fallback, no fault).
+    const reads = sim.stats.reads;
+    const result = try harness.open_engine();
+    try testing.expect(!result.checkpoint_fallback);
+    try testing.expect(!harness.tree.fault);
+    try testing.expectEqual(@as(u32, @intCast(slots.len)), harness.tree.level_count[last]);
+    try testing.expect(sim.stats.reads - reads < 64); // Not one read per loaded block.
+    // The healthy table reads; the rotted block is reported, and faults the tree.
+    try testing.expect(try harness.tree.get(&key_healthy) != null);
+    try testing.expectError(error.Corrupt, harness.tree.get(&key_rotten));
+    try testing.expect(harness.tree.fault);
 }
 
 /// Puts keys `first..first + count` (normal puts or journal replay puts).

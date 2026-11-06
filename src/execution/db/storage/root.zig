@@ -18,6 +18,7 @@ pub const table = @import("table.zig");
 pub const lsm = @import("lsm.zig");
 pub const lsm_filter = @import("lsm_filter.zig");
 pub const lsm_memtable = @import("lsm_memtable.zig");
+pub const lsm_bulk = @import("lsm_bulk.zig");
 pub const engine = @import("engine.zig");
 pub const io_storage = @import("io_storage.zig");
 

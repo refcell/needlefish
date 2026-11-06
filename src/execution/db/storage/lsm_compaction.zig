@@ -7,7 +7,11 @@
 //! ring; the table builder pulls from it one data block per grant, and the job cuts output
 //! tables at `table_records_max` records or at `Layout.data_blocks_max` data blocks (it packs
 //! records into blocks by the builder's own rule, `Table.data_fits`, to know where a block
-//! ends). A flush may so write several level-0 tables.
+//! ends). A flush may so write several level-0 tables. A merge also cuts an output table
+//! once it would overlap more than `growth_factor` tables of the level below its output (the
+//! grandparent level; RocksDB's rule), so a later merge of any one output table into that
+//! level reads a bounded number of tables, even when that level is a bulk-loaded last level
+//! of thousands of tables and the input spans the whole key space.
 //!
 //! The builder's `Source` is synchronous, while input blocks arrive asynchronously, so the
 //! job refills the staging ring (reading input blocks as needed) until it holds a whole
@@ -212,9 +216,48 @@ pub fn WalkerType(comptime Tree: type) type {
     };
 }
 
+/// Where the table builder will put each record of a table (its packing rule,
+/// `Table.data_fits`), so a writer cuts the table at `table_records_max` records or at
+/// `Layout.data_blocks_max` data blocks before the builder pulls the record.
+pub fn PackerType(comptime Tree: type) type {
+    return struct {
+        const Packer = @This();
+
+        records: u32 = 0,
+        /// Data blocks so far, and the last one's records and record bytes.
+        blocks: u32 = 0,
+        block_records: u32 = 0,
+        block_bytes: u32 = 0,
+
+        /// Counts a record of `record_size` bytes (key and value) into the table: in the
+        /// current data block if it fits, else in a new one. False (cut the table before the
+        /// record) when the table is full.
+        pub fn take(packer: *Packer, owner: *const Tree, record_size: u32) bool {
+            assert(packer.blocks <= owner.layout.data_blocks_max);
+            assert(record_size >= Tree.key_bytes);
+            if (packer.records == owner.config.table_records_max) return false;
+            const block_size = owner.config.block_size;
+            const records = packer.block_records;
+            const fits = Tree.Table.data_fits(block_size, packer.block_bytes, records, record_size);
+            if (packer.blocks > 0 and fits) {
+                packer.block_records += 1;
+                packer.block_bytes += record_size;
+            } else {
+                if (packer.blocks == owner.layout.data_blocks_max) return false;
+                packer.blocks += 1;
+                packer.block_records = 1;
+                packer.block_bytes = record_size;
+            }
+            packer.records += 1;
+            return true;
+        }
+    };
+}
+
 pub fn CompactionType(comptime Tree: type) type {
     return struct {
         const Compaction = @This();
+        const Packer = PackerType(Tree);
         const Table = Tree.Table;
         const Key = Tree.Key;
         const Value = Tree.Value;
@@ -246,13 +289,17 @@ pub fn CompactionType(comptime Tree: type) type {
         building: bool = false,
         reservation: Reservation = undefined,
         output_slot: u32 = 0,
-        output_records: u32 = 0,
-        /// The output table's data blocks so far, and the last one's records and bytes, as
-        /// the builder packs them (`block_take`).
-        output_blocks: u32 = 0,
-        output_block_records: u32 = 0,
-        output_block_bytes: u32 = 0,
+        /// The output table's records and data blocks so far, as the builder packs them.
+        packer: Packer = .{},
+        /// Merges: the tables of the level below the output (none for a flush or a merge into
+        /// the last level), the first one the output table overlaps, and how many have a
+        /// `key_min` at or below the last record (`overlap_take`).
+        overlap_slots: []const u32 = &.{},
+        overlap_first: u32 = 0,
+        overlap_end: u32 = 0,
         outputs: []u32,
+        /// The running job's outputs; after an install, the installed job's outputs until the
+        /// next job begins (tests check each table's cut against the level below).
         output_count: u32 = 0,
         acquired: []u64,
         acquired_count: u32 = 0,
@@ -427,8 +474,9 @@ pub fn CompactionType(comptime Tree: type) type {
 
         fn job_begin(self: *Compaction, kind: Kind, level_out: u32) void {
             assert(!self.active and !self.building);
-            assert(self.acquired_count == 0 and self.output_count == 0);
+            assert(self.acquired_count == 0);
             const owner = self.tree();
+            self.output_count = 0;
             self.kind = kind;
             self.level_out = level_out;
             self.active = true;
@@ -438,6 +486,10 @@ pub fn CompactionType(comptime Tree: type) type {
             self.walker_count = 0;
             self.memtable_stream = false;
             self.memtable_cursor = 0;
+            const below = level_out + 1 < self.config.levels_count and kind == .merge;
+            self.overlap_slots = if (below) owner.level_list(level_out + 1) else &.{};
+            self.overlap_first = 0;
+            self.overlap_end = 0;
             // Tombstones go once no level below the output can hold their keys (level 0's
             // other tables overlap, so a flush drops them only into an empty tree).
             var level = level_out + 1;
@@ -461,7 +513,8 @@ pub fn CompactionType(comptime Tree: type) type {
             const owner = self.tree();
             const level_out = level_in + 1;
             const inputs_all = owner.level_list(level_in);
-            assert(inputs_all.len > 0);
+            // An empty level cannot make room below it (the caller then reports a full tree).
+            if (inputs_all.len == 0) return false;
             const inputs = if (level_in == 0)
                 inputs_all
             else
@@ -476,12 +529,24 @@ pub fn CompactionType(comptime Tree: type) type {
             const outputs_max = std.math.divCeil(u64, range.records, table_records) catch
                 unreachable; // table_records_min > 0.
             if (outputs_max + 1 > self.layout.job_record_tables_max) return false;
+            const outputs = outputs_max + self.overlap_cuts_max(level_out, &range);
+            if (outputs + 1 > self.layout.job_tables_max) return false;
             const tables_max = self.layout.tables_max[level_out];
-            if (owner.level_count[level_out] + outputs_max + 1 > tables_max) return false;
+            if (owner.level_count[level_out] + outputs + 1 > tables_max) return false;
             self.job_begin(.merge, level_out);
             if (level_in > 0) owner.compact_cursor[level_in] = range.key_max;
             self.walkers_setup(level_in, inputs, overlap);
             return true;
+        }
+
+        /// Output tables a merge into `level_out` may cut at grandparent overlap: each such
+        /// cut moves `overlap_first` on by at least `growth_factor` of the overlapped tables.
+        fn overlap_cuts_max(self: *Compaction, level_out: u32, range: *const Range) u64 {
+            assert(level_out >= 1);
+            if (level_out + 1 == self.config.levels_count) return 0;
+            const owner = self.tree();
+            _, const count = owner.level_overlap(level_out + 1, &range.key_min, &range.key_max);
+            return count / self.config.growth_factor;
         }
 
         /// The position of the next table of `level_in` to merge, round robin by key.
@@ -670,8 +735,7 @@ pub fn CompactionType(comptime Tree: type) type {
                 assert(self.output_count < self.outputs.len);
                 self.building = true;
                 self.output_slot = owner.slot_acquire(self.level_out);
-                self.output_records = 0;
-                self.output_blocks = 0;
+                self.packer = .{};
                 const source: Table.Source = .{ .context = self, .next = source_next };
                 self.builder.build_paced(source, free_set, &self.reservation, 1, on_built);
             }
@@ -682,7 +746,6 @@ pub fn CompactionType(comptime Tree: type) type {
 
         fn source_next(context: *anyopaque) ?Table.Record {
             const self: *Compaction = @ptrCast(@alignCast(context));
-            if (self.output_records == self.config.table_records_max) return null;
             if (self.staging_count == 0) {
                 assert(self.merge_done);
                 return null;
@@ -690,7 +753,8 @@ pub fn CompactionType(comptime Tree: type) type {
             const capacity: u32 = @intCast(self.staging_keys.len);
             const index = self.staging_head;
             const length = self.staging_lengths[index];
-            if (!self.block_take(Tree.key_bytes + length)) return null;
+            if (!self.overlap_take(&self.staging_keys[index])) return null;
+            if (!self.packer.take(self.tree(), Tree.key_bytes + length)) return null;
             self.staging_head = (self.staging_head + 1) % capacity;
             self.staging_count -= 1;
             self.out_toggle +%= 1;
@@ -698,7 +762,6 @@ pub fn CompactionType(comptime Tree: type) type {
             self.out_keys[slot] = self.staging_keys[index];
             @memcpy(self.out_values[slot][0..length], self.staging_values[index][0..length]);
             self.out_lengths[slot] = length;
-            self.output_records += 1;
             const owner = self.tree();
             owner.stats.records_written += 1;
             if (owner.slot_filter(self.output_slot)) |words| {
@@ -707,26 +770,31 @@ pub fn CompactionType(comptime Tree: type) type {
             return .{ .key = &self.out_keys[slot], .value = self.out_values[slot][0..length] };
         }
 
-        /// Places a record of `record_size` bytes as the builder will: in the current data
-        /// block if it fits, else in a new one. False (cut the table) when the table already
-        /// has `data_blocks_max` data blocks.
-        fn block_take(self: *Compaction, record_size: u32) bool {
-            assert(self.output_blocks <= self.layout.data_blocks_max);
-            assert(record_size >= Tree.key_bytes);
-            const block_size = self.config.block_size;
-            const bytes = self.output_block_bytes;
-            const records = self.output_block_records;
-            const fits = Table.data_fits(block_size, bytes, records, record_size);
-            if (self.output_blocks > 0 and fits) {
-                self.output_block_records += 1;
-                self.output_block_bytes += record_size;
+        /// False (cut the table before `key`) when the output table with `key` would overlap
+        /// more than `growth_factor` tables of the level below the output. A table's first
+        /// record never cuts. If table i is cut at key k (`overlap_end(k) - first_i >
+        /// growth_factor`), table i + 1 starts at k, and its first overlapped table is at least
+        /// `overlap_end(k) - 1` (only that one may reach past k): so cuts move `overlap_first`
+        /// on by at least `growth_factor` each (`overlap_cuts_max`).
+        fn overlap_take(self: *Compaction, key: *const Key) bool {
+            const owner = self.tree();
+            const slots = self.overlap_slots;
+            assert(self.overlap_first <= self.overlap_end or self.packer.records == 0);
+            // Bounded: both cursors only move forward over `slots`.
+            while (self.overlap_end < slots.len) : (self.overlap_end += 1) {
+                const table_info = &owner.slot_infos[slots[self.overlap_end]];
+                if (Table.key_order(&table_info.key_min, key) == .gt) break;
+            }
+            if (self.packer.records == 0) {
+                while (self.overlap_first < slots.len) : (self.overlap_first += 1) {
+                    const table_info = &owner.slot_infos[slots[self.overlap_first]];
+                    if (Table.key_order(&table_info.key_max, key) != .lt) break;
+                }
                 return true;
             }
-            if (self.output_blocks == self.layout.data_blocks_max) return false;
-            self.output_blocks += 1;
-            self.output_block_records = 1;
-            self.output_block_bytes = record_size;
-            return true;
+            if (self.overlap_end - self.overlap_first <= self.config.growth_factor) return true;
+            owner.stats.cuts_overlap += 1;
+            return false;
         }
 
         fn on_paused(builder: *Table.Builder) void {
@@ -780,12 +848,12 @@ pub fn CompactionType(comptime Tree: type) type {
                 owner.immutable_memtable().reset();
                 owner.stats.flushes += 1;
             } else owner.stats.merges += 1;
+            if (self.level_out + 1 == self.config.levels_count) owner.stats.merges_last += 1;
             for (self.outputs[0..self.output_count]) |slot| {
                 owner.level_insert(self.level_out, slot);
             }
             self.active = false;
             self.walker_count = 0;
-            self.output_count = 0;
             self.acquired_count = 0;
             self.memtable_stream = false;
             assert(!self.active and !self.io_pending);

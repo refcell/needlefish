@@ -1084,6 +1084,20 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `lookup` through the shared block cache with its own block buffer, so it may run while an
   async lookup reads. A block that fails to verify returns `error.Corrupt` and sets the sticky
   `fault` (as a lookup does): later reads past the memtables fail too and compaction stops.
+- 2026-11-06: LSM bulk load (disk-state import step 3). `lsm_bulk.BulkLoaderType(Tree)`:
+  push-based `begin` / `append(key, value) Error!void` / `finish(callback)` (+ `poll`) into the
+  last level of an empty tree, cutting tables exactly as compaction does (shared `PackerType`),
+  one-block reservations per write; `error.Busy` = tick the storage. `TreeFull`/`NoSpace` are
+  sticky and leave the unfinished table's blocks acquired: the caller formats again (an import
+  aborts). While loading `Tree.bulk_active` refuses compaction and checkpoints; nothing is
+  durable until the next checkpoint. Landed with it: (a) merges cut an output table once it
+  would overlap more than `growth_factor` tables of the level below the output (RocksDB's
+  grandparent rule); `job_tables_max` adds `ceil(deep tables_max / growth_factor)` for these
+  cuts while the record-based bound (`job_record_tables_max`) still gates a merge. Without it
+  the bulk test panics "the last level is full" (checked). (b) `open_scan` skips the last level
+  (no filter; blocks verified when read); its tables' block lists stay zero until a merge's
+  walker reads their index block, and `level_remove` asserts the list is known. A rotted
+  last-level block is now found by the first `get`/`lookup`/merge (sticky fault), not by open.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as

@@ -26,17 +26,24 @@
 //!   Every level but the last has a split-block Bloom filter per table (`lsm_filter.zig`),
 //!   resident in RAM, so a lookup of an absent key reads at most the last level's block
 //!   (Monkey: most records live in the last level, where a filter costs the most).
+//!   `lookup` is asynchronous (grid reads complete from a storage tick); `get` is the same
+//!   search with blocking grid reads (`Grid.read_sync`), for synchronous callers.
 //!
 //! Compaction (`lsm_compaction.zig`) runs one job at a time (a memtable flush or a level
 //! merge), paced by `compact(blocks)`: each call (one per durable commit) grants a fixed
 //! number of grid block reads and writes, and unused grants do not accumulate. So compaction
 //! IO per commit is bounded and is a pure function of the commit sequence (DST).
 //!
+//! Bulk load (`lsm_bulk.zig`): a sorted stream written straight into the last level of an
+//! empty tree. Merges cut their outputs at grandparent overlap, so later merges into such a
+//! last level of thousands of tables stay bounded.
+//!
 //! Checkpoint (`checkpoint_encode`, in the caller's checkpoint bytes): the table list per
 //! level (the manifest), both memtables (the immutable one only while its flush is pending),
 //! and the blocks the running job acquired ("orphans"). A checkpoint may start at any time:
 //! the job's inputs are still in the manifest and its outputs are not, so open (`open_decode`
-//! + `open_scan`) releases the orphans and the job reruns. Blocks of compacted tables are
+//! + `open_scan`, which reads every level but the last) releases the orphans and the job
+//! reruns. Blocks of compacted tables are
 //! released through the free set, which reuses them only once no retained checkpoint can
 //! name them. Journal replay after open writes through `put_replay`, which may use the
 //! `replay_entries_max` entries that normal puts keep free. A replay can leave the mutable
@@ -107,6 +114,10 @@ pub const Stats = struct {
     busy: u64 = 0,
     /// Synchronous point reads (`get`).
     gets: u64 = 0,
+    /// Merges into the last level.
+    merges_last: u64 = 0,
+    /// Output tables a merge cut at grandparent overlap.
+    cuts_overlap: u64 = 0,
     /// Blocks of an interrupted job that open released.
     orphans_released: u64 = 0,
 };
@@ -232,6 +243,9 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         scan_outcome: ScanOutcome = .loaded,
         /// A table block failed to verify outside open: the tree stops compacting.
         fault: bool = false,
+        /// A bulk load (`lsm_bulk.zig`) is writing the last level: no compaction, no
+        /// checkpoint until it finishes.
+        bulk_active: bool = false,
         /// Called after a compaction job installs (the owner may wait for `checkpoint_ready`).
         install_callback: ?Callback = null,
         stats: Stats = .{},
@@ -467,6 +481,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         pub fn compact(self: *Tree, blocks: u64) void {
             assert(blocks > 0);
             assert(self.free_set != null);
+            assert(!self.bulk_active);
             if (self.mutable_memtable().count >= self.config.flush_entries_min) _ = self.swap();
             if (self.fault) return;
             self.compaction.grant(blocks);
@@ -795,7 +810,13 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             const base = self.layout.slot_base[level];
             const slots = self.level_slots[base..][0 .. self.level_count[level] + 1];
             var position: usize = 0;
-            if (level > 0) {
+            const last = if (slots.len > 1) &self.slot_infos[slots[slots.len - 2]] else null;
+            if (level > 0 and last != null and
+                Table.key_order(&last.?.key_min, &info.key_min) == .lt)
+            {
+                // Appending past the level's last table (a bulk load): no search.
+                position = slots.len - 1;
+            } else if (level > 0) {
                 while (position + 1 < slots.len) : (position += 1) {
                     const other = &self.slot_infos[slots[position]];
                     if (Table.key_order(&other.key_min, &info.key_min) == .gt) break;
@@ -815,7 +836,10 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             self.level_count[level] -= 1;
             self.level_records[level] -= self.slot_infos[slot].record_count;
             if (release) {
-                for (self.table_blocks(slot)) |address| self.free_set.?.release(address);
+                const blocks = self.table_blocks(slot);
+                // The block list is known: written, scanned, or read by the job removing it.
+                assert(blocks[0] == self.slot_infos[slot].index.address);
+                for (blocks) |address| self.free_set.?.release(address);
             }
             self.slot_used[slot] = false;
             assert(self.level_list(level).len == slots.len - 1);
@@ -831,6 +855,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             self.compact_cursor = @splat(@splat(0));
             self.orphan_count = 0;
             self.fault = false;
+            assert(!self.bulk_active);
         }
 
         // Checkpoint: header, level counts, tables, memtable entries, orphans.
@@ -877,6 +902,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         /// right before `checkpoint`, with no tick between). Returns their length.
         pub fn checkpoint_encode(self: *Tree, out: []u8) u32 {
             assert(self.scan_callback == null);
+            assert(!self.bulk_active);
             assert(self.checkpoint_ready());
             const size = self.checkpoint_size();
             assert(out.len >= size);
@@ -931,7 +957,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         }
 
         /// Loads checkpoint bytes into an empty tree (empty bytes: the empty tree). Checks the
-        /// structure only; `open_scan` then reads and verifies every table.
+        /// structure only; `open_scan` then reads and verifies the tables above the last level.
         pub fn open_decode(self: *Tree, bytes: []const u8) error{InvalidCheckpoint}!void {
             assert(!self.compaction.active and !self.lookup_active);
             self.reset();
@@ -1013,6 +1039,8 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
                 }
                 const slot = self.slot_acquire(level);
                 self.slot_infos[slot] = table_info;
+                // Unknown until its index block is read (scan or merge): see `level_remove`.
+                @memset(self.table_blocks(slot), 0);
                 self.level_insert(level, slot);
             }
             assert(self.level_count[level] == count);
@@ -1069,10 +1097,15 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             return Table.key_order(&table_info.key_min, &table_info.key_max) != .gt;
         }
 
-        // Open scan: read and verify every table, rebuild filters, release orphans.
+        // Open scan: read and verify the tables above the last level, rebuild filters, release
+        // orphans.
 
-        /// Reads every table `open_decode` loaded (block checks, every block acquired and not
-        /// released in the loaded free set), rebuilds the filters, then releases the orphans.
+        /// Reads every table `open_decode` loaded above the last level (block checks, every
+        /// block acquired and not released in the loaded free set), rebuilds the filters, then
+        /// releases the orphans. Last-level tables are not read (a restart over hundreds of GB
+        /// must not read them all): a rotted one is found by the first read of its block, which
+        /// reports `error.Corrupt` and faults the tree; their block lists (`table_blocks`) are
+        /// filled by the merge that reads them before it releases them.
         /// The callback fires with `scan_outcome` (at once when there is nothing to read). On
         /// `.corrupt` the caller resumes the engine as corrupt (fallback).
         pub fn open_scan(self: *Tree, callback: Callback) void {
@@ -1090,9 +1123,9 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             while (steps <= levels_max) : (steps += 1) {
                 if (walker.slots.len == 0 or walker.done()) {
                     if (walker.slots.len > 0) self.scan_level += 1;
-                    while (self.scan_level < self.config.levels_count and
+                    while (self.scan_level < self.scan_end() and
                         self.level_count[self.scan_level] == 0) self.scan_level += 1;
-                    if (self.scan_level == self.config.levels_count) return self.scan_finish();
+                    if (self.scan_level == self.scan_end()) return self.scan_finish();
                     walker.start(self, self.level_list(self.scan_level));
                 }
                 var record_steps: u64 = 0;
@@ -1110,6 +1143,13 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
                 return walker.fetch(on_scan_read);
             }
             unreachable; // Every level is reached within the bound.
+        }
+
+        /// The scan stops above the last level: it holds most of the data and has no filter
+        /// to rebuild, and its blocks are verified when read (`get`, `lookup`, merges).
+        fn scan_end(self: *const Tree) u32 {
+            assert(self.config.levels_count >= 2);
+            return self.config.levels_count - 1;
         }
 
         fn on_scan_read(walker: *Compaction.Walker) void {
