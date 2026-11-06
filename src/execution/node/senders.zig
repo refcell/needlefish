@@ -193,13 +193,28 @@ pub const Pipeline = struct {
         recoverer: consensus.Recoverer,
         pool: ?*Pool,
     ) void {
+        pipeline.start_with(raws, out, done, recoverer, pool, parallel_transactions_min);
+    }
+
+    /// `start` waking the workers from `parallel_min` transactions on: a prefetch ahead of
+    /// its block hides the wake-up cost, so it uses the pool for any block.
+    pub fn start_with(
+        pipeline: *Pipeline,
+        raws: []const []const u8,
+        out: []?Address,
+        done: []std.atomic.Value(u32),
+        recoverer: consensus.Recoverer,
+        pool: ?*Pool,
+        parallel_min: usize,
+    ) void {
+        assert(parallel_min > 0);
         assert(out.len == raws.len);
         assert(done.len >= batches_for(raws.len));
         assert(raws.len <= std.math.maxInt(u32) - batch_size);
         for (done[0..batches_for(raws.len)]) |*flag| flag.store(0, .monotonic);
         const job: Job = .{ .raws = raws, .out = out, .done = done, .recoverer = recoverer };
         pipeline.* = .{ .job = job };
-        if (raws.len < parallel_transactions_min) return; // Caller recovers.
+        if (raws.len < parallel_min) return; // Caller recovers.
         const workers = pool orelse return;
         pipeline.pool = workers;
         pipeline.generation = workers.begin(&pipeline.job);

@@ -1020,6 +1020,12 @@ bloom and block decode < 5 each. Recovery batch size 1, 2 and 8 measure the same
 Mgas/s), so 8 stays. No node-owned per-block cost outside the EVM is worth fixing; the
 next wins are in the evm and the replay backend (trie-db / nf-replay).
 
+Prefetched sender recovery: the replayer hands the executor the next block's transactions
+(`Executor.next_transactions`) and their senders are recovered on the pool while the current
+block commits, for any block size (inline recovery skips the pool below 32 transactions,
+which 7 of the 10 fixture blocks are). 3 runs each: **4.99 ms/block (931 Mgas/s) vs
+5.24 ms/block (888 Mgas/s)**, ~5%.
+
 ## 2026-11-06 db storage range for `debug_storageRangeAt` (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `zig build bench -Doptimize=ReleaseFast -- "db/history storage range"`: one account with

@@ -26,6 +26,25 @@ fn address_of(n: u8) [20]u8 {
     return consensus.signature.address_from_private(key(n)).?.bytes;
 }
 
+fn executor_config(state_gas_basis: u64, recovery_threads: u32) executor_module.Config {
+    return .{
+        .scratch_bytes = 1 << 20,
+        .transactions_max = 64,
+        .evm = .{ .memory_bytes_max = 1 << 20, .code_arena_bytes = 1 << 20 },
+        .limits = .{
+            .accounts_max = 256,
+            .slots_max = 1024,
+            .transient_slots_max = 64,
+            .journal_entries_max = 4096,
+            .logs_max = 64,
+            .log_data_bytes_max = 4096,
+            .code_bytes_max = 1 << 16,
+        },
+        .state_gas_basis = state_gas_basis,
+        .recovery_threads = recovery_threads,
+    };
+}
+
 const Fixture = struct {
     db: StateDb,
     executor: Executor,
@@ -50,21 +69,8 @@ const Fixture = struct {
         });
         errdefer fixture.db.deinit(testing.allocator);
         try test_fixture.put_base_time_proxy(&fixture.db, chain_spec);
-        fixture.executor = try Executor.init(testing.allocator, chain_spec, &fixture.db, .{
-            .scratch_bytes = 1 << 20,
-            .transactions_max = 64,
-            .evm = .{ .memory_bytes_max = 1 << 20, .code_arena_bytes = 1 << 20 },
-            .limits = .{
-                .accounts_max = 256,
-                .slots_max = 1024,
-                .transient_slots_max = 64,
-                .journal_entries_max = 4096,
-                .logs_max = 64,
-                .log_data_bytes_max = 4096,
-                .code_bytes_max = 1 << 16,
-            },
-            .state_gas_basis = state_gas_basis,
-        });
+        const config = executor_config(state_gas_basis, 0);
+        fixture.executor = try Executor.init(testing.allocator, chain_spec, &fixture.db, config);
     }
 
     fn deinit(fixture: *Fixture) void {
@@ -676,4 +682,84 @@ fn fuzz_state_limits(_: void, smith: *testing.Smith) anyerror!void {
 
 test "executor: fuzz gas-sized state limits" {
     try testing.fuzz({}, fuzz_state_limits, .{});
+}
+
+/// Blocks of transfers from senders 1-4; `next` prefetches each following block.
+fn prefetch_scenario(seed: u64, threads: u32, prefetch: bool) !struct { [32]u8, u64 } {
+    var prng = Prng.init(seed);
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.executor.deinit(testing.allocator);
+    f.executor = try Executor.init(testing.allocator, spec, &f.db, executor_config(0, threads));
+    for (1..5) |n| try f.db.put_account(address_of(@intCast(n)), eth, 0, &.{});
+    var buffers: [4][12][256]u8 = undefined;
+    var raws: [4][12][]const u8 = undefined;
+    var counts: [4]usize = undefined;
+    var nonces: [5]u64 = @splat(0);
+    for (&counts, 0..) |*count, block| {
+        count.* = prng.range(1, 12);
+        for (raws[block][0..count.*], 0..) |*raw, index| {
+            const from: u8 = @intCast(prng.range(1, 4));
+            const to: [20]u8 = @splat(@intCast(0x30 + prng.below(8)));
+            raw.* = try transfer(&buffers[block][index], from, nonces[from], to, 7, 2);
+            nonces[from] += 1;
+        }
+    }
+    var gas: u64 = 0;
+    var root: [32]u8 = undefined;
+    for (0..4) |block| {
+        const list = raws[block][0..counts[block]];
+        if (prefetch and block + 1 < 4) {
+            // Sometimes a prefetch the next block does not use (a copy): it is cancelled.
+            const next = raws[block + 1][0..counts[block + 1]];
+            f.executor.next_transactions = if (prng.chance(1, 4)) raws[block][0..1] else next;
+        }
+        const executed = try f.executor.execute_block(&block_env(block + 1), list, null);
+        for (executed.senders, list) |sender, raw| {
+            const envelope = try consensus.tx.Envelope.decode(raw);
+            try testing.expect(sender.eql(envelope.recover_sender(consensus.recover_address).?));
+        }
+        gas += executed.gas_used;
+        root = executed.state_root;
+    }
+    return .{ root, gas };
+}
+
+test "executor: prefetched sender recovery matches inline recovery" {
+    for (0..4) |seed| {
+        const inline_root, const inline_gas = try prefetch_scenario(seed, 0, false);
+        const root, const gas = try prefetch_scenario(seed, 2, true);
+        try testing.expectEqualSlices(u8, &inline_root, &root);
+        try testing.expectEqual(inline_gas, gas);
+    }
+}
+
+test "executor: a pending prefetch is cancelled at deinit" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.executor.deinit(testing.allocator);
+    f.executor = try Executor.init(testing.allocator, spec, &f.db, executor_config(0, 2));
+    var buffers: [3][256]u8 = undefined;
+    var raws: [3][]const u8 = undefined;
+    for (&raws, &buffers, 0..) |*raw, *buffer, nonce| {
+        raw.* = try transfer(buffer, 1, nonce, @splat(0x31), 1, 2);
+    }
+    f.executor.prefetch(&raws);
+    try testing.expect(f.executor.prefetched != null);
+    f.executor.cancel_prefetch();
+    try testing.expect(f.executor.prefetched == null);
+    f.executor.prefetch(&raws); // Left pending: `deinit` finishes it.
+}
+
+fn fuzz_prefetch(_: void, smith: *testing.Smith) anyerror!void {
+    const seed = smith.value(u64);
+    const inline_root, _ = try prefetch_scenario(seed, 0, false);
+    const root, _ = try prefetch_scenario(seed, 2, true);
+    try testing.expectEqualSlices(u8, &inline_root, &root);
+}
+
+test "executor: fuzz prefetched recovery" {
+    try testing.fuzz({}, fuzz_prefetch, .{});
 }

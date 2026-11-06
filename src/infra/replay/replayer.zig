@@ -292,8 +292,12 @@ pub const Replayer = struct {
     /// at the first, and replay continues past failed blocks. A block with gaps still fails
     /// with `WitnessIncomplete`.
     probe: bool = false,
-    /// Scratch: the transactions of the block being replayed.
+    /// Scratch: the transactions of the block being replayed and of the next one (two
+    /// halves by block parity), so the executor recovers the next block's senders while
+    /// this one commits.
     transaction_views: [][]const u8,
+    /// The block whose half of `transaction_views` is already filled (prefetched).
+    prefilled: ?u32 = null,
 
     /// The replayer must not move after `init` (the executor's backend points at it).
     pub fn init(
@@ -321,7 +325,8 @@ pub const Replayer = struct {
         const hashes = archive.ancestors_len + archive.block_count;
         self.header_hashes = try allocator.alloc(Hash, hashes);
         errdefer allocator.free(self.header_hashes);
-        self.transaction_views = try allocator.alloc([]const u8, config.executor.transactions_max);
+        const views = 2 * config.executor.transactions_max;
+        self.transaction_views = try allocator.alloc([]const u8, views);
         errdefer allocator.free(self.transaction_views);
         self.executor = try Executor.init_backend(allocator, spec, self.backend(), config.executor);
         errdefer self.executor.deinit(allocator);
@@ -396,11 +401,31 @@ pub const Replayer = struct {
         return outcome;
     }
 
-    fn execute(self: *Replayer, index: u32, header: *const Header, outcome: *Outcome) void {
+    fn views_of(self: *Replayer, index: u32) [][]const u8 {
+        const half = self.transaction_views.len / 2;
         const count = self.archive.transaction_count(index);
-        const transactions = self.transaction_views[0..count];
-        for (transactions, 0..) |*view, position| {
+        assert(count <= half); // `config_for` sizes `transactions_max` to the archive.
+        return self.transaction_views[(index % 2) * half ..][0..count];
+    }
+
+    fn fill_views(self: *Replayer, index: u32) [][]const u8 {
+        const views = self.views_of(index);
+        for (views, 0..) |*view, position| {
             view.* = self.archive.transaction(index, @intCast(position));
+        }
+        return views;
+    }
+
+    fn execute(self: *Replayer, index: u32, header: *const Header, outcome: *Outcome) void {
+        if (self.prefilled != index) {
+            self.executor.cancel_prefetch(); // Its views may be refilled below.
+            _ = self.fill_views(index);
+        }
+        const transactions = self.views_of(index);
+        self.prefilled = null;
+        if (index + 1 < self.archive.block_count) {
+            self.executor.next_transactions = self.fill_views(index + 1);
+            self.prefilled = index + 1;
         }
         // Base blocks carry an empty withdrawals list from Canyon on.
         const withdrawals: ?[]const @import("../../execution/payload/root.zig").Withdrawal =

@@ -173,10 +173,23 @@ pub const Executor = struct {
     recoverer: consensus.Recoverer,
     /// Static sender-recovery workers (`recovery_threads` of them); null recovers inline.
     recovery_pool: ?*senders_module.Pool,
-    /// Senders recovered up front by `execute_block` (one per transaction).
+    /// Senders recovered up front by `execute_block` (one per transaction): the current
+    /// pipeline slot's part of `senders_slots`.
     senders: []?primitives.Address,
-    /// Per-batch completion flags of the recovery pipeline.
+    /// Per-batch completion flags of the current pipeline slot.
     recovery_done: []std.atomic.Value(u32),
+    /// Two recovery slots (current block, prefetched next block), each `transactions_max`
+    /// senders and their batch flags. Pipelines stay in place: the pool points at them.
+    senders_slots: []?primitives.Address,
+    done_slots: []std.atomic.Value(u32),
+    pipelines: [2]senders_module.Pipeline = undefined,
+    slot: u1 = 0,
+    /// The next block's transactions, set by a caller that knows them (a replayer) before
+    /// `execute_block`: their senders are recovered while this block commits. They must
+    /// stay valid until the next `execute_block` or `deinit`.
+    next_transactions: ?[]const []const u8 = null,
+    /// Transactions whose recovery runs in the other slot ahead of their block.
+    prefetched: ?[]const []const u8 = null,
     /// The sender of the transaction being applied, when already known.
     known_sender: ?primitives.Address = null,
     /// Senders the caller vouches for, one per transaction of the next `apply_list` (the
@@ -225,10 +238,10 @@ pub const Executor = struct {
         assert(config.recovery_threads <= senders_module.threads_max);
         const scratch = try lazy.alloc(allocator, u8, config.scratch_bytes);
         errdefer lazy.free(allocator, scratch);
-        const senders = try allocator.alloc(?primitives.Address, config.transactions_max);
+        const senders = try allocator.alloc(?primitives.Address, 2 * config.transactions_max);
         errdefer allocator.free(senders);
         const batches = senders_module.batches_for(config.transactions_max);
-        const recovery_done = try allocator.alloc(std.atomic.Value(u32), batches);
+        const recovery_done = try allocator.alloc(std.atomic.Value(u32), 2 * batches);
         errdefer allocator.free(recovery_done);
         const threads = config.recovery_threads;
         const pool = if (threads > 0) try senders_module.Pool.create(allocator, threads) else null;
@@ -242,8 +255,10 @@ pub const Executor = struct {
             .transactions_max = config.transactions_max,
             .recoverer = consensus.recover_address,
             .recovery_pool = pool,
-            .senders = senders,
-            .recovery_done = recovery_done,
+            .senders = senders[0..config.transactions_max],
+            .recovery_done = recovery_done[0..batches],
+            .senders_slots = senders,
+            .done_slots = recovery_done,
             .allocator = allocator,
             .limits = config.limits,
             .state_gas = config.state_gas_basis,
@@ -251,9 +266,10 @@ pub const Executor = struct {
     }
 
     pub fn deinit(executor: *Executor, allocator: std.mem.Allocator) void {
+        executor.cancel_prefetch();
         if (executor.recovery_pool) |pool| pool.destroy(allocator);
-        allocator.free(executor.senders);
-        allocator.free(executor.recovery_done);
+        allocator.free(executor.senders_slots);
+        allocator.free(executor.done_slots);
         lazy.free(allocator, executor.scratch);
         executor.machine.deinit(allocator);
         allocator.destroy(executor.machine);
@@ -271,11 +287,70 @@ pub const Executor = struct {
         withdrawals: ?[]const payload.Withdrawal,
     ) Error!Executed {
         executor.invalid_index = null;
+        const next = executor.next_transactions;
+        executor.next_transactions = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
         var building = try executor.begin_block(block);
         errdefer executor.abort_block();
         try executor.apply_list(&building, transactions);
+        // This block's recovery is over: the pool takes the next block's while it commits.
+        if (next) |transactions_next| executor.prefetch(transactions_next);
         return executor.finish_block(&building, withdrawals);
+    }
+
+    /// Starts recovering `transactions` (a later block's) in the free slot.
+    pub fn prefetch(executor: *Executor, transactions: []const []const u8) void {
+        executor.cancel_prefetch();
+        if (executor.recovery_pool == null) return;
+        if (transactions.len <= 1 or transactions.len > executor.transactions_max) return;
+        const slot: u1 = executor.slot +% 1;
+        const senders, const done = executor.slot_buffers(slot);
+        const pipeline = &executor.pipelines[slot];
+        const pool = executor.recovery_pool;
+        const out = senders[0..transactions.len];
+        pipeline.start_with(transactions, out, done, executor.recoverer, pool, 1);
+        executor.prefetched = transactions;
+        assert(executor.prefetched != null);
+    }
+
+    /// Finishes a prefetch no block adopted (its senders are dropped); afterwards the
+    /// prefetched transactions may change.
+    pub fn cancel_prefetch(executor: *Executor) void {
+        if (executor.prefetched == null) return;
+        executor.pipelines[executor.slot +% 1].finish();
+        executor.prefetched = null;
+    }
+
+    fn slot_buffers(
+        executor: *Executor,
+        slot: u1,
+    ) struct { []?primitives.Address, []std.atomic.Value(u32) } {
+        const count = executor.transactions_max;
+        const batches = executor.done_slots.len / 2;
+        const senders = executor.senders_slots[@as(usize, slot) * count ..][0..count];
+        return .{ senders, executor.done_slots[@as(usize, slot) * batches ..][0..batches] };
+    }
+
+    /// The pipeline recovering `transactions`: the prefetched one when it matches (moved to
+    /// the current slot), else a new one in the current slot.
+    fn pipeline_for(
+        executor: *Executor,
+        transactions: []const []const u8,
+    ) *senders_module.Pipeline {
+        if (executor.prefetched) |raws| {
+            if (raws.ptr == transactions.ptr and raws.len == transactions.len) {
+                executor.prefetched = null;
+                executor.slot +%= 1;
+                executor.senders, executor.recovery_done = executor.slot_buffers(executor.slot);
+                return &executor.pipelines[executor.slot];
+            }
+            executor.cancel_prefetch();
+        }
+        const pipeline = &executor.pipelines[executor.slot];
+        const senders = executor.senders[0..transactions.len];
+        const pool = executor.recovery_pool;
+        pipeline.start(transactions, senders, executor.recovery_done, executor.recoverer, pool);
+        return pipeline;
     }
 
     /// Applies `transactions` in order, failing on the first error (its index is in
@@ -294,13 +369,9 @@ pub const Executor = struct {
         if (given) |senders| assert(senders.len == transactions.len);
         const recovered = given == null and executor.recovery_pool != null and
             transactions.len > 1;
-        var pipeline: senders_module.Pipeline = undefined;
-        if (recovered) {
-            const senders = executor.senders[0..transactions.len];
-            const pool = executor.recovery_pool;
-            const done = executor.recovery_done;
-            pipeline.start(transactions, senders, done, executor.recoverer, pool);
-        }
+        // The pool runs one job: a prefetch for other transactions retires first.
+        if (!recovered) executor.cancel_prefetch();
+        const pipeline = if (recovered) executor.pipeline_for(transactions) else undefined;
         defer if (recovered) pipeline.finish();
         defer executor.known_sender = null;
         for (transactions, 0..) |raw, index| {
