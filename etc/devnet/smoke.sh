@@ -112,13 +112,18 @@ until_ok "deposit credited on sequencer and verifier" deposited
 ok "deposit credited on L2"
 
 # 5. Load: a short seeded load test from dev accounts 2-4 (no devnet role uses them) must
-# confirm every transaction it submits (infra-tools lane, `base load-test`).
+# confirm every transaction it submits without a revert (infra-tools lane, `base load-test`).
+# Dev account 8 first deploys the workload contracts (token, storage writer, looper).
 load=$("$BASE" load-test --rpc-url "$SEQ" --chain-id "$L2_CHAIN_ID" --rate 20 --duration-s 5 \
-  --drain-s 30 --accounts 2,3,4 --mix transfer=70,calldata=30 2>&1) || fail "load test: $load"
+  --drain-s 30 --accounts 2,3,4 --funder-index 8 \
+  --mix transfer=40,calldata=20,erc20_transfer=10,storage=10,precompile=10,looper=10 \
+  --looper-iterations 1000 2>&1) || fail "load test: $load"
 submitted=$(echo "$load" | awk '/^submitted/ {print $2}')
 confirmed=$(echo "$load" | awk '/^confirmed/ {print $2}')
-[ -n "$submitted" ] && [ "$submitted" -gt 0 ] && [ "$submitted" = "$confirmed" ] ||
-  fail "load test confirmed $confirmed of $submitted: $load"
+reverted=$(echo "$load" | awk '/^reverted/ {print $2}')
+[ -n "$submitted" ] && [ "$submitted" -gt 0 ] && [ "$submitted" = "$confirmed" ] &&
+  [ "$reverted" = 0 ] ||
+  fail "load test confirmed $confirmed of $submitted ($reverted reverted): $load"
 ok "load test: $confirmed/$submitted confirmed, $(echo "$load" | grep '^latency' | tr -s ' ')"
 
 echo "smoke: all checks passed"
