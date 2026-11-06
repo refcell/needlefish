@@ -39,6 +39,7 @@ test {
     _ = @import("memory_fuzz.zig");
     _ = @import("call_fuzz.zig");
     _ = @import("sstore_fuzz.zig");
+    _ = @import("create_fuzz.zig");
     _ = @import("tx_check.zig");
 }
 

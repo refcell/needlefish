@@ -152,6 +152,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `headers.json` (now loaded), and prestateTracer lists a nonexistent EIP-7702 authority as
   an empty account, which must not be loaded (it would earn the 12500 existing-account
   refund).
+  Audit 4: the full 100-block window 53715983-53716082 (the last 21 blocks fetched into
+  `~/.cache/needlefish/replay-raw-evm`): 1745/1745.
 - [x] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const evm.Tracer`
   (null: one branch per frame). `enter(TraceFrame{kind: call|callcode|delegatecall|
   staticcall|create|create2|selfdestruct, from, to, value, gas, input, depth})` is matched by
@@ -164,8 +166,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   three slots with random originals; exact gas used and raw refund counter vs an
   EIP-2200/2929/3529 model at Osaka; catches a 1-wei refund change). The 2300 stipend
   check stays covered by the state tests.
-- [ ] Fuzz: CREATE/CREATE2 address derivation, init-code limits (EIP-3860), collision
-  rules, and code-deposit gas against a model.
+- [x] Fuzz: CREATE/CREATE2 (`create_fuzz.zig`: address derivation with random nonce and
+  salt; EIP-3541 0xef prefix, EIP-684 collision, EIP-170 runtime limit, EIP-3860 init-code
+  limit halting the creator; returned word, installed code, creator nonce). Deposit gas
+  stays covered by the state tests.
 - [ ] Performance: a block-sized transaction bench (1000 mixed transfers and erc20 calls
   through `transaction.transact` without per-tx state reset) to profile the tx envelope.
 - [x] Performance: account map — `start_call` reuses the parent frame's account for the
