@@ -121,7 +121,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   direct dirty-branch encoding, digest-keyed maps; storage-heavy build 16.1 -> 10.8 ms,
   replay 9.6 -> 6.4 ms under load; docs/PERF.md "db witness: sparse apply without
   re-decoding")
-- [ ] The sparse apply is now keccak-bound: ~32% of the storage-heavy verified build is the
+- [ ] (handed to the crypto lane: `common/crypto/keccak.zig`) The sparse apply is now keccak-bound: ~32% of the storage-heavy verified build is the
   rehash of ~15k dirty nodes (two lanes per `keccak256_batch` on NEON) and ~13% is `resolve`
   (branch scan + first touch of each preimage). Options: a wider software batch on aarch64
   (4 lanes over two NEON registers), or skip the post-root rehash where a caller only needs
@@ -862,6 +862,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (needs node integration and a cache of per-block inputs; the head is already 28 ms of a
   200 ms slot). `json.Writer.data` encodes hex 16 bytes per vector step straight into the
   response buffer (`json.write_hex`), byte-identical to the per-byte loop it replaced.
+- Keccak-bound items go to the crypto lane: a 4-lane `@Vector(4, u64)` batch on 128-bit NEON
+  needs ~50 vector registers for the 25-lane state (32 available) and likely spills; the real
+  win is ARMv8.2 SHA3 (EOR3/BCAX/RAX1/XAR), a consensus-critical change to their file.
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
