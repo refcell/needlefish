@@ -109,6 +109,13 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-05: demo (`docs/assets/demo.{mp4,gif}`, in the README): raw Ghostty recording of
+  `just replay` on an empty cache, blocks 53741014..53741023, 172 txs, 10/10, 0 gap rounds.
+- 2026-11-05: decision: some `eth_getProof` servers also list a node shorter than 32 bytes
+  that its parent inlines; the importer drops such nodes (past the root) instead of
+  loosening the shared verifier. Found on blocks 53734749..53734758.
+- 2026-11-05: `fill.py` and `fetch_raw.py` are retired; `base replay fetch` does both.
+
 - 2026-11-05: `just replay` end to end from an empty cache: latest blocks
   53731432..53731441 (150 txs) fetched in 80 s with one gap round, 10/10 reproduce.
 - 2026-11-05: fixture lives in `src/infra/replay/testdata/` (not `etc/replay/fixtures/`):
