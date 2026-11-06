@@ -159,6 +159,8 @@ pub const Journal = struct {
     context: *anyopaque,
     commit_block: *const fn (context: *anyopaque, block: *const JournalBlock) JournalError!void,
     move_head: *const fn (context: *anyopaque, hash: Hash) JournalError!void,
+    /// Holds checkpoints while the shared state holds an unjournaled block (`pending`).
+    hold_checkpoints: *const fn (context: *anyopaque, held: bool) void,
     /// Execution witness of a stored canonical block, with the state moved in memory only
     /// (`node/witness.zig`); null when the journal cannot produce one.
     witness: ?*const fn (
@@ -269,6 +271,9 @@ pub const Chain = struct {
     store: block_store.BlockStore,
     pool: ?*txpool.Pool = null,
     journal: ?Journal = null,
+    /// Durable mode: the stored block whose changes the state holds but the journal does
+    /// not yet (executed, not yet adopted). See `flush_pending`.
+    pending: ?Hash = null,
     /// Historical proofs window following the executed state (`attach_history`).
     history: ?*history_module.Store = null,
     /// Times the window was rebuilt from scratch (reorgs, moves, full store).
@@ -420,7 +425,6 @@ pub const Chain = struct {
             chain.db.rollback() catch unreachable;
             return .{ .invalid = @errorName(err) };
         };
-        chain.settle_head();
         return .valid;
     }
 
@@ -451,7 +455,6 @@ pub const Chain = struct {
             else => return error.InternalError,
         };
         chain.remember_build(entry);
-        chain.settle_head();
     }
 
     fn remember_build(chain: *Chain, entry: Built) void {
@@ -669,9 +672,10 @@ pub const Chain = struct {
             try chain.encode_record(child, transactions, withdrawals, receipts, executed.requests);
         try chain.store.put(ref_of(child, hash), bytes);
         if (chain.journal) |journal| {
-            // A failure leaves the record stored but unexecuted; the caller rolls back.
-            const entry = journal_block(child, hash, chain.store.record(hash).?, chain.db);
-            journal.commit_block(journal.context, &entry) catch return error.StateUnavailable;
+            // Journaled when adopted or built upon (`flush_pending`); a crash drops it.
+            assert(chain.pending == null); // Flushed by the `move_state` to its parent.
+            chain.pending = hash;
+            journal.hold_checkpoints(journal.context, true);
         }
         for (transactions, 0..) |raw, index| chain.index_transaction(raw, hash, @intCast(index));
         chain.state_hash = hash;
@@ -886,20 +890,26 @@ pub const Chain = struct {
     /// Brings `db` to the post-state of `target`: roll back to the common ancestor with
     /// the current state, then re-execute stored blocks up to `target`. Checks first, so
     /// a failure leaves the state where it was.
-    /// Durable mode: the database head is the forkchoice head at rest, so a restart
-    /// resumes there (as reth restores its persisted canonical head) and never on a block
-    /// that was built or imported but not made canonical. A stored non-head block's
-    /// changeset is unwound now and re-applied when a forkchoice update adopts it. A failed
-    /// move keeps the state where it is (best effort; the next state move retries).
-    fn settle_head(chain: *Chain) void {
-        if (chain.journal == null) return;
-        const head = chain.forkchoice.head_block_hash.bytes;
-        if (std.mem.eql(u8, &chain.state_hash, &head)) return;
-        chain.move_state(head) catch return;
-        assert(std.mem.eql(u8, &chain.state_hash, &head));
+    /// Durable mode: an executed block is journaled only when a state move needs it (a
+    /// forkchoice update adopting it, a child built or imported on it, or a move away from
+    /// it), so the database head is never a block nobody adopted: a restart resumes on the
+    /// forkchoice head (as reth persists only canonical blocks) and a crash drops the
+    /// block. Adopting the block costs one journal entry and no state movement. A failure
+    /// keeps it pending (the state and journal unchanged) for the next move to retry.
+    pub fn flush_pending(chain: *Chain) Error!void {
+        const hash = chain.pending orelse return;
+        const journal = chain.journal.?;
+        assert(std.mem.eql(u8, &chain.state_hash, &hash));
+        const child = chain.header(hash).?;
+        const entry = journal_block(&child, hash, chain.store.record(hash).?, chain.db);
+        journal.commit_block(journal.context, &entry) catch return error.StateUnavailable;
+        chain.pending = null;
+        journal.hold_checkpoints(journal.context, false);
+        assert(chain.pending == null);
     }
 
     pub fn move_state(chain: *Chain, target: Hash) Error!void {
+        try chain.flush_pending();
         if (std.mem.eql(u8, &target, &chain.state_hash)) return;
         if (chain.journal) |journal| {
             // The journal unwinds/applies stored changesets on the shared state.

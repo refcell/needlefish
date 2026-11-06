@@ -62,6 +62,8 @@ fn witness_from_state(chain: *Chain, generator: *Generator, stored: Record, hash
     }
     const root = if (chain.journal) |journal| blk: {
         const hook = journal.witness orelse return error.StateUnavailable;
+        // The hook moves the state relative to the journal's head: journal first.
+        chain.flush_pending() catch return error.StateUnavailable;
         break :blk try hook(journal.context, generator, hash, execute);
     } else try memory_witness(chain, generator, number, execute);
     if (!std.mem.eql(u8, &root, &stored.header.state_root.bytes)) {

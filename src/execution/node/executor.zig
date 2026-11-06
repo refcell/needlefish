@@ -135,7 +135,8 @@ pub const Executor = struct {
     arena: std.heap.FixedBufferAllocator,
     transactions_max: u32,
     recoverer: consensus.Recoverer,
-    recovery_threads: u32,
+    /// Static sender-recovery workers (`recovery_threads` of them); null recovers inline.
+    recovery_pool: ?*senders_module.Pool,
     /// Senders recovered up front by `execute_block` (one per transaction).
     senders: []?primitives.Address,
     /// Per-batch completion flags of the recovery pipeline.
@@ -178,6 +179,9 @@ pub const Executor = struct {
         errdefer allocator.free(senders);
         const batches = senders_module.batches_for(config.transactions_max);
         const recovery_done = try allocator.alloc(std.atomic.Value(u32), batches);
+        errdefer allocator.free(recovery_done);
+        const threads = config.recovery_threads;
+        const pool = if (threads > 0) try senders_module.Pool.create(allocator, threads) else null;
         return .{
             .spec = spec,
             .backend = backend,
@@ -187,13 +191,14 @@ pub const Executor = struct {
             .arena = std.heap.FixedBufferAllocator.init(scratch),
             .transactions_max = config.transactions_max,
             .recoverer = consensus.recover_address,
-            .recovery_threads = config.recovery_threads,
+            .recovery_pool = pool,
             .senders = senders,
             .recovery_done = recovery_done,
         };
     }
 
     pub fn deinit(executor: *Executor, allocator: std.mem.Allocator) void {
+        if (executor.recovery_pool) |pool| pool.destroy(allocator);
         allocator.free(executor.senders);
         allocator.free(executor.recovery_done);
         lazy.free(allocator, executor.scratch);
@@ -232,13 +237,13 @@ pub const Executor = struct {
             return error.TooManyTransactions;
         }
         assert(executor.known_sender == null);
-        const recovered = executor.recovery_threads > 0 and transactions.len > 1;
+        const recovered = executor.recovery_pool != null and transactions.len > 1;
         var pipeline: senders_module.Pipeline = undefined;
         if (recovered) {
             const senders = executor.senders[0..transactions.len];
-            const threads = executor.recovery_threads;
+            const pool = executor.recovery_pool;
             const done = executor.recovery_done;
-            pipeline.start(transactions, senders, done, executor.recoverer, threads);
+            pipeline.start(transactions, senders, done, executor.recoverer, pool);
         }
         defer if (recovered) pipeline.finish();
         defer executor.known_sender = null;

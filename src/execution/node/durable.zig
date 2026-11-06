@@ -219,6 +219,7 @@ pub fn Durable(comptime Storage: type) type {
                 .context = self,
                 .commit_block = commit_block,
                 .move_head = move_head,
+                .hold_checkpoints = hold_checkpoints,
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
                 .proofs = if (self.database.history != null) proofs else null,
@@ -316,6 +317,10 @@ pub fn Durable(comptime Storage: type) type {
             };
             _ = self.database.commit_applied(&input) catch |err| return map_error(err);
             assert(std.mem.eql(u8, &self.database.head_info.hash, &block.hash));
+        }
+
+        fn hold_checkpoints(context: *anyopaque, held: bool) void {
+            from(context).database.hold_checkpoints(held);
         }
 
         fn move_head(context: *anyopaque, hash: Hash) chain_module.JournalError!void {

@@ -204,24 +204,56 @@ test "durable: a restart resumes on the forkchoice head, not an unadopted block"
     const first = try h.build_head(h.head(), 12, 0xfe);
     const root = try h.node.?.db.root();
     // Built (getPayload) but never adopted by a forkchoice update: the sequencer crashed
-    // in between. The state is already back on the head.
+    // in between. The block was never journaled; checkpoints wait for it.
     try fixture.submit(h.node.?, 1, 1, 7, &buffers[1]);
+    try h.settle();
+    const database = &h.durable.database;
+    const sequence = database.submitted_sequence;
     const orphan = try fixture.build(h.node.?, first, 24, 0xfe);
-    try testing.expectEqualSlices(u8, &first.bytes, &h.node.?.chain.state_hash);
-    try testing.expectEqualSlices(u8, &root, &(try h.node.?.db.root()));
+    try testing.expectEqualSlices(u8, &orphan.bytes, &h.node.?.chain.state_hash);
+    try testing.expectEqualSlices(u8, &orphan.bytes, &h.node.?.chain.pending.?);
+    try testing.expectEqual(sequence, database.submitted_sequence);
+    try testing.expect(database.checkpoints_held);
     try h.settle();
     try h.crash_and_reopen();
     try testing.expectEqualSlices(u8, &first.bytes, &h.head().bytes);
     try testing.expectEqualSlices(u8, &root, &(try h.node.?.db.root()));
     try testing.expect(h.node.?.chain.store.ref(orphan.bytes) == null);
-    // Adopting a built block re-applies it; that head survives a restart.
+    // Adopting a built block costs one journal entry; that head survives a restart.
+    const reopened = &h.durable.database;
     const second = try fixture.build(h.node.?, first, 24, 0xfd);
-    try testing.expectEqualSlices(u8, &first.bytes, &h.node.?.chain.state_hash);
+    const before = reopened.submitted_sequence;
     const version = @import("../engine/root.zig").types.forkchoice_version(fixture.spec, 24);
     _ = try h.node.?.engine.forkchoice_updated(version, fixture.forkchoice(second), null);
+    try testing.expectEqual(before + 1, reopened.submitted_sequence);
+    try testing.expect(h.node.?.chain.pending == null and !reopened.checkpoints_held);
     try h.settle();
     try h.crash_and_reopen();
     try testing.expectEqualSlices(u8, &second.bytes, &h.head().bytes);
+}
+
+test "durable: reads during a pending block journal it and serve the head" {
+    const h = try Harness.create(6);
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    const genesis_hash = h.head();
+    const genesis_root = try h.node.?.db.root();
+    try fixture.submit(h.node.?, 1, 0, 5, &buffer);
+    const built = try fixture.build(h.node.?, genesis_hash, 12, 0xfe);
+    const chain = &h.node.?.chain;
+    try testing.expectEqualSlices(u8, &built.bytes, &chain.pending.?);
+    // A head-state read moves back to the forkchoice head through the journal.
+    try chain.ensure_head_state();
+    try testing.expect(chain.pending == null and !h.durable.database.checkpoints_held);
+    try testing.expectEqualSlices(u8, &genesis_hash.bytes, &chain.state_hash);
+    try testing.expectEqualSlices(u8, &genesis_root, &(try h.node.?.db.root()));
+    // Adopting it later re-applies the stored changeset.
+    const version = @import("../engine/root.zig").types.forkchoice_version(fixture.spec, 12);
+    _ = try h.node.?.engine.forkchoice_updated(version, fixture.forkchoice(built), null);
+    try testing.expectEqualSlices(u8, &built.bytes, &chain.state_hash);
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &built.bytes, &h.head().bytes);
 }
 
 test "durable: a reorg moves the shared state through stored changesets" {

@@ -14,6 +14,7 @@ const Case = @import("../../testing/bench.zig").Case;
 const StateDb = @import("state_db.zig").StateDb;
 const executor_module = @import("executor.zig");
 const Executor = executor_module.Executor;
+const senders = @import("senders.zig");
 
 const transfers = 500;
 const transfer_gas: u64 = 21_000;
@@ -95,8 +96,13 @@ fn run_execute(iterations: u32) u64 {
 fn run_execute_parallel(iterations: u32) u64 {
     const s = setup();
     const cpus: u32 = @intCast(std.Thread.getCpuCount() catch 1);
-    s.executor.recovery_threads = @min(cpus -| 1, 7);
-    defer s.executor.recovery_threads = 0;
+    const allocator = std.heap.page_allocator;
+    const pool = senders.Pool.create(allocator, @min(cpus -| 1, 7)) catch @panic("bench: pool");
+    s.executor.recovery_pool = pool;
+    defer {
+        s.executor.recovery_pool = null;
+        pool.destroy(allocator);
+    }
     return run_execute(iterations);
 }
 

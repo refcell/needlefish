@@ -50,6 +50,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).
 - [x] rpc: eth_simulateV1 (multi-block, state/block overrides, fee-free; see Log).
 - [ ] Performance: parallel sender recovery, prefetching, pipelined execution; gigagas/s target.
+- [ ] rpc: eth_call/estimateGas default gas capped to the EIP-7825 tx gas cap (2^24) post-Osaka
+  (reth `RPC_DEFAULT_GAS_CAP` min tx cap); `base basectl denim` hit gas_cap_exceeded.
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
 - [x] rpc: filters (eth_newFilter/newBlockFilter/newPendingTransactionFilter,
@@ -86,6 +88,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: Durable mode no longer unwinds and re-applies every built/imported block (dst-fuzz: 3 journal entries per block, sequencer lag in the sim). An executed block stays `Chain.pending` (state holds it, journal does not) until a state move needs it: the adopting FCU journals it (one entry, no state movement), a child or a move away journals it first, a crash drops it (reth persists only canonical blocks). Shared-file edit (db): `Database.hold_checkpoints`, since a checkpoint snapshot would capture the unjournaled state; `Journal.hold_checkpoints` wires it.
+- 2026-11-05: Sender recovery uses a static `senders.Pool` (futex workers spawned once, generation-tagged batch claims, as `trie/rehash_pool.zig`) instead of spawning threads per block; a failed spawn only lowers parallelism. Bench gain is within this machine's noise (shared with other builds), but it removes the per-block spawns that showed as 6% of main-thread samples.
 - 2026-11-05: eth_sendRawTransactionSync (`rpc/send_sync.zig`). The router stays synchronous: the handler submits and records the hash in `Api.sync`; `handle_rpc` parks the connection (`defer_response`) in a 64-slot waiter table swept every 10 ms; answers with the canonical receipt, or error 4 with the hash as data (EIP-7966, reth message). Max wait 25 s (reth: 30 s), under the HTTP server's 30 s parked-connection timeout; a positive `timeoutMs` (number or quantity) only shortens it. Refused before submission in a batch, with an id over 64 bytes, or when the table is full; notifications are submitted, not parked.
 - 2026-11-05: Denim RPC timestamps as base/base `rpc-types`: blocks get `timestampMs`, transactions and logs (incl. receipt logs, eth_getLogs) get `blockTimestampMs`, from the validated tx[1] BaseTime deposit (`format.timestamp_ms`), omitted otherwise. Not ported: base/base's 256-entry LRU (decoding tx[1] per request is cheap) and pending-block timestamps (no pending block here).
 - 2026-11-05: (reported by dst-fuzz) durable restart resumed on the last executed block, not the forkchoice head. Fix: `Chain.settle_head` keeps the database head at the forkchoice head at rest in durable mode. After a payload build (`start_build`) or a valid newPayload stores a non-head block, its changeset is unwound immediately; the adopting FCU re-applies it. Side builds (`build_block`, debug_executePayload/witness) keep the state at the built block as before. Safe/finalized labels are still not persisted (no database label API); recorded for later.

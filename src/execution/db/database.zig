@@ -361,6 +361,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         journal_bytes_pending: u64 = 0,
         in_flight_bytes: u64 = 0,
         checkpoint_wanted: bool = false,
+        /// Set while the caller's State holds changes not yet journaled (an executed block
+        /// awaiting adoption): a checkpoint snapshot then would capture them. Wanted
+        /// checkpoints start when released.
+        checkpoints_held: bool = false,
         checkpoints_completed: u64 = 0,
         checkpoint_error: ?anyerror = null,
         retained_bytes: u64 = 0,
@@ -748,6 +752,13 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(std.mem.eql(u8, &self.head_info.hash, &block.hash));
             const body = encode_block_and_head(block, self.queue_slot());
             return self.queue_push(@intCast(body.len));
+        }
+
+        /// Holds (or releases) checkpoint starts; see `checkpoints_held`.
+        pub fn hold_checkpoints(self: *Self, held: bool) void {
+            assert(self.checkpoints_held != held);
+            self.checkpoints_held = held;
+            if (!held and self.phase == .ready) self.checkpoint_maybe_start();
         }
 
         /// Asks for a checkpoint; it starts once the queue drains.
@@ -1191,6 +1202,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         fn checkpoint_maybe_start(self: *Self) void {
             if (!self.checkpoint_wanted or self.phase != .ready) return;
+            if (self.checkpoints_held) return;
             if (self.queue_count > 0 or self.engine.commit_callback != null) return;
             if (self.engine.checkpoint_phase != .idle) return;
             self.checkpoint_wanted = false;
