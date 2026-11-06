@@ -1,11 +1,11 @@
 # Lane: replay
 
-Owns `src/execution/replay/*` (or `src/infra/replay`, decide), the `base replay`
+Owns `src/infra/replay/*`, the `base replay`
 subcommand, `etc/replay/`, the `just replay` recipes, `docs/REPLAY.md`, and the README demo
 (`docs/assets/demo.*`).
 
-Goal: **prove needlefish executes real Base mainnet blocks correctly.** Fetch the last
-10-100 Base mainnet blocks plus a stateless witness of the state they touch, then replay
+Goal: **prove needlefish executes real Base mainnet blocks correctly.** Fetch 10 recent
+Base mainnet blocks plus a stateless witness of the state they touch, then replay
 them offline through needlefish's executor and check every block's state root, receipts
 root, gas used, and block hash against the canonical headers. Show it in a TUI, record a
 raw Ghostty demo with subtitles, and put it near the top of the README.
@@ -62,10 +62,14 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   `[![needlefish replaying Base mainnet blocks](docs/assets/demo.gif)](docs/assets/demo.mp4)`.
 
 ## Backlog
-- [ ] Witness fetcher (`base replay fetch`) with caching, batching, backoff, archive format.
-- [ ] Offline replayer (`base replay run`): partial-trie state, executor, root checks,
-  first-difference diagnostics.
-- [ ] Pass on 10 consecutive recent Base mainnet blocks; then 100.
+- [x] Archive format (`NFRP`, canonical body, strict decoder, seeded fuzz).
+- [x] Offline replayer (`base replay run`): partial-trie state, executor, root checks,
+  first-difference diagnostics, gap report.
+- [x] `base replay import <raw dir>`: archive from saved JSON-RPC results, every byte bound
+  to the chain; collapse siblings derived from post-state proofs.
+- [x] Pass on 10 consecutive Base mainnet blocks (53715983..53715992).
+- [ ] Witness fetcher (`base replay fetch`, default count 10): RPC, caching, backoff, and
+  the gap-fill loop (system-call contracts, precompiles, message passer).
 - [ ] TUI + plain mode.
 - [ ] `just replay` recipes, `docs/REPLAY.md`, fixture + unit test if small enough.
 - [ ] Demo recording with burned-in subtitles; README embed near the top.
@@ -73,9 +77,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Decisions
 
-- 2026-11-05: code lives in `src/execution/replay/` (library, pure, no IO) and
-  `bin/base/replay.zig` (RPC + files + TUI driver). It sits next to the executor and
-  `db/witness.zig` it drives.
+- 2026-11-05: code lives in `src/infra/replay/` (library, pure, no IO; it imports the
+  consensus JSON decoders, so it cannot sit under `execution/`) and `bin/base/replay.zig`
+  (RPC + files + TUI driver).
 - 2026-11-05: no public endpoint serves `debug_executionWitness`, `debug_getRaw*`,
   `debug_storageRangeAt`, or batched calls on drpc (blastapi does batch `eth_getProof`).
   So headers and transactions are re-encoded from JSON and bound by the block hash and
@@ -84,14 +88,28 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 - 2026-11-05: replay is chained: one `SparseState` over the union of every block's proof
   nodes and codes, never reset between blocks, so block N+1 runs on needlefish's own
   post-state of block N (a wrong root would also break the next block). BLOCKHASH is
-  served from the archive's hash-linked header chain (256 ancestors + the blocks).
+  served from 256 ancestor hashes plus the replayed blocks' hash-linked headers.
 - 2026-11-05: branch collapses on deletion need the sibling node, which no proof of a
-  touched key contains. The fetcher replays the archive itself; on a missing node it
-  finds the node's trie path through the pool (child -> parent index up to a state or
-  storage root), grinds an address or slot whose keccak256 has that nibble prefix, fetches
-  its proof at the block's parent, and retries. Bounded rounds.
+  touched key contains. Superseded (no grinding needed): after the collapse the sibling is
+  merged into a node on the deleted key's post-state path, so every suffix of a post-state
+  leaf or extension path is a candidate; the importer keeps a candidate whose hash a
+  witness node references but no proof supplies. A sibling that is a branch shows up as an
+  extension's child hash; it is recorded as opaque and resolves to a stand-in branch (only
+  its kind matters to the collapse; its real hash stays the reference).
+- 2026-11-05: keys no transaction trace shows (pre-block system calls: EIP-4788,
+  EIP-2935; precompiles and system addresses the executor loads; the L2ToL1MessagePasser
+  for the Isthmus withdrawals root) come from a gap-fill loop: replay, read the `GAPS` line,
+  fetch `eth_getProof` + `eth_getCode` at the parent, store as `proofs_extra.json` /
+  `codes_extra.json`, re-import. Bounded rounds.
+- 2026-11-05: scope is 10 blocks (owner decision); the 100-block target is dropped.
 - 2026-11-05: archive = `NFRP` frame (version, body size, keccak256 of the body) around a
   raw-deflate body (std.compress.flate). Body is canonical: nodes and codes sorted by
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-05: first real-data run. Blocks 53715983..53715992 (253 txs): all 10 reproduce
+  the transactions root, gas used, logs bloom, blob gas used, receipts root, state root,
+  withdrawals root and block hash. Archive 8.7 MB. The one divergence found was an EVM bug:
+  a new frame inherited the previous call's RETURNDATASIZE, so EIP-1167 proxies forwarded
+  zeroed calldata (block 53715983 tx 3). Fixed in `evm.zig` with a regression test.
