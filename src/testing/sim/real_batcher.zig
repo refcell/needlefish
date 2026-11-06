@@ -34,7 +34,8 @@ pub const View = struct {
     l1_reachable: bool,
     l2_reachable: bool,
     /// The rollup node is the first verifier; null when it is unreachable.
-    rollup: ?struct { safe: u64, unsafe: u64 },
+    /// `finalized` is reported only when the rollup node tracks one (the real verifier).
+    rollup: ?struct { safe: u64, unsafe: u64, finalized: ?u64 = null },
     drop_ppm: u32,
 };
 
@@ -97,7 +98,12 @@ const Backend = struct {
                 const rollup = view.rollup.?;
                 if (!std.mem.eql(u8, method, "optimism_syncStatus")) return rpc_error(out);
                 try out.print("\"result\":{{\"safe_l2\":{{\"number\":{d}}}," ++
-                    "\"unsafe_l2\":{{\"number\":{d}}}}}", .{ rollup.safe, rollup.unsafe });
+                    "\"unsafe_l2\":{{\"number\":{d}}}", .{ rollup.safe, rollup.unsafe });
+                if (rollup.finalized) |finalized| {
+                    assert(finalized <= rollup.safe);
+                    try out.print(",\"finalized_l2\":{{\"number\":{d}}}", .{finalized});
+                }
+                try out.writeAll("}");
             },
         }
     }

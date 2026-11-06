@@ -605,6 +605,7 @@ pub const Cluster = struct {
             heads = if (verifier.unsafe_head() == null) null else .{
                 .safe = verifier.safe_number(),
                 .unsafe = verifier.unsafe_number(),
+                .finalized = verifier.finalized_number(),
             };
         }
         return .{

@@ -262,4 +262,11 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   of the loss. Next: decide between re-posting unfinalized blocks on every start
   (DA cost) and a safe-head regression check. The real verifier keeps its safe head after
   the data was orphaned, which may be a verifier reorg-handling gap; ask dst-fuzz.
+- 2026-11-05: Coordinator decision on seed 850: the sim's optimism_syncStatus reports the
+  real verifier's `finalized_l2` (as op-node does), so a restarted batcher's unknown losses
+  re-post from finalized + 1. Ungated: seed 15 now passes; 16 and 850 wait on the verifier
+  unwinding its safe head on an L1 reorg (nf-consensus). The gate stays until they pass.
+  Main's gated sweep fails on seeds 345, 346, 675, 2779 and 2804 (and 1447 with this change):
+  "real sequencer did not produce on time" with the batcher fully confirmed. This is not
+  batcher-caused; I reported it to dst-fuzz.
 

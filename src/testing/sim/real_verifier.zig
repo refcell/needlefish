@@ -865,6 +865,16 @@ pub const RealVerifier = struct {
         return verifier.driver.sync_state().safe_head;
     }
 
+    /// The driver's finalized head number, never above the safe head; 0 during startup.
+    pub fn finalized_number(verifier: *const RealVerifier) u64 {
+        if (verifier.driver.phase == .starting) return 0;
+        const state = verifier.driver.sync_state();
+        const safe = state.safe_head.block_info.number;
+        const finalized = @min(state.finalized_head.block_info.number, safe);
+        assert(finalized <= safe);
+        return finalized;
+    }
+
     pub fn safe_number(verifier: *const RealVerifier) u64 {
         const head = verifier.safe_head() orelse return 0;
         return head.block_info.number;
