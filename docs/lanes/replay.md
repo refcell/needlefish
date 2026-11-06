@@ -109,6 +109,10 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-05: 100-block milestone from an empty cache: 53750445..53750544 (1747 txs,
+  320.9 Mgas, busiest block 25.7 Mgas) 100/100 in 13m49s with 13 gap rounds; 50 blocks
+  53747405..53747454 (825 txs) 50/50 with 21 rounds. No state-root or receipt mismatch.
+
 - 2026-11-05: demo (`docs/assets/demo.{mp4,gif}`, in the README): raw Ghostty recording of
   `just replay` on an empty cache, blocks 53741014..53741023, 172 txs, 10/10, 0 gap rounds.
 - 2026-11-05: decision: some `eth_getProof` servers also list a node shorter than 32 bytes
