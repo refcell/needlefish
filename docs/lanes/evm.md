@@ -185,6 +185,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (`getOrPut` first, remove on a database error): no measurable change (storage loop
   10.5 us, block 0.675 ms), not kept. The cost is memory: `slots_max` 2^18 reserves ~2^19
   buckets of a 64 B key plus a 96 B `Slot` (~75 MB), so each access misses cache and TLB.
+- [x] Vectors: EEST v5.4.0 `fixtures_develop` (Osaka and later; the stable set stops at
+  Prague) now fetched by `just vectors` into `.cache/vectors/eest-develop`: 63556/63556
+  pass, no skipped forks. Nothing to fix.
+- [x] Keccak in `node: replay` (~1000 samples): almost all is the witness `NodeStore.add`
+  and sparse-trie rehash (db lane), hashing each node once, which is inherent. std's
+  keccak-f runs ~139 ns per 32 B hash (~450 cycles), near single-state scalar on Apple
+  cores; published AArch64 work (Becker-Kannwischer 2022) gains from SHA3/NEON mainly
+  with multi-state batching, which the crypto lane already offers. Not rewriting keccak-f;
+  the lever is batching witness hashes through the crypto batch path (db lane).
 - [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
   account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
   account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a
