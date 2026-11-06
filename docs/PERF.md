@@ -960,7 +960,26 @@ Takeaways: the shadow write itself (5k keccaks, batched, plus 5k memtable puts) 
 per mainnet-sized block to the commit (+12%). Unpaced, a flush or merge runs inside the
 commit's durable wait, so durable p99 rises by ~6.5 ms; pacing (`checkpoint_bytes_per_commit`)
 caps that. The checkpoint carries 6.4 MB more (manifests and memtables); why it takes 2.7x longer
-was not profiled (it shares the ticks with compaction IO).
+was not profiled (it shares the ticks with compaction IO). Profiled below.
+
+Profile (same day, after the replay-reserve fix): the 40 ms was mostly the bench. Its
+`assert(db.idle())` before each checkpoint is compiled out in ReleaseFast, so the timed
+checkpoint overlapped the round's unpaced flushes and merges and carried immutable memtables
+not yet flushed (24-30 MB). The bench now ticks until idle first and reports that drain on
+its own row:
+
+| Case | flat trees off | flat trees on |
+| --- | ---: | ---: |
+| checkpoint p50 / p99 (before: overlapped) | 14.6 / 25.0 ms | 40.2 / 60.6 ms |
+| drain before checkpoint p50 / p99 | 0.0 / 25.2 ms | 36.5 / 58.8 ms |
+| checkpoint p50 / p99 (after the drain) | 13.8 / 14.9 ms | 18.2 / 19.4 ms |
+
+After the drain the checkpoint costs in proportion to its bytes (17.1 vs 18.8-24.2 MB;
+serialize 2.0 vs 2.2-3.2 ms, stream 11.7 vs 14.8-16.6 ms): the extra bytes are memtable
+entries (up to ~70k per tree; a memtable swaps only at a commit). Nothing cheap to cut in
+the checkpoint itself; the drain is compaction work the commits owe anyway (paced in the
+node by `checkpoint_bytes_per_commit`). The flat-off drain p99 (25 ms) is the same bench
+overlap on two of five checkpoints.
 All of this is extra until `State` reads through the trees and checkpoints stop carrying
 the flat tables (the next phase 2b steps).
 

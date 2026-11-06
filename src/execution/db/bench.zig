@@ -7,7 +7,8 @@
 //! - `run_commit` (its own runner, per-block percentiles): `Database.execute_and_commit`
 //!   until its entry is durable, over `IoStorage` on the OS backend (a scratch file
 //!   under `.zig-cache/tmp`, deleted afterwards) and over a zero-latency `SimStorage`, plus
-//!   the duration of each checkpoint of the full state.
+//!   the duration of each checkpoint of the full state (after the IO the last commit left
+//!   running, such as flat tree compaction, drains; the drain is reported on its own).
 //!
 //! Fixtures come from the page allocator and the scratch file is opened here: this is
 //! benchmark scaffolding, not library code. Measured blocks touch distinct, existing accounts
@@ -477,8 +478,9 @@ fn CommitRunType(comptime Storage: type) type {
         /// Per measured block: `execute_and_commit` alone, and until the head is durable.
         cpu_ns: []u64,
         durable_ns: []u64,
-        /// One checkpoint after setup and one after each round.
+        /// One checkpoint after setup and one after each round, and the drain before each.
         checkpoint_ns: []u64,
+        drain_ns: []u64,
         syncs: u64 = 0,
 
         /// `self` must not move after this (the engine and overlay point into it).
@@ -495,11 +497,13 @@ fn CommitRunType(comptime Storage: type) type {
                 .cpu_ns = try allocator.alloc(u64, shape.blocks()),
                 .durable_ns = try allocator.alloc(u64, shape.blocks()),
                 .checkpoint_ns = try allocator.alloc(u64, shape.rounds + 1),
+                .drain_ns = try allocator.alloc(u64, shape.rounds + 1),
             };
             self.overlay = try Overlay.init(allocator, &self.db.state, overlay_config(shape));
         }
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            allocator.free(self.drain_ns);
             allocator.free(self.checkpoint_ns);
             allocator.free(self.durable_ns);
             allocator.free(self.cpu_ns);
@@ -528,6 +532,10 @@ fn CommitRunType(comptime Storage: type) type {
 
         fn not_durable(self: *const Self, sequence: u64) bool {
             return self.db.durable_sequence < sequence;
+        }
+
+        fn busy(self: *const Self, _: u64) bool {
+            return !self.db.idle();
         }
 
         fn checkpoint_pending(self: *const Self, completed: u64) bool {
@@ -589,11 +597,15 @@ fn CommitRunType(comptime Storage: type) type {
             self.syncs += self.storage.stats.syncs - syncs_before;
         }
 
-        /// From the request until the checkpoint is written and the engine is idle again.
+        /// From the request until the checkpoint is written and the engine is idle again,
+        /// after the IO the last commit left running (compaction, code flush) drains.
         fn measure_checkpoint(self: *Self, io: std.Io, sample: u32) !void {
+            const drain_start = now_ns(io);
+            try self.tick_while(busy, 0);
             assert(self.db.idle());
             const completed = self.db.checkpoints_completed;
             const start = now_ns(io);
+            self.drain_ns[sample] = start - drain_start;
             self.db.request_checkpoint();
             try self.tick_while(checkpoint_pending, completed);
             self.checkpoint_ns[sample] = now_ns(io) - start;
@@ -626,6 +638,7 @@ fn CommitRunType(comptime Storage: type) type {
             });
             print_percentiles("  execute_and_commit (cpu)", self.cpu_ns);
             print_percentiles("  commit until durable", self.durable_ns);
+            print_percentiles("  drain before checkpoint", self.drain_ns);
             print_percentiles("  checkpoint", self.checkpoint_ns);
         }
     };
