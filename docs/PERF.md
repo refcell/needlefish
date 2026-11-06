@@ -637,6 +637,48 @@ first measurements (back to back, no slot pacing, not committed): the journal ou
 checkpoint (12.7k Busy retries, `finish` commits p50 420 ms) — an artifact of committing 20x
 faster than 200 ms slots, which is why the os case paces.
 
+## 2026-11-05 db commit steady rerun: paced vs unpaced, kqueue and io_uring (Apple M4 Pro, ReleaseFast)
+
+Same bench and shape as above; cases are now `db/commit steady os unpaced` and
+`db/commit steady os paced` (4 MiB per commit), and each run also prints `overlap`: every
+commit that overlapped a checkpoint (`start` + `advance` + `finish`). Runs interleaved, 2k
+blocks at 200 ms slots each, load average (1 min) at the start and end of each run. Every
+run: 51 checkpoints of 31.2 MB, 0 busy retries, 0 slot overruns; serialization 2.1-6.0 ms.
+Unpaced runs take 1.01-1.02 syncs/block, paced 1.00.
+
+macOS kqueue (F_FULLFSYNC, host load 10-50, one run per row in run order):
+
+| Run | load | all p50 / p90 / p99 / max | > 50 ms | overlap n | overlap p50 / p90 / p99 / max | > 50 ms | idle tick max |
+| --- | --- | --- | ---: | ---: | --- | ---: | ---: |
+| 1 unpaced | 19 -> 21 | 9.62 / 18.0 / 43.3 / 89.6 ms | 14 | 276 | 11.3 / 21.0 / 64.7 / 76.5 ms | 7 | 150 ms |
+| 1 paced | 21 -> 28 | 10.1 / 16.3 / 30.6 / 146.4 ms | 7 | 352 | 10.9 / 17.7 / 46.2 / 112.9 ms | 3 | 91 ms |
+| 2 unpaced | 28 -> 20 | 8.97 / 12.6 / 19.1 / 68.6 ms | 2 | 259 | 10.7 / 14.5 / 22.0 / 32.0 ms | 0 | 60 ms |
+| 2 paced | 20 -> 50 | 10.3 / 24.5 / 53.7 / 106.2 ms | 27 | 358 | 11.2 / 31.6 / 66.0 / 91.3 ms | 12 | 138 ms |
+| 3 paced | 16 -> 18 | 9.04 / 12.7 / 18.4 / 57.6 ms | 1 | 352 | 9.85 / 14.6 / 20.7 / 33.4 ms | 0 | 41 ms |
+| 3 unpaced | 18 -> 10 | 8.66 / 10.1 / 14.6 / 35.1 ms | 0 | 256 | 9.82 / 12.6 / 15.1 / 35.1 ms | 0 | 20 ms |
+
+Linux io_uring (`just test-linux` approach: alpine:3.20 in Docker, seccomp=unconfined,
+`-Drequire-io-uring=true`, source and caches copied into the container so the scratch file
+is on the container filesystem; 6 vCPUs, kernel 6.8, VM load ~1; host load 6-10):
+
+| Run | all p50 / p90 / p99 / max | > 50 ms | overlap n | overlap p50 / p90 / p99 / max | > 50 ms | idle tick max |
+| --- | --- | ---: | ---: | --- | ---: | ---: |
+| 1 unpaced | 6.33 / 7.76 / 9.25 / 20.6 ms | 0 | 285 | 7.98 / 8.84 / 11.2 / 13.3 ms | 0 | 2.3 ms |
+| 1 paced | 6.51 / 7.81 / 9.44 / 25.0 ms | 0 | 352 | 7.76 / 8.60 / 10.3 / 16.1 ms | 0 | 2.3 ms |
+| 2 unpaced | 6.48 / 8.37 / 13.2 / 61.0 ms | 2 | 240 | 8.90 / 11.5 / 17.2 / 61.0 ms | 1 | 2.8 ms |
+| 2 paced | 6.50 / 7.84 / 11.6 / 16.0 ms | 0 | 352 | 7.75 / 11.0 / 13.0 / 14.0 ms | 0 | 2.2 ms |
+
+Reading: on macOS the run-to-run spread (overlap p99 15-66 ms within one mode) is larger
+than any paced/unpaced difference; the cleanest pair (run 3) is equal within 1 ms at p50 and
+the tails track host load, not the mode. Pacing lowers the overlap-commit p50 penalty over
+`none` slightly (paced +0.9 / +1.2 / +1.0 ms vs unpaced +1.9 / +1.9 / +1.2 ms) at the cost
+of more overlapping commits per checkpoint (~7 vs ~5). On io_uring, where the ring can
+submit many checkpoint blocks per tick, paced overlap commits are at or below unpaced ones
+(p50 7.76 / 7.75 vs 7.98 / 8.90 ms, p99 10.3 / 13.0 vs 11.2 / 17.2 ms) and the only > 50 ms
+commits were unpaced. Pacing is neutral to slightly better, never clearly worse: the node
+keeps 4 MiB. The Docker VM's fsync is cheaper than F_FULLFSYNC on the host SSD, so the
+io_uring numbers bound the CPU and submission path, not a bare-metal Linux disk.
+
 ## 2026-11-05 db witness rpc: `debug_executionWitness` at 200 ms blocks (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `zig build bench -Doptimize=ReleaseFast -- "db/witness rpc"` (`db/witness_rpc_bench.zig`).

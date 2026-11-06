@@ -184,9 +184,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   single commit stalls. Crash tests must still pass.
   (`db/steady_bench.zig`; serialization 2-6 ms, no 50 ms stall attributable to it; checkpoint
   writes bounded per commit with `checkpoint_bytes_per_commit`, node 4 MiB; see Decisions)
-- [ ] Rerun `db/commit steady` (os backend, paced vs unpaced, interleaved) on a quiet machine
+- [x] Rerun `db/commit steady` (os backend, paced vs unpaced, interleaved) on a quiet machine
   and under `just test-linux` io_uring; confirm or revert the 4 MiB checkpoint pacing default.
 - [x] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
+  (kept 4 MiB: neutral on kqueue, overlap commits at or below unpaced on io_uring; PERF.md)
+- [ ] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
   (checkpoint load, journal replay, trie rebuild from flat tables, history rebuild-on-open
   over a 300-block window, path index fill); cut the dominant step (e.g. batched rehash on
   load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
@@ -395,6 +397,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   harness kept `checkpoints_seen` across `reopen`, so a fresh database's counter looked like
   a completed checkpoint and the test could rot the newest zone while the fallback zone was
   half overwritten (a double fault reported as `CheckpointCorrupt`); a test bug, fixed.
+  Rerun (3 interleaved pairs on kqueue at load 10-50, 2 pairs on io_uring in Docker): kept
+  4 MiB. Kqueue spread between runs of one mode (overlap p99 15-66 ms) exceeds any mode
+  difference; pacing trims the overlap p50 penalty over `none` (+0.9-1.2 vs +1.2-1.9 ms).
+  io_uring: paced overlap p50 7.8 / 7.8 vs 8.0 / 8.9 ms, p99 10.3 / 13.0 vs 11.2 / 17.2 ms,
+  and the only > 50 ms commits were unpaced. Revert to 0 only if a bare-metal Linux run
+  shows paced p99/max clearly worse.
 - Witness evm differential (`db/witness_evm_test.zig`) drives the evm directly
   (`transaction.transact` over a `TxEnv` list), not the node executor: the executor takes
   signed RLP transactions over `node.StateDb` and adds system calls, so it has no entry over
@@ -1046,3 +1054,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   53715985 INCOMPLETE (branch sibling); no trie mismatch. Tests: synthetic diff (collapse
   into an unproven leaf completes only with derived seeding), unproven branch stays
   incomplete with the right missing node, proof tampering, proof merge, receipts root.
+- 2026-11-05: `db/commit steady` rerun, paced vs unpaced interleaved (`steady_bench.zig`
+  cases renamed `os unpaced`/`os paced`, new `overlap` row). Kqueue (3 pairs, load 10-50):
+  overlap p99 64.7 / 22.0 / 15.1 ms unpaced vs 46.2 / 66.0 / 20.7 ms paced, tails follow
+  load. io_uring in Docker (2 pairs, 0 slot overruns, idle tick max 2.8 ms): all p50 6.3-6.5
+  ms both, overlap p99 11.2 / 17.2 unpaced vs 10.3 / 13.0 ms paced, > 50 ms 2 vs 0. Node
+  keeps `checkpoint_bytes_per_commit` 4 MiB.

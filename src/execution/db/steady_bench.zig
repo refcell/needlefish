@@ -51,9 +51,9 @@ const Case = struct {
 };
 
 pub const cases = [_]Case{
-    .{ .name = "db/commit steady sim", .storage = .sim, .layout = layout_node },
+    .{ .name = "db/commit steady sim unpaced", .storage = .sim, .layout = layout_node },
     .{ .name = "db/commit steady sim paced", .storage = .sim, .layout = layout_node_paced },
-    .{ .name = "db/commit steady os", .storage = .os, .layout = layout_node },
+    .{ .name = "db/commit steady os unpaced", .storage = .os, .layout = layout_node },
     .{ .name = "db/commit steady os paced", .storage = .os, .layout = layout_node_paced },
 };
 
@@ -172,22 +172,30 @@ comptime {
     for (kinds, 0..) |kind, index| assert(@backingInt(kind) == index);
 }
 
-/// Per-kind latency samples (nanoseconds) of one run.
+/// Per-kind latency samples (nanoseconds) of one run; `overlap` holds every commit that
+/// overlapped a checkpoint (any kind but `none`).
 pub const Samples = struct {
     all: []u64,
+    overlap: []u64,
     by_kind: [kind_count][]u64,
     counts: [kind_count]u32 = @splat(0),
     count: u32 = 0,
+    overlap_count: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, capacity: u32) !Samples {
         assert(capacity > 0);
-        var samples: Samples = .{ .all = try allocator.alloc(u64, capacity), .by_kind = undefined };
+        var samples: Samples = .{
+            .all = try allocator.alloc(u64, capacity),
+            .overlap = try allocator.alloc(u64, capacity),
+            .by_kind = undefined,
+        };
         for (&samples.by_kind) |*slice| slice.* = try allocator.alloc(u64, capacity);
         return samples;
     }
 
     fn deinit(samples: *Samples, allocator: std.mem.Allocator) void {
         for (samples.by_kind) |slice| allocator.free(slice);
+        allocator.free(samples.overlap);
         allocator.free(samples.all);
         samples.* = undefined;
     }
@@ -199,7 +207,12 @@ pub const Samples = struct {
         samples.count += 1;
         samples.by_kind[index][samples.counts[index]] = latency_ns;
         samples.counts[index] += 1;
+        if (kind != .none) {
+            samples.overlap[samples.overlap_count] = latency_ns;
+            samples.overlap_count += 1;
+        }
         assert(samples.counts[index] <= samples.count);
+        assert(samples.overlap_count + samples.counts[0] == samples.count);
     }
 
     /// Largest sample over every kind.
@@ -456,6 +469,10 @@ pub fn RunType(comptime Storage: type) type {
                 @as(f64, @floatFromInt(self.serialize_ns[2])) / 1e6,
             });
             print_percentiles("  all commits", self.samples.all[0..blocks]);
+            const overlap_count = self.samples.overlap_count;
+            if (overlap_count > 0) {
+                print_percentiles("  overlap", self.samples.overlap[0..overlap_count]);
+            }
             for (kinds) |kind| {
                 const index = @backingInt(kind);
                 const count = self.samples.counts[index];
