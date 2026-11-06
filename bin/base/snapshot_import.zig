@@ -94,6 +94,11 @@ const FileSource = struct {
 /// `hashed_state.EntrySource` over an MDBX cursor.
 const CursorEntries = struct {
     cursor: mdbx.Cursor,
+    /// The longest run of entries under one key (the largest storage trie, for DUPSORT).
+    run_key: Hash = @splat(0),
+    run_length: u64 = 0,
+    run_max: u64 = 0,
+    run_max_key: Hash = @splat(0),
 
     fn source(self: *CursorEntries) import.hashed_state.EntrySource {
         return .{ .context = self, .next = next };
@@ -102,6 +107,19 @@ const CursorEntries = struct {
     fn next(context: *anyopaque) anyerror!?import.hashed_state.Entry {
         const self: *CursorEntries = @ptrCast(@alignCast(context));
         const entry = try self.cursor.next() orelse return null;
+        if (entry.key.len == 32) {
+            if (std.mem.eql(u8, entry.key, &self.run_key)) {
+                self.run_length += 1;
+            } else {
+                self.run_key = entry.key[0..32].*;
+                self.run_length = 1;
+            }
+            if (self.run_length > self.run_max) {
+                self.run_max = self.run_length;
+                self.run_max_key = self.run_key;
+            }
+        }
+        assert(self.run_length <= self.cursor.entries);
         return .{ .key = entry.key, .value = entry.value };
     }
 };
@@ -228,6 +246,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     std.debug.print("snapshot block (Finish checkpoint): {d}\n", .{number});
     const expected = flags.state_root orelse try header_state_root(init, flags.rpc, number);
     std.debug.print("expected state root {x}\n", .{expected});
+    try code_stats(gpa, &reader);
     const root = try compute(init, &reader, &file_source);
     if (!std.mem.eql(u8, &root, &expected)) {
         std.debug.print("STATE ROOT MISMATCH: computed {x}, header {x}\n", .{ root, expected });
@@ -293,5 +312,31 @@ fn compute(init: std.process.Init, reader: *mdbx.Reader, source: *const FileSour
     if (accounts.cursor.entries != account_tree.items) return error.ItemCountMismatch;
     if (storages.cursor.entries != storage_tree.items) return error.ItemCountMismatch;
     assert(builder.stats.accounts == account_tree.items);
+    std.debug.print("largest storage trie: {d} slots (account hash {x})\n", .{
+        storages.run_max,
+        storages.run_max_key,
+    });
     return root;
+}
+
+/// Counts `Bytecodes` and checks every code against its key (keccak256 of the code).
+fn code_stats(gpa: std.mem.Allocator, reader: *mdbx.Reader) !void {
+    const tree = try reader.table(gpa, "Bytecodes");
+    var cursor = try mdbx.Cursor.init(gpa, reader, &tree);
+    defer cursor.deinit(gpa);
+    var codes: u64 = 0;
+    var code_bytes: u64 = 0;
+    var code_bytes_max: u64 = 0;
+    while (try cursor.next()) |entry| {
+        if (entry.key.len != 32) return error.Corrupt;
+        const code = try import.reth.decode_bytecode(entry.value);
+        const hash = base.execution.trie.node.keccak256(code);
+        if (!std.mem.eql(u8, &hash, entry.key)) return error.CodeHashMismatch;
+        codes += 1;
+        code_bytes += code.len;
+        code_bytes_max = @max(code_bytes_max, code.len);
+    }
+    if (codes != tree.items) return error.ItemCountMismatch;
+    std.debug.print("Bytecodes: {d} codes, {d} bytes ({d} MiB), largest {d} bytes, " ++
+        "every hash checked\n", .{ codes, code_bytes, code_bytes >> 20, code_bytes_max });
 }
