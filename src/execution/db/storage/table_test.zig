@@ -383,3 +383,46 @@ test "table: seeded mutations of a valid data block are rejected or stay consist
         try fuzz_data_block({}, payload[0..size]);
     }
 }
+
+test "table: a paced build pauses after each granted block and equals an unpaced build" {
+    var prng = Prng.init(0x9ace);
+    const block_size: u32 = 2 * sector_size;
+    const reference = try testing.allocator.create(Reference);
+    defer testing.allocator.destroy(reference);
+    reference.generate(&prng, 400, 300);
+    var unpaced: Harness = undefined;
+    try unpaced.init(block_size, 256, 16);
+    defer unpaced.deinit();
+    const expected = try unpaced.build(reference);
+    try testing.expect(expected.data_block_count > 2);
+
+    var paced: Harness = undefined;
+    try paced.init(block_size, 256, 16);
+    defer paced.deinit();
+    const blocks = Table.blocks_max(block_size, reference.count, reference.bytes_total());
+    var reservation = try paced.free_set.reserve(blocks);
+    defer paced.free_set.forfeit(&reservation);
+    reference.cursor = 0;
+    paced.built = false;
+    const source: Table.Source = .{ .context = reference, .next = Reference.next };
+    paced.builder.build_paced(source, &paced.free_set, &reservation, 1, Harness.on_built);
+    var pauses: u32 = 0;
+    var ticks: u32 = 0;
+    while (!paced.built) : (ticks += 1) {
+        if (ticks > 1_000_000) return error.Timeout;
+        if (paced.builder.paused) {
+            try testing.expectEqual(@as(u64, 0), paced.builder.blocks_allowed);
+            // No write goes out while paused.
+            const writes = paced.grid.stats.writes;
+            for (0..5) |_| paced.sim.tick();
+            try testing.expectEqual(writes, paced.grid.stats.writes);
+            pauses += 1;
+            paced.builder.grant(1);
+        }
+        paced.sim.tick();
+    }
+    const info = try paced.builder.result;
+    // One pause after every block but the last (data blocks + index - 1).
+    try testing.expectEqual(expected.data_block_count, pauses);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&info));
+}

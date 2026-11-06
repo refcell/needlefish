@@ -44,7 +44,7 @@ pub const SlotKey = struct {
     slot: u256,
 };
 
-const CodeRef = struct { offset: u32, len: u32 };
+pub const CodeRef = struct { offset: u32, len: u32 };
 
 const BlockHashEntry = struct { number: u64, hash: Hash, valid: bool };
 
@@ -340,6 +340,15 @@ pub const State = struct {
             .len = @intCast(code.len),
         });
         return .{ .hash = hash, .new = true };
+    }
+
+    /// Drops every code (an open that must discard the codes it loaded). Only before any
+    /// account is loaded: no account may reference a dropped code.
+    pub fn reset_codes(self: *State) void {
+        assert(self.account_table.count() == 0);
+        self.code_table.clearRetainingCapacity();
+        self.code_arena_len = 0;
+        assert(self.code_table.count() == 0);
     }
 
     pub fn state_root(self: *State) Error!Hash {

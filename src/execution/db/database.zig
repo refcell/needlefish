@@ -30,6 +30,13 @@
 //! (`checkpoint_flush`) so the checkpoint finishes and frees the journal.
 //! If the newest checkpoint is rotten, the engine resets the staged bytes, streams the older
 //! fallback checkpoint instead, and replays the longer journal kept since it.
+//! Code tables (with a grid, `engine.grid_block_count > 0`; `code_store.zig`): before each
+//! checkpoint the codes added since the last one are flushed into sorted grid tables (paced
+//! on the same per-commit block budget), and the checkpoint (version 2) carries the table
+//! list plus only the codes no table holds. `open` uses the engine's open pause: it decodes
+//! the table list, scans the tables into `State.code_arena`, loads the image, and resumes the
+//! journal. Codes stay resident, so `State.code_by_hash` is unchanged. Without a grid the
+//! checkpoint is version 1 with every code, as before.
 //!
 //! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
 //! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
@@ -59,6 +66,7 @@ const chain_module = @import("chain.zig");
 const changeset_module = @import("changeset.zig");
 const snapshot_module = @import("snapshot.zig");
 const history_module = @import("history.zig");
+const code_store_module = @import("code_store.zig");
 const trie_module = @import("../trie/root.zig");
 
 const StateTrie = trie_module.StateTrie;
@@ -246,7 +254,11 @@ comptime {
 
 /// "NFDB" read as a little-endian u32.
 pub const checkpoint_magic: u32 = 0x4244_464e;
+/// Version 1: header, snapshot, blocks (no grid). Version 2 (with a grid): the code table
+/// list (`CodeStore.manifest_encode`) follows the header, and the snapshot carries only
+/// the codes no table holds.
 pub const checkpoint_version: u16 = 1;
+pub const checkpoint_version_tables: u16 = 2;
 /// magic, version, head present, head meta (hash, parent, number, timestamp), state root,
 /// snapshot length, block count.
 pub const checkpoint_header_size: u32 = 4 + 2 + 1 + 32 + 32 + 8 + 8 + 32 + 4 + 4;
@@ -272,6 +284,25 @@ pub const Config = struct {
     /// (one unwind, apply, state root, and history commit per block, at most one window,
     /// plus one `reset` of the whole state) instead of restarting it at the head.
     history_rebuild_on_open: bool = true,
+    /// Code tables on the grid (`code_store.zig`), on when `engine.grid_block_count > 0`:
+    /// the most tables the list holds before every code is rewritten into fresh ones.
+    code_tables_max: u32 = 16,
+    /// New code bytes since the last flush below which a checkpoint skips the flush and
+    /// carries those codes in its image (fewer small tables, fewer rewrites).
+    code_flush_bytes_min: u32 = 64 * 1024,
+
+    /// The code store's config, null without a grid.
+    pub fn code_store_config(config: Config) ?code_store_module.Config {
+        if (config.engine.grid_block_count == 0) return null;
+        return .{
+            .block_size = config.engine.checkpoint_block_size,
+            .block_count = config.engine.grid_block_count,
+            .tables_max = config.code_tables_max,
+            .codes_max = config.state.codes_max,
+            .code_bytes_max = config.state.code_bytes_max,
+            .flush_bytes_min = config.code_flush_bytes_min,
+        };
+    }
 
     /// The chain ring holds the retention budget plus three of the largest records, so it
     /// never has to evict on its own: with live bytes L <= budget - n before inserting n,
@@ -290,6 +321,17 @@ pub const Config = struct {
             unreachable;
     }
 };
+
+/// Grid blocks for the code tables of `state` (the node default): four times the blocks
+/// all codes fill (the live tables; a rewrite's released tables waiting two checkpoints for
+/// reuse; and a rewrite's reservation, which assumes half-full data blocks), plus 64 spare.
+/// A flush that still finds no room is skipped and its codes stay in the image.
+pub fn code_grid_block_count(state: state_module.Config, block_size: u32) u64 {
+    const payload = @import("storage/grid.zig").payload_capacity_of(block_size);
+    assert(payload > 0);
+    const blocks = std.math.divCeil(u64, state.code_bytes_max, payload) catch unreachable;
+    return 4 * blocks + 64;
+}
 
 pub const Phase = enum { closed, formatting, opening, ready, failed };
 
@@ -326,6 +368,9 @@ pub const Commit = struct {
 pub const OpenStep = enum(u8) {
     /// The engine read the superblock and streamed (and verified) the checkpoint.
     checkpoint_read,
+    /// Code tables the checkpoint names read into the code arena (during the engine's open
+    /// pause; immediate without tables).
+    code_tables,
     /// Snapshot decoded into the flat tables (the incremental path also builds the trie).
     snapshot_tables,
     /// State trie built from the flat tables (bulk path only).
@@ -362,6 +407,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         const Self = @This();
 
         pub const Engine = engine_module.EngineType(Storage);
+        pub const CodeStore = code_store_module.CodeStoreType(Storage);
         pub const DurableCallback = *const fn (context: ?*anyopaque, sequence: u64) void;
 
         engine: Engine,
@@ -420,6 +466,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         open_trace: ?OpenTrace = null,
         /// Snapshot load path at `open` (tests compare both).
         load_mode: LoadMode = .bulk,
+        /// Codes in grid tables (null without a grid).
+        code_store: ?CodeStore = null,
+        /// The wanted checkpoint's code flush ran (or had nothing to do).
+        code_flushed: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
@@ -452,8 +502,14 @@ pub fn DatabaseType(comptime Storage: type) type {
                 history_store = try history_module.Store.init(allocator, history_config);
             }
             errdefer if (history_store) |*store| store.deinit(allocator);
+            var code_store: ?CodeStore = null;
+            if (config.code_store_config()) |code_config| {
+                code_store = try CodeStore.init(allocator, &engine.grid.?, code_config);
+            }
+            errdefer if (code_store) |*store| store.deinit(allocator);
             const buffers = try Buffers.init(allocator, config);
             return .{
+                .code_store = code_store,
                 .engine = engine,
                 .config = config,
                 .state = state,
@@ -502,6 +558,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Frees memory. After a simulated crash, engine operations may still be in flight.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.code_store) |*store| store.deinit(allocator);
             if (self.history) |*store| store.deinit(allocator);
             allocator.free(self.staging);
             allocator.free(self.queue_metadata);
@@ -520,7 +577,8 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// True when nothing is queued and no engine operation is in flight.
         pub fn idle(self: *const Self) bool {
-            return self.queue_count == 0 and self.engine.idle();
+            const flushing = if (self.code_store) |*store| store.flushing() else false;
+            return self.queue_count == 0 and self.engine.idle() and !flushing;
         }
 
         /// Writes an empty database. Completes when `phase` returns to `closed`. The caller
@@ -554,6 +612,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .on_checkpoint = consume_checkpoint,
                 .on_checkpoint_reset = consume_checkpoint_reset,
                 .on_entry = consume_entry,
+                .on_checkpoint_loaded = consume_checkpoint_loaded,
             }, on_open);
         }
 
@@ -577,6 +636,61 @@ pub fn DatabaseType(comptime Storage: type) type {
             // Staging overflow is the only load error before the first entry.
             self.staging_len = 0;
             self.load_error = null;
+        }
+
+        /// The engine paused after loading the checkpoint: read the code tables it names into
+        /// the arena (before the image's own codes), then load the image and resume.
+        fn consume_checkpoint_loaded(context: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            assert(self.phase == .opening);
+            assert(!self.load_done);
+            self.trace(.checkpoint_read);
+            const store = if (self.code_store) |*store| store else return self.open_loaded();
+            if (self.load_error != null or self.staging_len == 0) return self.open_loaded();
+            self.checkpoint_manifest(store) catch {
+                self.load_error = error.CheckpointInvalid;
+                return self.open_loaded();
+            };
+            store.owner = self;
+            const grid = &self.engine.grid.?;
+            store.scan_start(grid, &self.engine.free_set.?, &self.state, on_code_scan);
+        }
+
+        fn on_code_scan(store: *CodeStore) void {
+            const self: *Self = @ptrCast(@alignCast(store.owner.?));
+            assert(self.phase == .opening);
+            switch (store.scan_outcome) {
+                .loaded => {
+                    self.trace(.code_tables);
+                    self.open_loaded();
+                },
+                .corrupt => {
+                    // A table block did not verify: drop its codes and let the engine treat
+                    // the checkpoint as rotten (the fallback streams next, or open fails).
+                    self.state.reset_codes();
+                    store.reset();
+                    self.engine.open_resume(.corrupt);
+                },
+            }
+        }
+
+        /// Loads the staged checkpoint (codes from tables already in) and replays.
+        fn open_loaded(self: *Self) void {
+            assert(self.phase == .opening);
+            self.ensure_loaded();
+            self.engine.open_resume(.loaded);
+        }
+
+        /// Decodes the staged checkpoint's code table list into the code store.
+        fn checkpoint_manifest(self: *Self, store: *CodeStore) !void {
+            const bytes = self.staging[0..self.staging_len];
+            var reader: Reader = .{ .buffer = bytes };
+            if (try reader.int(u32) != checkpoint_magic) return error.CheckpointInvalid;
+            const version = try reader.int(u16);
+            if (version == checkpoint_version) return; // Written without a grid: no tables.
+            if (version != checkpoint_version_tables) return error.CheckpointInvalid;
+            if (bytes.len < checkpoint_header_size) return error.CheckpointInvalid;
+            _ = try store.manifest_decode(bytes[checkpoint_header_size..]);
         }
 
         fn consume_entry(context: *anyopaque, entry: engine_module.Entry) void {
@@ -610,7 +724,6 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.load_done = true;
             if (self.load_error != null) return;
             if (self.staging_len == 0) return; // Fresh format: no checkpoint yet.
-            self.trace(.checkpoint_read);
             self.checkpoint_load() catch {
                 self.load_error = error.CheckpointInvalid;
             };
@@ -821,6 +934,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// full). Later checkpoints are paced again.
         pub fn checkpoint_flush(self: *Self) void {
             if (self.phase != .ready) return;
+            if (self.code_store) |*store| store.grant(std.math.maxInt(u64));
             self.engine.checkpoint_grant(std.math.maxInt(u64));
             assert(!self.engine.checkpoint_paused());
         }
@@ -907,8 +1021,11 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.in_flight_bytes = 0;
             if (self.on_durable) |callback| callback(self.durable_context, self.durable_sequence);
             // A paced checkpoint writes its next chunk after each durable commit.
+            // The code flush before a checkpoint spends the same per-commit block budget.
             if (self.config.checkpoint_bytes_per_commit > 0) {
-                self.engine.checkpoint_grant(self.config.checkpoint_blocks_per_commit());
+                const blocks = self.config.checkpoint_blocks_per_commit();
+                if (self.code_store) |*store| store.grant(blocks);
+                self.engine.checkpoint_grant(blocks);
             }
             self.checkpoint_maybe_start();
             self.pump();
@@ -1281,9 +1398,11 @@ pub fn DatabaseType(comptime Storage: type) type {
         fn checkpoint_maybe_start(self: *Self) void {
             if (!self.checkpoint_wanted or self.phase != .ready) return;
             if (self.checkpoints_held) return;
-            if (self.queue_count > 0 or self.engine.commit_callback != null) return;
             if (self.engine.checkpoint_phase != .idle) return;
+            if (!self.code_flush_ready()) return;
+            if (self.queue_count > 0 or self.engine.commit_callback != null) return;
             self.checkpoint_wanted = false;
+            self.code_flushed = false;
             self.staging_len = self.checkpoint_write() catch |err| {
                 self.checkpoint_error = err;
                 return;
@@ -1294,6 +1413,30 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(blocks > 0);
             // Ready, no commit in flight, and no checkpoint running: checked above.
             self.engine.checkpoint_paced(producer, blocks, on_checkpoint) catch unreachable;
+        }
+
+        /// True once the wanted checkpoint's codes are in tables (or need none); otherwise
+        /// starts (or waits for) the flush. The flush runs alongside commits: it reads only
+        /// arena bytes, which never change, and completes its grid writes before the
+        /// checkpoint starts, so the checkpoint's sync covers them.
+        fn code_flush_ready(self: *Self) bool {
+            const store = if (self.code_store) |*store| store else return true;
+            if (store.flushing()) return false;
+            if (self.code_flushed) return true;
+            self.code_flushed = true;
+            store.owner = self;
+            const grid = &self.engine.grid.?;
+            const free_set = &self.engine.free_set.?;
+            const blocks = self.config.checkpoint_blocks_per_commit();
+            const status = store.flush_start(grid, free_set, &self.state, blocks, on_code_flush);
+            return status == .done;
+        }
+
+        fn on_code_flush(store: *CodeStore) void {
+            const self: *Self = @ptrCast(@alignCast(store.owner.?));
+            assert(self.code_flushed);
+            assert(!store.flushing());
+            self.checkpoint_maybe_start();
         }
 
         fn produce(context: *anyopaque, buffer: []u8) u32 {
@@ -1319,12 +1462,19 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// Serializes header, state snapshot, and retained blocks into the staging buffer.
         fn checkpoint_write(self: *Self) !u32 {
             assert(self.queue_count == 0);
-            var sink: snapshot_module.BufferSink = .{
-                .buffer = self.staging[checkpoint_header_size..],
-            };
-            try snapshot_module.write(&self.state, &sink);
+            var position: usize = checkpoint_header_size;
+            var filter: snapshot_module.CodeFilter = .{};
+            if (self.code_store) |*store| {
+                assert(!store.flushing());
+                const size = store.manifest_size();
+                if (size > self.staging.len - position) return error.CheckpointTooLarge;
+                position += store.manifest_encode(self.staging[position..]);
+                filter = store.code_filter();
+            }
+            var sink: snapshot_module.BufferSink = .{ .buffer = self.staging[position..] };
+            try snapshot_module.write_filtered(&self.state, &sink, filter);
             const snapshot_len: u32 = @intCast(sink.position);
-            var position: usize = checkpoint_header_size + snapshot_len;
+            position += snapshot_len;
             const count = self.chain.block_count();
             for (0..count) |index| {
                 const input = self.stored_block(@intCast(index));
@@ -1342,7 +1492,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         fn checkpoint_write_header(self: *Self, snapshot_len: u32, block_count: u32) void {
             var writer: Writer = .{ .buffer = self.staging[0..checkpoint_header_size] };
             writer.int(u32, checkpoint_magic);
-            writer.int(u16, checkpoint_version);
+            const tables = self.code_store != null;
+            writer.int(u16, if (tables) checkpoint_version_tables else checkpoint_version);
             const head_meta = self.chain.head() orelse BlockMeta{
                 .hash = @splat(0),
                 .parent_hash = @splat(0),
@@ -1385,7 +1536,9 @@ pub fn DatabaseType(comptime Storage: type) type {
             const bytes = self.staging[0..self.staging_len];
             var reader: Reader = .{ .buffer = bytes };
             if (try reader.int(u32) != checkpoint_magic) return error.CheckpointInvalid;
-            if (try reader.int(u16) != checkpoint_version) return error.CheckpointInvalid;
+            const version = try reader.int(u16);
+            const tables = version == checkpoint_version_tables and self.code_store != null;
+            if (version != checkpoint_version and !tables) return error.CheckpointInvalid;
             const present = try reader.int(u8);
             if (present > 1) return error.CheckpointInvalid;
             const head_meta: BlockMeta = .{
@@ -1398,6 +1551,12 @@ pub fn DatabaseType(comptime Storage: type) type {
             const snapshot_len = try reader.int(u32);
             const block_count = try reader.int(u32);
             if (block_count > self.config.chain.blocks_max) return error.CheckpointInvalid;
+            if (tables) {
+                // Decoded (and its tables scanned) during the open pause.
+                assert(reader.position == checkpoint_header_size);
+                const count = try reader.int(u32);
+                _ = try reader.bytes(@as(u64, count) * CodeStore.info_size);
+            }
             try self.snapshot_load(try reader.bytes(snapshot_len));
             for (0..block_count) |_| {
                 const size = try reader.int(u32);

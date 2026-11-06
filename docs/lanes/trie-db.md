@@ -241,12 +241,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   references a block. DST faults.
   (`storage/grid.zig`, `free_set.zig`, `table.zig`, `table_builder.zig`, `table_reader.zig`,
   `engine_grid_test.zig`; `db/table` bench: hit 0.21-0.28 us, cold miss 25 us; see Decisions)
-- [ ] Disk state phase 1d: the code store as the first table user: codes in grid tables (new
-  codes in State's table as the memtable, flushed to a table before each checkpoint, the
-  table list in the database checkpoint image), out of the checkpoint image; then out of RAM.
-  Blocked on the read path, see Decisions ("code store read path"). Then: database crash
-  tests (24 seeds incl. mid-flush and fallback with grid blocks), bench code lookup hit/miss
-  and checkpoint image size before/after on the db bench state.
+- [x] Disk state phase 1d: codes out of the checkpoint image (still resident in RAM): new codes
+  flushed into sorted grid tables before each checkpoint (paced on the checkpoint's block
+  budget), the table list in the database checkpoint (version 2), the image carrying only
+  codes no table holds, open scanning the tables during an engine open pause, a rewrite of
+  every code into fresh tables (old blocks released through the free set) when the list is
+  full; node grid sized from its code limits. Tests: database crash recovery over 24 seeds
+  (mid flush, mid rewrite, mid checkpoint, fallback; every code byte for byte, roots), grid vs
+  grid-less vs too-small-grid differential, v2 grid-less file, table rot falls back.
+  (`db/code_store.zig`, `database_code_test.zig`; `db/codes` bench: image 44.7 -> 17.7 MiB,
+  steady checkpoint 34-35 -> 13-14 ms, open 161 -> 151 ms; see Decisions)
+- [ ] Disk state phase 1e (rest of the code store): codes out of RAM. Needs a read path that
+  does not hand out evictable slices (phase 4's batched prefetch or per-block code pinning;
+  see "code store read path"). Smaller follow-ups: parallel table reads at open (the scan
+  reads one block at a time), skip the redundant keccak per code at open (grid checksums
+  already cover the bytes), a code lookup hit/miss bench through the database.
 - [ ] Disk state phase 2: hashed account and storage LSM trees (memtables, leveled compaction
   paced per durable commit, filters on all but the last level, fences, static block cache);
   `State` reads through them; checkpoints stop serializing the flat tables. Differential test
@@ -290,7 +299,36 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (16 ways) with CLOCK per set, keyed by address + checksum, refilled by copy from the
   reader's own buffer (a refill never waits on a write). Reader completes synchronously when
   every block is cached (`.done`) and from a storage tick otherwise (`.pending`).
-- Code store read path (why phase 1d is not wired in): `State.code_by_hash` is synchronous and
+- Disk state phase 1d (code tables, codes still in RAM). Watermark: `code_arena` is
+  append-only and codes immutable, so one arena offset (`arena_flushed`) says which codes
+  tables hold (offset below it and length <= the table value limit, 65 364 B at 64 KiB
+  blocks); the image carries the rest (`snapshot.CodeFilter`; codes longer than a table value
+  stay in the image forever). Open: the engine gets an explicit open phase
+  (`Consumer.on_checkpoint_loaded`, `Phase.opening_paused`, `open_resume(.loaded|.corrupt)`):
+  after the checkpoint (and free set) load, the database decodes the table list, scans every
+  table through the normal async grid reads into the arena (keccak checked, every block
+  acquired and not released in the loaded free set), then loads the image (its codes append
+  after the table codes, so the watermark is the arena length after the scan) and resumes the
+  journal. A table block that does not verify resumes `.corrupt`: the codes are dropped and
+  the engine falls back like a rotten checkpoint. No synchronous read was added. Flush: runs
+  when a checkpoint is wanted and none is running, alongside commits (it reads only arena
+  bytes), and the checkpoint starts once it is done, so its sync covers the table writes.
+  Pacing: the flush spends the same per-commit block budget as the checkpoint chunks
+  (`checkpoint_blocks_per_commit` per durable commit, to whichever of the two is running;
+  `checkpoint_flush` lifts both). One free-set reservation for the whole flush (sum of
+  `Table.blocks_max` per table); no room skips the flush (codes stay in the image).
+  `code_flush_bytes_min` (64 KiB default, 0 in tests) skips tiny flushes. Tables are cut so
+  `blocks_max` fits one index block (~33 MB of records at 64 KiB). Rewrite: when the new
+  tables would overflow `code_tables_max` (16), every code is written into fresh tables and
+  the old tables' blocks are released before the checkpoint starts (free set: reusable two
+  durable checkpoints later); init asserts all codes fit half the list. Database checkpoint
+  version 2 = version 1 + table list after the header; grid-less databases still write
+  version 1, so the sim and old files are unchanged. Node: `code_grid_block_count` = 4 x the
+  blocks all codes fill + 64 (live tables, a rewrite's released tables, a rewrite's
+  half-full-block reservation): 2116 blocks (132 MiB) at the default 32 MiB of code; set in
+  `service.init_durable` unless the limits set a grid. Existing durable datadirs written
+  without a grid now fail `LayoutMismatch` at open (devnet datadirs are regenerated).
+- Code store read path (why codes are still in RAM after phase 1d): `State.code_by_hash` is synchronous and
   its callers outside the lane (evm `State.code`, which caches the slice in the account for
   the whole block; node `StateDb`, witness, rpc) hold the returned slice for a block or
   longer, while grid reads are asynchronous and cached blocks are evicted. Codes can leave
@@ -1178,3 +1216,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   engine grid crash test over 24 seeds x 6 crashes (mid write, mid and paused checkpoint,
   newest-zone rot forcing the fallback) reading back every referenced block. `db/table`:
   build 2.2-2.4 GiB/s, lookup hit 0.21-0.28 us, cold miss 25 us. Code store (1d) remains.
+- 2026-11-06: disk state phase 1d: contract codes leave the checkpoint image (still resident):
+  sorted code tables on the grid flushed before each checkpoint on the checkpoint's block
+  budget, the table list in database checkpoint v2, an engine open pause in which open scans
+  the tables, rewrites into fresh tables with checkpoint-staged block reuse, node grid sized
+  from its code limits. Tests: 24-seed crash recovery (mid flush/rewrite/checkpoint, fallback),
+  grid vs grid-less differential, v2 file, table rot, engine pause, paced builds. `db/codes`
+  (100k accounts + 4096 codes, 28 MiB): image 44.7 -> 17.7 MiB, checkpoint 34-35 -> 13-14 ms
+  steady (27-28 ms right after deploying all codes), open 161 -> 151 ms. Codes out of RAM
+  (phase 1e / 4) remains.

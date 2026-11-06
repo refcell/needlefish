@@ -285,3 +285,13 @@ together. Refills of the block cache never wait on a write and are bounded per b
   `code_by_hash` callers (the evm caches the slice for a whole block) are synchronous and
   hold the slice. Codes first leave the checkpoint image while staying resident; they leave
   RAM with phase 4's batched prefetch (or per-block pinning). See the trie-db lane Decisions.
+- Open reads tables in an explicit engine open phase: after the checkpoint loads and before
+  journal replay the engine pauses (`Consumer.on_checkpoint_loaded`), the caller scans its
+  tables through the normal asynchronous storage interface, then resumes (`open_resume`);
+  data that does not verify resumes as corrupt and falls back like a rotten checkpoint. The
+  storage interface gained no synchronous read.
+- Phase 1d (done): codes are in tables and out of the image, still in `code_arena`. A
+  watermark on the append-only arena says which codes tables hold; the flush before each
+  checkpoint spends the checkpoint's per-commit block budget; when the table list is full,
+  all codes are rewritten from RAM and the old blocks freed through the free set. Measured in
+  docs/PERF.md "db code tables".

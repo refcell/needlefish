@@ -335,3 +335,151 @@ test "engine grid: the free set survives reopen and frees after two checkpoints"
     try testing.expect(!reopened.is_acquired(1));
     try testing.expect(reopened.is_acquired(2));
 }
+
+/// A consumer that pauses after every checkpoint load and resumes when the test says so.
+const Pauser = struct {
+    engine: Engine,
+    sim: *SimStorage,
+    phase_done: bool = false,
+    pauses: u32 = 0,
+    resets: u32 = 0,
+    loaded_bytes: u32 = 0,
+    checkpoint_done: bool = false,
+    produced: bool = false,
+
+    fn on_phase(engine: *Engine) void {
+        const self: *Pauser = @alignCast(@fieldParentPtr("engine", engine));
+        self.phase_done = true;
+    }
+
+    fn on_checkpoint(engine: *Engine) void {
+        const self: *Pauser = @alignCast(@fieldParentPtr("engine", engine));
+        _ = engine.checkpoint_result catch unreachable; // A few bytes fit the zone.
+        self.checkpoint_done = true;
+    }
+
+    fn produce(context: *anyopaque, buffer: []u8) u32 {
+        const self: *Pauser = @ptrCast(@alignCast(context));
+        if (self.produced) return 0;
+        self.produced = true;
+        buffer[0] = 0xab;
+        return 1;
+    }
+
+    fn consume(context: *anyopaque, chunk: []const u8) void {
+        const self: *Pauser = @ptrCast(@alignCast(context));
+        self.loaded_bytes += @intCast(chunk.len);
+    }
+
+    fn consume_reset(context: *anyopaque) void {
+        const self: *Pauser = @ptrCast(@alignCast(context));
+        self.resets += 1;
+        self.loaded_bytes = 0;
+    }
+
+    fn consume_entry(_: *anyopaque, _: engine_module.Entry) void {}
+
+    fn loaded(context: *anyopaque) void {
+        const self: *Pauser = @ptrCast(@alignCast(context));
+        assert(self.engine.phase == .opening_paused);
+        self.pauses += 1;
+    }
+
+    fn open(self: *Pauser) void {
+        self.phase_done = false;
+        self.engine.open(.{
+            .context = self,
+            .on_checkpoint = consume,
+            .on_checkpoint_reset = consume_reset,
+            .on_entry = consume_entry,
+            .on_checkpoint_loaded = loaded,
+        }, on_phase);
+    }
+
+    /// Ticks until the `count`th pause, then checks the engine stays paused meanwhile.
+    fn wait_pause(self: *Pauser, count: u32) !void {
+        var ticks: u32 = 0;
+        while (self.pauses < count) : (ticks += 1) {
+            if (ticks > 100_000) return error.Timeout;
+            self.sim.tick();
+        }
+        for (0..50) |_| self.sim.tick();
+        try testing.expectEqual(Engine.Phase.opening_paused, self.engine.phase);
+        try testing.expect(!self.engine.idle());
+        try testing.expectEqual(count, self.pauses);
+    }
+
+    fn wait(self: *Pauser, flag: *bool) !void {
+        var ticks: u32 = 0;
+        while (!flag.*) : (ticks += 1) {
+            if (ticks > 100_000) return error.Timeout;
+            self.sim.tick();
+        }
+        flag.* = false;
+    }
+
+    fn checkpoint(self: *Pauser) !void {
+        const producer: engine_module.Producer = .{ .context = self, .produce = produce };
+        self.produced = false;
+        try self.engine.checkpoint(producer, on_checkpoint);
+        try self.wait(&self.checkpoint_done);
+    }
+
+    fn reinit(self: *Pauser) !void {
+        self.engine.deinit(testing.allocator);
+        self.engine = try .init(testing.allocator, self.sim, config);
+        self.pauses = 0;
+        self.resets = 0;
+        self.loaded_bytes = 0;
+    }
+};
+
+test "engine grid: open pauses after the checkpoint; corrupt resumes fall back, then fail" {
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = config.size_bytes(),
+        .seed = 41,
+        .latency_ticks_max = 3,
+    });
+    defer sim.deinit(testing.allocator);
+    const pauser = try testing.allocator.create(Pauser);
+    defer testing.allocator.destroy(pauser);
+    pauser.* = .{ .engine = try .init(testing.allocator, &sim, config), .sim = &sim };
+    defer pauser.engine.deinit(testing.allocator);
+    pauser.engine.format(0x9a05e, Pauser.on_phase);
+    try pauser.wait(&pauser.phase_done);
+    // A fresh file pauses too (no checkpoint, nothing loaded).
+    pauser.open();
+    try pauser.wait_pause(1);
+    try testing.expectEqual(@as(u32, 0), pauser.loaded_bytes);
+    pauser.engine.open_resume(.loaded);
+    try pauser.wait(&pauser.phase_done);
+    _ = try pauser.engine.open_result;
+    try pauser.checkpoint();
+    try pauser.checkpoint();
+    try testing.expect(pauser.engine.superblock.working.has_fallback());
+
+    // The newest checkpoint's data is reported corrupt: the fallback loads and pauses again.
+    try pauser.reinit();
+    pauser.open();
+    try pauser.wait_pause(1);
+    const free_set_bytes: u32 = @intCast(pauser.engine.free_set_image.len);
+    try testing.expectEqual(@as(u32, 1), pauser.loaded_bytes);
+    pauser.engine.open_resume(.corrupt);
+    try pauser.wait_pause(2);
+    try testing.expectEqual(@as(u32, 1), pauser.resets);
+    try testing.expectEqual(@as(u32, 1), pauser.loaded_bytes);
+    pauser.engine.open_resume(.loaded);
+    try pauser.wait(&pauser.phase_done);
+    const result = try pauser.engine.open_result;
+    try testing.expect(result.checkpoint_fallback);
+    try testing.expect(free_set_bytes > 0);
+
+    // After the fallback there is no distinct fallback: corrupt again fails the open.
+    try pauser.reinit();
+    pauser.open();
+    try pauser.wait_pause(1);
+    pauser.engine.open_resume(.corrupt);
+    try pauser.wait(&pauser.phase_done);
+    try testing.expectError(error.CheckpointCorrupt, pauser.engine.open_result);
+    try testing.expectEqual(Engine.Phase.closed, pauser.engine.phase);
+}

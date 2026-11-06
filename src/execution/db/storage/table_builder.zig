@@ -8,6 +8,9 @@
 //! syncs: the caller makes the blocks durable (the engine's checkpoint sync covers every
 //! grid write that completed before the checkpoint started).
 //!
+//! Pacing: `build_paced` writes at most a given number of blocks, then pauses until `grant`
+//! allows more, so a table flush can spread over several commits like a paced checkpoint.
+//!
 //! Memory: one data block, one index block, and one record scratch buffer, allocated at init.
 
 const std = @import("std");
@@ -53,6 +56,10 @@ pub fn BuilderType(comptime Table: type) type {
         info: Table.Info = undefined,
         write: Table.Grid.Write = .{},
         result: anyerror!Table.Info = error.Empty,
+        /// Block writes left before the build pauses; what remains is reported after it ends.
+        blocks_allowed: u64 = 0,
+        /// The build waits for `grant` before its next block.
+        paused: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, grid: *Table.Grid) !Self {
             const block_size = grid.config.block_size;
@@ -103,7 +110,23 @@ pub fn BuilderType(comptime Table: type) type {
             reservation: *Reservation,
             callback: Callback,
         ) void {
+            self.build_paced(source, free_set, reservation, std.math.maxInt(u64), callback);
+        }
+
+        /// Like `build`, but writes at most `blocks_allowed` blocks before it pauses for
+        /// `grant`. After the callback, `blocks_allowed` holds the unused allowance.
+        pub fn build_paced(
+            self: *Self,
+            source: Table.Source,
+            free_set: *FreeSet,
+            reservation: *Reservation,
+            blocks_allowed: u64,
+            callback: Callback,
+        ) void {
+            assert(blocks_allowed > 0);
             assert(self.state == .idle);
+            self.blocks_allowed = blocks_allowed;
+            self.paused = false;
             assert(self.callback == null);
             self.source = source;
             self.free_set = free_set;
@@ -116,6 +139,23 @@ pub fn BuilderType(comptime Table: type) type {
             write_u32(self.index_block[block_header_size..], 4, 0);
             self.state = .writing_data;
             self.next_data_block();
+        }
+
+        /// Lets a paced build write `blocks` more blocks (saturating); resumes it if paused.
+        pub fn grant(self: *Self, blocks: u64) void {
+            assert(blocks > 0);
+            self.blocks_allowed +|= blocks;
+            if (!self.paused) return;
+            assert(self.state == .writing_data);
+            self.paused = false;
+            self.next_data_block();
+        }
+
+        /// Spends one block of the allowance on the write about to be submitted.
+        fn spend_block(self: *Self) void {
+            assert(self.blocks_allowed > 0);
+            assert(!self.paused);
+            self.blocks_allowed -= 1;
         }
 
         fn room(self: *const Self) u32 {
@@ -199,6 +239,7 @@ pub fn BuilderType(comptime Table: type) type {
             self.info.key_max = self.key_last;
             self.info.record_count += self.count;
             self.info.data_block_count = data_blocks + 1;
+            self.spend_block();
             self.grid.write_block(on_write, &self.write, self.data_block, address);
         }
 
@@ -218,13 +259,21 @@ pub fn BuilderType(comptime Table: type) type {
                 payload_size,
             );
             self.state = .writing_index;
+            self.spend_block();
             self.grid.write_block(on_write, &self.write, self.index_block, address);
         }
 
         fn on_write(write: *Table.Grid.Write) void {
             const self: *Self = @alignCast(@fieldParentPtr("write", write));
             switch (self.state) {
-                .writing_data => self.next_data_block(),
+                .writing_data => {
+                    // The next step writes one block (data or index) or none (an error).
+                    if (self.blocks_allowed == 0) {
+                        self.paused = true;
+                        return;
+                    }
+                    self.next_data_block();
+                },
                 .writing_index => self.finish(self.info),
                 .idle => unreachable,
             }

@@ -482,6 +482,13 @@ pub fn Service(comptime IO: type) type {
             const limits = &service.options.limits;
             var config = limits.durable;
             config.state = StateDb.state_config(limits.state);
+            // Contract codes go to grid tables, out of the checkpoint image; the grid is
+            // sized from the state's code limits unless the limits set one.
+            if (config.engine.grid_block_count == 0) {
+                const block_size = config.engine.checkpoint_block_size;
+                const blocks = db_module.database.code_grid_block_count(config.state, block_size);
+                config.engine.grid_block_count = blocks;
+            }
             // A durable node's history window lives in the database (fed by its head moves).
             const window = service.options.proofs_history_window;
             if (window > 0) config.history = history_config(limits, window);

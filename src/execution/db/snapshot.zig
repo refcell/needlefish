@@ -56,15 +56,42 @@ fn block_hash_count(state: *const State) u32 {
     return count;
 }
 
+/// Which codes a snapshot carries: a code is written when it lies at or past `offset_min`
+/// in the code arena or is longer than `length_max`. The others are stored elsewhere (the
+/// database's code tables) and must be in the state before the snapshot loads.
+pub const CodeFilter = struct {
+    offset_min: u32 = 0,
+    length_max: u32 = std.math.maxInt(u32),
+
+    pub fn includes(filter: CodeFilter, code: state_module.CodeRef) bool {
+        return code.offset >= filter.offset_min or code.len > filter.length_max;
+    }
+};
+
 /// Streams `state` into `sink`. Computes the state root first.
 pub fn write(state: *State, sink: anytype) !void {
+    return write_filtered(state, sink, .{});
+}
+
+fn code_count(state: *const State, filter: CodeFilter) u32 {
+    if (filter.offset_min == 0) return state.code_table.count();
+    var count: u32 = 0;
+    var codes = state.code_table.valueIterator();
+    while (codes.next()) |code| count += @intFromBool(filter.includes(code.*));
+    assert(count <= state.code_table.count());
+    return count;
+}
+
+/// Streams `state` into `sink` with only the codes `filter` includes.
+pub fn write_filtered(state: *State, sink: anytype, filter: CodeFilter) !void {
     const root = try state.state_root();
     try write_int(sink, u32, magic);
     try write_int(sink, u16, version);
     try sink.write(&root);
     try write_int(sink, u32, state.account_table.count());
     try write_int(sink, u32, state.storage_table.count());
-    try write_int(sink, u32, state.code_table.count());
+    const codes_written = code_count(state, filter);
+    try write_int(sink, u32, codes_written);
     try write_int(sink, u32, block_hash_count(state));
     var accounts = state.account_table.iterator();
     while (accounts.next()) |entry| {
@@ -80,11 +107,15 @@ pub fn write(state: *State, sink: anytype) !void {
         try write_word(sink, entry.value_ptr.*);
     }
     var codes = state.code_table.iterator();
+    var codes_seen: u32 = 0;
     while (codes.next()) |entry| {
+        if (!filter.includes(entry.value_ptr.*)) continue;
+        codes_seen += 1;
         const code = state.code_by_hash(entry.key_ptr.*).?;
         try write_int(sink, u32, @intCast(code.len));
         try sink.write(code);
     }
+    assert(codes_seen == codes_written);
     for (state.block_hashes) |entry| {
         if (!entry.valid) continue;
         try write_int(sink, u64, entry.number);
@@ -113,10 +144,11 @@ pub fn load_incremental(state: *State, source: anytype) !void {
     try verify(state, &expected);
 }
 
-/// Decodes the header and checks the counts against the state's capacities.
+/// Decodes the header and checks the counts against the state's capacities. The state may
+/// already hold codes (loaded from code tables); the snapshot's codes must all be new.
 fn load_header(state: *const State, source: anytype) !struct { Expected, Counts } {
     assert(state.account_table.count() == 0);
-    assert(state.code_table.count() == 0);
+    assert(state.storage_table.count() == 0);
     if (try read_int(source, u32) != magic) return error.InvalidSnapshot;
     if (try read_int(source, u16) != version) return error.InvalidSnapshot;
     var expected: Expected = undefined;

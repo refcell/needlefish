@@ -876,8 +876,34 @@ Takeaways: a cache hit is inside the <= 1 us target of docs/design/disk-state.md
 miss costs ~25 us of CPU before any device time because the reader reads, checksums, and
 copies a whole 64 KiB block; reading only the sectors the header names and checking the
 block once on insert are the next cuts when misses matter (phase 2 brings filters, so absent
-keys stop reading data blocks). Code lookup through the database and the checkpoint image
-size without codes are not measured yet: the code store (phase 1 item d) is not wired in.
+keys stop reading data blocks). The code store (phase 1d) is measured in the next section.
+
+## 2026-11-06 db code tables: codes out of the checkpoint image (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/codes` (`db/code_bench.zig`). Disk state phase
+1d: the db bench state (100k accounts, 64k slots) plus 4096 contract codes sized like mainnet
+bytecode (40% 0.1-2 KiB, 40% 2-12 KiB, 20% 12-24 KiB; ~28 MiB, inside the node's default code
+limits of 8192 codes / 32 MiB), 4 retained blocks, 64 KiB blocks, over `SimStorage` with one
+tick of latency (CPU side only). "First" is the checkpoint right after the codes are deployed
+(with a grid it also writes every code into one table); "then" is the next checkpoint after
+16 more codes (an incremental flush into a second table). Three runs:
+
+| | grid-less (today) | grid (code tables) |
+| --- | ---: | ---: |
+| checkpoint image, first | 44.7 MiB | 17.7 MiB |
+| checkpoint image, then | 44.1 MiB | 16.9 MiB |
+| checkpoint duration, first (incl. the 28 MiB table flush) | 35.5-37.6 ms | 27.0-28.1 ms |
+| checkpoint duration, then | 34.0-35.5 ms | 13.2-14.3 ms |
+| open (checkpoint read, table scan, image load, trie build, root) | 160.6-163.1 ms | 150.7-153.8 ms |
+| of which the table scan (2 tables, 28 MiB) | | 41.2-42.2 ms |
+
+Takeaways: the image loses the codes (-27 MiB; what remains is 14.6 MiB of accounts and slots
+plus the retained blocks), so each checkpoint writes and checksums 60% fewer bytes and a
+steady-state checkpoint takes 2.5x less time. The first checkpoint after a burst of deploys
+still beats today's, because writing a sorted table costs less than serializing the same
+codes into the image. Open barely moves: both variants keccak every code once at insert
+(`State.insert_code`), which dominates the 41 ms scan (0.7 GB/s); the scan reads its blocks
+one at a time. Phase 4 (codes out of RAM) removes the scan altogether.
 
 ## 2026-11-06 node mainnet replay (aarch64-macos, Apple M4 Pro, ReleaseFast)
 

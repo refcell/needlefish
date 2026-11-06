@@ -23,6 +23,10 @@
 //!   if replay reaches the newest checkpoint's coverage; the superblock is then rewritten to
 //!   name the fallback as newest (no distinct fallback), so the next checkpoint overwrites
 //!   the rotten zone and never the one just loaded.
+//! - Open phase: a consumer with `on_checkpoint_loaded` gets a pause between the loaded
+//!   checkpoint and the journal replay, to read the grid tables its checkpoint names through
+//!   the normal asynchronous storage interface; `open_resume(.loaded)` replays the journal,
+//!   `open_resume(.corrupt)` treats the checkpoint as rotten (fallback once, else fail).
 //!
 //! Crash safety: nothing a recoverable superblock depends on is overwritten while any copy of
 //! that superblock may still be chosen. The checkpoint zone in use and the journal entries
@@ -129,6 +133,22 @@ pub const Consumer = struct {
     /// Receives each replayed journal entry in order, after the whole checkpoint. The
     /// entry's slices are valid only during the call.
     on_entry: *const fn (context: *anyopaque, entry: Entry) void,
+    /// Optional open phase between the checkpoint and the journal: called once the loaded
+    /// checkpoint (newest or fallback; also when there is none) streamed and verified,
+    /// before any entry. The engine then pauses (`Phase.opening_paused`) until the consumer
+    /// calls `open_resume`, from this call or later from a storage tick. While paused the
+    /// consumer may read grid blocks (the free set is already restored), e.g. to scan the
+    /// tables its checkpoint names. Null resumes at once.
+    on_checkpoint_loaded: ?*const fn (context: *anyopaque) void = null,
+};
+
+/// What the consumer found while the engine paused after loading a checkpoint.
+pub const ResumeOutcome = enum {
+    /// Continue with the journal.
+    loaded,
+    /// Data the checkpoint names did not verify: discard it like a rotten checkpoint
+    /// (`on_checkpoint_reset`, then the fallback, or `CheckpointCorrupt`).
+    corrupt,
 };
 
 pub const OpenResult = struct {
@@ -175,6 +195,8 @@ pub fn EngineType(comptime Storage: type) type {
             opening_superblock,
             repairing,
             opening_checkpoint,
+            /// The checkpoint is loaded; waiting for the consumer's `open_resume`.
+            opening_paused,
             opening_journal,
             /// After a fallback: naming the fallback checkpoint as the newest.
             demoting,
@@ -445,7 +467,7 @@ pub fn EngineType(comptime Storage: type) type {
                 },
                 .demoting => self.open_done(),
                 .ready => self.checkpoint_superblock_done(),
-                .closed, .opening_checkpoint, .opening_journal => unreachable,
+                .closed, .opening_checkpoint, .opening_paused, .opening_journal => unreachable,
             }
         }
 
@@ -492,7 +514,7 @@ pub fn EngineType(comptime Storage: type) type {
                     (self.free_set == null and
                         checkpoint_.checksum == checksum_module.checksum(""));
                 if (!empty_ok) return self.open_checkpoint_failed();
-                return self.open_journal();
+                return self.open_checkpoint_loaded();
             }
             const blocks = checkpoint_module.block_count(
                 checkpoint_.size_bytes,
@@ -553,7 +575,7 @@ pub fn EngineType(comptime Storage: type) type {
             if (self.phase == .opening_checkpoint) {
                 checkpoint_io.result catch return self.open_checkpoint_failed();
                 if (!self.free_set_loaded()) return self.open_checkpoint_failed();
-                return self.open_journal();
+                return self.open_checkpoint_loaded();
             }
             assert(self.phase == .ready);
             assert(self.checkpoint_phase == .writing);
@@ -597,7 +619,29 @@ pub fn EngineType(comptime Storage: type) type {
             callback(self);
         }
 
+        /// The checkpoint is loaded and verified: pause for the consumer, if it asked to.
+        fn open_checkpoint_loaded(self: *Self) void {
+            assert(self.phase != .ready and self.phase != .closed);
+            // A freshly formatted file has no checkpoint: its free set stays all free.
+            assert(self.free_set_loaded() or self.open_target().sequence == 0);
+            self.phase = .opening_paused;
+            const consumer = self.consumer.?;
+            const loaded = consumer.on_checkpoint_loaded orelse return self.open_journal();
+            loaded(consumer.context);
+        }
+
+        /// Ends the pause after the checkpoint loaded (`Consumer.on_checkpoint_loaded`).
+        pub fn open_resume(self: *Self, outcome: ResumeOutcome) void {
+            assert(self.phase == .opening_paused);
+            assert(self.consumer.?.on_checkpoint_loaded != null);
+            switch (outcome) {
+                .loaded => self.open_journal(),
+                .corrupt => self.open_checkpoint_failed(),
+            }
+        }
+
         fn open_journal(self: *Self) void {
+            assert(self.phase == .opening_paused);
             const working = &self.superblock.working;
             if (self.open_fallback) {
                 self.open_start = working.journal_start_previous;

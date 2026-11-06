@@ -46,6 +46,8 @@ pub const restart = @import("restart_bench.zig");
 pub const footprint = @import("footprint_bench.zig");
 /// Sorted tables on the grid: build, lookup hit/miss (`table_bench.zig`).
 pub const table = @import("table_bench.zig");
+/// Code tables vs codes in the checkpoint image (`code_bench.zig`).
+pub const codes = @import("code_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -657,6 +659,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     restart.run(io, filter);
     footprint.run(io, filter);
     table.run(io, filter);
+    codes.run(io, filter);
 }
 
 fn run_commit_sim(
