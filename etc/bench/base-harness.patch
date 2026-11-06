@@ -1,0 +1,543 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e442af5..e64ac3f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -13250,6 +13250,24 @@ dependencies = [
+  "tokio",
+ ]
+ 
++[[package]]
++name = "nf-replay-bench"
++version = "0.0.0"
++dependencies = [
++ "alloy-consensus 2.5.0",
++ "alloy-primitives",
++ "alloy-rlp",
++ "alloy-rpc-types-engine",
++ "alloy-rpc-types-eth 2.5.0",
++ "base-common-chains",
++ "base-common-evm",
++ "base-common-rpc-types-engine",
++ "base-proof-executor",
++ "base-proof-mpt",
++ "miniz_oxide 0.9.1",
++ "serde_json",
++]
++
+ [[package]]
+ name = "nix"
+ version = "0.26.4"
+diff --git a/Cargo.toml b/Cargo.toml
+index 91c6156..96f570c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -11,6 +11,7 @@ exclude = [".github/"]
+ resolver = "2"
+ exclude = ["actions/fixtures", "crates/proof/zk/programs"]
+ members = [
++  "bench/nf-replay",
+   "acceptance",
+   "actions/*",
+   "bin/[a-o]*",
+diff --git a/bench/nf-replay/Cargo.toml b/bench/nf-replay/Cargo.toml
+new file mode 100644
+index 0000000..e7f7a0a
+--- /dev/null
++++ b/bench/nf-replay/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "nf-replay-bench"
++description = "Replays a needlefish .nfrp archive through base/base's stateless block executor"
++edition.workspace = true
++license.workspace = true
++version.workspace = true
++publish = false
++
++[dependencies]
++base-proof-executor = { workspace = true, features = ["std"] }
++base-proof-mpt = { workspace = true, features = ["std"] }
++base-common-evm = { workspace = true, features = ["std"] }
++base-common-chains = { workspace = true, features = ["std"] }
++base-common-rpc-types-engine = { workspace = true, features = ["std"] }
++alloy-rpc-types-engine = { workspace = true, features = ["std"] }
++alloy-consensus = { workspace = true, features = ["std"] }
++alloy-primitives = { workspace = true, features = ["std"] }
++alloy-rlp = { workspace = true, features = ["std"] }
++alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
++serde_json = { workspace = true, features = ["std"] }
++miniz_oxide = { workspace = true, features = ["std"] }
+diff --git a/bench/nf-replay/src/main.rs b/bench/nf-replay/src/main.rs
+new file mode 100644
+index 0000000..5d65b6e
+--- /dev/null
++++ b/bench/nf-replay/src/main.rs
+@@ -0,0 +1,351 @@
++//! Replays a needlefish `.nfrp` replay archive through base/base's stateless block executor
++//! (`base-proof-executor::StatelessL2Builder`) and prints one `BENCH` line per block.
++//!
++//! usage: nf-replay-bench <archive.nfrp> <parent-block.json> [warm runs]
++//!
++//! `parent-block.json` is the JSON-RPC response of `eth_getBlockByNumber(parent, false)`.
++//!
++//! Run 0 is cold (first execution in a fresh process); runs 1..=warm are warm. Every run
++//! starts from a fresh `TrieDB` over the archive's witness, so every run executes the same
++//! blocks from the same pre-state. A block whose sealed header hash differs from the
++//! canonical header ends the process with exit code 1.
++
++use std::{
++    collections::{HashMap, HashSet},
++    sync::{Arc, OnceLock},
++    time::Instant,
++};
++
++use alloy_consensus::{Header, Sealable, Sealed};
++use alloy_primitives::{Address, U256};
++use alloy_primitives::{B64, B256, Bytes, keccak256};
++use alloy_rlp::{Decodable, Encodable};
++use alloy_rpc_types_engine::PayloadAttributes;
++use base_common_chains::ChainConfig;
++use base_common_evm::BaseEvmFactory;
++use base_common_rpc_types_engine::BasePayloadAttributes;
++use base_proof_executor::{StatelessL2Builder, TrieDBProvider};
++use base_proof_mpt::{TrieHinter, TrieNode, TrieProvider};
++use std::{cell::RefCell, rc::Rc};
++
++/// Remembers the last account or slot the executor asked for, to name a witness gap.
++#[derive(Debug, Clone, Default)]
++struct LastKey(Rc<RefCell<String>>);
++
++impl TrieHinter for LastKey {
++    type Error = String;
++
++    fn hint_account_proof(&self, address: Address, _block: u64) -> Result<(), String> {
++        *self.0.borrow_mut() = format!("account {address}");
++        Ok(())
++    }
++
++    fn hint_storage_proof(&self, address: Address, slot: U256, _block: u64) -> Result<(), String> {
++        *self.0.borrow_mut() = format!("slot {address} {slot:#x}");
++        Ok(())
++    }
++
++    fn hint_execution_witness(
++        &self,
++        _parent: B256,
++        _attributes: &BasePayloadAttributes,
++    ) -> Result<(), String> {
++        Ok(())
++    }
++}
++
++#[derive(Debug, Default)]
++struct Store {
++    nodes: HashMap<B256, Bytes>,
++    codes: HashMap<B256, Bytes>,
++    headers: HashMap<B256, Header>,
++    hashes: HashMap<u64, B256>,
++    opaque: HashSet<B256>,
++}
++
++/// The archive's witness plus the storage-trie nodes TrieDB computed in earlier blocks of
++/// the current run (see `harvest`).
++#[derive(Debug, Clone)]
++struct Provider(Arc<Store>, Rc<RefCell<HashMap<B256, Bytes>>>);
++
++/// TrieDB keeps the account trie in memory across blocks but re-opens each account's storage
++/// trie from its root hash in every block; in the fault-proof program the host serves those
++/// post-state nodes. Here they come from the nodes TrieDB itself computed, collected between
++/// blocks outside the timed region. needlefish keeps its post-state trie in memory instead.
++fn harvest<'a>(
++    roots: impl IntoIterator<Item = (&'a Address, &'a TrieNode)>,
++    out: &mut HashMap<B256, Bytes>,
++) {
++    let mut stack: Vec<&TrieNode> = roots.into_iter().map(|(_, node)| node).collect();
++    let mut buffer = Vec::new();
++    while let Some(node) = stack.pop() {
++        match node {
++            TrieNode::Blinded { .. } | TrieNode::Empty => continue,
++            TrieNode::Leaf { .. } => {}
++            TrieNode::Extension { node, .. } => stack.push(node),
++            TrieNode::Branch { stack: children } => stack.extend(children.iter()),
++        }
++        buffer.clear();
++        node.encode(&mut buffer);
++        if buffer.len() >= 32 {
++            out.insert(keccak256(&buffer), Bytes::copy_from_slice(&buffer));
++        }
++    }
++}
++
++impl TrieProvider for Provider {
++    type Error = String;
++
++    fn trie_node_by_hash(&self, key: B256) -> Result<TrieNode, String> {
++        if let Some(raw) = self.0.nodes.get(&key) {
++            return TrieNode::decode(&mut raw.as_ref()).map_err(|e| e.to_string());
++        }
++        let extra = self.1.borrow();
++        let raw = extra.get(&key).ok_or_else(|| format!("missing node {key}"))?;
++        TrieNode::decode(&mut raw.as_ref()).map_err(|e| e.to_string())
++    }
++
++    /// Archive opaque branches, and siblings the witness lacks: TrieDB collapses a branch on
++    /// every delete, so a branch that a later insert of the same block re-expands needs its
++    /// surviving child only by reference (needlefish collapses once, after all changes). If a
++    /// sibling were really merged, the state root would differ and the block would fail.
++    fn is_opaque_branch(&self, key: B256) -> bool {
++        self.0.opaque.contains(&key)
++            || (!self.0.nodes.contains_key(&key) && !self.1.borrow().contains_key(&key))
++    }
++}
++
++impl TrieDBProvider for Provider {
++    fn bytecode_by_hash(&self, hash: B256) -> Result<Bytes, String> {
++        self.0.codes.get(&hash).cloned().ok_or_else(|| format!("missing code {hash}"))
++    }
++
++    fn header_by_hash(&self, hash: B256) -> Result<Header, String> {
++        self.0.headers.get(&hash).cloned().ok_or_else(|| format!("missing header {hash}"))
++    }
++
++    fn block_hash_by_number(&self, number: u64) -> Option<B256> {
++        self.0.hashes.get(&number).copied()
++    }
++}
++
++struct Reader<'a> {
++    bytes: &'a [u8],
++    offset: usize,
++}
++
++impl<'a> Reader<'a> {
++    fn take(&mut self, length: usize) -> &'a [u8] {
++        let slice = &self.bytes[self.offset..self.offset + length];
++        self.offset += length;
++        slice
++    }
++    fn u32(&mut self) -> u32 {
++        u32::from_le_bytes(self.take(4).try_into().unwrap())
++    }
++    fn u64(&mut self) -> u64 {
++        u64::from_le_bytes(self.take(8).try_into().unwrap())
++    }
++    fn hash(&mut self) -> B256 {
++        B256::from_slice(self.take(32))
++    }
++    fn section(&mut self) -> Vec<&'a [u8]> {
++        let count = self.u32();
++        let _payload = self.u32();
++        (0..count)
++            .map(|_| {
++                let length = self.u32() as usize;
++                self.take(length)
++            })
++            .collect()
++    }
++}
++
++struct Block {
++    header: Header,
++    hash: B256,
++    transactions: Vec<Bytes>,
++    /// Accounts and slots the block deleted (canonical post-state), for gap diagnostics.
++    deleted: Vec<String>,
++}
++
++fn load(path: &str) -> (Store, Vec<Block>, B256) {
++    let file = std::fs::read(path).expect("read archive");
++    assert_eq!(&file[0..4], b"NFRP");
++    let version = u32::from_le_bytes(file[4..8].try_into().unwrap());
++    let body_bytes = u64::from_le_bytes(file[8..16].try_into().unwrap()) as usize;
++    // Version 2 stores the body; version 1 (the committed fixture) raw-deflates it.
++    let inflated;
++    let body: &[u8] = match version {
++        2 => &file[48..],
++        1 => {
++            inflated = miniz_oxide::inflate::decompress_to_vec(&file[48..]).expect("inflate");
++            &inflated
++        }
++        _ => panic!("unsupported archive version {version}"),
++    };
++    assert_eq!(body.len(), body_bytes, "archive body size");
++    assert_eq!(keccak256(body).as_slice(), &file[16..48], "archive digest");
++    let mut reader = Reader { bytes: body, offset: 0 };
++    assert_eq!(reader.u64(), 8453, "Base mainnet archive");
++    let block_count = reader.u32() as usize;
++    let _witness_bytes = reader.u32();
++    assert_eq!(reader.take(4), b"NFWT");
++    assert_eq!(reader.u32(), 1);
++    let mut store = Store::default();
++    for node in reader.section() {
++        store.nodes.insert(keccak256(node), Bytes::copy_from_slice(node));
++    }
++    for code in reader.section() {
++        store.codes.insert(keccak256(code), Bytes::copy_from_slice(code));
++    }
++    assert!(reader.section().is_empty());
++    let mut blocks: Vec<Block> = reader
++        .section()
++        .into_iter()
++        .map(|raw| Block {
++            header: Header::decode(&mut &raw[..]).expect("header"),
++            hash: keccak256(raw),
++            transactions: Vec::new(),
++            deleted: Vec::new(),
++        })
++        .collect();
++    assert_eq!(blocks.len(), block_count);
++    let parent_state_root = reader.hash();
++    let ancestor_count = reader.u32() as u64;
++    let first = blocks[0].header.number;
++    for index in 0..ancestor_count {
++        store.hashes.insert(first - ancestor_count + index, reader.hash());
++    }
++    for _ in 0..reader.u32() {
++        store.opaque.insert(reader.hash());
++    }
++    for block in &mut blocks {
++        let count = reader.u32() as usize;
++        for _ in 0..count {
++            let length = reader.u32() as usize;
++            block.transactions.push(Bytes::copy_from_slice(reader.take(length)));
++        }
++        reader.take(count * 13); // Canonical receipts: diagnostics only.
++        let accounts = reader.u32() as usize;
++        for _ in 0..accounts {
++            let raw = reader.take(93);
++            if raw[20] == 0 {
++                block.deleted.push(format!("account {}", Address::from_slice(&raw[..20])));
++            }
++        }
++        let slots = reader.u32() as usize;
++        for _ in 0..slots {
++            let raw = reader.take(84);
++            if raw[52..84].iter().all(|byte| *byte == 0) {
++                let address = Address::from_slice(&raw[..20]);
++                let slot = B256::from_slice(&raw[20..52]);
++                block.deleted.push(format!("slot {address} {slot}"));
++            }
++        }
++        store.hashes.insert(block.header.number, block.hash);
++        store.headers.insert(block.hash, block.header.clone());
++    }
++    assert_eq!(reader.offset, body.len());
++    (store, blocks, parent_state_root)
++}
++
++fn attributes(block: &Block) -> BasePayloadAttributes {
++    let header = &block.header;
++    let extra = &header.extra_data;
++    BasePayloadAttributes {
++        payload_attributes: PayloadAttributes {
++            timestamp: header.timestamp,
++            prev_randao: header.mix_hash,
++            suggested_fee_recipient: header.beneficiary,
++            withdrawals: Some(Vec::new()),
++            parent_beacon_block_root: header.parent_beacon_block_root,
++            slot_number: None,
++            target_gas_limit: None,
++        },
++        transactions: Some(block.transactions.clone()),
++        no_tx_pool: Some(true),
++        gas_limit: Some(header.gas_limit),
++        eip_1559_params: (extra.len() >= 9).then(|| B64::from_slice(&extra[1..9])),
++        min_base_fee: (extra.len() >= 17)
++            .then(|| u64::from_be_bytes(extra[9..17].try_into().unwrap())),
++    }
++}
++
++fn now_ns() -> u64 {
++    static EPOCH: OnceLock<Instant> = OnceLock::new();
++    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
++}
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    let warm: u32 = args.get(3).map_or(5, |s| s.parse().expect("warm runs"));
++    let (store, blocks, parent_state_root) = load(&args[1]);
++    let response: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(&args[2]).expect("read parent")).expect("json");
++    let parent: alloy_rpc_types_eth::Header =
++        serde_json::from_value(response["result"].clone()).expect("parent header");
++    let parent: Header = parent.inner;
++    assert_eq!(parent.hash_slow(), blocks[0].header.parent_hash, "parent header hash");
++    assert_eq!(parent.state_root, parent_state_root, "parent state root");
++    let parent: Sealed<Header> = parent.seal_slow();
++    let config = ChainConfig::rollup_config_by_chain_id(8453).expect("Base mainnet config");
++    let store = Arc::new(store);
++    let attrs: Vec<BasePayloadAttributes> = blocks.iter().map(attributes).collect();
++    now_ns();
++    let last_key = LastKey::default();
++    for run in 0..=warm {
++        let provider = Provider(store.clone(), Rc::default());
++        let mut builder = StatelessL2Builder::new(
++            &config,
++            BaseEvmFactory::default(),
++            provider.clone(),
++            last_key.clone(),
++            parent.clone(),
++        );
++        builder.clock = Some(now_ns);
++        for (block, attrs) in blocks.iter().zip(&attrs) {
++            let attrs = attrs.clone();
++            let start = now_ns();
++            let outcome = builder.build_block(attrs).unwrap_or_else(|error| {
++                eprintln!(
++                    "block {}: {error} (last read: {})",
++                    block.header.number,
++                    last_key.0.borrow()
++                );
++                eprintln!("deleted by this block: {} keys", block.deleted.len());
++                let text = error.to_string();
++                if let Some(at) = text.find("missing node 0x") {
++                    let hash: B256 = text[at + 13..at + 79].parse().unwrap();
++                    eprintln!("opaque in archive: {}", store.opaque.contains(&hash));
++                }
++                std::process::exit(1);
++            });
++            let total_ns = now_ns() - start;
++            let ok = outcome.header.hash() == block.hash;
++            println!(
++                "BENCH run={run} block={} txs={} gas={} exec_ns={} total_ns={total_ns} ok={}",
++                block.header.number,
++                block.transactions.len(),
++                outcome.execution_result.gas_used,
++                builder.last_execute_ns,
++                u8::from(ok),
++            );
++            harvest(builder.trie_db().storage_roots(), &mut provider.1.borrow_mut());
++            if !ok {
++                let got = &outcome.header;
++                eprintln!(
++                    "mismatch at {}: state {} vs {}, receipts {} vs {}, gas {} vs {}",
++                    block.header.number,
++                    got.state_root,
++                    block.header.state_root,
++                    got.receipts_root,
++                    block.header.receipts_root,
++                    got.gas_used,
++                    block.header.gas_used
++                );
++                std::process::exit(1);
++            }
++        }
++    }
++}
+diff --git a/crates/proof/executor/src/builder/core.rs b/crates/proof/executor/src/builder/core.rs
+index cf46312..45ff725 100644
+--- a/crates/proof/executor/src/builder/core.rs
++++ b/crates/proof/executor/src/builder/core.rs
+@@ -50,6 +50,10 @@ where
+     pub(crate) trie_db: TrieDB<P, H>,
+     /// The block executor factory for creating Base execution environments.
+     pub(crate) factory: BaseBlockExecutorFactory<AlloyReceiptBuilder, RollupConfig, Evm>,
++    /// [bench patch] Monotonic clock (ns) for phase timing; `None` disables it.
++    pub clock: Option<fn() -> u64>,
++    /// [bench patch] ns from the start of `build_block` to the end of `execute_block`.
++    pub last_execute_ns: u64,
+ }
+ 
+ impl<'a, P, H, Evm> StatelessL2Builder<'a, P, H, Evm>
+@@ -84,7 +88,12 @@ where
+             config.clone(),
+             evm_factory,
+         );
+-        Self { config, trie_db, factory }
++        Self { config, trie_db, factory, clock: None, last_execute_ns: 0 }
++    }
++
++    /// [bench patch] The trie database, to read the post-state nodes it computed.
++    pub const fn trie_db(&self) -> &TrieDB<P, H> {
++        &self.trie_db
+     }
+ 
+     /// Builds and executes a new L2 block using the provided payload attributes.
+@@ -103,6 +112,7 @@ where
+         &mut self,
+         attrs: BasePayloadAttributes,
+     ) -> ExecutorResult<BlockBuildingOutcome> {
++        let start_ns = self.clock.map_or(0, |clock| clock());
+         // Step 1. Set up the execution environment.
+         let (base_fee_params, min_base_fee) = Self::active_base_fee_params(
+             self.config,
+@@ -155,6 +165,9 @@ where
+             .collect::<Result<Vec<_>, RecoveryError>>()
+             .map_err(ExecutorError::Recovery)?;
+         let ex_result = executor.execute_block(transactions.iter())?;
++        if let Some(clock) = self.clock {
++            self.last_execute_ns = clock().saturating_sub(start_ns);
++        }
+ 
+         info!(
+             target: "block_builder",
+diff --git a/crates/proof/executor/src/db/mod.rs b/crates/proof/executor/src/db/mod.rs
+index ab05efe..914d7f7 100644
+--- a/crates/proof/executor/src/db/mod.rs
++++ b/crates/proof/executor/src/db/mod.rs
+@@ -335,6 +335,11 @@ where
+             return Ok(B256::default());
+         }
+ 
++        // [bench patch] Known hashes come from a table, as in a node with a block index.
++        if let Some(hash) = self.fetcher.block_hash_by_number(block_number) {
++            return Ok(hash);
++        }
++
+         // Walk back the block headers to the desired block number.
+         while header.number > block_number {
+             header = self
+diff --git a/crates/proof/executor/src/db/traits.rs b/crates/proof/executor/src/db/traits.rs
+index 199c817..bacb9b7 100644
+--- a/crates/proof/executor/src/db/traits.rs
++++ b/crates/proof/executor/src/db/traits.rs
+@@ -33,6 +33,11 @@ pub trait TrieDBProvider: TrieProvider {
+     ///
+     /// [TrieDB]: crate::TrieDB
+     fn header_by_hash(&self, hash: B256) -> Result<Header, Self::Error>;
++
++    /// [bench patch] A known canonical block hash by number (BLOCKHASH table lookup).
++    fn block_hash_by_number(&self, _number: u64) -> Option<B256> {
++        None
++    }
+ }
+ 
+ /// The default, no-op implementation of the [`TrieDBProvider`] trait, used for testing.
+diff --git a/crates/proof/mpt/src/node.rs b/crates/proof/mpt/src/node.rs
+index 8254d7b..6134579 100644
+--- a/crates/proof/mpt/src/node.rs
++++ b/crates/proof/mpt/src/node.rs
+@@ -418,6 +418,17 @@ impl TrieNode {
+                                 node: Box::new(non_empty_node.clone()),
+                             };
+                         }
++                        Self::Blinded { commitment }
++                            if fetcher.is_opaque_branch(*commitment) =>
++                        {
++                            // [bench patch] Same result as unblinding a branch child.
++                            let commitment = *commitment;
++                            let nibble = *index as u8;
++                            *self = Self::Extension {
++                                prefix: Nibbles::from_nibbles_unchecked([nibble]),
++                                node: Box::new(Self::Blinded { commitment }),
++                            };
++                        }
+                         Self::Blinded { .. } => {
+                             non_empty_node.unblind(fetcher)?;
+                             self.collapse_if_possible(fetcher)?;
+diff --git a/crates/proof/mpt/src/traits.rs b/crates/proof/mpt/src/traits.rs
+index be103a8..453711a 100644
+--- a/crates/proof/mpt/src/traits.rs
++++ b/crates/proof/mpt/src/traits.rs
+@@ -22,6 +22,12 @@ pub trait TrieProvider {
+     /// - Ok(TrieNode): The trie node preimage.
+     /// - `Err(Self::Error)`: If the trie node preimage could not be fetched.
+     fn trie_node_by_hash(&self, key: B256) -> Result<TrieNode, Self::Error>;
++
++    /// [bench patch] Returns true when `key` is a branch node whose preimage is unavailable.
++    /// Collapsing a parent onto it only needs to know it is a branch.
++    fn is_opaque_branch(&self, _key: B256) -> bool {
++        false
++    }
+ }
+ 
+ /// The [`TrieHinter`] trait defines the synchronous interface for hinting the host to fetch trie

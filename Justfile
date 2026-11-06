@@ -15,8 +15,16 @@ default:
 build *args:
     zig build {{ args }}
 
-# Build all binaries optimized
+# Build all binaries optimized; downloads Zig 0.17.1 into .cache/zig if it is not on PATH
 release:
+    #!/usr/bin/env sh
+    set -eu
+    if [ "$(zig version 2>/dev/null || true)" != "0.17.1" ]; then
+        if [ "$(.cache/zig/zig version 2>/dev/null || true)" != "0.17.1" ]; then
+            sh etc/scripts/install-zig.sh .cache/zig
+        fi
+        PATH="$PWD/.cache/zig:$PATH"
+    fi
     zig build -Doptimize=ReleaseFast -Dgit-rev=$(git rev-parse --short HEAD)
 
 # Run unit tests, optionally filtered: just test rlp
