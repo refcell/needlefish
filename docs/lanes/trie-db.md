@@ -1551,3 +1551,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-06: paused (project paused by owner). Phase 2b rest (flat_trees: checkpoint without flat
   tables, open rebuild from trees) is unfinished and untested on local branch
   `wip/flat-trees-phase2b` (dfd9449e, base 1c2362e9); resume from there.
+- 2026-11-06: flat trees for disk mode (disk-state import plan steps 4-5). Account records grow
+  to 104 B (nonce, balance, code hash, storage root; the empty root without storage), read from
+  `State.state_trie.storage_root` right after each move (`flat_write` flushes the trie first so
+  dirty storage tries rehash in one batch); every address whose only change was storage gets a
+  record too (reserve counts one account put per storage entry, an upper bound). Checkpoint v4
+  carries four length-prefixed trees (accounts, storage, account branches, storage branches);
+  v3 is refused with or without flat trees (no migration: format again).
+- 2026-11-06: flat tree key limits are u64 (`Database.Config.flat_accounts_max`,
+  `flat_slots_max`, `flat_account_branches_max`, `flat_storage_branches_max`; null = the
+  `state` counts, so in-memory defaults are unchanged) and only size levels. Tables are cut at
+  one index block of largest records (`table_records_cap`), not at the memtable size. Branch
+  trees: no replay reserve (head moves do not write them yet), memtable = 2 x
+  `flat_branch_flush_entries_min` (default 1024: ~2.1B keys with 8 levels; 4096 for ~8.6B).
+- 2026-11-06: `FlatTrees` bulk import (`bulk_begin`, `bulk_append_{account,slot,account_branch,
+  storage_branch}`, `bulk_poll`, `bulk_finish`, `bulk_end`) owns four `lsm_bulk` loaders in one
+  boxed struct; compaction and checkpoints wait while it runs. Point reads `get_account`,
+  `get_slot`, `get_branch` sit on `Tree.get`. A database checkpoint needs a head (the state root
+  check on open), so an import commits its head block after `bulk_end`, then checkpoints.

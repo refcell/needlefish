@@ -6,7 +6,13 @@
 //! after a checkpoint and clean reopen, and after each crash at a random tick and reopen,
 //! every account and slot `State` holds equals the tree lookup, and every key ever written
 //! (a superset of the trees' keys: every tree key comes from a changeset) is absent from the
-//! trees when `State` does not hold it, so every tree entry exists in `State`.
+//! trees when `State` does not hold it, so every tree entry exists in `State`. Account
+//! records also carry the storage root `State`'s trie holds (blocks write storage without an
+//! account change too, so storage-only account records are exercised).
+//!
+//! Bulk import: sorted random accounts, slots, and branch records loaded into the four empty
+//! trees, a genesis block committed on top, checkpointed, then read back with the point reads after
+//! a clean reopen and after a crash; a crash before the checkpoint leaves the trees empty.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,6 +24,7 @@ const SimStorage = @import("storage/sim_storage.zig").SimStorage;
 const state_module = @import("state.zig");
 const overlay_module = @import("overlay.zig");
 const flat_trees_module = @import("flat_trees.zig");
+const branch_record = @import("branch_record.zig");
 const keccak256 = @import("../trie/node.zig").keccak256;
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -67,6 +74,7 @@ const config_flat: database.Config = .{
     .flat_trees = true,
     .flat_flush_entries_min = 24,
     .flat_cache_blocks = 16,
+    .flat_branch_flush_entries_min = 16,
 };
 
 const overlay_config: overlay_module.Config = .{
@@ -155,6 +163,10 @@ const Harness = struct {
         self.db.format(format_id);
         try self.tick_until(not_formatting);
         try self.open();
+        try self.commit_genesis();
+    }
+
+    fn commit_genesis(self: *Harness) !void {
         for (0..4) |index| {
             try self.overlay.set_account(address_of(index), .{ .balance = 100 + index });
             try self.overlay.set_storage(address_of(index), 1, index + 1);
@@ -218,10 +230,14 @@ const Harness = struct {
     fn random_writes(self: *Harness) !void {
         for (0..self.prng.range(1, 4)) |_| {
             const address = address_of(self.prng.below(addresses_max));
-            var info = self.overlay.basic(address) orelse state_module.AccountInfo{};
-            info.nonce += 1;
-            info.balance = self.prng.int(u64);
-            try self.overlay.set_account(address, info);
+            const existing = self.overlay.basic(address);
+            // Storage alone under an existing account: only its storage root changes.
+            if (existing == null or self.prng.chance(2, 3)) {
+                var info = existing orelse state_module.AccountInfo{};
+                info.nonce += 1;
+                info.balance = self.prng.int(u64);
+                try self.overlay.set_account(address, info);
+            }
             for (0..self.prng.below(4)) |_| {
                 const slot = self.prng.below(slots_per_address);
                 const value: u256 = if (self.prng.chance(1, 4)) 0 else self.prng.int(u64);
@@ -321,8 +337,13 @@ const Harness = struct {
             const value = try self.lookup(&trees.accounts, &key);
             const expected = state.basic(address);
             try testing.expectEqual(expected != null, value != null);
+            const read = try trees.get_account(&key);
+            try testing.expectEqual(value != null, read != null);
             if (value) |bytes| {
-                try testing.expect(flat_trees_module.account_decode(&bytes).eql(expected.?));
+                const decoded = flat_trees_module.account_decode(&bytes);
+                const root = state.state_trie.storage_root(key);
+                try testing.expect(decoded.eql(.{ .info = expected.?, .storage_root = root }));
+                try testing.expect(read.?.eql(decoded));
             }
             for (0..slots_per_address) |slot| {
                 const slot_key = flat_trees_module.storage_key(&key, slot);
@@ -347,6 +368,7 @@ const Harness = struct {
 };
 
 const Counts = struct {
+    storage_only: u64 = 0,
     flushes: u64 = 0,
     merges: u64 = 0,
     opens_with_tables: u32 = 0,
@@ -354,6 +376,7 @@ const Counts = struct {
 
 fn count(harness: *const Harness, counts: *Counts) void {
     const trees = &harness.db.flat.?;
+    counts.storage_only += trees.stats.puts_storage_only_accounts;
     counts.flushes += trees.accounts.stats.flushes + trees.storage.stats.flushes;
     counts.merges += trees.accounts.stats.merges + trees.storage.stats.merges;
 }
@@ -404,6 +427,24 @@ test "database flat trees: seeded blocks, reorgs, checkpoints, and crashes match
     try testing.expect(counts.flushes >= 40);
     try testing.expect(counts.merges >= 6);
     try testing.expect(counts.opens_with_tables >= 8);
+    try testing.expect(counts.storage_only >= 20);
+}
+
+test "database flat trees: checkpoint versions per config, version 3 refused" {
+    const valid = database.checkpoint_version_valid;
+    try testing.expectEqual(@as(u16, 4), database.checkpoint_version_flat);
+    try testing.expect(valid(database.checkpoint_version_flat, true, true));
+    try testing.expect(!valid(database.checkpoint_version_flat, false, true));
+    // Version 3 (72-byte account records, two trees) opens with no config.
+    for ([_]bool{ false, true }) |grid| {
+        for ([_]bool{ false, true }) |flat| {
+            if (flat and !grid) continue;
+            try testing.expect(!valid(database.checkpoint_version_flat_v3, flat, grid));
+        }
+    }
+    try testing.expect(!valid(database.checkpoint_version_tables, true, true));
+    try testing.expect(valid(database.checkpoint_version_tables, false, true));
+    try testing.expect(!valid(database.checkpoint_version, true, true));
 }
 
 test "database flat trees: a checkpoint written without flat trees is refused with them" {
@@ -479,4 +520,254 @@ test "database flat trees: a checkpoint waits until a replay-filled reserve is r
         try harness.reopen();
         try harness.check_recovered(acknowledged);
     }
+}
+
+// Bulk import.
+
+const BulkRecord = struct {
+    key: [flat_trees_module.storage_branch_key_size]u8,
+    value: [flat_trees_module.branch_value_size_max]u8,
+    value_len: u16,
+
+    fn less(_: void, a: BulkRecord, b: BulkRecord) bool {
+        return std.mem.order(u8, &a.key, &b.key) == .lt;
+    }
+};
+
+/// One tree's records: `records_count` random keys of `key_size` bytes (sorted, distinct) with
+/// random values of 1..`value_max` bytes (`account`: the last 32 bytes a storage root).
+fn bulk_records(prng: *Prng, records_count: u32, key_size: u32, value_max: u32) ![]BulkRecord {
+    const records = try testing.allocator.alloc(BulkRecord, records_count);
+    errdefer testing.allocator.free(records);
+    for (records) |*record| {
+        record.key = @splat(0);
+        prng.fill(record.key[0..key_size]);
+        if (key_size == branch_record.path_key_bytes or
+            key_size == branch_record.storage_key_bytes)
+        {
+            // A real path key: random hang of 0..63 nibbles.
+            var hang: [branch_record.hang_nibbles_max]u8 = undefined;
+            const len = prng.below(branch_record.hang_nibbles_max + 1);
+            for (hang[0..len]) |*nibble| nibble.* = @intCast(prng.below(16));
+            const offset = key_size - branch_record.path_key_bytes;
+            record.key[offset..][0..branch_record.path_key_bytes].* =
+                branch_record.path_key(hang[0..len]);
+        }
+        record.value_len = @intCast(prng.range(1, value_max));
+        prng.fill(record.value[0..record.value_len]);
+    }
+    std.mem.sortUnstable(BulkRecord, records, {}, BulkRecord.less);
+    // Distinct keys: drop repeats (random hangs repeat for short paths).
+    var kept: usize = 0;
+    for (records, 0..) |record, index| {
+        if (index > 0 and std.mem.eql(u8, &records[kept - 1].key, &record.key)) continue;
+        records[kept] = record;
+        kept += 1;
+    }
+    return testing.allocator.realloc(records, kept);
+}
+
+const BulkSet = struct {
+    accounts: []BulkRecord,
+    slots: []BulkRecord,
+    account_branches: []BulkRecord,
+    storage_branches: []BulkRecord,
+
+    fn init(prng: *Prng) !BulkSet {
+        const accounts = try bulk_records(prng, 150, 32, 1);
+        errdefer testing.allocator.free(accounts);
+        const slots = try bulk_records(prng, 400, 64, 1);
+        errdefer testing.allocator.free(slots);
+        const value_max = flat_trees_module.branch_value_size_max;
+        const account_branches = try bulk_records(prng, 80, 33, value_max);
+        errdefer testing.allocator.free(account_branches);
+        const storage_branches = try bulk_records(prng, 200, 65, value_max);
+        return .{
+            .accounts = accounts,
+            .slots = slots,
+            .account_branches = account_branches,
+            .storage_branches = storage_branches,
+        };
+    }
+
+    fn deinit(self: *BulkSet) void {
+        testing.allocator.free(self.accounts);
+        testing.allocator.free(self.slots);
+        testing.allocator.free(self.account_branches);
+        testing.allocator.free(self.storage_branches);
+    }
+
+    /// The account record of entry `index`, from its key and value bytes.
+    fn account(self: *const BulkSet, index: usize) flat_trees_module.Account {
+        const record = &self.accounts[index];
+        return .{
+            .info = .{
+                .nonce = record.value[0],
+                .balance = std.mem.readInt(u64, record.key[8..16], .little),
+                .code_hash = record.key[0..32].*,
+            },
+            .storage_root = keccak256(record.key[0..32]),
+        };
+    }
+
+    fn word(self: *const BulkSet, index: usize) u256 {
+        const record = &self.slots[index];
+        return @as(u256, std.mem.readInt(u64, record.key[0..8], .little)) | 1;
+    }
+};
+
+var bulk_finished: bool = false;
+
+fn on_bulk_finished(_: *FlatTrees) void {
+    bulk_finished = true;
+}
+
+/// Retries a bulk append that is `error.Busy` (the ring is full while a write is in flight).
+fn bulk_retry(harness: *Harness, comptime append: anytype, args: anytype) !void {
+    var ticks: u32 = 0;
+    while (true) : (ticks += 1) {
+        if (ticks >= ticks_max) return error.Timeout;
+        @call(.auto, append, args) catch |err| switch (err) {
+            error.Busy => {
+                harness.sim.tick();
+                harness.db.flat.?.bulk_poll();
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn bulk_load(harness: *Harness, set: *const BulkSet) !void {
+    const trees = &harness.db.flat.?;
+    try trees.bulk_begin(testing.allocator);
+    for (set.accounts, 0..) |*record, index| {
+        const account = set.account(index);
+        try bulk_retry(harness, FlatTrees.bulk_append_account, .{
+            trees, record.key[0..32], &account,
+        });
+    }
+    for (set.slots, 0..) |*record, index| {
+        try bulk_retry(harness, FlatTrees.bulk_append_slot, .{
+            trees, record.key[0..32], record.key[32..64], set.word(index),
+        });
+    }
+    for (set.account_branches) |*record| {
+        try bulk_retry(harness, FlatTrees.bulk_append_account_branch, .{
+            trees, record.key[0..33], record.value[0..record.value_len],
+        });
+    }
+    for (set.storage_branches) |*record| {
+        try bulk_retry(harness, FlatTrees.bulk_append_storage_branch, .{
+            trees, record.key[0..65], record.value[0..record.value_len],
+        });
+    }
+    // A key out of order is refused.
+    const first = set.accounts[0];
+    try testing.expectError(error.KeyOrder, trees.bulk_append_account(
+        first.key[0..32],
+        &set.account(0),
+    ));
+    bulk_finished = false;
+    trees.bulk_finish(on_bulk_finished);
+    var ticks: u32 = 0;
+    while (!bulk_finished) : (ticks += 1) {
+        if (ticks >= ticks_max) return error.Timeout;
+        harness.sim.tick();
+        trees.bulk_poll();
+    }
+    try trees.bulk_end(testing.allocator);
+    try testing.expect(trees.bulk == null);
+}
+
+/// Every loaded key reads back (`loaded`), or every key is absent; random keys are absent.
+fn bulk_check(harness: *Harness, set: *const BulkSet, loaded: bool) !void {
+    const trees = &harness.db.flat.?;
+    for (set.accounts, 0..) |*record, index| {
+        const got = try trees.get_account(record.key[0..32]);
+        try testing.expectEqual(loaded, got != null);
+        if (got) |account| try testing.expect(account.eql(set.account(index)));
+    }
+    for (set.slots, 0..) |*record, index| {
+        const got = try trees.get_slot(record.key[0..32], record.key[32..64]);
+        try testing.expectEqual(if (loaded) set.word(index) else 0, got);
+    }
+    for (set.account_branches) |*record| {
+        const hang = try branch_record.decode_path_key(record.key[0..33]);
+        const got = try trees.get_branch(null, hang.slice());
+        try testing.expectEqual(loaded, got != null);
+        if (got) |bytes| {
+            try testing.expectEqualSlices(u8, record.value[0..record.value_len], bytes);
+        }
+    }
+    for (set.storage_branches) |*record| {
+        const hang = try branch_record.decode_path_key(record.key[32..65]);
+        const got = try trees.get_branch(record.key[0..32], hang.slice());
+        try testing.expectEqual(loaded, got != null);
+        if (got) |bytes| {
+            try testing.expectEqualSlices(u8, record.value[0..record.value_len], bytes);
+        }
+    }
+    var key: Hash = undefined;
+    for (0..32) |_| {
+        harness.prng.fill(&key);
+        try testing.expect(try trees.get_account(&key) == null);
+        try testing.expectEqual(@as(u256, 0), try trees.get_slot(&key, &key));
+        try testing.expect(try trees.get_branch(&key, &.{}) == null);
+    }
+}
+
+fn run_bulk(seed: u64, checkpoint: bool) !void {
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = config_flat.engine.size_bytes(),
+        .seed = seed,
+        .latency_ticks_max = 3,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, seed, config_flat);
+    defer harness.destroy();
+    harness.db.format(0xb01c_0000 + seed);
+    try harness.tick_until(Harness.not_formatting);
+    try harness.open();
+    var set = try BulkSet.init(&harness.prng);
+    defer set.deinit();
+    try bulk_load(harness, &set);
+    const trees = &harness.db.flat.?;
+    // Every tree was loaded straight into its last level.
+    inline for (.{ "accounts", "storage", "account_branches", "storage_branches" }) |name| {
+        const tree = &@field(trees, name);
+        try testing.expect(tree.level_count[tree.config.levels_count - 1] > 0);
+        for (tree.level_count[0 .. tree.config.levels_count - 1]) |level_count| {
+            try testing.expectEqual(@as(u32, 0), level_count);
+        }
+    }
+    const branches_last = trees.storage_branches.config.levels_count - 1;
+    try testing.expect(trees.storage_branches.level_count[branches_last] > 1);
+    try bulk_check(harness, &set, true);
+    // Live writes on top of the loaded trees (a checkpoint needs a head).
+    try harness.commit_genesis();
+    try bulk_check(harness, &set, true);
+    if (!checkpoint) {
+        // Nothing is durable before a checkpoint: a crash opens the empty trees.
+        sim.crash();
+        try harness.reopen();
+        return bulk_check(harness, &set, false);
+    }
+    try harness.checkpoint();
+    try harness.reopen();
+    try bulk_check(harness, &set, true);
+    sim.crash();
+    try harness.reopen();
+    try bulk_check(harness, &set, true);
+}
+
+test "database flat trees: bulk import into four trees, checkpoint, reopen, crash, get" {
+    for (0..3) |seed| {
+        run_bulk(40 + seed, true) catch |err| {
+            std.debug.print("database flat trees bulk: failing seed={d}\n", .{40 + seed});
+            return err;
+        };
+    }
+    try run_bulk(50, false);
 }

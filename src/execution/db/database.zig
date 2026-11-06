@@ -39,10 +39,14 @@
 //! checkpoint is version 1 with every code, as before.
 //! Flat trees (`Config.flat_trees`, needs a grid; `flat_trees.zig`): every head move also
 //! writes its unwound changesets' old values and applied changesets' new values into an
-//! account tree and a storage tree (shadow writes: `State` stays the source of truth).
-//! Their compaction is granted the same per-commit block budget as the code flush; the
-//! checkpoint (version 3) carries both trees after the code table list; open decodes and
-//! scans them in the open pause and replay re-applies the puts through the replay reserve.
+//! account tree and a storage tree (shadow writes: `State` stays the source of truth), with
+//! each account record's storage root read from `State`'s trie right after the move (and a
+//! record for every address whose only change was storage). Two branch-record trees are
+//! written only by a bulk import (`FlatTrees.bulk_begin`). Their compaction is granted the
+//! same per-commit block budget as the code flush; the checkpoint (version 4) carries the
+//! four trees after the code table list; open decodes and scans them in the open pause and
+//! replay re-applies the puts through the replay reserve. Version 3 (72-byte account
+//! records, two trees) is refused.
 //! A checkpoint waits until both trees are `checkpoint_ready` (a replay that filled into the
 //! reserve while a flush was pending: the flush runs unpaced and installs first), so the next
 //! replay always has a full reserve.
@@ -271,9 +275,25 @@ pub const checkpoint_magic: u32 = 0x4244_464e;
 /// the codes no table holds.
 pub const checkpoint_version: u16 = 1;
 pub const checkpoint_version_tables: u16 = 2;
-/// Version 3 (flat trees on): version 2 with the flat trees' bytes
-/// (`FlatTrees.checkpoint_encode`) right after the code table list.
-pub const checkpoint_version_flat: u16 = 3;
+/// Version 4 (flat trees on): version 2 with the flat trees' bytes
+/// (`FlatTrees.checkpoint_encode`: account, storage, and both branch trees) right after the
+/// code table list. Version 3 (account records without the storage root, two trees) is
+/// refused: no migration, the datadir is formatted again.
+pub const checkpoint_version_flat: u16 = 4;
+pub const checkpoint_version_flat_v3: u16 = 3;
+
+/// Whether a checkpoint of `version` opens with the given config (`flat` trees on, a
+/// `grid`): version 1 (no tables) only without flat trees, version 2 only with a grid and
+/// without flat trees, version 4 only with flat trees; version 3 never.
+pub fn checkpoint_version_valid(version: u16, flat: bool, grid: bool) bool {
+    assert(!flat or grid);
+    return switch (version) {
+        checkpoint_version => !flat,
+        checkpoint_version_tables => grid and !flat,
+        checkpoint_version_flat => flat,
+        else => false,
+    };
+}
 /// magic, version, head present, head meta (hash, parent, number, timestamp), state root,
 /// snapshot length, block count.
 pub const checkpoint_header_size: u32 = 4 + 2 + 1 + 32 + 32 + 8 + 8 + 32 + 4 + 4;
@@ -313,20 +333,35 @@ pub const Config = struct {
     flat_flush_entries_min: u32 = 16 * 1024,
     /// Block cache blocks the flat trees' lookups share.
     flat_cache_blocks: u32 = 64,
+    /// Live keys the flat trees size their levels for (independent of `state`, which sizes
+    /// RAM tables); null: `state.accounts_max` / `state.storage_slots_max`.
+    flat_accounts_max: ?u64 = null,
+    flat_slots_max: ?u64 = null,
+    /// Branch records per branch tree at most; null: the account (slot) limit (a trie of n
+    /// leaves has fewer than n branches).
+    flat_account_branches_max: ?u64 = null,
+    flat_storage_branches_max: ?u64 = null,
+    /// Mutable memtable entries at which a branch tree flushes (entries ~1.1 KiB each).
+    flat_branch_flush_entries_min: u32 = 1024,
 
     /// The flat trees' config, null when off.
     pub fn flat_trees_config(config: Config) ?flat_trees_module.Config {
         if (!config.flat_trees) return null;
         assert(config.engine.grid_block_count > 0);
+        const accounts_max = config.flat_accounts_max orelse config.state.accounts_max;
+        const slots_max = config.flat_slots_max orelse config.state.storage_slots_max;
         return .{
             .block_size = config.engine.checkpoint_block_size,
             .block_count = config.engine.grid_block_count,
             .journal_bytes = config.engine.journal_size_bytes,
             .chain_bytes = config.chain.bytes_max,
             .entry_body_bytes = config.engine.entry_body_size_max,
-            .accounts_max = config.state.accounts_max,
-            .slots_max = config.state.storage_slots_max,
+            .accounts_max = accounts_max,
+            .slots_max = slots_max,
+            .account_branches_max = config.flat_account_branches_max orelse accounts_max,
+            .storage_branches_max = config.flat_storage_branches_max orelse slots_max,
             .flush_entries_min = config.flat_flush_entries_min,
+            .branch_flush_entries_min = config.flat_branch_flush_entries_min,
             .cache_blocks = config.flat_cache_blocks,
         };
     }
@@ -795,19 +830,12 @@ pub fn DatabaseType(comptime Storage: type) type {
             _ = try trees.open_decode(bytes[checkpoint_header_size + size ..]);
         }
 
-        /// Checks a checkpoint's version against the config: version 1 (no tables) opens
-        /// only without flat trees, version 2 only with a grid and without flat trees,
-        /// version 3 only with flat trees.
+        /// Checks a checkpoint's version against the config (`checkpoint_version_valid`).
         fn checkpoint_version_expected(self: *const Self, version: u16) !u16 {
             const flat = self.flat != null;
             const grid = self.code_store != null;
-            const valid = switch (version) {
-                checkpoint_version => !flat,
-                checkpoint_version_tables => grid and !flat,
-                checkpoint_version_flat => flat,
-                else => false,
-            };
-            if (!valid) return error.CheckpointInvalid;
+            if (!checkpoint_version_valid(version, flat, grid)) return error.CheckpointInvalid;
+            assert(version != checkpoint_version_flat_v3);
             return version;
         }
 
@@ -1311,13 +1339,34 @@ pub fn DatabaseType(comptime Storage: type) type {
         }
 
         /// Shadow-writes `self.changeset` (just applied, or unwound when not `forward`) into
-        /// the flat trees. Busy here means a too-small replay reserve, or a missed reserve.
+        /// the flat trees, storage roots from `State`'s trie (flushed first, so every dirty
+        /// storage trie rehashes in one batch). Busy here means a too-small replay reserve,
+        /// or a missed reserve.
         fn flat_write(self: *Self, forward: bool) OperationError!void {
             const trees = if (self.flat) |*trees| trees else return;
             const mode: FlatTrees.Mode = if (self.phase == .opening) .replay else .live;
             assert(mode == .replay or self.phase == .ready);
-            try trees.write(&self.changeset, forward, mode);
+            assert(!self.state.trie_stale);
+            try self.state.state_trie.flush();
+            const source: FlatSource = .{ .state = &self.state };
+            try trees.write(&self.changeset, forward, mode, source);
         }
+
+        /// What `FlatTrees.write` reads from `State` after a move.
+        const FlatSource = struct {
+            state: *State,
+
+            pub fn basic(
+                source: FlatSource,
+                address: state_module.Address,
+            ) ?state_module.AccountInfo {
+                return source.state.basic(address);
+            }
+
+            pub fn storage_root(source: FlatSource, address_hash: *const Hash) Hash {
+                return source.state.state_trie.storage_root(address_hash.*);
+            }
+        };
 
         fn apply_block(self: *Self, hash: Hash) OperationError!void {
             const view = self.chain.block(hash).?;
@@ -1718,6 +1767,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// install may run inside `checkpoint_prepare` and start the checkpoint there.
         fn flat_checkpoint_ready(self: *Self) bool {
             const trees = if (self.flat) |*trees| trees else return true;
+            // A bulk import is running: its owner requests the checkpoint after `bulk_end`.
+            if (trees.bulk != null) return false;
             if (trees.checkpoint_ready()) return true;
             trees.owner = self;
             trees.checkpoint_prepare(on_flat_install);
@@ -1884,8 +1935,10 @@ pub fn DatabaseType(comptime Storage: type) type {
                 _ = try reader.bytes(@as(u64, count) * CodeStore.info_size);
             }
             if (version == checkpoint_version_flat) {
-                // Both trees, decoded (and scanned) during the open pause.
-                for (0..2) |_| _ = try reader.bytes(try reader.int(u32));
+                // Every tree, decoded (and scanned) during the open pause.
+                for (0..flat_trees_module.tree_count) |_| {
+                    _ = try reader.bytes(try reader.int(u32));
+                }
             }
             try self.snapshot_load(try reader.bytes(snapshot_len));
             for (0..block_count) |_| {

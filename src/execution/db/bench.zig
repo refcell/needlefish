@@ -327,10 +327,17 @@ fn flat_trees_enable(config: *database.Config) void {
     config.engine.grid_block_count = 2048;
     const flat = config.flat_trees_config().?;
     const flat_trees = @import("flat_trees.zig");
-    const accounts = flat_trees.tree_config(flat, flat_trees.account_put_bytes_min, 1);
-    const storage = flat_trees.tree_config(flat, flat_trees.storage_put_bytes_min, 1);
-    const entries = 2 * (@as(u64, accounts.memtable_entries_max) * (32 + 1 + 72) +
-        @as(u64, storage.memtable_entries_max) * (64 + 1 + 32));
+    const cap = std.math.maxInt(u32);
+    const accounts = flat_trees.tree_config(flat, flat_trees.account_put_bytes_min, 1, cap);
+    const storage = flat_trees.tree_config(flat, flat_trees.storage_put_bytes_min, 1, cap);
+    const branches = flat_trees.branch_tree_config(flat, 1, cap);
+    const account_entry = flat_trees.account_key_size + 1 + flat_trees.account_value_size;
+    const storage_entry = flat_trees.storage_key_size + 1 + flat_trees.storage_value_size;
+    const branch_entry = flat_trees.storage_branch_key_size + 2 +
+        flat_trees.branch_value_size_max;
+    const entries = 2 * (@as(u64, accounts.memtable_entries_max) * account_entry +
+        @as(u64, storage.memtable_entries_max) * storage_entry +
+        2 * @as(u64, branches.memtable_entries_max) * branch_entry);
     const staging = config.checkpoint_staging_bytes + entries + 16 * 1024 * 1024;
     config.checkpoint_staging_bytes = @intCast(staging);
     const payload = checkpoint_module.payload_capacity(config.engine.checkpoint_block_size);
