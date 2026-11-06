@@ -120,6 +120,9 @@ pub const L1HeadSubscription = struct {
     /// `newHeads` notifications received; the step loop wakes when it changes.
     heads: std.atomic.Value(u64) = .init(0),
     task: ?Io.Future(void) = null,
+    /// Set by `stop`; the reader checks it between sessions and every backoff slice, so it
+    /// exits even when a cancel lands inside an operation that reports another error.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Tests silence the state-change logs (the test runner fails on stderr output).
     quiet: bool = false,
 
@@ -132,9 +135,16 @@ pub const L1HeadSubscription = struct {
         };
     }
 
+    /// Stops the reader task and waits for it to exit.
+    pub fn stop(sub: *L1HeadSubscription) void {
+        sub.stopping.store(true, .release);
+        if (sub.task) |*task| task.cancel(sub.io);
+        sub.task = null;
+    }
+
     fn run(sub: *L1HeadSubscription) void {
         var backoff_ms: u64 = backoff_ms_min;
-        while (true) {
+        while (!sub.stopping.load(.acquire)) {
             const before = sub.heads.load(.monotonic);
             sub.session() catch |err| {
                 if (err == error.Canceled) return;
@@ -146,10 +156,23 @@ pub const L1HeadSubscription = struct {
             };
             // A session that delivered heads resets the backoff.
             if (sub.heads.load(.monotonic) != before) backoff_ms = backoff_ms_min;
-            sub.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch return;
+            if (!sub.backoff(backoff_ms)) return;
             backoff_ms = @min(backoff_ms * 2, backoff_ms_max);
             assert(backoff_ms >= backoff_ms_min and backoff_ms <= backoff_ms_max);
         }
+    }
+
+    /// Sleeps `duration_ms` in slices of at most 100 ms; false once stopping or canceled.
+    fn backoff(sub: *L1HeadSubscription, duration_ms: u64) bool {
+        assert(duration_ms <= backoff_ms_max);
+        var left_ms = duration_ms;
+        while (left_ms > 0) {
+            if (sub.stopping.load(.acquire)) return false;
+            const slice_ms = @min(left_ms, 100);
+            sub.io.sleep(.fromMilliseconds(@intCast(slice_ms)), .awake) catch return false;
+            left_ms -= slice_ms;
+        }
+        return !sub.stopping.load(.acquire);
     }
 
     fn session(sub: *L1HeadSubscription) !void {
@@ -419,7 +442,7 @@ test "l1 ws: a subscription over loopback counts a newHeads notification" {
     // does not interrupt. Refused connects leave it in its (cancelable) backoff sleep.
     server.deinit(io);
     listening = false;
-    sub.task.?.cancel(io);
+    sub.stop();
     try testing.expectEqual(@as(u64, 1), sub.heads.load(.monotonic));
 }
 
