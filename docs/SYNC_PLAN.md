@@ -237,13 +237,39 @@ dependencies, TigerStyle, deterministic simulation tests for every state machine
 
 ## Order of work
 
-1. M1 on Sepolia, then mainnet: proves live correctness and gives the oracle.
-2. M2 in parallel: the long pole. Nothing stateful runs on mainnet without it.
-3. M5 on Sepolia in parallel: safe-head derivation against real L1.
-4. M3 then M4 on Sepolia: snapshot to tip. Then the same on mainnet once M2 passes 1B
-   entries.
-5. M6, then M7 soak on mainnet.
+Revised 2026-11-06 after the first live follower runs (below). The critical path is the
+stateful node: it fetches only block bodies from RPC, never state.
+
+1. M3 on Sepolia: import the public state snapshot (state component only) and match its
+   header state root.
+2. M2 in parallel, first as far as the imported Sepolia state needs: `State` reads through
+   the trees (2b), codes on disk (1e), branch store and sparse root (3). Proofs, history and
+   the 1B-entry scale proof follow before mainnet.
+3. M4 on Sepolia: staged catch-up from the snapshot block to the tip, then stay there on RPC
+   blocks.
+4. M5 and M6 on Sepolia: safe heads from L1, unsafe head from gossip.
+5. The same on mainnet, then the M7 soak.
 6. M8 when you want to stop depending on RPC for backfill.
+
+M1 (the stateless follower) is a bounded correctness oracle, not a gate. Measured on Base
+Sepolia with keyless endpoints: 69 consecutive blocks verified with zero mismatches, but 5 to
+30 s per block against 200 ms blocks, because every cold key costs an `eth_getProof` round
+trip (about 5 items/s public) and keys are discovered over several sequential passes. It
+falls behind by design, so it is used for fixture tests, short spot checks, and to re-execute
+a block the stateful node disputes, never as soak evidence.
+
+### Snapshot sizes (public, 2026-11-06)
+
+Base lists modular snapshots at `https://chain.base.org/api/snapshots`; each manifest names
+components with sizes and blake3 hashes. Only `state` (reth MDBX) is needed to bootstrap.
+
+| Chain | Block | `state` compressed | `state` MDBX | Full archive |
+| --- | --- | --- | --- | --- |
+| Base Sepolia | 55006660 | 310 GB | 438 GB | 1.44 TB |
+| Base mainnet | 53523727 | 762 GB | 1.14 TB | 5.2 TB |
+
+So a state-only mainnet import fits in about 4 to 5 TB with staging, not the 8 TB this plan
+first assumed for a full archive.
 
 ## Risks
 

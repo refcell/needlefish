@@ -46,10 +46,11 @@ then Base mainnet, checks every header field, and runs 24 h on each with zero mi
   (`skipped`); a block abandoned for want of data is counted too, never a mismatch.
 - [ ] (blocked) Real-time coverage on Sepolia: needs an `eth_getProof` endpoint at recent
   blocks with far more than 5 items/s (own node or a keyed provider).
-- [ ] Parallel workers on disjoint block segments if one follower cannot keep up.
-- [ ] 24 h Sepolia run, zero mismatches.
-- [ ] 24 h mainnet run, zero mismatches.
-- [ ] Head comparison checker and state sampling against a reference node.
+- [ ] Dispute tool: re-execute one block statelessly when the stateful node disagrees with
+  a header, to localize the bug.
+- [ ] Head comparison checker and state sampling against a reference node (M7).
+- Dropped 2026-11-06 (SYNC_PLAN "Order of work"): parallel segment workers and 24 h
+  follower soaks. The follower is an oracle, not the sync path.
 
 ## Decisions
 
@@ -62,6 +63,10 @@ then Base mainnet, checks every header field, and runs 24 h on each with zero mi
   keyless follower verifies contiguous segments, not every block.
 
 ## Log
+
+- 2026-11-06: Sepolia run from the tip, 69 consecutive blocks verified, zero mismatches,
+  9 rebases recovered; 5,013 blocks behind after 18 minutes. Stopped: the stateful path is
+  the critical path now.
 
 - 2026-11-06: first live run on Base Sepolia from the tip: 8 consecutive blocks verified,
   zero mismatches. Uncached blocks take 1 to 17 s, bounded by the proof endpoint's rate
