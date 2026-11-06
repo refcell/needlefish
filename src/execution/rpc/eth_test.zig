@@ -2121,3 +2121,86 @@ test "eth: base_sendRawTransactionValidity through the pool sink stores the pred
     try testing.expectEqual(@as(u32, 1), store.prune(h.api.pool.?, 0x11));
     try testing.expect(h.api.pool.?.get(hash) == null);
 }
+
+fn raw_hex_result(out: []u8, raw: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(out, "\"result\":\"0x{x}\"", .{raw});
+}
+
+test "eth: eth_getRawTransaction* return EIP-2718 bytes from the pool and the chain" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    const raw = try transfer_raw(&buffer, 0);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    var expected: [600]u8 = undefined;
+    const want = try raw_hex_result(&expected, raw);
+    var body: [256]u8 = undefined;
+    const by_hash_format = request_prefix_format ++
+        "eth_getRawTransactionByHash\",\"params\":[\"0x{x}\"]}}";
+    const hash = primitives.keccak256(raw).bytes;
+    const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash});
+    try expect_contains(try h.request_runtime(by_hash), want); // Pooled.
+    const block = try h.mine(12);
+    try expect_contains(try h.request_runtime(by_hash), want); // Mined.
+    const by_number = "eth_getRawTransactionByBlockNumberAndIndex";
+    try expect_contains(try h.request(by_number, "[\"latest\",\"0x0\"]"), want);
+    try expect_contains(try h.request(by_number, "[\"latest\",\"0x1\"]"), "\"result\":null");
+    const by_block_hash = try std.fmt.bufPrint(&body, request_prefix_format ++
+        "eth_getRawTransactionByBlockHashAndIndex\",\"params\":[\"0x{x}\",\"0x0\"]}}", .{
+        &block.bytes,
+    });
+    try expect_contains(try h.request_runtime(by_block_hash), want);
+    const unknown = try std.fmt.bufPrint(&body, by_hash_format, .{&@as([32]u8, @splat(7))});
+    try expect_contains(try h.request_runtime(unknown), "\"result\":null");
+    try expect_contains(try h.request("eth_mining", "[]"), "\"result\":false");
+    try expect_contains(try h.request("eth_hashrate", "[]"), "\"result\":\"0x0\"");
+    try expect_contains(try h.request("eth_protocolVersion", "[]"), "\"result\":\"0x44\"");
+}
+
+test "eth: seeded fuzz of eth_getRawTransactionByBlockNumberAndIndex" {
+    var prng = Prng.init(0x7277);
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffers: [6][256]u8 = undefined;
+    var raws: [6][]const u8 = undefined;
+    const count = prng.range(1, 6);
+    for (raws[0..count], 0..) |*raw, nonce| {
+        raw.* = try transfer_raw(&buffers[nonce], nonce);
+        try expect_contains(try send_raw(h, raw.*), "\"result\":\"0x");
+    }
+    _ = try h.mine(12);
+    for (0..32) |_| {
+        const index = prng.below(count + 3);
+        var body: [256]u8 = undefined;
+        const text = try h.request_runtime(try std.fmt.bufPrint(&body, request_prefix_format ++
+            "eth_getRawTransactionByBlockNumberAndIndex\",\"params\":[\"latest\",\"0x{x}\"]}}", .{
+            index,
+        }));
+        if (index >= count) {
+            try expect_contains(text, "\"result\":null");
+            continue;
+        }
+        // Pool order may differ from submission order: the bytes are one of the sent ones.
+        var found = false;
+        for (raws[0..count]) |raw| {
+            var expected: [600]u8 = undefined;
+            if (std.mem.indexOf(u8, text, try raw_hex_result(&expected, raw)) != null) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+fn fuzz_raw_by_index(_: void, smith: *testing.Smith) anyerror!void {
+    const h = try Harness.create();
+    defer h.destroy();
+    var body: [256]u8 = undefined;
+    const text = try h.request_runtime(try std.fmt.bufPrint(&body, request_prefix_format ++
+        "eth_getRawTransactionByBlockNumberAndIndex\",\"params\":[\"latest\",\"0x{x}\"]}}", .{
+        smith.value(u64),
+    }));
+    try expect_contains(text, "\"result\":null"); // The genesis block has no transactions.
+}
+
+test "eth: fuzz eth_getRawTransactionByBlockNumberAndIndex indexes" {
+    try testing.fuzz({}, fuzz_raw_by_index, .{});
+}

@@ -25,6 +25,12 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "eth_getUncleByBlockNumberAndIndex", .handler = uncle_by_index },
     .{ .name = "eth_getTransactionByBlockHashAndIndex", .handler = transaction_by_hash_index },
     .{ .name = "eth_getTransactionByBlockNumberAndIndex", .handler = transaction_by_number_index },
+    .{ .name = "eth_getRawTransactionByHash", .handler = raw_transaction_by_hash },
+    .{ .name = "eth_getRawTransactionByBlockHashAndIndex", .handler = raw_by_hash_index },
+    .{ .name = "eth_getRawTransactionByBlockNumberAndIndex", .handler = raw_by_number_index },
+    .{ .name = "eth_mining", .handler = mining },
+    .{ .name = "eth_hashrate", .handler = hashrate },
+    .{ .name = "eth_protocolVersion", .handler = protocol_version },
     .{ .name = "eth_accounts", .handler = accounts },
     .{ .name = "web3_sha3", .handler = sha3 },
     .{ .name = "txpool_status", .handler = txpool_status },
@@ -91,7 +97,10 @@ fn uncle_by_index(api: *Api, call: *Call) HandlerError!void {
     try call.writer.null_value();
 }
 
-fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash) HandlerError!void {
+/// A transaction as a JSON object or as its EIP-2718 bytes (`eth_getRawTransaction*`).
+const Form = enum { object, raw };
+
+fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) HandlerError!void {
     const index = try call.params.quantity(u64);
     try call.params.finish();
     const found = hash orelse return call.writer.null_value();
@@ -100,6 +109,7 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash) HandlerError!void {
     var transactions = record.transactions;
     for (0..index) |_| _ = transactions.bytes() catch unreachable;
     const raw = transactions.bytes() catch unreachable;
+    if (form == .raw) return call.writer.data(raw);
     try format.transaction(call.writer, raw, .{
         .block_hash = found,
         .block_number = record.header.number,
@@ -110,11 +120,60 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash) HandlerError!void {
 }
 
 fn transaction_by_hash_index(api: *Api, call: *Call) HandlerError!void {
-    try write_transaction_at(api, call, try block_by_hash(api, call));
+    try write_transaction_at(api, call, try block_by_hash(api, call), .object);
 }
 
 fn transaction_by_number_index(api: *Api, call: *Call) HandlerError!void {
-    try write_transaction_at(api, call, try block_by_number(api, call));
+    try write_transaction_at(api, call, try block_by_number(api, call), .object);
+}
+
+fn raw_by_hash_index(api: *Api, call: *Call) HandlerError!void {
+    try write_transaction_at(api, call, try block_by_hash(api, call), .raw);
+}
+
+fn raw_by_number_index(api: *Api, call: *Call) HandlerError!void {
+    try write_transaction_at(api, call, try block_by_number(api, call), .raw);
+}
+
+/// `eth_getRawTransactionByHash`: the EIP-2718 bytes of a canonical or pooled transaction
+/// (pooled ones in canonical form, without a blob sidecar), null when unknown.
+fn raw_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
+    const tx_hash = try call.params.fixed(32);
+    try call.params.finish();
+    if (api.chain.find_transaction(tx_hash)) |location| {
+        const record = api.chain.record(location.block_hash).?;
+        var transactions = record.transactions;
+        for (0..location.index) |_| _ = transactions.bytes() catch unreachable;
+        return call.writer.data(transactions.bytes() catch unreachable); // Stored by the chain.
+    }
+    const pool = api.pool orelse return call.writer.null_value();
+    const tx = pool.get(.{ .bytes = tx_hash }) orelse return call.writer.null_value();
+    const raw = node.chain.canonical_form(tx.raw, api.scratch) catch {
+        return call.fail(rpc.code.internal_error, "transaction too large");
+    };
+    try call.writer.data(raw);
+}
+
+/// Proof of stake: nothing is mined here (reth answers the same constants).
+fn mining(api: *Api, call: *Call) HandlerError!void {
+    _ = api;
+    try call.params.finish();
+    try call.writer.boolean(false);
+}
+
+fn hashrate(api: *Api, call: *Call) HandlerError!void {
+    _ = api;
+    try call.params.finish();
+    try call.writer.quantity(@as(u64, 0));
+}
+
+/// The devp2p `eth` protocol version reth reports (eth/68).
+pub const protocol_version_eth: u64 = 68;
+
+fn protocol_version(api: *Api, call: *Call) HandlerError!void {
+    _ = api;
+    try call.params.finish();
+    try call.writer.quantity(protocol_version_eth);
 }
 
 fn accounts(api: *Api, call: *Call) HandlerError!void {

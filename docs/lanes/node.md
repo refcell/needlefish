@@ -69,6 +69,13 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] rpc: debug_storageRangeAt handler behind `Api.storage_range` (rpc/storage_range.zig).
 - [x] wire `Api.storage_range` to trie-db's storage ranges (`Chain.storage_range_at`).
 - [x] rpc: base_insertValidatedTransaction(s) (builder ingress of pre-validated txs).
+- [x] rpc: eth_getRawTransactionByHash / ByBlockHashAndIndex / ByBlockNumberAndIndex,
+  eth_mining, eth_hashrate, eth_protocolVersion (reth constants).
+- [ ] rpc: eth_getTransactionBySenderAndNonce (reth).
+- [ ] rpc: debug_traceCallMany; debug_getModifiedAccountsByNumber/ByHash;
+  debug_intermediateRoots.
+- [ ] rpc: trace_* (parity tracers: trace_block, trace_transaction, trace_call,
+  trace_replayBlockTransactions, trace_filter).
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -107,6 +114,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: rpc parity: eth_getRawTransactionByHash (chain, then pool in canonical form; null when unknown, unlike debug_getRawTransaction's 0x), eth_getRawTransactionByBlock{Hash,Number}AndIndex (shares write_transaction_at via a Form enum), eth_mining false, eth_hashrate 0x0, eth_protocolVersion 0x44 (eth/68, as reth). Extended the backlog with the remaining standard-namespace gaps.
 - 2026-11-06: node-side lever survey at 996 Mgas/s replay: node-owned costs are ~1% (main-thread recovery 7/525 samples). Remaining non-EVM replay time is the replay backend commit/root (~22%, trie-db/nf-replay). Correction from nf-replay: witness hashing (`NodeStore.add`) runs once in `Replayer.init` (~62 ms for 100 blocks), outside the per-block timing; it only showed up because the 10-block bench process is short. Engine slot bench (500 transfers, builder + follower): 8.86 ms/slot (~1,185 Mgas/s); the follower's ~2.8 ms of parallel sender recovery (500 x ~45 us / 8 threads, an estimate) is the largest piece and already overlaps execution, so the next gain there is faster secp256k1 recovery (crypto). Note: profiling that bench with `sample` over short processes mostly sees setup signing (128 x 500 txs per process), not the slot.
 - 2026-11-06: validity pool storage (node half of the validity sink): `txpool.validity_store.Store` (static entries + predicate arena with bounded compaction; `insert/get/remove`, `prune(pool, next_block)` evicts txs past their block bound and drops entries whose tx left the pool, `admits(hash, reader, context)` for the builder) and `PoolSink` (pools the tx, stores predicates, never leaves a tx pooled without them; EIP-8130 refused: needs the RPC's lane lookup). `rpc.validity.Sink.of_pool_sink` adapts it. Not wired in the service: enabling it before the builder calls `admits` would pool transactions with unenforced predicates. Builder lane told.
 - 2026-11-06: base_insertValidatedTransaction / base_insertValidatedTransactions (rpc/insert_validated.zig): `{sender, raw, metering?}` pooled with the given sender (no signature recovery, `validate.validate_known`; EIP-8130 still admitted in full and must match the sender, else SenderMismatch). Batch <= 1024, parsed in full before any insert, one result each (null or {code,message}). Errors follow base/base: parse -32602, validation -32602 "invalid transaction: X", pool -32603 "pool rejected transaction: X" ("already imported" for duplicates). Extensions refused (base default); metering accepted and ignored (builder owns the cache). `eth.add_raw_checked` returns failures for per-entry reporting.
