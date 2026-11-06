@@ -265,6 +265,13 @@ pub fn decode_node(bytes: []const u8) DecodeError!Decoded {
 }
 
 /// Maps a node hash to its preimage (whose keccak256 must be that hash), or null.
+/// Receives the encoding of every node a root computation hashes (32 bytes or more), with its
+/// hash: a verifier that keeps the trie's new nodes can resolve them again after `clear`.
+pub const Sink = struct {
+    context: *anyopaque,
+    add: *const fn (context: *anyopaque, hash: *const Hash, bytes: []const u8) void,
+};
+
 pub const Resolver = struct {
     context: *anyopaque,
     resolve: *const fn (context: *anyopaque, hash: *const Hash) ?[]const u8,
@@ -297,6 +304,8 @@ pub const SparseTrie = struct {
     /// Nodes at and above this index are untouched since `clear`.
     fresh: u32 = 0,
     resolver: Resolver,
+    /// Optional: told about every node `update_root_refs` hashes.
+    sink: ?Sink = null,
     /// Root computation scratch (one entry per pool node): `depth << 32 | index` of every
     /// dirty node, then the same nodes ordered deepest level first.
     dirty: []u64,
@@ -1071,12 +1080,17 @@ pub const SparseTrie = struct {
                 self.nodes[waiting_node].ref = RlpNode.from_hash(digest);
             }
             self.nodes[index].ref = RlpNode.from_hash(digests[batch_width - 1]);
+            if (self.sink) |sink| {
+                for (inputs, &digests) |input, *digest| sink.add(sink.context, digest, input);
+            }
             waiting[length] = 0;
         }
         for (waiting, 0..) |waiting_count, length| {
             for (waiting_index[length][0..waiting_count], 0..) |waiting_node, slot| {
                 const encoded = self.pending_slot(length, slot);
-                self.nodes[waiting_node].ref = RlpNode.from_hash(node.keccak256(encoded));
+                const digest = node.keccak256(encoded);
+                self.nodes[waiting_node].ref = RlpNode.from_hash(digest);
+                if (self.sink) |sink| sink.add(sink.context, &digest, encoded);
             }
         }
         for (level) |index| assert(self.nodes[index].ref.len > 0);
@@ -1096,6 +1110,26 @@ pub const SparseTrie = struct {
         self.update_refs_serial(root);
         assert(self.nodes[root].ref.len > 0);
         return self.nodes[root].ref.root_hash();
+    }
+
+    /// Turns every clean node decoded from the preimage `source` (compared by address) back
+    /// into an unresolved node under its reference, so the next read resolves it again.
+    /// For a verifier that resolved a node to a stand-in it must not keep serving. Children
+    /// the stand-in materialized stay allocated until `clear`. Returns the nodes reset.
+    pub fn unresolve_source(self: *SparseTrie, source: []const u8) Error!u32 {
+        assert(source.len > 0);
+        var count: u32 = 0;
+        for (self.nodes[0..self.fresh]) |*current| {
+            if (current.kind != .branch and current.kind != .extension) continue;
+            if (current.source.ptr != source.ptr) continue;
+            // A changed stand-in has no reference to resolve again.
+            if (!current.ref.is_hash()) return error.InvalidWitness;
+            current.kind = .unresolved;
+            current.source = &.{};
+            count += 1;
+        }
+        assert(count <= self.fresh);
+        return count;
     }
 
     pub fn free_nodes(self: *const SparseTrie) u32 {

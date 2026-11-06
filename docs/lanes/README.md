@@ -23,6 +23,7 @@ work follows the milestones and lane split in [../SYNC_PLAN.md](../SYNC_PLAN.md)
 | proof | proof.md | `src/proof/*`, `bin/base {proof,proposer,challenger}` |
 | infra-tools | infra-tools.md | `src/infra/*`, `bin/base {basectl,websocket-proxy,roxy,load-test,withdrawer,balance-monitor}` |
 | sync-perf | sync-perf.md | `src/execution/sync/*`, `bin/base {sync,import,export}`, sync benches, measured perf edits |
+| follow | follow.md | `src/infra/follow/*`, `base follow`, sync verification checker (SYNC_PLAN M1) |
 | bench | bench.md | `docs/BENCHMARKS.md`, `etc/bench/`, `base replay bench`, README Benchmarks |
 
 Future lanes (spawned when capacity frees up) are listed in `docs/ROADMAP.md`.

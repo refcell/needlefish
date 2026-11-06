@@ -341,6 +341,8 @@ pub const NodeStore = struct {
     arena_len: u32 = 0,
     /// Asked for preimages the store lacks (see `SparseState.Fallback`).
     fallback: ?sparse.Resolver = null,
+    /// Nodes `keep` could not store for want of room (`SparseState.keep_new_nodes`).
+    dropped: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, items_max: u32, bytes_max: u32) !NodeStore {
         assert(items_max > 0);
@@ -364,6 +366,16 @@ pub const NodeStore = struct {
         self.index.clearRetainingCapacity();
         self.count = 0;
         self.arena_len = 0;
+        self.dropped = 0;
+    }
+
+    /// `sparse.Sink`: stores a node the trie just hashed; a full store counts it in
+    /// `dropped` instead.
+    fn keep(context: *anyopaque, hash: *const Hash, bytes: []const u8) void {
+        const self: *NodeStore = @ptrCast(@alignCast(context));
+        self.add_hashed(hash, bytes, true) catch {
+            self.dropped += 1;
+        };
     }
 
     pub fn add(self: *NodeStore, bytes: []const u8) error{WitnessFull}!Hash {
@@ -753,10 +765,34 @@ pub const SparseState = struct {
         assert(self.parent != null and !self.headers_verified);
     }
 
+    /// As `reset`, but keeps every node and code: the trie is rebuilt from the store as it is
+    /// read. With `keep_new_nodes` the store holds every node the trie ever computed, so
+    /// rebasing to a root the trie reached loses nothing (a follower recovering from a
+    /// failed `apply`, or emptying a full trie pool).
+    pub fn rebase(self: *SparseState, pre_state_root: Hash, parent: Parent) void {
+        const nodes = self.nodes.count;
+        const codes = self.codes.count;
+        self.clear_trie(pre_state_root);
+        self.parent = parent;
+        assert(self.nodes.count == nodes and self.codes.count == codes);
+        assert(self.parent != null and !self.headers_verified);
+    }
+
+    /// Stores the encoding of every node the trie hashes from now on (`NodeStore.dropped`
+    /// counts the ones a full store refused), or stops.
+    pub fn keep_new_nodes(self: *SparseState, enabled: bool) void {
+        self.trie.sink = if (enabled) .{ .context = self.nodes, .add = NodeStore.keep } else null;
+        assert((self.trie.sink != null) == enabled);
+    }
+
     /// As `reset`, unbound: no header chain verifies (the builder's scratch).
     fn clear(self: *SparseState, pre_state_root: Hash) void {
         self.nodes.clear();
         self.codes.clear();
+        self.clear_trie(pre_state_root);
+    }
+
+    fn clear_trie(self: *SparseState, pre_state_root: Hash) void {
         self.headers_len = 0;
         self.headers_tail_state_root = @splat(0);
         self.headers_verified = false;

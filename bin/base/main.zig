@@ -23,6 +23,7 @@ const roxy = @import("roxy.zig");
 const basectl = @import("basectl.zig");
 const audit = @import("audit.zig");
 const replay = @import("replay.zig");
+const follow = @import("follow.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -50,6 +51,7 @@ const usage =
     \\  basectl    operator commands: sync-status, block, txpool, doctor, ...
     \\  audit      transaction-event audit archiver: Vector ingest, JSON-RPC queries
     \\  replay     replay real Base blocks offline and check every header field
+    \\  follow     follow a live Base chain over RPC, re-executing and checking every block
     \\
 ;
 
@@ -74,6 +76,7 @@ test {
     _ = basectl;
     _ = audit;
     _ = replay;
+    _ = follow;
     _ = @import("metrics_server.zig");
 }
 
@@ -162,6 +165,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "replay")) {
         return try replay.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "follow")) {
+        return try follow.main(init, args);
     }
     return null;
 }

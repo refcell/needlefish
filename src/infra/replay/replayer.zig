@@ -142,27 +142,27 @@ pub const Gaps = struct {
         len.* += 1;
     }
 
-    fn account(gaps: *Gaps, address: Address) void {
+    pub fn account(gaps: *Gaps, address: Address) void {
         gaps.push(Address, &gaps.accounts, &gaps.accounts_len, address);
     }
 
-    fn slot(gaps: *Gaps, key: SlotKey) void {
+    pub fn slot(gaps: *Gaps, key: SlotKey) void {
         gaps.push(SlotKey, &gaps.slots, &gaps.slots_len, key);
     }
 
-    fn node(gaps: *Gaps, hash: Hash) void {
+    pub fn node(gaps: *Gaps, hash: Hash) void {
         gaps.push(Hash, &gaps.nodes, &gaps.nodes_len, hash);
     }
 
-    fn code(gaps: *Gaps, hash: Hash) void {
+    pub fn code(gaps: *Gaps, hash: Hash) void {
         gaps.push(Hash, &gaps.codes, &gaps.codes_len, hash);
     }
 
-    fn block_hash(gaps: *Gaps, number: u64) void {
+    pub fn block_hash(gaps: *Gaps, number: u64) void {
         gaps.push(u64, &gaps.block_hashes, &gaps.block_hashes_len, number);
     }
 
-    fn code_owner(gaps: *Gaps, address: Address) void {
+    pub fn code_owner(gaps: *Gaps, address: Address) void {
         gaps.push(Address, &gaps.code_owners, &gaps.code_owners_len, address);
     }
 };
@@ -192,21 +192,21 @@ const HashJob = struct {
     }
 };
 
-const CodeOwners = struct {
+pub const CodeOwners = struct {
     const capacity = 1024;
     hashes: [capacity]Hash = undefined,
     addresses: [capacity]Address = undefined,
     len: u32 = 0,
     next: u32 = 0,
 
-    fn put(owners: *CodeOwners, hash: Hash, address: Address) void {
+    pub fn put(owners: *CodeOwners, hash: Hash, address: Address) void {
         owners.hashes[owners.next] = hash;
         owners.addresses[owners.next] = address;
         owners.next = (owners.next + 1) % capacity;
         owners.len = @min(owners.len + 1, capacity);
     }
 
-    fn get(owners: *const CodeOwners, hash: Hash) ?Address {
+    pub fn get(owners: *const CodeOwners, hash: Hash) ?Address {
         for (0..owners.len) |index| {
             if (std.mem.eql(u8, &owners.hashes[index], &hash)) return owners.addresses[index];
         }
@@ -517,7 +517,6 @@ pub const Replayer = struct {
         if (!outcome.check(.state_root)) outcome.state_diff = self.diff_state(index);
     }
 
-    /// Checks every recomputed header field and the hash of the header resealed with them.
     fn compare(
         self: *Replayer,
         header: *const Header,
@@ -525,37 +524,15 @@ pub const Replayer = struct {
         executed: *const node_executor.Executed,
         outcome: *Outcome,
     ) void {
-        var sealed = header.*;
-        sealed.transactions_root = .{ .bytes = trie.ordered.ordered_trie_root(transactions) };
-        sealed.gas_used = executed.gas_used;
-        sealed.logs_bloom = executed.logs_bloom;
-        if (header.blob_gas_used != null) sealed.blob_gas_used = executed.blob_gas_used;
-        sealed.receipts_root = .{ .bytes = executed.receipts_root };
-        sealed.state_root = .{ .bytes = executed.state_root };
-        if (self.spec.is_upgrade_active(.isthmus, header.timestamp)) {
-            if (self.sparse.account_storage_root(l2_to_l1_message_passer)) |root| {
-                sealed.withdrawals_root = .{ .bytes = root };
-            } else |_| {
-                // The witness lacks the message passer's account: ask the fetcher for it.
-                self.gaps.account(l2_to_l1_message_passer);
-                sealed.withdrawals_root = .{ .bytes = @splat(0) };
-            }
-        }
-        const results = [check_count]bool{
-            sealed.transactions_root.eql(header.transactions_root),
-            sealed.gas_used == header.gas_used,
-            sealed.logs_bloom.eql(header.logs_bloom),
-            std.meta.eql(sealed.blob_gas_used, header.blob_gas_used),
-            sealed.receipts_root.eql(header.receipts_root),
-            sealed.state_root.eql(header.state_root),
-            std.meta.eql(sealed.withdrawals_root, header.withdrawals_root),
-            std.mem.eql(u8, &sealed.hash().bytes, &outcome.hash),
-        };
-        for (results, 0..) |passed, bit| {
-            if (passed) outcome.passed |= @as(u16, 1) << @intCast(bit);
-        }
-        assert(outcome.check(.block_hash) == outcome.ok() or outcome.failure != null or
-            !outcome.check(.block_hash));
+        outcome.passed = check_header(.{
+            .spec = self.spec,
+            .sparse = &self.sparse,
+            .gaps = &self.gaps,
+            .header = header,
+            .hash = &outcome.hash,
+            .transactions = transactions,
+            .executed = executed,
+        });
     }
 
     /// The first account or slot (in archive order) whose post-block value differs.
@@ -720,6 +697,59 @@ pub const Replayer = struct {
         return from(context).inner().block_hash(number);
     }
 };
+
+/// What `check_header` compares: a block's canonical header and hash, and the results of
+/// executing it over `sparse` (already committed).
+pub const HeaderCheck = struct {
+    spec: *const chainspec.ChainSpec,
+    sparse: *SparseState,
+    /// Records the message passer's account when the witness lacks it.
+    gaps: *Gaps,
+    header: *const Header,
+    hash: *const Hash,
+    transactions: []const []const u8,
+    executed: *const node_executor.Executed,
+};
+
+/// Checks every recomputed header field and the hash of the header resealed with them.
+/// Returns the passed checks: bit `@intFromEnum(check)` set means that field matched.
+pub fn check_header(input: HeaderCheck) u16 {
+    const header = input.header;
+    const executed = input.executed;
+    var sealed = header.*;
+    sealed.transactions_root = .{ .bytes = trie.ordered.ordered_trie_root(input.transactions) };
+    sealed.gas_used = executed.gas_used;
+    sealed.logs_bloom = executed.logs_bloom;
+    if (header.blob_gas_used != null) sealed.blob_gas_used = executed.blob_gas_used;
+    sealed.receipts_root = .{ .bytes = executed.receipts_root };
+    sealed.state_root = .{ .bytes = executed.state_root };
+    if (input.spec.is_upgrade_active(.isthmus, header.timestamp)) {
+        if (input.sparse.account_storage_root(l2_to_l1_message_passer)) |root| {
+            sealed.withdrawals_root = .{ .bytes = root };
+        } else |_| {
+            // The witness lacks the message passer's account: ask the fetcher for it.
+            input.gaps.account(l2_to_l1_message_passer);
+            sealed.withdrawals_root = .{ .bytes = @splat(0) };
+        }
+    }
+    const results = [check_count]bool{
+        sealed.transactions_root.eql(header.transactions_root),
+        sealed.gas_used == header.gas_used,
+        sealed.logs_bloom.eql(header.logs_bloom),
+        std.meta.eql(sealed.blob_gas_used, header.blob_gas_used),
+        sealed.receipts_root.eql(header.receipts_root),
+        sealed.state_root.eql(header.state_root),
+        std.meta.eql(sealed.withdrawals_root, header.withdrawals_root),
+        std.mem.eql(u8, &sealed.hash().bytes, input.hash),
+    };
+    var passed: u16 = 0;
+    for (results, 0..) |matched, bit| {
+        if (matched) passed |= @as(u16, 1) << @intCast(bit);
+    }
+    assert(passed <= all_checks);
+    assert(results[check_count - 1] == (passed >> (check_count - 1) == 1));
+    return passed;
+}
 
 /// The first receipt whose status, cumulative gas, or log count differs.
 pub fn diff_receipts(

@@ -164,7 +164,9 @@ pub fn add_block(
     return post_root;
 }
 
-fn decode_transactions(
+/// The EIP-2718 encodings of a block object's full transactions, re-encoded from JSON;
+/// they must hash to `root` (the header's `transactionsRoot`).
+pub fn decode_transactions(
     arena: std.mem.Allocator,
     raw: []const u8,
     root: Hash,
