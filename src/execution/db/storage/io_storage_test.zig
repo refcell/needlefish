@@ -188,6 +188,11 @@ fn HarnessType(comptime IO: type) type {
         }
 
         fn detach(self: *Harness) void {
+            // A real backend may still be reading into or writing from these buffers (an
+            // early error return, e.g. a timeout): freeing them would let the kernel finish
+            // into memory another test now owns. Drain first; the simulator drops operations
+            // on a crash, so there nothing is in flight that could land later.
+            if (IO != SimIo) self.drain();
             self.engine.deinit(testing.allocator);
             self.storage.deinit(testing.allocator);
         }
@@ -205,8 +210,25 @@ fn HarnessType(comptime IO: type) type {
 
         /// One step of the IO world, then one storage tick (which delivers callbacks).
         fn pump(self: *Harness) !void {
-            if (IO == SimIo) try self.io.run_for_ns(100 * std.time.ns_per_us);
+            if (IO == SimIo) {
+                try self.io.run_for_ns(100 * std.time.ns_per_us);
+            } else if (comptime @hasDecl(IO, "run_for_ns")) if (!self.storage.idle()) {
+                // Wait for the device, so step bounds count waits, not non-blocking polls
+                // (a loaded machine would otherwise exhaust them in seconds).
+                try self.io.run_for_ns(20 * std.time.ns_per_us);
+            };
             self.storage.tick();
+        }
+
+        /// Waits for every operation of a real backend to finish (bounded by wall time).
+        fn drain(self: *Harness) void {
+            var waits: u32 = 0;
+            while (!self.storage.idle()) : (waits += 1) {
+                // 1M waits of 20 us: 20 s for a handful of 64 KiB operations.
+                if (waits > 1_000_000) @panic("io_storage test: operations never finished");
+                self.pump() catch |err| std.debug.panic("io_storage test: drain: {t}", .{err});
+            }
+            assert(self.storage.idle());
         }
 
         fn wait_phase(self: *Harness) !void {
