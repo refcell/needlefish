@@ -3,8 +3,8 @@
 //! port 8000 and sign with an NSM-derived key; std has no vsock and the project links no NSM
 //! driver, so this binds TCP (default 127.0.0.1:8000) and reads the signer key from
 //! `BASE_ENCLAVE_SIGNER_KEY` like base/base's local mode (never argv, which other local users
-//! can read). The link is unauthenticated: anyone who reaches the port gets proofs signed, so
-//! keep it on loopback. Each connection carries length-prefixed link frames.
+//! can read). The link is unauthenticated, so only loopback addresses are accepted: anyone
+//! who reaches the port gets proofs signed. Each connection carries length-prefixed frames.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,7 +18,8 @@ const usage =
     \\usage: BASE_ENCLAVE_SIGNER_KEY=<hex> base nitro-enclave [--listen <ip:port>]
     \\       [--request-bytes-max <n>]
     \\  BASE_ENCLAVE_SIGNER_KEY  secp256k1 signer key (local mode; real enclaves derive it)
-    \\  --listen             TCP address in place of vsock port 8000 (default 127.0.0.1:8000)
+    \\  --listen             loopback TCP address in place of vsock port 8000
+    \\                       (default 127.0.0.1:8000)
     \\  --request-bytes-max  largest request frame (default 268435456)
     \\
 ;
@@ -58,6 +59,9 @@ fn parse_listen(value: []const u8, flags: *Flags) error{InvalidArguments}!void {
     if (parts.next() != null) return error.InvalidArguments;
     flags.port = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch
         return error.InvalidArguments;
+    // The unauthenticated signing link must not be reachable from other hosts.
+    if (flags.host[0] != 127) return error.InvalidArguments;
+    assert(flags.host[0] == 127);
 }
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
@@ -73,10 +77,6 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("nitro-enclave: invalid BASE_ENCLAVE_SIGNER_KEY\n", .{});
         return 2;
     };
-    if (flags.host[0] != 127) {
-        std.debug.print("nitro-enclave: warning: the link is unauthenticated; " ++
-            "anyone reaching this address can get proofs signed\n", .{});
-    }
     const allocator = init.gpa;
     const server: enclave.Server = .init_local(signer);
     const storage = try allocator.create(kzg.blob.Settings.Storage);
@@ -133,9 +133,11 @@ fn serve_connection(io: Io, handler: *enclave.Handler, stream: Io.net.Stream) vo
 }
 
 test "nitro-enclave: argument parsing" {
-    const flags = try parse(&.{ "--listen", "0.0.0.0:9000" });
+    const flags = try parse(&.{ "--listen", "127.0.0.2:9000" });
     try std.testing.expectEqual(@as(u16, 9000), flags.port);
-    try std.testing.expectEqual(@as(u8, 0), flags.host[0]);
+    try std.testing.expectEqual(@as(u8, 2), flags.host[3]);
+    const remote = parse(&.{ "--listen", "0.0.0.0:9000" });
+    try std.testing.expectError(error.InvalidArguments, remote);
     try std.testing.expectEqual(@as(u16, 8000), (try parse(&.{})).port);
     try std.testing.expectError(error.InvalidArguments, parse(&.{"--signer-key"}));
     const bad_listen = parse(&.{ "--listen", "1.2.3:4" });
