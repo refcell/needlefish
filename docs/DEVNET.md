@@ -131,6 +131,17 @@ Each binary must accept at least the flags below. Lanes may add more.
   txmgr: `--num-confirmations N --min-tip-cap GWEI --min-basefee GWEI
   --max-pending-transactions N` (base/base semantics).
 
+## Docker
+
+`just devnet docker-up` builds one image with every binary (`etc/docker/Dockerfile`, Zig
+installed by `etc/scripts/install-zig.sh`) and starts the same topology with
+`etc/docker/docker-compose.yml`, mirroring base/base's `etc/docker`. Each component runs
+`etc/docker/entrypoint.sh <component>` at a fixed IPv4 address on `172.30.0.0/24`
+(the CL takes IPv4 URLs only). The containers run with `seccomp=unconfined` because the
+default profile blocks io_uring. State is the host's `.devnet/` and ports are published on
+127.0.0.1 at the native ports, so `just devnet smoke` checks the Docker devnet unchanged.
+`just devnet docker-down` stops it. Only one devnet, native or Docker, runs per machine.
+
 ## Smoke test
 
 `just devnet smoke` passes when, within 120 s of `up`:

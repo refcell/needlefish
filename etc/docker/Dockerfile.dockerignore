@@ -1,0 +1,7 @@
+.git
+.devnet
+.cache
+.zig-cache
+zig-out
+.pi
+.claude

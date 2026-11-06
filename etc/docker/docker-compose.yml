@@ -1,0 +1,93 @@
+# All-Zig devnet in Docker, mirroring `just devnet up` (etc/devnet/devnet.sh) and base/base's
+# etc/docker layout: L1 dev chain, sequencer EL + CL, batcher, verifier EL + CL.
+#
+#   just devnet docker-up      build the image, start everything
+#   just devnet smoke          the same end-to-end checks as the native devnet
+#   just devnet docker-down    stop and remove the containers
+#
+# State is the host's .devnet/ (bind mount), and ports are published on 127.0.0.1 at the
+# native devnet's ports, so only one devnet (native or Docker) runs per machine.
+name: needlefish-devnet
+
+x-component: &component
+  image: needlefish-devnet:local
+  # Docker's default seccomp profile blocks io_uring (as in `just test-linux`).
+  security_opt: ["seccomp=unconfined"]
+  volumes:
+    - ../../.devnet:/devnet
+
+
+services:
+  setup:
+    <<: *component
+    build:
+      context: ../..
+      dockerfile: etc/docker/Dockerfile
+    command: ["setup"]
+    networks: [devnet]
+
+  l1:
+    <<: *component
+    command: ["l1"]
+    depends_on:
+      setup: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:8545:8545", "127.0.0.1:5052:5052"]
+    networks: { devnet: { ipv4_address: 172.30.0.10 } }
+
+  seq-el:
+    <<: *component
+    command: ["seq-el"]
+    depends_on:
+      setup: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:9545:9545", "127.0.0.1:9551:9551"]
+    networks: { devnet: { ipv4_address: 172.30.0.11 } }
+
+  ver-el:
+    <<: *component
+    command: ["ver-el"]
+    depends_on:
+      setup: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:10545:10545", "127.0.0.1:10551:10551"]
+    networks: { devnet: { ipv4_address: 172.30.0.14 } }
+
+  # Writes rollup.json with the real genesis hashes once l1 and seq-el answer.
+  rollup:
+    <<: *component
+    command: ["rollup"]
+    depends_on:
+      l1: { condition: service_started }
+      seq-el: { condition: service_started }
+    networks: [devnet]
+
+  seq-cl:
+    <<: *component
+    command: ["seq-cl"]
+    depends_on:
+      rollup: { condition: service_completed_successfully }
+    ports: ["127.0.0.1:7545:7545"]
+    networks: { devnet: { ipv4_address: 172.30.0.12 } }
+
+  batcher:
+    <<: *component
+    command: ["batcher"]
+    depends_on:
+      rollup: { condition: service_completed_successfully }
+      seq-cl: { condition: service_started }
+    ports: ["127.0.0.1:7300:7300"]
+    networks: { devnet: { ipv4_address: 172.30.0.13 } }
+
+  ver-cl:
+    <<: *component
+    command: ["ver-cl"]
+    depends_on:
+      rollup: { condition: service_completed_successfully }
+      ver-el: { condition: service_started }
+      seq-cl: { condition: service_started }
+    ports: ["127.0.0.1:8547:8547", "127.0.0.1:7301:7301"]
+    networks: { devnet: { ipv4_address: 172.30.0.15 } }
+
+networks:
+  devnet:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

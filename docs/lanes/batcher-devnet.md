@@ -54,7 +54,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] `base devnet transfer`: sign + send EIP-1559 tx (used by smoke for L2 tx and L1 deposit).
 - [x] `batcher/rpc`: JSON-RPC client over an injected transport (HTTP in bin, canned in tests).
 - [x] Smoke test passing: L2 tx included by sequencer, batch posted to L1, verifier derives the same safe head; L1 deposit appears on L2.
-- [ ] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
+- [x] Optional Docker compose mirroring base/base's `etc/docker` using our binaries.
 - [x] (from p2p lane) Run the CLs with discv5 + bootstore instead of an enode-only link,
   like a real network. In `start_consensus`: drop `--p2p.no-discovery --p2p.no-bootstore`
   from `p2p`, pass the sequencer's `enr=` (from its "p2p listening" log line) as the
@@ -272,4 +272,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - 2026-11-05: Devnet CLs use discv5 with a bootstore each. The verifier's bootnode is the
   sequencer's ENR, taken from its "p2p listening" log line. The smoke asserts the verifier's
   `opp2p_peerCount` `connectedGossip >= 1`. The smoke passes at 200 ms.
+- 2026-11-05: Docker devnet (`etc/docker/`, `just devnet docker-up|docker-down`): one image
+  from `zig build -Doptimize=ReleaseSafe` on alpine, one container per component at fixed
+  IPs (the CL accepts IPv4 URLs only), and `seccomp=unconfined` for io_uring. `.devnet/` is bind-mounted and
+  ports are published at the native ports, so the unchanged smoke passes against it (99/99).
 

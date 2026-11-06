@@ -29,3 +29,12 @@ reset:
 # End-to-end check: L2 tx sequenced, batched to L1, derived by verifier
 smoke:
     etc/devnet/devnet.sh smoke
+
+# The same devnet in Docker (etc/docker/docker-compose.yml); `smoke` checks it too
+docker-up:
+    etc/devnet/devnet.sh down
+    docker compose -f etc/docker/docker-compose.yml up -d --build
+
+# Stop and remove the Docker devnet
+docker-down:
+    docker compose -f etc/docker/docker-compose.yml down
