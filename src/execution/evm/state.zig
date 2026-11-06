@@ -170,7 +170,46 @@ pub const Limits = struct {
     log_data_bytes_max: u32 = 64 << 20,
     /// Bytes of contract code deployed within one block.
     code_bytes_max: u32 = 1 << 24,
+
+    /// Headroom for entries no transaction pays for: system calls (beacon root, history
+    /// storage), the L1 attributes deposit, fee vaults, and unmetered EIP-8130 writes.
+    pub const unmetered_headroom: u32 = 1 << 13;
+
+    /// Account and slot tables sized for one block of `gas_limit`, for a `State` that is
+    /// reset at least once per block. Every distinct slot costs at least 1900 gas (an
+    /// EIP-2930 storage key; a cold SLOAD/SSTORE costs more) and every distinct account at
+    /// least 2400 (an EIP-2930 address; cold access and intrinsic gas cost more). Smaller
+    /// tables than the defaults keep lookups in cache. Never exceeds the defaults.
+    pub fn for_block_gas(gas_limit: u64) Limits {
+        const defaults = Limits{};
+        const slots = gas_limit / 1900 + unmetered_headroom;
+        const accounts = gas_limit / 2400 + unmetered_headroom;
+        const limits = Limits{
+            .slots_max = @intCast(@min(
+                std.math.ceilPowerOfTwoAssert(u64, slots),
+                defaults.slots_max,
+            )),
+            .accounts_max = @intCast(@min(
+                std.math.ceilPowerOfTwoAssert(u64, accounts),
+                defaults.accounts_max,
+            )),
+        };
+        assert(limits.slots_max >= @min(slots, defaults.slots_max));
+        assert(limits.accounts_max >= @min(accounts, defaults.accounts_max));
+        return limits;
+    }
 };
+
+test "state: limits for a block cover its gas and never exceed the defaults" {
+    const base_block = Limits.for_block_gas(37_500_000);
+    try std.testing.expect(base_block.slots_max >= 37_500_000 / 1900);
+    try std.testing.expectEqual(@as(u32, 1 << 15), base_block.slots_max);
+    try std.testing.expectEqual(@as(u32, 1 << 15), base_block.accounts_max);
+    const huge = Limits.for_block_gas(1 << 40);
+    try std.testing.expectEqual(Limits{}, huge);
+    const empty = Limits.for_block_gas(0);
+    try std.testing.expectEqual(Limits.unmetered_headroom, empty.slots_max);
+}
 
 /// Zero-length placeholder while a `replace_code` undo pair is half applied.
 const undo_code_placeholder = [_]u8{0};

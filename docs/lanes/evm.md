@@ -185,11 +185,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (`getOrPut` first, remove on a database error): no measurable change (storage loop
   10.5 us, block 0.675 ms), not kept. The cost is memory: `slots_max` 2^18 reserves ~2^19
   buckets of a 64 B key plus a 96 B `Slot` (~75 MB), so each access misses cache and TLB.
-- [ ] Performance: size the slot/account tables from the block gas limit (every new slot
-  costs >= 2100 gas, so a 37.5M-gas block touches < 18k slots) instead of the 2^18
-  default; needs the executor (node lane) to pass `State.Limits` per block size.
-- [ ] Performance: `transact` self time is ~10% of the block bench; profile with inlining
-  off to find which validation or settlement step dominates.
+- [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
+  account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
+  account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a
+  37.5M-gas block gets 2^15 of each instead of 2^18 slots. For a `State` reset at least
+  once per block. The node lane wires it into the executor and measures `node: replay`.
+- [x] Performance: `transact` self time, profiled with its helpers `noinline`: spread
+  thin (per 1000-tx block, samples: `op.load_params` 86, `transact` 73, `intrinsic_gas` 68,
+  `pay_fees` 58, `validate_and_buy_gas` 50). `intrinsic_gas` now counts zero calldata
+  bytes 32 at a time: block bench 0.675 -> 0.66 ms. `load_params` is not cached across
+  txs: the L1 attributes deposit rewrites those slots mid-block.
 - [x] Performance: re-profiled `node: replay` after the analysis cache. Keccak (~1000
   samples) is the witness `NodeStore.add` / sparse trie (db/node lanes); `push_frame` left
   is first-sight analysis (the bench builds a fresh executor per run). EVM-owned: the

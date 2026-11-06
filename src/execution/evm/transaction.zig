@@ -132,8 +132,7 @@ pub fn blobs_per_tx_max(comptime fork: Fork) u64 {
 pub const Intrinsic = struct { gas: u64, floor: u64 };
 
 pub fn intrinsic_gas(comptime fork: Fork, tx: *const TxEnv) Intrinsic {
-    var zero_bytes: u64 = 0;
-    for (tx.data) |b| zero_bytes += @intFromBool(b == 0);
+    const zero_bytes = count_zero_bytes(tx.data);
     const nonzero_bytes: u64 = tx.data.len - zero_bytes;
     var total: u64 = gas.tx_base;
     total += zero_bytes * gas.tx_data_zero + nonzero_bytes * gas.tx_data_nonzero(fork);
@@ -152,6 +151,36 @@ pub fn intrinsic_gas(comptime fork: Fork, tx: *const TxEnv) Intrinsic {
         floor = gas.tx_base + gas.total_cost_floor_per_token * tokens;
     }
     return .{ .gas = total, .floor = floor };
+}
+
+/// Zero bytes in `data`, 32 at a time (calldata is often kilobytes).
+fn count_zero_bytes(data: []const u8) u64 {
+    const lanes = 32;
+    var zero_bytes: u64 = 0;
+    var index: usize = 0;
+    while (index + lanes <= data.len) : (index += lanes) {
+        const chunk: @Vector(lanes, u8) = data[index..][0..lanes].*;
+        const zeros: @Vector(lanes, u8) = @intFromBool(chunk == @as(@Vector(lanes, u8), @splat(0)));
+        zero_bytes += @reduce(.Add, @as(@Vector(lanes, u16), zeros));
+    }
+    for (data[index..]) |byte| zero_bytes += @intFromBool(byte == 0);
+    assert(zero_bytes <= data.len);
+    return zero_bytes;
+}
+
+test "transaction: vector zero-byte count matches the byte loop" {
+    var prng = @import("../../testing/prng.zig").Prng.init(0x2e20_0001);
+    var buffer: [300]u8 = undefined;
+    var round: u32 = 0;
+    while (round < 500) : (round += 1) {
+        const len: usize = @intCast(prng.below(buffer.len + 1));
+        for (buffer[0..len]) |*byte| {
+            byte.* = if (prng.below(3) == 0) 0 else @truncate(prng.int(u64));
+        }
+        var expected: u64 = 0;
+        for (buffer[0..len]) |byte| expected += @intFromBool(byte == 0);
+        try std.testing.expectEqual(expected, count_zero_bytes(buffer[0..len]));
+    }
 }
 
 pub fn effective_gas_price(tx: *const TxEnv, base_fee: u256) u256 {
