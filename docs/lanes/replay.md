@@ -121,6 +121,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: decision: archive format v2 stores the body uncompressed (v1 deflate still
+  reads; the committed fixture stays v1). Deflate saved 17% (52.7 -> 43.7 MB) but inflating
+  cost ~230 of ~450 ms load: a 100-block `replay run` went 0.72 s -> 0.45 s wall. Baseline
+  refreshed after sender prefetch: 837-991 Mgas/s across the three pinned windows.
+
 - 2026-11-06: third pinned window in `just replay-check`: 53840091..53840100 (221 txs,
   31.5 Mgas), fetched without the diff trace, 10/10.
 

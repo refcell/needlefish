@@ -1,13 +1,15 @@
 //! Replay archive: everything `base replay run` needs to re-execute a range of Base blocks
-//! offline, as one checksummed, compressed file.
+//! offline, as one checksummed file.
 //!
 //! Frame (integers little-endian):
 //!
-//!     magic "NFRP" | version u32 = 1 | body_bytes u64 | keccak256(body) | deflate(body)
+//!     magic "NFRP" | version u32 | body_bytes u64 | keccak256(body) | payload
 //!
-//! The body is raw deflate (`std.compress.flate`, no container). The inflated body must have
-//! exactly `body_bytes` bytes and match the digest, so a corrupt or truncated file is
-//! rejected before it is parsed.
+//! Version 2 (written): the payload is the body itself. Version 1 (still read): the payload
+//! is raw deflate (`std.compress.flate`, no container); it saved only ~17% on mainnet
+//! archives and inflating cost a third of `base replay run`'s load time. Either way the body
+//! must have exactly `body_bytes` bytes and match the digest, so a corrupt or truncated file
+//! is rejected before it is parsed.
 //!
 //! Body:
 //!
@@ -53,7 +55,9 @@ const keccak256 = trie.node.keccak256;
 const flate = std.compress.flate;
 
 pub const magic = [4]u8{ 'N', 'F', 'R', 'P' };
-pub const version: u32 = 1;
+pub const version: u32 = 2;
+/// The first format: the body deflated. Read, never written.
+pub const version_deflate: u32 = 1;
 /// Magic, version, body size, body digest.
 pub const frame_bytes = 4 + 4 + 8 + 32;
 /// Largest body a decoder accepts.
@@ -607,33 +611,42 @@ pub fn write_frame(body: []const u8, out: *std.Io.Writer) error{WriteFailed}!voi
     std.mem.writeInt(u64, prefix[8..16], body.len, .little);
     prefix[16..48].* = keccak256(body);
     try out.writeAll(&prefix);
-    var window: [flate.max_window_len]u8 = undefined;
-    var compress = try flate.Compress.init(out, &window, .raw, .level_6);
-    try compress.writer.writeAll(body);
-    try compress.finish();
+    try out.writeAll(body);
 }
 
 /// Inflates and checks a framed archive file; returns the body (from `allocator`).
 pub fn read_frame(allocator: std.mem.Allocator, file: []const u8) DecodeError![]u8 {
     if (file.len < frame_bytes) return error.Truncated;
     if (!std.mem.eql(u8, file[0..4], &magic)) return error.BadMagic;
-    if (std.mem.readInt(u32, file[4..8], .little) != version) return error.UnsupportedVersion;
+    const file_version = std.mem.readInt(u32, file[4..8], .little);
+    if (file_version != version and file_version != version_deflate) {
+        return error.UnsupportedVersion;
+    }
     const body_bytes = std.mem.readInt(u64, file[8..16], .little);
     if (body_bytes > body_bytes_max) return error.TooLarge;
     const digest: Hash = file[16..48].*;
     const body = try allocator.alloc(u8, @intCast(body_bytes));
     errdefer allocator.free(body);
-    var input: std.Io.Reader = .fixed(file[frame_bytes..]);
+    if (file_version == version) {
+        if (file.len - frame_bytes != body_bytes) return error.Corrupt;
+        @memcpy(body, file[frame_bytes..]);
+    } else try inflate(allocator, file[frame_bytes..], body);
+    if (!std.mem.eql(u8, &keccak256(body), &digest)) return error.Corrupt;
+    return body;
+}
+
+/// Inflates a version 1 payload into `body`, which it must fill exactly.
+fn inflate(allocator: std.mem.Allocator, payload: []const u8, body: []u8) DecodeError!void {
+    assert(body.len <= body_bytes_max);
+    var input: std.Io.Reader = .fixed(payload);
     var decompress: flate.Decompress = .init(&input, .raw, &.{});
-    // One spare byte: a stream longer than `body_bytes` fills it and fails the size check.
+    // One spare byte: a stream longer than `body.len` fills it and fails the size check.
     const spare = try allocator.alloc(u8, body.len + 1);
     defer allocator.free(spare);
     var output: std.Io.Writer = .fixed(spare);
     const inflated = decompress.reader.streamRemaining(&output) catch return error.Corrupt;
     if (inflated != body.len) return error.Corrupt;
     @memcpy(body, spare[0..body.len]);
-    if (!std.mem.eql(u8, &keccak256(body), &digest)) return error.Corrupt;
-    return body;
 }
 
 /// `read_frame` then `decode_body`.

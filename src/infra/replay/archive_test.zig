@@ -133,7 +133,7 @@ test "replay archive: the frame rejects corruption and truncation" {
     flipped[20] ^= 1; // Digest.
     try testing.expectError(error.Corrupt, archive_module.decode(allocator, flipped, &out));
     flipped[20] ^= 1;
-    flipped[4] = 2; // Version.
+    flipped[4] = 3; // Version.
     const unsupported = archive_module.decode(allocator, flipped, &out);
     try testing.expectError(error.UnsupportedVersion, unsupported);
     try testing.expectEqual(@as(u32, 0), out.block_count);
@@ -240,4 +240,39 @@ test "replay archive: fuzz decode" {
     defer out.deinit(allocator);
     const context: FuzzContext = .{ .out = &out, .allocator = allocator, .valid = valid };
     try fuzz.run_bytes(&context, fuzz_decode, .{ .iterations = 512, .corpus = &.{valid} });
+}
+
+test "replay archive: version 1 (deflate) frames still decode; version 2 is exact" {
+    const allocator = testing.allocator;
+    var archive = try Archive.init(allocator, config);
+    defer archive.deinit(allocator);
+    var chain: HeaderChain = .{};
+    try build(&archive, &chain, 4, 2);
+    const body = try archive_module.encode_body(allocator, &archive, witness_config);
+    defer allocator.free(body);
+    var v1: std.Io.Writer.Allocating = .init(allocator);
+    defer v1.deinit();
+    var prefix: [archive_module.frame_bytes]u8 = undefined;
+    @memcpy(prefix[0..4], &archive_module.magic);
+    std.mem.writeInt(u32, prefix[4..8], archive_module.version_deflate, .little);
+    std.mem.writeInt(u64, prefix[8..16], body.len, .little);
+    prefix[16..48].* = keccak256(body);
+    try v1.writer.writeAll(&prefix);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress = try std.compress.flate.Compress.init(&v1.writer, &window, .raw, .level_6);
+    try compress.writer.writeAll(body);
+    try compress.finish();
+    var out = try Archive.init(allocator, config);
+    defer out.deinit(allocator);
+    try archive_module.decode(allocator, v1.written(), &out);
+    try testing.expectEqual(@as(u32, 2), out.block_count);
+
+    const v2 = try encode_file(allocator, &archive);
+    defer allocator.free(v2);
+    try testing.expectEqual(archive_module.frame_bytes + body.len, v2.len);
+    const longer = try std.mem.concat(allocator, u8, &.{ v2, "x" });
+    defer allocator.free(longer);
+    var rejected = try Archive.init(allocator, config);
+    defer rejected.deinit(allocator);
+    try testing.expectError(error.Corrupt, archive_module.decode(allocator, longer, &rejected));
 }

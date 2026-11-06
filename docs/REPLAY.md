@@ -16,13 +16,19 @@ just replay-run            # replay the committed 10-block archive (no network)
 ### Throughput baseline
 
 The summary line reports replay time only (no fetch, no archive load): total ms, ms per
-block, and Mgas/s. `just replay-check` on an Apple M-series laptop under load, ReleaseFast,
-3 runs, 2026-11-06:
+block, and Mgas/s. `just replay-check` on an Apple M-series laptop under load (load average
+6-9 from other builds), ReleaseFast, with parallel and next-block sender recovery, 3 runs,
+2026-11-06:
 
 | Window | Blocks | Txs | Gas | Replay | Per block | Throughput |
 |---|---|---|---|---|---|---|
-| 53775088..53775187 | 100 | 1571 | 271.9 Mgas | 309-332 ms | 3.1-3.3 ms | 820-880 Mgas/s |
-| 53811190..53811209 | 20 | 314 | 70.6 Mgas | 78-80 ms | 3.9-4.0 ms | 879-907 Mgas/s |
+| 53775088..53775187 | 100 | 1571 | 271.9 Mgas | 274-280 ms | 2.7-2.8 ms | 972-991 Mgas/s |
+| 53811190..53811209 | 20 | 314 | 70.6 Mgas | 71-79 ms | 3.6-4.0 ms | 894-991 Mgas/s |
+| 53840091..53840100 | 10 | 221 | 31.5 Mgas | 34-38 ms | 3.4-3.8 ms | 837-927 Mgas/s |
+
+Before sender prefetch the first two windows ran at 820-907 Mgas/s. Loading the 100-block
+archive (read, digest check, parse, witness index) adds about 180 ms to a run: 0.45 s wall
+in total (version 1 deflated archives took 0.72 s, mostly inflating).
 
 A drop well outside these ranges on the same machine is a regression to bisect.
 
@@ -75,7 +81,8 @@ the witness is an error, never a silent zero.
 
 The archive (`src/infra/replay/archive.zig`) is one file:
 
-- an `NFRP` frame: version, body size, keccak256 of the body, raw-deflate body;
+- an `NFRP` frame: version, body size, keccak256 of the body, then the body (version 2;
+  version 1 archives, with a raw-deflate body, still load);
 - the witness (`NFWT`, canonical: nodes and codes sorted by hash, no duplicates);
 - the parent's state root and the 256 ancestor block hashes (`BLOCKHASH`);
 - the replayed blocks: RLP header, EIP-2718 transactions, and for diagnostics the
