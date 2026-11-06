@@ -238,6 +238,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: paused for replay focus (owner decision). Next on resume: ungated swarm seeds 992, 2258, 2622.
 - 2026-11-05: reorg: safedb reset records are flagged (in memory) and trusted only without a newer orphaned entry; a shadowed one is the cap before finalized. Gated 3000/3000; ungated 2997/3000 (992, 2258, 2622).
 - 2026-11-05: reorg: `driver.SafeCheck` checks the safedb against canonical L1 before discovery and caps the safe label at the newest supported safe head (finalized when none; unknown blocks wait, 3000-tick budget). The sim real verifier keeps its safedb across restarts (`--safedb.path`); the cluster's safe-decrease check re-latches on driver resets. Seed 850 and 15/16/2562/2856/329 pass with the batcher gate removed; gated 3000-seed sweep clean, ungated 2997/3000.
 - 2026-11-05: rpc: `service/forwarding.zig` forwards single HTTP JSON-RPC calls for methods the router does not serve to `--rpc.execution-forwarding-endpoint` (deferred responses, 4 keep-alive clients, -32603 on failure or when all are busy).
