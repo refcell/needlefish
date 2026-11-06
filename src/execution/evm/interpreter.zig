@@ -178,8 +178,8 @@ pub fn smod(a: u256, b: u256) u256 {
 
 pub fn addmod(a: u256, b: u256, n: u256) u256 {
     if (n == 0) return 0;
-    const sum = @as(u288, a) + b;
-    return uint.div_rem(u288, sum, n).remainder;
+    const sum = @as(u320, a) + b;
+    return uint.div_rem(u320, sum, n).remainder;
 }
 
 pub fn mulmod(a: u256, b: u256, n: u256) u256 {

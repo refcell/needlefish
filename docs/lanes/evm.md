@@ -185,8 +185,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   a stored hash fingerprint compared before the 52-byte key, or fewer lookups per SSTORE.
 - [ ] Performance: `transact` self time is ~10% of the block bench; profile with inlining
   off to find which validation or settlement step dominates.
-- [ ] Performance: re-profile `node: replay` after the analysis cache (nf-node saw keccak
-  13% and the interpreter 9% before it).
+- [x] Performance: re-profiled `node: replay` after the analysis cache. Keccak (~1000
+  samples) is the witness `NodeStore.add` / sparse trie (db/node lanes); `push_frame` left
+  is first-sight analysis (the bench builds a fresh executor per run). EVM-owned: the
+  interpreter loop, `slot_for`, and u256 division (`knuth_step` + `mulmod` ~250 samples).
+  Division now runs on 64-bit limbs with Möller-Granlund 2-by-1 reciprocal steps (was
+  32-bit limbs): new `evm: mulmod+div loop` bench 286 -> 150 us, replay ~723 -> ~752
+  Mgas/s; the uint differential fuzz catches a skipped add-back.
+- [ ] Performance: `reciprocal` still costs one u128 division (`__udivti3`) per DIV/MOD;
+  a table + Newton reciprocal (as in intx) would remove it.
 - [ ] Note for the db lane: the harness's `db.overlay` account map (`AutoContext([20]u8)`,
   `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
   there would help cold account loads.
