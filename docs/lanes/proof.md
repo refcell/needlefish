@@ -158,6 +158,17 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   numbered-header source); e2e proves a 4-block compressed range from the node fixture and
   replays the returned archive offline to the node's root.
 
+- [ ] `proof/primitives`: base/base `crates/proof/primitives`: `PerChainConfig` and its
+  config hash, `ProofJournal` encoding, `proof_encoder` (TEE proof bytes), shared by the
+  enclave, the proposer and the challenger.
+- [ ] `proof/tee-enclave`: base/base `crates/proof/tee/nitro-enclave`: the enclave server that
+  runs the client over a preimage oracle, signs the journal with its secp256k1 key, and
+  answers attestation requests (NSM behind an interface; a deterministic fake in tests).
+- [ ] `proof/tee-nitro-host`: base/base `crates/proof/tee/nitro-host`: host-side backend
+  feeding enclaves preimages, the enclave pool, proof generation and the TEE prover backend.
+- [ ] `proof/tee-registrar`: base/base `crates/proof/tee/registrar`: discovers signers,
+  verifies attestations (`tee/nitro`), plans and submits TEE signer registrations.
+
 ## Decisions
 - Boot pins the schedule ID like base/base, refusing Zenith active by the claim (dropping it
   after), but skips the Everest refusal: our executor is the node's, which runs EIP-8130.
@@ -318,6 +329,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: backlog extended with primitives and the TEE enclave, host and registrar.
 - 2026-11-05: AWS Nitro attestation verifier (CBOR, COSE_Sign1, X.509, P-384, journal ABI).
 - 2026-11-05: ScheduleId pinned at boot (golden value matches base/base).
 - 2026-11-05: host serves l2-account-storage-proof hints via eth_getProof.
