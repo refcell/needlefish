@@ -583,6 +583,7 @@ fn log(comptime topic_count: u8, f: *Frame, evm: *Evm) ?Exit {
     f.gas -= cost;
     const data = f.memory.slice(range.offset, range.size);
     evm.state.log(f.address, topics[0..topic_count], data) catch |err| return evm.fail(err);
+    if (evm.tracer) |tracer| tracer.log(tracer.context, f.address, topics[0..topic_count], data);
     return null;
 }
 
@@ -686,6 +687,7 @@ fn call_creates_account(
 fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     if (f.is_static) return .static_violation;
     const target = primitives.u256_to_address(f.stack.pop());
+    const balance = f.account.info.balance;
     const result = evm.state.self_destruct(fork, f.address, target) catch |err| {
         return evm.fail(err);
     };
@@ -699,7 +701,33 @@ fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
     if (!result.previously_destroyed) f.refund += gas.selfdestruct_refund(fork);
+    if (evm.tracer) |tracer| trace_self_destruct(tracer, f, target, balance);
     return .self_destruct;
+}
+
+/// callTracer reports SELFDESTRUCT as a zero-gas child frame moving the balance.
+fn trace_self_destruct(
+    tracer: *const evm_module.Tracer,
+    f: *Frame,
+    target: primitives.Address,
+    balance: u256,
+) void {
+    tracer.enter(tracer.context, .{
+        .kind = .selfdestruct,
+        .from = f.address,
+        .to = target,
+        .value = balance,
+        .gas = 0,
+        .input = &.{},
+        .depth = f.depth + 1,
+    });
+    tracer.exit(tracer.context, .{
+        .status = .success,
+        .exit = .self_destruct,
+        .gas_remaining = 0,
+        .gas_refund = 0,
+        .output = &.{},
+    });
 }
 
 test "interpreter: arithmetic helpers" {

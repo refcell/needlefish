@@ -145,6 +145,45 @@ pub const Outcome = struct {
 
 const Step = union(enum) { frame, done: Outcome };
 
+/// Call-frame tracing hook (debug_trace* callTracer). Every `enter` is matched by exactly
+/// one `exit` carrying that frame's outcome, in stack order; `log` fires as each LOG runs
+/// (a later revert of the frame is visible from its `exit` status). Null costs one branch
+/// per frame.
+pub const Tracer = struct {
+    context: *anyopaque,
+    enter: *const fn (context: *anyopaque, frame: TraceFrame) void,
+    exit: *const fn (context: *anyopaque, outcome: Outcome) void,
+    log: *const fn (
+        context: *anyopaque,
+        address: Address,
+        topics: []const primitives.B256,
+        data: []const u8,
+    ) void,
+};
+
+pub const TraceKind = enum {
+    call,
+    callcode,
+    delegatecall,
+    staticcall,
+    create,
+    create2,
+    selfdestruct,
+};
+
+pub const TraceFrame = struct {
+    kind: TraceKind,
+    /// The frame's caller (for SELFDESTRUCT, the destroyed contract).
+    from: Address,
+    /// Callee, the address being created, or the SELFDESTRUCT beneficiary.
+    to: Address,
+    value: u256,
+    gas: u64,
+    input: []const u8,
+    /// Call depth of the new frame (0 for the transaction's top frame).
+    depth: u16,
+};
+
 pub const Evm = struct {
     config: env.Config,
     state: *State,
@@ -160,6 +199,7 @@ pub const Evm = struct {
     return_len: u32 = 0,
     pending: Pending = .none,
     fatal_error: ?Error = null,
+    tracer: ?*const Tracer = null,
 
     pub fn init(allocator: std.mem.Allocator, config: env.Config, state: *State) !Evm {
         config.validate();
@@ -224,7 +264,7 @@ pub const Evm = struct {
             evm.arena.release(0);
         }
         var step: Step = switch (message.kind) {
-            .call => try evm.start_call(fork, .{
+            .call => try evm.traced_call(fork, .{
                 .kind = if (message.is_static) .staticcall else .call,
                 .target = message.target,
                 .code_address = try evm.resolve_code_address(fork, message.target),
@@ -232,7 +272,7 @@ pub const Evm = struct {
                 .input = message.input,
                 .gas_limit = message.gas_limit,
             }, null, message.caller),
-            .create => try evm.start_create(fork, .{
+            .create => try evm.traced_create(fork, .{
                 .is_create2 = false,
                 .caller = message.caller,
                 .value = message.value,
@@ -244,6 +284,7 @@ pub const Evm = struct {
         while (true) {
             switch (step) {
                 .done => |outcome| {
+                    if (evm.tracer) |tracer| tracer.exit(tracer.context, outcome);
                     if (evm.frames_len == 0) return outcome;
                     evm.resume_parent(outcome);
                 },
@@ -253,11 +294,58 @@ pub const Evm = struct {
             const exit = interpreter.run(fork, evm, frame);
             step = switch (exit) {
                 .fatal => return evm.fatal_error.?,
-                .call => try evm.start_call(fork, evm.pending.call, frame, frame.address),
-                .create => try evm.start_create(fork, evm.pending.create, frame),
+                .call => try evm.traced_call(fork, evm.pending.call, frame, frame.address),
+                .create => try evm.traced_create(fork, evm.pending.create, frame),
                 else => .{ .done = try evm.finish_frame(fork, exit) },
             };
         }
+    }
+
+    fn traced_call(
+        evm: *Evm,
+        comptime fork: Fork,
+        request: CallRequest,
+        parent: ?*Frame,
+        caller_address: Address,
+    ) Error!Step {
+        if (evm.tracer) |tracer| {
+            tracer.enter(tracer.context, .{
+                .kind = switch (request.kind) {
+                    inline else => |kind| @field(TraceKind, @tagName(kind)),
+                },
+                .from = caller_address,
+                .to = request.target,
+                .value = request.value,
+                .gas = request.gas_limit,
+                .input = request.input,
+                .depth = if (parent) |p| p.depth + 1 else 0,
+            });
+        }
+        return evm.start_call(fork, request, parent, caller_address);
+    }
+
+    fn traced_create(
+        evm: *Evm,
+        comptime fork: Fork,
+        request: CreateRequest,
+        parent: ?*Frame,
+    ) Error!Step {
+        if (evm.tracer) |tracer| {
+            const to = if (request.is_create2)
+                create2_address(request.caller, request.salt, request.init_code)
+            else
+                create_address(request.caller, (try evm.state.load(request.caller)).info.nonce);
+            tracer.enter(tracer.context, .{
+                .kind = if (request.is_create2) .create2 else .create,
+                .from = request.caller,
+                .to = to,
+                .value = request.value,
+                .gas = request.gas_limit,
+                .input = request.init_code,
+                .depth = if (parent) |p| p.depth + 1 else 0,
+            });
+        }
+        return evm.start_create(fork, request, parent);
     }
 
     /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code.

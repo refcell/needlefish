@@ -147,9 +147,14 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   53715983-53715992: 253/253. With nf-replay's return-data fix (`a1fe2ae3`) reverted it
   flags 8+ transactions, starting at 53715983 tx 3. `call_fuzz.zig` now also checks that a
   callee sees RETURNDATASIZE 0 after an earlier call (it missed that bug before).
-- [ ] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const Tracer` with
-  enter(kind, from, to, value, gas, input) / exit(gas_used, output, status) / log; null is
-  zero cost.
+- [x] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const evm.Tracer`
+  (null: one branch per frame). `enter(TraceFrame{kind: call|callcode|delegatecall|
+  staticcall|create|create2|selfdestruct, from, to, value, gas, input, depth})` is matched by
+  exactly one `exit(Outcome)` in stack order (gas used = frame gas - `gas_remaining`; `exit`
+  is the halt reason; `created` set for creates; `to` of a create is the derived address
+  even when it collides); `log(address, topics, data)` fires as each LOG runs. SELFDESTRUCT
+  is a zero-gas child moving the balance. Precompile calls and depth/balance failures also
+  get enter/exit.
 - [ ] Fuzz: SSTORE gas and refund state machine (EIP-2200/2929/3529: original, current,
   new values; warm/cold; stipend check) against a table-driven reference model.
 - [ ] Fuzz: CREATE/CREATE2 address derivation, init-code limits (EIP-3860), collision

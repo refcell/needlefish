@@ -419,3 +419,84 @@ test "transaction: precompiles are warm by predicate, without loading, for one t
     try std.testing.expect(!h.state.is_warm(ecrecover));
     try std.testing.expect((try h.state.access(ecrecover)).is_cold);
 }
+
+const TraceRecorder = struct {
+    events: [16][]const u8 = undefined,
+    frames: [8]evm_module.TraceFrame = undefined,
+    outcomes: [8]evm_module.Outcome = undefined,
+    events_len: u32 = 0,
+    frames_len: u32 = 0,
+    outcomes_len: u32 = 0,
+
+    fn push(recorder: *TraceRecorder, event: []const u8) void {
+        std.debug.assert(recorder.events_len < recorder.events.len);
+        recorder.events[recorder.events_len] = event;
+        recorder.events_len += 1;
+    }
+
+    fn enter(context: *anyopaque, frame: evm_module.TraceFrame) void {
+        const recorder: *TraceRecorder = @ptrCast(@alignCast(context));
+        recorder.push(@tagName(frame.kind));
+        recorder.frames[recorder.frames_len] = frame;
+        recorder.frames_len += 1;
+    }
+
+    fn exit(context: *anyopaque, outcome: evm_module.Outcome) void {
+        const recorder: *TraceRecorder = @ptrCast(@alignCast(context));
+        recorder.push("exit");
+        recorder.outcomes[recorder.outcomes_len] = outcome;
+        recorder.outcomes_len += 1;
+    }
+
+    fn log(context: *anyopaque, _: Address, _: []const primitives.B256, _: []const u8) void {
+        const recorder: *TraceRecorder = @ptrCast(@alignCast(context));
+        recorder.push("log");
+    }
+};
+
+test "evm: tracer sees nested calls, logs, selfdestruct, and create in order" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const a = primitives.address_from_int(0xaa);
+    const b = primitives.address_from_int(0xbb);
+    const beneficiary = primitives.address_from_int(0xbe);
+    // A: CALL(gas, B, 0, 0, 0, 0, 0); POP; CREATE(0, 0, 0); POP; STOP.
+    const code_a = [_]u8{
+        op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, // CALL args.
+        op.PUSH1, 0xbb, op.GAS, op.CALL, op.POP, // CALL B.
+        op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.CREATE, op.POP, op.STOP, // CREATE.
+    };
+    // B: LOG0(0, 0); SELFDESTRUCT(0xbe).
+    const code_b = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.LOG0, op.PUSH1, 0xbe, op.SELFDESTRUCT };
+    try h.database.put_account(a, 0, 1, &code_a);
+    try h.database.put_account(b, 5, 1, &code_b);
+    h.state.reset(h.database.interface());
+    var recorder = TraceRecorder{};
+    const tracer = evm_module.Tracer{
+        .context = &recorder,
+        .enter = TraceRecorder.enter,
+        .exit = TraceRecorder.exit,
+        .log = TraceRecorder.log,
+    };
+    h.evm.tracer = &tracer;
+    defer h.evm.tracer = null;
+    const outcome = try h.call(.osaka, a, &.{}, 1_000_000);
+    try std.testing.expectEqual(evm_module.Status.success, outcome.status);
+    const expected = [_][]const u8{
+        "call", "call", "log", "selfdestruct", "exit", "exit", "create", "exit", "exit",
+    };
+    try std.testing.expectEqual(@as(u32, expected.len), recorder.events_len);
+    for (expected, recorder.events[0..expected.len]) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+    try std.testing.expectEqual(@as(u16, 1), recorder.frames[1].depth);
+    try std.testing.expectEqualSlices(u8, &b, &recorder.frames[1].to);
+    try std.testing.expectEqualSlices(u8, &beneficiary, &recorder.frames[2].to);
+    try std.testing.expectEqual(@as(u256, 5), recorder.frames[2].value);
+    const created = evm_module.create_address(a, 1);
+    try std.testing.expectEqualSlices(u8, &created, &recorder.frames[3].to);
+    try std.testing.expectEqualSlices(u8, &created, &recorder.outcomes[2].created.?);
+    // The top frame's exit comes last and reports the transaction's outcome.
+    try std.testing.expectEqual(outcome.gas_remaining, recorder.outcomes[3].gas_remaining);
+}
