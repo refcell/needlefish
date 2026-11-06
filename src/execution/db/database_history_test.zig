@@ -247,6 +247,74 @@ const Harness = struct {
         try self.open();
     }
 
+    /// `reopen` with the snapshot and history rebuild done by `load_mode`.
+    fn reopen_with(self: *Harness, config: database.Config, mode: database.LoadMode) !void {
+        self.db.deinit(testing.allocator);
+        self.db = try Database.init(testing.allocator, &self.sim, config);
+        self.db.load_mode = mode;
+        self.overlay.discard();
+        self.overlay.base = &self.db.state;
+        try self.open();
+    }
+
+    /// Everything a load path could change, as one digest: the head, the state root, every
+    /// account and `has_storage`, the history window and usage, and the proofs of every
+    /// address at every block of the window.
+    fn reopen_digest(self: *Harness) !u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        const head = self.db.head_info;
+        hasher.update(&head.hash);
+        hasher.update(&head.state_root);
+        hasher.update(&try self.db.state.state_root());
+        for (0..addresses_max) |index| {
+            const address = address_of(index);
+            hasher.update(&.{@intFromBool(self.db.state.has_storage(address))});
+            const entry = self.db.state.account(address) orelse continue;
+            hasher.update(std.mem.asBytes(&entry.info.nonce));
+            hasher.update(std.mem.asBytes(&entry.info.balance));
+            hasher.update(std.mem.asBytes(&entry.storage_slots));
+        }
+        const store = if (self.db.history) |*store| store else return hasher.final();
+        hasher.update(&.{@intFromBool(self.db.history_off)});
+        const window = store.window() orelse return hasher.final();
+        const usage = store.usage();
+        const fields = [_]u64{
+            window.oldest,        window.head,       usage.paths, usage.small_versions,
+            usage.large_versions, usage.prune_queue, usage.bytes,
+        };
+        hasher.update(std.mem.sliceAsBytes(&fields));
+        var number = window.oldest;
+        while (number <= window.head) : (number += 1) {
+            hasher.update(std.mem.asBytes(&try self.proof_digest_all(number)));
+        }
+        return hasher.final();
+    }
+
+    /// `proof_digest` over every address.
+    fn proof_digest_all(self: *Harness, number: u64) !u64 {
+        const proofs = self.proofs;
+        var hasher = std.hash.Wyhash.init(number);
+        for (0..addresses_max) |index| {
+            const account = try self.db.proof_at(
+                number,
+                address_of(index),
+                &all_slots,
+                &proofs.account,
+                &proofs.storage,
+                &proofs.values,
+            );
+            hasher.update(&.{@intFromBool(account != null)});
+            for (0..proofs.account.count) |node| {
+                hasher.update(proofs.account.node_at(@intCast(node)));
+            }
+            for (&proofs.storage, &proofs.values) |*proof, value| {
+                for (0..proof.count) |node| hasher.update(proof.node_at(@intCast(node)));
+                hasher.update(std.mem.asBytes(&value));
+            }
+        }
+        return hasher.final();
+    }
+
     fn root_of(self: *const Harness, hash: Hash) Hash {
         for (self.roots[0..self.roots_len]) |entry| {
             if (std.mem.eql(u8, &entry.hash, &hash)) return entry.root;
@@ -699,4 +767,50 @@ test "database history: a byte budget shrinks the window, also when rebuilt on o
     // Shrinking is not a drop: history was never discarded.
     try testing.expectEqual(@as(u64, 0), h.db.history_drops);
     try testing.expect(!h.db.history_off);
+}
+
+/// Crashes at random points of a seeded workload and reopens the same storage three times:
+/// with the incremental (reference) load path, then the bulk path, then the bulk path on
+/// rehash threads. All three must recover identical state, window, usage, and proofs.
+fn run_load_differential(seed: u64, config: database.Config) !void {
+    const h = try Harness.create(seed, config);
+    defer h.destroy();
+    try h.format();
+    var cycle: u32 = 0;
+    while (cycle < 3) : (cycle += 1) {
+        for (0..h.prng.range(4, 30)) |_| try h.step();
+        try h.crash_and_reopen();
+        try h.reopen_with(config, .incremental);
+        const expected = try h.reopen_digest();
+        try h.reopen_with(config, .bulk);
+        try testing.expectEqual(expected, try h.reopen_digest());
+        var threaded = config;
+        threaded.state.rehash_threads = 2;
+        try h.reopen_with(threaded, .bulk);
+        try testing.expectEqual(expected, try h.reopen_digest());
+        try h.reopen_with(config, .bulk);
+    }
+}
+
+test "database history: bulk and incremental reopen recover the same state and history" {
+    const budget = blk: {
+        var config = base_config;
+        config.history.?.bytes_max = 52 * 1024;
+        break :blk config;
+    };
+    const no_history = blk: {
+        var config = base_config;
+        config.history = null;
+        break :blk config;
+    };
+    const configs = [_]database.Config{ base_config, budget, no_history };
+    for (configs, 0..) |config, index| {
+        for (0..2) |seed| {
+            const seed_full = 0x10ad_0000 + 16 * index + seed;
+            run_load_differential(seed_full, config) catch |err| {
+                std.debug.print("load differential: failing seed={d}\n", .{seed_full});
+                return err;
+            };
+        }
+    }
 }

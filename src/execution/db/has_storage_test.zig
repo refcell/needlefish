@@ -194,7 +194,8 @@ const Harness = struct {
         self.replica.deinit(testing.allocator);
         self.replica = try State.init(testing.allocator, state_config);
         var source: snapshot.BufferSource = .{ .buffer = self.buffer[0..sink.position] };
-        try snapshot.load(&self.replica, &source);
+        // The snapshot bytes are the bulk build's scratch, as in `Database` open.
+        try snapshot.load(&self.replica, &source, self.buffer[0..sink.position]);
         try testing.expectEqual(sink.position, source.position);
     }
 

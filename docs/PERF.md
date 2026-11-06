@@ -696,6 +696,64 @@ node, one keccak per distinct node). A real block also pays the interpreter (the
 evm block in "db witness" above). End to end through HTTP adds the socket send of 3.2 MB
 (not measured here; the large send buffer is filled by the same write).
 
+## 2026-11-06 db node restart (`Database.open`) (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/restart"` (`db/restart_bench.zig`; only runs
+when the filter names "restart"; ~20 min). Each case builds a database once (bench fill
+blocks, then 300 typical blocks of 1k account + 1k slot writes, journal and checkpoints as
+the node), drains it, then reopens it 3 times per variant and reports the median per step
+(`Database.open_trace`, wall and caller-thread CPU). History on = the node's history
+config: window 300, `bytes_max` 1 GiB, 1k versions per block. Shapes: 100k = 100k accounts,
+1k contracts x 64 slots (head 340); 1m = 1M accounts, 10k contracts x 64 slots (head 365).
+Os = `IoStorage` over kqueue on a scratch file (1m: under 2 GiB, deleted after). Variants:
+`incremental` = the old load path (snapshot decoded key by key into the tries, history
+window unwound through the trie; kept as the reference), `bulk` = the new path, `bulk 4
+threads` = bulk with `rehash_threads = 4`. The machine was loaded (load average 15-45):
+one run of 3 opens each, compare variants within a case.
+
+| Case, ms (median) | open | ckpt read | snapshot tables | snapshot trie | snapshot root | replay | hist unwind | hist trie | hist reset | hist apply |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100k sim, incremental | 299 | 83 | 90 | - | 47 | 73 | | | | |
+| 100k sim, bulk | 261 | 81 | 7.6 | 70 | 28 | 65 | | | | |
+| 100k sim, bulk 4 threads | 230 | 83 | 8.5 | 71 | 0.4 | 61 | | | | |
+| 100k os, incremental | 540 | 245 | 105 | - | 57 | 124 | | | | |
+| 100k os, bulk | 440 | 258 | 8.3 | 65 | 28 | 85 | | | | |
+| 100k os, bulk 4 threads | 381 | 217 | 8.9 | 75 | 0.8 | 77 | | | | |
+| 100k sim history, incremental | 3231 | 82 | 93 | - | 49 | 68 | 601 | - | 78 | 2232 |
+| 100k sim history, bulk | 2666 | 82 | 7.5 | 78 | 28 | 63 | 58 | 67 | 70 | 2185 |
+| 100k os history, incremental | 3435 | 147 | 93 | - | 49 | 86 | 640 | - | 78 | 2291 |
+| 100k os history, bulk | 2792 | 124 | 8.6 | 67 | 29 | 70 | 60 | 68 | 76 | 2260 |
+| 100k os history, bulk 4 threads | 2614 | 131 | 8.4 | 72 | 0.4 | 75 | 61 | 67 | 45 | 2137 |
+| 1m sim, incremental | 2957 | 185 | 2278 | - | 364 | 123 | | | | |
+| 1m sim, bulk | 1408 | 180 | 80 | 773 | 273 | 96 | | | | |
+| 1m sim, bulk 4 threads | 1073 | 183 | 80 | 705 | 6.9 | 88 | | | | |
+| 1m sim history, incremental | 9536 | 189 | 2411 | - | 363 | 112 | 1280 | - | 805 | 4322 |
+| 1m sim history, bulk | 7503 | 183 | 89 | 778 | 281 | 105 | 71 | 785 | 842 | 4296 |
+| 1m os history, incremental | 9752 | 399 | 2447 | - | 386 | 150 | 1246 | - | 778 | 4216 |
+| 1m os history, bulk | 7186 | 366 | 78 | 769 | 285 | 107 | 73 | 789 | 881 | 3974 |
+| 1m os history, bulk 4 threads | 5811 | 241 | 74 | 714 | 6.9 | 93 | 68 | 696 | 455 | 3478 |
+
+`blocks` (retained blocks into the chain index) is 5-9 ms everywhere and left out. The
+trie build alone (`db/restart trie`, `State.rebuild_trie` + root on a filled state, fastest
+of 5): 100k 64 + 28 ms; 1m 714 + 266 ms; 1m with 4 threads 706 ms including the root.
+Earlier bulk builds measured the parts at 1m: sorting the slot records by address with one
+pdq 340 ms and the 1M address hashes 370 ms (cache misses on 32-84 byte elements); an
+in-place 256-bucket pass (American flag) and a pdq per bucket brought them to 67 and 42 ms,
+and carrying each account's map entry pointer to the account-trie build saved the lookups
+(finish 290 -> 220 ms).
+
+Reading: snapshot decode + trie build drops from 2.3-2.4 s to 0.85 s at 1m (2.8x, 1.1 s
+with the root) and from 90 to 78 ms at 100k; the root step goes to ~0 with rehash threads
+(the account trie is hashed on the pool in subtries two levels down). History unwind is now
+table-only plus one bulk trie rebuild: 600-1280 ms -> 58-73 ms + 67-785 ms. With history
+on, open is now dominated by `history_apply` (re-applying the window with `commit_block`:
+~7.3 ms per typical block at 100k, ~14 ms at 1m); at 1m the 1 GiB budget keeps only the
+last 86 blocks (window from 280), so ~214 of the 300 re-applied blocks are pruned again
+(see the lane's limitations). The checkpoint read (80-190 ms CPU) is the AEGIS checksum of
+the image. Before this change (incremental, same binary; the old code was identical to it
+except for a shared branch-encode copy fast path) 100k: 299-540 ms open without history,
+3.2-3.4 s with; 1m: 3.0 s without, 9.5-9.8 s with.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

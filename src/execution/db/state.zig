@@ -84,6 +84,133 @@ fn hash_slots(changes: []const StorageChange, out: []Hash) void {
     hash_keys(32, keys[0..changes.len], out);
 }
 
+/// A slot in `State.build_trie`'s scratch; grouped by address, each group by slot hash.
+const SlotRecord = extern struct {
+    address: Address,
+    slot_hash: Hash,
+    value: [32]u8,
+
+    comptime {
+        assert(@sizeOf(SlotRecord) == 84 and @alignOf(SlotRecord) == 1);
+    }
+
+    /// Address, then slot hash.
+    fn less_than(_: void, a: SlotRecord, b: SlotRecord) bool {
+        const a_high = std.mem.readInt(u64, a.address[0..8], .big);
+        const b_high = std.mem.readInt(u64, b.address[0..8], .big);
+        if (a_high != b_high) return a_high < b_high;
+        switch (std.mem.order(u8, a.address[8..], b.address[8..])) {
+            .lt => return true,
+            .gt => return false,
+            .eq => return hash_less_than({}, a.slot_hash, b.slot_hash),
+        }
+    }
+
+    /// Groups records by address (not in address order): a byte of the address's hash.
+    fn bucket(record: *align(1) const SlotRecord) u8 {
+        return @truncate(std.hash.Wyhash.hash(0, &record.address) >> 56);
+    }
+
+    /// One account's run, as a `TrieType.build_sorted` source.
+    const Source = struct {
+        records: []align(1) const SlotRecord,
+
+        pub fn key(source: *const Source, index: u32) *const Hash {
+            return &source.records[index].slot_hash;
+        }
+
+        pub fn value(source: *const Source, index: u32, buffer: *[33]u8) []const u8 {
+            const word = std.mem.readInt(u256, &source.records[index].value, .big);
+            return trie.state_trie.encode_storage_value(word, buffer);
+        }
+    };
+};
+
+/// Byte order of two hashes (the first word decides all but about 2^-64 of pairs).
+fn hash_less_than(_: void, a: Hash, b: Hash) bool {
+    const a_high = std.mem.readInt(u64, a[0..8], .big);
+    const b_high = std.mem.readInt(u64, b[0..8], .big);
+    if (a_high != b_high) return a_high < b_high;
+    return std.mem.order(u8, a[8..], b[8..]) == .lt;
+}
+
+const BulkAccount = trie.state_trie.StateTrie.BulkAccount;
+
+comptime {
+    // A snapshot spends 92 bytes per account: its bytes are always enough scratch.
+    assert(@sizeOf(BulkAccount) <= 20 + 8 + 32 + 32);
+}
+
+fn account_less_than(_: void, a: BulkAccount, b: BulkAccount) bool {
+    return hash_less_than({}, a.address_hash, b.address_hash);
+}
+
+/// The hash's first byte: buckets in byte order, so bucketed and sorted is sorted.
+fn account_bucket(account: *align(1) const BulkAccount) u8 {
+    return account.address_hash[0];
+}
+
+/// Sorts `items` in place: one in-place counting pass into 256 buckets by `bucket_of`
+/// (American flag sort), then each bucket by `less_than`. Equal items share a bucket, so
+/// equal keys end up adjacent; the result is sorted when `bucket_of` is monotonic with
+/// `less_than`. Each small bucket sorts in cache, where one large pdq over 1M 32-byte keys
+/// spent most of its time on cache misses.
+fn sort_bucketed(
+    comptime T: type,
+    items: []align(1) T,
+    comptime bucket_of: fn (*align(1) const T) u8,
+    comptime less_than: fn (void, T, T) bool,
+) void {
+    var counts: [256]usize = @splat(0);
+    for (items) |*item| counts[bucket_of(item)] += 1;
+    var next: [256]usize = undefined;
+    var ends: [256]usize = undefined;
+    var offset: usize = 0;
+    for (&next, &ends, counts) |*bucket_next, *bucket_end, count| {
+        bucket_next.* = offset;
+        offset += count;
+        bucket_end.* = offset;
+    }
+    assert(offset == items.len);
+    // Every swap puts one item into its bucket for good: at most `items.len` swaps.
+    var swaps: usize = 0;
+    for (0..256) |bucket| {
+        while (next[bucket] < ends[bucket]) {
+            const target = bucket_of(&items[next[bucket]]);
+            if (target == bucket) {
+                next[bucket] += 1;
+                continue;
+            }
+            assert(swaps < items.len);
+            swaps += 1;
+            const moved = items[next[target]];
+            items[next[target]] = items[next[bucket]];
+            items[next[bucket]] = moved;
+            next[target] += 1;
+        }
+    }
+    // `items` may be unaligned (scratch bytes): sort through indices.
+    const Context = struct {
+        items: []align(1) T,
+
+        pub fn lessThan(context: @This(), a: usize, b: usize) bool {
+            return less_than({}, context.items[a], context.items[b]);
+        }
+
+        pub fn swap(context: @This(), a: usize, b: usize) void {
+            const item = context.items[a];
+            context.items[a] = context.items[b];
+            context.items[b] = item;
+        }
+    };
+    var start: usize = 0;
+    for (ends) |end| {
+        std.sort.pdqContext(start, end, Context{ .items = items });
+        start = end;
+    }
+    assert(start == items.len);
+}
+
 fn trie_account(info: AccountInfo) trie.Account {
     return .{ .nonce = info.nonce, .balance = info.balance, .code_hash = info.code_hash };
 }
@@ -116,6 +243,8 @@ pub const State = struct {
     }),
     state_trie: trie.StateTrie,
     config: Config,
+    /// The tables moved without the trie (`unwind_tables`) until `rebuild_trie`.
+    trie_stale: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !State {
         var account_table: std.AutoHashMapUnmanaged(Address, AccountEntry) = .empty;
@@ -214,6 +343,7 @@ pub const State = struct {
     }
 
     pub fn state_root(self: *State) Error!Hash {
+        assert(!self.trie_stale);
         return self.state_trie.root();
     }
 
@@ -266,6 +396,155 @@ pub const State = struct {
         assert(entry.storage_slots <= self.storage_table.count());
     }
 
+    /// Scratch bytes `build_trie` needs: one 84-byte slot record per slot and one 40-byte
+    /// `BulkAccount` per account. Never more than the snapshot of the same tables.
+    pub fn build_trie_scratch_bytes(self: *const State) u64 {
+        return @as(u64, self.storage_table.count()) * @sizeOf(SlotRecord) +
+            @as(u64, self.account_table.count()) * @sizeOf(BulkAccount);
+    }
+
+    /// Builds the state trie of the flat tables (snapshot load) in bulk: every key hashed in
+    /// SIMD batches, the slots grouped by account and sorted by slot hash and each storage
+    /// trie built from them in one pass, hashed together (on the rehash pool when
+    /// configured), then the account trie built from the sorted address hashes and hashed
+    /// (`StateTrie.bulk_*`). Same tries and root as `put_account` / `put_storage` of every
+    /// entry. `scratch` holds the sorted keys (`build_trie_scratch_bytes`). On error the
+    /// state must be discarded.
+    pub fn build_trie(self: *State, scratch: []u8) Error!void {
+        assert(!self.trie_stale);
+        assert(self.state_trie.account_count() == 0);
+        assert(scratch.len >= self.build_trie_scratch_bytes());
+        const slot_bytes = @as(usize, self.storage_table.count()) * @sizeOf(SlotRecord);
+        const account_bytes = @as(usize, self.account_table.count()) * @sizeOf(BulkAccount);
+        const records = std.mem.bytesAsSlice(SlotRecord, scratch[0..slot_bytes]);
+        const accounts = std.mem.bytesAsSlice(BulkAccount, scratch[slot_bytes..][0..account_bytes]);
+        try self.build_accounts(accounts);
+        self.fill_slot_records(records);
+        sort_bucketed(SlotRecord, records, SlotRecord.bucket, SlotRecord.less_than);
+        try self.build_storage(records);
+        sort_bucketed(BulkAccount, accounts, account_bucket, account_less_than);
+        try self.state_trie.bulk_finish(accounts);
+        assert(self.state_trie.account_count() == self.account_table.count());
+    }
+
+    /// `build_trie_scratch_bytes` at full tables: enough scratch for any `rebuild_trie`.
+    pub fn build_trie_scratch_bytes_max(config: Config) u64 {
+        return @as(u64, config.storage_slots_max) * @sizeOf(SlotRecord) +
+            @as(u64, config.accounts_max) * @sizeOf(BulkAccount);
+    }
+
+    /// Drops the state trie and builds it again from the flat tables (`build_trie`), after
+    /// `unwind_tables`: one O(state) bulk build instead of a trie update per unwound entry.
+    pub fn rebuild_trie(self: *State, scratch: []u8) Error!void {
+        assert(scratch.len >= self.build_trie_scratch_bytes());
+        self.state_trie.clear();
+        self.trie_stale = false;
+        try self.build_trie(scratch);
+        assert(self.state_trie.account_count() == self.account_table.count());
+    }
+
+    /// Reverts a block in the flat tables only, leaving the trie stale until `rebuild_trie`
+    /// (no reads of the root, applies, or unwinds in between). Same tables as `unwind`.
+    /// Fails before any change if the tables could overflow.
+    pub fn unwind_tables(self: *State, changeset: *const Changeset) Error!void {
+        const accounts = changeset.account_changes();
+        if (self.account_table.count() + accounts.len > self.config.accounts_max) {
+            return error.StateFull;
+        }
+        if (self.storage_table.count() + changeset.storage_len > self.config.storage_slots_max) {
+            return error.StateFull;
+        }
+        self.trie_stale = true;
+        // The order of `apply_direction`: accounts that exist afterwards, storage, removals.
+        for (accounts) |*change| {
+            const info = change.old orelse continue;
+            const result = self.account_table.getOrPutAssumeCapacity(change.address);
+            if (!result.found_existing) result.value_ptr.* = .{ .info = info };
+            result.value_ptr.info = info;
+        }
+        for (changeset.storage_changes()) |*change| {
+            const entry = self.account_table.getPtr(change.address) orelse {
+                return error.UnknownAccount;
+            };
+            const key: SlotKey = .{ .address = change.address, .slot = change.slot };
+            self.set_slot(entry, key, change.old);
+        }
+        for (accounts) |*change| {
+            if (change.old != null) continue;
+            const removed = self.account_table.fetchRemove(change.address);
+            if (removed) |entry| assert(entry.value.storage_slots == 0);
+        }
+        assert(self.trie_stale);
+    }
+
+    /// Adds every account to the trie (no storage yet), listing each in `accounts`.
+    fn build_accounts(self: *State, accounts: []align(1) BulkAccount) Error!void {
+        assert(accounts.len == self.account_table.count());
+        var iterator = self.account_table.iterator();
+        var keys: [keccak.batch_width]Address = undefined;
+        var infos: [keccak.batch_width]trie.Account = undefined;
+        var done: usize = 0;
+        while (done < accounts.len) {
+            const chunk = @min(keccak.batch_width, accounts.len - done);
+            for (keys[0..chunk], infos[0..chunk]) |*key, *trie_entry| {
+                // `chunk` entries remain: the table holds `accounts.len`.
+                const entry = iterator.next() orelse unreachable;
+                key.* = entry.key_ptr.*;
+                trie_entry.* = trie_account(entry.value_ptr.info);
+            }
+            var out: [keccak.batch_width]Hash = undefined;
+            hash_keys(20, keys[0..chunk], out[0..chunk]);
+            for (out[0..chunk], infos[0..chunk], 0..) |address_hash, trie_entry, index| {
+                const added = try self.state_trie.bulk_add_account(address_hash, trie_entry);
+                accounts[done + index] = added;
+            }
+            done += chunk;
+        }
+        assert(iterator.next() == null);
+    }
+
+    /// One record per slot: address, keccak256(slot), and value (big-endian).
+    fn fill_slot_records(self: *const State, records: []align(1) SlotRecord) void {
+        assert(records.len == self.storage_table.count());
+        var iterator = self.storage_table.iterator();
+        var keys: [keccak.batch_width][32]u8 = undefined;
+        var done: usize = 0;
+        while (done < records.len) {
+            const chunk = @min(keccak.batch_width, records.len - done);
+            for (keys[0..chunk], records[done..][0..chunk]) |*key, *record| {
+                // `chunk` entries remain: the table holds `records.len`.
+                const entry = iterator.next() orelse unreachable;
+                std.mem.writeInt(u256, key, entry.key_ptr.slot, .big);
+                record.address = entry.key_ptr.address;
+                std.mem.writeInt(u256, &record.value, entry.value_ptr.*, .big);
+            }
+            var out: [keccak.batch_width]Hash = undefined;
+            hash_keys(32, keys[0..chunk], out[0..chunk]);
+            for (records[done..][0..chunk], out[0..chunk]) |*record, slot_hash| {
+                record.slot_hash = slot_hash;
+            }
+            done += chunk;
+        }
+        assert(iterator.next() == null);
+    }
+
+    /// Builds each account's storage trie from its run of the grouped records.
+    fn build_storage(self: *State, records: []align(1) const SlotRecord) Error!void {
+        var start: usize = 0;
+        while (start < records.len) {
+            const address = &records[start].address;
+            var end = start + 1;
+            while (end < records.len and std.mem.eql(u8, &records[end].address, address)) {
+                end += 1;
+            }
+            const source: SlotRecord.Source = .{ .records = records[start..end] };
+            const count: u32 = @intCast(end - start);
+            try self.state_trie.bulk_storage(node.keccak256(address), &source, count);
+            start = end;
+        }
+        assert(start == records.len);
+    }
+
     /// Applies a block forward.
     pub fn apply(self: *State, changeset: *const Changeset) Error!void {
         try self.apply_direction(changeset, true);
@@ -297,6 +576,7 @@ pub const State = struct {
     /// Order matters: accounts that exist afterwards first, then storage (its account still
     /// exists in the trie), then removed accounts.
     fn apply_direction(self: *State, changeset: *const Changeset, forward: bool) Error!void {
+        assert(!self.trie_stale);
         try self.check_capacity(changeset);
         const accounts = changeset.account_changes();
         var address_hashes: [keccak.batch_width]Hash = undefined;

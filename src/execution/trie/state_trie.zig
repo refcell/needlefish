@@ -21,7 +21,7 @@ const Hash = node.Hash;
 pub const account_rlp_bytes_max = 2 + 9 + 33 + 33 + 33;
 const AccountTrie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 112 });
 const StorageTrie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 33 });
-const RehashPool = rehash_pool.RehashPoolType(StorageTrie);
+const RehashPool = rehash_pool.RehashPool;
 
 /// Upper bound on `Config.rehash_threads`.
 pub const rehash_threads_max = rehash_pool.threads_max;
@@ -100,6 +100,8 @@ pub const StateTrie = struct {
     /// Workers for the parallel storage rehash; null when `rehash_threads` is zero.
     rehash_pool: ?*RehashPool,
     rehash_parallel_nodes_min: u32,
+    /// Bulk load: storage tries built but not hashed yet (their roots in `storage_roots`).
+    bulk_roots_len: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !StateTrie {
         assert(config.accounts_max > 0);
@@ -287,7 +289,12 @@ pub const StateTrie = struct {
             count += 1;
         }
         assert(count <= dirty.len);
-        const roots = self.storage_roots[0..count];
+        self.hash_storage_roots(self.storage_roots[0..count]);
+    }
+
+    /// Rehashes the storage tries `roots` together, on the pool when there is one.
+    fn hash_storage_roots(self: *StateTrie, roots: []const StorageTrie.NodeIndex) void {
+        assert(roots.len <= self.storage_roots.len);
         if (self.rehash_pool) |pool| {
             self.update_storage_caches_parallel(pool, roots);
         } else {
@@ -359,6 +366,127 @@ pub const StateTrie = struct {
             try self.accounts.put(&address_hash, encoded);
         }
         self.dirty_len = 0;
+    }
+
+    /// Removes every account and slot; pools and buffers are kept.
+    pub fn clear(self: *StateTrie) void {
+        self.accounts.clear();
+        self.storage.clear();
+        self.entries.clearRetainingCapacity();
+        self.dirty_len = 0;
+        self.bulk_roots_len = 0;
+        assert(self.accounts.root == AccountTrie.none and self.entries.count() == 0);
+    }
+
+    // Bulk load (`db.State.build_trie`): `bulk_add_account` every account of an empty trie,
+    // `bulk_storage` each account's sorted slots, then `bulk_finish` with the sorted address
+    // hashes. Each trie is built from sorted keys (`TrieType.build_sorted`); nothing goes
+    // through the dirty list. The result equals `set_account` / `set_storage` of every entry.
+
+    /// An account added by `bulk_add_account`, as `bulk_finish` takes them. The entry
+    /// pointer stays valid through the bulk load: the entries map never grows (its capacity
+    /// is reserved at init) and nothing is removed.
+    pub const BulkAccount = extern struct {
+        address_hash: Hash,
+        entry: *Entry,
+    };
+
+    /// Adds an account to a trie under bulk load without marking it dirty.
+    pub fn bulk_add_account(
+        self: *StateTrie,
+        address_hash: Hash,
+        account: Account,
+    ) Error!BulkAccount {
+        assert(self.accounts.root == AccountTrie.none);
+        assert(self.dirty_len == 0);
+        if (self.entries.count() == self.accounts_max) return error.AccountsFull;
+        const result = self.entries.getOrPutAssumeCapacity(address_hash);
+        assert(!result.found_existing);
+        result.value_ptr.* = .{
+            .account = account,
+            .storage_root = StorageTrie.none,
+            .dirty = false,
+        };
+        return .{ .address_hash = address_hash, .entry = result.value_ptr };
+    }
+
+    /// Builds the storage trie of a `bulk_add_account` account from `count` sorted slots:
+    /// `source.key(i)` is the slot hash, `source.value(i, buffer)` its `encode_storage_value`.
+    /// Built tries are hashed `storage_roots.len` at a time (on the rehash pool if any).
+    pub fn bulk_storage(
+        self: *StateTrie,
+        address_hash: Hash,
+        source: anytype,
+        count: u32,
+    ) Error!void {
+        assert(self.accounts.root == AccountTrie.none);
+        assert(count > 0);
+        const entry = self.entries.getPtr(address_hash) orelse return error.UnknownAccount;
+        assert(entry.storage_root == StorageTrie.none);
+        try self.storage.build_sorted(&entry.storage_root, source, count);
+        assert(entry.storage_root != StorageTrie.none);
+        if (self.bulk_roots_len == self.storage_roots.len) self.bulk_hash_storage();
+        self.storage_roots[self.bulk_roots_len] = entry.storage_root;
+        self.bulk_roots_len += 1;
+    }
+
+    fn bulk_hash_storage(self: *StateTrie) void {
+        assert(self.bulk_roots_len <= self.storage_roots.len);
+        self.hash_storage_roots(self.storage_roots[0..self.bulk_roots_len]);
+        self.bulk_roots_len = 0;
+    }
+
+    /// Hashes the remaining storage tries and builds the account trie from every added
+    /// account (`accounts`, exactly those `bulk_add_account` returned, sorted by hash).
+    pub fn bulk_finish(self: *StateTrie, accounts: []align(1) const BulkAccount) Error!void {
+        assert(self.accounts.root == AccountTrie.none);
+        assert(accounts.len == self.entries.count());
+        self.bulk_hash_storage();
+        const BulkAccounts = struct {
+            state: *StateTrie,
+            accounts: []align(1) const BulkAccount,
+
+            pub fn key(bulk: *const @This(), index: u32) *const Hash {
+                return &bulk.accounts[index].address_hash;
+            }
+
+            pub fn value(bulk: *const @This(), index: u32, buffer: []u8) []const u8 {
+                const entry = bulk.accounts[index].entry;
+                const root_hash = bulk.state.storage.root_hash_of(entry.storage_root);
+                return encode_account(&entry.account, &root_hash, buffer);
+            }
+        };
+        const source: BulkAccounts = .{ .state = self, .accounts = accounts };
+        const count: u32 = @intCast(accounts.len);
+        try self.accounts.build_sorted(&self.accounts.root, &source, count);
+        assert(self.dirty_len == 0 and self.bulk_roots_len == 0);
+        if (self.rehash_pool) |pool| {
+            if (count > 0) self.bulk_hash_accounts(pool);
+        }
+    }
+
+    /// After a bulk build every account-trie node is dirty: hashes the subtries two levels
+    /// down on the pool (chunks of whole subtries, as for storage tries), then the top
+    /// levels on the caller. Bit-identical to `root` hashing it all serially.
+    fn bulk_hash_accounts(self: *StateTrie, pool: *RehashPool) void {
+        assert(self.accounts.root != AccountTrie.none);
+        var subtries: [AccountTrie.subtries_max]AccountTrie.NodeIndex = undefined;
+        const count = self.accounts.subtries(self.accounts.root, &subtries);
+        if (count > self.storage_root_ends.len) return; // Too few ends: `root` hashes it.
+        const ends = self.storage_root_ends[0..count];
+        const total = self.accounts.collect_dirty_split(subtries[0..count], ends);
+        const order = self.accounts.order[0..total];
+        if (total < self.rehash_parallel_nodes_min) {
+            if (total > 0) self.accounts.hash_collected(order);
+        } else {
+            var ranges: [rehash_pool.chunks_max][]u64 = undefined;
+            const chunks = (pool.thread_count + 1) * rehash_chunks_per_thread;
+            const parts = @min(chunks, rehash_pool.chunks_max);
+            split_ranges(order, ends, ranges[0..parts]);
+            pool.run(&self.accounts, ranges[0..parts]);
+        }
+        for (subtries[0..count]) |index| assert(self.accounts.cache[index].len > 0);
+        _ = self.accounts.root_hash();
     }
 
     /// The state root after all writes so far.

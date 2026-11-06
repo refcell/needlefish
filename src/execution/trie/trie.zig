@@ -734,6 +734,144 @@ pub fn TrieType(comptime config: Config) type {
             root.* = none;
         }
 
+        /// One pending range of a `build_sorted` walk: keys `[low, high)` share their first
+        /// `depth` nibbles and their trie goes into `slot`.
+        const BuildTask = struct { low: u32, high: u32, depth: u32, slot: *NodeIndex };
+
+        /// Pending ranges of a `build_sorted` walk, at most: a branch pops one range and
+        /// pushes up to 16, and branches nest at most `path_max` deep.
+        const build_stack_max = path_max * 15 + 1;
+
+        /// Builds the trie of `count` sorted, distinct keys of exactly `key_bytes_max` bytes
+        /// into the empty `root`, creating each node once: no per-insert descent, split, or
+        /// path rewrite. `source` provides `key(i) *const [key_bytes_max]u8` and
+        /// `value(i, *[value_size_max]u8) []const u8`. New nodes are dirty, so the next root
+        /// hash computes them. A key set has one canonical trie, so the result equals
+        /// inserting the keys one by one (node indices aside), and needs no spare nodes
+        /// beyond it. On `TrieFull` the pool holds a partial trie: discard the whole pool.
+        pub fn build_sorted(
+            self: *Self,
+            root: *NodeIndex,
+            source: anytype,
+            count: u32,
+        ) Error!void {
+            assert(root.* == none);
+            if (count == 0) return;
+            const Word = @Int(.unsigned, config.key_bytes_max * 8);
+            for (1..count) |index| {
+                const previous = std.mem.readInt(Word, source.key(@intCast(index - 1)), .big);
+                assert(previous < std.mem.readInt(Word, source.key(@intCast(index)), .big));
+            }
+            var stack: [build_stack_max]BuildTask = undefined;
+            stack[0] = .{ .low = 0, .high = count, .depth = 0, .slot = root };
+            var stack_len: u32 = 1;
+            var steps: u64 = 0;
+            while (stack_len > 0) : (steps += 1) {
+                // One task per leaf or branch: at most `2 * count - 1`.
+                assert(steps < 2 * @as(u64, count));
+                stack_len -= 1;
+                stack_len = try self.build_task(source, stack[stack_len], &stack, stack_len);
+            }
+            assert(root.* != none);
+        }
+
+        /// Fills `task.slot` with a leaf, or a branch (behind an extension when the keys
+        /// share more nibbles) whose children go onto `stack`. Returns the new stack length.
+        /// `TrieFull` (before any change) when the pool lacks the task's one or two nodes.
+        fn build_task(
+            self: *Self,
+            source: anytype,
+            task: BuildTask,
+            stack: *[build_stack_max]BuildTask,
+            stack_len: u32,
+        ) Error!u32 {
+            assert(task.high > task.low);
+            assert(task.depth < path_max);
+            const first = source.key(task.low);
+            const path = Nibbles.from_bytes(first);
+            assert(path.slice().len == path_max);
+            if (task.high - task.low == 1) {
+                if (self.free_count < 1) return error.TrieFull;
+                var buffer: [config.value_size_max]u8 = undefined;
+                const value = source.value(task.low, &buffer);
+                task.slot.* = self.new_leaf(path.slice()[task.depth..], value);
+                return stack_len;
+            }
+            const last = source.key(task.high - 1);
+            var common = task.depth;
+            while (key_nibble(first, common) == key_nibble(last, common)) common += 1;
+            // Distinct keys of one length differ before the end.
+            assert(common < path_max);
+            if (self.free_count < @as(u32, 1) + @intFromBool(common > task.depth)) {
+                return error.TrieFull;
+            }
+            const branch = self.allocate(.branch);
+            task.slot.* = if (common > task.depth)
+                self.new_extension(path.slice()[task.depth..common], branch)
+            else
+                branch;
+            var length = stack_len;
+            var low = task.low;
+            while (low < task.high) {
+                const nibble = key_nibble(source.key(low), common);
+                var high = low + 1;
+                while (high < task.high and key_nibble(source.key(high), common) == nibble) {
+                    high += 1;
+                }
+                assert(length < build_stack_max);
+                stack[length] = .{
+                    .low = low,
+                    .high = high,
+                    .depth = common + 1,
+                    .slot = &self.nodes[branch].body.branch[nibble],
+                };
+                length += 1;
+                low = high;
+            }
+            assert(length - stack_len >= 2 and length - stack_len <= 16);
+            return length;
+        }
+
+        /// Most subtries `subtries` returns: 16 children of 16 children.
+        pub const subtries_max = 256;
+
+        /// The subtries two levels below `root` (an extension and its branch count as one
+        /// level; a leaf above that depth is its own subtrie), to split one trie's rehash
+        /// across threads. Branch values are left out: they are hashed with the top levels.
+        pub fn subtries(self: *const Self, root: NodeIndex, out: *[subtries_max]NodeIndex) u32 {
+            assert(root != none);
+            out[0] = root;
+            var count: u32 = 1;
+            for (0..2) |_| {
+                var next: [subtries_max]NodeIndex = undefined;
+                var next_count: u32 = 0;
+                for (out[0..count]) |index| {
+                    const current = &self.nodes[index];
+                    const children: []const NodeIndex = switch (current.kind) {
+                        .free => unreachable, // Reachable nodes are never on the free list.
+                        .leaf => (&out[0])[0..0],
+                        .extension => (&current.body.extension.child)[0..1],
+                        .branch => current.body.branch[0..16],
+                    };
+                    if (current.kind == .leaf) {
+                        next[next_count] = index;
+                        next_count += 1;
+                    }
+                    for (children) |child| {
+                        if (child == none) continue;
+                        // At most 16 per entry and 16 entries after the first level.
+                        assert(next_count < subtries_max);
+                        next[next_count] = child;
+                        next_count += 1;
+                    }
+                }
+                @memcpy(out[0..next_count], next[0..next_count]);
+                count = next_count;
+            }
+            assert(count >= 1 and count <= subtries_max);
+            return count;
+        }
+
         const Frame = struct { index: NodeIndex, next_child: u8 };
 
         /// Post-order walk that fills in every dirty cache below `start`.

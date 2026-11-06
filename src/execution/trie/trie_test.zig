@@ -510,3 +510,117 @@ test "trie: change tracking reports every rehashed node at its path (batched and
         try check_change_tracking(Serial, 0xc4b0 + seed);
     }
 }
+
+/// Sorted, distinct 32-byte keys and their values, as a `build_sorted` source.
+const SortedSource = struct {
+    entries: []const Entry,
+
+    pub fn key(source: *const SortedSource, index: u32) *const [32]u8 {
+        return &source.entries[index].key;
+    }
+
+    pub fn value(source: *const SortedSource, index: u32, buffer: []u8) []const u8 {
+        const entry = &source.entries[index];
+        @memcpy(buffer[0..entry.value_len], entry.value[0..entry.value_len]);
+        return buffer[0..entry.value_len];
+    }
+};
+
+/// Sorts `entries` and drops repeated keys (last write wins); returns the distinct count.
+fn sort_distinct(entries: []Entry) u32 {
+    std.mem.sort(Entry, entries, {}, Entry.less_than);
+    var count: u32 = 0;
+    for (entries, 0..) |entry, index| {
+        const last = index + 1 == entries.len;
+        if (!last and std.mem.eql(u8, &entry.key, &entries[index + 1].key)) continue;
+        entries[count] = entry;
+        count += 1;
+    }
+    return count;
+}
+
+/// `build_sorted` of `entries` (sorted, distinct) equals inserting them one by one: same
+/// root, same node count, same reads. A pool one node short fails with `TrieFull`.
+fn expect_build_matches_inserts(built: *Trie, inserted: *Trie, entries: []const Entry) !void {
+    built.clear();
+    inserted.clear();
+    for (entries) |entry| try inserted.put(&entry.key, entry.value[0..entry.value_len]);
+    const source: SortedSource = .{ .entries = entries };
+    var root: Trie.NodeIndex = Trie.none;
+    try built.build_sorted(&root, &source, @intCast(entries.len));
+    built.root = root;
+    try testing.expectEqual(inserted.node_count(), built.node_count());
+    try testing.expectEqual(inserted.root_hash(), built.root_hash());
+    for (entries) |entry| {
+        const expected = entry.value[0..entry.value_len];
+        try testing.expectEqualSlices(u8, expected, built.get(&entry.key).?);
+    }
+}
+
+test "trie: seeded differential of build_sorted against inserts" {
+    var prng = Prng.init(0xb0_1d);
+    var built = try Trie.init(testing.allocator, 2048);
+    defer built.deinit(testing.allocator);
+    var inserted = try Trie.init(testing.allocator, 2048);
+    defer inserted.deinit(testing.allocator);
+    var entries: [400]Entry = undefined;
+    for (0..80) |round| {
+        const count = prng.below(entries.len + 1);
+        // Small key spaces share long prefixes (extensions, deep branches).
+        const key_space: u64 = switch (round % 4) {
+            0 => 0,
+            1 => 16,
+            2 => 1 << 12,
+            else => 1 << 40,
+        };
+        for (entries[0..count]) |*entry| entry.* = random_entry(&prng, key_space);
+        const distinct = sort_distinct(entries[0..count]);
+        try expect_build_matches_inserts(&built, &inserted, entries[0..distinct]);
+        if (distinct == 0) continue;
+        // A pool one node short of the trie fails cleanly.
+        var small = try Trie.init(testing.allocator, inserted.node_count() - 1);
+        defer small.deinit(testing.allocator);
+        const source: SortedSource = .{ .entries = entries[0..distinct] };
+        var root: Trie.NodeIndex = Trie.none;
+        const result = small.build_sorted(&root, &source, distinct);
+        try testing.expectError(error.TrieFull, result);
+    }
+}
+
+const BuildFuzzContext = struct {
+    built: *Trie,
+    inserted: *Trie,
+    entries: *[128]Entry,
+};
+
+fn fuzz_build_sorted(context: BuildFuzzContext, smith: *testing.Smith) anyerror!void {
+    var count: u32 = 0;
+    while (count < context.entries.len and !smith.eosWeightedSimple(15, 1)) : (count += 1) {
+        const entry = &context.entries[count];
+        // Keys from a tiny alphabet in the first bytes maximize shared prefixes.
+        entry.key = @splat(0);
+        entry.key[0] = smith.value(u8) & 0x31;
+        entry.key[1] = smith.value(u8) & 0x13;
+        entry.key[31] = smith.value(u8) & 0x11;
+        entry.value_len = 1 + (smith.value(u8) & 0x1f);
+        @memset(entry.value[0..entry.value_len], smith.value(u8));
+    }
+    const distinct = sort_distinct(context.entries[0..count]);
+    const entries = context.entries[0..distinct];
+    try expect_build_matches_inserts(context.built, context.inserted, entries);
+}
+
+test "trie: fuzz build_sorted against inserts" {
+    var built = try Trie.init(testing.allocator, 512);
+    defer built.deinit(testing.allocator);
+    var inserted = try Trie.init(testing.allocator, 512);
+    defer inserted.deinit(testing.allocator);
+    const entries = try testing.allocator.create([128]Entry);
+    defer testing.allocator.destroy(entries);
+    const context: BuildFuzzContext = .{
+        .built = &built,
+        .inserted = &inserted,
+        .entries = entries,
+    };
+    try testing.fuzz(context, fuzz_build_sorted, .{});
+}

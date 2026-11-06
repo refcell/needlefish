@@ -94,14 +94,33 @@ pub fn write(state: *State, sink: anytype) !void {
 
 const Counts = struct { accounts: u32, slots: u32, codes: u32, block_hashes: u32 };
 
-/// Loads a snapshot into an empty `state`. On error the state must be discarded.
-pub fn load(state: *State, source: anytype) !void {
+/// The root a snapshot records, returned by the table decoders for `verify`.
+pub const Expected = struct { root: node.Hash };
+
+/// Loads a snapshot into an empty `state`: decodes the flat tables, builds the state trie
+/// from them in bulk (`build_trie`, with `scratch` at least the snapshot's length), and
+/// checks the root. On error the state must be discarded.
+pub fn load(state: *State, source: anytype, scratch: []u8) !void {
+    const expected = try load_tables(state, source);
+    try build_trie(state, scratch);
+    try verify(state, &expected);
+}
+
+/// The reference load: inserts every account and slot into the trie key by key while
+/// decoding. Same tables, tries, and root as `load`.
+pub fn load_incremental(state: *State, source: anytype) !void {
+    const expected = try load_incremental_tables(state, source);
+    try verify(state, &expected);
+}
+
+/// Decodes the header and checks the counts against the state's capacities.
+fn load_header(state: *const State, source: anytype) !struct { Expected, Counts } {
     assert(state.account_table.count() == 0);
     assert(state.code_table.count() == 0);
     if (try read_int(source, u32) != magic) return error.InvalidSnapshot;
     if (try read_int(source, u16) != version) return error.InvalidSnapshot;
-    var expected_root: node.Hash = undefined;
-    try source.read(&expected_root);
+    var expected: Expected = undefined;
+    try source.read(&expected.root);
     const counts: Counts = .{
         .accounts = try read_int(source, u32),
         .slots = try read_int(source, u32),
@@ -112,17 +131,39 @@ pub fn load(state: *State, source: anytype) !void {
     if (counts.slots > state.config.storage_slots_max) return error.InvalidSnapshot;
     if (counts.codes > state.config.codes_max) return error.InvalidSnapshot;
     if (counts.block_hashes > state_module.block_hashes_max) return error.InvalidSnapshot;
+    return .{ expected, counts };
+}
+
+/// Decodes the snapshot into the flat tables only; the trie stays empty (`build_trie`).
+pub fn load_tables(state: *State, source: anytype) !Expected {
+    const expected, const counts = try load_header(state, source);
+    try load_account_table(state, source, counts.accounts);
+    try load_slot_table(state, source, counts.slots);
+    try load_codes(state, source, counts.codes);
+    try load_block_hashes(state, source, counts.block_hashes);
+    assert(state.state_trie.account_count() == 0);
+    return expected;
+}
+
+/// Decodes the snapshot and inserts each account and slot into the trie as it goes.
+pub fn load_incremental_tables(state: *State, source: anytype) !Expected {
+    const expected, const counts = try load_header(state, source);
     try load_accounts(state, source, counts.accounts);
     try load_slots(state, source, counts.slots);
     try load_codes(state, source, counts.codes);
-    for (0..counts.block_hashes) |_| {
-        const number = try read_int(source, u64);
-        var hash: node.Hash = undefined;
-        try source.read(&hash);
-        state.set_block_hash(number, hash);
-    }
+    try load_block_hashes(state, source, counts.block_hashes);
+    return expected;
+}
+
+/// Builds the state trie of the loaded tables in bulk (`State.build_trie`).
+pub fn build_trie(state: *State, scratch: []u8) !void {
+    try state.build_trie(scratch);
+}
+
+/// Checks the root against the snapshot's and that every referenced code is present.
+pub fn verify(state: *State, expected: *const Expected) !void {
     const root = try state.state_root();
-    if (!std.mem.eql(u8, &root, &expected_root)) return error.RootMismatch;
+    if (!std.mem.eql(u8, &root, &expected.root)) return error.RootMismatch;
     // Code bytes are outside the root: every referenced code hash must resolve.
     var accounts = state.account_table.iterator();
     while (accounts.next()) |entry| {
@@ -131,15 +172,41 @@ pub fn load(state: *State, source: anytype) !void {
     }
 }
 
+fn load_block_hashes(state: *State, source: anytype, count: u32) !void {
+    assert(count <= state_module.block_hashes_max);
+    for (0..count) |_| {
+        const number = try read_int(source, u64);
+        var hash: node.Hash = undefined;
+        try source.read(&hash);
+        state.set_block_hash(number, hash);
+    }
+}
+
+fn read_account(source: anytype) !struct { state_module.Address, state_module.AccountInfo } {
+    var address: state_module.Address = undefined;
+    try source.read(&address);
+    var info: state_module.AccountInfo = .{
+        .nonce = try read_int(source, u64),
+        .balance = try read_word(source),
+    };
+    try source.read(&info.code_hash);
+    return .{ address, info };
+}
+
+fn load_account_table(state: *State, source: anytype, count: u32) !void {
+    assert(count <= state.config.accounts_max);
+    for (0..count) |_| {
+        const address, const info = try read_account(source);
+        const result = state.account_table.getOrPutAssumeCapacity(address);
+        if (result.found_existing) return error.InvalidSnapshot;
+        result.value_ptr.* = .{ .info = info };
+    }
+    assert(state.account_table.count() == count);
+}
+
 fn load_accounts(state: *State, source: anytype, count: u32) !void {
     for (0..count) |_| {
-        var address: state_module.Address = undefined;
-        try source.read(&address);
-        var info: state_module.AccountInfo = .{
-            .nonce = try read_int(source, u64),
-            .balance = try read_word(source),
-        };
-        try source.read(&info.code_hash);
+        const address, const info = try read_account(source);
         if (state.account_table.contains(address)) return error.InvalidSnapshot;
         state.account_table.putAssumeCapacityNoClobber(address, .{ .info = info });
         try state.state_trie.set_account(node.keccak256(&address), .{
@@ -150,13 +217,34 @@ fn load_accounts(state: *State, source: anytype, count: u32) !void {
     }
 }
 
+fn read_slot(source: anytype) !struct { state_module.SlotKey, u256 } {
+    var key: state_module.SlotKey = undefined;
+    try source.read(&key.address);
+    key.slot = try read_word(source);
+    const value = try read_word(source);
+    if (value == 0) return error.InvalidSnapshot;
+    return .{ key, value };
+}
+
+fn load_slot_table(state: *State, source: anytype, count: u32) !void {
+    assert(count <= state.config.storage_slots_max);
+    for (0..count) |_| {
+        const key, const value = try read_slot(source);
+        const account = state.account_table.getPtr(key.address) orelse {
+            return error.InvalidSnapshot;
+        };
+        const result = state.storage_table.getOrPutAssumeCapacity(key);
+        if (result.found_existing) return error.InvalidSnapshot;
+        result.value_ptr.* = value;
+        account.storage_slots += 1;
+        assert(account.storage_slots <= state.storage_table.count());
+    }
+    assert(state.storage_table.count() == count);
+}
+
 fn load_slots(state: *State, source: anytype, count: u32) !void {
     for (0..count) |_| {
-        var key: state_module.SlotKey = undefined;
-        try source.read(&key.address);
-        key.slot = try read_word(source);
-        const value = try read_word(source);
-        if (value == 0) return error.InvalidSnapshot;
+        const key, const value = try read_slot(source);
         const account = state.account_table.getPtr(key.address) orelse {
             return error.InvalidSnapshot;
         };
@@ -263,7 +351,7 @@ test "snapshot: roundtrip restores root, reads, code, and block hashes" {
     var loaded = try State.init(testing.allocator, test_config);
     defer loaded.deinit(testing.allocator);
     var source: BufferSource = .{ .buffer = buffer[0..sink.position] };
-    try load(&loaded, &source);
+    try load(&loaded, &source, buffer[0..sink.position]);
     try testing.expectEqual(sink.position, source.position);
     try testing.expectEqual(try state.state_root(), try loaded.state_root());
     var address: state_module.Address = @splat(0);
@@ -303,6 +391,8 @@ test "snapshot: corruption and truncation never load silently" {
             end = prng.below(length);
         }
         var source: BufferSource = .{ .buffer = scratch[0..end] };
-        if (load(&loaded, &source)) |_| return error.TestUnexpectedSuccess else |_| {}
+        if (load(&loaded, &source, scratch[0..end])) |_| {
+            return error.TestUnexpectedSuccess;
+        } else |_| {}
     }
 }

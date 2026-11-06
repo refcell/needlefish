@@ -40,6 +40,8 @@ pub const history = @import("history_bench.zig");
 pub const steady = @import("steady_bench.zig");
 /// `debug_executionWitness` end to end from history (`witness_rpc_bench.zig`).
 pub const witness_rpc = @import("witness_rpc_bench.zig");
+/// `Database.open` end to end, per step (`restart_bench.zig`).
+pub const restart = @import("restart_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -627,6 +629,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
         };
     }
     steady.run(io, filter);
+    restart.run(io, filter);
 }
 
 fn run_commit_sim(
@@ -704,6 +707,7 @@ test {
     _ = history;
     _ = steady;
     _ = witness_rpc;
+    _ = restart;
 }
 
 test "bench: cases are well formed" {

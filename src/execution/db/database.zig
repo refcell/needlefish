@@ -321,6 +321,42 @@ pub const Commit = struct {
     state_root: Hash,
 };
 
+/// Steps of `open`, reported to `OpenTrace` as each one ends (in this order; history steps
+/// only with history on and a head). Library code never reads the clock: the caller does.
+pub const OpenStep = enum(u8) {
+    /// The engine read the superblock and streamed (and verified) the checkpoint.
+    checkpoint_read,
+    /// Snapshot decoded into the flat tables (the incremental path also builds the trie).
+    snapshot_tables,
+    /// State trie built from the flat tables (bulk path only).
+    snapshot_trie,
+    /// State root computed and checked against the snapshot.
+    snapshot_root,
+    /// Retained blocks inserted and the canonical head restored.
+    blocks,
+    /// Journal read and replayed; the metadata checked.
+    replay,
+    /// History rebuild: State unwound to the window start (the flat tables only when the
+    /// trie is rebuilt next).
+    history_unwind,
+    /// History rebuild: the state trie rebuilt in bulk from the unwound tables.
+    history_trie,
+    /// History rebuild: every trie node stored at the window start (path index fill).
+    history_reset,
+    /// History rebuild: blocks re-applied with `commit_block` up to the head.
+    history_apply,
+};
+
+pub const OpenTrace = struct {
+    context: *anyopaque,
+    step: *const fn (context: *anyopaque, step: OpenStep) void,
+};
+
+/// How `open` turns the checkpoint's snapshot into a state trie: `bulk` builds each trie
+/// from sorted keys (`snapshot.load`); `incremental` inserts key by key (the reference
+/// path, `snapshot.load_incremental`). Both produce the same tries and roots.
+pub const LoadMode = enum { bulk, incremental };
+
 pub fn DatabaseType(comptime Storage: type) type {
     return struct {
         const Self = @This();
@@ -380,6 +416,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         history_off: bool = false,
         /// The current head move could not update history; rebuild once it ends.
         history_stale: bool = false,
+        /// Reports the end of each `open` step (benchmarks); null reports nothing.
+        open_trace: ?OpenTrace = null,
+        /// Snapshot load path at `open` (tests compare both).
+        load_mode: LoadMode = .bulk,
 
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
@@ -570,6 +610,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.load_done = true;
             if (self.load_error != null) return;
             if (self.staging_len == 0) return; // Fresh format: no checkpoint yet.
+            self.trace(.checkpoint_read);
             self.checkpoint_load() catch {
                 self.load_error = error.CheckpointInvalid;
             };
@@ -600,7 +641,14 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.journal_bytes_pending = 0;
             self.phase = .ready;
             assert(self.queue_count == 0);
+            self.trace(.replay);
             if (self.head_info.present) self.history_rebuild_window();
+        }
+
+        fn trace(self: *Self, step: OpenStep) void {
+            assert(self.phase == .opening or self.phase == .ready);
+            const open_trace = self.open_trace orelse return;
+            open_trace.step(open_trace.context, step);
         }
 
         // Operations.
@@ -1065,12 +1113,13 @@ pub fn DatabaseType(comptime Storage: type) type {
             const store = if (self.history) |*store| store else return;
             if (!self.config.history_rebuild_on_open) return self.history_rebuild();
             const head = self.head_info.number;
-            const start = self.history_unwind_to(self.history_rebuild_start());
+            const start = self.history_rebuild_unwind() orelse return;
             assert(start <= head);
             var history_ok = true;
             store.reset(&self.state.state_trie, start) catch {
                 history_ok = false;
             };
+            self.trace(.history_reset);
             var number = start;
             while (number < head) {
                 number += 1;
@@ -1091,12 +1140,36 @@ pub fn DatabaseType(comptime Storage: type) type {
                 return;
             };
             assert(std.mem.eql(u8, &root, &self.head_info.state_root));
+            self.trace(.history_apply);
             if (history_ok) {
                 assert(store.window().?.head == head);
                 return;
             }
             self.history_drops += 1;
             self.history_rebuild();
+        }
+
+        /// Unwinds State to the window start; returns that block, or null when the trie
+        /// rebuild failed (the database failed). Unwinding the tables and rebuilding the trie
+        /// once costs O(state); unwinding the trie costs a trie update per entry of every
+        /// unwound block (more above a few dozen typical blocks at 100k accounts). The bulk
+        /// load path does the former when the staging buffer can hold the build's scratch.
+        fn history_rebuild_unwind(self: *Self) ?u64 {
+            const scratch_max = State.build_trie_scratch_bytes_max(self.config.state);
+            const rebuild = self.load_mode == .bulk and self.staging.len >= scratch_max;
+            const start = self.history_unwind_to(self.history_rebuild_start(), rebuild);
+            self.trace(.history_unwind);
+            if (self.state.trie_stale) {
+                assert(rebuild);
+                self.state.rebuild_trie(self.staging) catch {
+                    self.phase = .failed;
+                    self.open_error = error.ReplayFailed;
+                    return null;
+                };
+            }
+            assert(!self.state.trie_stale);
+            self.trace(.history_trie);
+            return start;
         }
 
         /// The oldest block the window can be rebuilt from: `head - window_blocks + 1`, or
@@ -1118,14 +1191,19 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Unwinds State from the head down to block `target`; returns the block it reached
         /// (higher than `target` when an unwind does not fit: `State.unwind` fails before
-        /// any change, so the state still holds the block above).
-        fn history_unwind_to(self: *Self, target: u64) u64 {
+        /// any change, so the state still holds the block above). With `tables_only` the trie
+        /// is left stale (`State.unwind_tables`) for `State.rebuild_trie`.
+        fn history_unwind_to(self: *Self, target: u64, tables_only: bool) u64 {
             assert(target <= self.head_info.number);
             var number = self.head_info.number;
             while (number > target) : (number -= 1) {
                 const view = self.chain.block(self.chain.canonical_hash(number).?).?;
                 self.changeset.decode(view.changeset) catch break;
-                self.state.unwind(&self.changeset) catch break;
+                if (tables_only) {
+                    self.state.unwind_tables(&self.changeset) catch break;
+                } else {
+                    self.state.unwind(&self.changeset) catch break;
+                }
             }
             assert(number >= target);
             return number;
@@ -1320,11 +1398,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             const snapshot_len = try reader.int(u32);
             const block_count = try reader.int(u32);
             if (block_count > self.config.chain.blocks_max) return error.CheckpointInvalid;
-            var source: snapshot_module.BufferSource = .{
-                .buffer = try reader.bytes(snapshot_len),
-            };
-            try snapshot_module.load(&self.state, &source);
-            if (source.position != snapshot_len) return error.CheckpointInvalid;
+            try self.snapshot_load(try reader.bytes(snapshot_len));
             for (0..block_count) |_| {
                 const size = try reader.int(u32);
                 const entry = try decode_entry(try reader.bytes(size));
@@ -1335,6 +1409,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (reader.position != bytes.len) return error.CheckpointInvalid;
             if (self.chain.block_count() != block_count) return error.CheckpointInvalid;
             if (present == 1) try self.restore_head(head_meta);
+            self.trace(.blocks);
             const root = try self.state.state_root();
             if (!std.mem.eql(u8, &root, &state_root)) return error.CheckpointInvalid;
             self.head_info = .{
@@ -1343,6 +1418,26 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .hash = head_meta.hash,
                 .state_root = state_root,
             };
+        }
+
+        /// Loads the checkpoint's snapshot (`load_mode`) and checks its root. The snapshot
+        /// bytes are scratch for the bulk trie build afterwards (they lie in `staging`, which
+        /// the engine no longer reads once the checkpoint is verified).
+        fn snapshot_load(self: *Self, bytes: []const u8) !void {
+            const offset = @intFromPtr(bytes.ptr) -% @intFromPtr(self.staging.ptr);
+            assert(offset + bytes.len <= self.staging_len);
+            var source: snapshot_module.BufferSource = .{ .buffer = bytes };
+            const scratch = self.staging[offset..][0..bytes.len];
+            const expected = switch (self.load_mode) {
+                .bulk => try snapshot_module.load_tables(&self.state, &source),
+                .incremental => try snapshot_module.load_incremental_tables(&self.state, &source),
+            };
+            if (source.position != bytes.len) return error.CheckpointInvalid;
+            self.trace(.snapshot_tables);
+            if (self.load_mode == .bulk) try snapshot_module.build_trie(&self.state, scratch);
+            self.trace(.snapshot_trie);
+            try snapshot_module.verify(&self.state, &expected);
+            self.trace(.snapshot_root);
         }
 
         /// Rebuilds the canonical index without touching state (the snapshot has it).

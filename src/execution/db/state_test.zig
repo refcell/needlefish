@@ -200,3 +200,76 @@ test "state: empty code hash resolves to empty code" {
     try testing.expect(!(try state.insert_code("abc")).new);
     try testing.expectEqualSlices(u8, "abc", state.code_by_hash(inserted.hash).?);
 }
+
+/// `unwind_tables` down a random depth then `rebuild_trie` equals `unwind` block by block:
+/// same root, reads, `has_storage`, and account proofs; and the rebuilt state applies the
+/// same blocks forward to the same head.
+fn expect_rebuild_matches_unwind(seed: u64, rehash_threads: u32) !void {
+    var prng = Prng.init(seed);
+    var config = state_config;
+    config.rehash_threads = rehash_threads;
+    var state = try State.init(testing.allocator, config);
+    defer state.deinit(testing.allocator);
+    var reference = try State.init(testing.allocator, state_config);
+    defer reference.deinit(testing.allocator);
+    var overlay = try Overlay.init(testing.allocator, &state, overlay_config);
+    defer overlay.deinit(testing.allocator);
+    var changesets: [blocks_count]Changeset = undefined;
+    for (&changesets) |*c| c.* = try Changeset.init(testing.allocator, changeset_config);
+    defer for (&changesets) |*c| c.deinit(testing.allocator);
+    const scratch_bytes = State.build_trie_scratch_bytes_max(config);
+    const scratch = try testing.allocator.alloc(u8, @intCast(scratch_bytes));
+    defer testing.allocator.free(scratch);
+    var model: Model = .{};
+    var roots: [blocks_count + 1]Hash = undefined;
+    roots[0] = try state.state_root();
+    for (0..blocks_count) |block| {
+        for (0..prng.range(1, 40)) |_| try random_write(&prng, &overlay, &model);
+        roots[block + 1] = try overlay.commit(&changesets[block]);
+        try reference.apply(&changesets[block]);
+    }
+    for (0..4) |_| {
+        const target = prng.below(blocks_count);
+        var height: usize = blocks_count;
+        while (height > target) : (height -= 1) {
+            try state.unwind_tables(&changesets[height - 1]);
+            try reference.unwind(&changesets[height - 1]);
+        }
+        try state.rebuild_trie(scratch);
+        try testing.expectEqual(roots[target], try state.state_root());
+        try expect_same_state(&state, &reference);
+        while (height < blocks_count) : (height += 1) {
+            try state.apply(&changesets[height]);
+            try reference.apply(&changesets[height]);
+        }
+        try testing.expectEqual(roots[blocks_count], try state.state_root());
+        try expect_same_state(&state, &reference);
+    }
+}
+
+fn expect_same_state(state: *State, reference: *State) !void {
+    try testing.expectEqual(try reference.state_root(), try state.state_root());
+    var proof: trie.StateTrie.AccountProof = .{};
+    var reference_proof: trie.StateTrie.AccountProof = .{};
+    for (0..addresses_max) |index| {
+        const address = address_of(index);
+        try testing.expectEqual(reference.has_storage(address), state.has_storage(address));
+        try testing.expectEqual(reference.account(address), state.account(address));
+        for (0..slots_max) |slot| {
+            try testing.expectEqual(reference.storage(address, slot), state.storage(address, slot));
+        }
+        const address_hash = trie.node.keccak256(&address);
+        try state.state_trie.prove_account(address_hash, &proof);
+        try reference.state_trie.prove_account(address_hash, &reference_proof);
+        try testing.expectEqual(reference_proof.count, proof.count);
+        for (0..proof.count) |node_index| {
+            const expected = reference_proof.node_at(@intCast(node_index));
+            try testing.expectEqualSlices(u8, expected, proof.node_at(@intCast(node_index)));
+        }
+    }
+}
+
+test "state: unwinding the tables and rebuilding the trie equals a trie unwind" {
+    try expect_rebuild_matches_unwind(0x4eb1, 0);
+    try expect_rebuild_matches_unwind(0x4eb2, 2);
+}

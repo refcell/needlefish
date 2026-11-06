@@ -117,7 +117,14 @@ pub const BufferSink = struct {
 
     pub fn write(self: *BufferSink, bytes: []const u8) void {
         assert(self.written + bytes.len <= self.buffer.len);
-        @memcpy(self.buffer[self.written..][0..bytes.len], bytes);
+        const out = self.buffer[self.written..];
+        // Branch encodings are mostly 33-byte child hashes and 1-byte empty slots: copy
+        // those inline instead of calling memmove per child.
+        switch (bytes.len) {
+            1 => out[0] = bytes[0],
+            33 => out[0..33].* = bytes[0..33].*,
+            else => @memcpy(out[0..bytes.len], bytes),
+        }
         self.written += bytes.len;
     }
 

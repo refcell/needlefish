@@ -186,11 +186,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   writes bounded per commit with `checkpoint_bytes_per_commit`, node 4 MiB; see Decisions)
 - [ ] Rerun `db/commit steady` (os backend, paced vs unpaced, interleaved) on a quiet machine
   and under `just test-linux` io_uring; confirm or revert the 4 MiB checkpoint pacing default.
-- [ ] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
+- [x] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
   (checkpoint load, journal replay, trie rebuild from flat tables, history rebuild-on-open
   over a 300-block window, path index fill); cut the dominant step (e.g. batched rehash on
   load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
 - [x] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
+  (`db/restart_bench.zig`; bulk trie build from sorted flat tables and table-only history
+  unwind; 1m open 3.0 -> 1.1-1.4 s, with history 9.5 -> 5.8-7.5 s; see Decisions, PERF.md)
+- [ ] History rebuild at open re-applies the whole 300-block window even when the byte budget
+  keeps fewer blocks (1m accounts: 86 kept, ~3 s of the 1m open re-applies blocks pruned
+  again). Start the rebuild at the window the budget will keep: a rebuild started later
+  that still shrinks ends at the same window (the shrink point is the max over blocks of
+  the first start that fits), so try a short window and widen it until no shrink happens.
+- [ ] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
   typical and heavy blocks end to end through rpc; provers poll every block, so keep it well
   under the slot (history-sourced path, no state disturbance).
   (`db/witness_rpc_bench.zig`, `-- "db/witness rpc"`; history reads memoized per call
@@ -205,6 +213,26 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   re-execution; or the wider keccak batch from the sparse-apply item above.
 
 ## Decisions
+- Bulk load on open (`LoadMode.bulk`, default): the snapshot fills the flat tables only;
+  `State.build_trie` then hashes every key in SIMD batches, groups the slots by account
+  (in-place 256-bucket pass on a byte of the address hash, pdq per bucket by address and
+  slot hash), builds each storage trie and then the account trie with
+  `TrieType.build_sorted` (one node per create, iterative, explicit stack; a key set has one
+  canonical trie, so roots and proofs are bit-identical to inserts; node indices differ),
+  and hashes them (storage tries and the account trie's subtries two levels down on the
+  rehash pool when configured; `RehashPool` is no longer generic over the trie). Scratch:
+  84 bytes per slot + 40 per account, never more than the snapshot bytes, so the snapshot
+  region of `staging` is reused (the engine no longer reads it after verification).
+  `build_sorted` checks the pool per node (1-2 per task) and fails with `TrieFull`
+  mid-build: the caller discards the state (open fails as before). The key-by-key path
+  stays as `LoadMode.incremental`, the reference for the reopen differential test.
+- History rebuild on open unwinds the flat tables only (`State.unwind_tables`, trie marked
+  stale and asserted unused) and rebuilds the trie once in bulk (`State.rebuild_trie`):
+  O(state) instead of a trie update per unwound entry. Only in bulk mode and when `staging`
+  holds `build_trie_scratch_bytes_max` (node: 24.6 MiB of 40 MiB); otherwise the trie unwind.
+- `Database.open_trace` reports each `OpenStep` end to the caller (the bench reads the
+  clock; library code never does).
+
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
   switch over then.
 - Two trie engines: `HashBuilder` (alloy-trie algorithm, streaming, sorted input, accepts
@@ -971,3 +999,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   per-byte reference, witness of a block identical before and after another commit),
   existing history-vs-unwind witness workload, cache unit test, seeded `write_hex`
   differential with chunked buffers, rpc witness tests (length now `db/witness_json`).
+- 2026-11-06: node restart time: `db/restart_bench.zig` (`db/restart`) reopens 100k and 1m
+  account databases (sim and os, history on/off, per-step medians via `open_trace`). Bulk
+  load (sorted builds, bucketed sorts, parallel account-trie hash) and table-only history
+  unwind: 100k open 299-540 -> 230-440 ms (history 3.2-3.4 -> 2.6-2.8 s), 1m 3.0 -> 1.1-1.4 s
+  (history 9.5-9.8 -> 5.8-7.5 s). Remaining: `history_apply` (budget-limited window, see
+  backlog) and the checkpoint checksum. Tests: reopen differential (incremental vs bulk vs
+  bulk on rehash threads after seeded crash/reopen: state, `has_storage`, history window
+  and usage, proofs of every address at every window block; with history, a byte budget,
+  and without), `build_sorted` vs inserts (seeded, one-node-short pool, fuzz), table unwind
+  + rebuild vs trie unwind (serial and threaded).
