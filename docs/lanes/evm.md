@@ -123,8 +123,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   DELEGATECALL/STATICCALL caller, value, and address; revert data; output window;
   RETURNDATASIZE; RETURNDATACOPY including the out-of-bounds halt) against a two-contract
   model.
-- [ ] Performance: keccak256 loop is ~185 ns per 64-byte hash; compare the crypto lane's
-  Keccak-f with a 2x-unrolled round and hand the result to that lane if faster.
+- [x] Performance: keccak256 — investigated, no change: the crypto lane's Keccak-f already
+  matches std (~146 vs ~139 ns per 32 B, docs/PERF.md) and has a 2-lane NEON batch path; the
+  EVM loop's ~185 ns per 64 B is that hash plus memory pricing. Left to the crypto lane.
+- [ ] Fuzz: SSTORE gas and refund state machine (EIP-2200/2929/3529: original, current,
+  new values; warm/cold; stipend check) against a table-driven reference model.
+- [ ] Fuzz: CREATE/CREATE2 address derivation, init-code limits (EIP-3860), collision
+  rules, and code-deposit gas against a model.
+- [ ] Performance: a block-sized transaction bench (1000 mixed transfers and erc20 calls
+  through `transaction.transact` without per-tx state reset) to profile the tx envelope.
 - [x] Performance: account map — `start_call` reuses the parent frame's account for the
   caller and the target account when it is also the code account: call loop 23.5 ->
   ~18.6-22.2 us (noisy, load ~25). A fold+fmix64 hash context for `State.accounts`
