@@ -42,8 +42,8 @@ allocation after startup.
   `sequencer`, `conductor`, `proofs`, `upgrade-readiness`, `doctor` as plain-text CLI
   commands over the node/consensus/batcher RPCs (port `basectl/src/{commands,rpc}`).
   TUI is out of scope until the CLI commands are complete.
-- [ ] `infra/audit`: transaction-event audit stream (port `audit/src/*`) over the node's
-  RPC, metrics exported.
+- [x] `infra/audit`: transaction-event audit archiver (port `audit-archiver`): Vector
+  NDJSON ingest, `base_getTransactionEvents*` JSON-RPC, metrics + health, `base audit`.
 - [x] `infra/snapshotter`: datadir snapshot create/restore for the node (port
   `snapshotter/src/*`), coordinate with trie-db for a consistent DB checkpoint.
 - [x] Devnet smoke: load-test step added to `just devnet smoke` (websocket-proxy dropped by
@@ -164,6 +164,23 @@ allocation after startup.
   5, fail below `--peer-fail-below`, default 1 as base/base's fail-at-zero), batcher stopped,
   and sequencer active vs conductor leadership. base/base's public-tip, bootnode, reth.toml,
   and external reachability checks need config/services we do not have and are omitted.
+- audit: base/base's Postgres + S3 archive becomes a bounded in-memory store
+  (`src/infra/audit/store.zig`): a slot ring plus a byte arena, sized at startup
+  (`--events-max`, `--store-bytes-max`), oldest events evicted first, chained hash indexes
+  for event id, tx hash, block number/hash, bundle id/hash, and the rejected list. Optional
+  durability is one append-only CRC-checked segment file (`--data-dir`): each accepted batch
+  is written and fsynced before the response (a failed write answers 503 and stores
+  nothing), replayed at startup (a torn or corrupt tail is truncated), and compacted to the
+  live events once it passes `--segment-bytes-max`.
+- audit retention keeps base/base's hot/warm/cold classes by event type (defaults 3/7/30
+  days, `hot <= warm <= cold <= 90`): events older than their class window are rejected at
+  ingest, hidden from queries, and pruned from the store head. Events more than 1 h in the
+  future are rejected. Query results are oldest first, limit default 500, max 2000; the
+  rejected query is newest first.
+- audit drops the `BUILDER_FLASHBLOCK_*` event types (rule 10): they are rejected per item
+  with reason `flashblock event types are not supported`.
+- audit bounds `event_id` to 256 bytes and only indexes bundle ids/hashes up to 256 bytes;
+  base/base leaves them unbounded. The retired write RPCs answer -32601.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -204,3 +221,6 @@ allocation after startup.
   method served by its upstream, a dead pinned upstream returns 502 without failover.
 - 2026-11-05: roxy block-lag exclusion (SimIo test, `--lag-max-blocks/--lag-poll-ms`,
   `roxy_upstream_head`); live: two dev-l1 nodes, all traffic to the leading one.
+- 2026-11-05: `base audit` archiver: Vector NDJSON ingest (idempotent by event_id), the five
+  `base_getTransactionEvents*`/`getRejected*` queries, metrics/health, segment durability;
+  live: duplicate batch answered `duplicate`, restart replayed events, torn tail truncated.
