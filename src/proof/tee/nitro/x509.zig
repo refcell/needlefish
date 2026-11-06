@@ -30,6 +30,7 @@ pub const oid_ec_public_key = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
 pub const oid_secp384r1 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
 const oid_basic_constraints = [_]u8{ 0x55, 0x1d, 0x13 };
 const oid_key_usage = [_]u8{ 0x55, 0x1d, 0x0f };
+const oid_crl_distribution_points = [_]u8{ 0x55, 0x1d, 0x1f };
 
 /// keyUsage bits as the first two content bytes, big endian (RFC 5280 4.2.1.3).
 pub const key_usage_digital_signature: u16 = 0x8000;
@@ -49,33 +50,33 @@ const tag_sequence: u8 = 0x30;
 const tag_version: u8 = 0xa0;
 const tag_extensions: u8 = 0xa3;
 
-const Tlv = struct {
+pub const Tlv = struct {
     tag: u8,
     content: []const u8,
 };
 
 /// Bounds-checked DER reader over one level of TLVs.
-const DerReader = struct {
+pub const DerReader = struct {
     bytes: []const u8,
     position: u32 = 0,
 
-    fn init(bytes: []const u8) DerReader {
+    pub fn init(bytes: []const u8) DerReader {
         assert(bytes.len <= std.math.maxInt(u32));
         return .{ .bytes = bytes };
     }
 
-    fn at_end(reader: *const DerReader) bool {
+    pub fn at_end(reader: *const DerReader) bool {
         assert(reader.position <= reader.bytes.len);
         return reader.position == reader.bytes.len;
     }
 
-    fn peek_tag(reader: *const DerReader) ?u8 {
+    pub fn peek_tag(reader: *const DerReader) ?u8 {
         assert(reader.position <= reader.bytes.len);
         if (reader.at_end()) return null;
         return reader.bytes[reader.position];
     }
 
-    fn next(reader: *DerReader) Error!Tlv {
+    pub fn next(reader: *DerReader) Error!Tlv {
         const rest = reader.bytes[reader.position..];
         if (rest.len < 2) return error.CertificateMalformed;
         const tag = rest[0];
@@ -97,7 +98,7 @@ const DerReader = struct {
         return .{ .tag = tag, .content = rest[header..end] };
     }
 
-    fn expect(reader: *DerReader, tag: u8) Error!Tlv {
+    pub fn expect(reader: *DerReader, tag: u8) Error!Tlv {
         const tlv = try reader.next();
         if (tlv.tag != tag) return error.CertificateMalformed;
         assert(tlv.content.len <= reader.bytes.len);
@@ -105,7 +106,7 @@ const DerReader = struct {
     }
 
     /// The full encoding (header and content) of the next TLV.
-    fn expect_raw(reader: *DerReader, tag: u8) Error![]const u8 {
+    pub fn expect_raw(reader: *DerReader, tag: u8) Error![]const u8 {
         const start = reader.position;
         _ = try reader.expect(tag);
         assert(reader.position > start);
@@ -135,8 +136,14 @@ pub const ParsedCert = struct {
     public_key: []const u8,
     /// DER ECDSA signature from signatureValue.
     signature: []const u8,
+    /// serialNumber INTEGER content octets, sign padding included.
+    serial: []const u8,
+    /// Encoded version value: 0 (v1, also when absent), 1 (v2) or 2 (v3).
+    version: u8,
     basic_constraints: ?BasicConstraints,
     key_usage: ?u16,
+    /// cRLDistributionPoints extension value (DER `CRLDistributionPoints`), if present.
+    crl_distribution_points: ?[]const u8,
 
     pub fn parse(der: []const u8) Error!ParsedCert {
         var outer = DerReader.init(der);
@@ -158,8 +165,9 @@ pub const ParsedCert = struct {
     fn parse_tbs(cert: *ParsedCert, signature_algorithm: []const u8) Error!void {
         var tbs_outer = DerReader.init(cert.tbs);
         var reader = DerReader.init((try tbs_outer.expect(tag_sequence)).content);
-        if (reader.peek_tag() == tag_version) try check_version(try reader.next());
-        _ = try reader.expect(tag_integer); // serialNumber
+        cert.version = 0;
+        if (reader.peek_tag() == tag_version) cert.version = try check_version(try reader.next());
+        cert.serial = (try reader.expect(tag_integer)).content;
         const tbs_algorithm = try reader.expect_raw(tag_sequence);
         // RFC 5280 4.1.2.3: must match the outer signatureAlgorithm.
         if (!std.mem.eql(u8, tbs_algorithm, signature_algorithm)) {
@@ -181,6 +189,7 @@ pub const ParsedCert = struct {
         }
         cert.basic_constraints = null;
         cert.key_usage = null;
+        cert.crl_distribution_points = null;
         if (reader.peek_tag() == tag_extensions) {
             var wrapper = DerReader.init((try reader.next()).content);
             try cert.parse_extensions((try wrapper.expect(tag_sequence)).content);
@@ -216,6 +225,9 @@ pub const ParsedCert = struct {
             } else if (std.mem.eql(u8, oid, &oid_key_usage)) {
                 if (cert.key_usage != null) return error.CertificateMalformed;
                 cert.key_usage = try parse_key_usage(value);
+            } else if (std.mem.eql(u8, oid, &oid_crl_distribution_points)) {
+                if (cert.crl_distribution_points != null) return error.CertificateMalformed;
+                cert.crl_distribution_points = value;
             }
         }
         assert(count <= extension_count_max);
@@ -249,12 +261,13 @@ pub const ParsedCert = struct {
     }
 };
 
-fn check_version(tlv: Tlv) Error!void {
+fn check_version(tlv: Tlv) Error!u8 {
     assert(tlv.tag == tag_version);
     var reader = DerReader.init(tlv.content);
     const version = try reader.expect(tag_integer);
     if (!reader.at_end()) return error.CertificateMalformed;
     if (version.content.len != 1 or version.content[0] > 2) return error.CertificateMalformed;
+    return version.content[0];
 }
 
 /// Content of a BIT STRING with zero unused bits.
