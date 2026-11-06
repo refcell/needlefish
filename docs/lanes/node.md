@@ -61,6 +61,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   needs an evm call-frame hook (asked nf-evm 2026-11-05).
 - [x] rpc: base_sendRawTransactionValidity node part (ingress checks, `txpool.validity`
   predicates + `matches`, `Api.validity_sink`).
+- [ ] rpc: eth_call/eth_estimateGas/debug_traceCall state and block overrides (geth 3rd
+  param; reuse the eth_simulateV1 override code).
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -99,6 +101,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: replay profile: keccak time is in the sparse trie/witness backend (replay-only, trie-db), not the node's production path; node-lane perf work waits on the evm code-analysis cache (nf-evm). Next backlog item added: call state/block overrides.
 - 2026-11-06: perf: new bench `node: replay 10 Base mainnet blocks` (bench_replay.zig, imports the nf-replay fixture; made `mainnet_test.fixture` pub). Baseline 12.3 ms/block, 379 Mgas/s. Profile: 40% in per-frame code analysis (evm `push_frame`/`analyze_code`, no cache) -> sent to nf-evm; keccak 13%.
 - 2026-11-05: prestateTracer reverted-frame gap closed for frames: a frame-address hook (evm Tracer, enter only, max 512 distinct, overflow -> error) runs during the traced tx; frame accounts are reported even when a revert cleared their warm stamp, and their slots read in the tx (original_tx stamp survives reverts). Still missed: accounts reached only by BALANCE/EXTCODE* inside a reverted frame.
 - 2026-11-05: base_sendRawTransactionValidity: base/base ingress order (flashblock_index rejected once Denim builds 200 ms blocks, batch rules, finite block expiry within 60 s of blocks from head+1, stateless tx validation, 8130 only from Everest); signature mode Off (accepted, not verified, as base/base's default). Accepted txs go to `Api.validity_sink` (pool storage + builder enforcement); with no sink the node rejects them after validation instead of pooling them unenforced (safer than silently ignoring the predicates). `txpool/validity.zig` holds the predicate types, parser and `matches` for the pool/builder.
