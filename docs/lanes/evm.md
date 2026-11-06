@@ -160,8 +160,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   even when it collides); `log(address, topics, data)` fires as each LOG runs. SELFDESTRUCT
   is a zero-gas child moving the balance. Precompile calls and depth/balance failures also
   get enter/exit.
-- [ ] Fuzz: SSTORE gas and refund state machine (EIP-2200/2929/3529: original, current,
-  new values; warm/cold; stipend check) against a table-driven reference model.
+- [x] Fuzz: SSTORE gas and refund state machine (`sstore_fuzz.zig`: random SSTORE/SLOAD over
+  three slots with random originals; exact gas used and raw refund counter vs an
+  EIP-2200/2929/3529 model at Osaka; catches a 1-wei refund change). The 2300 stipend
+  check stays covered by the state tests.
 - [ ] Fuzz: CREATE/CREATE2 address derivation, init-code limits (EIP-3860), collision
   rules, and code-deposit gas against a model.
 - [ ] Performance: a block-sized transaction bench (1000 mixed transfers and erc20 calls
