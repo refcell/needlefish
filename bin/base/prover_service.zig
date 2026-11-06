@@ -48,6 +48,9 @@ pub const WorkerFlags = struct {
     /// TEE: where to serve the enclave signer and health JSON-RPC.
     signer_rpc: ?[]const u8 = null,
     enclave_request_bytes_max: u32 = 64 << 20,
+    /// TEE: route proofs only to enclaves whose signer `TEEProverRegistry` (read over `--l1`)
+    /// finds valid; without it every local enclave is used.
+    tee_prover_registry: ?[20]u8 = null,
     prover_rpc: ?[]const u8 = null,
     l1: ?[]const u8 = null,
     l2: ?[]const u8 = null,
@@ -122,9 +125,17 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
                 return error.InvalidArguments;
         } else if (std.mem.eql(u8, name, "--enclave-request-bytes-max")) {
             flags.enclave_request_bytes_max = try parse_u32(value);
+        } else if (std.mem.eql(u8, name, "--tee-prover-registry-address")) {
+            const address = base.utilities.json.parse_fixed(20, value) catch
+                return error.InvalidArguments;
+            if (std.mem.allEqual(u8, &address, 0)) return error.InvalidArguments;
+            flags.tee_prover_registry = address;
         } else return error.InvalidArguments;
     }
     if (flags.backend == .tee and flags.enclave_key_file == null) return error.MissingFlag;
+    if (flags.backend != .tee and flags.tee_prover_registry != null) {
+        return error.InvalidArguments;
+    }
     if (flags.signer_rpc) |url| _ = try consensus_cli.parse_url(url);
     const required = [_]?[]const u8{ flags.prover_rpc, flags.l1, flags.l2, flags.rollup_config };
     for (required) |present| if (present == null) return error.MissingFlag;
@@ -227,6 +238,7 @@ pub fn worker_main(init: std.process.Init, args: []const []const u8) !u8 {
             "--l1 <url> --l2 <url> --rollup-config <file> [--l1-genesis <file>] " ++
             "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n         " ++
             "[--backend native|tee] [--enclave-key-file <file>] [--signer-rpc <url>]\n         " ++
+            "[--tee-prover-registry-address <addr>]\n         " ++
             telemetry_servers.Flags.usage ++ "\n", .{err});
         return 2;
     };
@@ -373,6 +385,16 @@ fn run_tee(
     std.debug.print("prover-worker: local-mode enclave signer 0x{x}\n", .{&signer_address});
     const links = [_]*tee_host.Link{&local.link};
     var pool: tee_host.Pool = try .init(&links);
+    var l1_endpoint: Endpoint = .init(allocator, &process.l1, process.pump(), 300_000);
+    defer l1_endpoint.deinit();
+    var rpc_registry: tee_host.rpc_registry.RpcRegistry(Endpoint) = undefined;
+    var checker: tee_host.Checker = undefined;
+    if (flags.tee_prover_registry) |address| {
+        rpc_registry = .init(&l1_endpoint, address);
+        checker = try .init(&links, rpc_registry.registry());
+        try pool.set_checker(&checker);
+        std.debug.print("prover-worker: gating enclaves on registry 0x{x}\n", .{&address});
+    }
     var generator: tee_host.Generator = try .init(allocator, process.source.as_source(), .{
         .rollup_config_json = inputs.rollup_json,
         .l1_config_json = inputs.l1_config,
@@ -458,6 +480,21 @@ test "prover service: command flags" {
     try std.testing.expectEqual(Backend.tee, tee.backend);
     try std.testing.expectEqualStrings("key.hex", tee.enclave_key_file.?);
     try std.testing.expectError(error.InvalidArguments, parse_worker(&.{ "--backend", "sp1" }));
+    const registry = [_][]const u8{
+        "--tee-prover-registry-address", "0x00000000000000000000000000000000000000a5",
+    };
+    const keyed = tee_args ++ [_][]const u8{ "--enclave-key-file", "key.hex" };
+    const gated = try parse_worker(&(keyed ++ registry));
+    try std.testing.expectEqual(@as(u8, 0xa5), gated.tee_prover_registry.?[19]);
+    // Registry gating is TEE-only, and the zero address is refused.
+    const native_registry = parse_worker(&(tee_args[0..6].* ++ [_][]const u8{
+        "--rollup-config", "rollup.json",
+    } ++ registry));
+    try std.testing.expectError(error.InvalidArguments, native_registry);
+    const zero = [_][]const u8{
+        "--tee-prover-registry-address", "0x0000000000000000000000000000000000000000",
+    };
+    try std.testing.expectError(error.InvalidArguments, parse_worker(&(keyed ++ zero)));
     const served = try parse_service(&.{ "--metrics.enabled", "--jobs-max", "4" });
     try std.testing.expect(served.telemetry.metrics_enabled);
     try std.testing.expectEqual(@as(u32, 4), served.jobs_max);
