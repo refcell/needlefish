@@ -1396,3 +1396,43 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
     const default = try h.request("debug_traceBlockByNumber", "[\"latest\"]");
     try expect_contains(default, "only callTracer");
 }
+
+test "eth: debug_traceCall traces a call against the head state" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const reverter = primitives.hex.decode_array(20, reverter_at[3..43]) catch unreachable;
+    try h.node.db.put_account(reverter, 0, 0, &.{ 0x5f, 0x5f, 0xfd });
+    const caller_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++
+        [_]u8{ 0x5a, 0xf1, 0x00 };
+    try h.node.db.put_account(@splat(0x57), 0, 0, &caller_code);
+    const caller_at = "\"0x5757575757575757575757575757575757575757\"";
+    const tracer = "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"withLog\":true}}";
+    const nested = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ ",\"gas\":\"0x30d40\"},\"latest\"," ++ tracer ++ "]",
+    );
+    try testing.expectEqual(@as(usize, 2), count_of(nested, "\"type\":\"CALL\""));
+    try expect_contains(nested, "\"gas\":\"0x30d40\"");
+    try expect_contains(nested, "\"logs\":[{");
+    const top = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\",{\"tracer\":\"callTracer\"," ++
+            "\"tracerConfig\":{\"onlyTopCall\":true}}]",
+    );
+    try testing.expectEqual(@as(usize, 1), count_of(top, "\"type\":\"CALL\""));
+    const reverted = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ reverter_at ++ "},\"latest\",{\"tracer\":\"callTracer\"}]",
+    );
+    try expect_contains(reverted, "\"error\":\"execution reverted\"");
+    try expect_contains(try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\"]",
+    ), "only callTracer");
+    // The executor's tracer is detached afterwards: a plain call still runs.
+    try expect_contains(try h.request("eth_call", "[{\"to\":" ++ caller_at ++ "}]"), "result");
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}

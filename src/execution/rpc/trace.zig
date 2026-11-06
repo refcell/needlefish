@@ -9,7 +9,8 @@
 //! reports the transaction's gas limit and gas used, logs of failed frames (and their
 //! descendants) are dropped, and `revertReason` decodes `Error(string)`. An EIP-8130
 //! transaction's later top-level phase calls nest under its first. Other tracers
-//! (struct logger, prestateTracer) are not supported.
+//! (struct logger, prestateTracer) are not supported. `debug_traceCall` runs the call as
+//! `eth_call` does (same view, gas default and simulation) with the recorder attached.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,6 +34,7 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "debug_traceTransaction", .handler = trace_transaction },
     .{ .name = "debug_traceBlockByNumber", .handler = trace_block_by_number },
     .{ .name = "debug_traceBlockByHash", .handler = trace_block_by_hash },
+    .{ .name = "debug_traceCall", .handler = trace_call },
 };
 
 /// Call depth bound (EIP-150 caps it at 1024; one more for the top frame and a phase shift).
@@ -425,6 +427,41 @@ fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     if (api.chain.record(hash) == null) return call.fail(rpc.code.server_error, "block not found");
     try trace(api, call, hash, null, options);
+}
+
+fn trace_call(api: *Api, call: *Call) HandlerError!void {
+    const request = try eth.parse_call_request(api, call);
+    const options = try options_of(call, try call.params.optional_raw());
+    try call.params.finish();
+    // The recorder sits between the parsed call data and the proof tail.
+    const data = request.message.data;
+    const base = @intFromPtr(api.scratch.ptr);
+    const data_end = if (data.len == 0) 0 else @intFromPtr(data.ptr) - base + data.len;
+    const end = switch (request.view) {
+        .head => api.scratch.len,
+        .historical => eth.proof_tail_offset(api).?, // Checked by `parse_call_request`.
+    };
+    if (data_end >= end) return call.fail(rpc.code.internal_error, "scratch too small");
+    var recorder = recorder_in(api.scratch[data_end..end]) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    recorder.with_logs = options.with_logs;
+    const tracer = recorder.tracer();
+    const executor = api.chain.executor;
+    executor.machine.tracer = &tracer;
+    const simulated = eth.simulate(api, call, request);
+    executor.machine.tracer = null;
+    const executed = switch (try simulated) {
+        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .executed => |executed| executed,
+    };
+    if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
+    if (recorder.frame_count == 0) return call.writer.null_value();
+    var header = eth.view_header(api, request.view);
+    var env = node.chain.env_of(&header);
+    env.timestamp += 1; // As `eth.simulate` runs it.
+    const limit = request.message.gas orelse executor.default_call_gas(&env);
+    const top: TopGas = .{ .limit = limit, .used = executed.gas_used };
+    try write_tree(call.writer, &recorder, 0, recorder.frame_count, top, options.only_top_call);
 }
 
 /// Per-transaction results of a re-execution: frame ranges and gas.
