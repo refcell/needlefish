@@ -142,7 +142,7 @@ pub const View = struct {
         const megagas = @as(f64, @floatFromInt(t.gas)) / 1e6;
         const all = t.passed == view.block_count;
         try view.out.print("\n  {s}{s}{d}/{d} blocks reproduced{s}  {d} txs  {d:.1} Mgas  " ++
-            "{d:.0} ms  {d:.0} Mgas/s\n", .{
+            "{d:.0} ms  {d:.2} ms/block  {d:.0} Mgas/s\n", .{
             s.bold(),
             if (all) s.green() else s.red(),
             t.passed,
@@ -151,6 +151,7 @@ pub const View = struct {
             t.transactions,
             megagas,
             seconds * 1e3,
+            seconds * 1e3 / @as(f64, @floatFromInt(@max(t.blocks, 1))),
             megagas / seconds,
         });
         if (all) {

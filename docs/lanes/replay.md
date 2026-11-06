@@ -115,6 +115,10 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: summary line adds ms/block; throughput baseline for both pinned windows in
+  docs/REPLAY.md (820-907 Mgas/s, 3.1-4.0 ms/block). Demo frames rechecked: bare `$` prompt,
+  relative paths only, no titlebar.
+
 - 2026-11-06: second pinned window in `just replay-check`: 53811190..53811209 (314 txs,
   70.6 Mgas, 1 gap round) 20/20.
 
