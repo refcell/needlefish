@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const proof_encoder = @import("../primitives/proof_encoder.zig");
 
 pub const Hash = [32]u8;
 pub const Address = [20]u8;
@@ -452,17 +453,9 @@ pub fn encode_tee_proof_bytes(
     l1_origin_hash: Hash,
     l1_origin_number: u64,
 ) error{ InvalidSignatureLength, InvalidV }!void {
-    if (signature.len != 65) return error.InvalidSignatureLength;
-    out.* = @splat(0);
-    @memcpy(out[1..33], &l1_origin_hash);
-    std.mem.writeInt(u64, out[57..65], l1_origin_number, .big);
-    @memcpy(out[65..130], signature);
-    out[129] = switch (out[129]) {
-        0, 1 => out[129] + 27,
-        27, 28 => out[129],
-        else => return error.InvalidV,
-    };
-    assert(out[0] == 0);
+    try proof_encoder.encode_proof_bytes(out, signature, l1_origin_hash, l1_origin_number);
+    assert(out[0] == proof_encoder.proof_type_tee);
+    assert(out[129] == 27 or out[129] == 28);
 }
 
 const testing = std.testing;
