@@ -80,6 +80,13 @@ allocation after startup.
   `basectl/src/denim.rs`, which upstream only shows in the TUI): schedule, BaseTime proxy and
   implementation, tx[1] metadata + receipt, header/storage/getter millis, 200 ms cadence walk,
   and the 12 HTTP timestamp wire fields; table or `--json`, exit 1 on any fail.
+- [ ] `infra/roxy` batch splitting: a batch whose methods route to different upstreams is split
+  per route and the responses reassembled in request order (proxyd parity; today -32600).
+- [ ] `infra/roxy` consensus tags: rewrite `latest` (and default block params) to the highest
+  block every admitted upstream has, so reads spread over replicas never go backwards
+  (proxyd consensus mode); builds on the lag poller.
+- [ ] `basectl node-metrics`: port upstream `commands/node_metrics.rs` (scrape and summarize a
+  node's Prometheus endpoint).
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
