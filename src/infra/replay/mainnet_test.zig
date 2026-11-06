@@ -59,13 +59,26 @@ test "replay: ten Base mainnet blocks reproduce every header field" {
 }
 
 /// Replays the fixture and returns each block's computed state root (all must pass).
-fn replay_roots(archive: *const archive_module.Archive, probe: bool) ![10][32]u8 {
+fn replay_roots(
+    archive: *const archive_module.Archive,
+    probe: bool,
+    threads: u32,
+) ![10][32]u8 {
     const allocator = testing.allocator;
     const replayer = try allocator.create(replayer_module.Replayer);
     defer allocator.destroy(replayer);
     const spec = &chainspec.ChainSpec.presets.base_mainnet;
-    try replayer.init(allocator, spec, archive, replayer_module.config_for(archive));
+    var config = replayer_module.config_for(archive);
+    config.executor.recovery_threads = threads;
+    try replayer.init(allocator, spec, archive, config);
     defer replayer.deinit(allocator);
+    // Parallel and serial witness hashing build the same store, in the same order.
+    const nodes = replayer.sparse.nodes;
+    try testing.expect(nodes.count > 0);
+    for (nodes.entries[0..nodes.count]) |*entry| {
+        const bytes = nodes.arena[entry.offset..][0..entry.len];
+        try testing.expectEqualSlices(u8, &keccak256(bytes), &entry.hash);
+    }
     replayer.probe = probe;
     var roots: [10][32]u8 = undefined;
     var index: usize = 0;
@@ -87,8 +100,9 @@ test "replay: a second replay, in probe mode, computes the same roots" {
     var archive = try archive_module.Archive.init(allocator, fixture_config);
     defer archive.deinit(allocator);
     try archive_module.decode(allocator, fixture, &archive);
-    const first = try replay_roots(&archive, false);
-    const second = try replay_roots(&archive, true);
+    // The second also hashes the witness on 3 threads.
+    const first = try replay_roots(&archive, false, 0);
+    const second = try replay_roots(&archive, true, 3);
     for (first, second) |a, b| try testing.expectEqualSlices(u8, &a, &b);
     try testing.expect(!std.mem.eql(u8, &first[0], &first[9]));
 }

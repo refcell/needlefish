@@ -787,6 +787,17 @@ pub const SparseState = struct {
         _ = try self.nodes.add(bytes);
     }
 
+    /// `add_node` for a node whose keccak256 the caller already computed (in parallel, say).
+    /// The caller guarantees `hash == keccak256(bytes)`; safe builds check it.
+    pub fn add_node_hashed(
+        self: *SparseState,
+        hash: *const Hash,
+        bytes: []const u8,
+    ) error{WitnessFull}!void {
+        if (std.debug.runtime_safety) assert(std.mem.eql(u8, &node.keccak256(bytes), hash));
+        try self.nodes.add_hashed(hash, bytes, false);
+    }
+
     pub fn add_code(self: *SparseState, code: []const u8) error{WitnessFull}!void {
         _ = try self.codes.add(code);
     }

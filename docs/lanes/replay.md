@@ -82,8 +82,8 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   failed blocks).
 - [x] Pinned 100-block window check: `just replay-check` (53775088..53775187).
 - [x] Fetch cost: drop the diffMode trace; changed keys come from pre/post proofs.
-- [ ] Hash witness nodes in parallel in `Replayer.init` (~60 ms of the 0.45 s wall for 100
-  blocks; needs a pub add-with-known-hash on `db.witness.NodeStore`, nf-trie-db's file).
+- [x] Hash witness nodes in parallel in `Replayer.init` (added the tiny additive
+  `SparseState.add_node_hashed` in nf-trie-db's witness.zig; safe builds check the hash).
 - [ ] (blocked) Third pinned window from an older fork era (pre-Isthmus, e.g. block
   29000000): keyless endpoints cannot serve it. drpc's free plan mostly times out tracing
   old blocks (one success: a 91 MB prestate trace, the next block timed out); blastapi
@@ -122,6 +122,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-06: `Replayer.init` hashes witness nodes on the recovery-thread count of short-lived
+  workers (strided shares), then inserts serially in archive order, so the store is
+  identical. 100-block `replay run` 0.45 s -> 0.40 s wall. Seeded fuzz of the strided shares;
+  the determinism test now loads one replay serially and one on 3 threads.
 
 - 2026-11-06: docs refresh: baseline row for the fourth window over 3 runs (860-987
   Mgas/s), fetch time ~70 s per 10 blocks without the diff trace.

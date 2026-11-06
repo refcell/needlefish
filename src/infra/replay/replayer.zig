@@ -169,6 +169,29 @@ pub const Gaps = struct {
 
 /// Recent (code hash, address) pairs from account reads, so a missing code can be traced
 /// back to an account the fetcher can ask for. A ring: old pairs are overwritten.
+/// Most witness hashing threads; the executor caps recovery threads the same way.
+const hash_threads_max = 64;
+/// Fewer nodes than this hash inline: thread start-up would cost more than it saves.
+const hash_parallel_min = 4096;
+/// keccak256 needs a few hundred bytes of stack.
+const hash_stack_bytes = 64 << 10;
+
+/// One worker's share of witness hashing: nodes `first`, `first + stride`, ...
+const HashJob = struct {
+    state: *const db.witness.ByteList,
+    hashes: []Hash,
+    first: u32,
+
+    fn run(job: HashJob, stride: u32) void {
+        assert(stride > 0);
+        assert(job.hashes.len == job.state.count);
+        var index: u32 = job.first;
+        while (index < job.state.count) : (index += stride) {
+            job.hashes[index] = keccak256(job.state.get(index));
+        }
+    }
+};
+
 const CodeOwners = struct {
     const capacity = 1024;
     hashes: [capacity]Hash = undefined,
@@ -330,7 +353,7 @@ pub const Replayer = struct {
         errdefer allocator.free(self.transaction_views);
         self.executor = try Executor.init_backend(allocator, spec, self.backend(), config.executor);
         errdefer self.executor.deinit(allocator);
-        try self.load();
+        try self.load(allocator, config.executor.recovery_threads);
     }
 
     pub fn deinit(self: *Replayer, allocator: std.mem.Allocator) void {
@@ -342,8 +365,49 @@ pub const Replayer = struct {
         self.* = undefined;
     }
 
+    /// Adds every witness node, hashing them on `threads` short-lived workers (the
+    /// executor's recovery workers are idle during init), then inserting serially in archive
+    /// order, so the store is the same as a serial `add_node` loop builds.
+    fn load_nodes(
+        self: *Replayer,
+        allocator: std.mem.Allocator,
+        threads: u32,
+    ) (Error || error{OutOfMemory})!void {
+        const state = &self.archive.witness.state;
+        const count = state.count;
+        const workers: u32 = @min(threads, hash_threads_max);
+        if (workers == 0 or count < hash_parallel_min) {
+            for (0..count) |index| try self.sparse.add_node(state.get(@intCast(index)));
+            return;
+        }
+        const hashes = try allocator.alloc(Hash, count);
+        defer allocator.free(hashes);
+        var handles: [hash_threads_max]std.Thread = undefined;
+        var spawned: u32 = 0;
+        // Worker 0 is this thread; a failed spawn leaves its share to this thread.
+        while (spawned + 1 < workers) : (spawned += 1) {
+            const job: HashJob = .{ .state = state, .hashes = hashes, .first = spawned + 1 };
+            const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = hash_stack_bytes };
+            handles[spawned] = std.Thread.spawn(spawn_config, HashJob.run, .{ job, workers }) catch
+                break;
+        }
+        HashJob.run(.{ .state = state, .hashes = hashes, .first = 0 }, workers);
+        for (spawned + 1..workers) |first| {
+            HashJob.run(.{ .state = state, .hashes = hashes, .first = @intCast(first) }, workers);
+        }
+        for (handles[0..spawned]) |handle| handle.join();
+        for (0..count) |index| {
+            try self.sparse.add_node_hashed(&hashes[index], state.get(@intCast(index)));
+        }
+        assert(self.sparse.nodes.count <= count);
+    }
+
     /// Binds the sparse state to the first block's parent and loads every node and code.
-    fn load(self: *Replayer) Error!void {
+    fn load(
+        self: *Replayer,
+        allocator: std.mem.Allocator,
+        threads: u32,
+    ) (Error || error{OutOfMemory})!void {
         const archive = self.archive;
         const witness = &archive.witness;
         const ancestors = archive.ancestors[0..archive.ancestors_len];
@@ -359,9 +423,7 @@ pub const Replayer = struct {
             .hash = archive.parent_hash(),
         });
         self.sparse.set_fallback(self.fallback());
-        for (0..witness.state.count) |index| {
-            try self.sparse.add_node(witness.state.get(@intCast(index)));
-        }
+        try self.load_nodes(allocator, threads);
         for (0..witness.codes.count) |index| {
             try self.sparse.add_code(witness.codes.get(@intCast(index)));
         }
@@ -676,4 +738,37 @@ pub fn diff_receipts(
     }
     assert(expected.len == computed.len);
     return null;
+}
+
+test "replay: strided witness hashing covers every node once (seeded fuzz)" {
+    const allocator = std.testing.allocator;
+    var list = try db.witness.ByteList.init(allocator, 512, 64 << 10);
+    defer list.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(0x7e9a);
+    const random = prng.random();
+    var hashes: [512]Hash = undefined;
+    for (0..64) |_| {
+        list.clear();
+        const count = random.uintAtMost(u32, 300);
+        var bytes: [96]u8 = undefined;
+        for (0..count) |_| {
+            const len = random.uintAtMost(usize, bytes.len);
+            random.bytes(bytes[0..len]);
+            try list.append(bytes[0..len]);
+        }
+        const stride = random.intRangeAtMost(u32, 1, 9);
+        @memset(hashes[0..count], @as(Hash, @splat(0)));
+        for (0..stride) |first| {
+            const job: HashJob = .{
+                .state = &list,
+                .hashes = hashes[0..count],
+                .first = @intCast(first),
+            };
+            job.run(stride);
+        }
+        for (0..count) |index| {
+            const expected = keccak256(list.get(@intCast(index)));
+            try std.testing.expectEqualSlices(u8, &expected, &hashes[index]);
+        }
+    }
 }

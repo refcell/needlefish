@@ -29,8 +29,8 @@ block, and Mgas/s. `just replay-check` on an Apple M-series laptop under load (l
 | 53864562..53864581 | 20 | 311 | 56.6 Mgas | 57-66 ms | 2.9-3.3 ms | 860-987 Mgas/s |
 
 Before sender prefetch the first two windows ran at 820-907 Mgas/s. Loading the 100-block
-archive (read, digest check, parse, witness index) adds about 180 ms to a run: 0.45 s wall
-in total (version 1 deflated archives took 0.72 s, mostly inflating).
+archive (read, digest check, parse, witness index, hashed in parallel) adds about 130 ms
+to a run: 0.40 s wall in total (version 1 deflated archives took 0.72 s, mostly inflating).
 
 A drop well outside these ranges on the same machine is a regression to bisect.
 
