@@ -301,6 +301,7 @@ pub const State = struct {
     pub fn begin_transaction(state: *State) void {
         assert(state.tx_id < std.math.maxInt(u32));
         state.tx_id += 1;
+        state.static_warm = .{};
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
@@ -736,6 +737,25 @@ pub const State = struct {
         return state.database.block_hash(number);
     }
 };
+
+test "state: static warm set by address" {
+    const natives = [_]Address{@splat(0x42)};
+    const warm = StaticWarm{ .precompiles = 0b110, .p256 = true, .natives = &natives };
+    var address: Address = @splat(0);
+    try std.testing.expect(!warm.contains(address));
+    address[19] = 1;
+    try std.testing.expect(warm.contains(address));
+    address[19] = 3;
+    try std.testing.expect(!warm.contains(address));
+    address[18] = 1;
+    address[19] = 0;
+    try std.testing.expect(warm.contains(address)); // 0x100.
+    address[0] = 1;
+    try std.testing.expect(!warm.contains(address)); // Not a small address.
+    try std.testing.expect(warm.contains(natives[0]));
+    const empty = StaticWarm{};
+    try std.testing.expect(!empty.contains(natives[0]));
+}
 
 test "state: entry is compact" {
     try std.testing.expect(@sizeOf(Entry) <= 64);

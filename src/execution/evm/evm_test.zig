@@ -399,3 +399,23 @@ test "evm: a delegation to a precompile runs empty code, not the precompile" {
     try std.testing.expectEqual(@as(u256, 1), try h.storage(contract, 0));
     try std.testing.expectEqual(@as(u256, 0), try h.storage(contract, 1));
 }
+
+test "transaction: precompiles are warm by predicate, without loading, for one tx" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const ecrecover = primitives.address_from_int(1);
+    const point_evaluation = primitives.address_from_int(0x0a);
+    const not_precompile = primitives.address_from_int(0x12);
+    h.state.begin_transaction();
+    try std.testing.expect(!h.state.is_warm(ecrecover));
+    try transaction.warm_system_addresses(.osaka, &h.evm);
+    try std.testing.expectEqual(@as(u32, 1), h.state.accounts.count()); // The coinbase only.
+    try std.testing.expect(h.state.is_warm(ecrecover));
+    try std.testing.expect(h.state.is_warm(point_evaluation));
+    try std.testing.expect(!(try h.state.access(ecrecover)).is_cold);
+    try std.testing.expect((try h.state.access(not_precompile)).is_cold);
+    h.state.begin_transaction(); // A system call or the next tx starts cold.
+    try std.testing.expect(!h.state.is_warm(ecrecover));
+    try std.testing.expect((try h.state.access(ecrecover)).is_cold);
+}

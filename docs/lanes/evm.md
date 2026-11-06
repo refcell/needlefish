@@ -133,6 +133,14 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Replay focus (owner, priority over the rest): audit EVM-side fee accounting at Base
   mainnet 53715983+ (Denim): L1 info deposit, L1 data fee, operator fee, DA footprint fee,
   fee vault credits, BaseTime deposit, 7702/system calls. Act first on nf-replay repros.
+  Audit 1 (vs base/base `handler.rs` `reward_beneficiary`, `l1block.rs`): matches. The tip
+  and base-fee vault use post-refund, post-7623-floor gas; the operator vault gets
+  charge(gas_used) and the caller is refunded charge(limit) - charge(gas_used) (Jovian x100
+  multiplier, no /1e6); the L1 fee is FastLZ-based and exempt for empty/0x7e envelopes;
+  deposits pay nothing. BaseTime's `ensure_predeploy` has no caller upstream (the proxy
+  arrives through upgrade deposits: consensus lane). The DA footprint feeds the header's
+  blob_gas_used, not per-tx fees (executor/builder lanes). System calls live in
+  `node/executor.zig`; `begin_transaction` now clears `static_warm`, so they start cold.
 - [ ] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const Tracer` with
   enter(kind, from, to, value, gas, input) / exit(gas_used, output, status) / log; null is
   zero cost.
