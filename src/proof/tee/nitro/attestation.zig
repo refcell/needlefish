@@ -345,7 +345,7 @@ test "nitro attestation: protected header must name ES384" {
 
 const SliceSink = struct {
     writer: cbor.Writer,
-    fn update(sink: *SliceSink, bytes: []const u8) void {
+    pub fn update(sink: *SliceSink, bytes: []const u8) void {
         sink.writer.raw(bytes) catch unreachable; // Test buffer is sized generously.
     }
 };
@@ -382,7 +382,7 @@ test "nitro attestation: parses the real Nitro attestation document" {
     }
     try testing.expectEqualSlices(
         u8,
-        @embedFile("testdata/aws_nitro_root_g1.der"),
+        @embedFile("aws_nitro_root_g1.der"),
         document.cabundle[0],
     );
     try testing.expectEqualSlices(u8, @embedFile("testdata/leaf.der"), document.certificate);

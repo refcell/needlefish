@@ -10,7 +10,7 @@ const fuzz = @import("../../../testing/fuzz.zig");
 const CertChain = x509.CertChain;
 const ChainResult = x509.ChainResult;
 
-const root_der = @embedFile("testdata/aws_nitro_root_g1.der");
+const root_der = @embedFile("aws_nitro_root_g1.der");
 const inter1_der = @embedFile("testdata/inter1.der");
 const inter2_der = @embedFile("testdata/inter2.der");
 const inter3_der = @embedFile("testdata/inter3.der");
