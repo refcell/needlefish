@@ -119,8 +119,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Performance: `CallRequest` carries the target and code accounts the interpreter already
   loaded, so `start_call` skips both lookups: call loop 19.9 -> 17.9 us (interleaved A/B
   against origin/main in a scratch worktree).
-- [ ] Fuzz: differential fuzz of CALL-family value/return-data plumbing (CALL, STATICCALL,
-  DELEGATECALL, RETURNDATACOPY/SIZE) against a small reference model of two contracts.
+- [x] Fuzz: differential fuzz of CALL-family plumbing (`call_fuzz.zig`: CALL/CALLCODE/
+  DELEGATECALL/STATICCALL caller, value, and address; revert data; output window;
+  RETURNDATASIZE; RETURNDATACOPY including the out-of-bounds halt) against a two-contract
+  model.
 - [ ] Performance: keccak256 loop is ~185 ns per 64-byte hash; compare the crypto lane's
   Keccak-f with a 2x-unrolled round and hand the result to that lane if faster.
 - [x] Performance: account map — `start_call` reuses the parent frame's account for the

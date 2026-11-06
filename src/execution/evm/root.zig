@@ -36,6 +36,7 @@ test {
     _ = @import("evm_fuzz.zig");
     _ = @import("arith_fuzz.zig");
     _ = @import("memory_fuzz.zig");
+    _ = @import("call_fuzz.zig");
 }
 
 pub const Fork = fork.Fork;
