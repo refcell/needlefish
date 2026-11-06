@@ -204,6 +204,12 @@ const KqueueImpl = struct {
         return os.peer_address(fd);
     }
 
+    /// Blocking positional read, outside the event loop (a synchronous point read).
+    pub fn read_now(io: *KqueueImpl, fd: Fd, buffer: []u8, offset: u64) common.ReadError!usize {
+        _ = io;
+        return os.pread(fd, buffer, offset);
+    }
+
     pub fn close_now(io: *KqueueImpl, fd: Fd) void {
         _ = io;
         os.close(fd);

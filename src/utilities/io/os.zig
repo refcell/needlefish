@@ -289,6 +289,24 @@ pub fn open_file(path: []const u8, mode: common.OpenMode) common.SetupError!fd_t
     };
 }
 
+/// Blocking positional read: the bytes read (0 at end of file). Retries interrupted calls a
+/// bounded number of times. For callers that must not wait for a completion (a synchronous
+/// point read); everything else goes through the completion backends.
+pub fn pread(fd: fd_t, buffer: []u8, offset: u64) common.ReadError!usize {
+    assert(buffer.len > 0);
+    var attempts: u32 = 0;
+    while (attempts < 64) : (attempts += 1) {
+        const rc = system.pread(fd, buffer.ptr, buffer.len, @intCast(offset));
+        const err = errno(rc);
+        if (err == .INTR) continue;
+        if (err != .SUCCESS) return read_error(err);
+        const size: usize = @intCast(rc);
+        assert(size <= buffer.len);
+        return size;
+    }
+    return error.Unexpected;
+}
+
 pub fn close(fd: fd_t) void {
     // close(2) always releases the descriptor, even on EINTR/EIO; nothing to retry.
     _ = system.close(fd);

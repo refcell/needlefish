@@ -216,6 +216,12 @@ const LinuxIoUring = struct {
         return os.peer_address(fd);
     }
 
+    /// Blocking positional read, outside the ring (a synchronous point read).
+    pub fn read_now(io: *LinuxIoUring, fd: Fd, buffer: []u8, offset: u64) common.ReadError!usize {
+        _ = io;
+        return os.pread(fd, buffer, offset);
+    }
+
     pub fn close_now(io: *LinuxIoUring, fd: Fd) void {
         _ = io;
         os.close(fd);

@@ -239,6 +239,28 @@ pub fn GridType(comptime Storage: type) type {
             self.read_submit(read);
         }
 
+        /// Reads and verifies the block `reference` names into `buffer` (one block) at once,
+        /// through `read_sectors_sync`, with `read_block`'s checks and retries. Returns the
+        /// verified payload (inside `buffer`), or null if every attempt failed.
+        pub fn read_sync(
+            self: *Self,
+            buffer: []align(sector_size) u8,
+            reference: Reference,
+            kind: BlockKind,
+        ) ?[]const u8 {
+            assert(buffer.len == self.config.block_size);
+            assert(reference.address >= 1 and reference.address <= self.config.block_count);
+            const offset = self.offset_of(reference.address);
+            var attempt: u32 = 0;
+            while (attempt < read_attempts_max) : (attempt += 1) {
+                if (attempt > 0) self.stats.read_retries += 1;
+                self.stats.reads += 1;
+                self.storage.read_sectors_sync(buffer, offset) catch continue;
+                if (verify(buffer, self.format_id, reference, kind)) |payload| return payload;
+            }
+            return null;
+        }
+
         fn read_submit(self: *Self, read: *Read) void {
             assert(read.attempts < read_attempts_max);
             read.attempts += 1;
@@ -382,4 +404,59 @@ test "grid: transient read faults are retried" {
     // 20% faults per read, 4 attempts: losing all four is rare.
     try testing.expect(verified >= 30);
     try testing.expect(grid.stats.read_retries > 0);
+}
+
+test "grid: read_sync verifies like read_block and retries transient faults" {
+    const block_size: u32 = 2 * sector_size;
+    var sim = try SimStorage.init(testing.allocator, .{ .size_bytes = 16 * block_size, .seed = 4 });
+    defer sim.deinit(testing.allocator);
+    var grid = GridType(SimStorage).init(&sim, .{
+        .zone_offset = 0,
+        .block_size = block_size,
+        .block_count = 16,
+    });
+    grid.format_id = 5;
+    var harness: TestIo = .{};
+    test_context = &harness;
+    defer test_context = null;
+    const block = try testing.allocator.alignedAlloc(u8, .fromByteUnits(sector_size), block_size);
+    defer testing.allocator.free(block);
+    const buffer = try testing.allocator.alignedAlloc(u8, .fromByteUnits(sector_size), block_size);
+    defer testing.allocator.free(buffer);
+    var prng = Prng.init(8);
+    prng.fill(block[block_header_size..][0..3000]);
+    const reference = seal(block, 5, 2, .table_data, 3000);
+    var write: GridType(SimStorage).Write = .{};
+    grid.write_block(TestIo.on_write, &write, block, 2);
+    while (harness.writes_done == 0) sim.tick();
+    const payload = grid.read_sync(buffer, reference, .table_data).?;
+    try testing.expectEqualSlices(u8, block[block_header_size..][0..3000], payload);
+    // Wrong kind, misdirected, and stale references fail every attempt.
+    try testing.expect(grid.read_sync(buffer, reference, .table_index) == null);
+    var misdirected = reference;
+    misdirected.address = 3;
+    try testing.expect(grid.read_sync(buffer, misdirected, .table_data) == null);
+    var stale = reference;
+    stale.checksum +%= 1;
+    try testing.expect(grid.read_sync(buffer, stale, .table_data) == null);
+    const attempts_max = GridType(SimStorage).read_attempts_max;
+    try testing.expectEqual(@as(u64, 3 * (attempts_max - 1)), grid.stats.read_retries);
+    // Transient faults are retried; rot is not.
+    sim.options.read_fault_numerator = 500;
+    const retries = grid.stats.read_retries;
+    var verified: u32 = 0;
+    for (0..32) |_| {
+        const read = grid.read_sync(buffer, reference, .table_data) orelse continue;
+        try testing.expectEqualSlices(u8, block[block_header_size..][0..3000], read);
+        verified += 1;
+    }
+    // Half the reads flip a bit; losing all four attempts is rare (1 in 16).
+    try testing.expect(verified >= 24);
+    try testing.expect(grid.stats.read_retries > retries);
+    sim.options.read_fault_numerator = 0;
+    // Rot inside the used bytes (`corrupt_sector` may land in the unused padding).
+    const rotten: usize = @intCast(grid.offset_of(2) + block_header_size + 1000);
+    sim.durable[rotten] ^= 0x04;
+    sim.memory[rotten] ^= 0x04;
+    try testing.expect(grid.read_sync(buffer, reference, .table_data) == null);
 }

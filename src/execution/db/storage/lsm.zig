@@ -105,6 +105,8 @@ pub const Stats = struct {
     /// Steps the job waited for a free block (the grid full or reserved by another writer).
     stalls: u64 = 0,
     busy: u64 = 0,
+    /// Synchronous point reads (`get`).
+    gets: u64 = 0,
     /// Blocks of an interrupted job that open released.
     orphans_released: u64 = 0,
 };
@@ -211,6 +213,9 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         orphan_count: u32 = 0,
         compaction: Compaction,
         reader: Table.Reader,
+        /// `get`'s block buffer (one block, read synchronously) and its copy of the value.
+        get_buffer: []align(storage.sector_size) u8,
+        get_value: Value = undefined,
         lookup_active: bool = false,
         lookup_asynchronous: bool = false,
         lookup_key: Key = undefined,
@@ -346,7 +351,11 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             errdefer allocator.free(orphans);
             var compaction = try Compaction.init(allocator, grid, config, layout);
             errdefer compaction.deinit(allocator);
-            const reader = try Table.Reader.init(allocator, grid, cache);
+            var reader = try Table.Reader.init(allocator, grid, cache);
+            errdefer reader.deinit(allocator);
+            const alignment = comptime std.mem.Alignment.fromByteUnits(storage.sector_size);
+            const get_buffer = try allocator.alignedAlloc(u8, alignment, config.block_size);
+            @memset(get_buffer, 0);
             @memset(slot_used, false);
             @memset(slot_blocks, 0);
             @memset(filters, 0);
@@ -363,6 +372,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
                 .orphans = orphans,
                 .compaction = compaction,
                 .reader = reader,
+                .get_buffer = get_buffer,
             };
         }
 
@@ -377,6 +387,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             allocator.free(self.orphans);
             self.compaction.deinit(allocator);
             self.reader.deinit(allocator);
+            allocator.free(self.get_buffer);
             self.* = undefined;
         }
 
@@ -598,6 +609,105 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             self.compaction.lookup_done();
             if (self.lookup_asynchronous) callback(self);
             return .done;
+        }
+
+        // Synchronous point read.
+
+        /// What one table holds for a key: a value or a tombstone (null: neither).
+        const Probe = union(enum) { tombstone, value: []const u8 };
+
+        /// Reads `key` at once (no callback, no tick): its value, or null when absent. Same
+        /// search as `lookup` (memtables, then level 0 newest first, then one table per deeper
+        /// level, filters first), but table blocks come from the block cache or a blocking
+        /// grid read (`Grid.read_sync`). The value stays valid until the next `get`. A block
+        /// that fails to verify returns `error.Corrupt` and faults the tree, as a lookup does
+        /// (sticky: later reads past the memtables return `error.Corrupt` too). Manifest
+        /// changes (job installs) run only from callbacks, so none happens during a call.
+        pub fn get(self: *Tree, key: *const Key) Error!?[]const u8 {
+            assert(self.scan_callback == null);
+            self.stats.gets += 1;
+            if (self.memtable_find(key)) |found| {
+                const memtable, const entry = found;
+                if (memtable.tombstones[entry]) return null;
+                return self.get_copy(memtable.value(entry));
+            }
+            if (self.fault) return error.Corrupt;
+            for (self.level_list(0)) |slot| {
+                if (!self.in_range(slot, key)) continue;
+                const probe = try self.get_table(slot, key) orelse continue;
+                return switch (probe) {
+                    .tombstone => null,
+                    .value => |value| value,
+                };
+            }
+            var level: u32 = 1;
+            while (level < self.config.levels_count) : (level += 1) {
+                const slot = self.level_find(level, key) orelse continue;
+                const probe = try self.get_table(slot, key) orelse continue;
+                return switch (probe) {
+                    .tombstone => null,
+                    .value => |value| value,
+                };
+            }
+            return null;
+        }
+
+        fn get_copy(self: *Tree, value: []const u8) []const u8 {
+            assert(value_length_valid(value.len));
+            @memcpy(self.get_value[0..value.len], value);
+            return self.get_value[0..value.len];
+        }
+
+        fn get_table(self: *Tree, slot: u32, key: *const Key) Error!?Probe {
+            assert(self.slot_used[slot]);
+            if (self.slot_filter(slot)) |words| {
+                if (!filter_module.may_contain(words, filter_module.hash(key))) {
+                    self.stats.filter_negatives += 1;
+                    return null;
+                }
+            }
+            self.stats.table_probes += 1;
+            const info = &self.slot_infos[slot];
+            const index = try self.get_block(info.index, .table_index);
+            const ordinal = Table.index_find(index, key) orelse return null;
+            // Taken before the data block's cache put can evict the index block.
+            const reference = Table.index_reference(index, ordinal);
+            const data = try self.get_block(reference, .table_data);
+            const value = Table.data_search(data, key) orelse return null;
+            if (value.len == 0) return .tombstone;
+            if (!value_length_valid(value.len)) return self.get_fault();
+            return .{ .value = self.get_copy(value) };
+        }
+
+        /// The verified payload of a table block: cached, or read at once and cached.
+        fn get_block(
+            self: *Tree,
+            reference: grid_module.Reference,
+            kind: grid_module.BlockKind,
+        ) Error![]const u8 {
+            const cache = self.reader.cache;
+            const block = cache.get(reference) orelse block: {
+                const payload = self.grid.read_sync(self.get_buffer, reference, kind) orelse
+                    return self.get_fault();
+                const valid = switch (kind) {
+                    .table_index => Table.index_valid(payload, self.grid.config.block_count),
+                    .table_data => Table.data_valid(payload),
+                    _ => false,
+                };
+                if (!valid) return self.get_fault();
+                const length = grid_module.block_header_size + payload.len;
+                break :block cache.put(reference, self.get_buffer[0..length]);
+            };
+            const header: *const grid_module.BlockHeader = @ptrCast(@alignCast(
+                block[0..grid_module.block_header_size],
+            ));
+            assert(header.address == reference.address);
+            return block[grid_module.block_header_size..][0..header.payload_size];
+        }
+
+        fn get_fault(self: *Tree) error{Corrupt} {
+            self.fault = true;
+            return error.Corrupt;
         }
 
         // Levels and table slots.

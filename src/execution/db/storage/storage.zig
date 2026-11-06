@@ -6,6 +6,7 @@
 //!
 //!   read_sectors(self, callback: *const fn (*Read) void, read: *Read,
 //!       buffer: []u8, offset: u64) void
+//!   read_sectors_sync(self, buffer: []u8, offset: u64) error{ReadFailed}!void
 //!   write_sectors(self, callback: *const fn (*Write) void, write: *Write,
 //!       buffer: []const u8, offset: u64) void
 //!   sync(self, callback: *const fn (*Sync) void, sync: *Sync) void
@@ -23,6 +24,10 @@
 //!   durable when the sync callback fires. A completed but unsynced write may be lost, kept,
 //!   or torn by a crash.
 //! - Concurrent operations must not overlap a pending write (the simulator asserts this).
+//! - `read_sectors_sync` reads at once, blocking the caller, and runs no callback: the one
+//!   synchronous operation, for point reads of callers that cannot wait for a tick (EVM state
+//!   reads). It sees every write whose callback fired. `error.ReadFailed`: the backend could
+//!   not read the sectors (after its own retries); the buffer is then undefined.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -76,6 +81,7 @@ pub fn assert_aligned(offset: u64, length: u64) void {
 pub fn assert_interface(comptime Storage: type) void {
     comptime {
         assert(@hasDecl(Storage, "read_sectors"));
+        assert(@hasDecl(Storage, "read_sectors_sync"));
         assert(@hasDecl(Storage, "write_sectors"));
         assert(@hasDecl(Storage, "sync"));
         assert(@hasDecl(Storage, "tick"));

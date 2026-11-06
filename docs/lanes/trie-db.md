@@ -1073,6 +1073,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `level0_tables_max - 1` + that many slots (unchanged when the memtable fits a table).
   `orphans_max` now counts a job's data blocks plus a partial data block and an index block
   per output table, so `checkpoint_size_max` grows slightly for every tree.
+- 2026-11-06: synchronous point read (disk-state import step 2). Deliberately deviates from
+  docs/design/disk-state.md section 9 ("the storage interface gained no synchronous read"):
+  every state caller (evm vtable, `Overlay`, sparse `Resolver`) is synchronous, so the
+  `Storage` contract gains `read_sectors_sync(buffer, offset) error{ReadFailed}!void`
+  (SimStorage: memcpy from what reads see, same transient bit flips; IoStorage: blocking
+  `pread` via the new `IO.read_now` / `utilities.io.os.pread`, short reads continued, errors
+  retried `read_retries_max` times then `ReadFailed`, past EOF zeros). `Grid.read_sync`
+  verifies and retries as `read_block`; `Tree.get(key) Error!?[]const u8` searches like
+  `lookup` through the shared block cache with its own block buffer, so it may run while an
+  async lookup reads. A block that fails to verify returns `error.Corrupt` and sets the sticky
+  `fault` (as a lookup does): later reads past the memtables fail too and compaction stops.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as

@@ -54,6 +54,8 @@ pub const SimStorage = struct {
 
     pub const Stats = struct {
         reads: u64 = 0,
+        /// Of `reads`, the synchronous ones.
+        reads_sync: u64 = 0,
         writes: u64 = 0,
         syncs: u64 = 0,
         read_faults: u64 = 0,
@@ -119,6 +121,17 @@ pub const SimStorage = struct {
         self.assert_no_pending_write_overlap(offset, buffer.len);
         read.* = .{ .callback = callback, .buffer = buffer, .offset = offset };
         self.submit(&read.completion, .read);
+    }
+
+    /// Reads at once from what reads see now, with the same transient read faults.
+    pub fn read_sectors_sync(self: *SimStorage, buffer: []u8, offset: u64) error{ReadFailed}!void {
+        self.assert_range(offset, buffer.len);
+        self.assert_no_pending_write_overlap(offset, buffer.len);
+        const start: usize = @intCast(offset);
+        @memcpy(buffer, self.memory[start..][0..buffer.len]);
+        self.maybe_read_fault(buffer);
+        self.stats.reads += 1;
+        self.stats.reads_sync += 1;
     }
 
     pub fn write_sectors(
@@ -513,5 +526,27 @@ test "sim storage: corrupt_sector and read faults flip bits" {
     sim.read_sectors(TestOps.on_read, &ops.read, &buffer, 0);
     drain(&sim);
     try testing.expect(std.mem.count(u8, &buffer, &.{0}) == sector_size - 1);
+    try testing.expectEqual(@as(u64, 1), sim.stats.read_faults);
+}
+
+test "sim storage: read_sectors_sync sees completed writes, not pending ones, with faults" {
+    var sim = try SimStorage.init(testing.allocator, .{ .size_bytes = 8 * sector_size, .seed = 2 });
+    defer sim.deinit(testing.allocator);
+    var ops: TestOps = .{};
+    var data: [sector_size]u8 = @splat(0x5c);
+    sim.write_sectors(TestOps.on_write, &ops.write, &data, 3 * sector_size);
+    var buffer: [sector_size]u8 = undefined;
+    // A pending write's sectors are not readable (a race); other sectors are.
+    try sim.read_sectors_sync(&buffer, 0);
+    try testing.expect(std.mem.allEqual(u8, &buffer, 0));
+    drain(&sim);
+    try sim.read_sectors_sync(&buffer, 3 * sector_size);
+    try testing.expectEqualSlices(u8, &data, &buffer);
+    try testing.expectEqual(@as(u32, 1), sim.unsynced_sector_count()); // Not synced by a read.
+    try testing.expectEqual(@as(u64, 2), sim.stats.reads_sync);
+    sim.options.read_fault_numerator = 1;
+    sim.options.read_fault_denominator = 1;
+    try sim.read_sectors_sync(&buffer, 3 * sector_size);
+    try testing.expectEqual(@as(usize, sector_size - 1), std.mem.count(u8, &buffer, &.{0x5c}));
     try testing.expectEqual(@as(u64, 1), sim.stats.read_faults);
 }

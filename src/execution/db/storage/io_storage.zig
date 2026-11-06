@@ -166,6 +166,37 @@ pub fn IoStorageType(comptime IO: type) type {
             self.submit(&read.completion);
         }
 
+        /// Reads at once with blocking positional reads (`IO.read_now`): short reads continue,
+        /// errors retry `read_retries_max` times, then `error.ReadFailed`. Past the end of the
+        /// file reads as zeros, as `read_sectors` does.
+        pub fn read_sectors_sync(self: *Self, buffer: []u8, offset: u64) error{ReadFailed}!void {
+            self.assert_range(offset, buffer.len);
+            self.assert_no_write_overlap(offset, buffer.len);
+            self.stats.reads += 1;
+            var done: usize = 0;
+            var retries: u32 = 0;
+            var calls: u64 = 0;
+            // Bounded: each call reads at least one byte, or retries, or ends the read.
+            while (done < buffer.len) : (calls += 1) {
+                assert(calls <= buffer.len + self.options.read_retries_max);
+                const rest = buffer[done..];
+                const size = self.io.read_now(self.fd, rest, offset + done) catch {
+                    if (retries == self.options.read_retries_max) return error.ReadFailed;
+                    retries += 1;
+                    self.stats.read_retries += 1;
+                    continue;
+                };
+                assert(size <= rest.len);
+                if (size == 0) {
+                    @memset(rest, 0);
+                    self.stats.read_zero_filled_bytes += rest.len;
+                    break;
+                }
+                if (done + size < buffer.len) self.stats.short_resubmits += 1;
+                done += size;
+            }
+        }
+
         pub fn write_sectors(
             self: *Self,
             callback: *const fn (*Write) void,

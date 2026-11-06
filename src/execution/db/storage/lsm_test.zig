@@ -90,6 +90,8 @@ const Counts = struct {
     lookups_table: u64 = 0,
     orphans_released: u64 = 0,
     filter_negatives: u64 = 0,
+    /// Synchronous block reads (`get` missing the block cache).
+    reads_sync: u64 = 0,
 };
 
 fn HarnessType(comptime spec: Spec) type {
@@ -322,10 +324,13 @@ fn HarnessType(comptime spec: Spec) type {
 
         /// Looks `index` up and checks it reads as `expected` (the seed of its value, or null
         /// when absent): presence, length, and every value byte.
+        /// The synchronous `get` must agree, before the lookup and while it reads.
         fn expect_lookup(self: *Harness, index: u32, expected: ?u64) !void {
             const key = key_of(index);
+            try expect_value(expected, try self.tree.get(&key));
             if (self.tree.lookup(&key, on_lookup) == .pending) {
                 self.counts.lookups_table += 1;
+                try expect_value(expected, try self.tree.get(&key));
                 try self.wait(&self.lookup_done);
             }
             const found = try self.tree.lookup_result;
@@ -401,7 +406,10 @@ fn HarnessType(comptime spec: Spec) type {
                     .delete = prng.chance(1, 4),
                 };
                 self.commit(count, &ops);
-            } else if (choice == 9 and idle_commit and engine.checkpoint_phase == .idle) {
+            } else if (choice == 9 and idle_commit and engine.checkpoint_phase == .idle and
+                self.tree.checkpoint_ready())
+            {
+                // As the database does: no checkpoint until the replay reserve is restored.
                 self.checkpoint();
             } else if (choice == 10) {
                 _ = self.tree.swap();
@@ -600,14 +608,21 @@ fn run_differential(comptime spec: Spec, seed: u64) !Counts {
         const result = try harness.open();
         try testing.expectEqual(sequence_last, result.sequence_last);
     }
+    harness.counts.reads_sync = sim.stats.reads_sync;
     return harness.counts;
 }
 
 test "lsm: differential vs a hash map model, 32-byte keys, with checkpoint and reopen" {
     var merges: u64 = 0;
+    var reads_sync: u64 = 0;
     const spec: Spec = .{ .key_size = 32, .value_size = 8 };
-    for (0..4) |seed| merges += (try run_differential(spec, seed)).merges;
+    for (0..4) |seed| {
+        const counts = try run_differential(spec, seed);
+        merges += counts.merges;
+        reads_sync += counts.reads_sync;
+    }
     try testing.expect(merges > 0);
+    try testing.expect(reads_sync > 0);
 }
 
 test "lsm: differential vs a hash map model, 64-byte keys (account ++ slot)" {
@@ -629,6 +644,80 @@ test "lsm: differential vs a hash map model, 65-byte keys, variable-length value
     var merges: u64 = 0;
     for (0..4) |seed| merges += (try run_differential(spec_variable, 200 + seed)).merges;
     try testing.expect(merges > 0);
+}
+
+/// Flushes `count` keys into level 0 and returns the slot of a level-0 table.
+fn flush_keys(comptime Harness: type, harness: *Harness, count: u32) !u32 {
+    const tree = &harness.tree;
+    try put_keys(Harness, tree, 0, count, .live);
+    try testing.expect(tree.swap());
+    tree.compact(std.math.maxInt(u64));
+    var ticks: u32 = 0;
+    while (!tree.compaction_idle()) : (ticks += 1) {
+        if (ticks > 100_000) return error.Timeout;
+        harness.sim.tick();
+    }
+    try testing.expect(tree.level_count[0] > 0);
+    return tree.level_list(0)[0];
+}
+
+test "lsm: get reports a rotted table block as corrupt and faults the tree" {
+    const Harness = HarnessType(.{ .key_size = 32, .value_size = 8 });
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = engine_config.size_bytes(),
+        .seed = 21,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 21, 64, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0x2077_0001);
+    const tree = &harness.tree;
+    const slot = try flush_keys(Harness, harness, 60);
+    // Healthy first: every key reads, through the grid (the cache holds nothing yet).
+    for (0..60) |index| {
+        try Harness.expect_value(index, try tree.get(&Harness.key_of(@intCast(index))));
+    }
+    try testing.expect(sim.stats.reads_sync > 0);
+    // Rot the first data block, and drop the cached copy (a cold block).
+    const address = tree.table_blocks(slot)[1];
+    const rotten: usize = @intCast(harness.engine.grid.?.offset_of(address) + 200);
+    sim.durable[rotten] ^= 0x20;
+    sim.memory[rotten] ^= 0x20;
+    @memset(harness.cache.addresses, 0);
+    const key_min = tree.slot_infos[slot].key_min;
+    try testing.expectError(error.Corrupt, tree.get(&key_min));
+    try testing.expect(tree.fault);
+    // Sticky: other keys past the memtables, and async lookups, report it too.
+    try testing.expectError(error.Corrupt, tree.get(&Harness.key_of(1)));
+    try testing.expectEqual(lsm.Status.done, tree.lookup(&key_min, Harness.on_lookup));
+    try testing.expectError(error.Corrupt, tree.lookup_result);
+    // The memtables still serve their keys.
+    try put_keys(Harness, tree, 100, 1, .live);
+    try Harness.expect_value(100, try tree.get(&Harness.key_of(100)));
+}
+
+test "lsm: get retries transient read faults" {
+    const Harness = HarnessType(.{ .key_size = 32, .value_size = 8 });
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = engine_config.size_bytes(),
+        .seed = 22,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 22, 64, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0x2077_0002);
+    const tree = &harness.tree;
+    _ = try flush_keys(Harness, harness, 60);
+    sim.options.read_fault_numerator = 100; // 10% of reads flip a bit.
+    for (0..60) |index| {
+        @memset(harness.cache.addresses, 0);
+        try Harness.expect_value(index, try tree.get(&Harness.key_of(@intCast(index))));
+    }
+    try testing.expect(sim.stats.read_faults > 0);
+    try testing.expect(harness.engine.grid.?.stats.read_retries > 0);
+    try testing.expect(!tree.fault);
 }
 
 test "lsm: differential with tables smaller than a memtable (multi-table flushes)" {

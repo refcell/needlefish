@@ -719,6 +719,13 @@ pub const SimIo = struct {
     }
 
     /// Synchronous close for cleanup paths. Prefer `close` on hot paths.
+    /// A positional read completed at once, with the same faults as `read` (a synchronous
+    /// point read: no simulated latency).
+    pub fn read_now(io: *SimIo, fd: Fd, buffer: []u8, offset: u64) common.ReadError!usize {
+        assert(buffer.len > 0);
+        return io.do_read(fd, buffer, offset);
+    }
+
     pub fn close_now(io: *SimIo, fd: Fd) void {
         io.descriptor_close(fd);
     }

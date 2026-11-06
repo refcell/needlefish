@@ -105,6 +105,12 @@ const FlakyIo = struct {
         return @intCast(io.prng.range(1, length));
     }
 
+    pub fn read_now(io: *FlakyIo, fd: Fd, buffer: []u8, offset: u64) io_common.ReadError!usize {
+        assert(fd == 0);
+        if (io.prng.chance(io.error_numerator, 8)) return error.InputOutput;
+        return io.do_read(.{ .buffer = buffer, .offset = offset });
+    }
+
     fn do_read(io: *FlakyIo, op: anytype) usize {
         if (op.offset >= io.file_size) return 0;
         const available: usize = @intCast(io.file_size - op.offset);
@@ -583,6 +589,33 @@ test "io_storage: engine over the io simulator, format to reopen" {
     const harness = try HarnessType(SimIo).create(&io, fd, 99);
     defer harness.destroy();
     _ = try format_commit_reopen(SimIo, harness, 120);
+    try harness.wait_idle();
+    try expect_sync_read_equals_async(harness);
+}
+
+/// A synchronous read returns what an asynchronous read of the same sectors returns.
+fn expect_sync_read_equals_async(harness: anytype) !void {
+    const storage_ = &harness.storage;
+    const Context = struct {
+        read: storage.Read = .{},
+        done: bool = false,
+        fn on_read(read: *storage.Read) void {
+            const context: *@This() = @fieldParentPtr("read", read);
+            context.done = true;
+        }
+    };
+    var context: Context = .{};
+    var expected: [4 * sector_size]u8 = @splat(0x11);
+    var actual: [4 * sector_size]u8 = @splat(0x22);
+    storage_.read_sectors(Context.on_read, &context.read, &expected, sector_size);
+    var ticks: u32 = 0;
+    while (!context.done) : (ticks += 1) {
+        try testing.expect(ticks < 10_000);
+        try harness.pump();
+    }
+    try storage_.read_sectors_sync(&actual, sector_size);
+    try testing.expectEqualSlices(u8, &expected, &actual);
+    try testing.expect(!std.mem.allEqual(u8, &actual, 0)); // The superblock zone was written.
 }
 
 fn os_io_init() !io_root.IO {
@@ -616,4 +649,42 @@ test "io_storage: engine over the os backend on a real file" {
     try harness.attach(fd_reopened);
     const result = try harness.open();
     try testing.expectEqual(acknowledged, result.sequence_last);
+    try harness.wait_idle();
+    try expect_sync_read_equals_async(harness);
+}
+
+test "io_storage: read_sectors_sync continues short reads, retries errors, zero-fills past EOF" {
+    const disk = try testing.allocator.alloc(u8, 8 * sector_size);
+    defer testing.allocator.free(disk);
+    var prng = Prng.init(3);
+    prng.fill(disk);
+    var io: FlakyIo = .{
+        .prng = Prng.init(4),
+        .disk = disk,
+        .file_size = 6 * sector_size,
+        .error_numerator = 2,
+    };
+    const Storage = IoStorageType(FlakyIo);
+    var io_storage = try Storage.init(testing.allocator, &io, 0, .{
+        .size_bytes = disk.len,
+        .read_retries_max = 64,
+    });
+    defer io_storage.deinit(testing.allocator);
+    var buffer: [4 * sector_size]u8 = undefined;
+    for (0..16) |_| {
+        @memset(&buffer, 0x77);
+        try io_storage.read_sectors_sync(&buffer, sector_size);
+        try testing.expectEqualSlices(u8, disk[sector_size..][0..buffer.len], &buffer);
+    }
+    try testing.expect(io_storage.stats.short_resubmits > 0);
+    try testing.expect(io_storage.stats.read_retries > 0);
+    // Past the end of the file: zeros, as the asynchronous read returns.
+    try io_storage.read_sectors_sync(&buffer, 4 * sector_size);
+    const tail = disk[4 * sector_size ..][0 .. 2 * sector_size];
+    try testing.expectEqualSlices(u8, tail, buffer[0 .. 2 * sector_size]);
+    try testing.expect(std.mem.allEqual(u8, buffer[2 * sector_size ..], 0));
+    try testing.expect(io_storage.idle()); // Nothing went through the completion queue.
+    // Every attempt failing: an error, not zeros.
+    io.error_numerator = 8;
+    try testing.expectError(error.ReadFailed, io_storage.read_sectors_sync(&buffer, 0));
 }
