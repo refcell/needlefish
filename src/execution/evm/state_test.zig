@@ -117,7 +117,7 @@ fn run_test(runner: *Runner, arena: std.mem.Allocator, case: Case, options: Opti
     return summary;
 }
 
-fn field(value: Value, name: []const u8) ?Value {
+pub fn field(value: Value, name: []const u8) ?Value {
     if (value != .object) return null;
     return value.object.get(name);
 }
@@ -142,7 +142,7 @@ fn parse_usize(value: ?Value) Error!usize {
 
 // ------------------------------------------------------------------ hex parsing
 
-fn strip_hex(text: []const u8) []const u8 {
+pub fn strip_hex(text: []const u8) []const u8 {
     if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) return text[2..];
     return text;
 }
@@ -154,13 +154,13 @@ pub fn parse_u256(text: []const u8) Error!u256 {
     return std.fmt.parseInt(u256, digits, 16) catch error.InvalidFixture;
 }
 
-fn parse_u64(text: []const u8) Error!u64 {
+pub fn parse_u64(text: []const u8) Error!u64 {
     const value = try parse_u256(text);
     if (value > std.math.maxInt(u64)) return error.InvalidFixture;
     return @intCast(value);
 }
 
-fn parse_bytes(arena: std.mem.Allocator, text: []const u8) Error![]u8 {
+pub fn parse_bytes(arena: std.mem.Allocator, text: []const u8) Error![]u8 {
     const digits = strip_hex(text);
     if (digits.len % 2 != 0) return error.InvalidFixture;
     const out = try arena.alloc(u8, digits.len / 2);
@@ -168,7 +168,7 @@ fn parse_bytes(arena: std.mem.Allocator, text: []const u8) Error![]u8 {
     return out;
 }
 
-fn parse_fixed(comptime size: usize, text: []const u8) Error![size]u8 {
+pub fn parse_fixed(comptime size: usize, text: []const u8) Error![size]u8 {
     const digits = strip_hex(text);
     if (digits.len != size * 2) return error.InvalidFixture;
     var out: [size]u8 = undefined;
@@ -176,7 +176,7 @@ fn parse_fixed(comptime size: usize, text: []const u8) Error![size]u8 {
     return out;
 }
 
-fn string_of(value: ?Value) Error![]const u8 {
+pub fn string_of(value: ?Value) Error![]const u8 {
     const v = value orelse return error.InvalidFixture;
     if (v != .string) return error.InvalidFixture;
     return v.string;
@@ -242,7 +242,7 @@ fn block_env(fork: Fork, fixture: Value) Error!env.BlockEnv {
     };
 }
 
-fn access_list(arena: std.mem.Allocator, value: Value) Error![]transaction.AccessListItem {
+pub fn access_list(arena: std.mem.Allocator, value: Value) Error![]transaction.AccessListItem {
     if (value != .array) return error.InvalidFixture;
     const items = try arena.alloc(transaction.AccessListItem, value.array.items.len);
     for (value.array.items, items) |item, *out| {
@@ -260,7 +260,7 @@ fn access_list(arena: std.mem.Allocator, value: Value) Error![]transaction.Acces
     return items;
 }
 
-fn hash_list(arena: std.mem.Allocator, value: Value) Error![]B256 {
+pub fn hash_list(arena: std.mem.Allocator, value: Value) Error![]B256 {
     if (value != .array) return error.InvalidFixture;
     const hashes = try arena.alloc(B256, value.array.items.len);
     for (value.array.items, hashes) |item, *out| out.* = try parse_fixed(32, try string_of(item));
@@ -269,7 +269,10 @@ fn hash_list(arena: std.mem.Allocator, value: Value) Error![]B256 {
 
 /// EIP-7702 tuples. The authority is recovered here (low-s, y parity 0 or 1) rather than
 /// taken from the fixture's `signer`, so invalid signatures exercise the skip path.
-fn authorization_list(arena: std.mem.Allocator, value: Value) Error![]transaction.Authorization {
+pub fn authorization_list(
+    arena: std.mem.Allocator,
+    value: Value,
+) Error![]transaction.Authorization {
     if (value != .array) return error.InvalidFixture;
     const items = try arena.alloc(transaction.Authorization, value.array.items.len);
     for (value.array.items, items) |item, *out| {

@@ -141,6 +141,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   arrives through upgrade deposits: consensus lane). The DA footprint feeds the header's
   blob_gas_used, not per-tx fees (executor/builder lanes). System calls live in
   `node/executor.zig`; `begin_transaction` now clears `static_warm`, so they start cold.
+  Audit 2: `zig build txcheck -- <replay-raw block dirs>` (`tx_check.zig`) runs every mainnet
+  transaction alone on its prestateTracer pre-state and compares status, gas used, and logs
+  with its receipt (no trie or executor, so a mismatch isolates the EVM). Blocks
+  53715983-53715992: 253/253. With nf-replay's return-data fix (`a1fe2ae3`) reverted it
+  flags 8+ transactions, starting at 53715983 tx 3. `call_fuzz.zig` now also checks that a
+  callee sees RETURNDATASIZE 0 after an earlier call (it missed that bug before).
 - [ ] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const Tracer` with
   enter(kind, from, to, value, gas, input) / exit(gas_used, output, status) / log; null is
   zero cost.

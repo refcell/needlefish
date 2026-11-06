@@ -100,6 +100,14 @@ fn add_vector_tools(
         .description = "Run state tests: zig build statetest -- <file-or-dir>",
     });
 
+    // Real chain blocks, one transaction at a time on its prestateTracer pre-state.
+    _ = add_tool(b, base, target, optimize, .{
+        .name = "txcheck",
+        .path = "src/execution/evm/tx_check_main.zig",
+        .step = "txcheck",
+        .description = "Check txs against receipts: zig build txcheck -- <block-dir>...",
+    });
+
     // ethereum/tests TransactionTests through the strict tx decoder.
     _ = add_tool(b, base, target, optimize, .{
         .name = "txtest",

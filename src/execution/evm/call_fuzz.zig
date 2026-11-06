@@ -2,7 +2,8 @@
 //!
 //! Contract A copies its calldata to memory and calls contract B with a random kind
 //! (CALL, CALLCODE, DELEGATECALL, STATICCALL), value, output window, and then a random
-//! RETURNDATACOPY range. B echoes `CALLER ‖ CALLVALUE ‖ ADDRESS ‖ calldata` and reverts
+//! RETURNDATACOPY range. B echoes CALLER, CALLVALUE, ADDRESS, RETURNDATASIZE (0 on entry
+//! even though A's warm-up call left return data), and its calldata, and reverts
 //! instead of returning when the first calldata byte is 0xff. A returns a fixed window of
 //! its memory: the success flag, RETURNDATASIZE, the output window, the input copy, and the
 //! RETURNDATACOPY result. The model predicts that window (or a halt when the copy range
@@ -28,22 +29,25 @@ const window_bytes = 0x600;
 const input_bytes_max = 0x100;
 const balance: u256 = 1 << 64;
 
-/// B: mem[0..96] = CALLER ‖ CALLVALUE ‖ ADDRESS, mem[96..] = calldata; RETURN or REVERT it.
+/// B: mem[0..128] = CALLER ‖ CALLVALUE ‖ ADDRESS ‖ RETURNDATASIZE, mem[128..] = calldata;
+/// RETURN or REVERT it.
 const callee_code = [_]u8{
-    op.CALLER,       op.PUSH1,        0,               op.MSTORE,
-    op.CALLVALUE,    op.PUSH1,        32,              op.MSTORE,
-    op.ADDRESS,      op.PUSH1,        64,              op.MSTORE,
-    op.CALLDATASIZE, op.PUSH1,        0,               op.PUSH1,
-    96,              op.CALLDATACOPY, op.PUSH1,        0,
-    op.CALLDATALOAD, op.PUSH1,        248,             op.SHR,
-    op.PUSH1,        0xff,            op.EQ,           op.PUSH1,
-    revert_pc,       op.JUMPI,        op.CALLDATASIZE, op.PUSH1,
-    96,              op.ADD,          op.PUSH1,        0,
-    op.RETURN,       op.JUMPDEST,     op.CALLDATASIZE, op.PUSH1,
-    96,              op.ADD,          op.PUSH1,        0,
+    op.CALLER,         op.PUSH1,        0,               op.MSTORE,
+    op.CALLVALUE,      op.PUSH1,        32,              op.MSTORE,
+    op.ADDRESS,        op.PUSH1,        64,              op.MSTORE,
+    op.RETURNDATASIZE, op.PUSH1,        96,              op.MSTORE,
+    op.CALLDATASIZE,   op.PUSH1,        0,               op.PUSH1,
+    header_bytes,      op.CALLDATACOPY, op.PUSH1,        0,
+    op.CALLDATALOAD,   op.PUSH1,        248,             op.SHR,
+    op.PUSH1,          0xff,            op.EQ,           op.PUSH1,
+    revert_pc,         op.JUMPI,        op.CALLDATASIZE, op.PUSH1,
+    header_bytes,      op.ADD,          op.PUSH1,        0,
+    op.RETURN,         op.JUMPDEST,     op.CALLDATASIZE, op.PUSH1,
+    header_bytes,      op.ADD,          op.PUSH1,        0,
     op.REVERT,
 };
-const revert_pc = 37;
+const revert_pc = 41;
+const header_bytes = 128;
 
 comptime {
     assert(callee_code[revert_pc] == op.JUMPDEST);
@@ -78,6 +82,10 @@ fn caller_program(buffer: []u8, case: Case) []const u8 {
     emit_bytes(buffer, &length, &.{ op.CALLDATASIZE, op.PUSH1, 0 });
     emit_push(buffer, &length, input_offset);
     emit_bytes(buffer, &length, &.{op.CALLDATACOPY});
+    // Warm-up STATICCALL(gas, B, 0, 0, 0, 0): leaves return data that B must not see.
+    emit_bytes(buffer, &length, &.{ op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0 });
+    emit_push(buffer, &length, primitives.address_to_u256(callee_contract));
+    emit_bytes(buffer, &length, &.{ op.GAS, op.STATICCALL, op.POP });
     // kind(gas, to, [value], in_offset, in_size, out_offset, out_size): pushed in reverse.
     emit_push(buffer, &length, case.out_size);
     emit_push(buffer, &length, case.out_offset);
@@ -107,29 +115,29 @@ fn caller_program(buffer: []u8, case: Case) []const u8 {
     return buffer[0..length];
 }
 
-/// What B sees as (CALLER, CALLVALUE, ADDRESS) for each call kind.
-fn seen(case: Case) [3]u256 {
+/// What B sees as (CALLER, CALLVALUE, ADDRESS, RETURNDATASIZE) for each call kind.
+fn seen(case: Case) [4]u256 {
     const a = primitives.address_to_u256(caller_contract);
     const b = primitives.address_to_u256(callee_contract);
     const origin = primitives.address_to_u256(evm_test.caller);
     return switch (case.kind) {
-        .call => .{ a, case.value, b },
-        .callcode => .{ a, case.value, a },
-        .delegatecall => .{ origin, 0, a }, // A's own CALLER and CALLVALUE (0).
-        .staticcall => .{ a, 0, b },
+        .call => .{ a, case.value, b, 0 },
+        .callcode => .{ a, case.value, a, 0 },
+        .delegatecall => .{ origin, 0, a, 0 }, // A's own CALLER and CALLVALUE (0).
+        .staticcall => .{ a, 0, b, 0 },
     };
 }
 
 const Expected = union(enum) { halt, window: [window_bytes]u8 };
 
 fn model(case: Case) Expected {
-    var return_data: [96 + input_bytes_max]u8 = undefined;
+    var return_data: [header_bytes + input_bytes_max]u8 = undefined;
     const identity = seen(case);
     for (identity, 0..) |word, index| {
         primitives.word_to_be(return_data[index * 32 ..][0..32], word);
     }
-    @memcpy(return_data[96..][0..case.input.len], case.input);
-    const return_len = 96 + case.input.len;
+    @memcpy(return_data[header_bytes..][0..case.input.len], case.input);
+    const return_len = header_bytes + case.input.len;
     const reverted = case.input.len > 0 and case.input[0] == 0xff;
     if (@as(usize, case.copy_from) + case.copy_size > return_len) return .halt;
     var window: [window_bytes]u8 = @splat(0);
@@ -147,7 +155,7 @@ fn random_case(prng: *Prng, input_buffer: *[input_bytes_max]u8) Case {
     const input_len: usize = @intCast(prng.below(input_bytes_max + 1));
     for (input_buffer[0..input_len]) |*byte| byte.* = @truncate(prng.int(u64));
     if (input_len > 0 and prng.below(4) == 0) input_buffer[0] = 0xff; // Revert path.
-    const return_len: u64 = 96 + input_len;
+    const return_len: u64 = header_bytes + input_len;
     const out_offset: u16 = @intCast(prng.range(64, input_offset - 0x40));
     const copy_size: u16 = @intCast(prng.below(return_len + 2));
     const copy_from: u16 = @intCast(prng.below(return_len + 2 - copy_size));

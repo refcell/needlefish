@@ -29,6 +29,7 @@ pub const eip8130_execute = @import("eip8130_execute.zig");
 pub const eip8130_simulate = @import("eip8130_simulate.zig");
 pub const bench = @import("bench.zig");
 pub const state_test = @import("state_test.zig");
+pub const tx_check = @import("tx_check.zig");
 
 test {
     _ = @import("evm_test.zig");
@@ -37,6 +38,7 @@ test {
     _ = @import("arith_fuzz.zig");
     _ = @import("memory_fuzz.zig");
     _ = @import("call_fuzz.zig");
+    _ = @import("tx_check.zig");
 }
 
 pub const Fork = fork.Fork;
