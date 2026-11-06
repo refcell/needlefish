@@ -22,10 +22,18 @@ const FakeUpstream = struct {
     index: u8,
     mode: Mode = .ok,
     calls: u32 = 0,
+    head: u64 = 100,
+    head_polls: u32 = 0,
 
     fn chain_id(upstream: *FakeUpstream, call: *rpc.Call) rpc.HandlerError!void {
         try call.params.finish();
         try call.writer.quantity(@as(u64, 10 + upstream.index));
+    }
+
+    fn block_number(upstream: *FakeUpstream, call: *rpc.Call) rpc.HandlerError!void {
+        try call.params.finish();
+        upstream.head_polls += 1;
+        try call.writer.quantity(upstream.head);
     }
 
     fn send_raw(upstream: *FakeUpstream, call: *rpc.Call) rpc.HandlerError!void {
@@ -38,6 +46,7 @@ const FakeUpstream = struct {
     const methods = [_]rpc.Method(*FakeUpstream){
         .{ .name = "eth_chainId", .handler = chain_id },
         .{ .name = "eth_sendRawTransaction", .handler = send_raw },
+        .{ .name = "eth_blockNumber", .handler = block_number },
     };
     const Router = rpc.Router(*FakeUpstream, &methods);
 
@@ -46,7 +55,9 @@ const FakeUpstream = struct {
         request: *const http.Request,
         response: *http.ResponseBuilder,
     ) void {
-        upstream.calls += 1;
+        // Head polls are counted separately from proxied calls.
+        const is_poll = std.mem.indexOf(u8, request.body, "eth_blockNumber") != null;
+        if (!is_poll) upstream.calls += 1;
         switch (upstream.mode) {
             .ok => _ = Router.handle(upstream, request.body, response.writer()),
             .status_500 => response.fail(500),
@@ -438,4 +449,31 @@ test "roxy: routed methods stay on their upstreams, also across retries" {
     result = try harness.call("/", "[" ++ send ++ "," ++ proof ++ "]");
     try testing.expect(contains(result.text(), "-32600"));
     try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_route.get());
+}
+
+test "roxy: an upstream trailing the best head is skipped, failing open" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.lag = .{ .max_blocks = 5, .poll_interval_ns = 200 * ms };
+    options.routes = try roxy.Routes.parse("eth_sendRawTransaction=2", 3);
+    try harness.init(57, .{ true, true, true }, options);
+    defer harness.deinit();
+    harness.upstreams[2].head = 10;
+    harness.run_ticking(1000 * ms);
+    try testing.expect(harness.upstreams[2].head_polls > 0);
+    try testing.expectEqual(@as(roxy.Mask, 0b100), harness.proxy.lagging());
+    for (0..6) |_| _ = try harness.call("/", chain_id_body);
+    try testing.expectEqual(@as(u32, 0), harness.upstreams[2].calls);
+    // The only upstream a route allows still serves it, lagging or not.
+    const send = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"eth_sendRawTransaction\"," ++
+        "\"params\":[\"0x00\"]}";
+    const result = try harness.call("/", send);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expectEqual(@as(u32, 1), harness.upstreams[2].calls);
+    // Caught up, it serves again.
+    harness.upstreams[2].head = 100;
+    harness.run_ticking(1000 * ms);
+    try testing.expectEqual(@as(roxy.Mask, 0), harness.proxy.lagging());
+    for (0..6) |_| _ = try harness.call("/", chain_id_body);
+    try testing.expect(harness.upstreams[2].calls > 1);
 }

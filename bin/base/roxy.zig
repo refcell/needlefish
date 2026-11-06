@@ -31,6 +31,8 @@ pub const Spec = struct {
     rate_limit_burst: u32 = 20,
     trusted_proxies: []const u8 = "",
     routes: []const u8 = "",
+    lag_max_blocks: u64 = 0,
+    lag_poll_ms: u32 = 1_000,
 
     pub const help = .{
         .listen_addr = "Address to serve on, IPv4:PORT",
@@ -48,6 +50,8 @@ pub const Spec = struct {
         .rate_limit_rps = "Requests per second per client IP (0: unlimited)",
         .rate_limit_burst = "Requests a client may burst after idling",
         .trusted_proxies = "Comma-separated CIDRs whose X-Forwarded-For is trusted",
+        .lag_max_blocks = "Skip upstreams this many blocks behind the best head (0: off)",
+        .lag_poll_ms = "eth_blockNumber polling interval for --lag-max-blocks",
         .routes = "Pin methods to upstreams: m1,m2=0|1;m3=2 (indices into --upstreams)",
     };
 };
@@ -105,6 +109,11 @@ pub fn settings_of(spec: Spec) !Settings {
     }
     settings.options = options_of(spec, settings.options.allowlist);
     settings.options.routes = try roxy.Routes.parse(spec.routes, settings.upstream_count);
+    if (spec.lag_poll_ms == 0) return error.InvalidValue;
+    settings.options.lag = .{
+        .max_blocks = spec.lag_max_blocks,
+        .poll_interval_ns = @as(u64, spec.lag_poll_ms) * std.time.ns_per_ms,
+    };
     settings.options.rate_limit = .{
         .requests_per_s = spec.rate_limit_rps,
         .burst = spec.rate_limit_burst,

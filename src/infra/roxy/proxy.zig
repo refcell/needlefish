@@ -11,6 +11,10 @@
 //! With a non-empty allowlist every request (and every entry of a batch) is checked before
 //! it is queued: a disallowed method gets JSON-RPC error -32601 without touching upstreams.
 //!
+//! With `lag.max_blocks > 0`, a dedicated client per upstream polls `eth_blockNumber` every
+//! `lag.poll_interval_ns`; an upstream more than `max_blocks` behind the best known head is
+//! skipped while another eligible upstream exists (fail open). An unknown head never lags.
+//!
 //! With `routes`, a method may be pinned to some upstreams (retries stay inside that set); a
 //! batch whose methods share no upstream gets JSON-RPC error -32600.
 //!
@@ -34,6 +38,7 @@ const health = @import("../../utilities/health/root.zig");
 const metrics = @import("../../utilities/metrics/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const io_common = @import("../../utilities/io/common.zig");
+const json = @import("../../utilities/json/root.zig");
 const pool_module = @import("pool.zig");
 const methods = @import("methods.zig");
 const Allowlist = @import("allowlist.zig").Allowlist;
@@ -49,6 +54,16 @@ pub const Address = io_common.Address;
 pub const Mask = pool_module.Mask;
 pub const upstreams_max = pool_module.upstreams_max;
 
+pub const Lag = struct {
+    /// Blocks an upstream may trail the best head; 0 disables head polling.
+    max_blocks: u64 = 0,
+    poll_interval_ns: u64 = 1000 * std.time.ns_per_ms,
+
+    pub fn enabled(lag: Lag) bool {
+        return lag.max_blocks > 0;
+    }
+};
+
 pub const Options = struct {
     upstreams: []const Address,
     clients_per_upstream: u32 = 4,
@@ -61,6 +76,7 @@ pub const Options = struct {
     /// Upstream indices refer to `upstreams`.
     routes: Routes = .{},
     rate_limit: rate_limit.Options = .{},
+    lag: Lag = .{},
     /// Proxies whose forwarding header is trusted when resolving the client IP.
     trusted_proxy: trusted_proxy.Config = .{},
     server: http.server.Options = .{},
@@ -69,7 +85,7 @@ pub const Options = struct {
 };
 
 const label_size_max = 24;
-const metrics_max = 10 + 3 * upstreams_max;
+const metrics_max = 10 + 4 * upstreams_max;
 const content_type_json = [_]http.parser.Header{
     .{ .name = "Content-Type", .value = "application/json" },
 };
@@ -91,6 +107,12 @@ pub fn Proxy(comptime IO: type) type {
             body: []const u8 = "",
             tried: Mask = 0,
             attempts: u32 = 0,
+        };
+
+        const HeadClient = struct {
+            proxy: *Self,
+            client: Client,
+            upstream: u32,
         };
 
         const UpstreamClient = struct {
@@ -121,6 +143,11 @@ pub fn Proxy(comptime IO: type) type {
         /// Scratch for the allowlist check.
         entries: [methods.batch_max]methods.Entry = undefined,
         entries_count: u32 = 0,
+        head_clients: []HeadClient = &.{},
+        heads: [upstreams_max]u64 = @splat(0),
+        head_known: Mask = 0,
+        head_poll_ns: u64 = 0,
+        upstream_head: [upstreams_max]metrics.Gauge = @splat(.{}),
         limiter: ?*Limiter = null,
 
         registry: metrics.Registry(metrics_max) = .{},
@@ -180,6 +207,8 @@ pub fn Proxy(comptime IO: type) type {
             errdefer if (proxy.limiter) |limiter| allocator.destroy(limiter);
             try proxy.init_clients(count);
             errdefer proxy.deinit_clients();
+            if (options.lag.enabled()) try proxy.init_head_clients(count);
+            errdefer proxy.deinit_head_clients();
             try proxy.server.init(allocator, io, proxy, options.server);
             errdefer proxy.server.deinit();
             try proxy.register_metrics(count);
@@ -210,6 +239,38 @@ pub fn Proxy(comptime IO: type) type {
             assert(initialized == count * per);
         }
 
+        fn init_head_clients(proxy: *Self, count: u32) !void {
+            assert(proxy.options.lag.enabled());
+            proxy.head_clients = try proxy.allocator.alloc(HeadClient, count);
+            var initialized: u32 = 0;
+            errdefer {
+                for (proxy.head_clients[0..initialized]) |*entry| entry.client.deinit();
+                proxy.allocator.free(proxy.head_clients);
+                proxy.head_clients = &.{};
+            }
+            for (proxy.head_clients, 0..) |*entry, index| {
+                const upstream: u32 = @intCast(index);
+                entry.* = .{
+                    .proxy = proxy,
+                    .upstream = upstream,
+                    .client = try Client.init(
+                        proxy.allocator,
+                        proxy.io,
+                        proxy.options.upstreams[upstream],
+                        proxy.options.client,
+                    ),
+                };
+                initialized += 1;
+            }
+            assert(initialized == count);
+        }
+
+        fn deinit_head_clients(proxy: *Self) void {
+            for (proxy.head_clients) |*entry| entry.client.deinit();
+            if (proxy.head_clients.len > 0) proxy.allocator.free(proxy.head_clients);
+            proxy.head_clients = &.{};
+        }
+
         fn deinit_clients(proxy: *Self) void {
             for (proxy.clients) |*entry| entry.client.deinit();
             proxy.allocator.free(proxy.clients);
@@ -220,6 +281,7 @@ pub fn Proxy(comptime IO: type) type {
             assert(proxy.slots.len > 0);
             proxy.server.deinit();
             proxy.deinit_clients();
+            proxy.deinit_head_clients();
             if (proxy.limiter) |limiter| proxy.allocator.destroy(limiter);
             proxy.allocator.free(proxy.free);
             proxy.allocator.free(proxy.queue);
@@ -251,7 +313,7 @@ pub fn Proxy(comptime IO: type) type {
             );
             try registry.gauge("roxy_pending", "Requests queued or in flight.", &proxy.pending);
             for (0..count) |index| try proxy.register_upstream(@intCast(index));
-            assert(registry.count == 9 + 3 * count);
+            assert(registry.count == 9 + 4 * count);
         }
 
         fn rejected_entry(comptime reason: []const u8, counter: *metrics.Counter) metrics.Entry {
@@ -291,6 +353,12 @@ pub fn Proxy(comptime IO: type) type {
                 .labels = labels,
                 .metric = .{ .gauge = &proxy.upstream_ejected[index] },
             });
+            try proxy.registry.register(.{
+                .name = "roxy_upstream_head",
+                .help = "Latest polled block number (0: unknown or polling disabled).",
+                .labels = labels,
+                .metric = .{ .gauge = &proxy.upstream_head[index] },
+            });
         }
 
         pub fn listen(proxy: *Self, address: Address) !Address {
@@ -312,6 +380,7 @@ pub fn Proxy(comptime IO: type) type {
         pub fn stopped(proxy: *const Self) bool {
             if (!proxy.server.stopped()) return false;
             for (proxy.clients) |*entry| if (entry.client.busy()) return false;
+            for (proxy.head_clients) |*entry| if (entry.client.busy()) return false;
             return true;
         }
 
@@ -319,7 +388,69 @@ pub fn Proxy(comptime IO: type) type {
         pub fn tick(proxy: *Self) void {
             proxy.server.tick();
             for (proxy.clients) |*entry| entry.client.tick();
+            for (proxy.head_clients) |*entry| entry.client.tick();
+            proxy.poll_heads();
             proxy.dispatch();
+        }
+
+        fn poll_heads(proxy: *Self) void {
+            if (!proxy.options.lag.enabled() or proxy.stopping) return;
+            const now_ns = proxy.io.now_monotonic_ns();
+            if (now_ns < proxy.head_poll_ns) return;
+            proxy.head_poll_ns = now_ns + proxy.options.lag.poll_interval_ns;
+            const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\"," ++
+                "\"params\":[]}";
+            for (proxy.head_clients) |*entry| {
+                if (entry.client.busy()) continue;
+                const headers = &content_type_json;
+                entry.client.request(*HeadClient, entry, on_head, .POST, "/", headers, body) catch
+                    proxy.forget_head(entry.upstream);
+            }
+        }
+
+        fn on_head(
+            entry: *HeadClient,
+            client: *Client,
+            result: http.client.Error!*const http.Response,
+        ) void {
+            const proxy = entry.proxy;
+            assert(client == &entry.client);
+            const response = result catch return proxy.forget_head(entry.upstream);
+            if (response.status != 200) return proxy.forget_head(entry.upstream);
+            const found = json.find_path(response.body, &.{"result"}) catch null;
+            const text = found orelse return proxy.forget_head(entry.upstream);
+            const unquoted = std.mem.trim(u8, text, "\"");
+            const head = json.parse_quantity(u64, unquoted) catch
+                return proxy.forget_head(entry.upstream);
+            proxy.heads[entry.upstream] = head;
+            proxy.head_known |= pool_module.bit(entry.upstream);
+            proxy.upstream_head[entry.upstream].set(@intCast(@min(head, std.math.maxInt(i64))));
+        }
+
+        fn forget_head(proxy: *Self, upstream: u32) void {
+            assert(upstream < proxy.pool.count);
+            proxy.head_known &= ~pool_module.bit(upstream);
+            proxy.upstream_head[upstream].set(0);
+        }
+
+        /// Upstreams with a known head more than `lag.max_blocks` behind the best one.
+        pub fn lagging(proxy: *const Self) Mask {
+            if (!proxy.options.lag.enabled() or proxy.head_known == 0) return 0;
+            var best: u64 = 0;
+            for (0..proxy.pool.count) |index| {
+                if (proxy.head_known & pool_module.bit(@intCast(index)) == 0) continue;
+                best = @max(best, proxy.heads[index]);
+            }
+            var mask: Mask = 0;
+            for (0..proxy.pool.count) |index| {
+                const upstream: u32 = @intCast(index);
+                if (proxy.head_known & pool_module.bit(upstream) == 0) continue;
+                if (proxy.heads[index] +| proxy.options.lag.max_blocks < best) {
+                    mask |= pool_module.bit(upstream);
+                }
+            }
+            assert(mask != proxy.head_known); // The best head never lags.
+            return mask;
         }
 
         /// Listening with at least one upstream not ejected.
@@ -553,7 +684,10 @@ pub fn Proxy(comptime IO: type) type {
                 return true;
             }
             const now_ns = proxy.io.now_monotonic_ns();
-            switch (proxy.pool.select(now_ns, slot.tried, proxy.busy_mask())) {
+            // Skip lagging upstreams unless nothing else is eligible (fail open).
+            var excluded = slot.tried | proxy.lagging();
+            if (pool_module.mask_all(proxy.pool.count) & ~excluded == 0) excluded = slot.tried;
+            switch (proxy.pool.select(now_ns, excluded, proxy.busy_mask())) {
                 .wait => return false,
                 .exhausted => proxy.answer_unavailable(index),
                 .upstream => |upstream| proxy.send(index, upstream),

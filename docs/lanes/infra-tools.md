@@ -73,6 +73,8 @@ allocation after startup.
   lane has yet; revisit when execution p2p exists.
 - [x] `infra/roxy` method routing (proxyd `rpc_method_mappings`): `--routes m=0|1;...` pins
   methods to upstreams (e.g. raw-tx sends to the sequencer); retries stay inside the route.
+- [x] `infra/roxy` block-lag exclusion (proxyd `consensus_max_block_lag`): per-upstream
+  `eth_blockNumber` polling; upstreams over `--lag-max-blocks` behind are skipped, fail open.
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -107,6 +109,9 @@ allocation after startup.
 - fee-jobs takes its first nonce from `latest` (the shared driver's tag), not base/base's
   `pending`: overlapping runs on one key may replace rather than queue behind each other.
   The key is env-only (`BASE_FEE_JOBS_PRIVATE_KEY`), never a flag.
+- roxy lag: one dedicated poll client per upstream (polls never queue behind requests); an
+  unknown head never counts as lagging, and a route whose only upstreams lag still serves.
+  No "latest" tag rewriting to the common head (proxyd consensus mode) yet.
 - roxy routes: a batch whose methods share no upstream is rejected (-32600) rather than split
   across upstreams (proxyd splits); splitting needs response reassembly, left for later.
   A failing pinned upstream is never failed over outside its route.
@@ -197,3 +202,5 @@ allocation after startup.
   process skipped on a 0 balance, missing key exits 2.
 - 2026-11-05: roxy method routing (`routes.zig` + fuzz, SimIo test, `--routes`); live: pinned
   method served by its upstream, a dead pinned upstream returns 502 without failover.
+- 2026-11-05: roxy block-lag exclusion (SimIo test, `--lag-max-blocks/--lag-poll-ms`,
+  `roxy_upstream_head`); live: two dev-l1 nodes, all traffic to the leading one.
