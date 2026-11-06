@@ -81,6 +81,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 - [x] Collect missing keys of every failing block per round (probe mode replays past
   failed blocks).
 - [x] Pinned 100-block window check: `just replay-check` (53775088..53775187).
+- [ ] (blocked) Third pinned window from an older fork era (pre-Isthmus, e.g. block
+  29000000): keyless endpoints cannot serve it. drpc's free plan mostly times out tracing
+  old blocks (one success: a 91 MB prestate trace, the next block timed out); blastapi
+  allows core EVM methods only; publicnode has no debug_*; mainnet.base.org filters it.
+  Revisit with a keyless archive tracer, or by deriving the prestate from proofs alone.
 
 ## Decisions
 
@@ -114,6 +119,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-06: decision: no older-era window for now (see backlog); fork coverage beyond the
+  current era stays with the EVM/state test vectors.
 
 - 2026-11-06: summary line adds ms/block; throughput baseline for both pinned windows in
   docs/REPLAY.md (820-907 Mgas/s, 3.1-4.0 ms/block). Demo frames rechecked: bare `$` prompt,
