@@ -65,8 +65,8 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   param; reuse the eth_simulateV1 override code).
 - [x] rpc: reth account/header reads: eth_getAccount, eth_getAccountInfo,
   eth_getHeaderByNumber, eth_getHeaderByHash.
-- [ ] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer) and
-  debug_storageRangeAt.
+- [x] rpc: debug_traceBlock (raw RLP block, callTracer/prestateTracer).
+- [ ] rpc: debug_storageRangeAt.
 - [ ] validity sink: pool storage of predicates + builder enforcement via
   `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
@@ -105,6 +105,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-06: debug_traceBlock(rlp, options): decodes the block into the first quarter of the RPC scratch, requires its parent in the store and history window, and shares `trace_block` (header + transaction decoder + reserved scratch prefix) with debug_traceBlockBy*; output is byte-identical to the stored-block trace for both tracers.
 - 2026-11-06: gas-sized state tables: `Config.state_gas_basis` (0 = static limits, tests unchanged) sizes the evm state cache's slot/account tables from block gas (slot >= 2,100 gas, account >= 2,600, + per-tx and fixed allowances); `fit_state` (begin_block, simulate) grows them between blocks when a block's gas limit exceeds the basis (at least doubling; never inside an open session or block, where overflow fails StateFull rather than misexecuting). `base node`, `base replay` and the replay bench use 2^26. Replay: 6.08 -> 5.46 ms/block (765 -> 853 Mgas/s).
 - 2026-11-06: rpc parity: eth_getAccount ({balance, nonce, codeHash, storageRoot} or null; head storage root from the trie, historical from `proof_at`), eth_getAccountInfo ({balance, nonce, code}, zeros when absent), eth_getHeaderByNumber/Hash (header fields + timestampMs, `size` = header RLP length) in rpc/account.zig. admin_drop* already existed (base/base uses the admin namespace).
 - 2026-11-06: parallel sender recovery in the replay path: `base replay` (bin/base/replay.zig, nf-replay's binary, small additive `replayer_config`) and the replay bench set `recovery_threads` = min(cores-1, 7) like `base node`; the library default stays 0 (deterministic tests/sim). ~5% faster (6.46 -> 6.16 ms/block). Test: the mainnet fixture replays with 3 workers and every check passes.

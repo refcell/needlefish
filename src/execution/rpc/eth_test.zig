@@ -1718,3 +1718,98 @@ test "eth: seeded fuzz of eth_getAccount against eth_getBalance" {
         } else try testing.expectEqualStrings("\"0x0\"", value);
     }
 }
+
+const call_config = "{\"tracer\":\"callTracer\"}";
+
+fn trace_block_request(h: *Harness, block: []const u8, config: []const u8) ![]const u8 {
+    var body: [8192]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&body);
+    const format = request_prefix_format ++ "debug_traceBlock\",\"params\":[\"0x{x}\",{s}]}}";
+    try stream.print(format, .{ block, config });
+    return h.request_runtime(stream.buffered());
+}
+
+/// Mines (on a history-backed harness) a block calling the counter; returns its RLP.
+fn traced_block(h: *Harness, out: []u8) ![]u8 {
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    _ = try h.mine(12);
+    var buffer: [256]u8 = undefined;
+    const raw = try contract_call_raw(&buffer, 0, counter);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(24);
+    return result_data(try h.request("debug_getRawBlock", "[\"latest\"]"), out);
+}
+
+test "eth: debug_traceBlock traces an RLP block like debug_traceBlockByNumber" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    var block_buffer: [4096]u8 = undefined;
+    const block = try traced_block(h, &block_buffer);
+    const configs = [_][]const u8{
+        "{\"tracer\":\"callTracer\"}",
+        "{\"tracer\":\"prestateTracer\"}",
+    };
+    for (configs) |config| {
+        var copy: [8192]u8 = undefined;
+        var body: [256]u8 = undefined;
+        const stored = try h.request_runtime(try std.fmt.bufPrint(
+            &body,
+            request_prefix_format ++ "debug_traceBlockByNumber\",\"params\":[\"latest\",{s}]}}",
+            .{config},
+        ));
+        @memcpy(copy[0..stored.len], stored);
+        try expect_contains(stored, "\"result\":[{");
+        const raw = try trace_block_request(h, block, config);
+        try testing.expectEqualStrings(copy[0..stored.len], raw);
+    }
+    try expect_contains(try trace_block_request(h, block[1..], call_config), "invalid block RLP");
+    // A block whose parent is unknown cannot be traced.
+    var decoded = try consensus.block.Block.decode(block);
+    decoded.header.parent_hash = .{ .bytes = @splat(0x77) };
+    var orphan: [4096]u8 = undefined;
+    const orphan_bytes = decoded.encode_to(&orphan);
+    const orphan_text = try trace_block_request(h, orphan_bytes, call_config);
+    try expect_contains(orphan_text, "parent block not found");
+}
+
+test "eth: seeded fuzz of debug_traceBlock with corrupted blocks" {
+    var prng = Prng.init(0x7462);
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    var block_buffer: [4096]u8 = undefined;
+    const block = try traced_block(h, &block_buffer);
+    var corrupted: [4096]u8 = undefined;
+    for (0..64) |_| {
+        const bytes = corrupted[0..block.len];
+        @memcpy(bytes, block);
+        for (0..prng.range(1, 4)) |_| bytes[prng.below(block.len)] = prng.int(u8);
+        const length = if (prng.chance(1, 4)) prng.range(1, block.len) else block.len;
+        // Always an answer, never a crash: a trace, or an error.
+        const text = try trace_block_request(h, bytes[0..length], call_config);
+        try testing.expect(std.mem.indexOf(u8, text, "\"result\"") != null or
+            std.mem.indexOf(u8, text, "\"error\"") != null);
+    }
+}
+
+fn fuzz_trace_block(_: void, smith: *testing.Smith) anyerror!void {
+    const h = try Harness.create();
+    defer h.destroy();
+    const bytes = smith.value([96]u8);
+    const length = smith.value(u8) % bytes.len;
+    const text = try trace_block_request(h, bytes[0..length], call_config);
+    try testing.expect(std.mem.indexOf(u8, text, "\"error\"") != null);
+}
+
+test "eth: fuzz debug_traceBlock input" {
+    try testing.fuzz({}, fuzz_trace_block, .{});
+}

@@ -17,6 +17,7 @@ const assert = std.debug.assert;
 
 const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
+const rlp = @import("../../common/rlp/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const evm = @import("../evm/root.zig");
@@ -36,6 +37,7 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "debug_traceBlockByNumber", .handler = trace_block_by_number },
     .{ .name = "debug_traceBlockByHash", .handler = trace_block_by_hash },
     .{ .name = "debug_traceCall", .handler = trace_call },
+    .{ .name = "debug_traceBlock", .handler = trace_raw_block },
 };
 
 /// Call depth bound (EIP-150 caps it at 1024; one more for the top frame and a phase shift).
@@ -487,6 +489,25 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
     try write_tree(call.writer, &recorder, 0, recorder.frame_count, top, options.only_top_call);
 }
 
+/// `debug_traceBlock(rlp, options)`: traces an RLP block (canonical or not) on its
+/// parent's state, which must be in the history window.
+fn trace_raw_block(api: *Api, call: *Call) HandlerError!void {
+    const tail = eth.proof_tail_offset(api) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    // The block's bytes take the first quarter of the scratch; the traces use the rest.
+    const raw = try call.params.data(api.scratch[0 .. tail / 4]);
+    const options = try options_of(call, try call.params.optional_raw());
+    try call.params.finish();
+    const block = consensus.block.Block.decode(raw) catch
+        return call.fail(rpc.code.invalid_params, "invalid block RLP");
+    if (api.chain.header(block.header.parent_hash.bytes) == null) {
+        return call.fail(rpc.code.server_error, "parent block not found");
+    }
+    const reserved = @intFromPtr(raw.ptr) - @intFromPtr(api.scratch.ptr) + raw.len;
+    const transactions = rlp.Decoder.init(block.body.transactions.payload);
+    try trace_block(api, call, &block.header, transactions, null, options, reserved);
+}
+
 /// Per-transaction results of a re-execution: frame ranges and gas.
 const Ranges = struct {
     first: [*]u32,
@@ -496,21 +517,45 @@ const Ranges = struct {
 /// Re-executes block `hash` up to transaction `only` (or all of it), tracing `only` (or
 /// every transaction), and writes the result.
 fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) HandlerError!void {
-    const chain = api.chain;
-    var stored = chain.record(hash) orelse {
+    const stored = api.chain.record(hash) orelse {
         return call.fail(rpc.code.server_error, "block not found");
     };
-    const header = stored.header;
+    try trace_block(api, call, &stored.header, stored.transactions, only, options, 0);
+}
+
+/// Re-executes a block (`header` and its transactions, which may live in the first
+/// `reserved` scratch bytes) on its parent's state and writes the traces.
+fn trace_block(
+    api: *Api,
+    call: *Call,
+    header: *const consensus.Header,
+    transactions_in: rlp.Decoder,
+    only: ?u32,
+    options: Options,
+    reserved: usize,
+) HandlerError!void {
+    const chain = api.chain;
     if (header.number == 0) return call.fail(rpc.code.invalid_params, "genesis has no parent");
+    var list = transactions_in;
     var count: u32 = 0;
-    while (!stored.transactions.is_empty()) : (count += 1) {
-        assert(count < chain.transactions_buffer.len); // Stored blocks fit the executor.
-        chain.transactions_buffer[count] = stored.transactions.bytes() catch unreachable;
+    while (!list.is_empty()) : (count += 1) {
+        if (count == chain.transactions_buffer.len) {
+            return call.fail(rpc.code.invalid_params, "too many transactions");
+        }
+        // Block RLP carries legacy transactions as lists and typed ones as strings.
+        const is_list = (list.peek_header() catch
+            return call.fail(rpc.code.invalid_params, "invalid transaction list")).list;
+        const item = if (is_list) list.raw() else list.bytes();
+        chain.transactions_buffer[count] = item catch
+            return call.fail(rpc.code.invalid_params, "invalid transaction list");
     }
+    if (only) |index| assert(index < count);
     const run_count = if (only) |index| index + 1 else count;
     const transactions = chain.transactions_buffer[0..run_count];
     const tail = eth.proof_tail_offset(api) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
+    if (reserved >= tail) return call.fail(rpc.code.internal_error, "scratch too small");
+    const space = api.scratch[reserved..tail];
     chain.ensure_head_state() catch {
         return call.fail(rpc.code.internal_error, "head state unavailable");
     };
@@ -522,15 +567,17 @@ fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) Handl
         .account_proof = &proofs.account,
         .storage_proof = &proofs.storage,
     };
-    const env = node.chain.env_of(&header);
+    const env = node.chain.env_of(header);
     const database = history.database();
     if (options.tracer == .prestate) {
-        return trace_prestate(api, call, &env, transactions, only, options, &history, tail);
+        return trace_prestate(api, call, &env, transactions, only, options, &history, space);
     }
     const per_transaction = run_count * (@sizeOf(u32) + @sizeOf(u64)) + 16;
-    if (per_transaction >= tail) return call.fail(rpc.code.internal_error, "scratch too small");
-    const ranges = carve_ranges(api.scratch[0..per_transaction], run_count + 1);
-    var recorder = recorder_in(api.scratch[per_transaction..tail]) orelse
+    if (per_transaction >= space.len) {
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    }
+    const ranges = carve_ranges(space[0..per_transaction], run_count + 1);
+    var recorder = recorder_in(space[per_transaction..]) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     recorder.with_logs = options.with_logs;
     execute(chain.executor, &env, transactions, only, &recorder, ranges, database) catch |err| {
@@ -749,12 +796,12 @@ fn trace_prestate(
     only: ?u32,
     options: Options,
     history: *node.HistoryDatabase,
-    tail: usize,
+    space: []u8,
 ) HandlerError!void {
-    const half = tail / 2;
-    var collected = prestate.Collected.init(api.scratch[0..half]) orelse
+    const half = space.len / 2;
+    var collected = prestate.Collected.init(space[0..half]) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
-    var staging: std.Io.Writer = .fixed(api.scratch[half..tail]);
+    var staging: std.Io.Writer = .fixed(space[half..]);
     var staged: json.Writer = .init(&staging);
     const executor = api.chain.executor;
     run_prestate(
