@@ -320,7 +320,7 @@ fn run_call(
         try write_failed(w, code_block_gas, "block gas limit reached", &.{});
         return 0;
     }
-    message.gas = message.gas orelse remaining;
+    message.gas = message.gas orelse @min(remaining, api.chain.executor.default_call_gas(env));
     const result = api.chain.executor.session_call(env, message) catch |err| {
         return call.fail(rpc.code.internal_error, @errorName(err));
     };

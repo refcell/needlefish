@@ -17,6 +17,7 @@ const chainspec = @import("../chainspec/root.zig");
 const history_module = @import("../db/history.zig");
 const eth = @import("eth.zig");
 const send_sync = @import("send_sync.zig");
+const chain_module = @import("../node/chain.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
 const engine_types = @import("../engine/root.zig").types;
@@ -1070,4 +1071,30 @@ test "eth: sendRawTransactionSync hands a single call's transaction to the trans
     try json.validate(out.buffered());
     try expect_contains(out.buffered(), "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{");
     try expect_contains(out.buffered(), "\"status\":\"0x1\"");
+}
+
+test "eth: calls without gas default under the Osaka per-transaction cap" {
+    // Every Base upgrade active: Osaka (EIP-7825) applies; the block limit is 30M > 2^24.
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    const to = "\"to\":\"0x00000000000000000000000000000000deadbeef\"";
+    const call_result = try h.request("eth_call", "[{" ++ to ++ "},\"latest\"]");
+    try expect_contains(call_result, "\"result\":\"0x\"");
+    const estimate = try h.request("eth_estimateGas", "[{" ++ to ++ "}]");
+    try expect_contains(estimate, "\"result\":\"0x5208\"");
+    // An explicit gas above the cap is still the caller's error.
+    const over = try h.request("eth_call", "[{" ++ to ++ ",\"gas\":\"0x1c9c380\"},\"latest\"]");
+    try expect_contains(over, "gas_cap_exceeded");
+    const head = h.node.chain.header(h.node.chain.head_hash()).?;
+    const env = chain_module.env_of(&head);
+    try testing.expect(head.gas_limit > 1 << 24);
+    try testing.expectEqual(@as(u64, 1 << 24), h.node.chain.executor.default_call_gas(&env));
+}
+
+test "eth: pre-Osaka calls without gas default to the block gas limit" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const head = h.node.chain.header(h.node.chain.head_hash()).?;
+    const env = chain_module.env_of(&head);
+    try testing.expectEqual(head.gas_limit, h.node.chain.executor.default_call_gas(&env));
 }

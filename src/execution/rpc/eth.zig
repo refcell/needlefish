@@ -674,7 +674,10 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
 /// Binary search for the smallest gas limit that succeeds, bounded by the block limit.
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     var request = try parse_call_request(api, call);
-    var high = request.message.gas orelse view_header(api, request.view).gas_limit;
+    const header = view_header(api, request.view);
+    var env = node.chain.env_of(&header);
+    env.timestamp += 1; // As `simulate` runs it: in the next block.
+    var high = request.message.gas orelse api.chain.executor.default_call_gas(&env);
     request.message.gas = high;
     const first = try simulate(api, call, request);
     switch (first) {

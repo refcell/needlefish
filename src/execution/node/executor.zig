@@ -437,6 +437,17 @@ pub const Executor = struct {
         assert(executor.state.accounts.count() == 0);
     }
 
+    /// The gas of a call that names none: the block's limit, capped from Osaka on at the
+    /// EIP-7825 per-transaction cap (as reth caps its RPC call gas), so a call without
+    /// `gas` is never rejected as `gas_cap_exceeded`.
+    pub fn default_call_gas(executor: *const Executor, block: *const BlockEnv) u64 {
+        const fork = evm_fork(executor.spec.spec_at(block.timestamp));
+        const cap = evm.transaction.tx_gas_limit_cap;
+        const result = if (fork.at_least(.osaka)) @min(block.gas_limit, cap) else block.gas_limit;
+        assert(result <= block.gas_limit);
+        return result;
+    }
+
     /// Runs `call` in `block` (fee-free: gas price zero) without discarding its changes.
     pub fn session_call(executor: *Executor, block: *const BlockEnv, call: Call) Error!SessionCall {
         executor.set_block_env(block);
@@ -445,7 +456,7 @@ pub const Executor = struct {
         const tx: TxEnv = .{
             .tx_type = .legacy,
             .caller = call.from,
-            .gas_limit = call.gas orelse block.gas_limit,
+            .gas_limit = call.gas orelse executor.default_call_gas(block),
             .gas_price = 0,
             .to = call.to,
             .value = call.value,
@@ -480,7 +491,7 @@ pub const Executor = struct {
         const tx: TxEnv = .{
             .tx_type = .legacy,
             .caller = call.from,
-            .gas_limit = @min(call.gas orelse block.gas_limit, block.gas_limit),
+            .gas_limit = @min(call.gas orelse executor.default_call_gas(block), block.gas_limit),
             .gas_price = 0,
             .to = call.to,
             .value = call.value,
