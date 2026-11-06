@@ -256,6 +256,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Performance: `reciprocal` is now a 256-entry seed table plus Newton steps (intx's
   `reciprocal_2by1`) instead of a `__udivti3` call; exact against the u128 division on
   100k random divisors and the edges. mulmod+div loop 150 -> 144 us.
+- [ ] Fuzz: MODEXP precompile against a simple square-and-multiply model over random
+  base/exponent/modulus lengths (including zero-length and leading-zero inputs) plus the
+  EIP-2565/7883 gas formula.
+- [ ] Vectors: P256VERIFY (RIP-7212, used on Base) against the public Wycheproof
+  ecdsa_secp256r1_sha256 vectors (fetched into `.cache`), checking the 32-byte output and
+  the fixed gas.
+- [ ] Fuzz: EIP-7702 delegation chains: random authorizations (valid, wrong chain, bad
+  nonce, self-sponsored, re-delegation, clearing) against a model of the resulting code,
+  nonces, and the 12500/25000 refund.
 - [x] Note for the db lane (sent to nf-trie-db): the harness's `db.overlay` account map (`AutoContext([20]u8)`,
   `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
   there would help cold account loads.
