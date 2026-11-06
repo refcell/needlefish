@@ -256,7 +256,7 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Performance: `reciprocal` is now a 256-entry seed table plus Newton steps (intx's
   `reciprocal_2by1`) instead of a `__udivti3` call; exact against the u128 division on
   100k random divisors and the edges. mulmod+div loop 150 -> 144 us.
-- [ ] Note for the db lane: the harness's `db.overlay` account map (`AutoContext([20]u8)`,
+- [x] Note for the db lane (sent to nf-trie-db): the harness's `db.overlay` account map (`AutoContext([20]u8)`,
   `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
   there would help cold account loads.
 - [x] Performance: account map — `start_call` reuses the parent frame's account for the
