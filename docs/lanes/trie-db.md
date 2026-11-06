@@ -235,10 +235,18 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   block grid chosen over a CoW B+tree and an append-only node log; phased plan.
   (`docs/design/disk-state.md`, `db/footprint_bench.zig` `-- db/footprint`, docs/PERF.md
   "db state memory footprint")
-- [ ] Disk state phase 1: grid + free set + immutable sorted tables (writer, reader, point
-  lookup, range scan, checksums) over `Storage`, superblock v3 naming a manifest, block reuse
-  only after no retained checkpoint references a block; first user: the code store (code log
-  + table index), taking `code_arena` out of RAM and out of the checkpoint image. DST faults.
+- [x] Disk state phase 1a-c: grid + free set + immutable sorted tables (writer, reader, point
+  lookup, range scan, checksums, block cache) over `Storage`, superblock v3, the engine
+  recording the free set in every checkpoint, block reuse only after no retained checkpoint
+  references a block. DST faults.
+  (`storage/grid.zig`, `free_set.zig`, `table.zig`, `table_builder.zig`, `table_reader.zig`,
+  `engine_grid_test.zig`; `db/table` bench: hit 0.21-0.28 us, cold miss 25 us; see Decisions)
+- [ ] Disk state phase 1d: the code store as the first table user: codes in grid tables (new
+  codes in State's table as the memtable, flushed to a table before each checkpoint, the
+  table list in the database checkpoint image), out of the checkpoint image; then out of RAM.
+  Blocked on the read path, see Decisions ("code store read path"). Then: database crash
+  tests (24 seeds incl. mid-flush and fallback with grid blocks), bench code lookup hit/miss
+  and checkpoint image size before/after on the db bench state.
 - [ ] Disk state phase 2: hashed account and storage LSM trees (memtables, leveled compaction
   paced per durable commit, filters on all but the last level, fences, static block cache);
   `State` reads through them; checkpoints stop serializing the flat tables. Differential test
@@ -255,6 +263,45 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   a public snapshot.
 
 ## Decisions
+- Disk state phase 1 (grid, free set, tables, engine). Addresses are block index + 1 (0 =
+  none); grid block size = `checkpoint_block_size` (one block size per file, no new layout
+  field). Parents hold `grid.Reference` (address + checksum), so a reused address can never
+  serve a stale block. Free set: four bitsets (acquired, released since the last snapshot,
+  released between the last two snapshots, freeing); a block released after checkpoint N's
+  snapshot frees when checkpoint N+2's superblock is durable, the first point where neither
+  the newest nor the fallback can name it; a failed checkpoint merges the stages later,
+  never earlier; reuse is lowest-address (deterministic); reservations make a table write
+  all-or-nothing. The engine owns the free set and streams its image ahead of the producer's
+  bytes in every checkpoint (snapshot at `checkpoint` start, free on the durable superblock,
+  undo on `CheckpointTooLarge`, restore from the checkpoint open loads, the fallback's own
+  after a fallback). The table list (manifest) is the caller's: it goes in the caller's
+  checkpoint bytes, so the superblock names no manifest. Superblock v3 only stores
+  `Layout.grid_block_count` in the word v2 kept reserved and zero. Migration rule (smallest
+  safe): open accepts v2 copies, which decode as grid-less layouts; the next superblock write
+  is v3. A v2 file opens unchanged in an engine without a grid and fails `LayoutMismatch` in
+  one with a grid; nothing is ever misread. Grid writes a checkpoint names must complete
+  before `checkpoint` starts (its final sync then covers them). Rot in a grid block is not
+  survived by the checkpoint fallback (no redundancy for grid blocks yet). Tables: fixed keys,
+  variable values inline (a record never spans blocks, so value <= block payload - 44 B,
+  65 364 B at 64 KiB; EIP-170 code is 24 KiB), one index block per table (1021 data blocks,
+  ~64 MiB at 64 KiB blocks). Codes inline as values instead of the design's separate code
+  log: codes are immutable and nothing compacts in phase 1, so a log only adds an
+  indirection; revisit when compaction would rewrite code bytes. Block cache: set-associative
+  (16 ways) with CLOCK per set, keyed by address + checksum, refilled by copy from the
+  reader's own buffer (a refill never waits on a write). Reader completes synchronously when
+  every block is cached (`.done`) and from a storage tick otherwise (`.pending`).
+- Code store read path (why phase 1d is not wired in): `State.code_by_hash` is synchronous and
+  its callers outside the lane (evm `State.code`, which caches the slice in the account for
+  the whole block; node `StateDb`, witness, rpc) hold the returned slice for a block or
+  longer, while grid reads are asynchronous and cached blocks are evicted. Codes can leave
+  RAM only with (1) a read path that does not return evictable slices: per-block code pinning
+  sized by the evm's own per-block code budget, or phase 4's batched prefetch before
+  execution; and (2) either a synchronous wait on one read (`read_sectors_wait`: memcpy in
+  `SimStorage`; spin `io.tick` without delivering other callbacks in `IoStorage`) or an engine
+  pause between checkpoint load and journal replay so open can scan code tables. The smallest
+  safe next step keeps codes resident in `code_arena` and only moves them out of the
+  checkpoint image (tables durable on the grid, image carries only codes not yet in a table,
+  open scans the tables, a full merge from RAM when the table list is full).
 - Disk-backed state (docs/design/disk-state.md): a TigerBeetle-style LSM forest on a block
   grid inside the engine file, hashed keys only (accounts, storage, trie branches by
   (owner, path), codes), leaves derived from records, sparse root over the branch tree,
@@ -1122,3 +1169,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-06: disk-backed state design (docs/design/disk-state.md) and the `db/footprint`
   bench: 591/780 B per account and 357/318 B per slot at 100k/1M accounts (194 B per account
   trie node, 114 B per storage trie node, ~1.39 nodes per entry); phases 1-6 in the backlog.
+- 2026-11-06: disk state phase 1a-c: grid blocks with checksummed headers and references, a
+  free set staged so released blocks wait two durable checkpoints, immutable sorted tables
+  (builder, reader, set-associative CLOCK block cache), engine grid zone with the free set in
+  every checkpoint, superblock v3 (v2 opens as grid-less). Tests: free-set state machine vs a
+  retained-checkpoint model (seeded + coverage fuzz; a one-checkpoint-early free is caught),
+  table differential vs a sorted reference over 24 shapes, rot detection, decoder fuzz,
+  engine grid crash test over 24 seeds x 6 crashes (mid write, mid and paused checkpoint,
+  newest-zone rot forcing the fallback) reading back every referenced block. `db/table`:
+  build 2.2-2.4 GiB/s, lookup hit 0.21-0.28 us, cold miss 25 us. Code store (1d) remains.

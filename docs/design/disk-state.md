@@ -270,3 +270,18 @@ together. Refills of the block cache never wait on a write and are bounded per b
 4. Proofs and witnesses over the store; batched prefetch; meet the section 6 targets.
 5. History on disk (`(owner, path, block)` tree), base/base's 15-day window, no rebuild on open.
 6. Scale proof: synthetic 100M+ entry state, then state import from a public snapshot.
+
+## 9. Corrections from phase 1
+
+- The superblock does not name the manifest. The engine streams its free set ahead of the
+  caller's checkpoint bytes, and the table list (manifest) is part of the caller's bytes;
+  superblock v3 only adds the grid size. Same protection (the superblock names a checkpoint
+  whose bytes include the manifest), no extra on-disk structure. Section 4.5 still holds.
+- Codes are stored inline as table values (a record never spans a block, so a code is at most
+  the block payload, ~64 KiB at 64 KiB blocks), not in a separate code log: codes are
+  immutable and phase 1 compacts nothing, so a log only adds an indirection. Revisit with
+  compaction (a log keeps compaction from rewriting code bytes).
+- Taking codes out of RAM needs a read path that does not hand out evictable slices, because
+  `code_by_hash` callers (the evm caches the slice for a whole block) are synchronous and
+  hold the slice. Codes first leave the checkpoint image while staying resident; they leave
+  RAM with phase 4's batched prefetch (or per-block pinning). See the trie-db lane Decisions.

@@ -857,6 +857,28 @@ Takeaways: at a Base-mainnet-like 500M accounts + 2B slots the in-memory state i
 (+~0.9 TiB history, ~200 GiB per checkpoint image), and the `u32` node index and the `u32`
 checkpoint staging size break first. Design response: docs/design/disk-state.md.
 
+## 2026-11-06 db sorted tables on the grid (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/table` (`db/table_bench.zig`). Disk state phase 1:
+one immutable table of 10k code-shaped records (32-byte hash key, 100..8000-byte value,
+38.8 MiB in 651 data blocks of 64 KiB) built and read through `SimStorage` with one tick of
+latency, so a miss is the CPU side of a read (copy, block checksum, structural check, cache
+insert), not device latency. Four runs:
+
+| Case | Result |
+| --- | ---: |
+| build (pull, pack, seal, write) | 16.0-17.5 ms (2.2-2.4 GiB/s) |
+| lookup, warm cache (two binary searches + one 16-way set scan) | 213-280 ns |
+| lookup, cold cache (one verified 64 KiB block read) | 24.6-25.7 us |
+| absent key, cold cache (no filters yet: still reads one data block) | 24.4-25.5 us |
+
+Takeaways: a cache hit is inside the <= 1 us target of docs/design/disk-state.md section 6. A
+miss costs ~25 us of CPU before any device time because the reader reads, checksums, and
+copies a whole 64 KiB block; reading only the sectors the header names and checking the
+block once on insert are the next cuts when misses matter (phase 2 brings filters, so absent
+keys stop reading data blocks). Code lookup through the database and the checkpoint image
+size without codes are not measured yet: the code store (phase 1 item d) is not wired in.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

@@ -44,6 +44,8 @@ pub const witness_rpc = @import("witness_rpc_bench.zig");
 pub const restart = @import("restart_bench.zig");
 /// In-memory bytes per account, slot, and trie node (`footprint_bench.zig`).
 pub const footprint = @import("footprint_bench.zig");
+/// Sorted tables on the grid: build, lookup hit/miss (`table_bench.zig`).
+pub const table = @import("table_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -654,6 +656,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     steady.run(io, filter);
     restart.run(io, filter);
     footprint.run(io, filter);
+    table.run(io, filter);
 }
 
 fn run_commit_sim(
