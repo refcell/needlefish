@@ -182,7 +182,8 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 ## Decisions
 - TEE host: enclave pool is round robin (base/base first-free); a claim that does not hold on
   the host is refused before the enclave runs; no `prover_prove` endpoint (proofs go through
-  the prover service); registration gating is an interface without an onchain client yet.
+  the prover service); registration gating reads `TEEProverRegistry` over `eth_call`
+  (`prover-worker --tee-prover-registry-address`; unset routes to every local enclave).
 - Registrar: static `--prover-endpoints` replace AWS target groups; registrations run one at a
   time inside a cycle (`--max-concurrency` accepted, unused); the bin refuses
   `--crl-nitro-verifier-address` (no DNS/TLS CRL fetcher); signer key from
@@ -361,6 +362,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: TEE host gates enclaves on `TEEProverRegistry.isValidSigner` via `eth_call`.
 - 2026-11-05: TEE nitro host + `prover-worker --backend tee`; registrar complete with `base registrar`.
 - 2026-11-05: registrar prover client, TEE registry/CertManager bindings, `base nitro-enclave`.
 - 2026-11-05: registrar pure logic (planner, P-384 hints, CRL, reconciler, tasks).
