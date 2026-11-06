@@ -214,7 +214,7 @@ fn run_archive(init: std.process.Init, archive: *const Archive, view: *tui.View)
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
-    try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
+    try replayer.init(gpa, spec, archive, replayer_config(archive));
     defer replayer.deinit(gpa);
     try view.progress();
     var replayed: u32 = 0;
@@ -321,7 +321,7 @@ pub fn check_archive(
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
-    try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
+    try replayer.init(gpa, spec, archive, replayer_config(archive));
     defer replayer.deinit(gpa);
     replayer.probe = true;
     var reports: std.ArrayList(GapReport) = .empty;
@@ -347,4 +347,13 @@ pub fn check_archive(
     }
     assert(reports.items.len <= archive.block_count);
     return if (reports.items.len == 0) null else reports.items;
+}
+
+/// The replayer limits for `archive`, recovering senders on one worker per spare core (at
+/// most 7) as `base node` does; results do not depend on the worker count.
+fn replayer_config(archive: *const Archive) replay.replayer.Config {
+    var config = replay.replayer.config_for(archive);
+    const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
+    config.executor.recovery_threads = @min(cores - 1, 7);
+    return config;
 }

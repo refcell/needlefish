@@ -926,6 +926,10 @@ keccak ~30% (mostly the replay-only sparse trie and witness backend), sparse tri
 ~15%, secp256k1 sender recovery ~10% (serial here; the production node recovers on up to
 7 threads), interpreter ~17%.
 
+With parallel sender recovery in the replay path (7 workers, as `base node`): 3 runs each,
+**6.16 ms/block (755 Mgas/s) vs 6.46 ms/block (720 Mgas/s)** serial, ~5%. Blocks average
+25 transactions, so recovery has little to split.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

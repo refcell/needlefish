@@ -2,7 +2,8 @@
 //! transactions, Denim-era 200 ms blocks) executed by the node's executor over the replay
 //! witness backend. Archive decode and replayer setup are outside the timed region; each
 //! sample times the ten `replay_next` calls (execution, commit, state root, receipts) and
-//! the best sample is reported as Mgas/s and ms per block.
+//! the best sample is reported as Mgas/s and ms per block. Senders are recovered in
+//! parallel as in `base node`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -30,7 +31,10 @@ fn replay_samples(io: std.Io) !void {
     const replayer = try allocator.create(replay.replayer.Replayer);
     defer allocator.destroy(replayer);
     const spec = &chainspec.ChainSpec.presets.base_mainnet;
-    const config = replay.replayer.config_for(&archive);
+    var config = replay.replayer.config_for(&archive);
+    // As `base node`: one sender-recovery worker per spare core, at most 7.
+    const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
+    config.executor.recovery_threads = @min(cores - 1, 7);
     var best_ns: u64 = std.math.maxInt(u64);
     var gas: u64 = 0;
     for (0..samples) |_| {
@@ -55,4 +59,26 @@ fn replay_samples(io: std.Io) !void {
         @as(f64, @floatFromInt(gas)) * 1e3 / @as(f64, @floatFromInt(best_ns)),
         gas,
     });
+}
+
+test "bench_replay: mainnet blocks replay identically with parallel sender recovery" {
+    // Recovery workers only change who recovers each sender; every header field, receipt
+    // and state root must still match mainnet.
+    const allocator = std.testing.allocator;
+    var archive = try replay.archive.Archive.init(allocator, mainnet.fixture_config);
+    defer archive.deinit(allocator);
+    try replay.archive.decode(allocator, mainnet.fixture, &archive);
+    const replayer = try allocator.create(replay.replayer.Replayer);
+    defer allocator.destroy(replayer);
+    var config = replay.replayer.config_for(&archive);
+    config.executor.recovery_threads = 3;
+    const spec = &chainspec.ChainSpec.presets.base_mainnet;
+    try replayer.init(allocator, spec, &archive, config);
+    defer replayer.deinit(allocator);
+    var blocks: u32 = 0;
+    while (!replayer.done()) : (blocks += 1) {
+        const outcome = try replayer.replay_next();
+        try std.testing.expect(outcome.ok());
+    }
+    try std.testing.expectEqual(archive.block_count, blocks);
 }
