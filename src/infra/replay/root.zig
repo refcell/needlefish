@@ -16,4 +16,5 @@ pub const Replayer = replayer.Replayer;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("archive_test.zig");
+    _ = @import("mainnet_test.zig");
 }

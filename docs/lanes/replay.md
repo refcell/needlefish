@@ -68,10 +68,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 - [x] `base replay import <raw dir>`: archive from saved JSON-RPC results, every byte bound
   to the chain; collapse siblings derived from post-state proofs.
 - [x] Pass on 10 consecutive Base mainnet blocks (53715983..53715992).
-- [ ] Witness fetcher (`base replay fetch`, default count 10): RPC, caching, backoff, and
-  the gap-fill loop (system-call contracts, precompiles, message passer).
-- [ ] TUI + plain mode.
-- [ ] `just replay` recipes, `docs/REPLAY.md`, fixture + unit test if small enough.
+- [x] Witness fetcher (`base replay fetch`, default count 10): RPC, caching, backoff, and
+  the in-process gap-fill loop (system-call contracts, precompiles, message passer).
+- [x] TUI + plain mode.
+- [x] `just replay` (fetch latest + run), `just replay-run`, `docs/REPLAY.md`, committed
+  fixture (`src/infra/replay/testdata/`, 8.7 MB) replayed by `zig build test`.
 - [ ] Demo recording with burned-in subtitles; README embed near the top.
 - [ ] Fuzz the archive decoder; DST-style deterministic replay test.
 
@@ -107,6 +108,11 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-05: `just replay` end to end from an empty cache: latest blocks
+  53731432..53731441 (150 txs) fetched in 80 s with one gap round, 10/10 reproduce.
+- 2026-11-05: fixture lives in `src/infra/replay/testdata/` (not `etc/replay/fixtures/`):
+  `@embedFile` cannot reach outside the `src/` module root.
 
 - 2026-11-05: first real-data run. Blocks 53715983..53715992 (253 txs): all 10 reproduce
   the transactions root, gas used, logs bloom, blob gas used, receipts root, state root,

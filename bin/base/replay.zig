@@ -9,13 +9,16 @@ const Io = std.Io;
 const base = @import("base");
 
 const replay = base.infra.replay;
+const tui = @import("replay_tui.zig");
+const fetch = @import("replay_fetch.zig");
 const Archive = replay.Archive;
 const assert = std.debug.assert;
 
 pub const default_archive = "replay.nfrp";
 const usage =
-    \\usage: base replay import <raw dir> [--out <archive>]
-    \\       base replay run [<archive>] [--blocks <n>]
+    \\usage: base replay fetch [--count <n>] [--from <block>] [--cache <dir>] [--out <archive>]
+    \\       base replay import <raw dir> [--out <archive>]
+    \\       base replay run [<archive>] [--blocks <n>] [--plain]
     \\
 ;
 const file_bytes_max = 1 << 30;
@@ -43,6 +46,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     }
     if (std.mem.eql(u8, args[0], "import")) return import_main(init, args[1..]);
     if (std.mem.eql(u8, args[0], "run")) return run_main(init, args[1..]);
+    if (std.mem.eql(u8, args[0], "fetch")) return fetch.main(init, args[1..]);
     std.debug.print("unknown replay command: {s}\n{s}", .{ args[0], usage });
     return 2;
 }
@@ -64,7 +68,19 @@ fn import_main(init: std.process.Init, args: []const []const u8) !u8 {
     defer archive.deinit(gpa);
     const window = try read_window(init, dir);
     try import_blocks(init, dir, &archive, window);
-    const body = try replay.archive.encode_body(gpa, &archive, archive_config.witness);
+    try write_archive(init, &archive, window, out_path);
+    return 0;
+}
+
+/// Encodes `archive` and writes it to `out_path`.
+pub fn write_archive(
+    init: std.process.Init,
+    archive: *const Archive,
+    window: Window,
+    out_path: []const u8,
+) !void {
+    const gpa = init.gpa;
+    const body = try replay.archive.encode_body(gpa, archive, archive_config.witness);
     defer gpa.free(body);
     var output: Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
@@ -82,12 +98,11 @@ fn import_main(init: std.process.Init, args: []const []const u8) !u8 {
         out_path,
         output.written().len,
     });
-    return 0;
 }
 
-const Window = struct { first: u64, count: u32 };
+pub const Window = struct { first: u64, count: u32 };
 
-fn read_window(init: std.process.Init, dir: Io.Dir) !Window {
+pub fn read_window(init: std.process.Init, dir: Io.Dir) !Window {
     const raw = try dir.readFileAlloc(init.io, "window.json", init.gpa, .limited(4096));
     defer init.gpa.free(raw);
     const Parsed = struct { first: u64, count: u32 };
@@ -99,7 +114,7 @@ fn read_window(init: std.process.Init, dir: Io.Dir) !Window {
     return .{ .first = parsed.value.first, .count = parsed.value.count };
 }
 
-fn import_blocks(init: std.process.Init, dir: Io.Dir, archive: *Archive, window: Window) !void {
+pub fn import_blocks(init: std.process.Init, dir: Io.Dir, archive: *Archive, window: Window) !void {
     const gpa = init.gpa;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -155,9 +170,12 @@ fn read_optional(
 fn run_main(init: std.process.Init, args: []const []const u8) !u8 {
     var path: []const u8 = default_archive;
     var blocks_limit: ?u32 = null;
+    var plain = false;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
-        if (std.mem.eql(u8, args[index], "--blocks")) {
+        if (std.mem.eql(u8, args[index], "--plain")) {
+            plain = true;
+        } else if (std.mem.eql(u8, args[index], "--blocks")) {
             if (index + 1 == args.len) return error.InvalidArguments;
             blocks_limit = try std.fmt.parseInt(u32, args[index + 1], 10);
             index += 1;
@@ -171,40 +189,45 @@ fn run_main(init: std.process.Init, args: []const []const u8) !u8 {
     var archive = try Archive.init(gpa, archive_config);
     defer archive.deinit(gpa);
     try replay.archive.decode(gpa, file, &archive);
-    return run_archive(gpa, &archive, blocks_limit);
+    var buffer: [4096]u8 = undefined;
+    const stdout = Io.File.stdout();
+    var writer = stdout.writer(init.io, &buffer);
+    const color = !plain and try stdout.isTty(init.io);
+    const limit = @min(blocks_limit orelse archive.block_count, archive.block_count);
+    var view: tui.View = .{
+        .out = &writer.interface,
+        .style = .{ .color = color },
+        .block_count = limit,
+    };
+    const first = base.execution.db.witness.header_number(archive.block_header(0)) catch
+        return error.InvalidArchive;
+    try view.header(first, file.len);
+    return run_archive(init, &archive, &view);
 }
 
-fn run_archive(gpa: std.mem.Allocator, archive: *const Archive, blocks_limit: ?u32) !u8 {
+fn run_archive(init: std.process.Init, archive: *const Archive, view: *tui.View) !u8 {
+    const gpa = init.gpa;
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
     try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
     defer replayer.deinit(gpa);
-    const limit = @min(blocks_limit orelse archive.block_count, archive.block_count);
-    var passed: u32 = 0;
+    try view.progress();
     var replayed: u32 = 0;
-    while (replayed < limit and !replayer.done()) : (replayed += 1) {
+    while (replayed < view.block_count and !replayer.done()) : (replayed += 1) {
+        const start = Io.Clock.awake.now(init.io);
         const outcome = try replayer.replay_next();
-        print_outcome(&outcome);
+        const elapsed = start.durationTo(Io.Clock.awake.now(init.io));
+        try view.row(&outcome, @intCast(@max(elapsed.nanoseconds, 0)));
         if (!outcome.ok()) {
+            try view.out.flush();
             print_failure(replayer, &outcome);
             print_gaps_json(replayer, &outcome);
             break;
         }
-        passed += 1;
     }
-    std.debug.print("{d}/{d} blocks reproduced\n", .{ passed, limit });
-    return if (passed == limit) 0 else 1;
-}
-
-fn print_outcome(outcome: *const replay.replayer.Outcome) void {
-    std.debug.print("block {d} {x} txs {d} gas {d}: {s}\n", .{
-        outcome.number,
-        outcome.hash[0..4],
-        outcome.transactions,
-        outcome.gas_used,
-        if (outcome.ok()) "ok" else "MISMATCH",
-    });
+    try view.summary();
+    return if (view.totals.passed == view.block_count) 0 else 1;
 }
 
 fn print_failure(replayer: *const replay.Replayer, outcome: *const replay.replayer.Outcome) void {
@@ -271,4 +294,49 @@ fn print_gaps_json(replayer: *const replay.Replayer, outcome: *const replay.repl
         std.debug.print("{s}\"0x{x}\"", .{ if (index == 0) "" else ",", hash });
     }
     std.debug.print("]}}\n", .{});
+}
+
+/// The keys the replay lacked in the first block that failed, for the fetcher.
+pub const GapReport = struct {
+    block: u64,
+    accounts: []const [20]u8,
+    slots: []const replay.replayer.SlotKey,
+    nodes: u32,
+    codes: u32,
+};
+
+/// Replays the whole archive silently. Null when every block passes; otherwise the gaps of
+/// the first failing block (copied into `arena`). A failure with no gaps is a real
+/// divergence: `error.Mismatch`.
+pub fn check_archive(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    archive: *const Archive,
+) !?GapReport {
+    const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
+    const replayer = try gpa.create(replay.Replayer);
+    defer gpa.destroy(replayer);
+    try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
+    defer replayer.deinit(gpa);
+    while (!replayer.done()) {
+        const outcome = try replayer.replay_next();
+        if (outcome.ok()) continue;
+        const gaps = &replayer.gaps;
+        const accounts = try arena.alloc([20]u8, gaps.accounts_len + gaps.code_owners_len);
+        @memcpy(accounts[0..gaps.accounts_len], gaps.accounts[0..gaps.accounts_len]);
+        @memcpy(accounts[gaps.accounts_len..], gaps.code_owners[0..gaps.code_owners_len]);
+        const report: GapReport = .{
+            .block = outcome.number,
+            .accounts = accounts,
+            .slots = try arena.dupe(replay.replayer.SlotKey, gaps.slots[0..gaps.slots_len]),
+            .nodes = gaps.nodes_len,
+            .codes = gaps.codes_len,
+        };
+        if (report.accounts.len + report.slots.len == 0) {
+            print_failure(replayer, &outcome);
+            return error.Mismatch;
+        }
+        return report;
+    }
+    return null;
 }
