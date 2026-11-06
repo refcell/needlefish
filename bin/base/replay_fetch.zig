@@ -28,7 +28,7 @@ pub const default_count = 10;
 const head_margin = 32;
 const batch_max = 16;
 const retries_max = 8;
-const gap_rounds_max = 64;
+const gap_rounds_max = 256;
 const response_bytes_max = 96 << 20;
 const ancestors = replay.archive.ancestors_max;
 

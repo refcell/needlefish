@@ -121,7 +121,7 @@ Transaction traces miss state that needlefish still reads:
 they write) and the message passer, and the first block with the precompiles. It then
 replays the archive in-process; any account or slot the replay still lacks is fetched at
 the parent into `proofs_extra.json` and `codes_extra.json` and the archive is rebuilt,
-until the replay has no gaps (64 rounds at most; typically one). `base replay run` prints
+until the replay has no gaps (256 rounds at most). `base replay run` prints
 the same gaps on a machine-readable line
 (`GAPS {"block":n,"accounts":[...],"slots":[...],"nodes":[...]}`).
 
