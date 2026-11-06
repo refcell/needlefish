@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index e442af5..e64ac3f 100644
+index e442af545..9c5a8fc4e 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -13250,6 +13250,24 @@ dependencies = [
+@@ -13250,6 +13250,26 @@ dependencies = [
   "tokio",
  ]
  
@@ -17,10 +17,12 @@ index e442af5..e64ac3f 100644
 + "alloy-rpc-types-eth 2.5.0",
 + "base-common-chains",
 + "base-common-evm",
++ "base-common-genesis",
 + "base-common-rpc-types-engine",
 + "base-proof-executor",
 + "base-proof-mpt",
 + "miniz_oxide 0.9.1",
++ "revm",
 + "serde_json",
 +]
 +
@@ -28,7 +30,7 @@ index e442af5..e64ac3f 100644
  name = "nix"
  version = "0.26.4"
 diff --git a/Cargo.toml b/Cargo.toml
-index 91c6156..96f570c 100644
+index 91c615656..96f570c67 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -11,6 +11,7 @@ exclude = [".github/"]
@@ -41,10 +43,10 @@ index 91c6156..96f570c 100644
    "bin/[a-o]*",
 diff --git a/bench/nf-replay/Cargo.toml b/bench/nf-replay/Cargo.toml
 new file mode 100644
-index 0000000..e7f7a0a
+index 000000000..209af098b
 --- /dev/null
 +++ b/bench/nf-replay/Cargo.toml
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,26 @@
 +[package]
 +name = "nf-replay-bench"
 +description = "Replays a needlefish .nfrp archive through base/base's stateless block executor"
@@ -58,24 +60,30 @@ index 0000000..e7f7a0a
 +base-proof-mpt = { workspace = true, features = ["std"] }
 +base-common-evm = { workspace = true, features = ["std"] }
 +base-common-chains = { workspace = true, features = ["std"] }
++base-common-genesis = { workspace = true, features = ["std"] }
 +base-common-rpc-types-engine = { workspace = true, features = ["std"] }
 +alloy-rpc-types-engine = { workspace = true, features = ["std"] }
-+alloy-consensus = { workspace = true, features = ["std"] }
++# The crypto backends base/base's node (`base-reth-node`) builds with: C libsecp256k1 for
++# sender recovery and ECRECOVER, blst, c-kzg and aws-lc P256. The proof executor alone
++# would build pure-Rust k256 and arkworks instead.
++alloy-consensus = { workspace = true, features = ["std", "secp256k1"] }
 +alloy-primitives = { workspace = true, features = ["std"] }
 +alloy-rlp = { workspace = true, features = ["std"] }
 +alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
 +serde_json = { workspace = true, features = ["std"] }
 +miniz_oxide = { workspace = true, features = ["std"] }
++revm = { workspace = true, features = ["std", "secp256k1", "blst", "c-kzg", "p256-aws-lc-rs"] }
 diff --git a/bench/nf-replay/src/main.rs b/bench/nf-replay/src/main.rs
 new file mode 100644
-index 0000000..5d65b6e
+index 000000000..2ce26ce89
 --- /dev/null
 +++ b/bench/nf-replay/src/main.rs
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,484 @@
 +//! Replays a needlefish `.nfrp` replay archive through base/base's stateless block executor
 +//! (`base-proof-executor::StatelessL2Builder`) and prints one `BENCH` line per block.
 +//!
 +//! usage: nf-replay-bench <archive.nfrp> <parent-block.json> [warm runs]
++//!            [--evm-only <prestate.nfps>]
 +//!
 +//! `parent-block.json` is the JSON-RPC response of `eth_getBlockByNumber(parent, false)`.
 +//!
@@ -83,6 +91,11 @@ index 0000000..5d65b6e
 +//! starts from a fresh `TrieDB` over the archive's witness, so every run executes the same
 +//! blocks from the same pre-state. A block whose sealed header hash differs from the
 +//! canonical header ends the process with exit code 1.
++//!
++//! `--evm-only` executes the blocks against a flat in-memory pre-state instead (`CacheDB`
++//! filled from the `NFPS` file `base replay bench --evm-only --prestate-out` writes): senders
++//! recovered before the timed region, no `TrieDB`, no state root. A block counts when its gas
++//! used and receipts root match the canonical header.
 +
 +use std::{
 +    collections::{HashMap, HashSet},
@@ -98,7 +111,12 @@ index 0000000..5d65b6e
 +use base_common_chains::ChainConfig;
 +use base_common_evm::BaseEvmFactory;
 +use base_common_rpc_types_engine::BasePayloadAttributes;
-+use base_proof_executor::{StatelessL2Builder, TrieDBProvider};
++use base_proof_executor::{StatelessL2Builder, TrieDBProvider, compute_receipts_root};
++use revm::{
++    bytecode::Bytecode,
++    database::{CacheDB, EmptyDB, State},
++    state::AccountInfo,
++};
 +use base_proof_mpt::{TrieHinter, TrieNode, TrieProvider};
 +use std::{cell::RefCell, rc::Rc};
 +
@@ -351,8 +369,118 @@ index 0000000..5d65b6e
 +    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 +}
 +
++/// The flat pre-state `base replay bench --evm-only --prestate-out` writes (`NFPS`).
++fn load_prestate(path: &str) -> CacheDB<EmptyDB> {
++    let bytes = std::fs::read(path).expect("read prestate");
++    let mut reader = Reader { bytes: &bytes, offset: 0 };
++    assert_eq!(reader.take(4), b"NFPS");
++    assert_eq!(reader.u32(), 1);
++    let accounts: Vec<(Address, u64, U256, B256)> = (0..reader.u32())
++        .map(|_| {
++            let address = Address::from_slice(reader.take(20));
++            let nonce = reader.u64();
++            let balance = U256::from_be_slice(reader.take(32));
++            let code_hash = reader.hash();
++            reader.take(1); // has_storage: revm reads storage on demand.
++            (address, nonce, balance, code_hash)
++        })
++        .collect();
++    let slots: Vec<(Address, U256, U256)> = (0..reader.u32())
++        .map(|_| {
++            let address = Address::from_slice(reader.take(20));
++            let slot = U256::from_be_slice(reader.take(32));
++            (address, slot, U256::from_be_slice(reader.take(32)))
++        })
++        .collect();
++    let mut codes = HashMap::new();
++    for _ in 0..reader.u32() {
++        let length = reader.u32() as usize;
++        let code = Bytes::copy_from_slice(reader.take(length));
++        codes.insert(keccak256(&code), code);
++    }
++    let mut db = CacheDB::new(EmptyDB::default());
++    for _ in 0..reader.u32() {
++        let number = reader.u64();
++        db.cache.block_hashes.insert(U256::from(number), reader.hash());
++    }
++    assert_eq!(reader.offset, bytes.len());
++    for (address, nonce, balance, code_hash) in accounts {
++        let code = codes.get(&code_hash).map(|code| Bytecode::new_raw(code.clone()));
++        let info = AccountInfo { balance, nonce, code_hash, account_id: None, code };
++        db.insert_account_info(address, info);
++    }
++    for (address, slot, value) in slots {
++        if !value.is_zero() {
++            db.insert_account_storage(address, slot, value).expect("slot");
++        }
++    }
++    db
++}
++
++/// `--evm-only`: every run from a fresh flat state, the canonical parent header of each block.
++fn evm_only(
++    config: &base_common_genesis::RollupConfig,
++    blocks: &[Block],
++    attrs: &[BasePayloadAttributes],
++    parent: &Sealed<Header>,
++    prestate: &str,
++    warm: u32,
++) {
++    let pre = load_prestate(prestate);
++    let recovered: Vec<Vec<_>> = attrs
++        .iter()
++        .map(|attrs| {
++            attrs.recovered_transactions_with_encoded().collect::<Result<Vec<_>, _>>().unwrap()
++        })
++        .collect();
++    let empty = Provider(Arc::new(Store::default()), Rc::default());
++    let mut builder =
++        StatelessL2Builder::new(config, BaseEvmFactory::default(), empty, LastKey::default(), parent.clone());
++    builder.clock = Some(now_ns);
++    for run in 0..=warm {
++        let mut state = State::builder().with_database(pre.clone()).build();
++        let mut parent = parent.clone();
++        for ((block, attrs), transactions) in blocks.iter().zip(attrs).zip(&recovered) {
++            let start = now_ns();
++            let result = builder
++                .bench_execute_in_memory(&parent, attrs, transactions, &mut state)
++                .expect("execute");
++            let receipts_start = now_ns();
++            let receipts_root =
++                compute_receipts_root(&result.receipts, config, block.header.timestamp);
++            let receipts_ns = now_ns() - receipts_start;
++            let total_ns = now_ns() - start;
++            let ok = receipts_root == block.header.receipts_root
++                && result.gas_used == block.header.gas_used;
++            let phases = builder.last_phases;
++            println!(
++                "BENCH run={run} block={} txs={} gas={} exec_ns={} total_ns={total_ns} \
++                 pre_ns={} recover_ns=0 post_ns={} receipts_ns={receipts_ns} commit_ns=0 \
++                 root_ns=0 ok={}",
++                block.header.number,
++                block.transactions.len(),
++                result.gas_used,
++                builder.last_execute_ns,
++                phases.pre_ns,
++                phases.post_ns,
++                u8::from(ok),
++            );
++            if !ok {
++                eprintln!("mismatch at {}", block.header.number);
++                std::process::exit(1);
++            }
++            parent = block.header.clone().seal_slow();
++        }
++    }
++}
++
 +fn main() {
-+    let args: Vec<String> = std::env::args().collect();
++    let mut args: Vec<String> = std::env::args().collect();
++    let prestate = args.iter().position(|arg| arg == "--evm-only").map(|at| {
++        let path = args.remove(at + 1);
++        args.remove(at);
++        path
++    });
 +    let warm: u32 = args.get(3).map_or(5, |s| s.parse().expect("warm runs"));
 +    let (store, blocks, parent_state_root) = load(&args[1]);
 +    let response: serde_json::Value =
@@ -366,6 +494,10 @@ index 0000000..5d65b6e
 +    let config = ChainConfig::rollup_config_by_chain_id(8453).expect("Base mainnet config");
 +    let store = Arc::new(store);
 +    let attrs: Vec<BasePayloadAttributes> = blocks.iter().map(attributes).collect();
++    if let Some(prestate) = prestate {
++        evm_only(&config, &blocks, &attrs, &parent, &prestate, warm);
++        return;
++    }
 +    now_ns();
 +    let last_key = LastKey::default();
 +    for run in 0..=warm {
@@ -397,12 +529,20 @@ index 0000000..5d65b6e
 +            });
 +            let total_ns = now_ns() - start;
 +            let ok = outcome.header.hash() == block.hash;
++            let phases = builder.last_phases;
 +            println!(
-+                "BENCH run={run} block={} txs={} gas={} exec_ns={} total_ns={total_ns} ok={}",
++                "BENCH run={run} block={} txs={} gas={} exec_ns={} total_ns={total_ns} \
++                 pre_ns={} recover_ns={} post_ns={} receipts_ns={} commit_ns={} root_ns={} ok={}",
 +                block.header.number,
 +                block.transactions.len(),
 +                outcome.execution_result.gas_used,
 +                builder.last_execute_ns,
++                phases.pre_ns,
++                phases.recover_ns,
++                phases.post_ns,
++                phases.receipts_ns,
++                phases.commit_ns,
++                phases.root_ns,
 +                u8::from(ok),
 +            );
 +            harvest(builder.trie_db().storage_roots(), &mut provider.1.borrow_mut());
@@ -423,27 +563,101 @@ index 0000000..5d65b6e
 +        }
 +    }
 +}
+diff --git a/crates/proof/executor/src/builder/assemble.rs b/crates/proof/executor/src/builder/assemble.rs
+index 8fddad48f..4fe0485b9 100644
+--- a/crates/proof/executor/src/builder/assemble.rs
++++ b/crates/proof/executor/src/builder/assemble.rs
+@@ -39,7 +39,10 @@ where
+         let timestamp = block_env.timestamp.saturating_to::<u64>();
+ 
+         // Compute the roots for the block header.
++        let now = self.clock.unwrap_or(|| 0);
++        let root_start_ns = now();
+         let state_root = self.trie_db.state_root(&bundle)?;
++        self.last_phases.root_ns = now().saturating_sub(root_start_ns);
+         let transactions_root = ordered_trie_with_encoder(
+             // SAFETY: The Base protocol will never generate a payload attributes with an empty
+             // transactions field. Panicking here is the desired behavior, as it indicates a severe
+@@ -48,7 +51,9 @@ where
+             |tx, buf| buf.put_slice(tx.as_ref()),
+         )
+         .root();
++        let receipts_start_ns = now();
+         let receipts_root = compute_receipts_root(&ex_result.receipts, self.config, timestamp);
++        self.last_phases.receipts_ns = now().saturating_sub(receipts_start_ns);
+         let withdrawals_root =
+             if self.config.is_feature_active_cascading(BaseFeature::L2ToL1MessageRoot, timestamp) {
+                 Some(self.message_passer_account(block_env.number.saturating_to::<u64>())?)
 diff --git a/crates/proof/executor/src/builder/core.rs b/crates/proof/executor/src/builder/core.rs
-index cf46312..45ff725 100644
+index cf4631222..d258fb716 100644
 --- a/crates/proof/executor/src/builder/core.rs
 +++ b/crates/proof/executor/src/builder/core.rs
-@@ -50,6 +50,10 @@ where
+@@ -7,7 +7,8 @@
+ use alloc::{string::ToString, vec::Vec};
+ use core::fmt::Debug;
+ 
+-use alloy_consensus::{Header, Sealed, crypto::RecoveryError};
++use alloy_consensus::{Header, Sealed, crypto::RecoveryError, transaction::Recovered};
++use alloy_eips::eip2718::WithEncoded;
+ use alloy_evm::{
+     EvmFactory, FromRecoveredTx, FromTxWithEncoded,
+     block::{BlockExecutionResult, BlockExecutor, BlockExecutorFactory},
+@@ -21,7 +22,7 @@ use base_common_rpc_types_engine::BasePayloadAttributes;
+ use base_proof_mpt::TrieHinter;
+ use revm::{
+     context::BlockEnv,
+-    database::{State, states::bundle_state::BundleRetention},
++    database::{CacheDB, EmptyDB, State, states::bundle_state::BundleRetention},
+ };
+ 
+ use crate::{ExecutorError, ExecutorResult, TrieDB, TrieDBError, TrieDBProvider};
+@@ -50,6 +51,33 @@ where
      pub(crate) trie_db: TrieDB<P, H>,
      /// The block executor factory for creating Base execution environments.
      pub(crate) factory: BaseBlockExecutorFactory<AlloyReceiptBuilder, RollupConfig, Evm>,
 +    /// [bench patch] Monotonic clock (ns) for phase timing; `None` disables it.
 +    pub clock: Option<fn() -> u64>,
-+    /// [bench patch] ns from the start of `build_block` to the end of `execute_block`.
++    /// [bench patch] ns from the start of `build_block` to the end of the last transaction.
 +    pub last_execute_ns: u64,
++    /// [bench patch] The last block split into phases (zero without `clock`).
++    pub last_phases: BenchPhases,
++}
++
++/// [bench patch] One block's phases, in ns, at the boundaries needlefish's
++/// `Executor.Phases` uses: pre-block (environment, executor and pre-block system calls),
++/// sender recovery, post-block changes, receipts root, state commit (merge transitions and
++/// take the bundle) and state root (fold the bundle into the tries and hash them).
++/// Transactions are `last_execute_ns` minus pre-block and recovery.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct BenchPhases {
++    /// Environment, executor creation and pre-block system calls.
++    pub pre_ns: u64,
++    /// Sender recovery (all senders, before the first transaction).
++    pub recover_ns: u64,
++    /// Post-block changes (`apply_post_execution_changes`).
++    pub post_ns: u64,
++    /// Receipts root.
++    pub receipts_ns: u64,
++    /// `merge_transitions` and `take_bundle`.
++    pub commit_ns: u64,
++    /// `TrieDB::state_root`.
++    pub root_ns: u64,
  }
  
  impl<'a, P, H, Evm> StatelessL2Builder<'a, P, H, Evm>
-@@ -84,7 +88,12 @@ where
+@@ -84,7 +112,19 @@ where
              config.clone(),
              evm_factory,
          );
 -        Self { config, trie_db, factory }
-+        Self { config, trie_db, factory, clock: None, last_execute_ns: 0 }
++        Self {
++            config,
++            trie_db,
++            factory,
++            clock: None,
++            last_execute_ns: 0,
++            last_phases: BenchPhases::default(),
++        }
 +    }
 +
 +    /// [bench patch] The trie database, to read the post-state nodes it computed.
@@ -452,26 +666,121 @@ index cf46312..45ff725 100644
      }
  
      /// Builds and executes a new L2 block using the provided payload attributes.
-@@ -103,6 +112,7 @@ where
+@@ -103,6 +143,9 @@ where
          &mut self,
          attrs: BasePayloadAttributes,
      ) -> ExecutorResult<BlockBuildingOutcome> {
-+        let start_ns = self.clock.map_or(0, |clock| clock());
++        let now = self.clock.unwrap_or(|| 0);
++        let start_ns = now();
++        self.last_phases = BenchPhases::default();
          // Step 1. Set up the execution environment.
          let (base_fee_params, min_base_fee) = Self::active_base_fee_params(
              self.config,
-@@ -155,6 +165,9 @@ where
+@@ -150,11 +193,26 @@ where
+         let executor = self.factory.create_executor(evm, ctx);
+ 
+         // Step 3. Execute the block containing the transactions within the payload attributes.
++        let recover_start_ns = now();
+         let transactions = attrs
+             .recovered_transactions_with_encoded()
              .collect::<Result<Vec<_>, RecoveryError>>()
              .map_err(ExecutorError::Recovery)?;
-         let ex_result = executor.execute_block(transactions.iter())?;
-+        if let Some(clock) = self.clock {
-+            self.last_execute_ns = clock().saturating_sub(start_ns);
+-        let ex_result = executor.execute_block(transactions.iter())?;
++        let recover_ns = now().saturating_sub(recover_start_ns);
++        // [bench patch] `BlockExecutor::execute_block`'s body, with a clock between steps.
++        let mut executor = executor;
++        executor.apply_pre_execution_changes()?;
++        let pre_end_ns = now();
++        for transaction in &transactions {
++            executor.execute_transaction(transaction)?;
 +        }
++        let execute_end_ns = now();
++        let ex_result = executor.apply_post_execution_changes()?;
++        let post_end_ns = now();
++        self.last_execute_ns = execute_end_ns.saturating_sub(start_ns);
++        self.last_phases.recover_ns = recover_ns;
++        self.last_phases.pre_ns = pre_end_ns.saturating_sub(start_ns).saturating_sub(recover_ns);
++        self.last_phases.post_ns = post_end_ns.saturating_sub(execute_end_ns);
  
          info!(
              target: "block_builder",
+@@ -164,8 +222,10 @@ where
+         );
+ 
+         // Step 4. Merge state transitions and seal the block.
++        let commit_start_ns = now();
+         state.merge_transitions(BundleRetention::Reverts);
+         let bundle = state.take_bundle();
++        self.last_phases.commit_ns = now().saturating_sub(commit_start_ns);
+         let header = self.seal_block(&attrs, parent_hash, &block_env, &ex_result, bundle)?;
+ 
+         info!(
+@@ -182,6 +242,50 @@ where
+         self.trie_db.set_parent_block_header(header.clone());
+         Ok((header, ex_result).into())
+     }
++
++    /// [bench patch] Steps 1 to 3 of [`Self::build_block`] (environment, executor, pre-block
++    /// changes, transactions, post-block changes) over `state` instead of the trie database,
++    /// with the senders already recovered: the EVM without witness reads, recovery or tries.
++    /// Records `last_execute_ns` and the pre- and post-block phases like `build_block`.
++    pub fn bench_execute_in_memory(
++        &mut self,
++        parent: &Sealed<Header>,
++        attrs: &BasePayloadAttributes,
++        transactions: &[WithEncoded<Recovered<BaseTxEnvelope>>],
++        state: &mut State<CacheDB<EmptyDB>>,
++    ) -> ExecutorResult<BlockExecutionResult<BaseReceiptEnvelope>> {
++        let now = self.clock.unwrap_or(|| 0);
++        let start_ns = now();
++        self.last_phases = BenchPhases::default();
++        let timestamp = attrs.payload_attributes.timestamp;
++        let (base_fee_params, min_base_fee) =
++            Self::active_base_fee_params(self.config, parent, timestamp)?;
++        let evm_env = self.evm_env(
++            BaseSpecId::from_timestamp(self.config, timestamp),
++            parent,
++            attrs,
++            &base_fee_params,
++            min_base_fee,
++        )?;
++        let evm = self.factory.evm_factory().create_evm(state, evm_env);
++        let ctx = BaseBlockExecutionCtx {
++            parent_hash: parent.seal(),
++            parent_beacon_block_root: attrs.payload_attributes.parent_beacon_block_root,
++            extra_data: Default::default(),
++        };
++        let mut executor = self.factory.create_executor(evm, ctx);
++        executor.apply_pre_execution_changes()?;
++        let pre_end_ns = now();
++        for transaction in transactions {
++            executor.execute_transaction(transaction)?;
++        }
++        let execute_end_ns = now();
++        let result = executor.apply_post_execution_changes()?;
++        self.last_execute_ns = execute_end_ns.saturating_sub(start_ns);
++        self.last_phases.pre_ns = pre_end_ns.saturating_sub(start_ns);
++        self.last_phases.post_ns = now().saturating_sub(execute_end_ns);
++        Ok(result)
++    }
+ }
+ 
+ /// The outcome of a block building operation, returning the sealed block [`Header`] and the
+diff --git a/crates/proof/executor/src/builder/mod.rs b/crates/proof/executor/src/builder/mod.rs
+index 111df55bb..dd61953c9 100644
+--- a/crates/proof/executor/src/builder/mod.rs
++++ b/crates/proof/executor/src/builder/mod.rs
+@@ -1,7 +1,7 @@
+ //! Stateless Base block builder implementation.
+ 
+ mod core;
+-pub use core::{BlockBuildingOutcome, StatelessL2Builder};
++pub use core::{BenchPhases, BlockBuildingOutcome, StatelessL2Builder};
+ 
+ mod assemble;
+ pub use assemble::compute_receipts_root;
 diff --git a/crates/proof/executor/src/db/mod.rs b/crates/proof/executor/src/db/mod.rs
-index ab05efe..914d7f7 100644
+index ab05efed0..914d7f723 100644
 --- a/crates/proof/executor/src/db/mod.rs
 +++ b/crates/proof/executor/src/db/mod.rs
 @@ -335,6 +335,11 @@ where
@@ -487,7 +796,7 @@ index ab05efe..914d7f7 100644
          while header.number > block_number {
              header = self
 diff --git a/crates/proof/executor/src/db/traits.rs b/crates/proof/executor/src/db/traits.rs
-index 199c817..bacb9b7 100644
+index 199c817cd..bacb9b7fe 100644
 --- a/crates/proof/executor/src/db/traits.rs
 +++ b/crates/proof/executor/src/db/traits.rs
 @@ -33,6 +33,11 @@ pub trait TrieDBProvider: TrieProvider {
@@ -502,8 +811,21 @@ index 199c817..bacb9b7 100644
  }
  
  /// The default, no-op implementation of the [`TrieDBProvider`] trait, used for testing.
+diff --git a/crates/proof/executor/src/lib.rs b/crates/proof/executor/src/lib.rs
+index f1bec8240..b867d5e47 100644
+--- a/crates/proof/executor/src/lib.rs
++++ b/crates/proof/executor/src/lib.rs
+@@ -11,7 +11,7 @@ mod db;
+ pub use db::{NoopTrieDBProvider, TrieDB, TrieDBProvider};
+ 
+ mod builder;
+-pub use builder::{BlockBuildingOutcome, StatelessL2Builder, compute_receipts_root};
++pub use builder::{BenchPhases, BlockBuildingOutcome, StatelessL2Builder, compute_receipts_root};
+ 
+ mod errors;
+ pub use errors::{
 diff --git a/crates/proof/mpt/src/node.rs b/crates/proof/mpt/src/node.rs
-index 8254d7b..6134579 100644
+index 8254d7bc6..6134579b8 100644
 --- a/crates/proof/mpt/src/node.rs
 +++ b/crates/proof/mpt/src/node.rs
 @@ -418,6 +418,17 @@ impl TrieNode {
@@ -525,7 +847,7 @@ index 8254d7b..6134579 100644
                              non_empty_node.unblind(fetcher)?;
                              self.collapse_if_possible(fetcher)?;
 diff --git a/crates/proof/mpt/src/traits.rs b/crates/proof/mpt/src/traits.rs
-index be103a8..453711a 100644
+index be103a8bd..453711aab 100644
 --- a/crates/proof/mpt/src/traits.rs
 +++ b/crates/proof/mpt/src/traits.rs
 @@ -22,6 +22,12 @@ pub trait TrieProvider {
