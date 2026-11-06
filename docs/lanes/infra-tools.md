@@ -80,7 +80,7 @@ allocation after startup.
   `basectl/src/denim.rs`, which upstream only shows in the TUI): schedule, BaseTime proxy and
   implementation, tx[1] metadata + receipt, header/storage/getter millis, 200 ms cadence walk,
   and the 12 HTTP timestamp wire fields; table or `--json`, exit 1 on any fail.
-- [ ] `infra/roxy` batch splitting: a batch whose methods route to different upstreams is split
+- [x] `infra/roxy` batch splitting: a batch whose methods route to different upstreams is split
   per route and the responses reassembled in request order (proxyd parity; today -32600).
 - [ ] `infra/roxy` consensus tags: rewrite `latest` (and default block params) to the highest
   block every admitted upstream has, so reads spread over replicas never go backwards
@@ -124,9 +124,18 @@ allocation after startup.
 - roxy lag: one dedicated poll client per upstream (polls never queue behind requests); an
   unknown head never counts as lagging, and a route whose only upstreams lag still serves.
   No "latest" tag rewriting to the common head (proxyd consensus mode) yet.
-- roxy routes: a batch whose methods share no upstream is rejected (-32600) rather than split
-  across upstreams (proxyd splits); splitting needs response reassembly, left for later.
-  A failing pinned upstream is never failed over outside its route.
+- roxy routes: a failing pinned upstream is never failed over outside its route.
+- roxy batch splitting: entries are grouped first-fit (an entry joins the first group whose
+  narrowed route mask intersects its own), so unrouted entries ride along with a routed group
+  instead of forming their own part; at most `rules_max + 1` parts. Each part is a slot of the
+  pending set (all parts or 503) going through the normal pool/retry/lag path; a split owns
+  fixed buffers (`--split-batches-max`, default 4; each holds request body max + 66 bytes and
+  one upstream response max for all part responses together). Part responses are matched to
+  entries by raw `id` text (proxyd sorts by id too); an entry without a match, a part whose
+  attempts all failed, or one whose response does not fit gets a -32603 error with its id
+  (message names the cause, e.g. `upstream answered HTTP 500`); the reassembled response is
+  always 200. A client timeout (504) while parts are in flight frees the split when the last
+  part ends. `--split-batches-max 0` restores the -32600 rejection.
 - roxy rate limiting keys on the client IP only (no API keys yet); an evicted bucket refills
   to the full burst, so table pressure can only loosen limits, never block a client wrongly.
 - load-test first slice: transfer/calldata/erc20-transfer payloads (erc20 targets a fixed
@@ -340,6 +349,11 @@ allocation after startup.
   method served by its upstream, a dead pinned upstream returns 502 without failover.
 - 2026-11-05: roxy block-lag exclusion (SimIo test, `--lag-max-blocks/--lag-poll-ms`,
   `roxy_upstream_head`); live: two dev-l1 nodes, all traffic to the leading one.
+- 2026-11-06: roxy batch splitting (`split.zig` + seeded/std.testing fuzz of reassembly, SimIo
+  tests for order, a failing part, a timed-out split, slot exhaustion; `--split-batches-max`).
+  Live with two dev-l1 nodes and a dead third upstream, routes `eth_chainId=0;net_version=1;
+  web3_clientVersion=2`: a 4-entry batch came back in order, the dead route's entry as -32603
+  `no upstream available`, `roxy_split_batches_total 1`.
 - 2026-11-05: `base audit` archiver: Vector NDJSON ingest (idempotent by event_id), the five
   `base_getTransactionEvents*`/`getRejected*` queries, metrics/health, segment durability;
   live: duplicate batch answered `duplicate`, restart replayed events, torn tail truncated.

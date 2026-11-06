@@ -15,8 +15,11 @@
 //! `lag.poll_interval_ns`; an upstream more than `max_blocks` behind the best known head is
 //! skipped while another eligible upstream exists (fail open). An unknown head never lags.
 //!
-//! With `routes`, a method may be pinned to some upstreams (retries stay inside that set); a
-//! batch whose methods share no upstream gets JSON-RPC error -32600.
+//! With `routes`, a method may be pinned to some upstreams (retries stay inside that set). A
+//! batch whose methods share no upstream is split into one sub-batch per group of entries
+//! that can share one (`split.zig`); each part takes a slot of the pending set and the
+//! answers are reassembled in request order. With `splits_max == 0` such a batch gets
+//! JSON-RPC error -32600 instead.
 //!
 //! With `rate_limit.requests_per_s > 0`, each client IP (resolved through `trusted_proxy`,
 //! so clients behind a trusted load balancer are told apart) has a token bucket; a client
@@ -45,6 +48,8 @@ const Allowlist = @import("allowlist.zig").Allowlist;
 const trusted_proxy = @import("../../utilities/trusted_proxy/root.zig");
 const rate_limit = @import("rate_limit.zig");
 const Routes = @import("routes.zig").Routes;
+const split_module = @import("split.zig");
+const Split = split_module.Split;
 
 /// Client buckets tracked at once (about 40 bytes each).
 pub const rate_limit_buckets_max = 4096;
@@ -77,6 +82,8 @@ pub const Options = struct {
     routes: Routes = .{},
     rate_limit: rate_limit.Options = .{},
     lag: Lag = .{},
+    /// Batches being split at once (0: a batch whose routes share no upstream gets -32600).
+    splits_max: u32 = 4,
     /// Proxies whose forwarding header is trusted when resolving the client IP.
     trusted_proxy: trusted_proxy.Config = .{},
     server: http.server.Options = .{},
@@ -85,7 +92,8 @@ pub const Options = struct {
 };
 
 const label_size_max = 24;
-const metrics_max = 10 + 4 * upstreams_max;
+const metrics_max = 11 + 4 * upstreams_max;
+const split_none = std.math.maxInt(u32);
 const content_type_json = [_]http.parser.Header{
     .{ .name = "Content-Type", .value = "application/json" },
 };
@@ -107,6 +115,19 @@ pub fn Proxy(comptime IO: type) type {
             body: []const u8 = "",
             tried: Mask = 0,
             attempts: u32 = 0,
+            /// The split this slot is a part of, or `split_none`.
+            split: u32 = split_none,
+            part: u8 = 0,
+        };
+
+        /// What `inspect` decided for an accepted body.
+        const Decision = struct {
+            /// Upstreams that may serve the whole body (0 when split).
+            mask: Mask,
+            /// `entries[0..entries_count]` describe the body.
+            parsed: bool,
+            /// Parts of a split (`part_masks`, `entry_part`); 1 when not split.
+            parts: u32 = 1,
         };
 
         const HeadClient = struct {
@@ -143,6 +164,12 @@ pub fn Proxy(comptime IO: type) type {
         /// Scratch for the allowlist check.
         entries: [methods.batch_max]methods.Entry = undefined,
         entries_count: u32 = 0,
+        /// Scratch for routing and splitting, parallel to `entries`.
+        entry_masks: [methods.batch_max]Mask = undefined,
+        entry_part: [methods.batch_max]u8 = undefined,
+        part_masks: [split_module.parts_max]Mask = undefined,
+        splits: []Split = &.{},
+        split_memory: []u8 = &.{},
         head_clients: []HeadClient = &.{},
         heads: [upstreams_max]u64 = @splat(0),
         head_known: Mask = 0,
@@ -159,6 +186,7 @@ pub fn Proxy(comptime IO: type) type {
         rejected_rate_limit: metrics.Counter = .{},
         rejected_route: metrics.Counter = .{},
         unavailable: metrics.Counter = .{},
+        split_batches: metrics.Counter = .{},
         pending: metrics.Gauge = .{},
         upstream_failures: [upstreams_max]metrics.Counter = @splat(.{}),
         upstream_ejections: [upstreams_max]metrics.Counter = @splat(.{}),
@@ -205,6 +233,8 @@ pub fn Proxy(comptime IO: type) type {
                 proxy.limiter = limiter;
             }
             errdefer if (proxy.limiter) |limiter| allocator.destroy(limiter);
+            try proxy.init_splits();
+            errdefer proxy.deinit_splits();
             try proxy.init_clients(count);
             errdefer proxy.deinit_clients();
             if (options.lag.enabled()) try proxy.init_head_clients(count);
@@ -212,6 +242,34 @@ pub fn Proxy(comptime IO: type) type {
             try proxy.server.init(allocator, io, proxy, options.server);
             errdefer proxy.server.deinit();
             try proxy.register_metrics(count);
+        }
+
+        fn init_splits(proxy: *Self) !void {
+            const count = proxy.options.splits_max;
+            if (count == 0) return;
+            const request_size = proxy.options.server.limits.body_size_max +
+                split_module.request_overhead_max;
+            const arena_size = proxy.options.client.limits.body_size_max;
+            const size_each = request_size + arena_size;
+            proxy.splits = try proxy.allocator.alloc(Split, count);
+            errdefer proxy.allocator.free(proxy.splits);
+            proxy.split_memory = try proxy.allocator.alloc(u8, @as(usize, size_each) * count);
+            for (proxy.splits, 0..) |*entry, index| {
+                const memory = proxy.split_memory[index * size_each ..][0..size_each];
+                entry.* = .{
+                    .request_buffer = memory[0..request_size],
+                    .arena = memory[request_size..],
+                };
+            }
+            assert(proxy.splits.len == count);
+        }
+
+        fn deinit_splits(proxy: *Self) void {
+            if (proxy.splits.len == 0) return;
+            for (proxy.splits) |*entry| assert(!entry.active);
+            proxy.allocator.free(proxy.split_memory);
+            proxy.allocator.free(proxy.splits);
+            proxy.splits = &.{};
         }
 
         fn init_clients(proxy: *Self, count: u32) !void {
@@ -282,6 +340,7 @@ pub fn Proxy(comptime IO: type) type {
             proxy.server.deinit();
             proxy.deinit_clients();
             proxy.deinit_head_clients();
+            proxy.deinit_splits();
             if (proxy.limiter) |limiter| proxy.allocator.destroy(limiter);
             proxy.allocator.free(proxy.free);
             proxy.allocator.free(proxy.queue);
@@ -312,8 +371,13 @@ pub fn Proxy(comptime IO: type) type {
                 &proxy.unavailable,
             );
             try registry.gauge("roxy_pending", "Requests queued or in flight.", &proxy.pending);
+            try registry.counter(
+                "roxy_split_batches_total",
+                "Batches split into one sub-batch per route group.",
+                &proxy.split_batches,
+            );
             for (0..count) |index| try proxy.register_upstream(@intCast(index));
-            assert(registry.count == 9 + 4 * count);
+            assert(registry.count == 10 + 4 * count);
         }
 
         fn rejected_entry(comptime reason: []const u8, counter: *metrics.Counter) metrics.Entry {
@@ -489,26 +553,75 @@ pub fn Proxy(comptime IO: type) type {
         ) void {
             assert(request.method == .POST);
             if (proxy.over_rate_limit(request, response)) return;
-            const allowed_upstreams = proxy.inspect(request.body, response) orelse return;
-            assert(allowed_upstreams != 0);
+            const decision = proxy.inspect(request.body, response) orelse return;
+            assert(decision.parts >= 1 and (decision.mask != 0) == (decision.parts == 1));
+            if (decision.parts > 1) return proxy.accept_split(request, response, decision);
             if (proxy.free_count == 0) {
                 proxy.rejected_overload.increment();
                 return response.fail(503);
             }
-            proxy.free_count -= 1;
-            const index = proxy.free[proxy.free_count];
-            const slot = &proxy.slots[index];
-            assert(slot.state == .free);
-            slot.* = .{
+            const index = proxy.slot_take();
+            proxy.slots[index] = .{
                 .state = .queued,
                 .token = response.defer_response(),
                 .target = request.target,
                 .body = request.body,
                 // Upstreams outside the route count as tried, so retries stay inside it.
-                .tried = ~allowed_upstreams,
+                .tried = ~decision.mask,
             };
             proxy.requests.increment();
             proxy.queue_push(index);
+            proxy.dispatch();
+        }
+
+        fn slot_take(proxy: *Self) u32 {
+            assert(proxy.free_count > 0);
+            proxy.free_count -= 1;
+            const index = proxy.free[proxy.free_count];
+            assert(proxy.slots[index].state == .free);
+            return index;
+        }
+
+        /// Queues one slot per part of a split batch (all or nothing: 503 when the pending
+        /// set or the split table is full).
+        fn accept_split(
+            proxy: *Self,
+            request: *const http.Request,
+            response: *http.ResponseBuilder,
+            decision: Decision,
+        ) void {
+            assert(decision.parsed and decision.parts >= 2);
+            const split_index = for (proxy.splits, 0..) |*entry, index| {
+                if (!entry.active) break index;
+            } else null;
+            if (split_index == null or proxy.free_count < decision.parts) {
+                proxy.rejected_overload.increment();
+                return response.fail(503);
+            }
+            const split = &proxy.splits[split_index.?];
+            const count = proxy.entries_count;
+            @memcpy(split.entry_part[0..count], proxy.entry_part[0..count]);
+            const token = response.defer_response();
+            const entries = proxy.entries[0..count];
+            const masks = proxy.part_masks[0..decision.parts];
+            // The request buffer holds the body plus `request_overhead_max`, which bounds the
+            // brackets and commas the parts add.
+            split.begin(token, request.body, entries, masks) catch unreachable;
+            for (0..decision.parts) |part| {
+                const index = proxy.slot_take();
+                proxy.slots[index] = .{
+                    .state = .queued,
+                    .token = token,
+                    .target = request.target,
+                    .body = split.part_body(@intCast(part)),
+                    .tried = ~split.parts[part].mask,
+                    .split = @intCast(split_index.?),
+                    .part = @intCast(part),
+                };
+                proxy.queue_push(index);
+            }
+            proxy.requests.increment();
+            proxy.split_batches.increment();
             proxy.dispatch();
         }
 
@@ -529,35 +642,43 @@ pub fn Proxy(comptime IO: type) type {
             return true;
         }
 
-        /// The upstreams that may serve `body`, or null when it was answered here: invalid,
-        /// a disallowed method (in a batch every entry gets an error), or a batch whose routes
-        /// share no upstream. Parses the body only when an allowlist or routes are set.
-        fn inspect(proxy: *Self, body: []const u8, response: *http.ResponseBuilder) ?Mask {
+        /// How to proxy `body`, or null when it was answered here: invalid, a disallowed
+        /// method (in a batch every entry gets an error), or (splitting disabled) a batch
+        /// whose routes share no upstream. Parses the body only when an allowlist or routes are
+        /// set.
+        fn inspect(proxy: *Self, body: []const u8, response: *http.ResponseBuilder) ?Decision {
             const all = pool_module.mask_all(proxy.pool.count);
             const allows_all = proxy.options.allowlist.allows_all();
-            if (allows_all and proxy.options.routes.empty()) return all;
+            const parse = !allows_all or !proxy.options.routes.empty();
+            if (!parse) return .{ .mask = all, .parsed = false };
             if (!allows_all and proxy.reject_disallowed(body, response)) return null;
             if (allows_all) {
                 // Not parsed yet: invalid bodies still get the upstream's own error.
-                const summary = methods.extract(body, &proxy.entries) catch return all;
-                return proxy.route_mask(proxy.entries[0..summary.count], response);
+                const summary = methods.extract(body, &proxy.entries) catch
+                    return .{ .mask = all, .parsed = false };
+                proxy.entries_count = summary.count;
             }
-            return proxy.route_mask(proxy.entries[0..proxy.entries_count], response);
+            return proxy.route(response);
         }
 
-        fn route_mask(
-            proxy: *Self,
-            entries: []const methods.Entry,
-            response: *http.ResponseBuilder,
-        ) ?Mask {
+        fn route(proxy: *Self, response: *http.ResponseBuilder) ?Decision {
+            const entries = proxy.entries[0..proxy.entries_count];
             assert(entries.len > 0);
             const all = pool_module.mask_all(proxy.pool.count);
             var mask = all;
-            for (entries) |*entry| {
-                const name = entry.name() orelse continue;
-                mask &= proxy.options.routes.mask_for(name) orelse all;
+            for (entries, 0..) |*entry, index| {
+                const name = entry.name() orelse "";
+                const entry_mask = proxy.options.routes.mask_for(name) orelse all;
+                proxy.entry_masks[index] = entry_mask;
+                mask &= entry_mask;
             }
-            if (mask != 0) return mask;
+            if (mask != 0) return .{ .mask = mask, .parsed = true };
+            if (proxy.splits.len > 0) {
+                const masks = proxy.entry_masks[0..entries.len];
+                const parts = split_module.assign(masks, &proxy.entry_part, &proxy.part_masks);
+                assert(parts >= 2); // The masks share no upstream.
+                return .{ .mask = 0, .parsed = true, .parts = parts };
+            }
             proxy.rejected_route.increment();
             const message = "batch mixes methods routed to different upstreams";
             methods.write_error(response.writer(), "null", rpc.code.invalid_request, message) catch
@@ -641,9 +762,24 @@ pub fn Proxy(comptime IO: type) type {
             const slot = &proxy.slots[index];
             assert(slot.state != .free);
             assert(proxy.free_count < proxy.free.len);
+            const split_index = slot.split;
             slot.* = .{};
             proxy.free[proxy.free_count] = index;
             proxy.free_count += 1;
+            if (split_index != split_none) proxy.split_part_closed(split_index);
+        }
+
+        /// After the last part: answers the reassembled batch (unless the client's request
+        /// timed out or the server stopped) and frees the split.
+        fn split_part_closed(proxy: *Self, split_index: u32) void {
+            const split = &proxy.splits[split_index];
+            if (!split.close_part()) return;
+            if (proxy.server.deferred_valid(split.token)) {
+                const resumed = proxy.server.resume_deferred(split.token, split, Split.write);
+                assert(resumed);
+            }
+            split.release();
+            assert(!split.active);
         }
 
         /// Sends every queued request that can go now. Re-entrant calls (a client that
@@ -786,6 +922,11 @@ pub fn Proxy(comptime IO: type) type {
         fn answer_upstream(proxy: *Self, index: u32, response: *const http.Response) void {
             const slot = &proxy.slots[index];
             assert(slot.state == .in_flight);
+            if (slot.split != split_none) {
+                const split = &proxy.splits[slot.split];
+                split.record_response(slot.part, response.status, response.body);
+                return proxy.slot_free(index);
+            }
             const resumed = proxy.server.resume_deferred(slot.token, response, write_upstream);
             assert(resumed); // Checked by the caller; nothing ran in between.
             proxy.slot_free(index);
@@ -810,6 +951,12 @@ pub fn Proxy(comptime IO: type) type {
             const slot = &proxy.slots[index];
             assert(slot.state != .free);
             assert(status >= 400);
+            if (slot.split != split_none) {
+                const outcome: split_module.Outcome =
+                    if (status == 413) .request_too_large else .unavailable;
+                proxy.splits[slot.split].record_failure(slot.part, outcome);
+                return proxy.slot_free(index);
+            }
             _ = proxy.server.resume_deferred(slot.token, status, write_status);
             proxy.slot_free(index);
         }

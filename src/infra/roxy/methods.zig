@@ -23,6 +23,9 @@ pub const Entry = struct {
     name_size: u8 = 0,
     /// Raw JSON text of `id` (a string with its quotes, a number, or `null`).
     id: []const u8 = "null",
+    /// Byte range of the request object in the body (`{` through `}`).
+    start: u32 = 0,
+    end: u32 = 0,
 
     pub fn name(entry: *const Entry) ?[]const u8 {
         if (entry.name_size == 0) return null;
@@ -79,7 +82,8 @@ const Key = enum { method, id, other };
 
 /// Reads one request object whose `{` was just consumed.
 fn extract_object(scanner: *json.Scanner, body: []const u8) Error!Entry {
-    var entry: Entry = .{};
+    assert(scanner.offset() > 0 and body[scanner.offset() - 1] == '{');
+    var entry: Entry = .{ .start = scanner.offset() - 1 };
     var method_seen = false;
     var id_seen = false;
     var members: u32 = 0;
@@ -105,6 +109,8 @@ fn extract_object(scanner: *json.Scanner, body: []const u8) Error!Entry {
         }
     }
     if (!method_seen) return error.InvalidRequest;
+    entry.end = scanner.offset();
+    assert(entry.end > entry.start and body[entry.end - 1] == '}');
     return entry;
 }
 
@@ -186,6 +192,8 @@ test "methods: batch, escapes, and case-insensitive keys" {
     try testing.expectEqualStrings("eth_chainId", entries[0].name().?);
     try testing.expectEqualStrings("eth_call", entries[1].name().?);
     try testing.expectEqualStrings("2", entries[1].id);
+    try testing.expectEqualStrings(body[1..32], body[entries[0].start..entries[0].end]);
+    try testing.expectEqual(@as(u32, body.len - 1), entries[1].end);
     // A method that is not a plain name extracts but never matches.
     _ = try extract_test("{\"method\":\"eth call\"}", &entries);
     try testing.expectEqual(@as(?[]const u8, null), entries[0].name());
@@ -234,6 +242,7 @@ fn check_arbitrary(body: []const u8) !void {
     for (entries[0..summary.count]) |*entry| {
         try json.validate(entry.id);
         if (entry.name()) |name| try testing.expect(allowlist_module.valid_name(name));
+        try json.validate(body[entry.start..entry.end]);
     }
 }
 

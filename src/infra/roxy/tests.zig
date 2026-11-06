@@ -1,6 +1,7 @@
 //! roxy over SimIo: three fake upstreams (utilities/rpc Router behind utilities/http), the
 //! proxy, and a test client. Covers retry and ejection with re-admission, the allowlist,
-//! and the pending-limit 503.
+//! the pending-limit 503, rate limits, routing with batch splitting, and block-lag
+//! exclusion.
 
 const std = @import("std");
 const testing = std.testing;
@@ -444,11 +445,119 @@ test "roxy: routed methods stay on their upstreams, also across retries" {
     var result = try harness.call("/", send);
     try testing.expectEqual(@as(u16, 500), result.status);
     try testing.expectEqual(before, harness.upstreams[0].calls + harness.upstreams[1].calls);
-    // A batch whose routes share no upstream is answered by the proxy.
+    // A batch whose routes share no upstream is split and answered in request order.
+    harness.upstreams[2].mode = .ok;
+    const calls_two = harness.upstreams[2].calls;
+    const calls_zero = harness.upstreams[0].calls;
     const proof = "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"eth_getProof\",\"params\":[]}";
     result = try harness.call("/", "[" ++ send ++ "," ++ proof ++ "]");
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expect(std.mem.startsWith(u8, result.text(), "[{\"jsonrpc\":\"2.0\",\"id\":7,"));
+    try testing.expect(contains(result.text(), "\"id\":8,"));
+    try testing.expectEqual(calls_two + 1, harness.upstreams[2].calls);
+    try testing.expectEqual(calls_zero + 1, harness.upstreams[0].calls);
+    try testing.expectEqual(@as(u64, 0), harness.proxy.rejected_route.get());
+    try testing.expectEqual(@as(u64, 1), harness.proxy.split_batches.get());
+}
+
+test "roxy: with splitting off, a batch whose routes share no upstream gets -32600" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.splits_max = 0;
+    options.routes = try roxy.Routes.parse("eth_sendRawTransaction=2;eth_chainId=0", 3);
+    try harness.init(60, .{ true, true, true }, options);
+    defer harness.deinit();
+    const result = try harness.call("/", "[" ++ split_send_1 ++ "," ++ chain_id_body ++ "]");
     try testing.expect(contains(result.text(), "-32600"));
     try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_route.get());
+    for (harness.upstreams) |upstream| try testing.expectEqual(@as(u32, 0), upstream.calls);
+}
+
+const split_send_1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\"," ++
+    "\"params\":[\"0x00\"]}";
+const split_batch = "[" ++ split_send_1 ++ "," ++
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"eth_chainId\",\"params\":[]}," ++
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"eth_sendRawTransaction\",\"params\":[\"0x00\"]}," ++
+    "{\"jsonrpc\":\"2.0\",\"id\":\"four\",\"method\":\"eth_chainId\",\"params\":[]}]";
+const split_routes = "eth_sendRawTransaction=2;eth_chainId=0|1";
+
+/// Index of `needle` in `haystack`; fails the test if absent.
+fn position(haystack: []const u8, needle: []const u8) !usize {
+    return std.mem.indexOf(u8, haystack, needle) orelse error.TestUnexpectedResult;
+}
+
+fn expect_split_order(text: []const u8) !void {
+    try testing.expect(text[0] == '[' and text[text.len - 1] == ']');
+    const one = try position(text, "\"id\":1,");
+    const two = try position(text, "\"id\":2,");
+    const three = try position(text, "\"id\":3,");
+    const four = try position(text, "\"id\":\"four\",");
+    try testing.expect(one < two and two < three and three < four);
+}
+
+test "roxy: split batches keep request order, and a failing part errors per entry" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.routes = try roxy.Routes.parse(split_routes, 3);
+    try harness.init(61, .{ true, true, true }, options);
+    defer harness.deinit();
+    for (0..3) |_| {
+        const result = try harness.call("/", split_batch);
+        try testing.expectEqual(@as(u16, 200), result.status);
+        try expect_split_order(result.text());
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.text(), "\"0x00\""));
+        try testing.expect(!contains(result.text(), "error"));
+    }
+    try testing.expectEqual(@as(u32, 3), harness.upstreams[2].calls);
+    try testing.expectEqual(@as(u32, 3), harness.upstreams[0].calls + harness.upstreams[1].calls);
+    // The pinned upstream fails: its entries get errors with their ids, the rest results.
+    harness.upstreams[2].mode = .status_500;
+    const result = try harness.call("/", split_batch);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try expect_split_order(result.text());
+    const failed = "\"id\":1,\"error\":{\"code\":-32603," ++
+        "\"message\":\"upstream answered HTTP 500\"}";
+    try testing.expect(contains(result.text(), failed));
+    try testing.expect(contains(result.text(), "\"id\":3,\"error\""));
+    try testing.expect(contains(result.text(), "\"id\":2,\"result\""));
+    try testing.expect(contains(result.text(), "\"id\":\"four\",\"result\""));
+    try testing.expectEqual(harness.proxy.slots.len, harness.proxy.free_count);
+    try testing.expectEqual(@as(u64, 4), harness.proxy.split_batches.get());
+}
+
+test "roxy: a split whose client timed out frees its slots when the parts end" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.routes = try roxy.Routes.parse(split_routes, 3);
+    options.server.io_timeout_ns = 300 * ms;
+    try harness.init(62, .{ true, true, true }, options);
+    defer harness.deinit();
+    harness.upstreams[2].mode = .hang;
+    var result = try harness.call("/", split_batch);
+    try testing.expectEqual(@as(u16, 504), result.status);
+    // The other part has completed; the hung one holds its slot until the upstream timeout.
+    try testing.expect(harness.proxy.free_count < harness.proxy.slots.len);
+    try testing.expect(harness.proxy.splits[0].active);
+    harness.run_ticking(1500 * ms);
+    try testing.expectEqual(harness.proxy.slots.len, harness.proxy.free_count);
+    for (harness.proxy.splits) |*split| try testing.expect(!split.active);
+    harness.upstreams[2].mode = .ok;
+    result = try harness.call("/", split_batch);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try expect_split_order(result.text());
+    try testing.expect(!contains(result.text(), "error"));
+}
+
+test "roxy: a split needing more slots than are free answers 503" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.routes = try roxy.Routes.parse(split_routes, 3);
+    options.pending_max = 1;
+    try harness.init(63, .{ true, true, true }, options);
+    defer harness.deinit();
+    const result = try harness.call("/", split_batch);
+    try testing.expectEqual(@as(u16, 503), result.status);
+    try testing.expectEqual(@as(u64, 1), harness.proxy.rejected_overload.get());
 }
 
 test "roxy: an upstream trailing the best head is skipped, failing open" {
