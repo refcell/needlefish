@@ -27,7 +27,8 @@ const AttributesWithParent = @import("../derive/attributes_queue.zig").Attribute
 const task_queue = @import("../engine/task_queue.zig");
 const sync_start = @import("../engine/sync_start.zig");
 const Finalizer = @import("../engine/finalizer.zig").Finalizer;
-const SafeDB = @import("../safedb/root.zig").SafeDB;
+const safedb_module = @import("../safedb/root.zig");
+const SafeDB = safedb_module.SafeDB;
 const OriginSelector = @import("../sequencer/origin.zig").OriginSelector;
 const sequencer_build = @import("../sequencer/build.zig");
 
@@ -171,6 +172,36 @@ pub const SafeCheck = struct {
     unsupported: bool = false,
     /// Ticks spent waiting for L1 lookups.
     ticks: u32 = 0,
+    /// A newer entry's L1 block is orphaned: reset records below it are not trusted.
+    orphan_seen: bool = false,
+    /// The newest canonical reset record that an orphan shadowed (last resort cap).
+    shadowed: ?BlockId = null,
+
+    /// Takes one entry, newest first, with whether its L1 block is canonical; true once
+    /// the cap is decided. A derived entry on canonical L1 decides; a canonical reset
+    /// record decides only when no newer entry is orphaned.
+    fn judge(check: *SafeCheck, entry: safedb_module.Entry, canonical: bool) bool {
+        assert(!check.done);
+        if (!canonical) {
+            check.orphan_seen = true;
+            return false;
+        }
+        if (entry.derived or !check.orphan_seen) {
+            check.cap = entry.safe_head;
+            return true;
+        }
+        if (check.shadowed == null) check.shadowed = entry.safe_head;
+        assert(check.orphan_seen);
+        return false;
+    }
+
+    /// No entry decided: fall back to a shadowed reset record, else (entries exist) to
+    /// the finalized head.
+    fn exhausted(check: *SafeCheck, entries: u32) void {
+        assert(check.cap == null);
+        check.cap = check.shadowed;
+        check.unsupported = entries > 0 and check.cap == null;
+    }
 };
 
 /// L1 lookups per tick for the safedb check.
@@ -358,19 +389,17 @@ pub const Driver = struct {
                     return true;
                 },
             };
-            if (canonical.hash.eql(entry.l1_block.hash)) {
-                check.cap = entry.safe_head;
+            if (check.judge(entry, canonical.hash.eql(entry.l1_block.hash))) {
                 check.done = true;
-                if (check.remaining.? < db.count) driver.stats.safe_unwinds += 1;
+                if (check.orphan_seen) driver.stats.safe_unwinds += 1;
                 return true;
             }
             check.remaining.? -= 1;
         }
         if (check.remaining.? > 0) return false;
         check.done = true;
-        check.unsupported = db.count > 0;
-        if (check.unsupported) driver.stats.safe_unwinds += 1;
-        assert(check.cap == null);
+        check.exhausted(db.count);
+        if (check.orphan_seen) driver.stats.safe_unwinds += 1;
         return true;
     }
 
@@ -961,6 +990,41 @@ test "driver: startup unwinds a safe head whose L1 data a reorg orphaned" {
             try testing.expect(entry.safe_head.number <= case.safe);
         }
     }
+}
+
+test "driver: safedb check trusts reset records only without newer orphans" {
+    const Entry = safedb_module.Entry;
+    const entry = struct {
+        fn make(l1: u64, safe: u64, derived: bool) Entry {
+            return .{
+                .l1_block = .{ .number = l1 },
+                .safe_head = .{ .number = safe },
+                .derived = derived,
+            };
+        }
+    }.make;
+    // Newest first: a canonical reset record with nothing newer orphaned decides.
+    var check: SafeCheck = .{};
+    try testing.expect(check.judge(entry(9, 60, false), true));
+    try testing.expectEqual(@as(u64, 60), check.cap.?.number);
+    // An orphaned newer entry shadows the reset record; an older derived entry decides.
+    check = .{};
+    try testing.expect(!check.judge(entry(12, 70, true), false));
+    try testing.expect(!check.judge(entry(9, 60, false), true));
+    try testing.expect(check.judge(entry(5, 40, true), true));
+    try testing.expectEqual(@as(u64, 40), check.cap.?.number);
+    // Without an older derived entry the shadowed reset record is the last resort.
+    check = .{};
+    try testing.expect(!check.judge(entry(12, 70, true), false));
+    try testing.expect(!check.judge(entry(9, 60, false), true));
+    check.exhausted(2);
+    try testing.expectEqual(@as(u64, 60), check.cap.?.number);
+    try testing.expect(!check.unsupported);
+    // Nothing canonical at all: the finalized head.
+    check = .{};
+    try testing.expect(!check.judge(entry(12, 70, true), false));
+    check.exhausted(1);
+    try testing.expect(check.cap == null and check.unsupported);
 }
 
 test "driver: the safedb check runs again after a reset" {

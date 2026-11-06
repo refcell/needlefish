@@ -22,6 +22,10 @@ pub const record_size_bytes = 80;
 pub const Entry = struct {
     l1_block: BlockId,
     safe_head: BlockId,
+    /// False for the record a pipeline reset writes (the reset head at its L1 origin, as
+    /// base/base does): it is weaker evidence that L1 up to `l1_block` derived
+    /// `safe_head`. In memory only; loaded records count as derived.
+    derived: bool = true,
 };
 
 pub const Error = error{ NotFound, OutOfMemory };
@@ -131,6 +135,7 @@ pub const SafeDB = struct {
         db.insert(.{
             .l1_block = reset_safe_head.l1_origin,
             .safe_head = reset_safe_head.block_info.id(),
+            .derived = false,
         });
     }
 
@@ -185,8 +190,13 @@ test "safedb: lookup, reset, and record roundtrip" {
     db.safe_head_reset(test_l2_block(99, 50));
     try testing.expectEqual(@as(u32, 2), db.count);
 
+    // That entry is the reset record; the flag is not persisted.
+    try testing.expect(!entry.derived);
     const record = encode_record(entry);
-    try testing.expectEqualDeep(entry, decode_record(&record));
+    const decoded = decode_record(&record);
+    try testing.expect(decoded.derived);
+    try testing.expectEqualDeep(entry.l1_block, decoded.l1_block);
+    try testing.expectEqualDeep(entry.safe_head, decoded.safe_head);
 }
 
 test "safedb: capacity evicts oldest; seeded fuzz against a reference" {
