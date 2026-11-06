@@ -3,7 +3,8 @@
 Work is split into lanes. Each lane is owned by one autonomous agent session and owns
 the directories listed in its file. A lane file is the lane's living backlog and log:
 the owning agent keeps its checklist current, records decisions, and appends a short
-dated log line after each push. Other lanes may read it to find interfaces.
+dated log line after each push. Other lanes may read it to find interfaces. Mainnet sync
+work follows the milestones and lane split in [../SYNC_PLAN.md](../SYNC_PLAN.md).
 
 | Lane | File | Owns |
 | --- | --- | --- |

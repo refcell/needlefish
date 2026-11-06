@@ -1,5 +1,8 @@
 # Roadmap
 
+Syncing Base mainnet (snapshot bootstrap, catch-up, live tip, verification) is planned in
+[SYNC_PLAN.md](SYNC_PLAN.md).
+
 Phase 1 (lanes in `docs/lanes/`): primitives, crypto, evm, trie-db, io-net, node,
 consensus, batcher-devnet, dst-fuzz. Milestone: `just devnet up` runs an all-Zig L1 +
 L2 sequencer + batcher + verifier and `just devnet smoke` passes.
