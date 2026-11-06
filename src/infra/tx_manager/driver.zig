@@ -56,6 +56,15 @@ pub const Config = struct {
     /// 1 (EIP-7594 cell proofs) is what L1 mempools accept since Osaka.
     sidecar_version: u1 = 1,
     manager: manager_module.Config = .{},
+    /// Called with every signed transaction right before it is broadcast, so a caller can
+    /// journal the hash first and a crash mid-send never loses it (the withdrawer does).
+    publish_hook: ?PublishHook = null,
+};
+
+pub const PublishHook = struct {
+    context: *anyopaque,
+    /// False holds the broadcast back (reported like an RPC failure, so it is retried).
+    before_publish: *const fn (context: *anyopaque, id: u64, nonce: u64, hash: Hash) bool,
 };
 
 pub const Error = rpc.Error || rpc.DecodeError || manager_module.SubmitError ||
@@ -242,6 +251,11 @@ pub fn Driver(comptime limits: manager_module.Limits) type {
                 // attempt as an RPC failure so the manager retries it.
                 return driver.manager.on_publish(version.id, @splat(0), .rpc, now_ms);
             };
+            if (driver.config.publish_hook) |hook| {
+                if (!hook.before_publish(hook.context, version.id, version.nonce, signed.hash)) {
+                    return driver.manager.on_publish(version.id, signed.hash, .rpc, now_ms);
+                }
+            }
             const buffer = driver.params_buffer;
             // params_buffer holds twice the largest raw transaction.
             const params = std.fmt.bufPrint(buffer, "[\"0x{x}\"]", .{signed.raw}) catch unreachable;
