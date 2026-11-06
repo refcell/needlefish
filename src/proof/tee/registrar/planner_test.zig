@@ -160,7 +160,8 @@ test "registrar planner: base fixture pins literals" {
     try testing.expectEqualSlices(u8, &leaf_hash, &plan.leaf_cert_hash);
     try testing.expectEqualSlices(u8, &fixture_tbs_keccak, &keccak256(plan.attestation_tbs));
     // Raw protected TLV (not reserialized content-only).
-    try testing.expectEqualSlices(u8, &.{ 0x44, 0xa1, 0x01, 0x38, 0x22 }, plan.attestation_tbs[12..17]);
+    const protected = [_]u8{ 0x44, 0xa1, 0x01, 0x38, 0x22 };
+    try testing.expectEqualSlices(u8, &protected, plan.attestation_tbs[12..17]);
     try testing.expectEqual(@as(u8, 0x40), plan.attestation_tbs[17]);
 
     try testing.expectEqual(@as(u8, 4), plan.cert_count);
@@ -179,7 +180,8 @@ test "registrar planner: base fixture pins literals" {
     var trailing_der: [1025]u8 = undefined;
     @memcpy(trailing_der[0..leaf.cert.len], leaf.cert);
     trailing_der[leaf.cert.len] = 0;
-    try testing.expect(std.meta.isError(CertManagerKeys.keys(trailing_der[0 .. leaf.cert.len + 1])));
+    const with_trailing = trailing_der[0 .. leaf.cert.len + 1];
+    try testing.expect(std.meta.isError(CertManagerKeys.keys(with_trailing)));
 }
 
 test "registrar planner: v3 layout rejects trailing bytes in version wrapper" {
@@ -229,13 +231,15 @@ test "registrar planner: ca labels and signer key checks" {
 
 test "registrar planner: der tlv helpers bound lengths" {
     try testing.expectError(error.DerTooShort, CertManagerKeys.der_tlv_at(&.{0x30}, 0));
-    try testing.expectError(error.DerLengthInvalid, CertManagerKeys.der_tlv_at(&.{ 0x30, 0x80 }, 0));
+    const tlv_at = CertManagerKeys.der_tlv_at;
+    try testing.expectError(error.DerLengthInvalid, tlv_at(&.{ 0x30, 0x80 }, 0));
     try testing.expectError(
         error.DerLengthInvalid,
         CertManagerKeys.der_tlv_at(&.{ 0x30, 0x85, 0, 0, 0, 0, 1 }, 0),
     );
-    try testing.expectError(error.DerLengthMismatch, CertManagerKeys.der_tlv_at(&.{ 0x30, 0x02, 0 }, 0));
-    try testing.expectError(error.DerLengthMismatch, CertManagerKeys.der_content_octets(&.{ 0x30, 0x00, 0 }));
+    try testing.expectError(error.DerLengthMismatch, tlv_at(&.{ 0x30, 0x02, 0 }, 0));
+    const content_octets = CertManagerKeys.der_content_octets;
+    try testing.expectError(error.DerLengthMismatch, content_octets(&.{ 0x30, 0x00, 0 }));
     const tlv = try CertManagerKeys.der_tlv_at(&.{ 0x30, 0x81, 0x01, 0xaa, 0x05 }, 0);
     try testing.expectEqualSlices(u8, &.{0xaa}, tlv.content);
     try testing.expectEqual(@as(usize, 4), tlv.end);

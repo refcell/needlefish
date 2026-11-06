@@ -261,7 +261,12 @@ fn push_children(
                 .is_map = true,
             };
         },
-        major_tag => .{ .remaining = 1, .indefinite = false, .value_pending = false, .is_map = false },
+        major_tag => .{
+            .remaining = 1,
+            .indefinite = false,
+            .value_pending = false,
+            .is_map = false,
+        },
         else => return,
     };
     // The depth check before every child read keeps the stack within bounds.

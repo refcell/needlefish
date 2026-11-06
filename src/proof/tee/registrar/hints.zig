@@ -292,7 +292,12 @@ pub const P384Hints = struct {
         return point;
     }
 
-    fn window_step(hints: *P384Hints, points: *const [64]Affine, point: Affine, mask: u64) Error!Affine {
+    fn window_step(
+        hints: *P384Hints,
+        points: *const [64]Affine,
+        point: Affine,
+        mask: u64,
+    ) Error!Affine {
         assert(mask < points.len);
         if (mask == 0) return point;
         return hints.add_affine(points[mask], point);

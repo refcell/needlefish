@@ -28,7 +28,8 @@ fn hex(comptime text: []const u8) [text.len / 2]u8 {
 /// One real Nitro document is enough for golden parity.
 fn fixture_hints(out: *types.RegistrationHints) !void {
     var tbs: [fixture_attestation.len + 64]u8 = undefined;
-    const plan = try planner.AttestationPlanner.prepare_registration_plan(fixture_attestation, &tbs);
+    const plan =
+        try planner.AttestationPlanner.prepare_registration_plan(fixture_attestation, &tbs);
     try P384Hints.for_registration_plan(plan.root_cert, &plan, out);
 }
 
@@ -133,13 +134,29 @@ test "registrar hints: collect_verify_hints rejects invalid inputs" {
         key: []const u8,
         want: hints_module.Error,
     };
+    const key = &public_key;
     const cases = [_]Case{
-        .{ .hash = &.{1}, .signature = valid_sig[0..95], .key = &public_key, .want = error.HintSignatureLength },
-        .{ .hash = &.{1}, .signature = &valid_sig, .key = public_key[0..95], .want = error.HintPublicKeyLength },
-        .{ .hash = &long_hash, .signature = &valid_sig, .key = &public_key, .want = error.HintHashLength },
-        .{ .hash = &.{1}, .signature = &zero_r, .key = &public_key, .want = error.HintScalarBounds },
-        .{ .hash = &.{1}, .signature = &order_r, .key = &public_key, .want = error.HintScalarBounds },
-        .{ .hash = &.{1}, .signature = &valid_sig, .key = &public_key, .want = error.HintPublicKeyNotOnCurve },
+        .{
+            .hash = &.{1},
+            .signature = valid_sig[0..95],
+            .key = key,
+            .want = error.HintSignatureLength,
+        },
+        .{
+            .hash = &.{1},
+            .signature = &valid_sig,
+            .key = key[0..95],
+            .want = error.HintPublicKeyLength,
+        },
+        .{ .hash = &long_hash, .signature = &valid_sig, .key = key, .want = error.HintHashLength },
+        .{ .hash = &.{1}, .signature = &zero_r, .key = key, .want = error.HintScalarBounds },
+        .{ .hash = &.{1}, .signature = &order_r, .key = key, .want = error.HintScalarBounds },
+        .{
+            .hash = &.{1},
+            .signature = &valid_sig,
+            .key = key,
+            .want = error.HintPublicKeyNotOnCurve,
+        },
     };
     for (cases) |case| {
         try testing.expectError(
@@ -167,11 +184,17 @@ test "registrar hints: collect_verify_hints rejects invalid inputs" {
 
 test "registrar hints: certificate parsing extracts keys and signatures" {
     var tbs: [fixture_attestation.len + 64]u8 = undefined;
-    const plan = try planner.AttestationPlanner.prepare_registration_plan(fixture_attestation, &tbs);
+    const plan =
+        try planner.AttestationPlanner.prepare_registration_plan(fixture_attestation, &tbs);
     const root_key = try P384Hints.parse_cert_public_key(plan.root_cert);
     const regional = try P384Hints.parse_cert_signature(plan.certs[0].cert);
     var buffer: [types.hint_stream_size_max]u8 = undefined;
-    _ = try P384Hints.collect_verify_hints(&regional.hash, &regional.signature, &root_key, &buffer);
+    _ = try P384Hints.collect_verify_hints(
+        &regional.hash,
+        &regional.signature,
+        &root_key,
+        &buffer,
+    );
     try testing.expectError(
         error.HintCertificateParse,
         P384Hints.parse_cert_public_key(plan.root_cert[0 .. plan.root_cert.len - 1]),
