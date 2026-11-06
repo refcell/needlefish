@@ -796,6 +796,43 @@ the image. Before this change (incremental, same binary; the old code was identi
 except for a shared branch-encode copy fast path) 100k: 299-540 ms open without history,
 3.2-3.4 s with; 1m: 3.0 s without, 9.5-9.8 s with.
 
+## 2026-11-06 trie parallel account rehash, radix changeset sort (aarch64-macos, Apple M4 Pro 14 cores, ReleaseFast)
+
+`StateTrie.root` now hashes the account trie on the rehash pool too (`rehash_threads` > 0):
+after `flush` it takes the subtries two levels below the root (`TrieType.subtries`, up to
+256), collects their dirty nodes with per-subtrie end offsets, splits them into chunks of
+whole subtries (as the storage path does), runs them on the pool, then hashes the top two
+levels on the caller. Below `rehash_parallel_nodes_min` (1024) dirty nodes it stays serial;
+0 threads (DST, sim) never reaches it. `Changeset.sort` replaced the pdqsort of its order
+words (`address[0..4] << 32 | index`) with a stable LSD radix sort of the 32-bit prefix
+(byte passes, constant bytes skipped) and sorts only runs of equal prefixes (one account's
+slots) with the full key. Medians of 5 interleaved runs of the old (HEAD^ plus the new bench
+cases) and new binaries, load average 6-8:
+
+| Case | Before | After | Change |
+| --- | ---: | ---: | --- |
+| trie/transfers 1k accts, 0 threads (new case) | 1 262 us | 1 268 us | noise (serial path unchanged) |
+| trie/transfers 1k accts, 4 threads (new case) | 1 344 us | 721 us | -46% |
+| trie/storage 4k slots, 4 threads | 1 415 us | 1 212 us | -14% (its 1k-account trie is now parallel) |
+| trie/storage 4k slots, 0 / 2 / 8 threads | 2 814 / 1 590 / 1 214 us | 2 946 / 1 539 / 1 150 us | 0 threads: noise |
+| trie/block, trie/state block | 1 218 / 1 461 us | 1 213 / 1 418 us | noise |
+| db/build_changeset 1k acct+4k slot (new case) | 298 us | 227 us | -24% (radix sort) |
+| db/block 1k acct+4k slot apply+root (0 threads) | 7.08 ms | 6.79 ms | -4% (radix sort) |
+| db/commit sim cpu p50 (0 threads) | 6.99 ms | 6.84 ms | -2% |
+| db/commit sim cpu p50 (4 rehash threads) | 5.62 ms | 4.40 ms | -22% |
+
+`trie/transfers` is the shape of a 500-transfer block: 1k random account updates (no
+storage) on 100k accounts, precomputed address hashes, then the root, so nearly all of it is
+account-trie rehash. Changeset sort alone (sort disabled vs enabled) was ~200 of ~365 us of
+`build_changeset`; the radix pass removes ~100 us of it; the rest is the hash-map lookups
+(`State.basic`, `State.storage`, overlay account per slot) and the permutation.
+
+Tried and dropped for the changeset sort: u256 order words holding the whole address and a
+monotone 32-bit slot summary (no fallback compares, but 32-byte words made it 40% slower),
+and u128 words (8 address bytes + slot summary, re-sorting runs whose 8-byte prefix holds
+several addresses): 15% slower. Compares were not the cost; pdqsort's branchy passes were.
+Not parallel: the account dirty-node collect and the top two levels (a few hundred nodes).
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

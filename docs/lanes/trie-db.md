@@ -155,6 +155,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [x] Enable parallel rehash in the node: set `rehash_threads` from the CPU count (as the
   sender-recovery threads do), keep 0 under DST/sim; measure the commit path end to end.
   (`--rehash-threads`, auto min(cores - 1, 4); db/commit sim cpu p50 7.81 -> 6.79 ms, PERF.md)
+- [x] Parallel account-trie rehash: `Overlay.commit` of a 500-transfer block is ~53%
+  account-trie hashing, serial because `rehash_threads` only covered storage tries. Split the
+  account trie's dirty nodes by subtrie across the pool, top levels on the caller; also cut
+  `build_changeset`'s sort. (trie/transfers 4 threads 1.34 -> 0.72 ms, db/commit sim 4
+  threads cpu p50 5.62 -> 4.40 ms, db/build_changeset 298 -> 227 us; docs/PERF.md)
 - [x] History memory budget at 200 ms blocks: measure bytes per retained block in
   `history.Store` (storage-heavy and typical blocks), express the window as wall-clock span
   at 5 blocks/s, add a byte budget (`Config.history_bytes_max`) that shrinks the window
@@ -277,7 +282,21 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `order` slice and its nodes' caches, with batch buffers on its own stack; results are
   bit-identical for any split. Fewer than 1024 dirty nodes hash on the caller. Claimed
   chunks, not one static range per thread: on a loaded machine workers lagged 3-4x behind
-  the caller's share. The account trie and the collect walk stay serial.
+  the caller's share. The collect walk stays serial.
+- Parallel account rehash (`StateTrie.hash_accounts`, from `root` and `bulk_finish`): with a
+  pool and a dirty account root, the dirty nodes of the subtries two levels down
+  (`TrieType.subtries`, <= 256, using `storage_root_ends` as the end offsets) are collected
+  serially and hashed in chunks of whole subtries on the pool, then `root_hash` hashes the
+  top two levels (and branch values) on the caller. Disjoint for the same reason as storage
+  tries: a subtrie's dirty nodes have all their dirty descendants in the same subtrie, and
+  the top levels are hashed only after the join. Same `rehash_parallel_nodes_min` threshold;
+  serial when `dirty_accounts_max` is below the subtrie count (too few end offsets).
+  Two levels, not one: 256 subtries split evenly into the pool's chunks even when the dirty
+  paths are skewed. Bit-identical (seeded differentials compare both pools' caches and
+  change marks, incl. a 4096-account trie with deletions; the parallel fuzz too).
+- Changeset sort: LSD radix on the 32-bit address prefix of the order words, then a full-key
+  sort of each run of equal prefixes; scratch is a second half of `Changeset.order` (2 words
+  per entry). Wider order words (u128 / u256 with a monotone slot summary) were slower.
 - State provider (`db/state.zig`, `db/overlay.zig`): committed state is flat hash tables
   (EVM reads) mirrored into `StateTrie` (roots). Reads follow revm `Database`: `basic`,
   `storage`, `code_by_hash`, `block_hash` (256-entry ring). The EVM lane can adapt its Host
@@ -1060,3 +1079,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   load. io_uring in Docker (2 pairs, 0 slot overruns, idle tick max 2.8 ms): all p50 6.3-6.5
   ms both, overlap p99 11.2 / 17.2 unpaced vs 10.3 / 13.0 ms paced, > 50 ms 2 vs 0. Node
   keeps `checkpoint_bytes_per_commit` 4 MiB.
+- 2026-11-06: parallel account-trie rehash in `StateTrie.root` (subtries two levels down on
+  the rehash pool, top levels on the caller) and a radix changeset sort. trie/transfers (new,
+  1k account updates on 100k) 4 threads 1.34 -> 0.72 ms; db/commit sim 4 threads cpu p50
+  5.62 -> 4.40 ms; db/build_changeset (new) 298 -> 227 us; db/block 7.08 -> 6.79 ms.
+  Tests: serial vs parallel pools (account + storage caches, change marks) seeded and fuzzed,
+  wide account trie with deletions, account and storage sort vs byte-wise sorts.

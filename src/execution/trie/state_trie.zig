@@ -5,8 +5,9 @@
 //! Writes only mark accounts dirty. `root` then rehashes the storage tries of dirty accounts,
 //! re-encodes those accounts, applies them to the account trie in sorted key order (adjacent
 //! paths share cached nodes and cache lines), and rehashes only the dirty paths.
-//! With `Config.rehash_threads` > 0 the dirty storage tries are hashed on a static thread
-//! pool (`rehash_pool.zig`), bit-identical to the serial path; zero (DST) stays serial.
+//! With `Config.rehash_threads` > 0 the dirty storage tries, then the dirty subtries of the
+//! account trie, are hashed on a static thread pool (`rehash_pool.zig`), bit-identical to
+//! the serial path; zero (DST) stays serial.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -48,11 +49,13 @@ pub const Config = struct {
     storage_nodes_max: u32,
     /// Accounts touched between flushes. A full list flushes early; it never fails.
     dirty_accounts_max: u32 = 4096,
-    /// Worker threads that rehash dirty storage tries in `flush`, besides the caller. Zero
+    /// Worker threads that rehash dirty storage tries in `flush` and dirty account subtries
+    /// in `root`, besides the caller. Zero
     /// (DST, the simulator) keeps everything on the calling thread. Roots are identical for
     /// any count.
     rehash_threads: u32 = 0,
-    /// Fewer dirty storage nodes than this rehash serially even with workers (tests set 0).
+    /// Fewer dirty storage (or account) nodes than this rehash serially even with workers
+    /// (tests set 0).
     rehash_parallel_nodes_min: u32 = rehash_parallel_nodes_min_default,
 };
 
@@ -97,7 +100,7 @@ pub const StateTrie = struct {
     storage_roots: []StorageTrie.NodeIndex,
     /// End offset of each storage root's dirty nodes in `storage.order` (parallel rehash).
     storage_root_ends: []u32,
-    /// Workers for the parallel storage rehash; null when `rehash_threads` is zero.
+    /// Workers for the parallel storage and account rehash; null when `rehash_threads` is 0.
     rehash_pool: ?*RehashPool,
     rehash_parallel_nodes_min: u32,
     /// Bulk load: storage tries built but not hashed yet (their roots in `storage_roots`).
@@ -461,15 +464,18 @@ pub const StateTrie = struct {
         try self.accounts.build_sorted(&self.accounts.root, &source, count);
         assert(self.dirty_len == 0 and self.bulk_roots_len == 0);
         if (self.rehash_pool) |pool| {
-            if (count > 0) self.bulk_hash_accounts(pool);
+            if (count > 0) self.hash_accounts(pool);
         }
     }
 
-    /// After a bulk build every account-trie node is dirty: hashes the subtries two levels
-    /// down on the pool (chunks of whole subtries, as for storage tries), then the top
-    /// levels on the caller. Bit-identical to `root` hashing it all serially.
-    fn bulk_hash_accounts(self: *StateTrie, pool: *RehashPool) void {
+    /// Hashes the dirty account-trie nodes in the subtries two levels down on the pool
+    /// (chunks of whole subtries, as for storage tries), then the top levels on the caller.
+    /// Each subtrie's dirty nodes are disjoint from every other's, and a node reads only its
+    /// children's caches, so this is bit-identical to `root_hash` hashing it all serially.
+    /// Fewer than `rehash_parallel_nodes_min` dirty nodes hash on the caller.
+    fn hash_accounts(self: *StateTrie, pool: *RehashPool) void {
         assert(self.accounts.root != AccountTrie.none);
+        assert(self.dirty_len == 0);
         var subtries: [AccountTrie.subtries_max]AccountTrie.NodeIndex = undefined;
         const count = self.accounts.subtries(self.accounts.root, &subtries);
         if (count > self.storage_root_ends.len) return; // Too few ends: `root` hashes it.
@@ -487,12 +493,19 @@ pub const StateTrie = struct {
         }
         for (subtries[0..count]) |index| assert(self.accounts.cache[index].len > 0);
         _ = self.accounts.root_hash();
+        assert(self.accounts.cache[self.accounts.root].len > 0);
     }
 
     /// The state root after all writes so far.
     pub fn root(self: *StateTrie) Error!Hash {
         try self.flush();
         assert(self.dirty_len == 0);
+        const account_root = self.accounts.root;
+        if (self.rehash_pool) |pool| {
+            const dirty = account_root != AccountTrie.none and
+                self.accounts.cache[account_root].len == 0;
+            if (dirty) self.hash_accounts(pool);
+        }
         return self.accounts.root_hash();
     }
 

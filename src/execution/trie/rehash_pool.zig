@@ -1,5 +1,5 @@
-//! Static worker pool for the parallel storage-trie rehash in `StateTrie.flush` (and the
-//! account-trie rehash after a bulk load, `StateTrie.bulk_finish`).
+//! Static worker pool for the parallel storage-trie rehash in `StateTrie.flush` and the
+//! account-trie rehash in `StateTrie.root` (and after a bulk load, `StateTrie.bulk_finish`).
 //!
 //! The threads are spawned once at `init` and sleep on a futex between flushes (no spawn per
 //! block). One `run` publishes a bounded list of chunks (at most `chunks_max` ranges of the
@@ -10,11 +10,12 @@
 //! its run ended finds nothing to claim: claims carry the run's generation.
 //!
 //! No shared mutable state: each chunk holds the dirty nodes of whole, distinct storage tries
-//! (`TrieType.collect_dirty_split`), and `TrieType.hash_collected` writes only its own chunk
-//! and the caches of the nodes in it, keeping its batch buffers on its own stack. A node
-//! reads the caches of its children, which are either clean (written by nobody during the
-//! run) or dirty and then in the same chunk. Hashing is a pure function of the trie, so the
-//! caches are bit-identical to a serial rehash for any split and any thread count.
+//! or account subtries (`TrieType.collect_dirty_split`), and `TrieType.hash_collected`
+//! writes only its own chunk and the caches of the nodes in it, keeping its batch buffers
+//! on its own stack. A node reads the caches of its children, which are either clean
+//! (written by nobody during the run) or dirty and then in the same chunk. Hashing is a
+//! pure function of the trie, so the caches are bit-identical to a serial rehash for any
+//! split and any thread count.
 //!
 //! A futex is a synchronization primitive, not I/O: the futex calls go straight to the OS
 //! through `std.Io.Threaded` (they ignore its state). With zero threads nothing here runs,

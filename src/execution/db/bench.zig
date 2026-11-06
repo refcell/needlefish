@@ -64,6 +64,11 @@ pub const cases = [_]Case{
         .run = bench_block,
     },
     .{
+        .name = "db/build_changeset 1k acct+4k slot",
+        .iterations = 5_000,
+        .run = bench_build_changeset,
+    },
+    .{
         .name = "db/changeset encode 1k acct+4k slot",
         .iterations = 1_000,
         .run = bench_encode,
@@ -374,6 +379,22 @@ fn bench_block(iterations: u32) u64 {
         const root = memory.block() catch @panic("bench: block failed");
         accumulator +%= root[0];
     }
+    return accumulator;
+}
+
+/// `Overlay.build_changeset` of one measured block's pending writes (left in the overlay,
+/// never committed, so every op sorts and looks up the same entries).
+fn bench_build_changeset(iterations: u32) u64 {
+    const memory = get_memory();
+    memory.overlay.discard();
+    write_block(&memory.overlay, memory.shape, &memory.prng) catch @panic("bench: block failed");
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        memory.overlay.build_changeset(&memory.changeset) catch @panic("bench: build failed");
+        assert(memory.changeset.storage_len == memory.shape.block_slots);
+        accumulator +%= memory.changeset.accounts_len;
+    }
+    memory.overlay.discard();
     return accumulator;
 }
 
@@ -715,7 +736,7 @@ test "bench: cases are well formed" {
         assert(case.name.len > 0);
         assert(case.iterations > 0);
     }
-    assert(cases.len == 3);
+    assert(cases.len == 4);
     shape_bench.check();
     shape_test.check();
     try std.testing.expect(matches(name_os, "db/commit"));

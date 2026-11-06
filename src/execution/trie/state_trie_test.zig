@@ -278,22 +278,27 @@ const RehashPair = struct {
         }
         const root = try pair.serial.root();
         try testing.expectEqual(root, try pair.parallel.root());
-        const serial = &pair.serial.storage;
-        const parallel = &pair.parallel.storage;
-        try testing.expectEqual(serial.free_count, parallel.free_count);
-        for (serial.nodes, parallel.nodes, 0..) |*a, *b, index| {
-            try testing.expectEqual(a.kind, b.kind);
-            if (a.kind == .free) continue;
-            const want = &serial.cache[index];
-            const got = &parallel.cache[index];
-            try testing.expectEqual(want.len, got.len);
-            if (want.len > 0) try testing.expectEqualSlices(u8, want.slice(), got.slice());
-        }
-        try testing.expectEqualSlices(u64, serial.changed, parallel.changed);
+        try expect_pools_equal(&pair.serial.storage, &pair.parallel.storage);
+        try expect_pools_equal(&pair.serial.accounts, &pair.parallel.accounts);
     }
 };
 
-test "state trie: parallel storage rehash matches serial (seeded differential)" {
+/// Both node pools hold the same nodes, cached references, and change marks.
+fn expect_pools_equal(serial: anytype, parallel: anytype) !void {
+    try testing.expectEqual(serial.free_count, parallel.free_count);
+    try testing.expectEqual(serial.root, parallel.root);
+    for (serial.nodes, parallel.nodes, 0..) |*a, *b, index| {
+        try testing.expectEqual(a.kind, b.kind);
+        if (a.kind == .free) continue;
+        const want = &serial.cache[index];
+        const got = &parallel.cache[index];
+        try testing.expectEqual(want.len, got.len);
+        if (want.len > 0) try testing.expectEqualSlices(u8, want.slice(), got.slice());
+    }
+    try testing.expectEqualSlices(u64, serial.changed, parallel.changed);
+}
+
+test "state trie: parallel storage and account rehash match serial (seeded differential)" {
     var prng = Prng.init(0x9a4a11e1);
     // Forced parallel on every flush (also the early flushes of a small dirty list), and
     // the default threshold with blocks big enough to cross it now and then.
@@ -324,6 +329,48 @@ fn fuzz_parallel_rehash(_: void, smith: *testing.Smith) anyerror!void {
     }
 }
 
-test "state trie: fuzz parallel storage rehash against serial" {
+test "state trie: fuzz parallel rehash against serial" {
     try testing.fuzz({}, fuzz_parallel_rehash, .{});
+}
+
+/// Account-only blocks over a wide account space, so the account trie is deep enough that
+/// its subtries two levels down hold most dirty nodes (the 64-account tries above are
+/// mostly top levels).
+const wide_accounts_max = 4096;
+
+fn wide_block(tries: *[2]state.StateTrie, seed: u64, operations: u32) !void {
+    var prng = Prng.init(seed);
+    for (0..operations) |_| {
+        const address_hash = index_hash('w', prng.below(wide_accounts_max));
+        if (prng.chance(1, 4)) {
+            for (tries) |*trie| try trie.delete_account(address_hash);
+        } else {
+            const account: state.Account = .{ .nonce = prng.below(8), .balance = prng.int(u64) };
+            for (tries) |*trie| try trie.set_account(address_hash, account);
+        }
+    }
+    try testing.expectEqual(try tries[0].root(), try tries[1].root());
+    try expect_pools_equal(&tries[0].accounts, &tries[1].accounts);
+}
+
+test "state trie: parallel account rehash matches serial on a wide account trie" {
+    var prng = Prng.init(0xacc0_0e11);
+    const setups = [_][2]u32{ .{ 4, 0 }, .{ 3, 0 }, .{ 4, 256 } };
+    for (setups) |setup| {
+        var config: state.Config = .{
+            .accounts_max = wide_accounts_max,
+            .account_nodes_max = wide_accounts_max * 3,
+            .storage_nodes_max = 16,
+        };
+        var tries: [2]state.StateTrie = undefined;
+        tries[0] = try state.StateTrie.init(testing.allocator, config);
+        defer tries[0].deinit(testing.allocator);
+        config.rehash_threads = setup[0];
+        config.rehash_parallel_nodes_min = setup[1];
+        tries[1] = try state.StateTrie.init(testing.allocator, config);
+        defer tries[1].deinit(testing.allocator);
+        for (&tries) |*trie| try trie.track_changes(testing.allocator);
+        for (0..40) |_| try wide_block(&tries, prng.int(u64), @intCast(1 + prng.below(3000)));
+        try testing.expect(tries[0].account_count() > 0);
+    }
 }

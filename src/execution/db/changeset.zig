@@ -89,7 +89,8 @@ pub const Changeset = struct {
     code_bytes_len: u32 = 0,
     code_ends: []u32,
     codes_len: u32 = 0,
-    /// Sort scratch: one index per entry of the larger of `accounts` and `storage`.
+    /// Sort scratch: two words per entry of the larger of `accounts` and `storage` (the
+    /// order words and the radix sort's second buffer).
     order: []u64,
 
     /// Buffers are reserved here and committed on first touch (`lazy_alloc`).
@@ -103,7 +104,7 @@ pub const Changeset = struct {
         const code_ends = try lazy.alloc(allocator, u32, config.codes_max);
         errdefer lazy.free(allocator, code_ends);
         const order_len = @max(config.accounts_max, config.storage_max);
-        const order = try lazy.alloc(allocator, u64, order_len);
+        const order = try lazy.alloc(allocator, u64, 2 * order_len);
         return .{
             .accounts = accounts,
             .storage = storage,
@@ -170,9 +171,10 @@ pub const Changeset = struct {
     /// sort gives the same order as a stable one.
     pub fn sort(self: *Changeset) void {
         const accounts = self.accounts[0..self.accounts_len];
-        sort_entries(AccountChange, accounts, self.order[0..accounts.len]);
+        const half = self.order.len / 2;
+        sort_entries(AccountChange, accounts, self.order[0..accounts.len], self.order[half..]);
         const storage = self.storage[0..self.storage_len];
-        sort_entries(StorageChange, storage, self.order[0..storage.len]);
+        sort_entries(StorageChange, storage, self.order[0..storage.len], self.order[half..]);
         for (1..@max(1, accounts.len)) |i| {
             assert(AccountChange.less_than(&accounts[i - 1], &accounts[i]));
         }
@@ -284,25 +286,44 @@ pub const Changeset = struct {
 
 /// Sorts `items` by `T.less_than` through an index array, then permutes `items` in place.
 /// Entries are 128+ bytes: sorting them directly copied entries on every compare and swap
-/// (~2 ms for 4k slots). Each order word is `address[0..4] << 32 | index`, so most compares
-/// are one integer compare (the prefix is the most significant part of the key) and only
-/// equal prefixes look at the entries.
-fn sort_entries(comptime T: type, items: []T, order: []u64) void {
+/// (~2 ms for 4k slots). Each order word is `address[0..4] << 32 | index`; a radix sort on
+/// the prefix (`radix_sort_prefix`) orders them without compares, then each run of equal
+/// prefixes (one account's slots, or a rare shared prefix) is sorted by the full key. The
+/// radix pass replaced a pdqsort of the words (~200 us of a 1k acct+4k slot changeset).
+fn sort_entries(comptime T: type, items: []T, order: []u64, scratch: []u64) void {
     assert(order.len == items.len);
     assert(items.len <= std.math.maxInt(u32));
+    assert(scratch.len >= order.len);
     for (order, items, 0..) |*word, *item, position| {
         const prefix: u64 = std.mem.readInt(u32, item.address[0..4], .big);
         word.* = prefix << 32 | position;
     }
+    radix_sort_prefix(order, scratch[0..order.len]);
     const Context = struct {
         items: []const T,
         fn less_than(context: @This(), a: u64, b: u64) bool {
-            if (a >> 32 != b >> 32) return a >> 32 < b >> 32;
             const a_item = &context.items[@as(u32, @truncate(a))];
             return T.less_than(a_item, &context.items[@as(u32, @truncate(b))]);
         }
     };
-    std.sort.pdq(u64, order, Context{ .items = items }, Context.less_than);
+    const context: Context = .{ .items = items };
+    var run_start: usize = 0;
+    while (run_start < order.len) {
+        const prefix = order[run_start] >> 32;
+        var run_end = run_start + 1;
+        while (run_end < order.len and order[run_end] >> 32 == prefix) run_end += 1;
+        if (run_end - run_start > 1) {
+            std.sort.pdq(u64, order[run_start..run_end], context, Context.less_than);
+        }
+        run_start = run_end;
+    }
+    assert(run_start == order.len);
+    permute(T, items, order);
+}
+
+/// Moves `items` into the order of `order` (the index in the low 32 bits of each word).
+fn permute(comptime T: type, items: []T, order: []u64) void {
+    assert(order.len == items.len);
     // Follow each cycle of the permutation: position k receives items[order[k]]. A finished
     // position is marked by index(order[k]) == k, so every entry moves at most once.
     var moves: u64 = 0;
@@ -322,6 +343,38 @@ fn sort_entries(comptime T: type, items: []T, order: []u64) void {
             target = source;
         }
     }
+}
+
+/// Stable LSD radix sort of `words` by their high 32 bits, one byte per pass; a pass whose
+/// byte is the same in every word is skipped. `scratch` is the second buffer.
+fn radix_sort_prefix(words: []u64, scratch: []u64) void {
+    assert(scratch.len == words.len);
+    if (words.len <= 1) return;
+    var source = words;
+    var target = scratch;
+    for (0..4) |pass| {
+        const shift: u6 = @intCast(32 + 8 * pass);
+        var counts: [256]u32 = @splat(0);
+        for (source) |word| counts[@as(u8, @truncate(word >> shift))] += 1;
+        if (counts[@as(u8, @truncate(source[0] >> shift))] == source.len) continue;
+        var offset: u32 = 0;
+        for (&counts) |*count| {
+            const next = offset + count.*;
+            count.* = offset;
+            offset = next;
+        }
+        assert(offset == source.len);
+        for (source) |word| {
+            const digit: u8 = @truncate(word >> shift);
+            target[counts[digit]] = word;
+            counts[digit] += 1;
+        }
+        const swap = source;
+        source = target;
+        target = swap;
+    }
+    if (source.ptr != words.ptr) @memcpy(words, source);
+    for (1..@max(1, words.len)) |index| assert(words[index - 1] >> 32 <= words[index] >> 32);
 }
 
 const Writer = struct {
@@ -475,7 +528,8 @@ test "changeset: sort matches a byte-wise stable sort" {
         for (0..count) |index| {
             // Few distinct prefixes and tails, so the prefix compare ties often.
             var address: Address = @splat(0);
-            address[prng.below(2) * 3] = @intCast(prng.below(3));
+            address[prng.below(3)] = @intCast(prng.below(3));
+            address[3] = @intCast(prng.below(256));
             address[19] = @intCast(prng.below(3));
             const slot = @as(u256, prng.below(4)) << 200 | index;
             try changeset.add_storage(.{ .address = address, .slot = slot, .old = 0, .new = 1 });
@@ -488,6 +542,34 @@ test "changeset: sort matches a byte-wise stable sort" {
             try testing.expectEqual(want.slot, got.slot);
         }
     }
+}
+
+test "changeset: account sort matches a byte-wise sort" {
+    var prng = Prng.init(0xacc5);
+    var changeset = try Changeset.init(testing.allocator, test_config);
+    defer changeset.deinit(testing.allocator);
+    var expected: [test_config.accounts_max]Address = undefined;
+    for (0..100) |_| {
+        changeset.clear();
+        const count = prng.below(test_config.accounts_max + 1);
+        for (0..count) |index| {
+            // Random prefixes (every radix pass runs), and shared ones that tie.
+            var address: Address = @splat(0);
+            if (prng.chance(1, 2)) prng.fill(address[0..4]);
+            std.mem.writeInt(u32, address[16..20], @intCast(index), .big);
+            expected[index] = address;
+            try changeset.add_account(.{ .address = address, .old = null, .new = .{} });
+        }
+        std.mem.sort(Address, expected[0..count], {}, address_less_than);
+        changeset.sort();
+        for (expected[0..count], changeset.account_changes()) |want, got| {
+            try testing.expectEqualSlices(u8, &want, &got.address);
+        }
+    }
+}
+
+fn address_less_than(_: void, a: Address, b: Address) bool {
+    return std.mem.order(u8, &a, &b) == .lt;
 }
 
 fn fuzz_decode(changeset: *Changeset, smith: *testing.Smith) anyerror!void {

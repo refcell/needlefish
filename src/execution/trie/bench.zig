@@ -31,6 +31,8 @@ pub const cases = [_]Case{
     .{ .name = "trie/storage 4k slots, 2 threads", .iterations = 100, .run = bench_storage_2 },
     .{ .name = "trie/storage 4k slots, 4 threads", .iterations = 100, .run = bench_storage_4 },
     .{ .name = "trie/storage 4k slots, 8 threads", .iterations = 100, .run = bench_storage_8 },
+    .{ .name = "trie/transfers 1k accts, 0 threads", .iterations = 100, .run = bench_transfers_0 },
+    .{ .name = "trie/transfers 1k accts, 4 threads", .iterations = 100, .run = bench_transfers_4 },
 };
 
 const Trie = trie_module.TrieType(.{ .key_bytes_max = 32, .value_size_max = 112 });
@@ -231,10 +233,66 @@ fn bench_storage_8(iterations: u32) u64 {
     return bench_storage(3, 8, iterations);
 }
 
+/// Transfer-heavy shape (a 500-transfer block): 1k random account updates on 100k accounts
+/// without storage, then the state root, nearly all of it account-trie rehash. Address
+/// hashes are precomputed so a block measures trie work, not key hashing.
+var transfer_fixtures: [2]?state.StateTrie = @splat(null);
+var transfer_prng = Prng.init(11);
+var transfer_hashes: [fixture_entries]node.Hash = undefined;
+var transfer_hashes_ready = false;
+
+fn transfer_fixture(slot: u32, threads: u32) *state.StateTrie {
+    assert(slot < transfer_fixtures.len);
+    if (!transfer_hashes_ready) {
+        for (&transfer_hashes, 0..) |*hash, index| hash.* = random_key(index);
+        transfer_hashes_ready = true;
+    }
+    if (transfer_fixtures[slot] == null) {
+        var trie = state.StateTrie.init(std.heap.page_allocator, .{
+            .accounts_max = fixture_entries,
+            .account_nodes_max = fixture_entries * 3,
+            .storage_nodes_max = 16,
+            .rehash_threads = threads,
+        }) catch @panic("bench: oom");
+        for (transfer_hashes, 0..) |address_hash, index| {
+            const account: state.Account = .{ .nonce = index, .balance = index * 1000 };
+            trie.set_account(address_hash, account) catch @panic("bench");
+        }
+        _ = trie.root() catch @panic("bench");
+        transfer_fixtures[slot] = trie;
+    }
+    return &transfer_fixtures[slot].?;
+}
+
+fn bench_transfers(slot: u32, threads: u32, iterations: u32) u64 {
+    const trie = transfer_fixture(slot, threads);
+    var accumulator: u64 = 0;
+    for (0..iterations) |_| {
+        for (0..1000) |_| {
+            const index = transfer_prng.below(fixture_entries);
+            const account: state.Account = .{
+                .nonce = transfer_prng.below(1 << 20),
+                .balance = transfer_prng.int(u64),
+            };
+            trie.set_account(transfer_hashes[index], account) catch @panic("bench");
+        }
+        accumulator +%= (trie.root() catch @panic("bench"))[0];
+    }
+    return accumulator;
+}
+
+fn bench_transfers_0(iterations: u32) u64 {
+    return bench_transfers(0, 0, iterations);
+}
+
+fn bench_transfers_4(iterations: u32) u64 {
+    return bench_transfers(1, 4, iterations);
+}
+
 test "bench: cases are well formed" {
     for (cases) |case| {
         assert(case.name.len > 0);
         assert(case.iterations > 0);
     }
-    assert(cases.len == 9);
+    assert(cases.len == 11);
 }
