@@ -10,8 +10,8 @@
 //! | `sweep`    | L2    | contract balance >= 0.01 ETH                     | withdrawETH()   |
 //!
 //! A false precondition is a successful skip. Read errors, send failures, timeouts, and
-//! reverted receipts fail the job. `confirm` (proving `FeeDisburser` withdrawals) needs the
-//! withdrawer and is not ported yet.
+//! reverted receipts fail the job. `confirm` (proving and finalizing the `FeeDisburser`'s
+//! withdrawals through the withdrawer flow) lives in `confirm.zig`.
 //!
 //! IO goes through the injected JSON-RPC client and a `clock` (`now_ms()`, `sleep_ms(ms)`),
 //! so tests run against a fake chain with a fake clock.
@@ -21,6 +21,8 @@ const assert = std.debug.assert;
 
 const rpc = @import("../../batcher/rpc/root.zig");
 const tx_manager = @import("../tx_manager/root.zig");
+
+pub const confirm = @import("confirm.zig");
 
 pub const Address = tx_manager.driver.Address;
 pub const Hash = tx_manager.driver.Hash;
@@ -169,4 +171,5 @@ pub fn run(
 
 test {
     _ = @import("tests.zig");
+    _ = confirm;
 }

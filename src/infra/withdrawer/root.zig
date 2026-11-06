@@ -18,4 +18,5 @@ test {
     _ = @import("withdrawal_test.zig");
     _ = @import("status_test.zig");
     _ = @import("flow_test.zig");
+    _ = @import("fake_chain.zig");
 }

@@ -68,7 +68,7 @@ allocation after startup.
   their in-flight workers land.
 - [x] `infra/fee_jobs` + `base fee-jobs disburse|process|sweep` (port `fee-jobs`): precondition
   reads, one tx_manager send, fail on revert (tx_manager now reports receipt status).
-- [ ] `base fee-jobs confirm`: prove/finalize `FeeDisburser` withdrawals via the withdrawer
+- [x] `base fee-jobs confirm`: prove/finalize `FeeDisburser` withdrawals via the withdrawer
   (after `infra/withdrawer` lands).
 - [ ] `infra/telemetry` EL reachability probe: needs RLPx (ECIES + devp2p Hello), which no
   lane has yet; revisit when execution p2p exists.
@@ -272,6 +272,27 @@ allocation after startup.
     hash-pinned multi-read snapshot races the 200 ms head (one verifier run of ~15 runs lost
     the race: `eth_getCode(BaseTime proxy): rpc error`).
   - `eth_getStorageAt` rejects a zero-padded 32-byte slot key `0x00…00` as invalid params.
+- fee-jobs confirm mirrors base/base `confirm.rs` matching exactly: message passer sender ==
+  L2CrossDomainMessenger, `relayMessage._sender` == L2StandardBridge, `finalizeBridgeETH._from`
+  == `--contract`; both calls decoded canonically (exact head offset and padded length, clean
+  address words), as alloy's `abi_decode_validate`. Other withdrawals are skipped and logged; a
+  receipt with none fails. The withdrawer flow gained an optional `Config.filter` (null keeps
+  every withdrawal) and records skipped hashes; the flow stays IO-free, the binary logs them.
+- fee-jobs confirm runs two flow passes per disbursal, `.prove` then `.finalize`, instead of
+  `.run`: `.run` would wait out the 7-day challenge window, while base/base takes one step per
+  withdrawal per run (a cron job). `--dry-run` is one `.status` pass (decisions only; base/base
+  also estimates the calldata). No journal: each run decides from the chain like base/base (an
+  in-memory sink satisfies the flow). A withdrawal timeout or an L1 send left in flight ends the
+  run (the single-send driver cannot send past it); other receipt/withdrawal failures are
+  counted, the run continues, and the process exits 1. A failure inside one receipt stops that
+  receipt's remaining withdrawals (base/base continues per withdrawal).
+- fee-jobs confirm flags keep base/base names and defaults in our units: `--lookback-s`
+  (21 days), `--l2-block-time-ms` (2000, base/base's default; set 200 for 200 ms chains),
+  `--num-blocks-per-query` (3000), `--withdrawal-timeout-s` (600), `--dry-run`, plus the
+  withdrawer's `--portal` (factory and registry are read from it; zero addresses rejected before
+  scanning) and `--l1-chain-id`. Bounds: 256 disbursals per run, 1024 logs per query, 100000
+  queries per window. The withdrawer fake chains moved to `withdrawer/fake_chain.zig` so the
+  confirm tests reuse them with a synthetic, fully verified single-leaf-trie proof.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -336,3 +357,10 @@ allocation after startup.
   mid-run scrape `tx_manager_submitted_total 48`, `completed{confirmed} 45`, `pending 3`, then
   89/85/4 eight seconds later; 99/99 confirmed. `withdrawer initiate` scrape: submitted 1,
   pending 1.
+- 2026-11-05: `base fee-jobs confirm` (`fee_jobs/confirm.zig`: window chunking, `FeesDisbursed`
+  scan with dedupe, strict FeeDisburser matcher + seeded/std.testing fuzz, two-pass job) and the
+  withdrawer flow filter hook. Fake-chain tests: fee withdrawal proven (real proof verification)
+  then finalized on a later run, foreign withdrawal skipped, receipt without a match fails while
+  the run continues, empty window is a no-op, paused fails, dry run sends nothing; base/base's
+  window, scan, and unrelated-sender cases ported. No devnet run: the stand-in portal cannot
+  prove (the binary exits 1 at "reading portal contracts" against dev-l1).

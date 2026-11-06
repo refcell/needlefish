@@ -23,12 +23,10 @@ const Hash = [32]u8;
 const Address = [20]u8;
 
 const fixture_json = @embedFile("testdata/base_sepolia_withdrawal_proof.json");
-const portal: Address = @splat(0x50);
-const factory_address: Address = @splat(0xfa);
-const registry_address: Address = @splat(0xa5);
-const game_proxy: Address = @splat(0x9a);
+const fake_chain = @import("fake_chain.zig");
+const Chain = fake_chain.Chain;
+const portal = fake_chain.portal;
 const fixture_transaction = "809b89557a33bbb8a20141e46e0c74129db40c184d0e3b9ed2f4e7c78eb74b85";
-const sends_max = 16;
 
 const Fixture = struct {
     arena: std.heap.ArenaAllocator,
@@ -38,6 +36,9 @@ const Fixture = struct {
     header_number: u64,
     receipt_block: u64,
     root_claim: Hash,
+    receipts: [1]fake_chain.Receipt,
+    /// What the fake chains serve; points into `fixture` (load in place).
+    chain: fake_chain.Fixture,
 
     fn load(fixture: *Fixture) !void {
         fixture.arena = .init(testing.allocator);
@@ -53,247 +54,21 @@ const Fixture = struct {
         fixture.receipt_block = try parse_hex(receipt.object.get("blockNumber").?.string);
         const claim = root.object.get("game").?.object.get("rootClaim").?.string;
         _ = try std.fmt.hexToBytes(&fixture.root_claim, claim[2..]);
+        fixture.receipts = .{.{ .hash = fixture_hash(), .json = fixture.receipt }};
+        fixture.chain = .{
+            .receipts = &fixture.receipts,
+            .header = fixture.header,
+            .header_number = fixture.header_number,
+            .proof = fixture.proof,
+            .root_claim = fixture.root_claim,
+            .withdrawal_hash = withdrawal_hash_of(fixture),
+        };
     }
 
     fn parse_hex(text: []const u8) !u64 {
         return std.fmt.parseInt(u64, text[2..], 16);
     }
 };
-
-const Sent = struct { hash: Hash, nonce: u64, selector: [4]u8, block: u64 = 0 };
-
-const Chain = struct {
-    fixture: *const Fixture,
-    is_l2: bool,
-    head: u64 = 10,
-    time_s: u64 = 1_000,
-    account_nonce: u64 = 0,
-    sent: [sends_max]Sent = undefined,
-    sent_count: u32 = 0,
-    proven_at: u64 = 0,
-    finalized: bool = false,
-    paused: bool = false,
-    game_finalized: bool = true,
-    finalize_success: bool = true,
-
-    fn transport(chain: *Chain) rpc.Transport {
-        return .{ .context = chain, .send_fn = send };
-    }
-
-    fn block_hash(number: u64) Hash {
-        var hash: Hash = @splat(0xbb);
-        std.mem.writeInt(u64, hash[0..8], number, .big);
-        return hash;
-    }
-
-    /// Mines every pending transaction in one block at `time_s`.
-    fn mine(chain: *Chain, time_s: u64) void {
-        chain.head += 1;
-        chain.time_s = time_s;
-        for (chain.sent[0..chain.sent_count]) |*sent| {
-            if (sent.block != 0 or sent.nonce != chain.account_nonce) continue;
-            sent.block = chain.head;
-            chain.account_nonce += 1;
-            if (std.mem.eql(u8, &sent.selector, &calldata.prove_withdrawal_transaction)) {
-                chain.proven_at = time_s;
-            }
-            if (std.mem.eql(u8, &sent.selector, &calldata.finalize_withdrawal_transaction)) {
-                chain.finalized = chain.finalize_success;
-            }
-        }
-    }
-
-    fn count(chain: *const Chain, selector: [4]u8) u32 {
-        var total: u32 = 0;
-        for (chain.sent[0..chain.sent_count]) |sent| {
-            if (std.mem.eql(u8, &sent.selector, &selector)) total += 1;
-        }
-        return total;
-    }
-
-    fn send(context: *anyopaque, body: []const u8, response: []u8) rpc.TransportError!usize {
-        const chain: *Chain = @ptrCast(@alignCast(context));
-        var arena_memory: [64 * 1024]u8 = undefined;
-        var arena: std.heap.FixedBufferAllocator = .init(&arena_memory);
-        const Value = std.json.Value;
-        const request = std.json.parseFromSliceLeaky(Value, arena.allocator(), body, .{}) catch
-            return error.TransportFailed;
-        const id = request.object.get("id").?.integer;
-        const method = request.object.get("method").?.string;
-        const params = request.object.get("params").?.array.items;
-        var writer: std.Io.Writer = .fixed(response);
-        writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":", .{id}) catch
-            return error.ResponseTooLarge;
-        chain.answer(method, params, &writer) catch |err| switch (err) {
-            error.WriteFailed => return error.ResponseTooLarge,
-            else => return error.TransportFailed,
-        };
-        writer.writeAll("}") catch return error.ResponseTooLarge;
-        return writer.buffered().len;
-    }
-
-    fn answer(
-        chain: *Chain,
-        method: []const u8,
-        params: []const std.json.Value,
-        w: *std.Io.Writer,
-    ) !void {
-        const eql = std.mem.eql;
-        if (eql(u8, method, "eth_getBlockByNumber")) return chain.block(params[0].string, w);
-        if (eql(u8, method, "eth_maxPriorityFeePerGas")) return w.writeAll("\"0x1\"");
-        if (eql(u8, method, "eth_estimateGas")) return w.writeAll("\"0x30d40\"");
-        if (eql(u8, method, "eth_getTransactionCount")) {
-            return w.print("\"0x{x}\"", .{chain.account_nonce});
-        }
-        if (eql(u8, method, "eth_sendRawTransaction")) return chain.accept(params[0].string, w);
-        if (eql(u8, method, "eth_getTransactionReceipt")) return chain.receipt(params[0].string, w);
-        if (eql(u8, method, "eth_getProof")) return w.writeAll(chain.fixture.proof);
-        if (eql(u8, method, "eth_call")) return chain.call(params[0], w);
-        return error.UnknownMethod;
-    }
-
-    fn block(chain: *Chain, tag: []const u8, w: *std.Io.Writer) !void {
-        const number = if (std.mem.eql(u8, tag, "latest"))
-            chain.head
-        else
-            try std.fmt.parseInt(u64, tag[2..], 16);
-        if (chain.is_l2 and number == chain.fixture.header_number) {
-            return w.writeAll(chain.fixture.header);
-        }
-        // The withdrawal's L2 block is older than every game.
-        const timestamp = if (chain.is_l2) 1_500 else chain.time_s;
-        try w.print("{{\"number\":\"0x{x}\",\"timestamp\":\"0x{x}\",\"baseFeePerGas\":\"0x7\"," ++
-            "\"hash\":\"0x{x}\"}}", .{ number, timestamp, &block_hash(number) });
-    }
-
-    fn accept(chain: *Chain, hex: []const u8, w: *std.Io.Writer) !void {
-        var raw: [16 * 1024]u8 = undefined;
-        const bytes = try std.fmt.hexToBytes(&raw, hex[2..]);
-        const envelope = try consensus.tx.Envelope.decode(bytes);
-        const input = envelope.input();
-        assert(chain.sent_count < sends_max);
-        chain.sent[chain.sent_count] = .{
-            .hash = envelope.hash().bytes,
-            .nonce = envelope.nonce().?,
-            .selector = input[0..4].*,
-        };
-        chain.sent_count += 1;
-        try w.print("\"0x{x}\"", .{&envelope.hash().bytes});
-    }
-
-    fn receipt(chain: *Chain, hex: []const u8, w: *std.Io.Writer) !void {
-        var hash: Hash = undefined;
-        _ = try std.fmt.hexToBytes(&hash, hex[2..]);
-        var expected: Hash = undefined;
-        _ = try std.fmt.hexToBytes(&expected, fixture_transaction);
-        if (chain.is_l2 and std.mem.eql(u8, &hash, &expected)) {
-            return w.writeAll(chain.fixture.receipt);
-        }
-        for (chain.sent[0..chain.sent_count]) |sent| {
-            if (!std.mem.eql(u8, &sent.hash, &hash) or sent.block == 0) continue;
-            try w.print("{{\"status\":\"0x1\",\"blockNumber\":\"0x{x}\",\"blockHash\":\"0x{x}\"," ++
-                "\"logs\":[", .{ sent.block, &block_hash(sent.block) });
-            if (std.mem.eql(u8, &sent.selector, &calldata.finalize_withdrawal_transaction)) {
-                try chain.finalized_log(w);
-            }
-            return w.writeAll("]}");
-        }
-        try w.writeAll("null");
-    }
-
-    fn finalized_log(chain: *Chain, w: *std.Io.Writer) !void {
-        var out: [4]withdrawal_module.Withdrawal = undefined;
-        _ = &out;
-        const withdrawal_hash = withdrawal_hash_of(chain.fixture);
-        try w.print("{{\"address\":\"0x{x}\",\"topics\":[\"0x{x}\",\"0x{x}\"]," ++
-            "\"data\":\"0x{x}\"}}", .{
-            &portal,
-            &calldata.withdrawal_finalized_topic,
-            &withdrawal_hash,
-            &word(@intFromBool(chain.finalize_success)),
-        });
-    }
-
-    fn call(chain: *Chain, request: std.json.Value, w: *std.Io.Writer) !void {
-        var to: Address = undefined;
-        _ = try std.fmt.hexToBytes(&to, request.object.get("to").?.string[2..]);
-        var input_buffer: [256]u8 = undefined;
-        const data_hex = request.object.get("data").?.string[2..];
-        const input = try std.fmt.hexToBytes(&input_buffer, data_hex);
-        const selector = input[0..4].*;
-        if (is(selector, calldata.check_withdrawal)) return w.writeAll("\"0x\"");
-        var result: [3][32]u8 = undefined;
-        const words = try chain.call_words(selector, &result);
-        try w.writeAll("\"0x");
-        for (result[0..words]) |item| try w.print("{x}", .{&item});
-        try w.writeAll("\"");
-    }
-
-    fn call_words(chain: *Chain, selector: [4]u8, out: *[3][32]u8) !usize {
-        if (is(selector, calldata.dispute_game_factory)) {
-            return one(out, address_word(factory_address));
-        }
-        if (is(selector, calldata.anchor_state_registry)) {
-            return one(out, address_word(registry_address));
-        }
-        if (is(selector, calldata.finalized_withdrawals)) return one(out, flag(chain.finalized));
-        if (is(selector, registry.paused)) return one(out, flag(chain.paused));
-        if (is(selector, calldata.proven_withdrawals)) {
-            out[0] = address_word(if (chain.proven_at == 0) @splat(0) else game_proxy);
-            out[1] = word(chain.proven_at);
-            return 2;
-        }
-        if (is(selector, registry.is_game_blacklisted)) return one(out, word(0));
-        if (is(selector, registry.is_game_retired)) return one(out, word(0));
-        if (is(selector, registry.is_game_proper)) return one(out, word(1));
-        if (is(selector, registry.is_game_respected)) return one(out, word(1));
-        if (is(selector, registry.is_game_finalized)) return one(out, flag(chain.game_finalized));
-        if (is(selector, calldata.game_status)) return one(out, word(2));
-        if (is(selector, calldata.proof_maturity_delay_seconds)) return one(out, word(100));
-        if (is(selector, calldata.game_resolved_at)) return one(out, word(500));
-        if (is(selector, registry.dispute_game_finality_delay_seconds)) return one(out, word(200));
-        if (is(selector, factory.game_count)) return one(out, word(1));
-        if (is(selector, factory.game_at_index)) {
-            out[0] = word(621);
-            out[1] = word(2_000);
-            out[2] = address_word(game_proxy);
-            return 3;
-        }
-        if (is(selector, calldata.game_extra_data)) {
-            out[0] = word(32);
-            out[1] = word(32);
-            out[2] = word(chain.fixture.header_number);
-            return 3;
-        }
-        if (is(selector, calldata.game_root_claim)) return one(out, chain.fixture.root_claim);
-        return error.UnknownSelector;
-    }
-};
-
-fn is(selector: [4]u8, expected: [4]u8) bool {
-    return std.mem.eql(u8, &selector, &expected);
-}
-
-fn flag(value: bool) [32]u8 {
-    return word(@intFromBool(value));
-}
-
-fn one(out: *[3][32]u8, value: [32]u8) usize {
-    out[0] = value;
-    return 1;
-}
-
-fn word(value: u64) [32]u8 {
-    var out: [32]u8 = @splat(0);
-    std.mem.writeInt(u64, out[24..32], value, .big);
-    return out;
-}
-
-fn address_word(address: Address) [32]u8 {
-    var out: [32]u8 = @splat(0);
-    out[12..32].* = address;
-    return out;
-}
 
 fn withdrawal_hash_of(fixture: *const Fixture) Hash {
     _ = fixture;
@@ -343,8 +118,8 @@ const Harness = struct {
 
     fn init(harness: *Harness) !void {
         try harness.fixture.load();
-        harness.l1 = .{ .fixture = &harness.fixture, .is_l2 = false };
-        harness.l2 = .{ .fixture = &harness.fixture, .is_l2 = true };
+        harness.l1 = .{ .fixture = &harness.fixture.chain, .is_l2 = false };
+        harness.l2 = .{ .fixture = &harness.fixture.chain, .is_l2 = true };
         const limits: rpc.Limits = .{
             .request_bytes_max = 64 * 1024,
             .response_bytes_max = 64 * 1024,
