@@ -168,8 +168,14 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   feeding enclaves preimages, the enclave pool, proof generation and the TEE prover backend.
 - [ ] `proof/tee-registrar`: base/base `crates/proof/tee/registrar`: discovers signers,
   verifies attestations (`tee/nitro`), plans and submits TEE signer registrations.
+  Done: COSE walker, planner, P-384 hint transcript (matches base/base goldens), CRL checks
+  behind a fetcher, task set, reconciler. Left: prover client, discovery (static list in
+  place of AWS target groups), driver loop, signer manager txs, service, `bin/base registrar`.
 
 ## Decisions
+- Registrar: fixed limits (32 cert plans, 651 inverses per stream, 64 instances per cycle,
+  256 pending tasks); the reconciler returns grace events and gauges instead of logging;
+  attestation and certificates parse with the stricter `tee/nitro` parser.
 - No port of base/base `zk/utils` `BootInfoStruct`: SP1 reads it from its public values
   through serde, and we run no zkVM, so it would have no consumer. Revisit with a zkVM.
 - The live devnet has no EIP-2935 contract, so leaps there fall back to the parent walk;
@@ -337,6 +343,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: registrar pure logic (planner, P-384 hints, CRL, reconciler, tasks).
 - 2026-11-05: proof primitives (config hash goldens for 4 chains, journal, proof bytes) and the TEE enclave (signer, bincode link, server, e2e).
 - 2026-11-05: executor accepts Denim same-second children; live Denim devnet proof holds, replays, rejects a wrong claim.
 - 2026-11-05: backlog extended with primitives and the TEE enclave, host and registrar.
