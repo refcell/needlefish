@@ -158,10 +158,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   numbered-header source); e2e proves a 4-block compressed range from the node fixture and
   replays the returned archive offline to the node's root.
 
-- [ ] `proof/primitives`: base/base `crates/proof/primitives`: `PerChainConfig` and its
+- [x] `proof/primitives`: base/base `crates/proof/primitives`: `PerChainConfig` and its
   config hash, `ProofJournal` encoding, `proof_encoder` (TEE proof bytes), shared by the
   enclave, the proposer and the challenger.
-- [ ] `proof/tee-enclave`: base/base `crates/proof/tee/nitro-enclave`: the enclave server that
+- [x] `proof/tee-enclave`: base/base `crates/proof/tee/nitro-enclave`: the enclave server that
   runs the client over a preimage oracle, signs the journal with its secp256k1 key, and
   answers attestation requests (NSM behind an interface; a deterministic fake in tests).
 - [ ] `proof/tee-nitro-host`: base/base `crates/proof/tee/nitro-host`: host-side backend
@@ -170,6 +170,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   verifies attestations (`tee/nitro`), plans and submits TEE signer registrations.
 
 ## Decisions
+- TEE enclave: no vsock or `/dev/nsm` (std has neither, no libc): the link runs over any
+  `std.Io` stream and NSM is an interface. Frames longer than the caller's buffer and proofs
+  with more than 512 intermediate roots are refused (base/base caps neither). Local mode
+  takes the signer key from the caller. `to_rollup_config` drops the fee config.
 - Boot pins the schedule ID like base/base, refusing Zenith active by the claim (dropping it
   after), but skips the Everest refusal: our executor is the node's, which runs EIP-8130.
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
@@ -329,6 +333,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: proof primitives (config hash goldens for 4 chains, journal, proof bytes) and the TEE enclave (signer, bincode link, server, e2e).
 - 2026-11-05: executor accepts Denim same-second children; live Denim devnet proof holds, replays, rejects a wrong claim.
 - 2026-11-05: backlog extended with primitives and the TEE enclave, host and registrar.
 - 2026-11-05: AWS Nitro attestation verifier (CBOR, COSE_Sign1, X.509, P-384, journal ABI).
