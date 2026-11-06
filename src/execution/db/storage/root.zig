@@ -12,6 +12,8 @@ pub const sim_storage = @import("sim_storage.zig");
 pub const superblock = @import("superblock.zig");
 pub const journal = @import("journal.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const free_set = @import("free_set.zig");
+pub const grid = @import("grid.zig");
 pub const engine = @import("engine.zig");
 pub const io_storage = @import("io_storage.zig");
 
