@@ -24,6 +24,7 @@ const basectl = @import("basectl.zig");
 const audit = @import("audit.zig");
 const replay = @import("replay.zig");
 const follow = @import("follow.zig");
+const snapshot_import = @import("snapshot_import.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -52,6 +53,7 @@ const usage =
     \\  audit      transaction-event audit archiver: Vector ingest, JSON-RPC queries
     \\  replay     replay real Base blocks offline and check every header field
     \\  follow     follow a live Base chain over RPC, re-executing and checking every block
+    \\  snapshot-import  verify a reth snapshot database: state root against the block header
     \\
 ;
 
@@ -77,6 +79,7 @@ test {
     _ = audit;
     _ = replay;
     _ = follow;
+    _ = snapshot_import;
     _ = @import("metrics_server.zig");
 }
 
@@ -168,6 +171,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "follow")) {
         return try follow.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "snapshot-import")) {
+        return try snapshot_import.main(init, args);
     }
     return null;
 }

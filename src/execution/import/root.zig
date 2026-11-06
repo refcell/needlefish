@@ -3,12 +3,16 @@
 //! - `state_root`: streaming state root over a whole state in hashed-key order, the check
 //!   every imported snapshot must pass against its header.
 //! - `mdbx`: read-only reader for MDBX files (reth's state database).
+//! - `reth`: decoders for the reth table values the import reads.
+//! - `hashed_state`: the state root of reth's `HashedAccounts` + `HashedStorages` tables.
 
 const std = @import("std");
 
 pub const state_root = @import("state_root.zig");
 pub const StateRootBuilder = state_root.StateRootBuilder;
 pub const mdbx = @import("mdbx.zig");
+pub const reth = @import("reth.zig");
+pub const hashed_state = @import("hashed_state.zig");
 
 test {
     std.testing.refAllDecls(@This());
