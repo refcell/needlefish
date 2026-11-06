@@ -20,6 +20,7 @@ pub const fakes = @import("fakes.zig");
 pub const rpc_l1 = @import("rpc_l1.zig");
 pub const discovery = @import("discovery.zig");
 pub const driver = @import("driver.zig");
+pub const service = @import("service.zig");
 
 pub const P384Hints = hints.P384Hints;
 pub const AttestationPlanner = planner.AttestationPlanner;
@@ -30,6 +31,7 @@ pub const RegistrationTaskSet = registration_tasks.RegistrationTaskSet;
 pub const SignerManager = signer_manager.SignerManager;
 pub const RegistrationDriver = driver.Driver;
 pub const StaticDiscovery = discovery.StaticDiscovery;
+pub const RegistrarConfig = service.RegistrarConfig;
 
 test {
     std.testing.refAllDecls(@This());
