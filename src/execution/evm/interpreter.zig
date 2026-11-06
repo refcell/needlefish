@@ -15,6 +15,7 @@ const gas = @import("gas.zig");
 const uint = @import("uint.zig");
 const memory_module = @import("memory.zig");
 const bytecode = @import("bytecode.zig");
+const opcode_profile = @import("opcode_profile.zig");
 const state_module = @import("state.zig");
 const evm_module = @import("evm.zig");
 const Fork = @import("fork.zig").Fork;
@@ -32,6 +33,8 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     const exit: Exit = loop: {
         dispatch: switch (f.analyzed.code[f.pc]) {
             inline else => |opcode| {
+                const start = opcode_profile.now();
+                defer opcode_profile.record(opcode, start);
                 if (step(fork, opcode, f, evm)) |exit| break :loop exit;
                 continue :dispatch f.analyzed.code[f.pc];
             },
@@ -185,7 +188,10 @@ pub fn addmod(a: u256, b: u256, n: u256) u256 {
 pub fn mulmod(a: u256, b: u256, n: u256) u256 {
     if (n == 0) return 0;
     if (a == 0 or b == 0) return 0;
-    const product = @as(u512, a) * b;
+    const product = uint.wide_mul(a, b);
+    // `mulmod(a, b, not(0))` is how full-precision mulDiv (Uniswap FullMath) gets the
+    // product's high word; 2^256 = 1 mod (2^256 - 1), so it reduces to hi + lo.
+    if (n == std.math.maxInt(u256)) return uint.reduce_all_ones(product);
     return uint.div_rem(u512, product, n).remainder;
 }
 

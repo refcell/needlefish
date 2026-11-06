@@ -203,9 +203,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Coverage vs base/base (`crates/common/evm`): Everest's NonceManager stub, Canyon,
   EIP-8130 committed phases, and B-20 stablecoin all have counterparts; `beryl_metrics`
   is telemetry. No gap found.
-- [ ] Performance: attribute `interpreter.run` self time (~18% of replay) per opcode
-  (an opt-in per-opcode cycle counter in the bench build, since `sample` addresses are
-  not stable across the bench's processes) and specialize the hottest handlers.
+- [x] Performance: `-Devm-opcode-profile=true` (`opcode_profile.zig`) counts every opcode
+  and accumulates timer ticks per handler (children excluded); the bench prints the top 30
+  at exit; compiled away otherwise. On `node: replay`: SLOAD ~40% of handler ticks (cold
+  witness reads, db lane), MULMOD ~15%, KECCAK256 ~8%, SSTORE 3%, then JUMPI/MSTORE/PUSH.
+  MULMOD operands are almost all full 256-bit with a full 256-bit modulus (737k of 762k);
+  `not(0)` moduli (FullMath) are 13.6k and now fold hi + lo directly. Division works on
+  limb arrays (bitcast, no u256/u512 shift-and-mask per limb) and the product is a 4x4
+  schoolbook `wide_mul`: MULMOD 99 -> 77 ticks, mulmod+div loop 145 -> 125 us; replay
+  interleaved A/B is within noise at this load (~880-910 Mgas/s). `push_frame` time left
+  is first-sight analysis; nothing to specialize there.
+- [ ] Performance: SLOAD is ~40% of interpreter handler time on replay, nearly all cold
+  reads through the witness `SparseState.storage` (db lane); hand the opcode profile to
+  the db lane.
 - [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
   account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
   account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a

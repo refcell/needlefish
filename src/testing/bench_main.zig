@@ -30,4 +30,5 @@ pub fn main(init: std.process.Init) !void {
     base.execution.node.bench_replay.run(init.io, filter);
     bench.run_cases(init.io, base.consensus.p2p.bench.cases, filter);
     base.builder.core.bench.run(init.io, filter);
+    base.execution.evm.opcode_profile.report(30);
 }

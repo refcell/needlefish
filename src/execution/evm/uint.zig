@@ -9,6 +9,7 @@
 //! operators below.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const fuzz = @import("../../testing/fuzz.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
@@ -48,6 +49,33 @@ pub fn div(a: u256, b: u256) u256 {
 pub fn rem(a: u256, b: u256) u256 {
     if (b == 0) return 0;
     return div_rem(u256, a, b).remainder;
+}
+
+/// The full 512-bit product as a 4x4-limb schoolbook multiply (16 64x64->128 products;
+/// the generic `u512 * u512` lowering multiplies wider than needed).
+pub fn wide_mul(a: u256, b: u256) u512 {
+    const a_limbs = to_limbs(u256, a);
+    const b_limbs = to_limbs(u256, b);
+    var result: [8]u64 = @splat(0);
+    for (0..4) |i| {
+        var carry: u64 = 0;
+        for (0..4) |j| {
+            const t = @as(u128, a_limbs[i]) * b_limbs[j] + result[i + j] + carry;
+            result[i + j] = @truncate(t);
+            carry = @truncate(t >> 64);
+        }
+        result[i + 4] = carry;
+    }
+    return @bitCast(result);
+}
+
+/// `x mod (2^256 - 1)`: 2^256 is congruent to 1, so fold the high word onto the low one.
+pub fn reduce_all_ones(x: u512) u256 {
+    const all_ones: u256 = std.math.maxInt(u256);
+    const sum = @addWithOverflow(@as(u256, @truncate(x)), @as(u256, @truncate(x >> 256)));
+    // hi + lo <= 2^257 - 2, so with a carry the low word is at most 2^256 - 2.
+    const folded = sum[0] + sum[1];
+    return if (folded == all_ones) 0 else folded;
 }
 
 /// Number of significant 64-bit limbs in `x` (at least one).
@@ -113,6 +141,31 @@ inline fn div_2by1(high: u64, low: u64, d: u64, v: u64) QuotientRemainder {
     return .{ .quotient = quotient, .remainder = remainder };
 }
 
+fn Limbs(comptime T: type) type {
+    return [@bitSizeOf(T) / limb_bits]u64;
+}
+
+/// Limbs of `x`, least significant first (the target is little-endian).
+inline fn to_limbs(comptime T: type, x: T) Limbs(T) {
+    comptime assert(builtin.cpu.arch.endian() == .little);
+    return @bitCast(x);
+}
+
+/// `x[0..count] << shift` into `count + 1` limbs (the top limb takes the carried-out bits).
+fn shift_left(out: []u64, x: []const u64, shift: u6) void {
+    assert(out.len == x.len + 1);
+    if (shift == 0) {
+        @memcpy(out[0..x.len], x);
+        out[x.len] = 0;
+        return;
+    }
+    const back: u6 = @intCast(64 - @as(u7, shift));
+    out[x.len] = x[x.len - 1] >> back;
+    var index = x.len - 1;
+    while (index > 0) : (index -= 1) out[index] = (x[index] << shift) | (x[index - 1] >> back);
+    out[0] = x[0] << shift;
+}
+
 /// Short division by a single-limb divisor: one reciprocal step per dividend limb.
 fn div_rem_single(comptime T: type, a: T, dividend_limbs: u32, divisor: u64) DivRem(T) {
     assert(divisor != 0);
@@ -120,19 +173,20 @@ fn div_rem_single(comptime T: type, a: T, dividend_limbs: u32, divisor: u64) Div
     const shift: u6 = @intCast(@clz(divisor));
     const d = divisor << shift;
     const v = reciprocal(d);
-    const Wide = @Int(.unsigned, @bitSizeOf(T) + limb_bits);
-    const a_shifted = @as(Wide, a) << shift;
-    var quotient: T = 0;
-    var carry: u64 = limb(a_shifted, dividend_limbs);
+    const a_limbs = to_limbs(T, a);
+    var u: [@bitSizeOf(T) / limb_bits + 1]u64 = undefined;
+    shift_left(u[0 .. dividend_limbs + 1], a_limbs[0..dividend_limbs], shift);
+    var quotient: Limbs(T) = @splat(0);
+    var carry: u64 = u[dividend_limbs];
     var index = dividend_limbs;
     while (index > 0) {
         index -= 1;
-        const step = div_2by1(carry, limb(a_shifted, index), d, v);
+        const step = div_2by1(carry, u[index], d, v);
         carry = step.remainder;
-        quotient |= @as(T, step.quotient) << @intCast(index * limb_bits);
+        quotient[index] = step.quotient;
     }
     assert(carry >> shift < divisor);
-    return .{ .quotient = quotient, .remainder = carry >> shift };
+    return .{ .quotient = @bitCast(quotient), .remainder = carry >> shift };
 }
 
 fn div_rem_knuth(
@@ -147,29 +201,35 @@ fn div_rem_knuth(
     assert(n >= 2 and n <= divisor_limbs_max);
     assert(m >= n);
     // Normalize so the divisor's top limb has its high bit set (D1).
-    const shift: u6 = @intCast(@clz(limb(b, n - 1)));
-    const Wide = @Int(.unsigned, @bitSizeOf(T) + limb_bits);
-    var v: [divisor_limbs_max]u64 = undefined;
-    const b_shifted = b << shift;
-    for (0..n) |i| v[i] = limb(b_shifted, @intCast(i));
+    const b_limbs = to_limbs(u256, b);
+    const shift: u6 = @intCast(@clz(b_limbs[n - 1]));
+    var v_wide: [divisor_limbs_max + 1]u64 = undefined;
+    shift_left(v_wide[0 .. n + 1], b_limbs[0..n], shift);
+    assert(v_wide[n] == 0);
+    const v = v_wide[0..n];
     assert(v[n - 1] >> 63 == 1);
+    const a_limbs = to_limbs(T, a);
     var u: [@bitSizeOf(T) / limb_bits + 1]u64 = undefined;
-    const a_shifted = @as(Wide, a) << shift;
-    for (0..m + 1) |i| u[i] = limb(a_shifted, @intCast(i));
+    shift_left(u[0 .. m + 1], a_limbs[0..m], shift);
     const top_reciprocal = reciprocal(v[n - 1]);
 
-    var quotient: T = 0;
+    var quotient: Limbs(T) = @splat(0);
     var j: u32 = m - n + 1;
     while (j > 0) {
         j -= 1;
-        const digit = knuth_step(u[j .. j + n + 1], v[0..n], top_reciprocal);
-        quotient |= @as(T, digit) << @intCast(j * limb_bits);
+        quotient[j] = knuth_step(u[j .. j + n + 1], v, top_reciprocal);
     }
-    var remainder: u256 = 0;
-    for (0..n) |i| remainder |= @as(u256, u[i]) << @intCast(i * limb_bits);
-    remainder >>= shift;
-    assert(remainder < b);
-    return .{ .quotient = quotient, .remainder = remainder };
+    // Denormalize the remainder u[0..n] (D8).
+    var remainder: [divisor_limbs_max]u64 = @splat(0);
+    if (shift == 0) {
+        @memcpy(remainder[0..n], u[0..n]);
+    } else {
+        const back: u6 = @intCast(64 - @as(u7, shift));
+        for (0..n) |i| remainder[i] = (u[i] >> shift) | (u[i + 1] << back);
+    }
+    const result: u256 = @bitCast(remainder);
+    assert(result < b);
+    return .{ .quotient = @bitCast(quotient), .remainder = result };
 }
 
 /// One quotient digit (D3-D6): `window` is u[j..j+n], updated in place to the remainder.
@@ -228,6 +288,24 @@ fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
 }
 
 // ------------------------------------------------------------------------- tests
+
+test "uint: schoolbook product and the all-ones reduction match the builtins" {
+    var prng = Prng.init(0x3c3c_0001);
+    const max: u256 = std.math.maxInt(u256);
+    const edges = [_]u256{ 0, 1, 2, max, max - 1, 1 << 255, (1 << 128) - 1 };
+    for (edges) |a| for (edges) |b| try expect_product(a, b);
+    var round: u32 = 0;
+    while (round < 20_000) : (round += 1) {
+        try expect_product(shaped(u256, &prng), shaped(u256, &prng));
+    }
+}
+
+fn expect_product(a: u256, b: u256) !void {
+    const product = @as(u512, a) * b;
+    try testing.expectEqual(product, wide_mul(a, b));
+    const modulus: u512 = std.math.maxInt(u256);
+    try testing.expectEqual(@as(u256, @intCast(product % modulus)), reduce_all_ones(product));
+}
 
 test "uint: table-and-Newton reciprocal equals the 128-bit division" {
     var prng = Prng.init(0x2ec1_0001);

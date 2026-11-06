@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "fuzz_soak", fuzz_soak);
     const fuzz_seed = b.option(u64, "fuzz-seed", "Mixed into every seeded fuzz seed") orelse 0;
     options.addOption(u64, "fuzz_seed", fuzz_seed);
+    const opcode_profile = b.option(bool, "evm-opcode-profile", "Time EVM opcodes") orelse false;
+    options.addOption(bool, "evm_opcode_profile", opcode_profile);
 
     const base = b.addModule("base", .{
         .root_source_file = b.path("src/base.zig"),
