@@ -11,6 +11,7 @@ const primitives = @import("../../common/primitives/root.zig");
 const fixture = @import("../../execution/node/test_fixture.zig");
 const db_module = @import("../../execution/db/root.zig");
 const eth = @import("../../execution/rpc/eth.zig");
+const eth_proof = @import("../../execution/rpc/eth_proof.zig");
 const engine_types = @import("../../execution/engine/root.zig").types;
 const preimage = @import("../preimage/root.zig");
 const mpt = @import("../mpt/root.zig");
@@ -65,7 +66,8 @@ const Harness = struct {
     node: *fixture.Node,
     api: eth.Api,
     generator: db_module.witness_block.Generator,
-    scratch: [1 << 16]u8 = undefined,
+    /// Large enough for `eth_getProof`'s buffers.
+    scratch: [@max(1 << 16, @sizeOf(eth_proof.Scratch) + 64)]u8 = undefined,
     world: io.SimWorld,
     server_io: io.SimIo,
     client_io: io.SimIo,
@@ -210,6 +212,22 @@ test "rpc source: L1 provider reads a mined block through hints served over HTTP
     try testing.expect(store.count() > count);
     const root = harness.node.chain.record(genesis_hash).?.header.state_root.bytes;
     try testing.expect(store.get(.keccak256(root)) != null);
+
+    // A storage proof hint stores the account path in block 1's state (EIP-2935 leaps).
+    var proof_data: [60]u8 = undefined;
+    std.mem.writeInt(u64, proof_data[0..8], 1, .big);
+    const account = fixture.address_of(1).bytes;
+    proof_data[8..28].* = account;
+    proof_data[28..60].* = @splat(0);
+    try handler.handle(.l2_account_storage_proof, &proof_data);
+    const state_root = harness.node.chain.record(block_hash).?.header.state_root.bytes;
+    resolver.reset();
+    var scratch: @import("../../execution/trie/root.zig").RlpNode = .{};
+    const keccak = @import("../../common/crypto/keccak.zig");
+    const account_key = keccak.keccak256(&account);
+    const leaf = try mpt.key_reader.get(resolver.resolver(), state_root, &account_key, &scratch);
+    try testing.expect(leaf != null);
+    try testing.expectError(error.InvalidHintData, handler.handle(.l2_account_storage_proof, ""));
 
     // An unknown block is a clean failure, not a stored value.
     const unknown: [32]u8 = @splat(0x42);

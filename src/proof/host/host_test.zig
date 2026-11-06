@@ -212,6 +212,10 @@ test "host: a source header that does not match its hash is refused" {
     try testing.expectError(error.HashMismatch, handler.handle(.l1_block_header, &hash));
     try testing.expectError(error.InvalidHintData, handler.handle(.l2_block_header, "short"));
     try testing.expectError(error.UnsupportedHint, handler.handle(.l1_precompile, &hash));
+    // A source without proofs leaves EIP-2935 leaps to fall back to the parent walk.
+    const proof_data: [60]u8 = @splat(1);
+    const proof_hint = handler.handle(.l2_account_storage_proof, &proof_data);
+    try testing.expectError(error.UnsupportedHint, proof_hint);
     const blob_data = hash ++ @as([8]u8, @splat(0));
     try testing.expectError(error.MissingRoots, handler.handle(.l1_blob, &blob_data));
     try testing.expectEqual(@as(u32, 0), store.count());

@@ -70,6 +70,14 @@ pub const Source = struct {
             parent_hash: Hash,
             attributes_json: []const u8,
         ) SourceError![]const []const u8,
+        /// The account and storage proof nodes (`eth_getProof`) of `slot` of `address` at
+        /// L2 block `number`; null when the source cannot serve them.
+        storage_proof: ?*const fn (
+            context: *anyopaque,
+            number: u64,
+            address: [20]u8,
+            slot: [32]u8,
+        ) SourceError![]const []const u8 = null,
     };
 };
 
@@ -152,12 +160,22 @@ pub const Handler = struct {
                 const items = try vtable.payload_witness(context, data[0..32].*, data[32..]);
                 for (items) |item| _ = try handler.store.put_keccak(item);
             },
+            .l2_account_storage_proof => try handler.handle_storage_proof(data),
             .l1_precompile,
             .starting_l2_output,
             .l2_account_proof,
-            .l2_account_storage_proof,
             => return error.UnsupportedHint,
         }
+    }
+
+    /// `number (8) ++ address (20) ++ slot (32)`: stores every proof node by its hash.
+    fn handle_storage_proof(handler: *Handler, data: []const u8) Error!void {
+        if (data.len != 60) return error.InvalidHintData;
+        const proof = handler.source.vtable.storage_proof orelse return error.UnsupportedHint;
+        const number = std.mem.readInt(u64, data[0..8], .big);
+        const nodes = try proof(handler.source.context, number, data[8..28].*, data[28..60].*);
+        for (nodes) |node| _ = try handler.store.put_keccak(node);
+        assert(data.len == 60);
     }
 
     fn put_checked(handler: *Handler, hash: Hash, bytes: []const u8) Error!void {

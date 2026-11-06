@@ -88,6 +88,7 @@ pub fn RpcSource(comptime IO: type) type {
             .blob = blob,
             .preimage = preimage,
             .payload_witness = payload_witness,
+            .storage_proof = storage_proof,
         };
 
         fn of(context: *anyopaque) *Self {
@@ -174,6 +175,56 @@ pub fn RpcSource(comptime IO: type) type {
             const number = std.math.add(u64, parent.number, 1) catch return error.SourceFailed;
             const witness = try call(l2, "debug_executionWitness", .{ .number = number });
             return source.witness_items(witness);
+        }
+
+        fn storage_proof(
+            context: *anyopaque,
+            number: u64,
+            address: [20]u8,
+            slot: [32]u8,
+        ) SourceError![]const []const u8 {
+            const source = of(context);
+            const l2 = &source.l2;
+            var slots_buffer: [72]u8 = undefined;
+            const slots = std.fmt.bufPrint(&slots_buffer, "[\"0x{x}\"]", .{&slot}) catch
+                unreachable; // 66 hex characters plus brackets and quotes fit.
+            const raw = l2.call("eth_getProof", &.{
+                .{ .address = address },
+                .{ .raw_json = slots },
+                .{ .number = number },
+            }) catch |err| return switch (err) {
+                error.NotFound => error.NotFound,
+                error.CallFailed => error.SourceFailed,
+            };
+            const allocator = l2.arena.allocator();
+            var all: std.ArrayList([]const u8) = .empty;
+            const account = (json.find_path(raw, &.{"accountProof"}) catch null) orelse
+                return error.SourceFailed;
+            all.appendSlice(allocator, try source.hex_list(l2, account)) catch
+                return error.SourceFailed;
+            const storage = (json.find_path(raw, &.{"storageProof"}) catch null) orelse
+                return error.SourceFailed;
+            const first = first_element(storage) orelse return error.SourceFailed;
+            const nodes = (json.find_path(first, &.{"proof"}) catch null) orelse
+                return error.SourceFailed;
+            all.appendSlice(allocator, try source.hex_list(l2, nodes)) catch
+                return error.SourceFailed;
+            assert(all.items.len > 0);
+            return all.items;
+        }
+
+        /// The raw text of the first element of a JSON array, or null.
+        fn first_element(text: []const u8) ?[]const u8 {
+            var scanner = json.Scanner.init(text);
+            const open = scanner.next() catch return null;
+            if (open.tag != .array_begin) return null;
+            const start = scanner.offset();
+            const first = scanner.next() catch return null;
+            if (first.tag == .array_end) return null;
+            scanner.skip(first) catch return null;
+            const end = scanner.offset();
+            assert(start <= end and end <= text.len);
+            return std.mem.trim(u8, text[start..end], " \t\r\n");
         }
 
         /// The raw header of block `number` (null: the latest) on `chain`; valid until the
