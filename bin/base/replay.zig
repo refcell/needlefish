@@ -318,6 +318,7 @@ pub fn check_archive(
     defer gpa.destroy(replayer);
     try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
     defer replayer.deinit(gpa);
+    replayer.probe = true;
     while (!replayer.done()) {
         const outcome = try replayer.replay_next();
         if (outcome.ok()) continue;

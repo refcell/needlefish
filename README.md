@@ -20,7 +20,8 @@ keeps its layout, so every crate there has an obvious home here.
 
 `just replay` fetches the latest 10 Base mainnet blocks and the state they touch from public
 RPC, re-executes them offline, and checks every header field against the chain
-([docs/REPLAY.md](docs/REPLAY.md), [video](docs/assets/demo.mp4)).
+([docs/REPLAY.md](docs/REPLAY.md), [video](docs/assets/demo.mp4)). `just replay 100` does the
+same for 100 blocks: 100 consecutive mainnet blocks (1747 transactions) reproduce exactly.
 
 > [!WARNING]
 > Pre-alpha. Components are landing daily and the devnet is being assembled now. Do not run it

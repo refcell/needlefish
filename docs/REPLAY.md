@@ -119,9 +119,10 @@ Transaction traces miss state that needlefish still reads:
 
 `base replay fetch` seeds every block with the system contracts (and the ring-buffer slots
 they write) and the message passer, and the first block with the precompiles. It then
-replays the archive in-process; any account or slot the replay still lacks is fetched at
-the parent into `proofs_extra.json` and `codes_extra.json` and the archive is rebuilt,
-until the replay has no gaps (256 rounds at most). `base replay run` prints
+replays the archive in-process in probe mode, where a missing account reads as absent and a
+missing slot as zero, so one pass collects every key a block lacks. Those keys are fetched
+at the parent into `proofs_extra.json` and `codes_extra.json` and the archive is rebuilt,
+until the replay has no gaps (about one round per block with gaps; 256 rounds at most). `base replay run` prints
 the same gaps on a machine-readable line
 (`GAPS {"block":n,"accounts":[...],"slots":[...],"nodes":[...]}`).
 

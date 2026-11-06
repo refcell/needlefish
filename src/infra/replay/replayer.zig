@@ -287,6 +287,10 @@ pub const Replayer = struct {
     next_block: u32 = 0,
     /// Why the backend reported `StateUnavailable`.
     backend_error: ?anyerror = null,
+    /// Probe mode (witness gap search): a missing account reads as absent and a missing
+    /// slot as zero, so one pass records every missing key of a block instead of stopping
+    /// at the first. The block still fails with `WitnessIncomplete`.
+    probe: bool = false,
     /// Scratch: the transactions of the block being replayed.
     transaction_views: [][]const u8,
 
@@ -308,6 +312,7 @@ pub const Replayer = struct {
         self.current_number = 0;
         self.next_block = 0;
         self.backend_error = null;
+        self.probe = false;
         self.sparse = try SparseState.init(allocator, config.sparse);
         errdefer self.sparse.deinit(allocator);
         self.changeset = try db.Changeset.init(allocator, config.changeset);
@@ -407,6 +412,12 @@ pub const Replayer = struct {
             self.sparse.incomplete = false;
             return;
         };
+        if (self.sparse.incomplete or !self.gaps.empty()) {
+            assert(self.probe or !self.gaps.empty() or self.sparse.incomplete);
+            outcome.failure = error.WitnessIncomplete;
+            self.sparse.incomplete = false;
+            return;
+        }
         outcome.computed_state_root = executed.state_root;
         self.compare(header, transactions, &executed, outcome);
         if (!outcome.check(.receipts_root) or !outcome.check(.gas_used)) {
@@ -589,6 +600,7 @@ pub const Replayer = struct {
         const self = from(context);
         const info = self.inner().basic(address) catch |err| {
             self.gaps.account(address);
+            if (self.probe) return null;
             return err;
         };
         if (info) |account| {
@@ -609,6 +621,7 @@ pub const Replayer = struct {
         const self = from(context);
         return self.inner().storage(address, slot) catch |err| {
             self.gaps.slot(.{ .address = address, .slot = slot });
+            if (self.probe) return 0;
             return err;
         };
     }
