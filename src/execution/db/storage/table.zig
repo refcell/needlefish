@@ -168,8 +168,18 @@ pub const BlockCache = struct {
     }
 };
 
+/// Keys up to 72 bytes: the widest key space is a storage-branch path key (65 bytes).
+pub const key_size_max: u32 = 72;
+
+/// Bytes after the fence keys that keep `Info` free of implicit padding (whose bytes would be
+/// undefined in a checkpoint): the counts start 8-aligned and the size is a multiple of 16.
+fn info_padding_size(key_size: u32) u32 {
+    const keys_end = @sizeOf(Reference) + 2 * key_size;
+    return std.mem.alignForward(u32, keys_end + 16, 16) - 16 - keys_end;
+}
+
 pub fn TableType(comptime Storage: type, comptime key_size: u32) type {
-    comptime assert(key_size > 0 and key_size <= 64);
+    comptime assert(key_size > 0 and key_size <= key_size_max);
     return struct {
         pub const Key = [key_size]u8;
         pub const Grid = grid_module.GridType(Storage);
@@ -179,10 +189,19 @@ pub fn TableType(comptime Storage: type, comptime key_size: u32) type {
             index: Reference,
             key_min: Key,
             key_max: Key,
+            /// Zero; present only for key sizes whose fence keys end unaligned.
+            padding: [info_padding_size(key_size)]u8 = @splat(0),
             record_count: u64,
             data_block_count: u32,
             reserved: u32 = 0,
         };
+
+        comptime {
+            // No implicit padding: every byte of a checkpointed `Info` is defined.
+            const size = @sizeOf(Reference) + 2 * key_size + info_padding_size(key_size) + 16;
+            assert(@sizeOf(Info) == size);
+            assert(@offsetOf(Info, "record_count") % 8 == 0);
+        }
 
         pub const Record = struct {
             key: *const Key,
@@ -201,6 +220,19 @@ pub fn TableType(comptime Storage: type, comptime key_size: u32) type {
         pub fn value_size_max(block_size: u32) u32 {
             return grid_module.payload_capacity_of(block_size) - payload_header_size - 4 -
                 key_size;
+        }
+
+        /// Payload bytes of a data block for record ends and records.
+        pub fn data_room(block_size: u32) u32 {
+            return grid_module.payload_capacity_of(block_size) - payload_header_size;
+        }
+
+        /// Whether a record of `record_size` bytes (key and value) still fits a data block
+        /// that holds `count` records of `records_bytes` bytes. The builder packs by this rule,
+        /// and callers that cut tables by data blocks mirror it.
+        pub fn data_fits(block_size: u32, records_bytes: u32, count: u32, record_size: u32) bool {
+            assert(record_size >= key_size);
+            return records_bytes + record_size + 4 * (count + 1) <= data_room(block_size);
         }
 
         pub fn index_capacity(block_size: u32) u32 {

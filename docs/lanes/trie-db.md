@@ -1060,6 +1060,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `SparseTrie.get` is unchanged: after the memo, warm reads are ~76 ns/key of walk.
   `apply_hashed` with caller hashes bypasses the memo. The evm lane may call
   `prefetch_storage`; nothing does yet.
+- 2026-11-06: LSM wider keys and variable values (disk-state import step 1). Keys up to 72 B
+  (`table.key_size_max`; `Info` gets explicit zero padding so every checkpointed byte is
+  defined). `lsm.TreeVariableType(Storage, key_size, value_size_max)` stores 1..max-byte values:
+  the memtable keeps a `u16` length per entry (slots stay `value_size_max` wide: static memory
+  by the largest value), checkpoint entries are `key ++ u16 length ++ bytes` (0 = tombstone);
+  `TreeType` trees keep their exact entry format. Tables are cut at `table_records_max` records
+  or `Layout.data_blocks_max` data blocks, the compaction mirroring the builder's packing
+  (`Table.data_fits`); fixed trees size `data_blocks_max` so records always cut first, variable
+  trees cap it at one index block. `memtable_entries_max <= table_records_max` is gone: a flush
+  writes up to `ceil(memtable / table_records_min)` level-0 tables, and level 0 has
+  `level0_tables_max - 1` + that many slots (unchanged when the memtable fits a table).
+  `orphans_max` now counts a job's data blocks plus a partial data block and an index block
+  per output table, so `checkpoint_size_max` grows slightly for every tree.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as

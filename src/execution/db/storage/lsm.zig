@@ -1,19 +1,26 @@
-//! LSM tree over the grid: fixed-size keys and values, the primitive for flat state (disk state
-//! phase 2). One tree per key space: hashed accounts (32-byte keys) and hashed storage slots
-//! (64-byte keys, account hash ++ slot hash).
+//! LSM tree over the grid: fixed-size keys (up to 72 bytes) and fixed-size values
+//! (`TreeType`) or values of 1..`value_size_max` bytes (`TreeVariableType`), the primitive for
+//! flat state (disk state phase 2). One tree per key space: hashed accounts (32-byte keys),
+//! hashed storage slots (64-byte keys, account hash ++ slot hash), and trie branch records.
 //!
 //! Shape (leveled, TigerBeetle/RocksDB style):
 //! - Two static memtables (`lsm_memtable.zig`): writes go to the mutable one; once it holds
 //!   `flush_entries_min` entries and the other is empty, they swap and the full one becomes
-//!   immutable, sorted once, and is flushed into a new level-0 table. A put into a full
+//!   immutable, sorted once, and is flushed into new level-0 tables (one per
+//!   `table_records_max` records or full index block: several when the memtable is larger
+//!   than a table). A put into a full
 //!   mutable memtable fails with `error.Busy` (backpressure, as the journal does); nothing is
 //!   allocated after `init`.
 //! - Level 0 holds up to `level0_tables_max` tables that may overlap (newest first). Levels
 //!   1.. hold disjoint tables sorted by key; level i holds about `capacity[i]` records, level
 //!   1 as much as a full level 0 and each next level `growth_factor` times more.
-//! - Tables are `table.zig` tables. A record's value is `value_size` bytes, or empty for a
-//!   tombstone (a delete). Compaction drops shadowed versions and drops tombstones once no
-//!   deeper level can hold the key.
+//! - Tables are `table.zig` tables. A record's value is `value_size` bytes (variable trees:
+//!   1..`value_size_max`), or empty for a tombstone (a delete). Tables are cut at
+//!   `table_records_max` records or at `Layout.data_blocks_max` data blocks (one index block),
+//!   whichever comes first; fixed trees size their tables so the record limit always comes
+//!   first. Checkpoint memtable entries are `key ++ tag u8 ++ value` (fixed) or
+//!   `key ++ length u16 ++ value bytes` (variable, length 0 for a tombstone). Compaction
+//!   drops shadowed versions and drops tombstones once no deeper level can hold the key.
 //! - Point lookup: mutable, immutable, then each level-0 table newest first, then the one
 //!   table per deeper level whose key range (fence keys `key_min`/`key_max`) holds the key.
 //!   Every level but the last has a split-block Bloom filter per table (`lsm_filter.zig`),
@@ -102,34 +109,81 @@ pub const Stats = struct {
     orphans_released: u64 = 0,
 };
 
+pub const ValueMode = enum { fixed, variable };
+
+/// A tree whose values are exactly `value_size` bytes.
 pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_size: u32) type {
+    return TreeShapeType(Storage, .{
+        .key_size = key_size,
+        .value_size = value_size,
+        .mode = .fixed,
+    });
+}
+
+/// A tree whose values are 1..`value_size_max` bytes.
+pub fn TreeVariableType(
+    comptime Storage: type,
+    comptime key_size: u32,
+    comptime value_size_max: u32,
+) type {
+    return TreeShapeType(Storage, .{
+        .key_size = key_size,
+        .value_size = value_size_max,
+        .mode = .variable,
+    });
+}
+
+const Shape = struct { key_size: u32, value_size: u32, mode: ValueMode };
+
+fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
+    const key_size = shape.key_size;
+    const value_size = shape.value_size;
+    const mode = shape.mode;
+    comptime assert(value_size > 0);
+    comptime assert(mode == .fixed or value_size <= std.math.maxInt(u16));
     return struct {
         const Tree = @This();
 
+        pub const variable = mode == .variable;
         pub const Table = table_module.TableType(Storage, key_size);
         pub const Grid = Table.Grid;
         pub const Key = Table.Key;
+        /// Fixed: the value. Variable: room for the largest value.
         pub const Value = [value_size]u8;
+        /// What a put takes: the value (fixed) or its bytes (variable, 1..`value_size`).
+        pub const ValueIn = if (variable) []const u8 else *const Value;
         pub const Info = Table.Info;
-        pub const Memtable = memtable_module.MemtableType(key_size, value_size);
+        pub const Memtable = memtable_module.MemtableType(key_size, value_size, variable);
         pub const Compaction = compaction_module.CompactionType(Tree);
         pub const Callback = *const fn (*Tree) void;
         pub const info_size: u32 = @sizeOf(Info);
         pub const key_bytes = key_size;
+        /// Fixed: the value size. Variable: the largest value size.
         pub const value_bytes = value_size;
-        pub const entry_size: u32 = key_size + 1 + value_size;
+        /// Checkpoint bytes of one memtable entry before its value (key and tag or length).
+        pub const entry_header_size: u32 = key_size + if (variable) 2 else 1;
+        /// Checkpoint bytes of one memtable entry at most.
+        pub const entry_size: u32 = entry_header_size + value_size;
 
         pub const Layout = struct {
+            /// Records a data block holds at least when values are their largest.
             records_per_block_full: u32,
             /// Records a data block holds at most (all tombstones).
             records_per_block_max: u32,
+            /// Data blocks one table holds at most (compaction cuts its output here).
+            data_blocks_max: u32,
             blocks_per_table: u32,
+            /// Records every table of a job's output but its last holds at least (each is cut
+            /// at `table_records_max` records or at `data_blocks_max` full data blocks).
+            table_records_min: u32,
             capacity: [levels_max]u64,
             tables_max: [levels_max]u32,
             /// Level `l`'s table slots are `slot_base[l]..slot_base[l + 1]`.
             slot_base: [levels_max + 1]u32,
             filter_words: u32,
-            /// Output tables one job may write.
+            /// Output tables one job may write cut by records or blocks (merges must fit).
+            job_record_tables_max: u32,
+            /// Output tables one job may write, also counting cuts at grandparent overlap.
             job_tables_max: u32,
             orphans_max: u32,
         };
@@ -166,6 +220,8 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         /// The lookup's outcome: found (`lookup_value` holds the value) or absent.
         lookup_result: Error!bool = false,
         lookup_value: Value = undefined,
+        /// Bytes of `lookup_value` that are the value (fixed trees: `value_size`).
+        lookup_length: u32 = 0,
         scan_level: u32 = 0,
         scan_callback: ?Callback = null,
         scan_outcome: ScanOutcome = .loaded,
@@ -178,16 +234,28 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         pub fn layout_of(config: Config) Layout {
             assert(config.levels_count >= 2 and config.levels_count <= levels_max);
             assert(config.growth_factor >= 2 and config.level0_tables_max >= 1);
-            const room = grid_module.payload_capacity_of(config.block_size) - 8;
+            assert(config.table_records_max > 0 and config.memtable_entries_max > 0);
+            assert(value_size <= Table.value_size_max(config.block_size));
+            const room = Table.data_room(config.block_size);
             const full: u32 = room / (key_size + value_size + 4);
-            assert(full >= 2);
-            const data_blocks = std.math.divCeil(u32, config.table_records_max, full) catch
+            assert(full >= if (variable) 1 else 2);
+            // Every data block of a table but its last holds at least `full` records (a block
+            // closes only when the next record does not fit), so `table_records_max` records
+            // need at most this many blocks.
+            const data_blocks_records = std.math.divCeil(u32, config.table_records_max, full) catch
                 unreachable; // full > 0.
-            assert(data_blocks + 1 <= Table.index_capacity(config.block_size));
+            const index_capacity = Table.index_capacity(config.block_size);
+            // Fixed trees fit `table_records_max` in one index block; variable trees cut a
+            // table at a full index block when their values are large.
+            if (!variable) assert(data_blocks_records + 1 <= index_capacity);
+            const data_blocks = @min(data_blocks_records, index_capacity - 1);
+            const table_records_min = @min(config.table_records_max, data_blocks * full);
             var layout: Layout = .{
                 .records_per_block_full = full,
                 .records_per_block_max = room / (key_size + 4),
+                .data_blocks_max = data_blocks,
                 .blocks_per_table = data_blocks + 1,
+                .table_records_min = table_records_min,
                 .capacity = @splat(0),
                 .tables_max = @splat(0),
                 .slot_base = @splat(0),
@@ -195,11 +263,26 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                     config.table_records_max,
                     config.bits_per_key,
                 ),
+                .job_record_tables_max = 0,
                 .job_tables_max = 0,
                 .orphans_max = 0,
             };
+            layout_levels(config, &layout);
+            return layout;
+        }
+
+        /// Level capacities and table counts, job output and orphan bounds.
+        fn layout_levels(config: Config, layout: *Layout) void {
+            assert(layout.table_records_min > 0);
+            // A flush writes at most this many level-0 tables.
+            const flush_tables = std.math.divCeil(
+                u32,
+                config.memtable_entries_max,
+                layout.table_records_min,
+            ) catch unreachable; // table_records_min > 0.
             const level0_records = @as(u64, config.level0_tables_max) *
                 config.memtable_entries_max;
+            var deep_tables_max: u32 = 0;
             for (0..config.levels_count) |level| {
                 layout.capacity[level] = if (level <= 1)
                     level0_records
@@ -208,18 +291,28 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                 const records = layout.capacity[level];
                 const tables = std.math.divCeil(u64, records, config.table_records_max) catch
                     unreachable; // table_records_max > 0.
+                // A flush starts only below `level0_tables_max` tables.
                 layout.tables_max[level] = if (level == 0)
-                    config.level0_tables_max
+                    config.level0_tables_max - 1 + flush_tables
                 else
                     @intCast(3 * tables + 2 * config.growth_factor + 4);
                 layout.slot_base[level + 1] = layout.slot_base[level] + layout.tables_max[level];
+                if (level >= 2) deep_tables_max = @max(deep_tables_max, layout.tables_max[level]);
             }
-            layout.job_tables_max = @max(
-                layout.tables_max[1] + config.level0_tables_max + 1,
+            layout.job_record_tables_max = @max(
+                layout.tables_max[1] + layout.tables_max[0] + 1,
                 2 * config.growth_factor + 8,
             );
-            layout.orphans_max = layout.job_tables_max * layout.blocks_per_table;
-            return layout;
+            // Cuts at grandparent overlap: each advances the grandparent cursor by at least
+            // `growth_factor` tables (`lsm_compaction.zig` `overlap_cut`).
+            const overlap_cuts = std.math.divCeil(u32, deep_tables_max, config.growth_factor) catch
+                unreachable; // growth_factor >= 2.
+            layout.job_tables_max = layout.job_record_tables_max + overlap_cuts + 1;
+            // A job's records need at most `job_record_tables_max - 1` tables' worth of full
+            // data blocks, plus per output table a partial last data block and an index block.
+            layout.orphans_max = layout.job_record_tables_max * layout.data_blocks_max +
+                2 * layout.job_tables_max;
+            assert(layout.job_tables_max > layout.job_record_tables_max);
         }
 
         pub fn init(
@@ -232,7 +325,6 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             assert(config.flush_entries_min > 0);
             assert(config.flush_entries_min + config.replay_entries_max <=
                 config.memtable_entries_max);
-            assert(config.memtable_entries_max <= config.table_records_max);
             const layout = layout_of(config);
             const slots: usize = layout.slot_base[config.levels_count];
             const filter_slots: usize = layout.slot_base[config.levels_count - 1];
@@ -314,25 +406,37 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             return limit -| self.mutable_memtable().count;
         }
 
+        /// Whether a value of `length` bytes is valid for this tree (0, a tombstone, is not).
+        pub fn value_length_valid(length: usize) bool {
+            if (variable) return length >= 1 and length <= value_size;
+            return length == value_size;
+        }
+
+        fn value_slice(value: ?ValueIn) ?[]const u8 {
+            const bytes: []const u8 = value orelse return null;
+            assert(value_length_valid(bytes.len));
+            return bytes;
+        }
+
         /// Writes `key` (a delete when `value` is null). `error.Busy`: the memtable is full;
         /// keep calling `compact` and retry.
-        pub fn put(self: *Tree, key: *const Key, value: ?*const Value) error{Busy}!void {
+        pub fn put(self: *Tree, key: *const Key, value: ?ValueIn) error{Busy}!void {
             assert(self.scan_callback == null);
             if (self.capacity_free() == 0) {
                 self.stats.busy += 1;
                 return error.Busy;
             }
-            try self.mutable_memtable().put(key, value);
+            try self.mutable_memtable().put(key, value_slice(value));
             self.stats.puts += 1;
         }
 
         /// A put during journal replay: may use the replay reserve.
-        pub fn put_replay(self: *Tree, key: *const Key, value: ?*const Value) error{Busy}!void {
+        pub fn put_replay(self: *Tree, key: *const Key, value: ?ValueIn) error{Busy}!void {
             assert(self.scan_callback == null);
             assert(!self.compaction.active);
             if (self.mutable_memtable().count == self.config.memtable_entries_max and
                 self.immutable_memtable().count == 0) _ = self.swap();
-            try self.mutable_memtable().put(key, value);
+            try self.mutable_memtable().put(key, value_slice(value));
             self.stats.puts += 1;
         }
 
@@ -374,8 +478,21 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             return null;
         }
 
+        /// The value the last lookup found (valid when `lookup_result` is true).
+        pub fn lookup_bytes(self: *const Tree) []const u8 {
+            assert(self.lookup_length <= value_size);
+            return self.lookup_value[0..self.lookup_length];
+        }
+
+        fn lookup_set(self: *Tree, value: []const u8) void {
+            assert(value.len <= value_size);
+            @memcpy(self.lookup_value[0..value.len], value);
+            self.lookup_length = @intCast(value.len);
+        }
+
         /// Finds `key`. On `.done` (or in the callback after `.pending`) `lookup_result` says
-        /// whether it is present, and `lookup_value` holds its value. One lookup at a time.
+        /// whether it is present, and `lookup_bytes` (or `lookup_value`) holds its value. One
+        /// lookup at a time.
         pub fn lookup(self: *Tree, key: *const Key, callback: Callback) Status {
             assert(!self.lookup_active);
             assert(self.scan_callback == null);
@@ -384,7 +501,7 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                 const memtable, const entry = found;
                 self.stats.lookups_memtable += 1;
                 self.lookup_result = !memtable.tombstones[entry];
-                self.lookup_value = memtable.values[entry];
+                self.lookup_set(memtable.value(entry));
                 return .done;
             }
             if (self.fault) {
@@ -404,7 +521,7 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         fn lookup_candidate(self: *Tree) ?u32 {
             var steps: u32 = 0;
             // Bounded: every level-0 table once, then one step per deeper level.
-            while (steps <= self.config.level0_tables_max + levels_max) : (steps += 1) {
+            while (steps <= self.layout.tables_max[0] + levels_max) : (steps += 1) {
                 const level = self.lookup_level;
                 if (level == self.config.levels_count) return null;
                 const slots = self.level_list(level);
@@ -428,7 +545,7 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
         fn lookup_advance(self: *Tree) Status {
             assert(self.lookup_active);
             var steps: u32 = 0;
-            while (steps <= self.config.level0_tables_max + levels_max) : (steps += 1) {
+            while (steps <= self.layout.tables_max[0] + levels_max) : (steps += 1) {
                 const slot = self.lookup_candidate() orelse return self.lookup_complete(false);
                 if (self.slot_filter(slot)) |words| {
                     if (!filter_module.may_contain(words, filter_module.hash(&self.lookup_key))) {
@@ -454,8 +571,8 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             self.reader.result catch return error.Corrupt;
             const value = self.reader.value orelse return null;
             if (value.len == 0) return false;
-            if (value.len != value_size) return error.Corrupt;
-            self.lookup_value = value[0..value_size].*;
+            if (!value_length_valid(value.len)) return error.Corrupt;
+            self.lookup_set(value);
             return true;
         }
 
@@ -627,13 +744,21 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                 2 * self.config.memtable_entries_max * entry_size + self.layout.orphans_max * 8;
         }
 
+        /// Checkpoint bytes of a memtable's entries.
+        fn entries_size(memtable: *const Memtable) u32 {
+            if (!variable) return memtable.count * entry_size;
+            const size = memtable.count * entry_header_size + memtable.value_bytes_total;
+            assert(size <= memtable.count * entry_size);
+            return @intCast(size);
+        }
+
         pub fn checkpoint_size(self: *Tree) u32 {
             var tables: u32 = 0;
             for (self.level_count) |count| tables += count;
-            const entries = self.memtables[0].count + self.memtables[1].count;
             const orphans: u32 = @intCast(self.compaction.orphans().len);
-            const size = checkpoint_header_size + tables * info_size + entries * entry_size +
-                orphans * 8;
+            const entries_bytes = entries_size(&self.memtables[0]) +
+                entries_size(&self.memtables[1]);
+            const size = checkpoint_header_size + tables * info_size + entries_bytes + orphans * 8;
             assert(size <= self.checkpoint_size_max());
             return size;
         }
@@ -661,12 +786,7 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                 }
             }
             for ([_]*Memtable{ self.immutable_memtable(), self.mutable_memtable() }) |memtable| {
-                for (0..memtable.count) |entry| {
-                    @memcpy(out[offset..][0..key_size], &memtable.keys[entry]);
-                    out[offset + key_size] = @intFromBool(memtable.tombstones[entry]);
-                    @memcpy(out[offset + key_size + 1 ..][0..value_size], &memtable.values[entry]);
-                    offset += entry_size;
-                }
+                offset += encode_entries(memtable, out[offset..]);
             }
             for (orphans) |address| {
                 std.mem.writeInt(u64, out[offset..][0..8], address, .little);
@@ -674,6 +794,30 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             }
             assert(offset == size);
             return size;
+        }
+
+        /// Writes a memtable's entries; returns their length.
+        fn encode_entries(memtable: *const Memtable, out: []u8) usize {
+            var offset: usize = 0;
+            var entry: u32 = 0;
+            while (entry < memtable.count) : (entry += 1) {
+                const header = out[offset..][0..entry_header_size];
+                @memcpy(header[0..key_size], &memtable.keys[entry]);
+                const body = out[offset + entry_header_size ..];
+                if (variable) {
+                    const value = memtable.value(entry);
+                    std.mem.writeInt(u16, header[key_size..][0..2], @intCast(value.len), .little);
+                    @memcpy(body[0..value.len], value);
+                    offset += entry_header_size + value.len;
+                } else {
+                    // Tombstones carry zeros (the memtable zeroes their values).
+                    header[key_size] = @intFromBool(memtable.tombstones[entry]);
+                    @memcpy(body[0..value_size], &memtable.values[entry]);
+                    offset += entry_size;
+                }
+            }
+            assert(offset == entries_size(memtable));
+            return offset;
         }
 
         /// Loads checkpoint bytes into an empty tree (empty bytes: the empty tree). Checks the
@@ -709,21 +853,25 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
                 if (count > limit) return error.InvalidCheckpoint;
                 tables += count;
             }
-            const size = checkpoint_header_size + tables * info_size +
-                (@as(u64, entries_old) + entries_new) * entry_size + @as(u64, orphans) * 8;
-            if (bytes.len != size) return error.InvalidCheckpoint;
+            // Everything but the entries; fixed entries have a known size too.
+            const size_fixed = checkpoint_header_size + tables * info_size + @as(u64, orphans) * 8;
+            const entries = @as(u64, entries_old) + entries_new;
+            if (bytes.len < size_fixed + entries * entry_header_size) {
+                return error.InvalidCheckpoint;
+            }
+            if (bytes.len > size_fixed + entries * entry_size) return error.InvalidCheckpoint;
             var offset: usize = checkpoint_header_size;
             for (0..self.config.levels_count) |level| {
                 const count = read_u32(bytes, 32 + 4 * level);
                 try self.decode_level(@intCast(level), bytes[offset..][0 .. count * info_size]);
                 offset += count * info_size;
             }
+            const entries_end = bytes.len - @as(usize, orphans) * 8;
             const memtable_old = self.immutable_memtable();
-            try decode_entries(memtable_old, bytes[offset..][0 .. entries_old * entry_size]);
-            offset += entries_old * entry_size;
+            offset += try decode_entries(memtable_old, bytes[offset..entries_end], entries_old);
             const memtable_new = self.mutable_memtable();
-            try decode_entries(memtable_new, bytes[offset..][0 .. entries_new * entry_size]);
-            offset += entries_new * entry_size;
+            offset += try decode_entries(memtable_new, bytes[offset..entries_end], entries_new);
+            if (offset != entries_end) return error.InvalidCheckpoint;
             memtable_old.sort();
             for (self.orphans[0..orphans]) |*address| {
                 address.* = std.mem.readInt(u64, bytes[offset..][0..8], .little);
@@ -760,22 +908,44 @@ pub fn TreeType(comptime Storage: type, comptime key_size: u32, comptime value_s
             assert(self.level_count[level] == count);
         }
 
-        fn decode_entries(memtable: *Memtable, bytes: []const u8) error{InvalidCheckpoint}!void {
-            assert(bytes.len % entry_size == 0);
+        /// Decodes `count` entries from the front of `bytes`; returns the bytes they took.
+        fn decode_entries(
+            memtable: *Memtable,
+            bytes: []const u8,
+            count: u32,
+        ) error{InvalidCheckpoint}!usize {
             assert(memtable.count == 0);
+            assert(count <= memtable.capacity());
             var offset: usize = 0;
-            while (offset < bytes.len) : (offset += entry_size) {
-                const key = bytes[offset..][0..key_size];
-                const tag = bytes[offset + key_size];
-                const value = bytes[offset + key_size + 1 ..][0..value_size];
-                if (tag > 1) return error.InvalidCheckpoint;
-                const tombstone = tag == 1;
-                if (tombstone and !std.mem.allEqual(u8, value, 0)) return error.InvalidCheckpoint;
-                const count = memtable.count;
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                if (bytes.len - offset < entry_header_size) return error.InvalidCheckpoint;
+                const header = bytes[offset..][0..entry_header_size];
+                const key = header[0..key_size];
+                var tombstone: bool = undefined;
+                var length: usize = value_size;
+                if (variable) {
+                    length = std.mem.readInt(u16, header[key_size..][0..2], .little);
+                    if (length > value_size) return error.InvalidCheckpoint;
+                    tombstone = length == 0;
+                } else {
+                    if (header[key_size] > 1) return error.InvalidCheckpoint;
+                    tombstone = header[key_size] == 1;
+                }
+                if (bytes.len - offset - entry_header_size < length) return error.InvalidCheckpoint;
+                const value = bytes[offset + entry_header_size ..][0..length];
+                // Fixed tombstones carry zeros, so every decoded entry re-encodes the same.
+                if (!variable and tombstone and !std.mem.allEqual(u8, value, 0)) {
+                    return error.InvalidCheckpoint;
+                }
+                offset += entry_header_size + length;
+                const before = memtable.count;
                 memtable.put(key, if (tombstone) null else value) catch unreachable; // Counted.
                 // A key appears at most once per memtable.
-                if (memtable.count != count + 1) return error.InvalidCheckpoint;
+                if (memtable.count != before + 1) return error.InvalidCheckpoint;
             }
+            assert(offset <= bytes.len);
+            return offset;
         }
 
         fn info_valid(self: *const Tree, table_info: *const Info) bool {

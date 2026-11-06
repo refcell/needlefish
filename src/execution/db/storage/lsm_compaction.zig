@@ -5,7 +5,9 @@
 //! level) newest first: of equal keys only the newest survives, and a tombstone is dropped
 //! when no level below the output can hold the key. Merged records go to a small staging
 //! ring; the table builder pulls from it one data block per grant, and the job cuts output
-//! tables at `table_records_max` records.
+//! tables at `table_records_max` records or at `Layout.data_blocks_max` data blocks (it packs
+//! records into blocks by the builder's own rule, `Table.data_fits`, to know where a block
+//! ends). A flush may so write several level-0 tables.
 //!
 //! The builder's `Source` is synchronous, while input blocks arrive asynchronously, so the
 //! job refills the staging ring (reading input blocks as needed) until it holds a whole
@@ -186,7 +188,7 @@ pub fn WalkerType(comptime Tree: type) type {
             var index: u32 = 0;
             while (index < count) : (index += 1) {
                 const value = Table.data_record(payload, index)[Tree.key_bytes..];
-                if (value.len != 0 and value.len != Tree.value_bytes) return false;
+                if (value.len != 0 and !Tree.value_length_valid(value.len)) return false;
             }
             const first = Table.record_key(Table.data_record(payload, 0));
             const last = Table.record_key(Table.data_record(payload, count - 1));
@@ -235,7 +237,8 @@ pub fn CompactionType(comptime Tree: type) type {
         drop_tombstones: bool = false,
         staging_keys: []Key,
         staging_values: []Value,
-        staging_tombstones: []bool,
+        /// Per staged record its value length; 0 for a tombstone.
+        staging_lengths: []u16,
         staging_head: u32 = 0,
         staging_count: u32 = 0,
         merge_done: bool = false,
@@ -244,6 +247,11 @@ pub fn CompactionType(comptime Tree: type) type {
         reservation: Reservation = undefined,
         output_slot: u32 = 0,
         output_records: u32 = 0,
+        /// The output table's data blocks so far, and the last one's records and bytes, as
+        /// the builder packs them (`block_take`).
+        output_blocks: u32 = 0,
+        output_block_records: u32 = 0,
+        output_block_bytes: u32 = 0,
         outputs: []u32,
         output_count: u32 = 0,
         acquired: []u64,
@@ -251,6 +259,7 @@ pub fn CompactionType(comptime Tree: type) type {
         /// The record handed to the builder: two slots, since it may hold the previous one.
         out_keys: [2]Key = undefined,
         out_values: [2]Value = undefined,
+        out_lengths: [2]u16 = @splat(0),
         out_toggle: u1 = 0,
         budget: u64 = 0,
         io_pending: bool = false,
@@ -263,7 +272,7 @@ pub fn CompactionType(comptime Tree: type) type {
             config: @import("lsm.zig").Config,
             layout: Tree.Layout,
         ) !Compaction {
-            const walker_count = config.level0_tables_max + 1;
+            const walker_count = layout.tables_max[0] + 1;
             const walkers = try allocator.alloc(Walker, walker_count);
             errdefer allocator.free(walkers);
             var initialized: u32 = 0;
@@ -282,8 +291,8 @@ pub fn CompactionType(comptime Tree: type) type {
             errdefer allocator.free(staging_keys);
             const staging_values = try allocator.alloc(Value, staging);
             errdefer allocator.free(staging_values);
-            const staging_tombstones = try allocator.alloc(bool, staging);
-            errdefer allocator.free(staging_tombstones);
+            const staging_lengths = try allocator.alloc(u16, staging);
+            errdefer allocator.free(staging_lengths);
             const outputs = try allocator.alloc(u32, layout.job_tables_max);
             errdefer allocator.free(outputs);
             const acquired = try allocator.alloc(u64, layout.orphans_max);
@@ -298,7 +307,7 @@ pub fn CompactionType(comptime Tree: type) type {
                 .input_slots = input_slots,
                 .staging_keys = staging_keys,
                 .staging_values = staging_values,
-                .staging_tombstones = staging_tombstones,
+                .staging_lengths = staging_lengths,
                 .builder = builder,
                 .outputs = outputs,
                 .acquired = acquired,
@@ -312,7 +321,7 @@ pub fn CompactionType(comptime Tree: type) type {
             allocator.free(self.input_slots);
             allocator.free(self.staging_keys);
             allocator.free(self.staging_values);
-            allocator.free(self.staging_tombstones);
+            allocator.free(self.staging_lengths);
             allocator.free(self.outputs);
             allocator.free(self.acquired);
             self.builder.deinit(allocator);
@@ -463,10 +472,10 @@ pub fn CompactionType(comptime Tree: type) type {
                 owner.level_overlap(level_out, &range.key_min, &range.key_max);
             const overlap = owner.level_list(level_out)[overlap_first..][0..overlap_count];
             for (overlap) |slot| range.records += owner.slot_infos[slot].record_count;
-            const table_records = self.config.table_records_max;
+            const table_records = self.layout.table_records_min;
             const outputs_max = std.math.divCeil(u64, range.records, table_records) catch
-                unreachable; // table_records_max > 0.
-            if (outputs_max + 1 > self.layout.job_tables_max) return false;
+                unreachable; // table_records_min > 0.
+            if (outputs_max + 1 > self.layout.job_record_tables_max) return false;
             const tables_max = self.layout.tables_max[level_out];
             if (owner.level_count[level_out] + outputs_max + 1 > tables_max) return false;
             self.job_begin(.merge, level_out);
@@ -544,11 +553,7 @@ pub fn CompactionType(comptime Tree: type) type {
                 const memtable = self.tree().immutable_memtable();
                 if (self.memtable_cursor == memtable.count) return null;
                 const entry = memtable.order[self.memtable_cursor];
-                const value: []const u8 = if (memtable.tombstones[entry])
-                    &.{}
-                else
-                    &memtable.values[entry];
-                return .{ .key = &memtable.keys[entry], .value = value };
+                return .{ .key = &memtable.keys[entry], .value = memtable.value(entry) };
             }
             return self.walkers[stream - 1].peek();
         }
@@ -610,9 +615,10 @@ pub fn CompactionType(comptime Tree: type) type {
                 const capacity: u32 = @intCast(self.staging_keys.len);
                 assert(self.staging_count < capacity);
                 const index = (self.staging_head + self.staging_count) % capacity;
+                assert(tombstone or Tree.value_length_valid(record.value.len));
                 self.staging_keys[index] = key;
-                self.staging_tombstones[index] = tombstone;
-                if (!tombstone) self.staging_values[index] = record.value[0..Tree.value_bytes].*;
+                self.staging_lengths[index] = @intCast(record.value.len);
+                @memcpy(self.staging_values[index][0..record.value.len], record.value);
                 self.staging_count += 1;
             }
             var stream = winner;
@@ -665,6 +671,7 @@ pub fn CompactionType(comptime Tree: type) type {
                 self.building = true;
                 self.output_slot = owner.slot_acquire(self.level_out);
                 self.output_records = 0;
+                self.output_blocks = 0;
                 const source: Table.Source = .{ .context = self, .next = source_next };
                 self.builder.build_paced(source, free_set, &self.reservation, 1, on_built);
             }
@@ -682,23 +689,44 @@ pub fn CompactionType(comptime Tree: type) type {
             }
             const capacity: u32 = @intCast(self.staging_keys.len);
             const index = self.staging_head;
+            const length = self.staging_lengths[index];
+            if (!self.block_take(Tree.key_bytes + length)) return null;
             self.staging_head = (self.staging_head + 1) % capacity;
             self.staging_count -= 1;
             self.out_toggle +%= 1;
             const slot = self.out_toggle;
             self.out_keys[slot] = self.staging_keys[index];
-            self.out_values[slot] = self.staging_values[index];
+            @memcpy(self.out_values[slot][0..length], self.staging_values[index][0..length]);
+            self.out_lengths[slot] = length;
             self.output_records += 1;
             const owner = self.tree();
             owner.stats.records_written += 1;
             if (owner.slot_filter(self.output_slot)) |words| {
                 filter_module.insert(words, filter_module.hash(&self.out_keys[slot]));
             }
-            const value: []const u8 = if (self.staging_tombstones[index])
-                &.{}
-            else
-                &self.out_values[slot];
-            return .{ .key = &self.out_keys[slot], .value = value };
+            return .{ .key = &self.out_keys[slot], .value = self.out_values[slot][0..length] };
+        }
+
+        /// Places a record of `record_size` bytes as the builder will: in the current data
+        /// block if it fits, else in a new one. False (cut the table) when the table already
+        /// has `data_blocks_max` data blocks.
+        fn block_take(self: *Compaction, record_size: u32) bool {
+            assert(self.output_blocks <= self.layout.data_blocks_max);
+            assert(record_size >= Tree.key_bytes);
+            const block_size = self.config.block_size;
+            const bytes = self.output_block_bytes;
+            const records = self.output_block_records;
+            const fits = Table.data_fits(block_size, bytes, records, record_size);
+            if (self.output_blocks > 0 and fits) {
+                self.output_block_records += 1;
+                self.output_block_bytes += record_size;
+                return true;
+            }
+            if (self.output_blocks == self.layout.data_blocks_max) return false;
+            self.output_blocks += 1;
+            self.output_block_records = 1;
+            self.output_block_bytes = record_size;
+            return true;
         }
 
         fn on_paused(builder: *Table.Builder) void {
@@ -713,8 +741,8 @@ pub fn CompactionType(comptime Tree: type) type {
             assert(self.io_pending and self.building);
             self.io_pending = false;
             self.building = false;
-            // A table starts only with staged records and is cut at `table_records_max`,
-            // which `layout_of` keeps within one index block.
+            // A table starts only with staged records and is cut at `table_records_max`
+            // records or `data_blocks_max` data blocks, within one index block.
             const table_info = builder.result catch unreachable;
             const owner = self.tree();
             owner.slot_infos[self.output_slot] = table_info;

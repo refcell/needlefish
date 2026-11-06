@@ -161,10 +161,6 @@ pub fn BuilderType(comptime Table: type) type {
             self.blocks_allowed -= 1;
         }
 
-        fn room(self: *const Self) u32 {
-            return grid_module.payload_capacity_of(self.block_size) - payload_header_size;
-        }
-
         /// Pulls records until the next one does not fit; returns how many the block holds.
         fn fill(self: *Self) u32 {
             self.count = 0;
@@ -180,7 +176,7 @@ pub fn BuilderType(comptime Table: type) type {
                 self.pending = null;
                 assert(record.value.len <= Table.value_size_max(self.block_size));
                 const size: u32 = @intCast(key_size + record.value.len);
-                if (self.records_len + size + 4 * (self.count + 1) > self.room()) {
+                if (!Table.data_fits(self.block_size, self.records_len, self.count, size)) {
                     assert(self.count > 0);
                     self.pending = record;
                     break;

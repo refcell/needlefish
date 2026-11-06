@@ -54,7 +54,29 @@ const tree_config: lsm.Config = .{
     .growth_factor = 4,
 };
 
-const zone_size = engine_config.checkpoint_zone_size_bytes;
+fn tree_config_with(memtable_entries_max: u32, table_records_max: u32) lsm.Config {
+    var config = tree_config;
+    config.memtable_entries_max = memtable_entries_max;
+    config.table_records_max = table_records_max;
+    return config;
+}
+
+/// A harness shape: key and value sizes, value mode, tree config, and engine sizes.
+const Spec = struct {
+    key_size: u32,
+    value_size: u32,
+    variable: bool = false,
+    tree: lsm.Config = tree_config,
+    grid_blocks: u64 = grid_blocks,
+    zone_blocks: u64 = engine_config.checkpoint_zone_size_bytes / block_size,
+
+    fn engine(comptime spec: Spec) engine_module.Config {
+        var config = engine_config;
+        config.grid_block_count = spec.grid_blocks;
+        config.checkpoint_zone_size_bytes = spec.zone_blocks * block_size;
+        return config;
+    }
+};
 
 const Op = struct { sequence: u64, key: u32, seed: u64, delete: bool };
 
@@ -70,10 +92,17 @@ const Counts = struct {
     filter_negatives: u64 = 0,
 };
 
-fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
+fn HarnessType(comptime spec: Spec) type {
     return struct {
         const Harness = @This();
-        const Tree = lsm.TreeType(SimStorage, key_size, value_size);
+        const key_size = spec.key_size;
+        const value_size = spec.value_size;
+        const engine_config_spec = spec.engine();
+        const zone_size = engine_config_spec.checkpoint_zone_size_bytes;
+        const Tree = if (spec.variable)
+            lsm.TreeVariableType(SimStorage, key_size, value_size)
+        else
+            lsm.TreeType(SimStorage, key_size, value_size);
         const Key = Tree.Key;
         const Value = Tree.Value;
 
@@ -105,7 +134,7 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
             const self = try testing.allocator.create(Harness);
             errdefer testing.allocator.destroy(self);
             self.* = .{
-                .engine = try .init(testing.allocator, sim, engine_config),
+                .engine = try .init(testing.allocator, sim, engine_config_spec),
                 .sim = sim,
                 .cache = undefined,
                 .tree = undefined,
@@ -134,11 +163,11 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
         fn tree_init(self: *Harness) !void {
             self.cache = try BlockCache.init(testing.allocator, block_size, 16);
             errdefer self.cache.deinit(testing.allocator);
-            var config = tree_config;
-            config.memtable_entries_max = tree_config.memtable_entries_max;
+            var config = spec.tree;
+            config.block_count = spec.grid_blocks;
             self.tree = try Tree.init(testing.allocator, &self.engine.grid.?, &self.cache, config);
             assert(self.tree.checkpoint_size_max() + self.engine.free_set_image.len <=
-                engine_config.checkpoint_zone_size_bytes);
+                engine_config_spec.checkpoint_zone_size_bytes);
         }
 
         /// A crash: fresh engine, cache, and tree over the same storage.
@@ -146,32 +175,52 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
             self.tree.deinit(testing.allocator);
             self.cache.deinit(testing.allocator);
             self.engine.deinit(testing.allocator);
-            self.engine = try .init(testing.allocator, self.sim, engine_config);
+            self.engine = try .init(testing.allocator, self.sim, engine_config_spec);
             try self.tree_init();
             self.phase_done = false;
             self.lookup_done = false;
         }
 
         fn key_of(index: u32) Key {
-            var key: Key = undefined;
-            for (0..key_size / 8) |chunk| {
-                // 64-byte keys share their first half per 16 indices (account ++ slot).
-                const source: u64 = if (key_size == 64 and chunk < 4) index / 16 else index;
+            var words: [(key_size + 7) / 8 * 8]u8 = undefined;
+            for (0..words.len / 8) |chunk| {
+                // Keys of 64 bytes and more share their first half per 16 indices (account ++
+                // slot, account ++ path).
+                const source: u64 = if (key_size >= 64 and chunk < 4) index / 16 else index;
                 const word = std.hash.Wyhash.hash(chunk, std.mem.asBytes(&source));
-                std.mem.writeInt(u64, key[chunk * 8 ..][0..8], word, .little);
+                std.mem.writeInt(u64, words[chunk * 8 ..][0..8], word, .little);
             }
-            return key;
+            return words[0..key_size].*;
+        }
+
+        /// The value length for `seed`: fixed trees their value size; variable trees often
+        /// the largest value (so tables fill blocks), else any length from 1.
+        fn value_length(seed: u64) u32 {
+            if (!spec.variable) return value_size;
+            const mixed = std.hash.Wyhash.hash(7, std.mem.asBytes(&seed));
+            if (mixed % 8 < 3) return value_size;
+            return @intCast(1 + (mixed >> 8) % value_size);
         }
 
         fn value_of(seed: u64) Value {
-            var value: Value = undefined;
-            for (0..value_size / 8) |chunk| {
+            var value: Value = @splat(0);
+            var words: [(value_size + 7) / 8 * 8]u8 = undefined;
+            for (0..words.len / 8) |chunk| {
                 const word = if (chunk == 0)
                     seed
                 else
                     std.hash.Wyhash.hash(chunk, std.mem.asBytes(&seed));
-                std.mem.writeInt(u64, value[chunk * 8 ..][0..8], word, .little);
+                std.mem.writeInt(u64, words[chunk * 8 ..][0..8], word, .little);
             }
+            const length = value_length(seed);
+            @memcpy(value[0..length], words[0..length]);
+            return value;
+        }
+
+        /// What `Tree.put` takes for the value of `seed` (in `value`), or null for a delete.
+        fn value_in(value: *const Value, seed: u64, delete: bool) ?Tree.ValueIn {
+            if (delete) return null;
+            if (spec.variable) return value[0..value_length(seed)];
             return value;
         }
 
@@ -250,7 +299,8 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
                 const key = key_of(op.key);
                 const value = value_of(op.seed);
                 // The replay reserve covers every entry the journal holds.
-                self.tree.put_replay(&key, if (op.delete) null else &value) catch unreachable;
+                const in = value_in(&value, op.seed, op.delete);
+                self.tree.put_replay(&key, in) catch unreachable;
             }
         }
 
@@ -270,17 +320,23 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
             flag.* = false;
         }
 
-        fn lookup(self: *Harness, index: u32) !?u64 {
+        /// Looks `index` up and checks it reads as `expected` (the seed of its value, or null
+        /// when absent): presence, length, and every value byte.
+        fn expect_lookup(self: *Harness, index: u32, expected: ?u64) !void {
             const key = key_of(index);
             if (self.tree.lookup(&key, on_lookup) == .pending) {
                 self.counts.lookups_table += 1;
                 try self.wait(&self.lookup_done);
             }
             const found = try self.tree.lookup_result;
-            if (!found) return null;
-            const seed = std.mem.readInt(u64, self.tree.lookup_value[0..8], .little);
-            try testing.expectEqualSlices(u8, &value_of(seed), &self.tree.lookup_value);
-            return seed;
+            try expect_value(expected, if (found) self.tree.lookup_bytes() else null);
+        }
+
+        fn expect_value(expected: ?u64, actual: ?[]const u8) !void {
+            const seed = expected orelse return testing.expect(actual == null);
+            const bytes = actual orelse return error.TestExpectedValue;
+            const value = value_of(seed);
+            try testing.expectEqualSlices(u8, value[0..value_length(seed)], bytes);
         }
 
         /// Submits one batch of ops as a journal entry and applies it to the tree.
@@ -306,7 +362,8 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
                 op.sequence = sequence;
                 const key = key_of(op.key);
                 const value = value_of(op.seed);
-                self.tree.put(&key, if (op.delete) null else &value) catch unreachable; // Room.
+                const in = value_in(&value, op.seed, op.delete);
+                self.tree.put(&key, in) catch unreachable; // Room.
                 self.log[self.log_len] = op.*;
                 self.log_len += 1;
                 if (op.delete) {
@@ -350,7 +407,7 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
                 _ = self.tree.swap();
             } else if (choice == 11) {
                 const index: u32 = @intCast(prng.below(self.universe));
-                try testing.expectEqual(self.current.get(index), try self.lookup(index));
+                try self.expect_lookup(index, self.current.get(index));
             } else if (engine.checkpoint_paused()) {
                 engine.checkpoint_grant(self.pace_blocks);
             }
@@ -390,8 +447,7 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
             defer model.deinit();
             var index: u32 = 0;
             while (index < self.universe) : (index += 1) {
-                const actual = try self.lookup(index);
-                testing.expectEqual(model.get(index), actual) catch |err| {
+                self.expect_lookup(index, model.get(index)) catch |err| {
                     std.debug.print("lsm: key {d} at sequence {d}\n", .{ index, sequence });
                     return err;
                 };
@@ -415,7 +471,7 @@ fn HarnessType(comptime key_size: u32, comptime value_size: u32) type {
             const checkpoint_newest = self.engine.superblock.working.checkpoint;
             if (checkpoint_newest.sequence == 0) return false;
             const zone = checkpoint_newest.zone;
-            const offset: usize = @intCast(engine_config.checkpoint_zone_offset(zone));
+            const offset: usize = @intCast(engine_config_spec.checkpoint_zone_offset(zone));
             self.sim.durable[offset] ^= 0x10;
             self.sim.memory[offset] ^= 0x10;
             return true;
@@ -455,7 +511,7 @@ fn choice_of(prng: *Prng) u64 {
     };
 }
 
-const CrashHarness = HarnessType(32, 8);
+const CrashHarness = HarnessType(.{ .key_size = 32, .value_size = 8 });
 
 fn run_crash_seed(seed: u64, counts: *Counts) !void {
     var prng = Prng.init(seed);
@@ -515,11 +571,11 @@ test "lsm: crashes mid flush, merge, and checkpoint, and fallbacks recover the m
 
 /// Clean reopens: tick until nothing is in flight, then crash (only unsynced grid writes of
 /// no consequence are lost); every committed op must be recovered.
-fn run_differential(comptime key_size: u32, comptime value_size: u32, seed: u64) !Counts {
-    const Harness = HarnessType(key_size, value_size);
+fn run_differential(comptime spec: Spec, seed: u64) !Counts {
+    const Harness = HarnessType(spec);
     var prng = Prng.init(seed);
     var sim = try SimStorage.init(testing.allocator, .{
-        .size_bytes = engine_config.size_bytes(),
+        .size_bytes = spec.engine().size_bytes(),
         .seed = seed,
         .latency_ticks_max = 2,
     });
@@ -549,14 +605,112 @@ fn run_differential(comptime key_size: u32, comptime value_size: u32, seed: u64)
 
 test "lsm: differential vs a hash map model, 32-byte keys, with checkpoint and reopen" {
     var merges: u64 = 0;
-    for (0..4) |seed| merges += (try run_differential(32, 8, seed)).merges;
+    const spec: Spec = .{ .key_size = 32, .value_size = 8 };
+    for (0..4) |seed| merges += (try run_differential(spec, seed)).merges;
     try testing.expect(merges > 0);
 }
 
 test "lsm: differential vs a hash map model, 64-byte keys (account ++ slot)" {
     var merges: u64 = 0;
-    for (0..3) |seed| merges += (try run_differential(64, 32, 100 + seed)).merges;
+    const spec: Spec = .{ .key_size = 64, .value_size = 32 };
+    for (0..3) |seed| merges += (try run_differential(spec, 100 + seed)).merges;
     try testing.expect(merges > 0);
+}
+
+/// 65-byte keys (account ++ branch path) with values of 1..120 bytes.
+const spec_variable: Spec = .{
+    .key_size = 65,
+    .value_size = 120,
+    .variable = true,
+    .zone_blocks = 12,
+};
+
+test "lsm: differential vs a hash map model, 65-byte keys, variable-length values" {
+    var merges: u64 = 0;
+    for (0..4) |seed| merges += (try run_differential(spec_variable, 200 + seed)).merges;
+    try testing.expect(merges > 0);
+}
+
+test "lsm: differential with tables smaller than a memtable (multi-table flushes)" {
+    const config = comptime tree_config_with(128, 48);
+    var flushes: u64 = 0;
+    const fixed: Spec = .{ .key_size = 32, .value_size = 8, .tree = config };
+    for (0..2) |seed| flushes += (try run_differential(fixed, 300 + seed)).flushes;
+    const variable = comptime blk: {
+        var spec = spec_variable;
+        spec.tree = config;
+        break :blk spec;
+    };
+    for (0..2) |seed| flushes += (try run_differential(variable, 400 + seed)).flushes;
+    try testing.expect(flushes > 0);
+}
+
+/// Puts `count` keys, flushes them, and checks the level-0 tables the flush cut: within the
+/// record and data block limits, covering every record, and the keys read back.
+fn run_flush_cut(comptime spec: Spec, count: u32) !void {
+    const Harness = HarnessType(spec);
+    var sim = try SimStorage.init(testing.allocator, .{
+        .size_bytes = spec.engine().size_bytes(),
+        .seed = 11,
+        .latency_ticks_max = 2,
+    });
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 11, count, 16);
+    defer harness.destroy();
+    try harness.format_and_open(0xc070_0000 + spec.key_size);
+    const tree = &harness.tree;
+    try put_keys(Harness, tree, 0, count, .live);
+    try testing.expect(tree.swap());
+    tree.compact(std.math.maxInt(u64));
+    var ticks: u32 = 0;
+    while (!tree.compaction_idle()) : (ticks += 1) {
+        if (ticks > 100_000) return error.Timeout;
+        sim.tick();
+    }
+    const layout = tree.layout;
+    var records: u64 = 0;
+    var cut_blocks: u32 = 0;
+    var cut_records: u32 = 0;
+    try testing.expect(tree.level_count[0] >= 2);
+    try testing.expect(tree.level_count[0] <= layout.tables_max[0]);
+    for (tree.level_list(0)) |slot| {
+        const info = &tree.slot_infos[slot];
+        try testing.expect(info.record_count <= spec.tree.table_records_max);
+        try testing.expect(info.data_block_count <= layout.data_blocks_max);
+        if (info.data_block_count == layout.data_blocks_max) cut_blocks += 1;
+        if (info.record_count == spec.tree.table_records_max) cut_records += 1;
+        records += info.record_count;
+    }
+    try testing.expectEqual(@as(u64, count), records);
+    // Fixed trees cut by records; large variable values cut by data blocks first.
+    if (spec.variable) try testing.expect(cut_blocks > 0) else try testing.expect(cut_records > 0);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) try harness.expect_lookup(index, index);
+}
+
+test "lsm: a flush writes several level-0 tables, cut by records or by data blocks" {
+    // Room for several level-0 tables, so no merge follows the flush.
+    const fixed = comptime blk: {
+        var config = tree_config_with(128, 48);
+        config.level0_tables_max = 8;
+        break :blk config;
+    };
+    try run_flush_cut(.{ .key_size = 32, .value_size = 8, .tree = fixed, .zone_blocks = 24 }, 64);
+    // Values up to 1000 bytes: a table of 4096 records would need more data blocks than an
+    // index block names, so the flush cuts at a full index block.
+    const variable = comptime blk: {
+        var config = tree_config_with(1024, 4096);
+        config.level0_tables_max = 8;
+        break :blk config;
+    };
+    try run_flush_cut(.{
+        .key_size = 65,
+        .value_size = 1000,
+        .variable = true,
+        .tree = variable,
+        .grid_blocks = 1024,
+        .zone_blocks = 290,
+    }, 960);
 }
 
 /// Puts keys `first..first + count` (normal puts or journal replay puts).
@@ -573,9 +727,10 @@ fn put_keys(
     for (first..first + count) |index| {
         const key = Harness.key_of(@intCast(index));
         const value = Harness.value_of(index);
+        const in = Harness.value_in(&value, index, false);
         switch (mode) {
-            .live => try tree.put(&key, &value),
-            .replay => try tree.put_replay(&key, &value),
+            .live => try tree.put(&key, in),
+            .replay => try tree.put_replay(&key, in),
         }
     }
 }
@@ -584,7 +739,7 @@ fn put_keys(
 // reserve while a flush was pending, then a checkpoint before the first swap. The next
 // replay must still fit `replay_entries_max` distinct new keys.
 test "lsm: a checkpoint after a replay into the reserve leaves a full reserve" {
-    const Harness = HarnessType(32, 8);
+    const Harness = HarnessType(.{ .key_size = 32, .value_size = 8 });
     var sim = try SimStorage.init(testing.allocator, .{
         .size_bytes = engine_config.size_bytes(),
         .seed = 7,
@@ -624,7 +779,7 @@ test "lsm: a checkpoint after a replay into the reserve leaves a full reserve" {
 }
 
 fn fuzz_workload(_: void, smith: *std.testing.Smith) anyerror!void {
-    const Harness = HarnessType(32, 8);
+    const Harness = HarnessType(.{ .key_size = 32, .value_size = 8 });
     var sim = try SimStorage.init(testing.allocator, .{
         .size_bytes = engine_config.size_bytes(),
         .seed = smith.value(u64),
@@ -655,70 +810,92 @@ test "lsm: fuzz the workload with crashes against the model" {
     try fuzz.run({}, fuzz_workload, .{ .iterations = 24, .input_size_max = 4096 });
 }
 
-const DecodeContext = struct {
-    const Tree = lsm.TreeType(SimStorage, 32, 8);
+fn DecodeContextType(comptime Tree: type) type {
+    return struct {
+        const Context = @This();
 
-    sim: SimStorage,
-    grid: Tree.Grid,
-    cache: BlockCache,
-    tree: Tree,
-    sample: []u8,
-    sample_len: u32,
-    out: []u8,
-};
+        sim: SimStorage,
+        grid: Tree.Grid,
+        cache: BlockCache,
+        tree: Tree,
+        sample: []u8,
+        sample_len: u32,
+        out: []u8,
 
-/// Raw bytes, or (first byte odd) a valid checkpoint with bytes flipped: either way, what
-/// decodes must re-encode to the same bytes.
-fn fuzz_decode(context: *DecodeContext, bytes: []const u8) anyerror!void {
-    const tree = &context.tree;
-    var input: [2048]u8 = undefined;
-    var length: usize = @min(bytes.len, input.len);
-    @memcpy(input[0..length], bytes[0..length]);
-    if (bytes.len > 0 and bytes[0] % 2 == 1) {
-        length = context.sample_len;
-        @memcpy(input[0..length], context.sample[0..length]);
-        var index: usize = 1;
-        while (index + 1 < bytes.len) : (index += 2) {
-            input[bytes[index] * length / 256] ^= bytes[index + 1];
+        /// Raw bytes, or (first byte odd) a valid checkpoint with bytes flipped: either way,
+        /// what decodes must re-encode to the same bytes.
+        fn fuzz_decode(context: *Context, bytes: []const u8) anyerror!void {
+            const tree = &context.tree;
+            var input: [8192]u8 = undefined;
+            var length: usize = @min(bytes.len, input.len);
+            @memcpy(input[0..length], bytes[0..length]);
+            if (bytes.len > 0 and bytes[0] % 2 == 1) {
+                length = context.sample_len;
+                @memcpy(input[0..length], context.sample[0..length]);
+                var index: usize = 1;
+                while (index + 1 < bytes.len) : (index += 2) {
+                    input[bytes[index] * length / 256] ^= bytes[index + 1];
+                }
+            }
+            tree.open_decode(input[0..length]) catch return;
+            const encoded = tree.checkpoint_encode(context.out);
+            if (length > 0) {
+                try testing.expectEqualSlices(u8, input[0..length], context.out[0..encoded]);
+            }
+            tree.reset();
         }
-    }
-    tree.open_decode(input[0..length]) catch return;
-    const encoded = tree.checkpoint_encode(context.out);
-    if (length > 0) try testing.expectEqualSlices(u8, input[0..length], context.out[0..encoded]);
-    tree.reset();
+
+        fn run(seed: u64) !void {
+            const context = try testing.allocator.create(Context);
+            defer testing.allocator.destroy(context);
+            context.sim = try SimStorage.init(testing.allocator, .{
+                .size_bytes = grid_blocks * block_size,
+                .seed = 1,
+            });
+            defer context.sim.deinit(testing.allocator);
+            context.grid = .init(&context.sim, .{
+                .zone_offset = 0,
+                .block_size = block_size,
+                .block_count = grid_blocks,
+            });
+            context.cache = try BlockCache.init(testing.allocator, block_size, 16);
+            defer context.cache.deinit(testing.allocator);
+            const tree = &context.tree;
+            tree.* = try .init(testing.allocator, &context.grid, &context.cache, tree_config);
+            defer tree.deinit(testing.allocator);
+            context.out = try testing.allocator.alloc(u8, tree.checkpoint_size_max());
+            defer testing.allocator.free(context.out);
+            context.sample = try testing.allocator.alloc(u8, tree.checkpoint_size_max());
+            defer testing.allocator.free(context.sample);
+            // A valid sample: both memtables with values (of random lengths in a variable
+            // tree) and tombstones (no tables: those need blocks).
+            var prng = Prng.init(seed);
+            for (0..40) |index| {
+                if (index == 20) try testing.expect(tree.swap());
+                var key: Tree.Key = undefined;
+                prng.fill(&key);
+                var value: Tree.Value = undefined;
+                prng.fill(&value);
+                const length = if (Tree.variable) prng.range(1, 48) else Tree.value_bytes;
+                const in: Tree.ValueIn = if (Tree.variable) value[0..length] else &value;
+                try tree.put(&key, if (index % 5 == 0) null else in);
+            }
+            context.sample_len = tree.checkpoint_encode(context.sample);
+            assert(context.sample_len <= 8192);
+            tree.reset();
+            // The sample itself decodes (so flipped samples reach the deep checks).
+            try tree.open_decode(context.sample[0..context.sample_len]);
+            tree.reset();
+            const options: fuzz.Options = .{ .iterations = 512, .input_size_max = 2048 };
+            try fuzz.run_bytes(context, fuzz_decode, options);
+        }
+    };
 }
 
 test "lsm: fuzz the checkpoint decoder" {
-    const context = try testing.allocator.create(DecodeContext);
-    defer testing.allocator.destroy(context);
-    context.sim = try SimStorage.init(testing.allocator, .{
-        .size_bytes = grid_blocks * block_size,
-        .seed = 1,
-    });
-    defer context.sim.deinit(testing.allocator);
-    context.grid = .init(&context.sim, .{
-        .zone_offset = 0,
-        .block_size = block_size,
-        .block_count = grid_blocks,
-    });
-    context.cache = try BlockCache.init(testing.allocator, block_size, 16);
-    defer context.cache.deinit(testing.allocator);
-    context.tree = try .init(testing.allocator, &context.grid, &context.cache, tree_config);
-    defer context.tree.deinit(testing.allocator);
-    context.out = try testing.allocator.alloc(u8, context.tree.checkpoint_size_max());
-    defer testing.allocator.free(context.out);
-    context.sample = try testing.allocator.alloc(u8, context.tree.checkpoint_size_max());
-    defer testing.allocator.free(context.sample);
-    // A valid sample: both memtables with values and tombstones (no tables: those need blocks).
-    var prng = Prng.init(5);
-    for (0..40) |index| {
-        if (index == 20) try testing.expect(context.tree.swap());
-        var key: [32]u8 = undefined;
-        prng.fill(&key);
-        const value = std.mem.toBytes(prng.int(u64));
-        try context.tree.put(&key, if (index % 5 == 0) null else &value);
-    }
-    context.sample_len = context.tree.checkpoint_encode(context.sample);
-    context.tree.reset();
-    try fuzz.run_bytes(context, fuzz_decode, .{ .iterations = 512, .input_size_max = 2048 });
+    try DecodeContextType(lsm.TreeType(SimStorage, 32, 8)).run(5);
+}
+
+test "lsm: fuzz the checkpoint decoder, 65-byte keys and variable-length values" {
+    try DecodeContextType(lsm.TreeVariableType(SimStorage, 65, 120)).run(6);
 }

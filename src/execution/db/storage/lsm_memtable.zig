@@ -1,33 +1,46 @@
-//! LSM memtable: a fixed-capacity table of the newest writes, with fixed-size keys and values.
+//! LSM memtable: a fixed-capacity table of the newest writes, with fixed-size keys and either
+//! fixed-size values or (variable mode) values of 1..`value_size_max` bytes.
 //!
-//! Writes go to parallel arrays (key, value, tombstone) in arrival order; an open-addressing
-//! hash index (linear probing, at most half full) finds a key's entry, so a repeated key
-//! overwrites its entry in place and the memtable holds each key once. A full memtable
-//! refuses writes (`error.Busy`); nothing is ever allocated after `init`.
+//! Writes go to parallel arrays (key, value, tombstone, and in variable mode a `u16` value
+//! length) in arrival order; an open-addressing hash index (linear probing, at most half full)
+//! finds a key's entry, so a repeated key overwrites its entry in place and the memtable holds
+//! each key once. A full memtable refuses writes (`error.Busy`); nothing is ever allocated
+//! after `init`. Variable values occupy a `value_size_max` slot each: static memory sized by
+//! the largest value, as every other bound here.
 //!
 //! When the tree flushes a memtable it sorts it once (`sort`: `order` lists the entries in key
-//! order) and streams it into a level-0 table, then `reset`s it. A tombstone is a delete: it
+//! order) and streams it into level-0 tables, then `reset`s it. A tombstone is a delete: it
 //! shadows older values of the key in the levels below until compaction drops it.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
-    comptime assert(key_size > 0 and key_size <= 64);
-    comptime assert(value_size > 0);
+const key_size_max = @import("table.zig").key_size_max;
+
+/// `value_size`: the value size, or (`variable`) the largest value size.
+pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime varies: bool) type {
+    const variable = varies;
+    const value_size_max = value_size;
+    comptime assert(key_size > 0 and key_size <= key_size_max);
+    comptime assert(value_size_max > 0);
+    comptime assert(!variable or value_size_max <= std.math.maxInt(u16));
     return struct {
         const Memtable = @This();
         pub const Key = [key_size]u8;
-        pub const Value = [value_size]u8;
+        pub const Value = [value_size_max]u8;
 
         keys: []Key,
         values: []Value,
         tombstones: []bool,
+        /// Variable mode: each entry's value length (0 for a tombstone). Empty otherwise.
+        lengths: []u16,
         /// Entry indices in key order, valid after `sort` until the next write.
         order: []u32,
         /// Hash index: entry index + 1, or 0 for an empty slot. Power-of-two length.
         slots: []u32,
         count: u32 = 0,
+        /// Sum of the entries' value lengths (tombstones count 0).
+        value_bytes_total: u64 = 0,
         sorted: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, entries_max: u32) !Memtable {
@@ -39,16 +52,20 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
             errdefer allocator.free(values);
             const tombstones = try allocator.alloc(bool, entries_max);
             errdefer allocator.free(tombstones);
+            const lengths = try allocator.alloc(u16, if (variable) entries_max else 0);
+            errdefer allocator.free(lengths);
             const order = try allocator.alloc(u32, entries_max);
             errdefer allocator.free(order);
             const slot_count = std.math.ceilPowerOfTwo(u32, 2 * entries_max) catch unreachable;
             const slots = try allocator.alloc(u32, slot_count);
             @memset(slots, 0);
             @memset(tombstones, false);
+            @memset(lengths, 0);
             return .{
                 .keys = keys,
                 .values = values,
                 .tombstones = tombstones,
+                .lengths = lengths,
                 .order = order,
                 .slots = slots,
             };
@@ -58,6 +75,7 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
             allocator.free(self.keys);
             allocator.free(self.values);
             allocator.free(self.tombstones);
+            allocator.free(self.lengths);
             allocator.free(self.order);
             allocator.free(self.slots);
             self.* = undefined;
@@ -71,7 +89,17 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
             assert(self.count <= self.capacity());
             @memset(self.slots, 0);
             self.count = 0;
+            self.value_bytes_total = 0;
             self.sorted = false;
+        }
+
+        /// The value bytes of `entry`: empty for a tombstone.
+        pub fn value(self: *const Memtable, entry: u32) []const u8 {
+            assert(entry < self.count);
+            if (self.tombstones[entry]) return &.{};
+            const length: u32 = if (variable) self.lengths[entry] else value_size_max;
+            assert(length > 0 and length <= value_size_max);
+            return self.values[entry][0..length];
         }
 
         fn slot_first(self: *const Memtable, key: *const Key) usize {
@@ -94,9 +122,14 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
             unreachable; // The index is never full.
         }
 
-        /// Writes `key` (a delete when `value` is null). `error.Busy` when the memtable is full
-        /// and the key is new.
-        pub fn put(self: *Memtable, key: *const Key, value: ?*const Value) error{Busy}!void {
+        /// Writes `key` (a delete when `value_bytes` is null). Fixed mode: exactly
+        /// `value_size_max` bytes; variable mode: 1..`value_size_max`. `error.Busy` when the
+        /// memtable is full and the key is new.
+        pub fn put(self: *Memtable, key: *const Key, value_bytes: ?[]const u8) error{Busy}!void {
+            if (value_bytes) |bytes| {
+                assert(bytes.len > 0 and bytes.len <= value_size_max);
+                assert(variable or bytes.len == value_size_max);
+            }
             const mask = self.slots.len - 1;
             var slot = self.slot_first(key);
             var probes: usize = 0;
@@ -105,6 +138,7 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
                 if (existing == 0) {
                     if (self.count == self.capacity()) return error.Busy;
                     self.keys[self.count] = key.*;
+                    self.tombstones[self.count] = true; // No value yet: counts 0 bytes below.
                     self.count += 1;
                     self.slots[slot] = self.count;
                     break self.count - 1;
@@ -112,8 +146,14 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32) type {
                 if (std.mem.eql(u8, &self.keys[existing - 1], key)) break existing - 1;
                 slot = (slot + 1) & mask;
             } else unreachable; // The index is never full.
-            self.tombstones[entry] = value == null;
-            if (value) |bytes| self.values[entry] = bytes.* else @memset(&self.values[entry], 0);
+            self.value_bytes_total -= self.value(entry).len;
+            self.tombstones[entry] = value_bytes == null;
+            const length: usize = if (value_bytes) |bytes| bytes.len else 0;
+            if (value_bytes) |bytes| @memcpy(self.values[entry][0..length], bytes);
+            // Zeroed past the value: checkpoint bytes and lookups never see stale bytes.
+            @memset(self.values[entry][length..], 0);
+            if (variable) self.lengths[entry] = @intCast(length);
+            self.value_bytes_total += length;
             self.sorted = false;
             assert(self.count <= self.capacity());
         }
@@ -137,7 +177,7 @@ const testing = std.testing;
 const Prng = @import("../../../testing/prng.zig").Prng;
 
 test "lsm memtable: overwrite in place, deletes, Busy when full, sorted order" {
-    const Memtable = MemtableType(32, 8);
+    const Memtable = MemtableType(32, 8, false);
     var memtable = try Memtable.init(testing.allocator, 64);
     defer memtable.deinit(testing.allocator);
     var model = std.AutoHashMap([32]u8, ?u64).init(testing.allocator);
@@ -150,7 +190,7 @@ test "lsm memtable: overwrite in place, deletes, Busy when full, sorted order" {
         const value: u64 = prng.int(u64);
         const delete = prng.chance(1, 4);
         const bytes = std.mem.toBytes(value);
-        const result = memtable.put(key, if (delete) null else &bytes);
+        const result = memtable.put(key, if (delete) null else @as([]const u8, &bytes));
         if (result) |_| {
             try model.put(key.*, if (delete) null else value);
         } else |err| {
