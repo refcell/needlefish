@@ -213,9 +213,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   schoolbook `wide_mul`: MULMOD 99 -> 77 ticks, mulmod+div loop 145 -> 125 us; replay
   interleaved A/B is within noise at this load (~880-910 Mgas/s). `push_frame` time left
   is first-sight analysis; nothing to specialize there.
-- [ ] Performance: SLOAD is ~40% of interpreter handler time on replay, nearly all cold
-  reads through the witness `SparseState.storage` (db lane); hand the opcode profile to
-  the db lane.
+- [x] Performance: SLOAD is ~40% of interpreter handler time on replay, nearly all cold
+  reads through the witness `SparseState.storage`. Sent to nf-trie-db with the repro; they
+  are memoizing keccak(slot/address) in `SparseState` and may add
+  `SparseState.prefetch_storage(account, slots)` (batch keccak). Whether the EVM calls a
+  prefetch per tx is ours to decide once the signature lands.
+- [x] Performance: KECCAK256 (~11% of handler ticks on replay; 93% of inputs <= 64 bytes,
+  mostly 64-byte mapping keys; ~60% repeat within a tx, ~91% across the run). Tried a
+  1024-entry direct-mapped digest memo on `Evm`: erc20 bench 915 -> 614 ns (it rehashes
+  one key), block bench and replay unchanged within noise (interleaved A/B 918 vs 910
+  Mgas/s), so not kept.
+- [ ] Performance: if nf-trie-db lands `prefetch_storage`, try calling it with a tx's
+  access-list slots (and the sender/recipient balance slots of known tokens) before
+  execution; keep only with an interleaved replay A/B gain.
 - [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
   account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
   account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a
