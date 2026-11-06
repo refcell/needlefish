@@ -11,6 +11,7 @@ const assert = std.debug.assert;
 const bench = @import("../../testing/bench.zig");
 const chainspec = @import("../chainspec/root.zig");
 const replay = @import("../../infra/replay/root.zig");
+const node_executor = @import("executor.zig");
 const mainnet = @import("../../infra/replay/mainnet_test.zig");
 
 const name = "node: replay 10 Base mainnet blocks (Mgas/s)";
@@ -35,6 +36,7 @@ fn replay_samples(io: std.Io) !void {
     // As `base node`: one sender-recovery worker per spare core, at most 7.
     const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
     config.executor.recovery_threads = @min(cores - 1, 7);
+    config.executor.state_gas_basis = node_executor.default_state_gas_basis;
     var best_ns: u64 = std.math.maxInt(u64);
     var gas: u64 = 0;
     for (0..samples) |_| {

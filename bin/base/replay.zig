@@ -355,5 +355,6 @@ fn replayer_config(archive: *const Archive) replay.replayer.Config {
     var config = replay.replayer.config_for(archive);
     const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
     config.executor.recovery_threads = @min(cores - 1, 7);
+    config.executor.state_gas_basis = base.execution.node.executor.default_state_gas_basis;
     return config;
 }

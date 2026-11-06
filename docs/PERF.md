@@ -965,6 +965,10 @@ With parallel sender recovery in the replay path (7 workers, as `base node`): 3 
 **6.16 ms/block (755 Mgas/s) vs 6.46 ms/block (720 Mgas/s)** serial, ~5%. Blocks average
 25 transactions, so recovery has little to split.
 
+With gas-sized state tables (`Config.state_gas_basis` = 2^26 gas: ~37k slot and ~16k account
+entries instead of 2^18 and 2^16, which reserved ~75 MB of slot table): 3 runs each,
+**5.46 ms/block (853 Mgas/s) vs 6.08 ms/block (765 Mgas/s)**, ~10%.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

@@ -35,6 +35,14 @@ const Fixture = struct {
     }
 
     fn init_with(fixture: *Fixture, chain_spec: *const chainspec.ChainSpec) !void {
+        try fixture.init_sized(chain_spec, 0);
+    }
+
+    fn init_sized(
+        fixture: *Fixture,
+        chain_spec: *const chainspec.ChainSpec,
+        state_gas_basis: u64,
+    ) !void {
         fixture.db = try StateDb.init(testing.allocator, .{
             .trie = .{ .accounts_max = 256, .account_nodes_max = 4096, .storage_nodes_max = 4096 },
             .code_bytes_max = 1 << 16,
@@ -55,6 +63,7 @@ const Fixture = struct {
                 .log_data_bytes_max = 4096,
                 .code_bytes_max = 1 << 16,
             },
+            .state_gas_basis = state_gas_basis,
         });
     }
 
@@ -601,4 +610,70 @@ fn fuzz_given_senders(_: void, smith: *testing.Smith) anyerror!void {
 
 test "executor: fuzz given senders" {
     try testing.fuzz({}, fuzz_given_senders, .{});
+}
+
+test "executor: gas-sized state tables bound every block and grow for larger limits" {
+    // Every distinct slot costs at least 2,100 gas: a 37.5M-gas block touches < 18k slots.
+    try testing.expect(executor_module.slots_for_gas(37_500_000) < 1 << 15);
+    var f: Fixture = undefined;
+    try f.init_sized(spec, 1_000_000);
+    defer f.deinit();
+    const small = f.executor.state.limits.slots_max;
+    try testing.expectEqual(executor_module.slots_for_gas(1_000_000), small);
+    for (1..3) |n| try f.db.put_account(address_of(@intCast(n)), eth, 0, &.{});
+    var buffers: [2][256]u8 = undefined;
+    const raws = [_][]const u8{
+        try transfer(&buffers[0], 1, 0, @splat(0x31), 5, 2),
+        try transfer(&buffers[1], 2, 0, @splat(0x32), 7, 2),
+    };
+    // block_env's 30M gas limit exceeds the 1M basis: the tables grow before the block.
+    const grown = try f.executor.execute_block(&block_env(1), &raws, null);
+    try testing.expectEqual(@as(u64, 30_000_000), f.executor.state_gas);
+    const grown_slots = f.executor.state.limits.slots_max;
+    try testing.expectEqual(executor_module.slots_for_gas(30_000_000), grown_slots);
+    try f.db.rollback();
+    // Same block on static tables: same result.
+    var static: Fixture = undefined;
+    try static.init();
+    defer static.deinit();
+    for (1..3) |n| try static.db.put_account(address_of(@intCast(n)), eth, 0, &.{});
+    const reference = try static.executor.execute_block(&block_env(1), &raws, null);
+    try testing.expectEqualSlices(u8, &reference.state_root, &grown.state_root);
+    // A smaller block keeps the tables; an open session never regrows them.
+    try f.executor.fit_state(10_000_000);
+    try testing.expectEqual(@as(u64, 30_000_000), f.executor.state_gas);
+    const session = f.executor.session_begin(null);
+    _ = try f.executor.state.load(address_of(1));
+    try f.executor.fit_state(100_000_000);
+    try testing.expectEqual(@as(u64, 30_000_000), f.executor.state_gas);
+    f.executor.session_end(session);
+}
+
+test "executor: seeded fuzz of gas-sized state limits" {
+    var prng = Prng.init(0x6761);
+    const base: evm.state.Limits = .{};
+    var previous: evm.state.Limits = executor_module.limits_for_gas(base, 1);
+    var gas: u64 = 1;
+    for (0..256) |_| {
+        gas = @min(gas + prng.range(1, 1 << 24), executor_module.state_gas_basis_max);
+        const limits = executor_module.limits_for_gas(base, gas);
+        // Enough for every cold slot and account access the gas can pay for, monotonic in
+        // gas, and the other limits untouched.
+        try testing.expect(limits.slots_max > gas / 2_100);
+        try testing.expect(limits.accounts_max > gas / 2_600);
+        try testing.expect(limits.slots_max >= previous.slots_max);
+        try testing.expect(limits.accounts_max >= previous.accounts_max);
+        try testing.expectEqual(base.journal_entries_max, limits.journal_entries_max);
+        previous = limits;
+    }
+}
+
+fn fuzz_state_limits(_: void, smith: *testing.Smith) anyerror!void {
+    const gas = smith.value(u64) % executor_module.state_gas_basis_max + 1;
+    const limits = executor_module.limits_for_gas(.{}, gas);
+    try testing.expect(limits.slots_max > gas / 2_100 and limits.accounts_max > gas / 2_600);
+}
+
+test "executor: fuzz gas-sized state limits" {
+    try testing.fuzz({}, fuzz_state_limits, .{});
 }

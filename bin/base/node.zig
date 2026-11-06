@@ -184,6 +184,7 @@ fn limits(flags: Flags) base.execution.node.service.Limits {
     var result: base.execution.node.service.Limits = .{};
     const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
     result.executor.recovery_threads = @min(cores - 1, 7);
+    result.executor.state_gas_basis = node.executor.default_state_gas_basis;
     const auto = node.state_db.rehash_threads_auto(cores);
     result.state.trie.rehash_threads = flags.rehash_threads orelse auto;
     std.debug.assert(result.state.trie.rehash_threads <= rehash_threads_max);

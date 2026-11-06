@@ -52,7 +52,41 @@ pub const Config = struct {
     limits: evm.state.Limits = .{},
     /// Extra threads recovering a block's senders up front in `execute_block` (0: inline).
     recovery_threads: u32 = 0,
+    /// Non-zero: size the state cache's account and slot tables for blocks of this much gas
+    /// (`limits_for_gas`) instead of `limits`, and grow them between blocks when a block's
+    /// gas limit exceeds it. Smaller tables keep the cache's probes in CPU caches.
+    state_gas_basis: u64 = 0,
 };
+
+/// Distinct storage slots a block can touch with `gas`: each costs at least a cold SLOAD
+/// (2,100 gas), plus gas-free system writes (a few per transaction, a transaction costs at
+/// least 21,000) and a fixed allowance for pre-block system calls and fee reads.
+pub fn slots_for_gas(gas: u64) u64 {
+    return gas / 2_100 + gas / 21_000 * 4 + 4_096;
+}
+
+/// Distinct accounts a block can touch with `gas`: a cold account access costs 2,600 gas,
+/// and each transaction (at least 21,000 gas) brings a few accounts without one.
+pub fn accounts_for_gas(gas: u64) u64 {
+    return gas / 2_600 + gas / 21_000 * 4 + 1_024;
+}
+
+/// The production basis: above a Base 200 ms block's gas limit (~37.5M); larger limits
+/// grow the tables.
+pub const default_state_gas_basis: u64 = 1 << 26;
+
+/// Gas basis beyond which the tables would exceed the static defaults' memory.
+pub const state_gas_basis_max: u64 = 1 << 32;
+
+/// `base` with the account and slot tables sized for blocks of `gas`.
+pub fn limits_for_gas(base: evm.state.Limits, gas: u64) evm.state.Limits {
+    assert(gas > 0 and gas <= state_gas_basis_max);
+    var limits = base;
+    limits.slots_max = @intCast(slots_for_gas(gas));
+    limits.accounts_max = @intCast(accounts_for_gas(gas));
+    assert(limits.slots_max > gas / 2_100 and limits.accounts_max > gas / 2_600);
+    return limits;
+}
 
 /// Block context, from a header or from payload attributes when building.
 pub const BlockEnv = struct {
@@ -101,6 +135,8 @@ pub const Backend = struct {
 };
 
 pub const Error = evm.evm.Error || BackendError || base_time.TransitionError || error{
+    /// Reallocating the state cache for a larger block gas limit failed.
+    StateGrowFailed,
     ScratchFull,
     TooManyTransactions,
     InvalidTransaction,
@@ -148,6 +184,12 @@ pub const Executor = struct {
     given_senders: ?[]const primitives.Address = null,
     /// Index of the last transaction rejected by `execute_block`.
     invalid_index: ?u32 = null,
+    /// Owns the state cache's tables (`fit_state` reallocates them).
+    allocator: std.mem.Allocator,
+    /// The limits the state cache was configured with (`Config.limits`).
+    limits: evm.state.Limits,
+    /// Block gas the state tables are sized for; 0 for static `limits`.
+    state_gas: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -167,7 +209,12 @@ pub const Executor = struct {
         assert(config.scratch_bytes > 0);
         const state = try allocator.create(evm.State);
         errdefer allocator.destroy(state);
-        state.* = try evm.State.init(allocator, backend.database, config.limits);
+        assert(config.state_gas_basis <= state_gas_basis_max);
+        const state_limits = if (config.state_gas_basis > 0)
+            limits_for_gas(config.limits, config.state_gas_basis)
+        else
+            config.limits;
+        state.* = try evm.State.init(allocator, backend.database, state_limits);
         errdefer state.deinit(allocator);
         const machine = try allocator.create(evm.Evm);
         errdefer allocator.destroy(machine);
@@ -197,6 +244,9 @@ pub const Executor = struct {
             .recovery_pool = pool,
             .senders = senders,
             .recovery_done = recovery_done,
+            .allocator = allocator,
+            .limits = config.limits,
+            .state_gas = config.state_gas_basis,
         };
     }
 
@@ -283,6 +333,7 @@ pub const Executor = struct {
 
     /// Starts a block: resets the scratch arena and runs the pre-block system calls.
     pub fn begin_block(executor: *Executor, block: *const BlockEnv) Error!Building {
+        try executor.fit_state(block.gas_limit);
         executor.arena.reset();
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         errdefer executor.abort_block();
@@ -617,6 +668,7 @@ pub const Executor = struct {
     /// (base fee zero, gas price zero), then discards every change. The output borrows
     /// the scratch arena until the next call.
     pub fn simulate(executor: *Executor, block: *const BlockEnv, call: Call) Error!Simulated {
+        try executor.fit_state(block.gas_limit);
         executor.arena.reset();
         defer executor.abort_block();
         var free_block = block.*;
@@ -727,6 +779,26 @@ pub const Executor = struct {
     }
 
     /// Sets the evm block context (pending-state builders resume an open block with it).
+    /// Grows gas-sized state tables (`Config.state_gas_basis`) to fit a block of
+    /// `gas_limit`, at least doubling. Only between blocks: an open session or block keeps
+    /// its tables (a block beyond them then fails with `StateFull`, never misexecutes).
+    pub fn fit_state(executor: *Executor, gas_limit: u64) Error!void {
+        if (executor.state_gas == 0 or gas_limit <= executor.state_gas) return;
+        const state = executor.state;
+        if (state.accounts.count() > 0 or state.slots.count() > 0) return;
+        const gas = @min(@max(gas_limit, executor.state_gas *| 2), state_gas_basis_max);
+        if (gas <= executor.state_gas) return;
+        const grown = evm.State.init(
+            executor.allocator,
+            state.database,
+            limits_for_gas(executor.limits, gas),
+        ) catch return error.StateGrowFailed;
+        state.deinit(executor.allocator);
+        state.* = grown;
+        executor.state_gas = gas;
+        assert(executor.state.accounts.count() == 0);
+    }
+
     pub fn set_block_env(executor: *Executor, block: *const BlockEnv) void {
         var blob_base_fee: u256 = 1;
         if (executor.spec.blob_params_at(block.timestamp)) |params| {
