@@ -164,20 +164,31 @@ program can run against an in-memory oracle in tests and the cluster simulator.
 - [x] `proof/tee-enclave`: base/base `crates/proof/tee/nitro-enclave`: the enclave server that
   runs the client over a preimage oracle, signs the journal with its secp256k1 key, and
   answers attestation requests (NSM behind an interface; a deterministic fake in tests).
-- [ ] `proof/tee-nitro-host`: base/base `crates/proof/tee/nitro-host`: host-side backend
+- [x] `proof/tee-nitro-host`: base/base `crates/proof/tee/nitro-host`: host-side backend
   feeding enclaves preimages, the enclave pool, proof generation and the TEE prover backend.
-- [ ] `proof/tee-registrar`: base/base `crates/proof/tee/registrar`: discovers signers,
+- [x] `proof/tee-registrar`: base/base `crates/proof/tee/registrar`: discovers signers,
   verifies attestations (`tee/nitro`), plans and submits TEE signer registrations.
   Done: COSE walker, planner, P-384 hint transcript (matches base/base goldens), CRL checks
-  behind a fetcher, task set, reconciler. Left: prover client, discovery (static list in
-  place of AWS target groups), driver loop, signer manager txs, service, `bin/base registrar`.
+  behind a fetcher, task set, reconciler, prover client, signer manager, static discovery,
+  driver loop (seeded fault sim), service, `base registrar`.
 
 - [ ] `proof/bin-tee`: base/base `bin/prover/{nitro-enclave,nitro-host}`: `base nitro-enclave`
   (local-mode enclave server; TCP in place of vsock) and `base nitro-host` (host server feeding
   enclaves, `enclave_*` and `prover_prove` JSON-RPC), plus a devnet smoke: TEE proof of a range.
-  Done: `base nitro-enclave` (smoke: listens, drops a malformed frame, keeps serving).
+  Done: `base nitro-enclave` (smoke: listens, drops a malformed frame, keeps serving);
+  `base prover-worker --backend tee` (host side; e2e test through an in-process enclave).
+  Left: live devnet TEE proof through `nitro-enclave` + `prover-worker --backend tee`.
 
 ## Decisions
+- TEE host: enclave pool is round robin (base/base first-free); a claim that does not hold on
+  the host is refused before the enclave runs; no `prover_prove` endpoint (proofs go through
+  the prover service); registration gating is an interface without an onchain client yet.
+- Registrar: static `--prover-endpoints` replace AWS target groups; registrations run one at a
+  time inside a cycle (`--max-concurrency` accepted, unused); the bin refuses
+  `--crl-nitro-verifier-address` (no DNS/TLS CRL fetcher); signer key from
+  `BASE_REGISTRAR_PRIVATE_KEY`, `--private-key` or `--dev-key-index`.
+- `base nitro-enclave` binds loopback only and reads `BASE_ENCLAVE_SIGNER_KEY`: its link is
+  unauthenticated and argv is readable by other local users.
 - Not ported: base/base `bin/challenger-e2e` (forks L1 into Anvil for a K8s job); the
   challenger's deterministic sim tests and the devnet smoke cover its behaviour here.
 - Registrar: fixed limits (32 cert plans, 651 inverses per stream, 64 instances per cycle,
@@ -350,6 +361,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: TEE nitro host + `prover-worker --backend tee`; registrar complete with `base registrar`.
 - 2026-11-05: registrar prover client, TEE registry/CertManager bindings, `base nitro-enclave`.
 - 2026-11-05: registrar pure logic (planner, P-384 hints, CRL, reconciler, tasks).
 - 2026-11-05: proof primitives (config hash goldens for 4 chains, journal, proof bytes) and the TEE enclave (signer, bincode link, server, e2e).
