@@ -17,6 +17,8 @@ const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const metrics = @import("../../utilities/metrics/root.zig");
 
+pub const schedule = @import("schedule.zig");
+
 pub const B256 = primitives.B256;
 
 /// base/base `DEFAULT_METERING_STORE_MAX_CAPACITY` / `DEFAULT_METERING_STORE_TTL_SECS`.
@@ -344,4 +346,5 @@ pub const MeteringStore = struct {
 
 test {
     _ = @import("root_test.zig");
+    _ = schedule;
 }

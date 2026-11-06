@@ -57,11 +57,19 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - [x] `miner_setGasLimit` in pool selection: `BlockBuilder` fills pool transactions only up
   to `min(Chain.gas_limit_target, block gas limit)` (base/base `GasLimitConfig` in
   `execute_best_transactions`); the synchronous `Chain` build already did, the builder did not.
-- [ ] Resource metering in tx selection: wire `builder/metering` into `BlockBuilder.apply_best`
-  as base/base `execute_best_transactions` does (`check_simulated_usage` before execution,
-  `check_executed_usage` after, `apply_accounted_usage` on commit, throttled count per build),
-  plus the `resource_metering_*` and `metering_late_arrival_*` metrics of
-  `crates/builder/core/src/metrics.rs`. Off by default, like `enable_resource_metering`.
+- [ ] Resource metering in tx selection (base/base `execute_best_transactions` resource
+  metering path, `crates/execution/payload/src/{resource_metering,config}.rs`):
+  - [x] `metering/schedule.zig`: schedule JSON (version 1, dimensions with block/tx limits,
+    base gas weight, operation gas/count prices, `dryRun`), base/base validation, evaluator
+    (`evaluate`, `check` ranking, `decide`, atomic `add_usage`), fail-open overflow.
+  - [ ] Wire into `BlockBuilder.apply_best`: per-build cumulative usage; simulated check
+    before execution (needs per-tx opcode rows from `base_meterBundle` in `MeteringStore`,
+    which holds only totals today; missing data fails open), executed check after
+    (actual gas used plus `STATE_*` post-state counts from the executor), deposits accounted
+    unthrottled; transaction-scope excludes evict from the pool, block-scope skip the build.
+  - [ ] Flags and metrics: `--builder.enable-resource-metering` plus a schedule file path
+    (an empty file fails closed, `EmptySchedule`), `ResourceMeteringMetrics` (limit hits by
+    dimension/scope/enforced, calculation failures, throttled per build).
 - [ ] Sequencer self-import cost (from the `builder:` bench: build 20 ms CPU, self-import 55 ms
   wall at 2610 txs): the node re-recovers every sender and re-executes the sealed block. Hand
   the builder's known senders (it already skips ecrecover via `known_sender`) to the import, or
@@ -116,7 +124,11 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   cluster's 200 ms mode is the dst-fuzz lane's backlog item; the cluster only has to forward
   events and replay hashes. A getPayload arriving after the slot end is counted
   (`resolves_late`), not a violation: under injected network delay it is the consensus side's
-  lateness, and the service still answers without waiting.
+  lateness, and the service still answers without waiting.- 2026-11-05: resource-metering schedules are bounded for static allocation: 128 dimensions
+  (base/base), 512 rules per dimension (base/base) and `Config.rules_max` (default 4096) rules
+  in total (needlefish only; over it is `TooManyOperations`). JSON integers must be plain
+  decimal u64 (no sign, fraction or exponent), matching serde's u64 for every file base/base
+  accepts except the literal `-0`.
 
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
@@ -169,3 +181,7 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   injected faults; cadence DST now skips slots (cancel, expiry) and runs through the audit.
 - 2026-11-05: `BlockBuilder` honours the `miner_setGasLimit` target (`Chain.gas_limit_target`)
   for pool transactions; unit test plus the seeded/fuzz builder job draws a target.
+
+- 2026-11-05: `builder/metering` resource-metering schedule (JSON load + validation, evaluator,
+  ranked budget check, decisions); base/base cases ported, seeded + `std.testing.fuzz` model
+  check against a wide-arithmetic reference, corrupted files and arbitrary bytes.
