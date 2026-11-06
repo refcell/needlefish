@@ -264,9 +264,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   secp256r1 vectors the crypto lane already embeds (~350 cases), through the precompile at
   Fjord (3450 gas) and Osaka (6900 gas): 32-byte 1 when valid, empty when not, fixed gas,
   out of gas one short.
-- [ ] Fuzz: EIP-7702 delegation chains: random authorizations (valid, wrong chain, bad
-  nonce, self-sponsored, re-delegation, clearing) against a model of the resulting code,
-  nonces, and the 12500/25000 refund.
+- [x] Fuzz: EIP-7702 delegation chains (`delegation_fuzz.zig`): 1..6 tuples over three
+  authorities (absent, empty-present, funded, delegated, real code; sometimes the sender)
+  with right/zero/wrong chain, right/wrong/max nonce, missing signer, and clearing, against
+  a model of every authority's code and nonce and the gas used (12500 refunds, 1/5 cap).
+  Catches a dropped refund and a dropped real-code skip.
+- [ ] Performance (measured lever: lookup count, not hash cost): add `-Devm-opcode-profile`
+  counters for State account-map and slot-map lookups per SLOAD/SSTORE/BALANCE/CALL on
+  replay, then remove redundant ones (expected: SLOAD does an account lookup plus a slot
+  lookup; the executing contract's `*Account` can live in the frame).
+- [ ] Performance: SLOAD/SSTORE single slot-map probe: fold the warm check, original-value
+  load, and present-value read into one `getOrPut` per access; A/B on replay.
+- [ ] Performance: CALL family: count account lookups per call (target access, code load,
+  delegation target, value transfer) and reuse the loaded `*Account` across them.
 - [x] Performance: nf-trie-db's `db.address_map` context (std Wyhash, `u160` equality) in
   `State.accounts` and `MemoryDatabase.accounts`/`storage`: interleaved A/B on the block
   bench ~5% slower with it in `State.accounts` (681 vs 645 us), neutral in `memory_db`

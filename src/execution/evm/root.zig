@@ -43,6 +43,7 @@ test {
     _ = @import("create_fuzz.zig");
     _ = @import("journal_fuzz.zig");
     _ = @import("modexp_fuzz.zig");
+    _ = @import("delegation_fuzz.zig");
     _ = @import("tx_check.zig");
 }
 
