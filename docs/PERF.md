@@ -879,6 +879,21 @@ block once on insert are the next cuts when misses matter (phase 2 brings filter
 keys stop reading data blocks). Code lookup through the database and the checkpoint image
 size without codes are not measured yet: the code store (phase 1 item d) is not wired in.
 
+## 2026-11-06 node mainnet replay (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "node: replay"`: the ten committed Base mainnet
+blocks 53715983..53715992 (253 txs, 46.5 Mgas) through the node executor over the replay
+witness backend, best of 30, setup untimed.
+
+| bench | ms/block | Mgas/s |
+|---|---|---|
+| node: replay 10 Base mainnet blocks | 12.3 | 379 |
+
+`sample` profile (top of stack, ~2.4k samples): `Evm.push_frame` 40% (inlined
+`Arena.analyze_code`: every call frame copies and re-analyzes its code, no cache), keccak
+13%, interpreter 9%, sparse trie (replay backend only) ~6%, secp256k1 recovery ~5%. The
+code-analysis cache is the largest lever for the gigagas/s target (sent to nf-evm).
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

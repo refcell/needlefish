@@ -11,7 +11,7 @@ const chainspec = @import("../../execution/chainspec/root.zig");
 const archive_module = @import("archive.zig");
 const replayer_module = @import("replayer.zig");
 
-const fixture = @embedFile("testdata/base-mainnet-53715983-10.nfrp");
+pub const fixture = @embedFile("testdata/base-mainnet-53715983-10.nfrp");
 
 pub const fixture_config: archive_module.Archive.Config = .{
     .witness = .{

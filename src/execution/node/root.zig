@@ -22,6 +22,7 @@ pub const genesis = @import("genesis.zig");
 pub const beacon = @import("beacon.zig");
 pub const bench = @import("bench.zig");
 pub const bench_engine = @import("bench_engine.zig");
+pub const bench_replay = @import("bench_replay.zig");
 pub const senders = @import("senders.zig");
 pub const durable = @import("durable.zig");
 pub const Durable = durable.Durable;
