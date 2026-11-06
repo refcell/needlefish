@@ -130,9 +130,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (`State.static_warm`, consulted only on a stale stamp) instead of `state.access` loading
   and journaling ~20 accounts per transaction (nf-node profile: `warm_addresses` ~5% and
   `State.load` ~8% of a 500-transfer block).
-- [ ] Replay focus (owner, priority over the rest): audit EVM-side fee accounting at Base
+- [x] Replay focus (owner, priority over the rest): audit EVM-side fee accounting at Base
   mainnet 53715983+ (Denim): L1 info deposit, L1 data fee, operator fee, DA footprint fee,
   fee vault credits, BaseTime deposit, 7702/system calls. Act first on nf-replay repros.
+  Covered end to end: nf-replay reproduces the state root (every balance and vault credit)
+  of all 100 blocks 53715983-53716082, and txcheck matches 1745/1745 receipts.
   Audit 1 (vs base/base `handler.rs` `reward_beneficiary`, `l1block.rs`): matches. The tip
   and base-fee vault use post-refund, post-7623-floor gas; the operator vault gets
   charge(gas_used) and the caller is refunded charge(limit) - charge(gas_used) (Jovian x100
@@ -223,9 +225,17 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   1024-entry direct-mapped digest memo on `Evm`: erc20 bench 915 -> 614 ns (it rehashes
   one key), block bench and replay unchanged within noise (interleaved A/B 918 vs 910
   Mgas/s), so not kept.
-- [ ] Performance: if nf-trie-db lands `prefetch_storage`, try calling it with a tx's
-  access-list slots (and the sender/recipient balance slots of known tokens) before
-  execution; keep only with an interleaved replay A/B gain.
+- [x] Performance: nf-trie-db landed the `SparseState` key-hash memo (replay ~925 -> ~972
+  Mgas/s on their runs; SLOAD 497 -> 476 ticks/exec) and offers
+  `SparseState.prefetch_storage(address, slots)`. Not wired: it only saves the batch-vs-
+  single keccak difference (~77 vs ~140 ns) for slots known before execution, i.e.
+  access-list keys, which are rare on Base mainnet; the memo already hashes each key once.
+  It would need an optional `Database` vtable hook plus replayer wiring for a gain below
+  replay noise. Revisit if access lists become common or the trie walk gets batched.
+- [x] Fuzz: journaled `State` against a snapshot-stack model (`journal_fuzz.zig`): nested
+  checkpoint/revert/discard, balances, nonces, SSTORE, TSTORE, address and slot warming,
+  logs, and account re-creation across up to 4 transactions; every observable compared
+  after each step. Catches reverts that stop un-warming slots.
 - [x] Performance (EVM side): `State.Limits.for_block_gas(gas_limit)` sizes the slot and
   account tables from the block gas limit (>= 1900 gas per distinct slot, >= 2400 per
   account, plus 2^13 headroom for unmetered system writes; capped at the defaults): a
