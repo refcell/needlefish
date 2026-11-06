@@ -371,6 +371,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: paused for replay focus (all work pushed; backlog empty except zk, not ported).
 - 2026-11-05: `base proof verify-tee`; devnet TEE receipts verify offline.
 - 2026-11-05: live devnet TEE proof (`etc/proof/devnet-tee.sh`); `proof/bin-tee` done.
 - 2026-11-05: TEE host gates enclaves on `TEEProverRegistry.isValidSigner` via `eth_call`.
