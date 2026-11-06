@@ -306,6 +306,7 @@ fn compute(init: std.process.Init, reader: *mdbx.Reader, source: *const FileSour
         accounts.source(),
         storages.source(),
         .{ .context = &progress, .report = Progress.report },
+        null,
     );
     Progress.report(&progress, &builder.stats);
     // Every table item was consumed: the tree counts agree with what was streamed.

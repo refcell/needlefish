@@ -28,6 +28,26 @@ pub const Progress = struct {
 
 pub const progress_interval: u64 = 1 << 20;
 
+/// Receives the state's leaves as they stream: every slot in (address hash, slot hash)
+/// order, and every account once its storage root is known, in address-hash order. Each
+/// stream is strictly ascending, so it can feed a bulk loader directly. A sink error stops
+/// the computation and is returned.
+pub const LeafSink = struct {
+    context: *anyopaque,
+    slot: *const fn (
+        context: *anyopaque,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+        value: u256,
+    ) anyerror!void,
+    account: *const fn (
+        context: *anyopaque,
+        address_hash: *const Hash,
+        account: *const state_root.Account,
+        storage_root: *const Hash,
+    ) anyerror!void,
+};
+
 pub const Error = error{Corrupt} || reth.Error || state_root.Error;
 
 pub fn compute(
@@ -35,17 +55,19 @@ pub fn compute(
     accounts: EntrySource,
     storages: EntrySource,
     progress: ?Progress,
+    leaves: ?LeafSink,
 ) anyerror!Hash {
     var pending = try storages.next(storages.context);
     while (try accounts.next(accounts.context)) |entry| {
         if (entry.key.len != 32) return error.Corrupt;
         const address_hash = entry.key[0..32].*;
-        const account = try reth.decode_account(entry.value);
-        try builder.begin_account(&address_hash, .{
-            .nonce = account.nonce,
-            .balance = account.balance,
-            .code_hash = account.code_hash,
-        });
+        const decoded = try reth.decode_account(entry.value);
+        const account: state_root.Account = .{
+            .nonce = decoded.nonce,
+            .balance = decoded.balance,
+            .code_hash = decoded.code_hash,
+        };
+        try builder.begin_account(&address_hash, account);
         const slots_before = builder.stats.slots;
         while (pending) |slot_entry| {
             if (slot_entry.key.len != 32) return error.Corrupt;
@@ -56,10 +78,12 @@ pub fn compute(
             // reth deletes zero slots; a stored zero would mean a broken writer.
             if (slot.value == 0) return error.Corrupt;
             try builder.add_slot(&slot.slot, slot.value);
+            if (leaves) |sink| try sink.slot(sink.context, &address_hash, &slot.slot, slot.value);
             pending = try storages.next(storages.context);
         }
         assert(builder.stats.slots >= slots_before);
-        _ = try builder.end_account();
+        const storage_root = try builder.end_account();
+        if (leaves) |sink| try sink.account(sink.context, &address_hash, &account, &storage_root);
         if (progress) |p| {
             if (builder.stats.accounts % progress_interval == 0) {
                 p.report(p.context, &builder.stats);
@@ -87,6 +111,45 @@ const SliceEntries = struct {
         if (self.index == self.entries.len) return null;
         self.index += 1;
         return self.entries[self.index - 1];
+    }
+};
+
+/// Collects the leaf streams and checks each is strictly ascending.
+const LeafLog = struct {
+    const AccountLeaf = struct { key: Hash, account: state_root.Account, root: Hash };
+    const SlotLeaf = struct { key: [64]u8, value: u256 };
+
+    arena: std.mem.Allocator,
+    accounts: std.ArrayList(AccountLeaf) = .empty,
+    slots: std.ArrayList(SlotLeaf) = .empty,
+
+    fn sink(self: *LeafLog) LeafSink {
+        return .{ .context = self, .slot = on_slot, .account = on_account };
+    }
+
+    fn on_slot(context: *anyopaque, owner: *const Hash, slot: *const Hash, value: u256) !void {
+        const self: *LeafLog = @ptrCast(@alignCast(context));
+        const key = owner.* ++ slot.*;
+        if (self.slots.items.len > 0) {
+            const last = &self.slots.items[self.slots.items.len - 1].key;
+            try testing.expect(std.mem.order(u8, last, &key) == .lt);
+        }
+        try self.slots.append(self.arena, .{ .key = key, .value = value });
+    }
+
+    fn on_account(
+        context: *anyopaque,
+        key: *const Hash,
+        account: *const state_root.Account,
+        root: *const Hash,
+    ) !void {
+        const self: *LeafLog = @ptrCast(@alignCast(context));
+        if (self.accounts.items.len > 0) {
+            const last = &self.accounts.items[self.accounts.items.len - 1].key;
+            try testing.expect(std.mem.order(u8, last, key) == .lt);
+        }
+        const leaf: AccountLeaf = .{ .key = key.*, .account = account.*, .root = root.* };
+        try self.accounts.append(self.arena, leaf);
     }
 };
 
@@ -170,8 +233,32 @@ test "hashed state: root of reth-encoded tables equals StateTrie's (seeded)" {
         // Odd rounds stream branch records too; the root must not change.
         var sinks: state_root.RecordSinks = .{ .target = state_root.discard_sink };
         if (round % 2 == 1) builder.set_record_sink(&sinks);
-        const root = try compute(builder, account_source.source(), storage_source.source(), null);
+        var leaves: LeafLog = .{ .arena = arena };
+        const root = try compute(
+            builder,
+            account_source.source(),
+            storage_source.source(),
+            null,
+            leaves.sink(),
+        );
         try testing.expectEqualSlices(u8, &try reference.root(), &root);
+        // The leaf streams are the input, in order, with each account's storage root.
+        try testing.expectEqual(accounts.items.len, leaves.accounts.items.len);
+        for (accounts.items, leaves.accounts.items) |input, leaf| {
+            try testing.expectEqualSlices(u8, input.key, &leaf.key);
+            const expected = reference.get_account(leaf.key).?;
+            try testing.expectEqual(expected.nonce, leaf.account.nonce);
+            try testing.expectEqual(expected.balance, leaf.account.balance);
+            try testing.expectEqualSlices(u8, &expected.code_hash, &leaf.account.code_hash);
+            try testing.expectEqualSlices(u8, &reference.storage_root(leaf.key), &leaf.root);
+        }
+        try testing.expectEqual(storages.items.len, leaves.slots.items.len);
+        for (storages.items, leaves.slots.items) |input, leaf| {
+            try testing.expectEqualSlices(u8, input.key, leaf.key[0..32]);
+            try testing.expectEqualSlices(u8, input.value[0..32], leaf.key[32..64]);
+            const decoded = try reth.decode_storage_entry(input.value);
+            try testing.expectEqual(decoded.value, leaf.value);
+        }
         // Orphaned storage (an entry below the first account) is corrupt.
         if (storages.items.len > 0) {
             var orphan: Hash = @splat(0);
@@ -182,7 +269,7 @@ test "hashed state: root of reth-encoded tables equals StateTrie's (seeded)" {
             var again: SliceEntries = .{ .entries = accounts.items };
             var orphaned: SliceEntries = .{ .entries = with_orphan.items };
             builder.* = .{};
-            const result = compute(builder, again.source(), orphaned.source(), null);
+            const result = compute(builder, again.source(), orphaned.source(), null, null);
             try testing.expectError(error.Corrupt, result);
         }
     }
