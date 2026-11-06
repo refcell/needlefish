@@ -266,6 +266,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [ ] Fuzz: EIP-7702 delegation chains: random authorizations (valid, wrong chain, bad
   nonce, self-sponsored, re-delegation, clearing) against a model of the resulting code,
   nonces, and the 12500/25000 refund.
+- [x] Performance: nf-trie-db's `db.address_map` context (std Wyhash, `u160` equality) in
+  `State.accounts` and `MemoryDatabase.accounts`/`storage`: interleaved A/B on the block
+  bench ~5% slower with it in `State.accounts` (681 vs 645 us), neutral in `memory_db`
+  alone; not adopted. Third account-map context tried in `State` without a gain (see the
+  fold+fmix64 attempts): its cost is the lookup count, not hashing or equality.
 - [x] Note for the db lane (sent to nf-trie-db): the harness's `db.overlay` account map (`AutoContext([20]u8)`,
   `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
   there would help cold account loads.
