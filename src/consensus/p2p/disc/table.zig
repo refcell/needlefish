@@ -56,6 +56,8 @@ pub const InsertResult = union(enum) {
     /// Parked in the replacement cache; ping `least_recent` to decide eviction.
     pending: struct { least_recent: NodeId },
     rejected_self,
+    /// Older (lower `seq`) than the record we hold: a replay; nothing changes.
+    rejected_stale,
     rejected_subnet,
     rejected_full,
 };
@@ -158,10 +160,7 @@ pub const Table = struct {
         const node_id = record.node_id();
         const bucket = table.bucket_for(node_id) orelse return .rejected_self;
         if (table.find(bucket.live[0..bucket.live_count], node_id)) |position| {
-            const entry = &table.pool[bucket.live[position]];
-            if (record.sequence >= entry.record.sequence) entry.record = record.*;
-            entry.endpoint = endpoint;
-            return .updated;
+            return table.update(bucket, &table.pool[bucket.live[position]], record, endpoint);
         }
         if (!table.subnet_allows(bucket, endpoint)) return .rejected_subnet;
         if (bucket.live_count < table.config.bucket_size) {
@@ -173,6 +172,38 @@ pub const Table = struct {
         }
         table.park(bucket, node_id, record, endpoint, now_ns) orelse return .rejected_full;
         return .{ .pending = .{ .least_recent = table.least_recent(bucket) } };
+    }
+
+    /// A known node's record. Only a newer record (higher `seq`, signed by the node) may
+    /// move its endpoint: a replayed older record, or anyone's NODES response carrying
+    /// one, must not redirect a live node to a stale address. A move stays inside the
+    /// subnet limits and must prove liveness again.
+    fn update(
+        table: *Table,
+        bucket: *const Bucket,
+        entry: *Entry,
+        record: *const enr.Record,
+        endpoint: Endpoint,
+    ) InsertResult {
+        assert(std.mem.eql(u8, &entry.node_id, &record.node_id()));
+        if (record.sequence < entry.record.sequence) return .rejected_stale;
+        // Same `seq` is the same record (or the node's own equivocation): keep ours.
+        if (record.sequence == entry.record.sequence) return .updated;
+        if (!entry.endpoint.eql(endpoint)) {
+            const old_subnet = subnet_of(entry.endpoint);
+            const new_subnet = subnet_of(endpoint);
+            const same_subnet = old_subnet != null and new_subnet != null and
+                std.mem.eql(u8, &old_subnet.?, &new_subnet.?);
+            if (!same_subnet and !table.subnet_allows(bucket, endpoint)) {
+                return .rejected_subnet;
+            }
+            entry.endpoint = endpoint;
+            entry.verified = false;
+            entry.failures = 0;
+        }
+        entry.record = record.*;
+        assert(entry.record.sequence == record.sequence);
+        return .updated;
     }
 
     fn new_entry(
@@ -202,7 +233,10 @@ pub const Table = struct {
     ) ?void {
         const replacements = bucket.replacements[0..bucket.replacements_count];
         if (table.find(replacements, node_id)) |position| {
-            table.pool[replacements[position]] = new_entry(node_id, record, endpoint, now_ns);
+            const parked = &table.pool[replacements[position]];
+            // A replay of an older record does not overwrite the parked one.
+            if (record.sequence < parked.record.sequence) return;
+            parked.* = new_entry(node_id, record, endpoint, now_ns);
             return;
         }
         if (table.config.replacements_max == 0) return null;

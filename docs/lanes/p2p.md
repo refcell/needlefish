@@ -80,6 +80,17 @@ behind a small interface and switch later.
   so a replay is rejected again, not ignored; negative control: inserting into the seen
   table before the schedule check fails it). Score bans already propagate to discv5
   (`ban_node`, base/base `BanAddrs`). Rate limits and req/resp: none in base/base.
+- [x] discv5 table and node-record edge cases. Found: `Table.insert` on a known node
+  overwrote its endpoint even for an older record (it only kept the newer record), so
+  anyone replaying a node's old, validly signed record (in a NODES response) moved a
+  live node to a stale address, left record and endpoint inconsistent, and published
+  the stale record to the dialer. Fix: an older `seq` is `rejected_stale`; the same
+  `seq` changes nothing; a newer record may move the endpoint only within the subnet
+  limits, and a move clears `verified`/failures so liveness is re-proven; the
+  replacement cache keeps the newer record too (sigp discv5 semantics: records only
+  advance by `seq`). Tests: scripted replay/move/subnet case and a seeded fuzz of
+  record versions in any order (newest kept while live; endpoint always the record's).
+  Negative control: the old update fails both.
 - [x] Scoring parity: `peers/score.zig` already mirrors base/base `score.rs` formula for
   formula (thresholds, topic and peer params, `score_decay`); covered by its tests.
 - [x] Req/resp sync at 5 blocks/s: not applicable; base/base has no p2p req/resp
@@ -512,3 +523,4 @@ behind a small interface and switch later.
 - 2026-11-05: per-peer IWANT/IDONTWANT id budgets (control flood 3.8 ms -> 53 us per RPC).
 - 2026-11-05: inbound yamux stream negotiation timeout (10 s); many-streams bound test.
 - 2026-11-05: gossip validation parity audit; version-matrix and schedule-replay tests.
+- 2026-11-05: discv5 table refuses stale-record endpoint moves.
