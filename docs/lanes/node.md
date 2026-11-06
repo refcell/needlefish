@@ -45,7 +45,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
 - [x] FCU+getPayload+newPayload latency benchmark at 200 ms well under the 150 ms seal offset;
   record in docs/PERF.md (`node/bench_engine.zig`: 11.7 ms per 10.5 Mgas slot).
 - [x] rpc: Denim `timestampMs` on blocks, `blockTimestampMs` on transactions and logs.
-- [ ] Durable-mode slot bench (cost of `settle_head` unwind + re-apply per slot).
+- [x] Durable-mode slot bench (cost of `settle_head` unwind + re-apply per slot): within noise.
 - [ ] rpc: eth_sendRawTransactionSync (EIP-7966: deferred response until the receipt or a
   timeout; needs async handler support in the rpc router).
 - [x] rpc: debug_executePayload, debug_proofsSyncStatus (base/base proofs debug overrides).

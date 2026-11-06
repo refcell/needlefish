@@ -556,6 +556,13 @@ Fixes: forkchoice pool pruning no longer recovers every included sender (the exe
 reports senders and the chain keeps the last 4 blocks'); forced attribute transactions
 are recovered in parallel. Well under the 150 ms seal offset.
 
+Durable mode (`node: 200 ms slot, durable (sim storage)`: `--datadir` layout from the
+default limits, journal settled every slot): 14.5-17.7 ms against 17.1-18.5 ms in memory
+in the same runs (machine shared with other builds; the spread is noise). The
+`settle_head` unwind after each build/import and the re-apply on the adopting FCU do not
+show up next to execution. Real-disk write latency is not measured (journal writes run
+asynchronously off the slot).
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
