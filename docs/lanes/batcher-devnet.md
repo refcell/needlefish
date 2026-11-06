@@ -293,3 +293,4 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   because the std panics on TCP connect timeouts in 0.17.1. Our dev L1 serves no WebSocket,
   so a loopback test with a scripted server covers it.
 
+- 2026-11-05: paused for replay focus. Open: the sim BUG(batcher) gate (nf-consensus's fixes leave ungated 992, 2258 and 2622 failing; triage them with nf-consensus, then drop the gate).
