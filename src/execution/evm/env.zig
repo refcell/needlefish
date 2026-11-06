@@ -39,6 +39,9 @@ pub const Config = struct {
     memory_bytes_max: u32 = 64 << 20,
     /// LIFO arena for code analyses of live frames.
     code_arena_bytes: u32 = 96 << 20,
+    /// Analysis cache by code hash: byte buffer and table slots (a power of two).
+    code_cache_bytes: u32 = 64 << 20,
+    code_cache_entries: u32 = 1 << 14,
     /// EIP-170 runtime code size limit.
     code_size_max: u32 = 24_576,
     /// EIP-3860 init code size limit.

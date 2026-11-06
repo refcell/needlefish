@@ -20,6 +20,7 @@ const crypto = @import("../../common/crypto/root.zig");
 const native = @import("native.zig");
 const Fork = @import("fork.zig").Fork;
 const Address = primitives.Address;
+const B256 = primitives.B256;
 const State = state_module.State;
 const Account = state_module.Account;
 
@@ -200,6 +201,7 @@ pub const Evm = struct {
     stacks: [][stack_module.limit]u256,
     shared_memory: memory_module.SharedMemory,
     arena: bytecode.Arena,
+    code_cache: bytecode.AnalysisCache,
     return_buffer: []u8,
     precompile_scratch: []u64,
     return_len: u32 = 0,
@@ -220,6 +222,12 @@ pub const Evm = struct {
         errdefer shared_memory.deinit(allocator);
         var arena = try bytecode.Arena.init(allocator, config.code_arena_bytes);
         errdefer arena.deinit(allocator);
+        var code_cache = try bytecode.AnalysisCache.init(
+            allocator,
+            config.code_cache_bytes,
+            config.code_cache_entries,
+        );
+        errdefer code_cache.deinit(allocator);
         const return_buffer = try allocator.alloc(u8, config.memory_bytes_max);
         errdefer allocator.free(return_buffer);
         const scratch_limbs = crypto.modexp.scratch_limbs_needed(config.modexp_modulus_bytes_max);
@@ -231,6 +239,7 @@ pub const Evm = struct {
             .stacks = stacks,
             .shared_memory = shared_memory,
             .arena = arena,
+            .code_cache = code_cache,
             .return_buffer = return_buffer,
             .precompile_scratch = precompile_scratch,
         };
@@ -241,6 +250,7 @@ pub const Evm = struct {
         allocator.free(evm.stacks);
         evm.shared_memory.deinit(allocator);
         evm.arena.deinit(allocator);
+        evm.code_cache.deinit(allocator);
         allocator.free(evm.return_buffer);
         allocator.free(evm.precompile_scratch);
         evm.* = undefined;
@@ -267,6 +277,8 @@ pub const Evm = struct {
         assert(evm.frames_len == 0);
         evm.return_len = 0;
         evm.fatal_error = null;
+        // No frame is live, so the cache's analyses can be dropped once it has filled.
+        if (evm.code_cache.full) evm.code_cache.reset();
         errdefer {
             evm.frames_len = 0;
             evm.arena.release(0);
@@ -438,6 +450,7 @@ pub const Evm = struct {
         try evm.push_frame(.{
             .kind = .call,
             .code = code,
+            .code_hash = code_account.info.code_hash,
             .gas = request.gas_limit,
             .input = request.input,
             .address = address,
@@ -594,6 +607,8 @@ pub const Evm = struct {
     const FrameSpec = struct {
         kind: FrameKind,
         code: []const u8,
+        /// The code's keccak for a call (cached analysis); null for init code.
+        code_hash: ?B256 = null,
         gas: u64,
         input: []const u8,
         address: Address,
@@ -611,7 +626,7 @@ pub const Evm = struct {
         assert(index == spec.depth);
         const memory_base: u32 = if (parent) |p| p.memory_base + p.memory.len else 0;
         const arena_mark = evm.arena.mark();
-        const analyzed = try evm.arena.analyze_code(spec.code);
+        const analyzed = try evm.analyze_frame_code(spec.code, spec.code_hash);
         evm.frames[index] = .{
             .analyzed = analyzed,
             .gas = spec.gas,
@@ -633,6 +648,17 @@ pub const Evm = struct {
         // frame; the parent's return data is replaced by this frame's output when it returns.
         evm.return_len = 0;
         evm.frames_len += 1;
+    }
+
+    /// A call's code analysis comes from the cache by code hash; init code and code that
+    /// does not fit the cache are analyzed into the frame arena.
+    fn analyze_frame_code(evm: *Evm, code: []const u8, hash: ?B256) Error!bytecode.Analyzed {
+        const code_hash = hash orelse return evm.arena.analyze_code(code);
+        if (evm.code_cache.get(&code_hash)) |analyzed| {
+            assert(std.mem.eql(u8, analyzed.original(), code));
+            return analyzed;
+        }
+        return evm.code_cache.put(&code_hash, code) orelse evm.arena.analyze_code(code);
     }
 
     /// Pop the top frame, applying create code deposit and journal rules.

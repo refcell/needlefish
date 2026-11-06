@@ -93,6 +93,87 @@ pub const Arena = struct {
     }
 };
 
+/// Process-lifetime analyses keyed by code hash. Code behind a hash never changes, so an
+/// entry stays valid across transactions, blocks, and reorgs. Bounded twice: a fixed open-
+/// addressed table (kept at most 3/4 full) and a fixed byte buffer. Entries are append-only
+/// while frames may reference them; when full, `put` returns null (the caller falls back to
+/// the frame arena) and `reset` runs only once no frame is live.
+pub const AnalysisCache = struct {
+    buffer: []u8,
+    used: usize = 0,
+    entries: []Entry,
+    count: u32 = 0,
+    full: bool = false,
+
+    const Entry = struct {
+        hash: [32]u8,
+        analyzed: Analyzed,
+        occupied: bool,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, bytes: usize, entries_count: u32) !AnalysisCache {
+        assert(std.math.isPowerOfTwo(entries_count));
+        assert(entries_count >= 4);
+        const buffer = try allocator.alloc(u8, bytes);
+        errdefer allocator.free(buffer);
+        const entries = try allocator.alloc(Entry, entries_count);
+        for (entries) |*entry| entry.occupied = false;
+        return .{ .buffer = buffer, .entries = entries };
+    }
+
+    pub fn deinit(cache: *AnalysisCache, allocator: std.mem.Allocator) void {
+        allocator.free(cache.buffer);
+        allocator.free(cache.entries);
+        cache.* = undefined;
+    }
+
+    fn slot(cache: *const AnalysisCache, hash: *const [32]u8) usize {
+        // The key is a keccak output: its leading bytes are already uniformly distributed.
+        const mask = cache.entries.len - 1;
+        return @as(usize, @truncate(std.mem.readInt(u64, hash[0..8], .little))) & mask;
+    }
+
+    /// The analysis of the code with `hash`, or null when it is not cached.
+    pub fn get(cache: *const AnalysisCache, hash: *const [32]u8) ?Analyzed {
+        var index = cache.slot(hash);
+        var probes: usize = 0;
+        while (probes < cache.entries.len) : (probes += 1) {
+            const entry = &cache.entries[index];
+            if (!entry.occupied) return null;
+            if (std.mem.eql(u8, &entry.hash, hash)) return entry.analyzed;
+            index = (index + 1) & (cache.entries.len - 1);
+        }
+        unreachable; // The table is never more than 3/4 full, so a probe meets an empty slot.
+    }
+
+    /// Analyze `code` (whose keccak is `hash`) into the cache; null when the cache is full.
+    pub fn put(cache: *AnalysisCache, hash: *const [32]u8, code: []const u8) ?Analyzed {
+        assert(cache.get(hash) == null);
+        const size = analysis_bytes(code.len);
+        const table_full = (cache.count + 1) * 4 > cache.entries.len * 3;
+        if (table_full or cache.buffer.len - cache.used < size) {
+            cache.full = true;
+            return null;
+        }
+        const analyzed = analyze(code, cache.buffer[cache.used..][0..size]);
+        cache.used += size;
+        var index = cache.slot(hash);
+        while (cache.entries[index].occupied) index = (index + 1) & (cache.entries.len - 1);
+        cache.entries[index] = .{ .hash = hash.*, .analyzed = analyzed, .occupied = true };
+        cache.count += 1;
+        assert(cache.used <= cache.buffer.len);
+        return analyzed;
+    }
+
+    /// Drop every entry. Only valid while no frame references an analysis.
+    pub fn reset(cache: *AnalysisCache) void {
+        for (cache.entries) |*entry| entry.occupied = false;
+        cache.used = 0;
+        cache.count = 0;
+        cache.full = false;
+    }
+};
+
 /// EIP-7702 delegation designator: 0xef0100 followed by a 20-byte address.
 pub const delegation_prefix = [3]u8{ 0xef, 0x01, 0x00 };
 pub const delegation_len = 23;
@@ -101,6 +182,28 @@ pub fn delegation_target(code: []const u8) ?[20]u8 {
     if (code.len != delegation_len) return null;
     if (!std.mem.eql(u8, code[0..3], &delegation_prefix)) return null;
     return code[3..23].*;
+}
+
+test "bytecode: analysis cache hits, fills, and resets" {
+    var cache = try AnalysisCache.init(std.testing.allocator, 256, 8);
+    defer cache.deinit(std.testing.allocator);
+    const code = [_]u8{ op.PUSH1, op.JUMPDEST, op.JUMPDEST };
+    var hashes: [8][32]u8 = undefined;
+    for (&hashes, 0..) |*hash, index| hash.* = @splat(@intCast(index));
+    try std.testing.expect(cache.get(&hashes[0]) == null);
+    const first = cache.put(&hashes[0], &code).?;
+    try std.testing.expect(first.is_jumpdest(2) and !first.is_jumpdest(1));
+    try std.testing.expectEqual(first.code.ptr, cache.get(&hashes[0]).?.code.ptr);
+    // Six entries fill the 8-slot table to 3/4; the seventh is refused.
+    for (hashes[1..6]) |*hash| _ = cache.put(hash, &code).?;
+    try std.testing.expect(cache.put(&hashes[6], &code) == null);
+    try std.testing.expect(cache.full);
+    for (hashes[0..6]) |*hash| try std.testing.expect(cache.get(hash) != null);
+    cache.reset();
+    try std.testing.expect(cache.get(&hashes[0]) == null and !cache.full);
+    // A code larger than the byte buffer is refused.
+    const big: [300]u8 = @splat(0);
+    try std.testing.expect(cache.put(&hashes[7], &big) == null);
 }
 
 test "bytecode: jumpdests skip push data" {

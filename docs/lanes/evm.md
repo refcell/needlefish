@@ -170,8 +170,26 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   salt; EIP-3541 0xef prefix, EIP-684 collision, EIP-170 runtime limit, EIP-3860 init-code
   limit halting the creator; returned word, installed code, creator nonce). Deposit gas
   stays covered by the state tests.
-- [ ] Performance: a block-sized transaction bench (1000 mixed transfers and erc20 calls
-  through `transaction.transact` without per-tx state reset) to profile the tx envelope.
+- [x] Performance: a block-sized transaction bench (`evm: block of 1000 transactions`: one
+  Denim block of 500 ETH + 500 erc20 transfers from 100 senders, one state reset per
+  block): ~0.75 ms/block. Its profile showed `warm_system_addresses` recomputing the
+  precompile set (18 `precompiles.lookup`) per tx, ~5%; now cached on `Evm` by
+  (fork, upgrade): ~0.72 ms/block. The remaining keccak (~20%) is the erc20 slot hashing.
+- [x] Performance (nf-node's replay profile: 40% in `push_frame` code analysis): a
+  process-lifetime `bytecode.AnalysisCache` keyed by code hash (64 MiB buffer, 16k-slot
+  table kept <= 3/4 full; append-only while frames are live; reset at the next top-level
+  message once full; init code and overflow use the frame arena; ReleaseSafe asserts the
+  cached code equals the frame's). `node: replay` 387 -> 740 Mgas/s; block bench 0.72 ->
+  0.68 ms; txcheck 1745/1745 and both state suites still pass.
+- [ ] Performance: `StorageKeyContext.eql` + `slot_for` are ~16% of the block bench; try
+  a stored hash fingerprint compared before the 52-byte key, or fewer lookups per SSTORE.
+- [ ] Performance: `transact` self time is ~10% of the block bench; profile with inlining
+  off to find which validation or settlement step dominates.
+- [ ] Performance: re-profile `node: replay` after the analysis cache (nf-node saw keccak
+  13% and the interpreter 9% before it).
+- [ ] Note for the db lane: the harness's `db.overlay` account map (`AutoContext([20]u8)`,
+  `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
+  there would help cold account loads.
 - [x] Performance: account map — `start_call` reuses the parent frame's account for the
   caller and the target account when it is also the code account: call loop 23.5 ->
   ~18.6-22.2 us (noisy, load ~25). A fold+fmix64 hash context for `State.accounts`

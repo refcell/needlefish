@@ -13,6 +13,8 @@ const Address = primitives.Address;
 pub const test_config = env.Config{
     .memory_bytes_max = 1 << 20,
     .code_arena_bytes = 1 << 22,
+    .code_cache_bytes = 1 << 20,
+    .code_cache_entries = 1 << 8,
     .modexp_modulus_bytes_max = 4096,
 };
 
