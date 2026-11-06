@@ -289,7 +289,8 @@ pub const Replayer = struct {
     backend_error: ?anyerror = null,
     /// Probe mode (witness gap search): a missing account reads as absent and a missing
     /// slot as zero, so one pass records every missing key of a block instead of stopping
-    /// at the first. The block still fails with `WitnessIncomplete`.
+    /// at the first, and replay continues past failed blocks. A block with gaps still fails
+    /// with `WitnessIncomplete`.
     probe: bool = false,
     /// Scratch: the transactions of the block being replayed.
     transaction_views: [][]const u8,
@@ -369,7 +370,9 @@ pub const Replayer = struct {
     }
 
     /// Replays the next block. A block that fails leaves the replayer unusable for the
-    /// blocks after it (their pre-state is wrong), so `done` is then forced.
+    /// blocks after it (their pre-state is wrong), so `done` is then forced, except in probe
+    /// mode: the gap search goes on to collect later blocks' missing keys (their outcomes
+    /// mean nothing else).
     pub fn replay_next(self: *Replayer) Error!Outcome {
         assert(!self.done());
         const index = self.next_block;
@@ -388,7 +391,7 @@ pub const Replayer = struct {
             .computed_state_root = @splat(0),
         };
         self.execute(index, &header, &outcome);
-        if (!outcome.ok()) self.next_block = self.archive.block_count;
+        if (!outcome.ok() and !self.probe) self.next_block = self.archive.block_count;
         assert(outcome.number == header.number);
         return outcome;
     }

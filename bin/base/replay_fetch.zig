@@ -435,19 +435,25 @@ fn fill_gaps(f: *Fetcher, window: replay_cli.Window, sub: []const u8) !void {
         var archive = try Archive.init(gpa, replay_cli.archive_config);
         defer archive.deinit(gpa);
         try replay_cli.import_blocks(f.init, f.dir, &archive, window);
-        const report = try replay_cli.check_archive(gpa, f.alloc(), &archive) orelse {
+        const reports = try replay_cli.check_archive(gpa, f.alloc(), &archive) orelse {
             const out = f.flags.out;
             try replay_cli.write_archive(f.init, &archive, window, out);
             std.debug.print("witness complete after {d} gap rounds ({s})\n", .{ round, sub });
             return;
         };
-        std.debug.print("  gap round {d}: block {d} lacks {d} accounts, {d} slots\n", .{
-            round + 1,
-            report.block,
-            report.accounts.len,
-            report.slots.len,
-        });
-        try add_extra(f, report);
+        var progressed: u32 = 0;
+        for (reports) |report| {
+            std.debug.print("  gap round {d}: block {d} lacks {d} accounts, {d} slots\n", .{
+                round + 1,
+                report.block,
+                report.accounts.len,
+                report.slots.len,
+            });
+            if (try add_extra(f, report)) progressed += 1;
+        }
+        // Later blocks' gaps can repeat known keys (their pre-state is wrong); the first
+        // block's gaps are always new, so a round without progress is a real dead end.
+        if (progressed == 0) return error.WitnessIncomplete;
     }
     return error.WitnessIncomplete;
 }
@@ -509,7 +515,8 @@ fn slot_hex(f: *Fetcher, slot: u64) ![]u8 {
     return std.fmt.allocPrint(f.alloc(), "0x{x:0>64}", .{slot});
 }
 
-fn add_extra(f: *Fetcher, report: replay_cli.GapReport) !void {
+/// Adds a block's gap keys to its extra keys and fetches them; false when none were new.
+fn add_extra(f: *Fetcher, report: replay_cli.GapReport) !bool {
     var keys: Keys = .{};
     try load_extra(f, report.block, &keys);
     const before = key_count(&keys);
@@ -521,8 +528,9 @@ fn add_extra(f: *Fetcher, report: replay_cli.GapReport) !void {
         const slot = try std.fmt.allocPrint(f.alloc(), "0x{x:0>64}", .{key.slot});
         try keys.add_slot(f.alloc(), address, slot);
     }
-    if (key_count(&keys) == before) return error.WitnessIncomplete; // No progress.
+    if (key_count(&keys) == before) return false;
     try write_extra(f, report.block, &keys);
+    return true;
 }
 
 fn key_count(keys: *const Keys) usize {

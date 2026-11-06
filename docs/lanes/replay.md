@@ -78,7 +78,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   compute the same roots); fuzz the fetcher's batch-response parser.
 - [x] `just replay 100` from a cold cache: `[k/N]` progress, resumable cache, optional pinned
   first block (`just replay 100 53750445`) for a deterministic window.
-- [ ] Collect missing keys of every failing block per round (today: the first one only).
+- [x] Collect missing keys of every failing block per round (probe mode replays past
+  failed blocks).
+- [x] Pinned 100-block window check: `just replay-check` (53775088..53775187).
 
 ## Decisions
 
@@ -112,6 +114,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-06: one gap round fills every block lacking state: cached window 53775088..+100
+  with its 3 gap blocks cleared needs 1 round (was 3), same archive bytes, 100/100.
 
 - 2026-11-06: cold `just replay 100` (build + fetch + run, one command): 53775088..53775187,
   1571 txs, 271.9 Mgas, 3 gap rounds, 100/100 in 13m24s.

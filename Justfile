@@ -83,6 +83,11 @@ replay count='10' from='':
         {{ if from == "" { "" } else { "--from " + from } }} --out .cache/replay/latest.nfrp
     zig-out/bin/base replay run .cache/replay/latest.nfrp
 
+# Pinned 100-block mainnet window (53775088..53775187, 1571 txs): every block's state root,
+# receipts root, logs bloom, gas used and hash must match. Fetches once, then from the cache.
+replay-check:
+    just replay 100 53775088
+
 # Replay a saved archive offline (default: the committed 10-block fixture)
 replay-run archive='src/infra/replay/testdata/base-mainnet-53715983-10.nfrp':
     zig build -Doptimize=ReleaseFast

@@ -9,6 +9,7 @@ root or block hash would differ.
 just replay                # fetch the latest 10 blocks from public RPC, replay offline
 just replay 100            # the latest 100 blocks (about 15 minutes from a cold cache)
 just replay 100 53750445   # a pinned window: the same blocks every run
+just replay-check          # pinned 100-block window 53775088..53775187, all fields
 just replay-run            # replay the committed 10-block archive (no network)
 ```
 
@@ -124,7 +125,9 @@ they write) and the message passer, and the first block with the precompiles. It
 replays the archive in-process in probe mode, where a missing account reads as absent and a
 missing slot as zero, so one pass collects every key a block lacks. Those keys are fetched
 at the parent into `proofs_extra.json` and `codes_extra.json` and the archive is rebuilt,
-until the replay has no gaps (about one round per block with gaps; 256 rounds at most). `base replay run` prints
+until the replay has no gaps (256 rounds at most). Probe mode also keeps replaying past a
+failed block, so one round fills every block that lacks state; a later block's keys may be
+probe noise from its wrong pre-state, which costs only a few extra valid proofs. `base replay run` prints
 the same gaps on a machine-readable line
 (`GAPS {"block":n,"accounts":[...],"slots":[...],"nodes":[...]}`).
 

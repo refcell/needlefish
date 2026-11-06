@@ -309,39 +309,42 @@ pub const GapReport = struct {
     codes: u32,
 };
 
-/// Replays the whole archive silently. Null when every block passes; otherwise the gaps of
-/// the first failing block (copied into `arena`). A failure with no gaps is a real
-/// divergence: `error.Mismatch`.
+/// Replays the whole archive silently in probe mode. Null when every block passes;
+/// otherwise the gaps of every block that lacks state. A block that fails without gaps
+/// before any block with gaps is a real mismatch (printed); after one, its pre-state is
+/// already wrong, so it is skipped.
 pub fn check_archive(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     archive: *const Archive,
-) !?GapReport {
+) !?[]const GapReport {
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
     try replayer.init(gpa, spec, archive, replay.replayer.config_for(archive));
     defer replayer.deinit(gpa);
     replayer.probe = true;
+    var reports: std.ArrayList(GapReport) = .empty;
     while (!replayer.done()) {
         const outcome = try replayer.replay_next();
         if (outcome.ok()) continue;
         const gaps = &replayer.gaps;
+        if (gaps.accounts_len + gaps.code_owners_len + gaps.slots_len == 0) {
+            if (reports.items.len > 0) continue;
+            print_failure(replayer, &outcome);
+            return error.Mismatch;
+        }
         const accounts = try arena.alloc([20]u8, gaps.accounts_len + gaps.code_owners_len);
         @memcpy(accounts[0..gaps.accounts_len], gaps.accounts[0..gaps.accounts_len]);
         @memcpy(accounts[gaps.accounts_len..], gaps.code_owners[0..gaps.code_owners_len]);
-        const report: GapReport = .{
+        try reports.append(arena, .{
             .block = outcome.number,
             .accounts = accounts,
             .slots = try arena.dupe(replay.replayer.SlotKey, gaps.slots[0..gaps.slots_len]),
             .nodes = gaps.nodes_len,
             .codes = gaps.codes_len,
-        };
-        if (report.accounts.len + report.slots.len == 0) {
-            print_failure(replayer, &outcome);
-            return error.Mismatch;
-        }
-        return report;
+        });
     }
-    return null;
+    assert(reports.items.len <= archive.block_count);
+    return if (reports.items.len == 0) null else reports.items;
 }
