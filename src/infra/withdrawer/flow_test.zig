@@ -451,6 +451,64 @@ test "withdrawer flow: run proves, waits out the delays, and finalizes" {
     try testing.expect(harness.l1.time_s >= harness.l1.proven_at + 101);
 }
 
+test "withdrawer flow: tx_manager metrics count the prove and finalize sends" {
+    var harness: Harness = .{};
+    try harness.init();
+    defer harness.deinit();
+    var tx_metrics: @import("../tx_manager/root.zig").metrics.Metrics = .{};
+    var config = run_config;
+    config.tx_metrics = &tx_metrics;
+    var flow = try harness.start(config);
+    defer flow.deinit(testing.allocator);
+    try testing.expectEqual(flow_module.Progress.done, try harness.run(&flow, 600));
+    try testing.expectEqual(@as(u64, 2), tx_metrics.submitted.get());
+    try testing.expectEqual(@as(u64, 2), tx_metrics.confirmed.get());
+    try testing.expectEqual(@as(u64, 2), tx_metrics.done_count());
+}
+
+fn accept_none(context: ?*const anyopaque, withdrawal: *const withdrawal_module.Withdrawal) bool {
+    assert(context == null);
+    assert(withdrawal.transaction.data.len > 0);
+    return false;
+}
+
+fn accept_bridge(context: ?*const anyopaque, withdrawal: *const withdrawal_module.Withdrawal) bool {
+    const sender: *const Address = @ptrCast(@alignCast(context.?));
+    return std.mem.eql(u8, &withdrawal.transaction.sender, sender);
+}
+
+test "withdrawer flow: a filter that rejects every withdrawal fails without sending" {
+    var harness: Harness = .{};
+    try harness.init();
+    defer harness.deinit();
+    var config = run_config;
+    config.filter = .{ .accept = accept_none };
+    var flow = try harness.start(config);
+    defer flow.deinit(testing.allocator);
+    try testing.expectError(error.NoMatchingWithdrawal, harness.run(&flow, 10));
+    try testing.expectEqual(@as(usize, 1), flow.skipped_withdrawals().len);
+    try testing.expectEqualSlices(
+        u8,
+        &withdrawal_hash_of(&harness.fixture),
+        &flow.skipped_withdrawals()[0],
+    );
+    try testing.expectEqual(@as(u32, 0), harness.l1.sent_count);
+}
+
+test "withdrawer flow: an accepting filter keeps the default behavior" {
+    var harness: Harness = .{};
+    try harness.init();
+    defer harness.deinit();
+    const messenger: Address = consensus.predeploys.l2_cross_domain_messenger.bytes;
+    var config = run_config;
+    config.filter = .{ .context = &messenger, .accept = accept_bridge };
+    var flow = try harness.start(config);
+    defer flow.deinit(testing.allocator);
+    try testing.expectEqual(flow_module.Progress.done, try harness.run(&flow, 600));
+    try testing.expectEqual(@as(usize, 0), flow.skipped_withdrawals().len);
+    try testing.expect(harness.l1.finalized);
+}
+
 test "withdrawer flow: status and paused runs never send" {
     var harness: Harness = .{};
     try harness.init();

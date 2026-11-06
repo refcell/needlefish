@@ -10,6 +10,7 @@
 const std = @import("std");
 const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
+const metrics_server = @import("metrics_server.zig");
 
 const Io = std.Io;
 const cli = base.utilities.cli;
@@ -18,6 +19,8 @@ const accounts = base.batcher.devnet.accounts;
 const withdrawer = base.infra.withdrawer;
 const flow_module = withdrawer.flow;
 const journal_module = withdrawer.journal;
+const tx_metrics_module = base.infra.tx_manager.metrics;
+const MetricsServer = metrics_server.Server(tx_metrics_module.entries_count);
 
 const assert = std.debug.assert;
 const env_prefix = "BASE_WITHDRAWER_";
@@ -41,6 +44,8 @@ pub const Spec = struct {
     poll_interval_s: u32 = 12,
     confirmations: u64 = 1,
     network_timeout_ms: u64 = 10_000,
+    metrics_addr: []const u8 = "0.0.0.0",
+    metrics_port: u16 = 0,
 
     pub const help = .{
         .l1_rpc_url = "L1 JSON-RPC endpoint (http://...)",
@@ -59,6 +64,8 @@ pub const Spec = struct {
         .poll_interval_s = "Seconds between status polls while waiting",
         .confirmations = "Blocks deep before a sent transaction counts",
         .network_timeout_ms = "Per-request RPC timeout",
+        .metrics_addr = "IPv4 address for /metrics and /healthz",
+        .metrics_port = "Port for tx_manager /metrics and /healthz (0: off)",
     };
 };
 
@@ -119,6 +126,7 @@ pub fn parse_config(command: flow_module.Command, spec: Spec, parsed: *Parsed) !
     const needs_l2 = command == .initiate or parsed.initiate != null or parsed.transaction != null;
     if (needs_l2 and spec.l2_rpc_url.len == 0) return error.MissingL2Rpc;
     if (parsed.initiate != null and spec.l2_chain_id == 0) return error.MissingL2ChainId;
+    _ = try metrics_server.listen_address(spec.metrics_addr, spec.metrics_port);
     assert(parsed.command == command);
 }
 
@@ -279,7 +287,15 @@ fn run(init: std.process.Init, spec: Spec, parsed: *const Parsed) !u8 {
     defer flow.deinit(gpa);
     drivers[0].config.publish_hook = flow.publish_hook();
     drivers[1].config.publish_hook = flow.publish_hook();
-    loop(init.io, &flow) catch |err| {
+    var tx_metrics: tx_metrics_module.Metrics = .{};
+    const server = start_metrics(gpa, spec, &tx_metrics) catch |err| {
+        std.debug.print("withdrawer: metrics endpoint: {t}\n", .{err});
+        return 2;
+    };
+    defer if (server) |active| active.destroy(gpa);
+    if (server != null) flow.config.tx_metrics = &tx_metrics;
+    const exported: Exported = .{ .server = server, .tx_metrics = &tx_metrics, .drivers = drivers };
+    loop(init.io, &flow, exported) catch |err| {
         std.debug.print("withdrawer: {t}\n", .{err});
         report(&flow);
         return 1;
@@ -309,11 +325,42 @@ fn driver_config(
     };
 }
 
-fn loop(io: Io, flow: *flow_module.Flow) !void {
+/// `--metrics-port`: the server and the metrics it serves, or a null server when off.
+const Exported = struct {
+    server: ?*MetricsServer,
+    tx_metrics: *tx_metrics_module.Metrics,
+    drivers: *const [2]flow_module.SendDriver,
+
+    fn set_pending(exported: Exported) void {
+        if (exported.server == null) return;
+        const pending = exported.drivers[0].manager.pending_count() +
+            exported.drivers[1].manager.pending_count();
+        exported.tx_metrics.set_pending(pending);
+    }
+};
+
+fn start_metrics(
+    gpa: std.mem.Allocator,
+    spec: Spec,
+    tx_metrics: *tx_metrics_module.Metrics,
+) !?*MetricsServer {
+    const address = try metrics_server.listen_address(spec.metrics_addr, spec.metrics_port) orelse
+        return null;
+    const server = try MetricsServer.create(gpa);
+    errdefer server.destroy(gpa);
+    try tx_metrics.register(server.registry());
+    const bound = try server.listen(address);
+    std.debug.print("withdrawer: metrics on port {d}\n", .{bound.port});
+    return server;
+}
+
+fn loop(io: Io, flow: *flow_module.Flow, exported: Exported) !void {
     var reported_ms: u64 = 0;
     while (true) {
         const now = now_ms(io);
-        switch (try flow.step(now)) {
+        const progress = try flow.step(now);
+        exported.set_pending();
+        switch (progress) {
             .done => return,
             .working => {},
             .waiting => |waiting| {
@@ -322,7 +369,7 @@ fn loop(io: Io, flow: *flow_module.Flow) !void {
                     report(flow);
                 }
                 const sleep_ms = @min(waiting.until_ms -| now, 5_000);
-                try io.sleep(.fromMilliseconds(@intCast(@max(sleep_ms, 100))), .awake);
+                try MetricsServer.sleep(exported.server, io, @max(sleep_ms, 100));
             },
         }
     }
@@ -385,4 +432,29 @@ test "withdrawer: flags to config" {
         .data = "0xbeef",
     }, parsed);
     try testing.expectEqualSlices(u8, "\xbe\xef", parsed.initiate.?.data);
+}
+
+test "withdrawer: --metrics-port defaults off and validates the address" {
+    var diagnostic: cli.Diagnostic = .{};
+    const env: cli.Env = .{};
+    const args = [_][]const u8{
+        "--l1-rpc-url",  "http://127.0.0.1:8545",
+        "--portal",      "0x5050505050505050505050505050505050505050",
+        "--l1-chain-id", "900",
+        "--dev-account", "1",
+    };
+    const off = try cli.parse(Spec, env_prefix, &args, env, &diagnostic);
+    try testing.expectEqual(@as(u16, 0), off.metrics_port);
+    const parsed = try testing.allocator.create(Parsed);
+    defer testing.allocator.destroy(parsed);
+    try parse_config(.status, off, parsed);
+    const on_args = args ++ [_][]const u8{
+        "--metrics-port", "7311", "--metrics-addr", "127.0.0.1",
+    };
+    const on = try cli.parse(Spec, env_prefix, &on_args, env, &diagnostic);
+    try testing.expectEqual(@as(u16, 7311), on.metrics_port);
+    try parse_config(.status, on, parsed);
+    var bad = on;
+    bad.metrics_addr = "not-an-ip";
+    try testing.expectError(error.InvalidCharacter, parse_config(.status, bad, parsed));
 }

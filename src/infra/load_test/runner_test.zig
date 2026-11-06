@@ -316,6 +316,21 @@ test "load_test runner: offered load is confirmed with block-time latency" {
     try testing.expect(summary.throughput_milli_tps > 10_000);
 }
 
+test "load_test runner: tx_manager metrics aggregate every sender" {
+    const setup = try create_setup(try test_config(44));
+    defer destroy_setup(setup);
+    var tx_metrics: @import("../tx_manager/metrics.zig").Metrics = .{};
+    setup.runner.tx_metrics = &tx_metrics;
+    _ = setup.run(2_000);
+    const summary = setup.runner.recorder.summary();
+    try testing.expect(summary.submitted > 0);
+    try testing.expectEqual(summary.submitted, tx_metrics.submitted.get());
+    try testing.expectEqual(summary.confirmed + summary.failed, tx_metrics.done_count());
+    try testing.expectEqual(summary.confirmed - summary.reverted, tx_metrics.confirmed.get());
+    try testing.expectEqual(@as(i64, 0), tx_metrics.pending.get());
+    try testing.expectEqual(tx_metrics.done_count(), tx_metrics.latency.count.load(.monotonic));
+}
+
 test "load_test runner: a congested chain shows up as latency and backpressure" {
     const setup = try create_setup(try test_config(43));
     defer destroy_setup(setup);

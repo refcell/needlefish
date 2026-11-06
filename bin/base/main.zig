@@ -68,6 +68,7 @@ test {
     _ = roxy;
     _ = basectl;
     _ = audit;
+    _ = @import("metrics_server.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

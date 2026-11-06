@@ -9,11 +9,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const base = @import("base");
 const HttpTransport = @import("http_transport.zig").HttpTransport;
+const metrics_server = @import("metrics_server.zig");
 
 const Io = std.Io;
 const cli = base.utilities.cli;
 const rpc = base.batcher.rpc;
 const load_test = base.infra.load_test;
+const metrics = base.utilities.metrics;
+const tx_metrics_module = base.infra.tx_manager.metrics;
 
 const env_prefix = "BASE_LOAD_TEST_";
 
@@ -36,6 +39,8 @@ pub const Spec = struct {
     storage_slots: u32 = 4,
     looper_iterations: u32 = 10_000,
     json: bool = false,
+    metrics_addr: []const u8 = "0.0.0.0",
+    metrics_port: u16 = 0,
 
     pub const help = .{
         .rpc_url = "JSON-RPC endpoint (http://...)",
@@ -56,6 +61,8 @@ pub const Spec = struct {
         .storage_slots = "Fresh storage slots written per storage transaction",
         .looper_iterations = "Loop iterations per looper transaction (40 gas each)",
         .json = "Print the report as one JSON line on stdout",
+        .metrics_addr = "IPv4 address for /metrics and /healthz",
+        .metrics_port = "Port for /metrics and /healthz (0: off)",
     };
 };
 
@@ -172,7 +179,12 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     defer runner.deinit(init.gpa);
-    try run(init.io, runner);
+    const exporter = start_metrics(init.gpa, spec, runner) catch |err| {
+        std.debug.print("load-test: metrics endpoint: {t}\n", .{err});
+        return 2;
+    };
+    defer if (exporter) |active| active.destroy(init.gpa);
+    try run(init.io, runner, exporter);
     var buffer: [8192]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     if (spec.json) {
@@ -189,12 +201,84 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     return if (runner.recorder.confirmed > 0) 0 else 1;
 }
 
-fn run(io: Io, runner: *load_test.Runner) !void {
+/// The load-test's own counters next to the aggregated tx_manager metrics.
+const Exporter = struct {
+    const MetricsServer = metrics_server.Server(tx_metrics_module.entries_count + 5);
+
+    server: *MetricsServer,
+    tx_metrics: tx_metrics_module.Metrics = .{},
+    submitted: metrics.Counter = .{},
+    confirmed: metrics.Counter = .{},
+    reverted: metrics.Counter = .{},
+    failed: metrics.Counter = .{},
+    send_errors: metrics.Counter = .{},
+
+    fn create(gpa: std.mem.Allocator, address: base.utilities.io.Address) !*Exporter {
+        const exporter = try gpa.create(Exporter);
+        errdefer gpa.destroy(exporter);
+        exporter.* = .{ .server = try MetricsServer.create(gpa) };
+        errdefer exporter.server.destroy(gpa);
+        const registry = exporter.server.registry();
+        try exporter.tx_metrics.register(registry);
+        try registry.counter(
+            "load_test_submitted_total",
+            "Load sends accepted.",
+            &exporter.submitted,
+        );
+        try registry.counter(
+            "load_test_confirmed_total",
+            "Load sends confirmed (reverted included).",
+            &exporter.confirmed,
+        );
+        try registry.counter(
+            "load_test_reverted_total",
+            "Confirmed but reverted.",
+            &exporter.reverted,
+        );
+        try registry.counter(
+            "load_test_failed_total",
+            "Sends that never confirmed.",
+            &exporter.failed,
+        );
+        try registry.counter(
+            "load_test_send_errors_total",
+            "Sends the tx manager rejected before publishing.",
+            &exporter.send_errors,
+        );
+        const bound = try exporter.server.listen(address);
+        std.debug.print("load-test: metrics on port {d}\n", .{bound.port});
+        return exporter;
+    }
+
+    fn destroy(exporter: *Exporter, gpa: std.mem.Allocator) void {
+        exporter.server.destroy(gpa);
+        gpa.destroy(exporter);
+    }
+
+    fn sync(exporter: *Exporter, recorder: *const load_test.runner.Recorder) void {
+        metrics_server.sync_counter(&exporter.submitted, recorder.submitted);
+        metrics_server.sync_counter(&exporter.confirmed, recorder.confirmed);
+        metrics_server.sync_counter(&exporter.reverted, recorder.reverted);
+        metrics_server.sync_counter(&exporter.failed, recorder.failed);
+        metrics_server.sync_counter(&exporter.send_errors, recorder.send_errors);
+    }
+};
+
+fn start_metrics(gpa: std.mem.Allocator, spec: Spec, runner: *load_test.Runner) !?*Exporter {
+    const address = try metrics_server.listen_address(spec.metrics_addr, spec.metrics_port) orelse
+        return null;
+    const exporter = try Exporter.create(gpa, address);
+    runner.tx_metrics = &exporter.tx_metrics;
+    return exporter;
+}
+
+fn run(io: Io, runner: *load_test.Runner, exporter: ?*Exporter) !void {
     var progress_at_ms = now_ms(io) + 5_000;
     while (true) {
         const now = now_ms(io);
         if (runner.done(now)) return;
         runner.step(now);
+        if (exporter) |active| active.sync(&runner.recorder);
         if (now >= progress_at_ms and !runner.loading) {
             progress_at_ms = now + 5_000;
             const prep = &runner.prep.?;
@@ -210,7 +294,7 @@ fn run(io: Io, runner: *load_test.Runner) !void {
                 runner.outstanding(),
             });
         }
-        try io.sleep(.fromMilliseconds(50), .awake);
+        try Exporter.MetricsServer.sleep(if (exporter) |active| active.server else null, io, 50);
     }
 }
 
@@ -233,6 +317,20 @@ test "load-test: flags to config" {
         .chain_id = 901,
         .mix = "swap=1",
     }, &parsed));
+}
+
+test "load-test: --metrics-port defaults off and parses" {
+    var diagnostic: cli.Diagnostic = .{};
+    const env: cli.Env = .{};
+    const base_args = [_][]const u8{ "--rpc-url", rpc_url, "--chain-id", "901" };
+    const off = try cli.parse(Spec, env_prefix, &base_args, env, &diagnostic);
+    try testing.expectEqual(@as(u16, 0), off.metrics_port);
+    const none = try metrics_server.listen_address(off.metrics_addr, off.metrics_port);
+    try testing.expectEqual(@as(?base.utilities.io.Address, null), none);
+    const on_args = base_args ++ [_][]const u8{ "--metrics-port", "7310" };
+    const on = try cli.parse(Spec, env_prefix, &on_args, env, &diagnostic);
+    const address = (try metrics_server.listen_address(on.metrics_addr, on.metrics_port)).?;
+    try testing.expectEqual(@as(u16, 7310), address.port);
 }
 
 test "load-test: senders and contract mixes enable the prep phase" {

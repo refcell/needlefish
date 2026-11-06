@@ -13,6 +13,7 @@ pub const roxy = @import("roxy/root.zig");
 pub const basectl = @import("basectl/root.zig");
 pub const withdrawer = @import("withdrawer/root.zig");
 pub const audit = @import("audit/root.zig");
+pub const metrics_endpoint = @import("metrics_endpoint/root.zig");
 
 test {
     std.testing.refAllDecls(@This());

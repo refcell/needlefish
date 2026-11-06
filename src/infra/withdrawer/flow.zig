@@ -54,6 +54,17 @@ pub const Config = struct {
     pending_wait_ms: u64 = 180_000,
     /// Consecutive failed RPC rounds tolerated before giving up.
     rpc_failures_max: u32 = 20,
+    /// Optional: only withdrawals it accepts are handled (null handles every withdrawal of
+    /// the receipt). A receipt with none accepted fails with `NoMatchingWithdrawal`.
+    filter: ?WithdrawalFilter = null,
+    /// Optional tx_manager metrics fed with this flow's sends and completions.
+    tx_metrics: ?*tx_manager.metrics.Metrics = null,
+};
+
+/// Selects the withdrawals a flow handles (fee-jobs `confirm`: the FeeDisburser's own).
+pub const WithdrawalFilter = struct {
+    context: ?*const anyopaque = null,
+    accept: *const fn (context: ?*const anyopaque, withdrawal: *const Withdrawal) bool,
 };
 
 /// Appends one record durably (the binary writes and syncs the journal file).
@@ -85,6 +96,7 @@ pub const Error = reader_module.Error || status_module.Error || tx_manager.drive
         MissingFinalizationEvent,
         NothingToInitiate,
         NoSpaceLeft,
+        NoMatchingWithdrawal,
     };
 
 const Phase = enum {
@@ -124,6 +136,9 @@ pub const Flow = struct {
     /// Calldata of the current send (copied by the driver on `send`).
     calldata_buffer: []u8,
     l2_transaction: ?Hash = null,
+    /// Hashes of the receipt's withdrawals the filter rejected (the caller logs them).
+    skipped: [withdrawal_module.withdrawals_max]Hash = undefined,
+    skipped_count: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -270,6 +285,7 @@ pub const Flow = struct {
             .value = initiate.value,
             .data = input,
         }, now_ms);
+        if (flow.config.tx_metrics) |tx_metrics| tx_metrics.on_submit();
         flow.phase = .initiate_wait;
     }
 
@@ -282,6 +298,7 @@ pub const Flow = struct {
         const driver = flow.l2_driver.?;
         try driver.step(flow.reader.l2, now_ms);
         const completion = driver.take_completion() orelse return flow.wait_short(now_ms);
+        if (flow.config.tx_metrics) |tx_metrics| tx_metrics.on_completion(completion, now_ms);
         const hash = try flow.settle_completion(completion, flow.reader.l2, null);
         flow.l2_transaction = hash;
         flow.after_initiate();
@@ -296,7 +313,33 @@ pub const Flow = struct {
         flow.withdrawal_count = @intCast(found.len);
         flow.index = 0;
         assert(flow.withdrawal_count > 0);
+        if (flow.config.filter) |filter| try flow.apply_filter(filter);
         flow.phase = .decide;
+    }
+
+    /// The withdrawals of the receipt the filter rejected.
+    pub fn skipped_withdrawals(flow: *const Flow) []const Hash {
+        assert(flow.skipped_count <= withdrawal_module.withdrawals_max);
+        return flow.skipped[0..flow.skipped_count];
+    }
+
+    /// Keeps the accepted withdrawals in receipt order and records the skipped ones.
+    fn apply_filter(flow: *Flow, filter: WithdrawalFilter) Error!void {
+        const total = flow.withdrawal_count;
+        var kept: u32 = 0;
+        flow.skipped_count = 0;
+        for (flow.withdrawals[0..total]) |withdrawal| {
+            if (filter.accept(filter.context, &withdrawal)) {
+                flow.withdrawals[kept] = withdrawal;
+                kept += 1;
+            } else {
+                flow.skipped[flow.skipped_count] = withdrawal.hash();
+                flow.skipped_count += 1;
+            }
+        }
+        assert(kept + flow.skipped_count == total);
+        flow.withdrawal_count = kept;
+        if (kept == 0) return error.NoMatchingWithdrawal;
     }
 
     fn decide(flow: *Flow, now_ms: u64) Error!void {
@@ -391,6 +434,7 @@ pub const Flow = struct {
             .to = .{ .bytes = flow.reader.contracts.portal },
             .data = flow.calldata_buffer[0..flow.prepared_length],
         }, now_ms);
+        if (flow.config.tx_metrics) |tx_metrics| tx_metrics.on_submit();
         flow.phase = .send_wait;
     }
 
@@ -434,6 +478,7 @@ pub const Flow = struct {
     fn await_send(flow: *Flow, now_ms: u64) Error!void {
         try flow.l1_driver.step(flow.reader.l1, now_ms);
         const completion = flow.l1_driver.take_completion() orelse return flow.wait_short(now_ms);
+        if (flow.config.tx_metrics) |tx_metrics| tx_metrics.on_completion(completion, now_ms);
         const finalize_hash: ?Hash = if (flow.send.step == .finalize) flow.send.subject else null;
         const hash = try flow.settle_completion(completion, flow.reader.l1, finalize_hash);
         flow.note_transaction(hash);

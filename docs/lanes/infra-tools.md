@@ -64,7 +64,7 @@ allocation after startup.
   client IPs through `utilities/trusted_proxy`, 429 + JSON-RPC -32016 like proxyd.
 - [x] `infra/tx_manager` metrics core (`metrics.zig`): submitted, completed by outcome,
   bumps, pending, submit-to-completion latency histogram; `Completion.submitted_at_ms`.
-- [ ] Export tx_manager metrics from `load-test` and `withdrawer` (`--metrics-port`), after
+- [x] Export tx_manager metrics from `load-test` and `withdrawer` (`--metrics-port`), after
   their in-flight workers land.
 - [x] `infra/fee_jobs` + `base fee-jobs disburse|process|sweep` (port `fee-jobs`): precondition
   reads, one tx_manager send, fail on revert (tx_manager now reports receipt status).
@@ -218,6 +218,17 @@ allocation after startup.
   Status and not-ready waits poll every `--poll-interval-s` rather than sleeping until
   `ready_at`. The signer is required for every command (`checkWithdrawal` is called from
   it); `--dev-account` uses the public dev mnemonic.
+- tx_manager metrics export (`--metrics-port`, 0 = off, `--metrics-addr` default 0.0.0.0):
+  `infra/metrics_endpoint` is a `utilities/http` server on a `utilities/io` backend that
+  answers `/metrics` (fixed registry), `/`, and `/healthz`. The blocking tools keep their loops
+  and replace each sleep with `wait_ns`, which runs the IO for the same time, so no thread is
+  needed (`run_for_ns` blocks like a sleep and serves meanwhile). A scrape that arrives while
+  the tool is inside a blocking RPC waits for the next sleep (bounded by the RPC timeout).
+  load-test aggregates every sender driver into one `Metrics` through `Runner.tx_metrics`
+  (load-phase sends only; prep sends are not counted) and also exports `load_test_{submitted,
+  confirmed,reverted,failed,send_errors}_total`, synced from the recorder each loop. The
+  withdrawer feeds its flow's sends/completions through `flow.Config.tx_metrics`; pending is
+  the sum over its L1 and L2 drivers.
 
 - basectl denim: pure evaluation (`denim.zig`) is separate from RPC gathering
   (`denim_fetch.zig`). HTTP only: base/base's three WebSocket subscription checks are not
@@ -320,3 +331,8 @@ allocation after startup.
   under Findings.
 - 2026-11-05: `basectl denim` rerun on a fresh devnet from main: block/tx millisecond fields
   pass; remaining fail is the BaseTime getters (`eth_call` default gas over the Osaka cap).
+- 2026-11-05: `--metrics-port` for `load-test` and `withdrawer` (`infra/metrics_endpoint`,
+  SimIo + OS-backend scrape tests, runner/flow metrics tests). Live on dev-l1: load-test 5 tx/s,
+  mid-run scrape `tx_manager_submitted_total 48`, `completed{confirmed} 45`, `pending 3`, then
+  89/85/4 eight seconds later; 99/99 confirmed. `withdrawer initiate` scrape: submitted 1,
+  pending 1.

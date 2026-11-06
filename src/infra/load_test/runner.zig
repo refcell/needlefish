@@ -17,6 +17,7 @@ const assert = std.debug.assert;
 const rpc = @import("../../batcher/rpc/root.zig");
 const driver_module = @import("../tx_manager/driver.zig");
 const manager = @import("../tx_manager/manager.zig");
+const tx_metrics_module = @import("../tx_manager/metrics.zig");
 const accounts = @import("../../batcher/devnet/accounts.zig");
 const pacing = @import("pacing.zig");
 const workload = @import("workload.zig");
@@ -84,6 +85,8 @@ pub const Runner = struct {
     prep_deadline_ms: u64 = 0,
     /// False while the prep phase runs.
     loading: bool = true,
+    /// Optional tx_manager metrics for the load phase's sends (prep sends are not counted).
+    tx_metrics: ?*tx_metrics_module.Metrics = null,
 
     const Submitted = struct { id: u64 = 0, at_ms: u64 = 0 };
 
@@ -231,12 +234,16 @@ pub const Runner = struct {
     pub fn step(runner: *Runner, now_ms: u64) void {
         if (!runner.loading) return runner.step_prep(now_ms);
         if (runner.submitting(now_ms)) runner.submit_owed(now_ms);
+        var pending: u32 = 0;
         for (runner.drivers[0..runner.sender_count], 0..) |*driver, index| {
             driver.step(runner.clients[index], now_ms) catch {
                 runner.rpc_errors += 1;
             };
             runner.collect(@intCast(index), now_ms);
+            pending += driver.manager.pending_count();
         }
+        if (runner.tx_metrics) |tx_metrics| tx_metrics.set_pending(pending);
+        assert(pending <= runner.sender_count * sends_per_sender_max);
     }
 
     fn step_prep(runner: *Runner, now_ms: u64) void {
@@ -273,6 +280,7 @@ pub const Runner = struct {
             };
             runner.remember(index, id, now_ms);
             runner.recorder.record_submit(now_ms);
+            if (runner.tx_metrics) |tx_metrics| tx_metrics.on_submit();
         }
         // Owed sends that found no sender are not carried over (open loop).
         runner.pacer.record_sent(owed);
@@ -307,6 +315,7 @@ pub const Runner = struct {
                 now_ms - at_ms,
                 now_ms,
             );
+            if (runner.tx_metrics) |tx_metrics| tx_metrics.on_completion(completion, now_ms);
         }
     }
 
