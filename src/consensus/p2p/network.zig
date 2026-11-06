@@ -73,6 +73,7 @@ pub fn service_config(
             .established_inbound_max = options.peers_hi,
             .established_outbound_max = options.peers_hi,
         },
+        .redial_known_interval_ns = options.redial_known_interval_s * ns_per_s,
         .ban_enabled = options.ban_peers,
         .ban_threshold = @floatFromInt(options.ban_threshold),
         .ban_duration_ns = options.ban_duration_min * 60 * ns_per_s,

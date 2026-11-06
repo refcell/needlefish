@@ -210,6 +210,13 @@ pub const Stats = struct {
     blocked_inbound: [topics_max]u64 = @splat(0),
     /// IWANT and IDONTWANT ids skipped because the peer's heartbeat budget ran out.
     control_ids_ignored: u64 = 0,
+    /// Inbound RPC frames and their parts, before any filtering (interop diagnostics).
+    rpcs_received: u64 = 0,
+    publishes_received: u64 = 0,
+    grafts_received: u64 = 0,
+    prunes_received: u64 = 0,
+    ihaves_received: u64 = 0,
+    iwants_received: u64 = 0,
 };
 
 pub const Router = struct {
@@ -422,7 +429,7 @@ pub const Router = struct {
         return router.cache.data(entry);
     }
 
-    fn subscribed_count(router: *const Router) u32 {
+    pub fn subscribed_count(router: *const Router) u32 {
         var count: u32 = 0;
         for (router.topics[0..router.topics_count]) |topic| count += @intFromBool(topic.subscribed);
         return count;
@@ -508,6 +515,12 @@ pub const Router = struct {
         if (source.score < router.config.thresholds.graylist_threshold) return error.Graylisted;
         router.scratch.decode(frame) catch return error.InvalidRpc;
         const message = router.scratch;
+        router.stats.rpcs_received += 1;
+        router.stats.publishes_received += message.publish_slice().len;
+        router.stats.grafts_received += message.graft_slice().len;
+        router.stats.prunes_received += message.prune_slice().len;
+        router.stats.ihaves_received += message.ihave_slice().len;
+        router.stats.iwants_received += message.iwant_slice().len;
         for (message.subscriptions_slice()) |sub_opts| router.on_subscription(slot, sub_opts);
         for (message.publish_slice()) |published| router.on_message(slot, published, now_ns);
         for (message.graft_slice()) |graft| router.on_graft(slot, graft.topic_id, now_ns);

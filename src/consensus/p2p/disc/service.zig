@@ -68,6 +68,9 @@ pub const Stats = struct {
     /// (sigp `UnverifiableEnr`), and those that then answered a ping there.
     unverifiable_enr: u64 = 0,
     unverifiable_enr_verified: u64 = 0,
+    /// Handshakes we sent in answer to a WHOAREYOU (outbound sessions; behind NAT the
+    /// inbound `handshakes_completed` stays zero).
+    handshakes_initiated: u64 = 0,
 };
 
 /// A record from a handshake whose advertised socket is being pinged before insertion.
@@ -714,6 +717,7 @@ pub const Service = struct {
         };
         service.random.bytes(&outgoing.masking_iv);
         service.emit(from, &outgoing);
+        service.stats.handshakes_initiated += 1;
         pending.nonce = nonce;
         pending.handshake_sent = true;
         pending.deadline_ns = now_ns + service.config.request_timeout_ns;

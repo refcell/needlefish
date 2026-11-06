@@ -40,6 +40,9 @@ pub const Options = struct {
     redial: u32 = 500,
     redial_period_min: u64 = 60,
     pending_dial_timeout_s: u64 = 30,
+    /// Re-dial known unconnected nodes every this many seconds; 0 is off (needlefish only,
+    /// for nodes without inbound reachability: `Service.Config.redial_known_interval_ns`).
+    redial_known_interval_s: u64 = 0,
     bootnodes: [bootnodes_max][]const u8 = undefined,
     bootnodes_count: u32 = 0,
     bootnodes_file: ?[]const u8 = null,
@@ -141,6 +144,7 @@ fn apply_number(options: *Options, name: []const u8, text: []const u8) Error!boo
         .{ .name = "redial", .field = "redial" },
         .{ .name = "redial.period", .field = "redial_period_min" },
         .{ .name = "pending-dial.timeout", .field = "pending_dial_timeout_s" },
+        .{ .name = "redial.known-interval", .field = "redial_known_interval_s" },
     };
     inline for (fields) |entry| {
         if (eql(name, entry.name)) {

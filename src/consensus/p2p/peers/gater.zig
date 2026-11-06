@@ -186,6 +186,11 @@ pub const Gater = struct {
         return null;
     }
 
+    /// True while a dial to `peer` is pending.
+    pub fn is_dialing(gater: *const Gater, peer: peer_id.PeerId) bool {
+        return gater.find_pending(&peer) != null;
+    }
+
     fn find_pending(gater: *const Gater, peer: *const peer_id.PeerId) ?u32 {
         for (gater.pending[0..gater.pending_count], 0..) |*dial, index| {
             if (dial.peer.eql(peer)) return @intCast(index);

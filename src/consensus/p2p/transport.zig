@@ -121,7 +121,12 @@ pub fn Transport(comptime IO: type) type {
             datagrams_sent: u64 = 0,
             datagrams_dropped: u64 = 0,
             datagram_receive_errors: u64 = 0,
+            /// Closes per connection-level reason (`connection.CloseReason`).
+            close_reasons: [close_reason_count]u64 = @splat(0),
+            /// Links torn down by a socket error or end of stream, with no connection reason.
+            socket_closes: u64 = 0,
         };
+        pub const close_reason_count = std.meta.fieldNames(connection_module.CloseReason).len;
 
         /// Allocates every link and buffer up front. `transport` must not move afterwards.
         pub fn init(
@@ -677,6 +682,12 @@ pub fn Transport(comptime IO: type) type {
             assert(link.state == .open or link.state == .connecting);
             transport.stats.closed += 1;
             link.slot = null;
+            const reason = if (link.connection_live) link.connection.closed_reason() else null;
+            if (reason) |value| {
+                transport.stats.close_reasons[@backingInt(value)] += 1;
+            } else {
+                transport.stats.socket_closes += 1;
+            }
             if (link.connection_live) {
                 link.connection.deinit();
                 link.connection_live = false;

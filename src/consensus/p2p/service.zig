@@ -61,6 +61,10 @@ pub const Config = struct {
     score_inspect_interval_ns: u64 = 15 * ns_per_s,
     gater_prune_interval_ns: u64 = 60 * ns_per_s,
     pending_dial_prune_interval_ns: u64 = 5 * ns_per_s,
+    /// Re-dial every known, unconnected node of this chain this often; 0 is off (base/base
+    /// dials only what each lookup returns). A node behind NAT gets no inbound peers, and
+    /// busy peers refuse outbound ones until a slot frees, so it must keep asking.
+    redial_known_interval_ns: u64 = 0,
     mcache: @import("gossip/mcache.zig").Config = .{},
     /// Compressed accepted blocks held until consensus pops them (`handler.Config`).
     accepted_bytes: u32 = 32 * (1 << 20),
@@ -114,6 +118,8 @@ pub const Stats = struct {
     connection_durations: observations.Durations = .{},
     banned: u64 = 0,
     invalid_rpcs: u64 = 0,
+    /// Dials started by `redial_known`.
+    redials: u64 = 0,
 };
 
 const commands_max = 128;
@@ -123,7 +129,7 @@ pub const Peerstore = peerstore_module.Peerstore(PeerInfo);
 /// What identify and ping told us about a connected peer, bounded for static storage.
 pub const PeerInfo = struct {
     pub const text_max = 64;
-    pub const protocols_max = 8;
+    pub const protocols_max = 16;
     pub const addresses_max = 4;
 
     agent_version: Text = .{},
@@ -196,6 +202,7 @@ pub const Service = struct {
     next_inspect_ns: u64 = 0,
     next_gater_prune_ns: u64 = 0,
     next_dial_prune_ns: u64 = 0,
+    next_redial_known_ns: u64 = 0,
     /// Time of the latest `tick` (for calls that carry no time, like admin RPC).
     now_ns: u64 = 0,
     stats: Stats = .{},
@@ -532,6 +539,34 @@ pub const Service = struct {
             service.next_dial_prune_ns = now_ns + service.config.pending_dial_prune_interval_ns;
             service.prune_expired_dials(now_ns);
         }
+        const redial_interval_ns = service.config.redial_known_interval_ns;
+        if (redial_interval_ns > 0 and now_ns >= service.next_redial_known_ns) {
+            service.next_redial_known_ns = now_ns + redial_interval_ns;
+            service.redial_known(now_ns);
+        }
+    }
+
+    /// Dials every node in the discovery table that is on this chain and not connected,
+    /// subject to the gater and the pending-dial limit like any other dial.
+    fn redial_known(service: *Service, now_ns: u64) void {
+        const chain_id = service.config.rollup.l2_chain_id;
+        var entries: [32]*const disc.table.Entry = undefined;
+        var dialed: u32 = 0;
+        var distance: u16 = 1;
+        while (distance <= 256) : (distance += 1) {
+            const count = service.discovery.table.at_distance(distance, &entries);
+            for (entries[0..count]) |entry| {
+                if (enr.validate_chain(&entry.record, chain_id) != .valid) continue;
+                const address = multiaddr.from_enr(&entry.record) orelse continue;
+                const peer = address.peer() orelse continue;
+                if (service.slot_of(&peer) != null) continue;
+                if (service.gater.is_dialing(peer)) continue;
+                service.dial(&address, now_ns);
+                dialed += 1;
+            }
+        }
+        service.stats.redials += dialed;
+        assert(distance == 257);
     }
 
     /// Disconnects peers under the ban threshold and bans them in discovery.

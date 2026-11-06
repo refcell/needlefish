@@ -379,3 +379,55 @@ test "p2p service: dial and inbound refusals are counted by base/base reason" {
     try std.testing.expectEqual(@as(u64, 1), inbound[@backingInt(reason)]);
     try std.testing.expectEqual(@as(u64, 1), service.stats.inbound_refused);
 }
+
+fn dials_to(service: *Service, peer: peer_id.PeerId) u32 {
+    var count: u32 = 0;
+    while (service.pop_command()) |command| switch (command) {
+        .dial => |address| count += @intFromBool(address.peer().?.eql(&peer)),
+        .disconnect => {},
+    };
+    return count;
+}
+
+test "p2p service: known unconnected nodes are redialed only when enabled" {
+    var fixture: @import("rpc_test.zig").Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const service = fixture.service;
+    // On this chain and unconnected, on another chain, and already connected (secret 21).
+    const secrets = [_]u8{ 61, 62, 21 };
+    const chains = [_]u64{ chain_id, 10, chain_id };
+    var peers: [3]peer_id.PeerId = undefined;
+    var addresses: [3]multiaddr.Multiaddr = undefined;
+    for (secrets, chains, &peers, &addresses, 0..) |byte, chain, *peer, *address, index| {
+        var secret: [32]u8 = @splat(0);
+        secret[31] = byte;
+        const record = try enr.build(secret, .{
+            .ip4 = .{ 10, 6, @intCast(index), 1 },
+            .tcp = 9222,
+            .udp = 9223,
+            .opstack = .{ .chain_id = chain },
+        });
+        const endpoint = disc.service.Service.endpoint_of(&record).?;
+        _ = service.discovery.table.insert(&record, endpoint, 0);
+        peer.* = peer_id.from_public_key(record.public_key);
+        address.* = multiaddr.from_enr(&record).?;
+    }
+    // Off (base/base): nodes already in the table are never dialed again.
+    service.tick(1 * ns_per_s);
+    service.tick(30 * ns_per_s);
+    try std.testing.expectEqual(@as(u32, 0), dials_to(service, peers[0]));
+    service.config.redial_known_interval_ns = 10 * ns_per_s;
+    service.tick(31 * ns_per_s);
+    try std.testing.expectEqual(@as(u32, 1), dials_to(service, peers[0]));
+    try std.testing.expectEqual(@as(u64, 1), service.stats.redials);
+    // A busy peer refused us; the next attempt waits for the interval.
+    service.on_dial_failed(&addresses[0]);
+    service.tick(35 * ns_per_s);
+    try std.testing.expectEqual(@as(u32, 0), dials_to(service, peers[0]));
+    service.tick(41 * ns_per_s);
+    try std.testing.expectEqual(@as(u32, 1), dials_to(service, peers[0]));
+    // The other chain's node and the connected peer were never dialed.
+    try std.testing.expectEqual(@as(u64, 2), service.stats.redials);
+    try std.testing.expectEqual(@as(u64, 0), count_of(service, .already_connected));
+}
