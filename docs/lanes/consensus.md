@@ -67,6 +67,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     pick origins at the L1 head minus confirmations
   - [x] `--sequencer.recover` (initial recover mode)
   - [x] `--rpc.disabled`
+  - [x] `--rpc.execution-forwarding-endpoint`: unserved HTTP RPC methods go to the EL
   - [x] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
@@ -104,6 +105,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- execution forwarding: single requests over HTTP only; batches and WebSocket stay local (unknown methods -32601), because the servers cannot defer one batch entry or a WS frame. base/base forwards per batch entry.
 - safedb persistence: one rewritten image (like checkpoints) instead of redb; the in-memory safedb stays on without a path (base/base disables tracking), since the RPC is useful anyway.
 - Subsecond (Denim) blocks follow base/base timing: build at the parent's timestamp, `getPayload` at T - 50 ms. Pre-Denim blocks keep build-at-T, seal-on-payload-id (base/base builds one slot early); the devnet runs Denim from genesis so this only affects legacy chains.
 - Admin and dev RPC are off by default like base/base (unmerged modules answer -32601). The devnet sequencer passes `--rpc.enable-admin` because the batcher finds the leader with `admin_sequencerActive`.
@@ -232,6 +234,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: rpc: `service/forwarding.zig` forwards single HTTP JSON-RPC calls for methods the router does not serve to `--rpc.execution-forwarding-endpoint` (deferred responses, 4 keep-alive clients, -32603 on failure or when all are busy).
 - 2026-11-05: rpc: `--rpc.disabled` starts no HTTP or WebSocket RPC server (`Options.rpc_address` is optional; `start` returns null and logs "rpc disabled").
 - 2026-11-05: safedb: `service/safedb_store.zig` persists the L1->safe-head entries (`--safedb.path`) as one crc-checked image (`magic | count | 80-byte records | crc32`) through `store_file`; `SafeDB.version` drives writes; the driver waits for the load.
 - 2026-11-05: devnet smoke passes at native 200 ms blocks on main (Denim at genesis from batcher-devnet, EL fixes from node): 25 blocks/5 s, verifier derives, load test 99/99.

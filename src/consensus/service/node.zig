@@ -46,6 +46,7 @@ const engine_json = @import("../sources/engine_json.zig");
 const signer_watcher = @import("signer_watcher.zig");
 const checkpoint = @import("checkpoint.zig");
 const safedb_store = @import("safedb_store.zig");
+const forwarding = @import("forwarding.zig");
 const metrics_module = @import("metrics.zig");
 const follow = @import("follow.zig");
 const conductor_module = @import("conductor.zig");
@@ -104,6 +105,9 @@ pub const Options = struct {
     /// Follow mode (`--source-l2-rpc`): insert blocks from this source node's execution RPC
     /// instead of deriving them.
     follow_source: ?Address = null,
+    /// HTTP JSON-RPC calls for methods this node does not serve go to this execution RPC
+    /// (`--rpc.execution-forwarding-endpoint`); unknown methods fail when null.
+    execution_forwarding: ?Address = null,
     /// Sequencer conductor (`--conductor.rpc`): commits sealed payloads, gates starting.
     conductor: ?Address = null,
     /// Serve `admin_*` (`--rpc.enable-admin`); base/base leaves them off by default.
@@ -335,6 +339,8 @@ pub fn Node(comptime IO: type) type {
         /// Persists `safe_db` when `safedb_path` is set.
         safedb_store: ?*SafeDbStore = null,
         safedb_logged: bool = false,
+        /// Forwards unserved HTTP RPC methods when `execution_forwarding` is set.
+        forwarder: ?*Forwarder = null,
         metrics: metrics_module.Metrics = .{},
         metrics_server: ?MetricsServer = null,
         follower: ?*Follower = null,
@@ -345,6 +351,13 @@ pub fn Node(comptime IO: type) type {
 
         pub const Checkpoints = checkpoint.CheckpointStore(IO);
         pub const SafeDbStore = safedb_store.SafeDbStore(IO);
+        pub const Forwarder = forwarding.Forwarder(IO, RpcServer);
+        /// Every method name the RPC router serves; the rest may be forwarded.
+        const served_methods = names: {
+            var names: [RpcRouter.all.len][]const u8 = undefined;
+            for (RpcRouter.all, 0..) |method, index| names[index] = method.name;
+            break :names names;
+        };
         pub const Follower = follow.Follower(IO);
         pub const Conductor = conductor_module.Conductor(IO);
         pub const WsRpc = ws_rpc_module.WsRpc(IO);
@@ -413,6 +426,8 @@ pub fn Node(comptime IO: type) type {
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
             errdefer node.rpc_server.deinit();
+            if (options.execution_forwarding) |address| try node.init_forwarder(address);
+            errdefer node.deinit_forwarder();
             try node.init_metrics();
             errdefer node.deinit_metrics();
             if (options.upgrade_signal) |config| try node.init_upgrade(&config);
@@ -619,6 +634,28 @@ pub fn Node(comptime IO: type) type {
             store.deinit(node.allocator);
             node.allocator.destroy(store);
             node.checkpoints = null;
+        }
+
+        fn init_forwarder(node: *Self, address: Address) !void {
+            assert(node.forwarder == null);
+            const forwarder = try node.allocator.create(Forwarder);
+            errdefer node.allocator.destroy(forwarder);
+            const options = node.options.http_client;
+            try forwarder.init(node.allocator, node.io, &node.rpc_server, address, options);
+            node.forwarder = forwarder;
+            assert(node.forwarder != null);
+        }
+
+        /// Waits (bounded) for forwarded calls in flight, then frees the clients.
+        fn deinit_forwarder(node: *Self) void {
+            const forwarder = node.forwarder orelse return;
+            var rounds: u32 = 0;
+            while (forwarder.busy() and rounds < 1000) : (rounds += 1) {
+                node.io.run_for_ns(std.time.ns_per_ms) catch break;
+            }
+            forwarder.deinit();
+            node.allocator.destroy(forwarder);
+            node.forwarder = null;
         }
 
         fn init_safedb_store(node: *Self, path: []const u8) !void {
@@ -835,6 +872,7 @@ pub fn Node(comptime IO: type) type {
         /// Frees everything. The IO must not run afterwards (in-flight operations would
         /// complete into freed memory); the binary tears both down together.
         pub fn deinit(node: *Self) void {
+            node.deinit_forwarder();
             node.deinit_p2p();
             node.deinit_upgrade();
             node.deinit_checkpoints();
@@ -912,9 +950,10 @@ pub fn Node(comptime IO: type) type {
             const signer_busy = if (node.signer) |signer| signer.busy() else false;
             const follower_busy = if (node.follower) |follower| follower.busy() else false;
             const conductor_busy = if (node.conductor) |conductor| conductor.busy() else false;
+            const forwarder_busy = if (node.forwarder) |forwarder| forwarder.busy() else false;
             return node.watcher.busy() or node.l1.busy() or node.l2.busy() or
                 node.message_passer.busy() or node.engine.busy() or blobs_busy or signer_busy or
-                follower_busy or conductor_busy;
+                follower_busy or conductor_busy or forwarder_busy;
         }
 
         /// One step of the node's state machines; call every few milliseconds.
@@ -925,6 +964,7 @@ pub fn Node(comptime IO: type) type {
             node.message_passer.tick();
             node.polling.tick();
             if (node.blobs) |blobs| blobs.tick();
+            if (node.forwarder) |forwarder| forwarder.tick();
             const now_ms = node.io.now_realtime_ns() / std.time.ns_per_ms;
             // Startup may need the checkpoints, so the driver waits until they are read.
             const checkpoints_ready = if (node.checkpoints) |store| store.loaded != null else true;
@@ -1085,6 +1125,9 @@ pub fn Node(comptime IO: type) type {
             response: *http.ResponseBuilder,
         ) void {
             if (request.method != .POST) return response.fail(405);
+            if (node.forwarder) |forwarder| {
+                if (forwarder.handle(request.body, &served_methods, response)) return;
+            }
             const outcome = node.serve_rpc(request.body, response.writer());
             if (outcome == .empty) response.status = 204;
         }
@@ -1737,5 +1780,89 @@ test "node: receives gossiped unsafe blocks from a p2p peer" {
     // Startup has not finished (no L1), so the driver does not take the block yet.
     try testing.expectEqual(@as(u64, 1), node.driver.stats.unsafe_ignored);
     peer.stop();
+    while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
+}
+
+const ForwardCapture = struct {
+    body: [512]u8 = undefined,
+    length: usize = 0,
+    status: u16 = 0,
+    done: bool = false,
+
+    fn on_response(
+        capture: *ForwardCapture,
+        _: *http_client.Client(sim.SimIo),
+        result: http_client.Error!*const http.parser.Response,
+    ) void {
+        const response = result catch {
+            capture.done = true;
+            return;
+        };
+        capture.status = response.status;
+        capture.length = @min(response.body.len, capture.body.len);
+        @memcpy(capture.body[0..capture.length], response.body[0..capture.length]);
+        capture.done = true;
+    }
+
+    fn text(capture: *const ForwardCapture) []const u8 {
+        return capture.body[0..capture.length];
+    }
+};
+
+test "node: unserved HTTP RPC methods are forwarded to the execution endpoint" {
+    var fake: FakeRpc = .{};
+    fake.add(.{ .method = "eth_chainId", .result = "\"0x385\"" });
+    var harness: Harness = undefined;
+    try harness.init_connections(&fake, 0xf0, 8);
+    defer harness.deinit();
+    const rollup: RollupConfig = .{ .block_time = 2 };
+    var log_buffer: [4096]u8 = undefined;
+    var memory: log.MemorySink = .{ .buffer = &log_buffer };
+    var logger: log.Logger = .{ .sink = memory.sink() };
+    const node = try testing.allocator.create(TestNode);
+    defer testing.allocator.destroy(node);
+    const rpc_address = sim.Address.ip4(.{ 10, 0, 0, 2 }, 7545);
+    try node.init(testing.allocator, &harness.client_io, &logger, &rollup, .{
+        .l1 = harness.address,
+        .l2 = harness.address,
+        .jwt_secret = .{ .bytes = @splat(7) },
+        .rpc_address = rpc_address,
+        .http_client = harness_module.client_options,
+        .execution_forwarding = harness.address,
+    });
+    defer node.deinit();
+    _ = try node.start();
+    var caller_io: sim.SimIo = undefined;
+    try sim.SimIo.init(&caller_io, testing.allocator, &harness.world, .{
+        .host = sim.Address.ip4(.{ 10, 0, 0, 3 }, 0),
+    });
+    defer caller_io.deinit();
+    const Client = http_client.Client(sim.SimIo);
+    var caller = try Client.init(testing.allocator, &caller_io, rpc_address, .{});
+    defer caller.deinit();
+    const headers = [_]http.parser.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    const bodies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":41,"method":"eth_chainId","params":[]}
+        ,
+        \\{"jsonrpc":"2.0","id":42,"method":"optimism_rollupConfig","params":[]}
+    };
+    var captures: [bodies.len]ForwardCapture = @splat(.{});
+    for (bodies, &captures) |body, *capture| {
+        const on_response = ForwardCapture.on_response;
+        try caller.request(*ForwardCapture, capture, on_response, .POST, "/", &headers, body);
+        var rounds: u32 = 0;
+        while (!capture.done and rounds < 200) : (rounds += 1) {
+            node.tick();
+            harness.world.run_for_ns(std.time.ns_per_ms);
+        }
+        try testing.expect(capture.done);
+        try testing.expectEqual(@as(u16, 200), capture.status);
+    }
+    // The fake EL answered the forwarded call verbatim; the served one stayed local.
+    try testing.expect(std.mem.indexOf(u8, captures[0].text(), "\"0x385\"") != null);
+    try testing.expect(std.mem.indexOf(u8, captures[0].text(), "\"id\":41") != null);
+    try testing.expect(std.mem.indexOf(u8, captures[1].text(), "\"block_time\":2") != null);
+    try testing.expectEqual(@as(u64, 1), node.forwarder.?.forwarded);
+    try testing.expectEqual(@as(u64, 0), node.forwarder.?.failed);
     while (node.busy()) harness.world.run_for_ns(std.time.ns_per_s / 10);
 }

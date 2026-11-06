@@ -17,7 +17,7 @@ const usage =
     \\usage: base consensus --rollup-config ROLLUP.json --l1 URL --l2 URL --l2-jwt FILE
     \\         [--l1-beacon URL] [--rpc.addr IP] [--rpc.port P]
     \\         [--rpc.ws-enabled [--rpc.ws-port P]] [--rpc.enable-admin] [--rpc.dev-enabled]
-    \\         [--rpc.disabled]
+    \\         [--rpc.disabled] [--rpc.execution-forwarding-endpoint URL]
     \\         [--l1.verifier-confs N] [--sequencer.l1-confs N] [--sequencer.recover]
     \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
@@ -36,6 +36,8 @@ pub const Flags = struct {
     l2: ?io.Address = null,
     /// Follow mode (base/base `follow --source-l2-rpc`): no derivation.
     source_l2_rpc: ?io.Address = null,
+    /// Execution RPC that serves the HTTP RPC methods this node does not.
+    execution_forwarding: ?io.Address = null,
     /// op-conductor (base/base `--conductor.rpc`).
     conductor_rpc: ?io.Address = null,
     sequencer_stopped: bool = false,
@@ -163,6 +165,8 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.l2 = try parse_url(value);
     } else if (eql(u8, arg, "--conductor.rpc")) {
         flags.conductor_rpc = try parse_url(value);
+    } else if (eql(u8, arg, "--rpc.execution-forwarding-endpoint")) {
+        flags.execution_forwarding = try parse_url(value);
     } else if (eql(u8, arg, "--source-l2-rpc")) {
         flags.source_l2_rpc = try parse_url(value);
     } else if (eql(u8, arg, "--l2-jwt")) {
@@ -289,6 +293,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .checkpoint_path = flags.checkpoint_path,
         .safedb_path = flags.safedb_path,
         .follow_source = flags.source_l2_rpc,
+        .execution_forwarding = flags.execution_forwarding,
         .rpc_admin = flags.rpc_admin,
         .rpc_dev = flags.rpc_dev,
         .ws_address = addresses.ws,
@@ -441,6 +446,11 @@ test "consensus: flags" {
     try std.testing.expect(!with_ws.rpc_disabled);
     const no_rpc = try parse_flags(&(ws_args ++ [_][]const u8{"--rpc.disabled"}));
     try std.testing.expect(no_rpc.rpc_disabled and no_rpc.rpc_ws_enabled);
+    const forward_args = required ++ [_][]const u8{
+        "--rpc.execution-forwarding-endpoint", "http://127.0.0.1:9545",
+    };
+    const forwarding = try parse_flags(&forward_args);
+    try std.testing.expectEqual(@as(u16, 9545), forwarding.execution_forwarding.?.port);
     const no_servers = server_addresses(&no_rpc);
     try std.testing.expect(no_servers.rpc == null and no_servers.ws == null);
     const servers = server_addresses(&with_ws);
