@@ -15,6 +15,7 @@ pub const config = @import("config.zig");
 pub const link = @import("link.zig");
 pub const backend = @import("backend.zig");
 pub const registration = @import("registration.zig");
+pub const rpc_registry = @import("rpc_registry.zig");
 pub const pool = @import("pool.zig");
 pub const health = @import("health.zig");
 pub const proof_generator = @import("proof_generator.zig");
