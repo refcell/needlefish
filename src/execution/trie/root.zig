@@ -30,6 +30,7 @@ pub const RlpNode = node.RlpNode;
 pub const empty_root = node.empty_root;
 pub const HashBuilder = hash_builder.HashBuilder;
 pub const HashBuilderType = hash_builder.HashBuilderType;
+pub const BranchNode = hash_builder.BranchNode;
 pub const TrieType = trie.TrieType;
 pub const verify_proof = proof.verify;
 pub const ordered_trie_root = ordered.ordered_trie_root;

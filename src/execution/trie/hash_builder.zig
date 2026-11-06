@@ -36,6 +36,45 @@ pub const NodeSink = struct {
     };
 };
 
+/// One branch of a 32-byte-key trie (state or storage) together with the extension above it,
+/// if any: the unit stored as a branch record (`db/branch_record.zig`). The branch's
+/// value slot is always empty in these tries.
+pub const BranchNode = struct {
+    /// A branch sits at depth <= 63 of a 64-nibble trie, so its extension has <= 63 nibbles.
+    pub const extension_nibbles_max = 63;
+
+    extension_len: u8 = 0,
+    /// Nibbles of the extension above the branch, `extension_len` of them.
+    extension: [extension_nibbles_max]u8 = undefined,
+    /// One bit per present child (bit n = nibble n). At least two bits.
+    state_mask: u16 = 0,
+    /// Children that are branch records themselves (subset of `state_mask`); the other
+    /// present children are leaves.
+    tree_mask: u16 = 0,
+    /// The present children's references in nibble order, `@popCount(state_mask)` of them.
+    children: [16]RlpNode = undefined,
+    /// The full key of each leaf child in nibble order, `leaf_count()` of them.
+    leaf_keys: [16]Hash = undefined,
+
+    pub fn extension_slice(self: *const BranchNode) []const u8 {
+        assert(self.extension_len <= extension_nibbles_max);
+        return self.extension[0..self.extension_len];
+    }
+
+    pub fn child_count(self: *const BranchNode) u32 {
+        return @popCount(self.state_mask);
+    }
+
+    pub fn leaf_mask(self: *const BranchNode) u16 {
+        assert(self.tree_mask & ~self.state_mask == 0);
+        return self.state_mask & ~self.tree_mask;
+    }
+
+    pub fn leaf_count(self: *const BranchNode) u32 {
+        return @popCount(self.leaf_mask());
+    }
+};
+
 pub fn HashBuilderType(comptime depth_max: u32) type {
     comptime assert(depth_max > 0 and depth_max <= nibbles_module.nibbles_max);
     return struct {
