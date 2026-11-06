@@ -60,6 +60,9 @@ pub fn BuilderType(comptime Table: type) type {
         blocks_allowed: u64 = 0,
         /// The build waits for `grant` before its next block.
         paused: bool = false,
+        /// Optional: called when a paced build pauses (its last granted block is written), so
+        /// an owner that grants one block at a time learns the write completed.
+        pause_callback: ?Callback = null,
 
         pub fn init(allocator: std.mem.Allocator, grid: *Table.Grid) !Self {
             const block_size = grid.config.block_size;
@@ -270,6 +273,8 @@ pub fn BuilderType(comptime Table: type) type {
                     // The next step writes one block (data or index) or none (an error).
                     if (self.blocks_allowed == 0) {
                         self.paused = true;
+                        // Last: the owner may `grant` from inside the callback.
+                        if (self.pause_callback) |callback| callback(self);
                         return;
                     }
                     self.next_data_block();

@@ -15,6 +15,9 @@ pub const checkpoint = @import("checkpoint.zig");
 pub const free_set = @import("free_set.zig");
 pub const grid = @import("grid.zig");
 pub const table = @import("table.zig");
+pub const lsm = @import("lsm.zig");
+pub const lsm_filter = @import("lsm_filter.zig");
+pub const lsm_memtable = @import("lsm_memtable.zig");
 pub const engine = @import("engine.zig");
 pub const io_storage = @import("io_storage.zig");
 
@@ -32,6 +35,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("journal_test.zig");
     _ = @import("table_test.zig");
+    _ = @import("lsm_test.zig");
     _ = @import("engine_test.zig");
     _ = @import("engine_grid_test.zig");
     _ = @import("io_storage_test.zig");
