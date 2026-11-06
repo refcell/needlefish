@@ -121,6 +121,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: third pinned window in `just replay-check`: 53840091..53840100 (221 txs,
+  31.5 Mgas), fetched without the diff trace, 10/10.
+
 - 2026-11-06: no more diffMode trace: changed keys = touched keys whose verified pre and
   post proof values differ. Halves trace downloads (a fresh 10-block fetch: 73 s, 10/10).
   The cached 100-block window re-imports 420 bytes smaller: 5 slots the per-transaction
