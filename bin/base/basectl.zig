@@ -27,6 +27,7 @@ pub const Command = enum {
     upgrade_readiness,
     doctor,
     denim,
+    node_metrics,
 
     /// Parses the hyphenated command name (`sync-status`).
     pub fn parse(text: []const u8) ?Command {
@@ -72,7 +73,7 @@ pub const Spec = struct {
         .json = "Print JSON instead of text",
         .block = "block: latest|safe|finalized|pending|earliest, a number, or a hash",
         .sender = "txpool: only this sender's transactions (0x address)",
-        .node_name = "conductor/sequencer: name shown for the node",
+        .node_name = "conductor/sequencer/node-metrics: name shown for the node",
         .factory = "proofs: DisputeGameFactory address on L1",
         .limit = "proofs: newest games to list (1..32)",
         .target_version = "upgrade-readiness: announced version to check (major.minor.patch)",
@@ -98,6 +99,7 @@ const usage =
     \\  p2p                peer identity and counts on both layers
     \\  sequencer          sequencer activity, role, heads, peers
     \\  conductor          HA conductor state and raft membership (--conductor-rpc)
+    \\  node-metrics       one node's shared metrics: leadership, heads, sync, peers
     \\  proofs             recent dispute games (--factory)
     \\  upgrade-readiness  support for scheduled L1 upgrades (exit 1 when not ready)
     \\  doctor             health checks with pass/warn/fail (exit 1 on any fail)
@@ -235,6 +237,12 @@ fn run(command: Command, spec: Spec, context: *const types.Context, io: Io, out:
             spec,
             out,
         ),
+        .node_metrics => emit(
+            basectl.node_metrics,
+            basectl.node_metrics.fetch(context, spec.node_name),
+            spec,
+            out,
+        ),
         .proofs => run_proofs(spec, context, out),
         .upgrade_readiness => run_upgrade_readiness(spec, context, out),
         .doctor => run_doctor(spec, context, io, out),
@@ -336,6 +344,7 @@ test "basectl: command names and addresses" {
     try std.testing.expectEqual(Command.upgrade_readiness, Command.parse("upgrade-readiness").?);
     try std.testing.expectEqual(@as(?Command, null), Command.parse("tui"));
     try std.testing.expectEqual(Command.denim, Command.parse("denim").?);
+    try std.testing.expectEqual(Command.node_metrics, Command.parse("node-metrics").?);
     const address = (try parse_address("0x" ++ "00000000000000000000000000000000000000ff", "x")).?;
     try std.testing.expectEqual(@as(u8, 0xff), address.bytes[19]);
     try std.testing.expect(valid_url(""));

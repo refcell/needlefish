@@ -49,6 +49,8 @@ pub const NodeStatus = struct {
     sync: Probe(sync_status.SyncStatus),
     cl_peers: Probe(p2p.PeerStats),
     el_peers: Probe(u64),
+    el_block: Probe(u64),
+    el_syncing: Probe(bool),
 
     pub fn unsafe_l2(status: *const NodeStatus) ?u64 {
         const sync = status.sync.get() orelse return null;
@@ -108,6 +110,15 @@ pub fn decode_membership(value: json.Value) DecodeError!Membership {
     return membership;
 }
 
+/// `eth_syncing`: `false` when synced, a progress object while syncing.
+pub fn decode_syncing(value: json.Value) DecodeError!bool {
+    return switch (value) {
+        .bool => |syncing| syncing,
+        .object => true,
+        else => error.MalformedResponse,
+    };
+}
+
 pub fn fetch_node(context: *const types.Context) NodeStatus {
     const conductor = context.conductor.client;
     const rollup = context.rollup.client;
@@ -141,6 +152,8 @@ pub fn fetch_node(context: *const types.Context) NodeStatus {
         ),
         .cl_peers = probe(p2p.PeerStats, rollup, "opp2p_peerStats", "[]", p2p.decode_peer_stats),
         .el_peers = probe(u64, context.l2.client, "net_peerCount", "[]", types.decode_number),
+        .el_block = probe(u64, context.l2.client, "eth_blockNumber", "[]", types.decode_number),
+        .el_syncing = probe(bool, context.l2.client, "eth_syncing", "[]", decode_syncing),
     };
     assert(status.is_leader != .failed or status.is_leader.failed != .not_configured or
         conductor == null);

@@ -15,6 +15,7 @@ pub const batcher = @import("batcher.zig");
 pub const p2p = @import("p2p.zig");
 pub const conductor = @import("conductor.zig");
 pub const sequencer = @import("sequencer.zig");
+pub const node_metrics = @import("node_metrics.zig");
 pub const proofs = @import("proofs.zig");
 pub const upgrade_readiness = @import("upgrade_readiness.zig");
 pub const doctor = @import("doctor.zig");

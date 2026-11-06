@@ -85,8 +85,8 @@ allocation after startup.
 - [x] `infra/roxy` consensus tags: rewrite `latest` (and default block params) to the highest
   block every admitted upstream has, so reads spread over replicas never go backwards
   (proxyd consensus mode); builds on the lag poller.
-- [ ] `basectl node-metrics`: port upstream `commands/node_metrics.rs` (scrape and summarize a
-  node's Prometheus endpoint).
+- [x] `basectl node-metrics`: port upstream `commands/node_metrics.rs` (the per-node metrics
+  shared by the conductor and sequencer views; it does not scrape Prometheus).
 
 ## Decisions
 - tx_manager is sans-IO: `Manager` emits `fetch_nonce`/`publish`/`query_receipt` actions and
@@ -194,6 +194,14 @@ allocation after startup.
   fail a command on their own. Not served by needlefish yet: `admin_nodeInfo` (EL identity
   in `p2p`) and every `conductor_*` method (no conductor server). `txpool` falls back from
   `txpool_status` to counting `txpool_content`.
+- basectl node-metrics: upstream `node_metrics.rs` is not a command and does not scrape
+  Prometheus; it is `NodeMetricsJson::from_status`, the 15 per-node fields flattened into the
+  conductor and sequencer JSON. Ported as `node_metrics.NodeMetrics.from_status` over our
+  `conductor.NodeStatus` (which gained upstream's `el_block` from `eth_blockNumber` and
+  `el_syncing` from `eth_syncing`: `false` or a progress object) and exposed as `basectl
+  node-metrics` (table or `--json`, snake_case keys, null/"unknown" for failed or unconfigured
+  reads). It fails (exit 1) only when every read failed. Our conductor/sequencer JSON keep
+  their raw probes (now incl. `el_block`/`el_syncing`) instead of flattening the projection.
 - basectl proofs lists dispute games from the L1 `DisputeGameFactory` (`--factory`, eth_call
   `gameCount`/`gameAtIndex`/`status`/`l2BlockNumber`/`rootClaim`); prover-service views are
   out of scope.
@@ -373,6 +381,10 @@ allocation after startup.
   method served by its upstream, a dead pinned upstream returns 502 without failover.
 - 2026-11-05: roxy block-lag exclusion (SimIo test, `--lag-max-blocks/--lag-poll-ms`,
   `roxy_upstream_head`); live: two dev-l1 nodes, all traffic to the leading one.
+- 2026-11-06: `basectl node-metrics` (fake-transport tests: projection, text, JSON, nothing
+  reachable). Live: against a running devnet sequencer every CL/EL field filled (unsafe 4326,
+  safe 4297, finalized 4257, L1 432, cl_peers 1, el_syncing false); against a lone dev-l1 node
+  only the EL fields; unreachable endpoints exit 1.
 - 2026-11-06: roxy consensus tags (`tags.zig` + seeded/std.testing fuzz, SimIo tests with
   upstreams at different heads: rewritten params, explicit numbers above the head, a falling
   replica not moving the head back, batch and split rewrites, buffer overflow; flags
