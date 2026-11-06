@@ -172,14 +172,19 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   behind a fetcher, task set, reconciler, prover client, signer manager, static discovery,
   driver loop (seeded fault sim), service, `base registrar`.
 
-- [ ] `proof/bin-tee`: base/base `bin/prover/{nitro-enclave,nitro-host}`: `base nitro-enclave`
+- [x] `proof/bin-tee`: base/base `bin/prover/{nitro-enclave,nitro-host}`: `base nitro-enclave`
   (local-mode enclave server; TCP in place of vsock) and `base nitro-host` (host server feeding
   enclaves, `enclave_*` and `prover_prove` JSON-RPC), plus a devnet smoke: TEE proof of a range.
   Done: `base nitro-enclave` (smoke: listens, drops a malformed frame, keeps serving);
   `base prover-worker --backend tee` (host side; e2e test through an in-process enclave).
-  Left: live devnet TEE proof through `nitro-enclave` + `prover-worker --backend tee`.
+  Devnet smoke `etc/proof/devnet-tee.sh`: a TEE proof of a 4-block range, signed by the
+  local-mode enclave. `nitro-host` is `prover-worker --backend tee` here.
 
 ## Decisions
+- Enclave chains: like base/base, only pinned config hashes are signed for. A local-mode-only
+  opt-in (`--enclave-allow-custom-chain`, `nitro-enclave --allow-custom-chain`) hashes the
+  boot rollup config instead, so the local devnet (chain 901) can be proved; enclave mode
+  never does.
 - TEE host: enclave pool is round robin (base/base first-free); a claim that does not hold on
   the host is refused before the enclave runs; no `prover_prove` endpoint (proofs go through
   the prover service); registration gating reads `TEEProverRegistry` over `eth_call`
@@ -362,6 +367,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: live devnet TEE proof (`etc/proof/devnet-tee.sh`); `proof/bin-tee` done.
 - 2026-11-05: TEE host gates enclaves on `TEEProverRegistry.isValidSigner` via `eth_call`.
 - 2026-11-05: TEE nitro host + `prover-worker --backend tee`; registrar complete with `base registrar`.
 - 2026-11-05: registrar prover client, TEE registry/CertManager bindings, `base nitro-enclave`.
