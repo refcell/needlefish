@@ -4,6 +4,7 @@ const std = @import("std");
 
 pub const nitro = @import("nitro/root.zig");
 pub const enclave = @import("enclave/root.zig");
+pub const registrar = @import("registrar/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
