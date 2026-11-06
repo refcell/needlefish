@@ -17,6 +17,9 @@ pub const l1 = @import("l1.zig");
 pub const metrics = @import("metrics.zig");
 pub const signer_manager = @import("signer_manager.zig");
 pub const fakes = @import("fakes.zig");
+pub const rpc_l1 = @import("rpc_l1.zig");
+pub const discovery = @import("discovery.zig");
+pub const driver = @import("driver.zig");
 
 pub const P384Hints = hints.P384Hints;
 pub const AttestationPlanner = planner.AttestationPlanner;
@@ -25,6 +28,8 @@ pub const pinned_root_cert_hash = planner.pinned_root_cert_hash;
 pub const SignerReconciler = reconciler.SignerReconciler;
 pub const RegistrationTaskSet = registration_tasks.RegistrationTaskSet;
 pub const SignerManager = signer_manager.SignerManager;
+pub const RegistrationDriver = driver.Driver;
+pub const StaticDiscovery = discovery.StaticDiscovery;
 
 test {
     std.testing.refAllDecls(@This());
