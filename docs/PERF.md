@@ -940,6 +940,30 @@ skips vs 59k table probes over the three lookup runs), and the last level's part
 coverage keeps most absent keys off it too. Next: read only the sectors a block uses and keep
 fences resident so a cold hit is one data-block read.
 
+## 2026-11-06 db flat trees shadow writes (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/commit sim (zero latency"` (`db/bench.zig`).
+Disk state phase 2b first step: `Database` shadow-writes every commit's changeset into the
+flat account and storage LSM trees (`Config.flat_trees`). Same workload as `db/commit sim`:
+128 blocks of 1k account + 4k slot writes over 100k accounts / 64k slots, zero-latency
+`SimStorage`, unpaced (compaction gets unlimited blocks per commit), 64 KiB grid blocks,
+flush at 16k memtable entries. One run:
+
+| Case | flat trees off | flat trees on |
+| --- | ---: | ---: |
+| execute_and_commit (cpu) p50 / p99 | 7.20 / 9.44 ms | 8.04 / 8.71 ms |
+| commit until durable p50 / p99 | 7.25 / 9.74 ms | 8.46 / 16.28 ms |
+| checkpoint p50 | 15.1 ms | 40.2 ms |
+| checkpoint bytes | 17.1 MB | 23.5 MB |
+
+Takeaways: the shadow write itself (5k keccaks, batched, plus 5k memtable puts) adds ~0.84 ms
+per mainnet-sized block to the commit (+12%). Unpaced, a flush or merge runs inside the
+commit's durable wait, so durable p99 rises by ~6.5 ms; pacing (`checkpoint_bytes_per_commit`)
+caps that. The checkpoint carries 6.4 MB more (manifests and memtables); why it takes 2.7x longer
+was not profiled (it shares the ticks with compaction IO).
+All of this is extra until `State` reads through the trees and checkpoints stop carrying
+the flat tables (the next phase 2b steps).
+
 ## 2026-11-06 node mainnet replay (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `zig build bench -Doptimize=ReleaseFast -- "node: replay"`: the ten committed Base mainnet

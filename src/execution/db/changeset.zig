@@ -259,6 +259,17 @@ pub const Changeset = struct {
         try self.check_sorted();
     }
 
+    /// The account and storage entry counts of an encoded changeset (its header only).
+    pub fn encoded_counts(input: []const u8) Error!struct { accounts: u32, storage: u32 } {
+        var reader: Reader = .{ .buffer = input };
+        if (try reader.int(u32) != magic) return error.InvalidChangeset;
+        if (try reader.int(u16) != version) return error.InvalidChangeset;
+        const accounts = try reader.int(u32);
+        const storage = try reader.int(u32);
+        assert(reader.position == 14);
+        return .{ .accounts = accounts, .storage = storage };
+    }
+
     fn decode_account(self: *Changeset, reader: *Reader) Error!void {
         const address = (try reader.bytes(20))[0..20].*;
         const flags = try reader.int(u8);

@@ -105,6 +105,8 @@ pub const Shape = struct {
     round_blocks: u32,
     /// Storage-rehash workers of the state trie (`State.Config.rehash_threads`).
     rehash_threads: u32 = 0,
+    /// Shadow-write flat trees on a grid (`database.Config.flat_trees`).
+    flat_trees: bool = false,
 
     pub fn slots(shape: Shape) u32 {
         return shape.contracts * shape.slots_per_contract;
@@ -294,7 +296,7 @@ fn database_config(shape: Shape) database.Config {
     const block_size: u32 = 64 * 1024;
     const payload = checkpoint_module.payload_capacity(block_size);
     const zone_blocks = std.math.divCeil(u64, staging, payload) catch unreachable; // payload > 0.
-    return .{
+    var config: database.Config = .{
         .engine = .{
             .journal_size_bytes = 2 * blocks_per_lap * entry_bytes,
             .checkpoint_zone_size_bytes = (zone_blocks + 1) * block_size,
@@ -312,6 +314,28 @@ fn database_config(shape: Shape) database.Config {
         .queue_entries_max = 4,
         .checkpoint_staging_bytes = @intCast(staging),
     };
+    if (shape.flat_trees) flat_trees_enable(&config);
+    return config;
+}
+
+/// Turns on the flat trees: a grid (128 MiB: about 8x the trees' records, room for the
+/// level slack and for compacted tables waiting two checkpoints) and staging for their
+/// checkpoint bytes (both memtables full at most).
+fn flat_trees_enable(config: *database.Config) void {
+    config.flat_trees = true;
+    config.engine.grid_block_count = 2048;
+    const flat = config.flat_trees_config().?;
+    const flat_trees = @import("flat_trees.zig");
+    const accounts = flat_trees.tree_config(flat, flat_trees.account_put_bytes_min, 1);
+    const storage = flat_trees.tree_config(flat, flat_trees.storage_put_bytes_min, 1);
+    const entries = 2 * (@as(u64, accounts.memtable_entries_max) * (32 + 1 + 72) +
+        @as(u64, storage.memtable_entries_max) * (64 + 1 + 32));
+    const staging = config.checkpoint_staging_bytes + entries + 16 * 1024 * 1024;
+    config.checkpoint_staging_bytes = @intCast(staging);
+    const payload = checkpoint_module.payload_capacity(config.engine.checkpoint_block_size);
+    const zone_blocks = std.math.divCeil(u64, staging, payload) catch unreachable; // payload > 0.
+    config.engine.checkpoint_zone_size_bytes = (zone_blocks + 1) *
+        config.engine.checkpoint_block_size;
 }
 
 // In-memory cases.
@@ -631,6 +655,14 @@ pub fn matches(name: []const u8, filter: ?[]const u8) bool {
 const name_sim = "db/commit sim (zero latency)";
 const name_os = "db/commit os (fsync)";
 const name_sim_rehash = "db/commit sim (zero latency, 4 rehash threads)";
+const name_sim_flat = "db/commit sim (zero latency, flat trees)";
+
+/// `shape_bench` with the flat trees shadow-written on every commit.
+const shape_bench_flat: Shape = blk: {
+    var shape = shape_bench;
+    shape.flat_trees = true;
+    break :blk shape;
+};
 
 /// `shape_bench` with the rehash workers a node on 5+ cores starts (`rehash_threads_auto`).
 const shape_bench_rehash: Shape = blk: {
@@ -650,6 +682,12 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
         const shape = shape_bench_rehash;
         run_commit_sim(io, std.heap.page_allocator, shape, name_sim_rehash) catch |err| {
             std.debug.print("{s}: failed: {s}\n", .{ name_sim_rehash, @errorName(err) });
+        };
+    }
+    if (matches(name_sim_flat, filter)) {
+        const shape = shape_bench_flat;
+        run_commit_sim(io, std.heap.page_allocator, shape, name_sim_flat) catch |err| {
+            std.debug.print("{s}: failed: {s}\n", .{ name_sim_flat, @errorName(err) });
         };
     }
     if (matches(name_os, filter)) {

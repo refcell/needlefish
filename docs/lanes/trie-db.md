@@ -266,9 +266,17 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   over the engine (mid flush, mid merge, mid checkpoint, fallback; orphan release), workload
   and decoder fuzz. (`lsm_test.zig`; `db/lsm` bench: put 25 ns, write amplification 6.8,
   warm hit 295 ns, cold hit 24 us, absent 1.0 us; see Decisions)
-- [ ] Disk state phase 2b (rest): shadow-write account/storage changesets into the trees from
-  `Database` behind a config flag with a differential test against `State`'s flat tables;
-  then `State` reads through the trees, checkpoints stop serializing the flat tables, open
+- [x] Disk state phase 2b, shadow writes: `Database` writes every head move's changesets
+  (unwound: old values, applied: new values) into an account tree (keccak(address) -> 72 B
+  account) and a storage tree (keccak(address) ++ keccak(slot) -> 32 B word, zero = delete)
+  behind `Config.flat_trees` (off by default, node unchanged; `flat_trees.zig`). Compaction
+  per durable commit on the checkpoint block budget, both trees in checkpoint v3, open scan
+  in the engine's open pause, replay through the replay reserve. Test: 6-seed differential
+  (random blocks, reorgs, checkpoint + clean reopen, 3 crashes per seed) of every touched
+  account and slot vs `State`, plus v2 checkpoint refused with flat trees on.
+  (`database_flat_test.zig`; `db/commit sim (zero latency, flat trees)`: +0.84 ms cpu p50
+  per 1k acct + 4k slot block; see Decisions)
+- [ ] Disk state phase 2b (rest): `State` reads through the trees, checkpoints stop serializing the flat tables, open
   builds the trie by range scan. Smaller follow-ups: resident per-block fences (a cold hit
   reads the index block too), batched/parallel lookups (one lookup at a time per tree today),
   read only a block's used sectors, persisted filters (open rebuilds them by scanning every
@@ -368,6 +376,30 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   every table, as phase 2's trie rebuild must scan anyway); persisting them comes with
   phase 3's scan-free open. Fences are the tables' `key_min`/`key_max`; per-block fences stay
   in the index block (through the block cache).
+- Disk state phase 2b shadow writes (`flat_trees.zig`). Writes hook `move_state` (each
+  unwound changeset's old values, then each applied changeset's new values, after the State
+  call) and `commit_applied` (the caller already applied State); never the history rebuild
+  on open (State ends where it started, trees untouched). Account value 72 B (nonce u64 BE,
+  balance u256 BE, code hash), no storage root (State's flat table has none; phase 3 owns
+  roots); a removed account and a zero slot are tombstones (a destroyed account's slots are
+  all in its changeset). Room: a live head move first counts its puts from the encoded
+  changeset headers (`Changeset.encoded_counts`) and returns `error.Busy` before any change
+  when a mutable memtable lacks room, after granting one more compaction (so a pending swap
+  or flush moves on without commits). Memtable sizing per tree, with e = the smallest
+  changeset entry per put (93 B account, 116 B slot): replay reserve = (journal + retained
+  chain bytes)/e (replay cannot compact: no grid IO before ready; every distinct replayed key
+  comes from an entry in the journal or a retained block); one head move <= (chain bytes +
+  largest entry)/e; memtable = flush threshold + move + reserve, so below the flush
+  threshold a move always fits and at it the memtables swap. Tables hold one memtable; levels
+  grow by 8 until the last holds 2x the state's key limit. Compaction is granted
+  `checkpoint_blocks_per_commit` (unpaced: unlimited) on every durable commit, as the code
+  flush. Checkpoint v3 = v2 + length-prefixed account then storage tree bytes after the code
+  table list; open needs the version matching its config (v1/v2 refused with flat trees, v3
+  without): no backfill of existing state, so turning the flag on needs a fresh database.
+  `Database.idle` waits for tree IO and lookups (an owner freed mid-IO would be called back).
+  Known gap: the replay bound counts distinct keys from the checkpoint on; a checkpoint taken
+  right after an open whose replay filled into the reserve (before the first swap) leaves
+  less than a full reserve for the next replay (put_replay still swaps when it can).
 - Code store read path (why codes are still in RAM after phase 1d): `State.code_by_hash` is synchronous and
   its callers outside the lane (evm `State.code`, which caches the slice in the account for
   the whole block; node `StateDb`, witness, rpc) hold the returned slice for a block or
@@ -1272,3 +1304,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   fallback, orphan release), workload + decoder fuzz. `db/lsm` (1000 blocks of 1k accounts +
   4k slots): put 25 ns, compaction 5.5 ms and 98 blocks per block, write amplification 6.8,
   lookup warm 295 ns / cold 24 us / absent 1.0 us. Shadow writes and `State` reads (2b) remain.
+- 2026-11-06: disk state phase 2b first step: `Database` shadow-writes committed changesets
+  into flat account and storage LSM trees behind `Config.flat_trees` (off by default):
+  unwinds write old values, live head moves reserve memtable room (`Busy` otherwise),
+  compaction per durable commit, trees in checkpoint v3, open scan, replay reserve. Tests:
+  6-seed differential vs `State` after random blocks with reorgs, checkpoint + reopen, and 18
+  crash/reopen cycles (105 flushes, 19 merges); a v2 checkpoint is refused with flat trees.
+  `db/commit sim (zero latency, flat trees)`: execute_and_commit p50 7.20 -> 8.04 ms, until
+  durable 7.25 -> 8.46 ms (p99 9.7 -> 16.3 ms, unpaced merges), checkpoint 15 -> 40 ms.
+  `State` reads through the trees remain.

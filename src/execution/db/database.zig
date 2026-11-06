@@ -37,6 +37,12 @@
 //! the table list, scans the tables into `State.code_arena`, loads the image, and resumes the
 //! journal. Codes stay resident, so `State.code_by_hash` is unchanged. Without a grid the
 //! checkpoint is version 1 with every code, as before.
+//! Flat trees (`Config.flat_trees`, needs a grid; `flat_trees.zig`): every head move also
+//! writes its unwound changesets' old values and applied changesets' new values into an
+//! account tree and a storage tree (shadow writes: `State` stays the source of truth).
+//! Their compaction is granted the same per-commit block budget as the code flush; the
+//! checkpoint (version 3) carries both trees after the code table list; open decodes and
+//! scans them in the open pause and replay re-applies the puts through the replay reserve.
 //!
 //! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
 //! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
@@ -67,6 +73,7 @@ const changeset_module = @import("changeset.zig");
 const snapshot_module = @import("snapshot.zig");
 const history_module = @import("history.zig");
 const code_store_module = @import("code_store.zig");
+const flat_trees_module = @import("flat_trees.zig");
 const trie_module = @import("../trie/root.zig");
 
 const StateTrie = trie_module.StateTrie;
@@ -259,6 +266,9 @@ pub const checkpoint_magic: u32 = 0x4244_464e;
 /// the codes no table holds.
 pub const checkpoint_version: u16 = 1;
 pub const checkpoint_version_tables: u16 = 2;
+/// Version 3 (flat trees on): version 2 with the flat trees' bytes
+/// (`FlatTrees.checkpoint_encode`) right after the code table list.
+pub const checkpoint_version_flat: u16 = 3;
 /// magic, version, head present, head meta (hash, parent, number, timestamp), state root,
 /// snapshot length, block count.
 pub const checkpoint_header_size: u32 = 4 + 2 + 1 + 32 + 32 + 8 + 8 + 32 + 4 + 4;
@@ -290,6 +300,31 @@ pub const Config = struct {
     /// New code bytes since the last flush below which a checkpoint skips the flush and
     /// carries those codes in its image (fewer small tables, fewer rewrites).
     code_flush_bytes_min: u32 = 64 * 1024,
+    /// Shadow-write committed changesets into flat account and storage trees on the grid
+    /// (`flat_trees.zig`); needs a grid. Off: nothing changes (checkpoint version 2).
+    /// A database opens only with the setting it was written with (no backfill yet).
+    flat_trees: bool = false,
+    /// Mutable memtable entries at which a flat tree flushes.
+    flat_flush_entries_min: u32 = 16 * 1024,
+    /// Block cache blocks the flat trees' lookups share.
+    flat_cache_blocks: u32 = 64,
+
+    /// The flat trees' config, null when off.
+    pub fn flat_trees_config(config: Config) ?flat_trees_module.Config {
+        if (!config.flat_trees) return null;
+        assert(config.engine.grid_block_count > 0);
+        return .{
+            .block_size = config.engine.checkpoint_block_size,
+            .block_count = config.engine.grid_block_count,
+            .journal_bytes = config.engine.journal_size_bytes,
+            .chain_bytes = config.chain.bytes_max,
+            .entry_body_bytes = config.engine.entry_body_size_max,
+            .accounts_max = config.state.accounts_max,
+            .slots_max = config.state.storage_slots_max,
+            .flush_entries_min = config.flat_flush_entries_min,
+            .cache_blocks = config.flat_cache_blocks,
+        };
+    }
 
     /// The code store's config, null without a grid.
     pub fn code_store_config(config: Config) ?code_store_module.Config {
@@ -408,6 +443,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         pub const Engine = engine_module.EngineType(Storage);
         pub const CodeStore = code_store_module.CodeStoreType(Storage);
+        pub const FlatTrees = flat_trees_module.FlatTreesType(Storage);
         pub const DurableCallback = *const fn (context: ?*anyopaque, sequence: u64) void;
 
         engine: Engine,
@@ -470,6 +506,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         code_store: ?CodeStore = null,
         /// The wanted checkpoint's code flush ran (or had nothing to do).
         code_flushed: bool = false,
+        /// Flat account and storage trees (`Config.flat_trees`), null when off.
+        flat: ?FlatTrees = null,
 
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
@@ -507,8 +545,14 @@ pub fn DatabaseType(comptime Storage: type) type {
                 code_store = try CodeStore.init(allocator, &engine.grid.?, code_config);
             }
             errdefer if (code_store) |*store| store.deinit(allocator);
+            var flat: ?FlatTrees = null;
+            if (config.flat_trees_config()) |flat_config| {
+                flat = try FlatTrees.init(allocator, &engine.grid.?, flat_config);
+            }
+            errdefer if (flat) |*trees| trees.deinit(allocator);
             const buffers = try Buffers.init(allocator, config);
             return .{
+                .flat = flat,
                 .code_store = code_store,
                 .engine = engine,
                 .config = config,
@@ -558,6 +602,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Frees memory. After a simulated crash, engine operations may still be in flight.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.flat) |*trees| trees.deinit(allocator);
             if (self.code_store) |*store| store.deinit(allocator);
             if (self.history) |*store| store.deinit(allocator);
             allocator.free(self.staging);
@@ -578,7 +623,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// True when nothing is queued and no engine operation is in flight.
         pub fn idle(self: *const Self) bool {
             const flushing = if (self.code_store) |*store| store.flushing() else false;
-            return self.queue_count == 0 and self.engine.idle() and !flushing;
+            const flat_idle = if (self.flat) |*trees| trees.idle() else true;
+            return self.queue_count == 0 and self.engine.idle() and !flushing and flat_idle;
         }
 
         /// Writes an empty database. Completes when `phase` returns to `closed`. The caller
@@ -645,6 +691,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(self.phase == .opening);
             assert(!self.load_done);
             self.trace(.checkpoint_read);
+            if (self.flat) |*trees| {
+                trees.bind(&self.engine.grid.?, &self.engine.free_set.?);
+                trees.reset();
+            }
             const store = if (self.code_store) |*store| store else return self.open_loaded();
             if (self.load_error != null or self.staging_len == 0) return self.open_loaded();
             self.checkpoint_manifest(store) catch {
@@ -662,16 +712,31 @@ pub fn DatabaseType(comptime Storage: type) type {
             switch (store.scan_outcome) {
                 .loaded => {
                     self.trace(.code_tables);
-                    self.open_loaded();
+                    const trees = if (self.flat) |*trees| trees else return self.open_loaded();
+                    trees.owner = self;
+                    trees.open_scan(on_flat_scan);
                 },
-                .corrupt => {
-                    // A table block did not verify: drop its codes and let the engine treat
-                    // the checkpoint as rotten (the fallback streams next, or open fails).
-                    self.state.reset_codes();
-                    store.reset();
-                    self.engine.open_resume(.corrupt);
-                },
+                .corrupt => self.open_corrupt(),
             }
+        }
+
+        fn on_flat_scan(trees: *FlatTrees) void {
+            const self: *Self = @ptrCast(@alignCast(trees.owner.?));
+            assert(self.phase == .opening);
+            switch (trees.scan_outcome) {
+                .loaded => self.open_loaded(),
+                .corrupt => self.open_corrupt(),
+            }
+        }
+
+        /// A table block did not verify: drop its codes and trees and let the engine treat
+        /// the checkpoint as rotten (the fallback streams next, or open fails).
+        fn open_corrupt(self: *Self) void {
+            assert(self.phase == .opening);
+            self.state.reset_codes();
+            self.code_store.?.reset();
+            if (self.flat) |*trees| trees.reset();
+            self.engine.open_resume(.corrupt);
         }
 
         /// Loads the staged checkpoint (codes from tables already in) and replays.
@@ -687,10 +752,28 @@ pub fn DatabaseType(comptime Storage: type) type {
             var reader: Reader = .{ .buffer = bytes };
             if (try reader.int(u32) != checkpoint_magic) return error.CheckpointInvalid;
             const version = try reader.int(u16);
-            if (version == checkpoint_version) return; // Written without a grid: no tables.
-            if (version != checkpoint_version_tables) return error.CheckpointInvalid;
+            // Flat trees open only from a checkpoint that carries them (no backfill).
+            if (try self.checkpoint_version_expected(version) == checkpoint_version) return;
             if (bytes.len < checkpoint_header_size) return error.CheckpointInvalid;
-            _ = try store.manifest_decode(bytes[checkpoint_header_size..]);
+            const size = try store.manifest_decode(bytes[checkpoint_header_size..]);
+            const trees = if (self.flat) |*trees| trees else return;
+            _ = try trees.open_decode(bytes[checkpoint_header_size + size ..]);
+        }
+
+        /// Checks a checkpoint's version against the config: version 1 (no tables) opens
+        /// only without flat trees, version 2 only with a grid and without flat trees,
+        /// version 3 only with flat trees.
+        fn checkpoint_version_expected(self: *const Self, version: u16) !u16 {
+            const flat = self.flat != null;
+            const grid = self.code_store != null;
+            const valid = switch (version) {
+                checkpoint_version => !flat,
+                checkpoint_version_tables => grid and !flat,
+                checkpoint_version_flat => flat,
+                else => false,
+            };
+            if (!valid) return error.CheckpointInvalid;
+            return version;
         }
 
         fn consume_entry(context: *anyopaque, entry: engine_module.Entry) void {
@@ -852,6 +935,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 return .{ .sequence = sequence, .state_root = self.head_info.state_root };
             }
             try self.insert_check(input);
+            try self.flat_reserve_applied(input);
             try self.chain_insert(input);
             self.chain.plan_reorg(input.hash, &self.plan) catch |err| {
                 // Stored in memory: journal it alone so replay stays in step.
@@ -861,6 +945,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             };
             assert(self.plan.unwind_hashes().len == 0 and self.plan.apply_hashes().len == 1);
             self.chain.set_head(&self.plan);
+            self.flat_write(true) catch |err| {
+                self.phase = .failed;
+                return err;
+            };
             self.state.set_block_hash(input.number, input.hash);
             const state_root = self.state.state_root() catch |err| {
                 self.phase = .failed;
@@ -1027,6 +1115,8 @@ pub fn DatabaseType(comptime Storage: type) type {
                 if (self.code_store) |*store| store.grant(blocks);
                 self.engine.checkpoint_grant(blocks);
             }
+            // Flat tree compaction is paced per durable commit on the same budget.
+            if (self.flat) |*trees| trees.compact(self.config.checkpoint_blocks_per_commit());
             self.checkpoint_maybe_start();
             self.pump();
         }
@@ -1102,6 +1192,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// in the middle leaves the database `failed`.
         fn move_head(self: *Self, hash: Hash) OperationError!void {
             try self.chain.plan_reorg(hash, &self.plan);
+            try self.flat_reserve_plan();
             self.move_state() catch |err| {
                 self.phase = .failed;
                 return err;
@@ -1126,11 +1217,15 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(!self.history_stale);
             const store = self.history_tracking();
             // The first head also applies the block the walk stopped at (genesis).
-            if (self.chain.head() == null) try self.apply_block(self.plan.ancestor.hash);
+            if (self.chain.head() == null) {
+                try self.apply_block(self.plan.ancestor.hash);
+                try self.flat_write(true);
+            }
             for (self.plan.unwind_hashes()) |hash| {
                 const view = self.chain.block(hash).?;
                 self.changeset.decode(view.changeset) catch return error.InvalidChangeset;
                 try self.state.unwind(&self.changeset);
+                try self.flat_write(false);
             }
             if (store) |tracked| if (self.plan.unwind_len > 0) {
                 tracked.unwind_to(self.plan.ancestor.number) catch {
@@ -1139,6 +1234,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             };
             for (self.plan.apply_hashes()) |hash| {
                 try self.apply_block(hash);
+                try self.flat_write(true);
                 const tracked = store orelse continue;
                 if (self.history_stale) continue;
                 const number = self.chain.meta(hash).?.number;
@@ -1146,6 +1242,46 @@ pub fn DatabaseType(comptime Storage: type) type {
                     self.history_stale = true;
                 };
             }
+        }
+
+        /// Live head moves only: fails with `error.Busy` before any change when the flat
+        /// trees lack memtable room for every put the planned move can make.
+        fn flat_reserve_plan(self: *Self) OperationError!void {
+            const trees = if (self.flat) |*trees| trees else return;
+            if (self.phase != .ready) return; // Replay writes into the replay reserve.
+            var puts: flat_trees_module.Puts = .{};
+            if (self.chain.head() == null) {
+                const view = self.chain.block(self.plan.ancestor.hash).?;
+                FlatTrees.puts_add(&puts, view.changeset) catch return error.InvalidChangeset;
+            }
+            for ([2][]const Hash{ self.plan.unwind_hashes(), self.plan.apply_hashes() }) |hashes| {
+                for (hashes) |hash| {
+                    const view = self.chain.block(hash).?;
+                    FlatTrees.puts_add(&puts, view.changeset) catch
+                        return error.InvalidChangeset;
+                }
+            }
+            try trees.reserve(puts, self.config.checkpoint_blocks_per_commit());
+        }
+
+        /// `commit_applied`: reserves the flat trees' room for the block's changeset and
+        /// decodes it into `self.changeset` for `flat_write` (State already holds it).
+        fn flat_reserve_applied(self: *Self, input: *const BlockInput) OperationError!void {
+            const trees = if (self.flat) |*trees| trees else return;
+            assert(self.phase == .ready);
+            var puts: flat_trees_module.Puts = .{};
+            FlatTrees.puts_add(&puts, input.changeset) catch return error.InvalidChangeset;
+            try trees.reserve(puts, self.config.checkpoint_blocks_per_commit());
+            self.changeset.decode(input.changeset) catch return error.InvalidChangeset;
+        }
+
+        /// Shadow-writes `self.changeset` (just applied, or unwound when not `forward`) into
+        /// the flat trees. Busy here means a too-small replay reserve, or a missed reserve.
+        fn flat_write(self: *Self, forward: bool) OperationError!void {
+            const trees = if (self.flat) |*trees| trees else return;
+            const mode: FlatTrees.Mode = if (self.phase == .opening) .replay else .live;
+            assert(mode == .replay or self.phase == .ready);
+            try trees.write(&self.changeset, forward, mode);
         }
 
         fn apply_block(self: *Self, hash: Hash) OperationError!void {
@@ -1471,6 +1607,12 @@ pub fn DatabaseType(comptime Storage: type) type {
                 position += store.manifest_encode(self.staging[position..]);
                 filter = store.code_filter();
             }
+            if (self.flat) |*trees| {
+                if (trees.checkpoint_size() > self.staging.len - position) {
+                    return error.CheckpointTooLarge;
+                }
+                position += trees.checkpoint_encode(self.staging[position..]);
+            }
             var sink: snapshot_module.BufferSink = .{ .buffer = self.staging[position..] };
             try snapshot_module.write_filtered(&self.state, &sink, filter);
             const snapshot_len: u32 = @intCast(sink.position);
@@ -1492,8 +1634,13 @@ pub fn DatabaseType(comptime Storage: type) type {
         fn checkpoint_write_header(self: *Self, snapshot_len: u32, block_count: u32) void {
             var writer: Writer = .{ .buffer = self.staging[0..checkpoint_header_size] };
             writer.int(u32, checkpoint_magic);
-            const tables = self.code_store != null;
-            writer.int(u16, if (tables) checkpoint_version_tables else checkpoint_version);
+            const version = if (self.flat != null)
+                checkpoint_version_flat
+            else if (self.code_store != null)
+                checkpoint_version_tables
+            else
+                checkpoint_version;
+            writer.int(u16, version);
             const head_meta = self.chain.head() orelse BlockMeta{
                 .hash = @splat(0),
                 .parent_hash = @splat(0),
@@ -1536,9 +1683,8 @@ pub fn DatabaseType(comptime Storage: type) type {
             const bytes = self.staging[0..self.staging_len];
             var reader: Reader = .{ .buffer = bytes };
             if (try reader.int(u32) != checkpoint_magic) return error.CheckpointInvalid;
-            const version = try reader.int(u16);
-            const tables = version == checkpoint_version_tables and self.code_store != null;
-            if (version != checkpoint_version and !tables) return error.CheckpointInvalid;
+            const version = try self.checkpoint_version_expected(try reader.int(u16));
+            const tables = version != checkpoint_version;
             const present = try reader.int(u8);
             if (present > 1) return error.CheckpointInvalid;
             const head_meta: BlockMeta = .{
@@ -1556,6 +1702,10 @@ pub fn DatabaseType(comptime Storage: type) type {
                 assert(reader.position == checkpoint_header_size);
                 const count = try reader.int(u32);
                 _ = try reader.bytes(@as(u64, count) * CodeStore.info_size);
+            }
+            if (version == checkpoint_version_flat) {
+                // Both trees, decoded (and scanned) during the open pause.
+                for (0..2) |_| _ = try reader.bytes(try reader.int(u32));
             }
             try self.snapshot_load(try reader.bytes(snapshot_len));
             for (0..block_count) |_| {
