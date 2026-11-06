@@ -39,6 +39,9 @@ const Chain = struct {
     block_url: []const u8,
     proof_url: []const u8,
     proof_batch: u32,
+    /// Blocks the follower may fall behind the tip before it re-anchors there (the proof
+    /// endpoint's window, with a margin).
+    max_behind: u64,
     /// Spacing between items sent to the proof endpoint (its public rate limit).
     proof_item_interval_ms: u32,
 };
@@ -51,6 +54,7 @@ const chains = [_]Chain{
         // Serves `eth_getProof` for the most recent 10,000 blocks; batches of 5.
         .proof_url = "https://sepolia.base.org",
         .proof_batch = 5,
+        .max_behind = 8_000,
         .proof_item_interval_ms = 150,
     },
     .{
@@ -59,6 +63,7 @@ const chains = [_]Chain{
         .block_url = "https://mainnet.base.org",
         .proof_url = "https://base.drpc.org",
         .proof_batch = 1,
+        .max_behind = 8_000,
         .proof_item_interval_ms = 100,
     },
 };
@@ -70,6 +75,7 @@ const Flags = struct {
     proof_batch: ?u32 = null,
     from: ?u64 = null,
     blocks: ?u64 = null,
+    max_behind: ?u64 = null,
     status: ?[]const u8 = null,
     verbose: bool = false,
 };
@@ -103,6 +109,9 @@ fn parse(args: []const []const u8) !Flags {
             flags.from = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--blocks")) {
             flags.blocks = try std.fmt.parseInt(u64, value, 10);
+        } else if (std.mem.eql(u8, name, "--max-behind")) {
+            flags.max_behind = try std.fmt.parseInt(u64, value, 10);
+            if (flags.max_behind.? == 0) return error.InvalidArguments;
         } else if (std.mem.eql(u8, name, "--status")) {
             flags.status = value;
         } else return error.InvalidArguments;
@@ -270,6 +279,12 @@ const Driver = struct {
     codes_fetched: u64 = 0,
     post_fetches: u64 = 0,
     reorgs: u64 = 0,
+    /// Blocks never verified: skipped by a re-anchor at the tip.
+    skipped: u64 = 0,
+    /// Contiguous verified stretches (one per anchor).
+    segments: u64 = 0,
+    /// Blocks given up on for want of data (endpoint failures), not mismatches.
+    abandoned: u64 = 0,
     gas_window: u64 = 0,
     window_start_ms: i64 = 0,
     last_lag_ms: i64 = 0,
@@ -322,6 +337,7 @@ const Driver = struct {
             hash.* = decoded.hash.bytes;
             state_root = decoded.header.state_root.bytes;
         }
+        driver.segments += 1;
         driver.follower.start(.{
             .number = number,
             .hash = hashes[hashes.len - 1],
@@ -586,6 +602,22 @@ const Driver = struct {
         std.debug.print("  every changed account and slot matches the canonical post-state\n", .{});
     }
 
+    /// Re-anchors just below the chain head, counting the blocks never verified. Returns
+    /// the next block to follow.
+    fn skip_to_tip(driver: *Driver, number: u64, why: []const u8) !u64 {
+        driver.chain_head = try driver.head_number();
+        const next = @max(driver.chain_head, number + 1);
+        driver.skipped += next - number;
+        std.debug.print("re-anchoring at {d} ({s}): blocks {d}..{d} not verified\n", .{
+            next - 1,
+            why,
+            number,
+            next - 1,
+        });
+        try driver.anchor(next - 1);
+        return next;
+    }
+
     fn summary(driver: *Driver, force: bool) !void {
         const now = Io.Clock.awake.now(driver.io()).toMilliseconds();
         if (!force and now - driver.last_summary_ms < summary_interval_ms) return;
@@ -597,7 +629,7 @@ const Driver = struct {
         const behind = driver.chain_head -| head;
         std.debug.print("follow {s} head {d} verified {d} txs {d} behind {d} blocks " ++
             "({d} ms) {d:.2} Mgas/s passes {d} proofs {d} codes {d} rebases {d} resets {d} " ++
-            "reorgs {d} mismatches 0\n", .{
+            "reorgs {d} segments {d} skipped {d} abandoned {d} mismatches 0\n", .{
             driver.flags.chain.name,
             head,
             stats.blocks,
@@ -611,6 +643,9 @@ const Driver = struct {
             stats.rebases,
             stats.resets,
             driver.reorgs,
+            driver.segments,
+            driver.skipped,
+            driver.abandoned,
         });
         try driver.write_status(behind, mgas_s);
         driver.last_summary_ms = now;
@@ -627,7 +662,8 @@ const Driver = struct {
             "\"started\":{d},\"head\":{d},\"head_hash\":\"0x{x}\",\"verified\":{d}," ++
             "\"transactions\":{d},\"gas\":{d},\"behind_blocks\":{d},\"lag_ms\":{d}," ++
             "\"mgas_per_s\":{d:.3},\"rebases\":{d},\"resets\":{d},\"reorgs\":{d}," ++
-            "\"proofs\":{d},\"mismatches\":0}}\n", .{
+            "\"proofs\":{d},\"segments\":{d},\"skipped\":{d},\"abandoned\":{d}," ++
+            "\"mismatches\":0}}\n", .{
             driver.flags.chain.name,
             real_s,
             driver.started_ms,
@@ -643,6 +679,9 @@ const Driver = struct {
             stats.resets,
             driver.reorgs,
             driver.proofs_fetched,
+            driver.segments,
+            driver.skipped,
+            driver.abandoned,
         });
         const temporary = try std.fmt.allocPrint(driver.alloc(), "{s}.tmp", .{path});
         try Io.Dir.cwd().writeFile(driver.io(), .{ .sub_path = temporary, .data = text });
@@ -731,6 +770,44 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     return run(&driver);
 }
 
+/// Verifies one block. False on a mismatch (reported); a block abandoned for want of data
+/// leaves the head where it was (the caller re-anchors).
+fn verify_one(driver: *Driver, block: *const follow.follower.Block) !bool {
+    const io = driver.io();
+    const started = Io.Clock.awake.now(io).toMilliseconds();
+    const outcome = driver.follow_block(block) catch |err| {
+        if (err == error.Mismatch) {
+            try driver.summary(true);
+            return false;
+        }
+        driver.abandoned += 1;
+        std.debug.print("block {d}: abandoned after {t} (not a mismatch)\n", .{
+            block.number,
+            err,
+        });
+        return true;
+    };
+    if (!outcome.ok()) {
+        try driver.report_mismatch(&outcome);
+        try driver.summary(true);
+        return false;
+    }
+    const finished = Io.Clock.awake.now(io).toMilliseconds();
+    const header = try base.common.consensus.Header.decode(block.header_rlp);
+    driver.last_lag_ms = Io.Clock.real.now(io).toMilliseconds() -
+        @as(i64, @intCast(header.timestamp)) * 1000;
+    driver.gas_window += header.gas_used;
+    driver.chain_head = @max(driver.chain_head, block.number);
+    if (driver.flags.verbose) std.debug.print("block {d} {d} txs {d} gas ok in {d} ms\n", .{
+        block.number,
+        outcome.transactions,
+        outcome.gas_used,
+        finished - started,
+    });
+    try driver.summary(false);
+    return true;
+}
+
 fn run(driver: *Driver) !u8 {
     const io = driver.io();
     driver.chain_head = try driver.head_number();
@@ -745,14 +822,19 @@ fn run(driver: *Driver) !u8 {
     });
     try driver.anchor(first - 1);
     driver.window_start_ms = Io.Clock.awake.now(io).toMilliseconds();
+    const max_behind = driver.flags.max_behind orelse driver.flags.chain.max_behind;
     var number = first;
     var head_checked_ms: i64 = 0;
-    while (driver.flags.blocks == null or number - first < driver.flags.blocks.?) {
+    while (driver.flags.blocks == null or driver.follower.stats.blocks < driver.flags.blocks.?) {
         _ = driver.arena.reset(.retain_capacity);
         const now_ms = Io.Clock.awake.now(io).toMilliseconds();
         if (now_ms - head_checked_ms > 2_000) {
             driver.chain_head = driver.head_number() catch driver.chain_head;
             head_checked_ms = now_ms;
+        }
+        if (driver.chain_head > number + max_behind) {
+            number = try driver.skip_to_tip(number, "proof window");
+            continue;
         }
         const raw = try driver.block_json(number) orelse {
             try io.sleep(.fromMilliseconds(50), .awake);
@@ -771,31 +853,9 @@ fn run(driver: *Driver) !u8 {
             try driver.anchor(number - 1);
             continue;
         }
-        const started = Io.Clock.awake.now(io).toMilliseconds();
-        const outcome = driver.follow_block(&block) catch |err| {
-            std.debug.print("block {d}: {t}\n", .{ number, err });
-            try driver.summary(true);
-            return 1;
-        };
-        if (!outcome.ok()) {
-            try driver.report_mismatch(&outcome);
-            try driver.summary(true);
-            return 1;
-        }
-        const finished = Io.Clock.awake.now(io).toMilliseconds();
-        const header = try base.common.consensus.Header.decode(block.header_rlp);
-        driver.last_lag_ms = Io.Clock.real.now(io).toMilliseconds() -
-            @as(i64, @intCast(header.timestamp)) * 1000;
-        driver.gas_window += header.gas_used;
-        driver.chain_head = @max(driver.chain_head, number);
-        if (driver.flags.verbose) std.debug.print("block {d} {d} txs {d} gas ok in {d} ms\n", .{
-            number,
-            outcome.transactions,
-            outcome.gas_used,
-            finished - started,
-        });
-        try driver.summary(false);
-        number += 1;
+        if (!try verify_one(driver, &block)) return 1;
+        const verified = driver.follower.head.number == block.number;
+        number = if (verified) number + 1 else try driver.skip_to_tip(number, "abandoned");
     }
     try driver.summary(true);
     return 0;
@@ -816,6 +876,8 @@ test "follow: flags" {
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--block-rpc", "ftp://x" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{"--from"}));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "--proof-batch", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--max-behind", "0" }));
+    try std.testing.expectEqual(@as(?u64, 50), (try parse(&.{ "--max-behind", "50" })).max_behind);
 }
 
 test "follow: responses are accepted only without errors" {

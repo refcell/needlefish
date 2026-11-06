@@ -41,12 +41,25 @@ then Base mainnet, checks every header field, and runs 24 h on each with zero mi
 - [x] Follower state machine over the fixture: 10 mainnet blocks verify with the witness
   served on demand, including a rebase midway.
 - [x] `base follow` RPC driver, Sepolia defaults, status file, mismatch report.
-- [ ] Throughput: prefetch proofs at `latest` from an unmetered endpoint first, then the
-  rate-limited parent-state endpoint only for what is still missing.
+- [x] Bounded lag: past `--max-behind` blocks (default 8000, inside the 10,000-block proof
+  window) the follower re-anchors at the tip and counts the blocks it never verified
+  (`skipped`); a block abandoned for want of data is counted too, never a mismatch.
+- [ ] (blocked) Real-time coverage on Sepolia: needs an `eth_getProof` endpoint at recent
+  blocks with far more than 5 items/s (own node or a keyed provider).
 - [ ] Parallel workers on disjoint block segments if one follower cannot keep up.
 - [ ] 24 h Sepolia run, zero mismatches.
 - [ ] 24 h mainnet run, zero mismatches.
 - [ ] Head comparison checker and state sampling against a reference node.
+
+## Decisions
+
+- 2026-11-06: no `latest` prefetch. Measured on Sepolia: the keys a block needs are mostly
+  the ones it writes, whose proofs at `latest` no longer match the parent state, so gap
+  counts did not drop and each pass paid an extra round trip. Reverted.
+- 2026-11-06: keyless Sepolia proof capacity is about 5 `eth_getProof` items/s
+  (sepolia.base.org, -32011 beyond); publicnode, tenderly and drpc serve no usable window at
+  recent blocks or rate-limit at once. A block needs 30 to 300 proofs while cold, so a
+  keyless follower verifies contiguous segments, not every block.
 
 ## Log
 
