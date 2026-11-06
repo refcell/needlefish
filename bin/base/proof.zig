@@ -8,6 +8,7 @@ const base = @import("base");
 
 const proof = base.proof;
 const proof_run = @import("proof_run.zig");
+const proof_verify_tee = @import("proof_verify_tee.zig");
 const kzg = base.common.crypto.kzg;
 
 const usage =
@@ -17,10 +18,14 @@ const usage =
     \\                      [--claim-root <hex>] [--out <archive>]
     \\                      [--l1-genesis <file>]  (L1 chains that are not built in)
     \\
+++ proof_verify_tee.usage ++
+    \\
     \\  replay   run the fault-proof client over a recorded preimage archive
     \\  run      prove a claim against L1/L2 execution RPCs (native mode) and
     \\           optionally record the preimages into an archive
     \\  both exit 0 if the claimed output root holds, 1 if it does not
+    \\  verify-tee  check a prover-service TEE receipt offline: rebuild the signed journal
+    \\              and recover its signer (exit 0 when it verifies)
     \\
 ;
 
@@ -47,6 +52,13 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             std.debug.print("proof: run failed: {t}\n", .{err});
             return 2;
         };
+    }
+    if (args.len > 0 and std.mem.eql(u8, args[0], "verify-tee")) {
+        const flags = proof_verify_tee.parse(args[1..]) catch |err| {
+            std.debug.print("proof: {t}\n{s}", .{ err, usage });
+            return 2;
+        };
+        return proof_verify_tee.main(init, &flags);
     }
     const command = parse(args) catch {
         std.debug.print("{s}", .{usage});
@@ -91,5 +103,6 @@ test "proof: argument parsing" {
 }
 
 test {
+    _ = proof_verify_tee;
     _ = proof_run;
 }
