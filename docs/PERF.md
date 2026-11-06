@@ -1155,3 +1155,23 @@ Find the slowest tests with `just test-times`. Keep any single test under ~1 s i
 long simulations belong in `zig build sim` / swarm, not the unit suite.
 
 2026-11-05: suite ~90 s run time; 73 s in one p2p discv5 cluster test (flagged to the lane).
+
+## 2026-11-06 db witness: key hash memo in `SparseState` (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`witness.KeyMemo` memoizes keccak256 of storage slots and addresses, so `apply_evm` and
+`apply` reuse the hashes of the block's reads. `db/witness 1k acct+4k slot` (5989 keys),
+the block's reads through `SparseState.database()` right after `load` (new rows in the
+witness bench), then again:
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| reads cold (after `load`) | 2684.6 us (448 ns/key) | 1867.9 us (312 ns/key) |
+| reads warm (second pass) | 1515.9 us (253 ns/key) | 457.5 us (76 ns/key) |
+
+`node: replay 10 Base mainnet blocks`, interleaved A/B runs: before 917.2 / 933.4 /
+925.9 / 915.6 Mgas/s (4.98-5.08 ms/block), after 971.9 / 972.2 / 981.4 Mgas/s
+(4.74-4.79 ms/block). `-Devm-opcode-profile=true`: SLOAD 496.6 -> 476.3 ticks/exec
+(41.7% -> 40.1% of handler ticks), total 941.9 -> 970.7 Mgas/s under the profiler.
+The rest of SLOAD is the trie walk (nodes are decoded once per pool node already) and the
+evm's own slot table.
+

@@ -31,6 +31,7 @@ const trie = @import("../trie/root.zig");
 const state_module = @import("state.zig");
 const changeset_module = @import("changeset.zig");
 const history = @import("history.zig");
+const key_memo_module = @import("witness_key_memo.zig");
 const rlp = trie.rlp;
 const node = trie.node;
 const sparse = trie.sparse;
@@ -40,6 +41,7 @@ const SlotKey = state_module.SlotKey;
 const Changeset = changeset_module.Changeset;
 const AccountChange = changeset_module.AccountChange;
 const StorageChange = changeset_module.StorageChange;
+pub const KeyMemo = key_memo_module.KeyMemo;
 pub const Address = state_module.Address;
 pub const Hash = state_module.Hash;
 pub const AccountInfo = state_module.AccountInfo;
@@ -493,12 +495,6 @@ pub fn header_parent_hash(header: []const u8) error{InvalidWitness}!Hash {
     return (try header_link(header)).parent_hash;
 }
 
-fn slot_hash_of(slot: u256) Hash {
-    var key: [32]u8 = undefined;
-    std.mem.writeInt(u256, &key, slot, .big);
-    return node.keccak256(&key);
-}
-
 fn address_order(a: *const Address, b: *const Address) std.math.Order {
     return std.math.order(std.mem.readInt(u160, a, .big), std.mem.readInt(u160, b, .big));
 }
@@ -534,33 +530,63 @@ pub const ChangesetHashes = struct {
 const key_chunk = 64;
 
 /// keccak256 of the addresses of `items` (`Address`es, or structs with an `address`) into
-/// `out`, batched.
-fn hash_addresses(comptime T: type, items: []const T, out: []Hash) void {
+/// `out`: from `memo` where it has them, the rest batched (and memoized).
+fn hash_addresses(comptime T: type, items: []const T, out: []Hash, memo: ?*KeyMemo) void {
     assert(items.len == out.len);
     var inputs: [key_chunk][]const u8 = undefined;
+    var hashes: [key_chunk]Hash = undefined;
+    var positions: [key_chunk]usize = undefined;
     var start: usize = 0;
     while (start < items.len) : (start += key_chunk) {
         const len = @min(key_chunk, items.len - start);
-        for (inputs[0..len], items[start..][0..len]) |*input, *item| {
-            input.* = if (T == Address) item else &item.address;
+        var misses: usize = 0;
+        for (items[start..][0..len], out[start..][0..len], start..) |*item, *digest, index| {
+            const address: *const Address = if (T == Address) item else &item.address;
+            if (memo) |table| if (table.address_cached(address)) |hash| {
+                digest.* = hash;
+                continue;
+            };
+            inputs[misses] = address;
+            positions[misses] = index;
+            misses += 1;
         }
-        sparse.keccak256_many(inputs[0..len], out[start..][0..len]);
+        assert(misses <= len);
+        sparse.keccak256_many(inputs[0..misses], hashes[0..misses]);
+        for (inputs[0..misses], positions[0..misses], hashes[0..misses]) |input, at, *hash| {
+            out[at] = hash.*;
+            if (memo) |table| table.put_address(input[0..20], hash);
+        }
     }
 }
 
-/// keccak256 of the 32-byte big-endian `slot` of each of `items` into `out`, batched.
-fn hash_slots(comptime T: type, items: []const T, out: []Hash) void {
+/// keccak256 of the 32-byte big-endian `slot` of each of `items` into `out`: from `memo`
+/// where it has them, the rest batched (and memoized).
+fn hash_slots(comptime T: type, items: []const T, out: []Hash, memo: ?*KeyMemo) void {
     assert(items.len == out.len);
     var keys: [key_chunk][32]u8 = undefined;
     var inputs: [key_chunk][]const u8 = undefined;
+    var hashes: [key_chunk]Hash = undefined;
+    var positions: [key_chunk]usize = undefined;
     var start: usize = 0;
     while (start < items.len) : (start += key_chunk) {
         const len = @min(key_chunk, items.len - start);
-        for (keys[0..len], inputs[0..len], items[start..][0..len]) |*key, *input, *item| {
-            std.mem.writeInt(u256, key, item.slot, .big);
-            input.* = key;
+        var misses: usize = 0;
+        for (items[start..][0..len], out[start..][0..len], start..) |*item, *digest, index| {
+            std.mem.writeInt(u256, &keys[misses], item.slot, .big);
+            if (memo) |table| if (table.slot_key_cached(&keys[misses])) |hash| {
+                digest.* = hash;
+                continue;
+            };
+            inputs[misses] = &keys[misses];
+            positions[misses] = index;
+            misses += 1;
         }
-        sparse.keccak256_many(inputs[0..len], out[start..][0..len]);
+        assert(misses <= len);
+        sparse.keccak256_many(inputs[0..misses], hashes[0..misses]);
+        for (keys[0..misses], positions[0..misses], hashes[0..misses]) |*key, at, *hash| {
+            out[at] = hash.*;
+            if (memo) |table| table.put_slot_key(key, hash);
+        }
     }
 }
 
@@ -569,6 +595,7 @@ fn hash_slots(comptime T: type, items: []const T, out: []Hash) void {
 const KeyCursor = struct {
     changeset: *const Changeset,
     given: ?ChangesetHashes,
+    memo: ?*KeyMemo,
     slots: [key_chunk]Hash = undefined,
     slots_start: usize = 0,
     slots_len: usize = 0,
@@ -584,7 +611,7 @@ const KeyCursor = struct {
             self.slots_start = index;
             self.slots_len = @min(key_chunk, changes.len - index);
             const out = self.slots[0..self.slots_len];
-            hash_slots(StorageChange, changes[index..][0..self.slots_len], out);
+            hash_slots(StorageChange, changes[index..][0..self.slots_len], out, self.memo);
         }
         return self.slots[index - self.slots_start];
     }
@@ -597,7 +624,8 @@ const KeyCursor = struct {
             self.accounts_start = index;
             self.accounts_len = @min(key_chunk, accounts.len - index);
             const out = self.accounts[0..self.accounts_len];
-            hash_addresses(AccountChange, accounts[index..][0..self.accounts_len], out);
+            const items = accounts[index..][0..self.accounts_len];
+            hash_addresses(AccountChange, items, out, self.memo);
         }
         return self.accounts[index - self.accounts_start];
     }
@@ -605,7 +633,9 @@ const KeyCursor = struct {
     /// The address hash of the storage run starting at change `index`.
     fn storage_address(self: *const KeyCursor, index: usize) Hash {
         if (self.given) |given| return given.storage_addresses[index];
-        return node.keccak256(&self.changeset.storage_changes()[index].address);
+        const address = &self.changeset.storage_changes()[index].address;
+        if (self.memo) |memo| return memo.address_hash(address);
+        return node.keccak256(address);
     }
 };
 
@@ -650,6 +680,8 @@ pub const SparseState = struct {
     /// trie roots (contiguous, for one batched rehash).
     runs: []StorageRun,
     run_roots: []sparse.NodeIndex,
+    /// keccak256 of the addresses and slots read or written (cleared by `reset`).
+    keys: KeyMemo,
     /// A read through `database()` failed for want of witness data (the evm only sees
     /// `DatabaseFailure`).
     incomplete: bool = false,
@@ -684,6 +716,8 @@ pub const SparseState = struct {
         errdefer lazy.free(allocator, runs);
         const run_roots = try lazy.alloc(allocator, sparse.NodeIndex, config.storage_tries_max);
         errdefer lazy.free(allocator, run_roots);
+        var keys = try KeyMemo.init(allocator, .{});
+        errdefer keys.deinit(allocator);
         var result: SparseState = .{
             .nodes = nodes,
             .codes = codes,
@@ -692,6 +726,7 @@ pub const SparseState = struct {
             .storage_tries_max = config.storage_tries_max,
             .runs = runs,
             .run_roots = run_roots,
+            .keys = keys,
         };
         try result.storage_roots.ensureTotalCapacity(allocator, config.storage_tries_max);
         return result;
@@ -699,6 +734,7 @@ pub const SparseState = struct {
 
     pub fn deinit(self: *SparseState, allocator: std.mem.Allocator) void {
         self.storage_roots.deinit(allocator);
+        self.keys.deinit(allocator);
         lazy.free(allocator, self.run_roots);
         lazy.free(allocator, self.runs);
         self.trie.deinit(allocator);
@@ -728,6 +764,7 @@ pub const SparseState = struct {
         self.pre_state_root = pre_state_root;
         self.trie.clear();
         self.storage_roots.clearRetainingCapacity();
+        self.keys.clear();
         self.incomplete = false;
         // The pool was just emptied and has at least one node.
         self.account_root = self.trie.root_from_hash(pre_state_root) catch unreachable;
@@ -832,7 +869,9 @@ pub const SparseState = struct {
     }
 
     pub fn basic(self: *SparseState, address: Address) Error!?AccountInfo {
-        const account = try self.account_state(&node.keccak256(&address)) orelse return null;
+        const account = try self.account_state(&self.keys.address_hash(&address)) orelse {
+            return null;
+        };
         return .{
             .nonce = account.nonce,
             .balance = account.balance,
@@ -841,9 +880,16 @@ pub const SparseState = struct {
     }
 
     pub fn storage(self: *SparseState, address: Address, slot: u256) Error!u256 {
-        const root = (try self.storage_root_slot(&node.keccak256(&address))).*;
-        const value = try self.trie.get(root, &slot_hash_of(slot)) orelse return 0;
+        const root = (try self.storage_root_slot(&self.keys.address_hash(&address))).*;
+        const value = try self.trie.get(root, &self.keys.slot_hash(slot)) orelse return 0;
         return history.decode_storage_value(value) catch error.InvalidWitness;
+    }
+
+    /// Hashes `address` and the not yet memoized `slots` ahead of `storage` reads of them,
+    /// with batched keccak. Optional: `storage` gives the same values without it.
+    pub fn prefetch_storage(self: *SparseState, address: Address, slots: []const u256) void {
+        _ = self.keys.address_hash(&address);
+        self.keys.prefetch_slots(slots);
     }
 
     pub fn code_by_hash(self: *SparseState, hash: Hash) Error![]const u8 {
@@ -872,7 +918,7 @@ pub const SparseState = struct {
     /// The storage root in `address`'s account leaf (post-state after `apply`), or the
     /// empty root for a missing account.
     pub fn account_storage_root(self: *SparseState, address: Address) Error!Hash {
-        const account = try self.account_state(&node.keccak256(&address)) orelse {
+        const account = try self.account_state(&self.keys.address_hash(&address)) orelse {
             return node.empty_root;
         };
         return account.storage_root;
@@ -906,7 +952,7 @@ pub const SparseState = struct {
         changeset: *const Changeset,
         hashes: ?ChangesetHashes,
     ) Error!void {
-        var cursor: KeyCursor = .{ .changeset = changeset, .given = hashes };
+        var cursor: KeyCursor = .{ .changeset = changeset, .given = hashes, .memo = &self.keys };
         const runs = try self.apply_storage(&cursor);
         self.trie.update_root_refs(self.run_roots[0..runs]);
         try self.apply_accounts(&cursor, runs);
@@ -1088,7 +1134,8 @@ pub const SparseState = struct {
             } else null;
             const wiped = account.in_database and account.storage_cleared;
             if (wiped) {
-                const root = try self.storage_root_slot(&node.keccak256(&account.address));
+                const address_hash = self.keys.address_hash(&account.address);
+                const root = try self.storage_root_slot(&address_hash);
                 root.* = sparse.none;
             }
             const same = if (old != null and new != null)
@@ -1156,7 +1203,7 @@ pub const SparseState = struct {
         address: evm.Address,
     ) evm.state.Error!?evm.state.AccountInfo {
         const self = from(context);
-        const address_hash = node.keccak256(&address);
+        const address_hash = self.keys.address_hash(&address);
         const account = self.account_state(&address_hash) catch |err| {
             return self.database_failure(err);
         } orelse return null;
@@ -1507,8 +1554,8 @@ pub const Builder = struct {
         const accounts_half = self.account_hashes.len / 2;
         const slots_half = self.slot_hashes.len / 2;
         assert(accounts.len <= accounts_half and slots.len <= slots_half);
-        hash_addresses(Address, accounts, self.account_hashes[0..accounts.len]);
-        hash_slots(SlotKey, slots, self.slot_hashes[0..slots.len]);
+        hash_addresses(Address, accounts, self.account_hashes[0..accounts.len], null);
+        hash_slots(SlotKey, slots, self.slot_hashes[0..slots.len], null);
         for (slots, self.storage_address_hashes[0..slots.len], 0..) |*key, *hash, index| {
             if (index > 0 and std.mem.eql(u8, &key.address, &slots[index - 1].address)) {
                 hash.* = self.storage_address_hashes[index - 1];

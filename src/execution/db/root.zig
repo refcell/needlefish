@@ -49,6 +49,7 @@ test {
     _ = @import("history_test.zig");
     _ = @import("witness_test.zig");
     _ = @import("witness_differential_test.zig");
+    _ = @import("witness_key_memo.zig");
     _ = @import("witness_evm_test.zig");
     _ = @import("has_storage_test.zig");
     _ = @import("witness_block_test.zig");

@@ -318,6 +318,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - [ ] Disk state phase 6: scale proof on a synthetic 100M+ entry state, then state import from
   a public snapshot.
 
+- [x] Performance (nf-evm replay profile: SLOAD ~40% of handler ticks, cold reads through
+  `SparseState.storage`): `witness.KeyMemo` (`db/witness_key_memo.zig`) memoizes keccak256
+  of slots and addresses per `SparseState` (direct-mapped, 8192 + 2048 entries, cleared by
+  `reset`). Reads, `apply_evm`'s old-value reads and `apply`'s key batches reuse the hashes
+  of the execution's reads; `prefetch_storage(address, slots)` batch-hashes ahead. Db bench
+  (1k acct + 4k slot block, 5989 keys) reads after `load`: cold 448 -> 312 ns/key, warm
+  253 -> 76 ns/key; `node: replay` ~925 -> ~972 Mgas/s, SLOAD 497 -> 476 ticks/exec.
+  Memo on/off differential in `witness_differential_test.zig`.
+
 ## Decisions
 - Disk state phase 1 (grid, free set, tables, engine). Addresses are block index + 1 (0 =
   none); grid block size = `checkpoint_block_size` (one block size per file, no new layout
@@ -1013,6 +1022,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   remembers up to `canonical_max`); nothing in the database serves them. `Database.init`
   asserts `window_blocks <= canonical_max` so the ring always covers the window.
 
+- Key hash memo (`KeyMemo`): direct-mapped (one probe, collisions overwrite), keys compared
+  in full, so a hit is the keccak256 itself and results are bit-identical; generation tags
+  make `reset` O(1). Fixed sizes (8192 slot, 2048 address entries, ~670 KiB, written
+  once at `init`) rather than a `SparseState.Config` field, so no caller changes; slot hashes
+  are per slot, not per (account, slot), since keccak(slot) ignores the account. Trie
+  walks were already decoded once per pool node (`resolve` + `unloaded` offsets), so
+  `SparseTrie.get` is unchanged: after the memo, warm reads are ~76 ns/key of walk.
+  `apply_hashed` with caller hashes bypasses the memo. The evm lane may call
+  `prefetch_storage`; nothing does yet.
+
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
   `journal_stop` corruption; acknowledged entries after it are lost). Not fixed: needs
@@ -1445,3 +1464,5 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   `eth_getProof` / `debug_storageRangeAt` at the window's oldest block with
   `HistoryUnavailable` (the canonical check in `node/durable.zig`) although history held it.
   Harness loop widened to 10 seeds (~1 s Debug); 64 seeds of `0x77_0000 + i` pass (6.6 s).
+- 2026-11-06: witness `KeyMemo`: cold `SparseState` reads 448 -> 312 ns/key, warm 253 -> 76;
+  `node: replay` ~925 -> ~972 Mgas/s (interleaved A/B, same machine).

@@ -8,6 +8,10 @@
 //! witness, with and without `verify_root`, encodes (`witness_codec`) to exactly the bytes
 //! of the reference witness, from the live state (`StateSource`) and from the history store
 //! (`HistorySource`), and the verified roots agree.
+//!
+//! The same blocks also run on `SparseState`s with the key memo on (a tiny table, so it hits,
+//! misses and collides) and off: reads (values or errors), roots and post-state reads agree,
+//! both for a state reset per block and for one kept across blocks (randomly cleared).
 
 const std = @import("std");
 const testing = std.testing;
@@ -256,6 +260,82 @@ const Fixture = struct {
     }
 };
 
+/// One `SparseState` with the key memo on and one with it off, over the same inputs.
+const MemoPair = struct {
+    on: witness.SparseState,
+    off: witness.SparseState,
+
+    fn init(pair: *MemoPair, root: Hash) !void {
+        const allocator = testing.allocator;
+        pair.on = try witness.SparseState.init(allocator, sparse_config);
+        errdefer pair.on.deinit(allocator);
+        pair.off = try witness.SparseState.init(allocator, sparse_config);
+        errdefer pair.off.deinit(allocator);
+        pair.on.keys.deinit(allocator);
+        pair.on.keys = try witness.KeyMemo.init(allocator, .{
+            .slots_count = 16,
+            .addresses_count = 8,
+        });
+        pair.off.keys.enabled = false;
+        pair.reset(root);
+    }
+
+    fn deinit(pair: *MemoPair) void {
+        pair.off.deinit(testing.allocator);
+        pair.on.deinit(testing.allocator);
+    }
+
+    fn reset(pair: *MemoPair, root: Hash) void {
+        pair.on.reset(root, .{ .number = 0, .hash = @splat(0) });
+        pair.off.reset(root, .{ .number = 0, .hash = @splat(0) });
+    }
+
+    fn add_nodes(pair: *MemoPair, built: *const witness.Witness) !void {
+        for (0..built.state.count) |index| {
+            try pair.on.add_node(built.state.get(@intCast(index)));
+            try pair.off.add_node(built.state.get(@intCast(index)));
+        }
+    }
+
+    fn expect_reads(pair: *MemoPair, reads: *const witness.KeySet) !void {
+        for (reads.accounts.slice()) |address| {
+            const on = pair.on.basic(address);
+            const off = pair.off.basic(address);
+            try testing.expectEqual(off, on);
+        }
+        for (reads.slots.slice()) |key| {
+            const on = pair.on.storage(key.address, key.slot);
+            const off = pair.off.storage(key.address, key.slot);
+            try testing.expectEqual(off, on);
+        }
+    }
+
+    fn run(pair: *MemoPair, prng: *Prng, fixture: *Fixture) !void {
+        const reads = &fixture.recorder.keys;
+        if (prng.chance(1, 2)) {
+            for (reads.slots.slice()) |key| pair.on.prefetch_storage(key.address, &.{key.slot});
+        }
+        try pair.expect_reads(reads);
+        try pair.on.apply(&fixture.changeset);
+        try pair.off.apply(&fixture.changeset);
+        try testing.expectEqual(pair.off.state_root(), pair.on.state_root());
+        try pair.expect_reads(reads);
+    }
+};
+
+fn run_memo_pairs(prng: *Prng, fixture: *Fixture, pairs: *[2]MemoPair) !void {
+    const pre_root = try fixture.state.state_root();
+    // Pair 0: reset to the block's pre-state each block (a fresh verifier).
+    pairs[0].reset(pre_root);
+    // Pair 1: kept across blocks (the replayer), its memo randomly cleared.
+    if (prng.chance(1, 4)) pairs[1].on.keys.clear();
+    try testing.expectEqual(pre_root, pairs[1].off.state_root());
+    for (pairs) |*pair| {
+        try pair.add_nodes(&fixture.built);
+        try pair.run(prng, fixture);
+    }
+}
+
 fn genesis(prng: *Prng, fixture: *Fixture) !void {
     const overlay = &fixture.overlay;
     for (0..genesis_accounts) |index| {
@@ -299,13 +379,14 @@ fn random_writes(prng: *Prng, overlay: *Overlay, deletes: bool) !void {
     }
 }
 
-fn run_block(prng: *Prng, fixture: *Fixture, number: u64) !void {
+fn run_block(prng: *Prng, fixture: *Fixture, number: u64, pairs: *[2]MemoPair) !void {
     fixture.recorder.keys.clear();
     try fixture.store.reset(&fixture.state.state_trie, number);
     try random_reads(prng, &fixture.recorder);
     try random_writes(prng, &fixture.overlay, prng.chance(2, 3));
     try fixture.overlay.build_changeset(&fixture.changeset);
     try fixture.expect_same(fixture.builder.state_source(&fixture.state));
+    try run_memo_pairs(prng, fixture, pairs);
     const source: witness.HistorySource = .{
         .store = &fixture.store,
         .number = number,
@@ -324,6 +405,13 @@ test "witness differential: sorted multi-key builder equals per-key proofs + rep
         try fixture.init();
         defer fixture.deinit();
         try genesis(&prng, fixture);
-        for (0..blocks_per_seed) |block| try run_block(&prng, fixture, block);
+        const pairs = try testing.allocator.create([2]MemoPair);
+        defer testing.allocator.destroy(pairs);
+        const root = try fixture.state.state_root();
+        try pairs[0].init(root);
+        defer pairs[0].deinit();
+        try pairs[1].init(root);
+        defer pairs[1].deinit();
+        for (0..blocks_per_seed) |block| try run_block(&prng, fixture, block, pairs);
     }
 }

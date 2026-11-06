@@ -75,6 +75,8 @@ const Metric = enum(u8) {
     load,
     replay,
     stateless,
+    sparse_reads_cold,
+    sparse_reads_warm,
 };
 const metrics_count = std.enums.values(Metric).len;
 
@@ -396,6 +398,7 @@ fn measure_sample(
     report.trie_used = trie_used(&fixture.sparse);
     report.trie_capacity = @intCast(fixture.sparse.trie.nodes.len);
     if (!std.mem.eql(u8, &fixture.sparse.state_root(), &post_root)) return error.RootMismatch;
+    if (kind == .writes) try measure_sparse_reads(io, fixture, report, sample);
     if (kind == .calls) {
         fixture.sparse.reset(fixture.pre_root, no_headers_parent);
         try fixture.sparse.load(&fixture.decoded);
@@ -411,6 +414,20 @@ fn measure_sample(
     report.codes = fixture.built.codes.count;
     report.keys = fixture.built.keys.count;
     report.encoded_bytes = @intCast(size);
+}
+
+/// The block's reads through `SparseState.database()` right after `load` (cold: every key
+/// hashed, every trie node on the path decoded), then again (warm: decoded nodes, memoized
+/// key hashes).
+fn measure_sparse_reads(io: std.Io, fixture: *Fixture, report: *Report, sample: u32) !void {
+    fixture.sparse.reset(fixture.pre_root, no_headers_parent);
+    try fixture.sparse.load(&fixture.decoded);
+    var clock = bench.now_ns(io);
+    std.mem.doNotOptimizeAway(try fixture.read_keys(fixture.sparse.database()));
+    clock = lap(io, report, .sparse_reads_cold, sample, clock);
+    std.mem.doNotOptimizeAway(try fixture.read_keys(fixture.sparse.database()));
+    _ = lap(io, report, .sparse_reads_warm, sample, clock);
+    assert(!fixture.sparse.incomplete);
 }
 
 /// `Builder.build_with` without root verification; must give the witness `build` gave.
@@ -499,6 +516,14 @@ fn print_report(name: []const u8, report: *Report) void {
         megabytes_per_s(report.encoded_bytes, encode),
         megabytes_per_s(report.encoded_bytes, decode),
     });
+    if (report.times_ns[@backingInt(Metric.sparse_reads_cold)][0] != 0) {
+        const cold = report.median_us(.sparse_reads_cold);
+        const warm = report.median_us(.sparse_reads_warm);
+        const keys: f64 = @floatFromInt(@max(report.keys, 1));
+        std.debug.print("  {s:<38} {d:>10.1} us / {d:.1} us ({d:.0} / {d:.0} ns/key)\n", .{
+            "SparseState reads cold / warm", cold, warm, cold * 1e3 / keys, warm * 1e3 / keys,
+        });
+    }
     if (report.times_ns[@backingInt(Metric.stateless)][0] != 0) {
         std.debug.print("  {s:<38} {d:>10.1} us\n", .{
             "stateless evm run + apply_evm", report.median_us(.stateless),
