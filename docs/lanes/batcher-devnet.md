@@ -237,6 +237,11 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   channel reaching every safe head seen since is handed out. Sweep with the gate removed
   except for crashes/byzantine posts: 1/3000 left (329: a re-posted tx at a reused nonce
   loses to the older tx; the nonce-only confirmation cannot tell). Gate kept until fixed.
+- [x] Smoke asserts the 200 ms cadence (>= 80% of nominal blocks over 5 s).
+- [x] Blob-DA devnet mode: `DEVNET_DA=blobs just devnet up` runs the batcher with
+  `--data-availability blobs` and the smoke still passes (dev L1 beacon serves the blobs).
+- [ ] `--l1-ws-url` (the last base/base batcher flag we lack): accept it and use a
+  WebSocket `newHeads` subscription to wake the step loop instead of waiting a poll interval.
 - [ ] (coordinator) Drop the sim BUG(batcher) gate: (a) seed 329, an older tx wins a reused
   nonce, so confirm contested nonces by receipt (all attempt hashes) and re-post when none is
   ours; (b) crash-restart, a restarted batcher forgets its old txs, so a rollback below the
@@ -276,4 +281,8 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   from `zig build -Doptimize=ReleaseSafe` on alpine, one container per component at fixed
   IPs (the CL accepts IPv4 URLs only), and `seccomp=unconfined` for io_uring. `.devnet/` is bind-mounted and
   ports are published at the native ports, so the unchanged smoke passes against it (99/99).
+- 2026-11-05: Smoke checks the 200 ms cadence (>= 20 blocks in 5 s). `DEVNET_DA=blobs`
+  posts batches as blobs, and `base devnet batches --beacon URL` decodes blob txs through an
+  injected `BlobSource` (the bin GETs `/eth/v1/beacon/blobs/{slot}`, the consensus
+  endpoint). The smoke passes in both modes.
 

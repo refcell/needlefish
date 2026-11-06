@@ -2,7 +2,8 @@
 //! the batch inbox, reassembles channels with the consensus `Channel`, decompresses them
 //! and prints every batch. A debugging and smoke-test tool in the spirit of op-node's
 //! batch_decoder; it reuses the derivation code, so what it prints is what a verifier
-//! would read. Blob transactions are counted but not decoded (needs a beacon API).
+//! would read. Blob transactions are decoded when a `BlobSource` (a beacon API) is given,
+//! else only counted.
 //!
 //! CLI tool, not a hot path: it allocates from the caller's arena, bounded by `Limits`.
 
@@ -16,6 +17,8 @@ const protocol = @import("../../consensus/protocol/root.zig");
 const frame_module = @import("../../consensus/protocol/frame.zig");
 const batch_module = @import("../../consensus/protocol/batch.zig");
 const batch_reader = @import("../../consensus/protocol/batch_reader.zig");
+const blobs = @import("../blobs/root.zig");
+const blob_tx = @import("../txdata/blob.zig");
 
 const Address = primitives.Address;
 
@@ -26,12 +29,26 @@ pub const Limits = struct {
     decompressed_bytes_max: u64 = 10_000_000,
 };
 
+/// Fetches the blobs of a blob transaction, in `hashes` order, from the L1 block at
+/// `timestamp` (a beacon API in the binary, canned in tests).
+pub const BlobSource = struct {
+    context: *anyopaque,
+    fetch_fn: *const fn (
+        context: *anyopaque,
+        arena: Allocator,
+        timestamp: u64,
+        hashes: []const [32]u8,
+    ) anyerror![]const *const blobs.Blob,
+};
+
 pub const Params = struct {
     inbox: Address,
     /// Only transactions from this sender count (the batcher), when set.
     sender: ?Address = null,
     from_block: u64,
     to_block: u64,
+    /// Decodes blob transactions when set; without it they are only counted.
+    blob_source: ?BlobSource = null,
 };
 
 pub const Summary = struct {
@@ -39,6 +56,8 @@ pub const Summary = struct {
     blob_txs: u32 = 0,
     frames: u32 = 0,
     invalid_frames: u32 = 0,
+    /// Blob transactions whose blobs could not be fetched or were malformed.
+    unavailable_blob_txs: u32 = 0,
     channels: u32 = 0,
     singular_batches: u32 = 0,
     span_batches: u32 = 0,
@@ -46,6 +65,17 @@ pub const Summary = struct {
 };
 
 const OpenChannel = struct { channel: protocol.Channel, opened_at: u64 };
+
+/// Per-scan state shared by calldata and blob transactions.
+const Scan = struct {
+    arena: Allocator,
+    open: *std.ArrayList(OpenChannel),
+    input: []u8,
+    frames: []frame_module.Frame,
+    limits: Limits,
+    summary: *Summary,
+    out: *Writer,
+};
 
 pub fn inspect(
     arena: Allocator,
@@ -59,6 +89,16 @@ pub fn inspect(
     var open: std.ArrayList(OpenChannel) = try .initCapacity(arena, limits.channels_open_max);
     const input = try arena.alloc(u8, limits.input_bytes_max);
     const frames = try arena.alloc(frame_module.Frame, limits.frames_per_tx_max);
+    assert(input.len >= blobs.blob_data_length_max);
+    var scan: Scan = .{
+        .arena = arena,
+        .open = &open,
+        .input = input,
+        .frames = frames,
+        .limits = limits,
+        .summary = &summary,
+        .out = out,
+    };
     var number = params.from_block;
     while (number <= params.to_block) : (number += 1) {
         var text: [48]u8 = undefined;
@@ -73,17 +113,13 @@ pub fn inspect(
             summary.inbox_txs += 1;
             if (try rpc.quantity(u8, try rpc.field(tx, "type")) == 3) {
                 summary.blob_txs += 1;
+                const blob_source = params.blob_source orelse continue;
+                const timestamp = try rpc.quantity(u64, try rpc.field(block, "timestamp"));
+                try add_blob_tx(&scan, blob_source, tx, timestamp, number);
                 continue;
             }
             const data = try rpc.data(try rpc.field(tx, "input"), input);
-            const parsed = frame_module.parse_frames(data, frames) catch {
-                summary.invalid_frames += 1;
-                continue;
-            };
-            for (parsed) |frame| {
-                summary.frames += 1;
-                try add_frame(arena, &open, frame, number, limits, &summary, out);
-            }
+            try add_tx_data(&scan, data, number);
         }
     }
     for (open.items) |*pending| {
@@ -93,6 +129,65 @@ pub fn inspect(
         });
     }
     return summary;
+}
+
+fn add_tx_data(scan: *Scan, data: []const u8, l1_number: u64) !void {
+    const parsed = frame_module.parse_frames(data, scan.frames) catch {
+        scan.summary.invalid_frames += 1;
+        return;
+    };
+    assert(parsed.len <= scan.frames.len);
+    for (parsed) |frame| {
+        scan.summary.frames += 1;
+        try add_frame(scan.arena, scan.open, frame, l1_number, scan.limits, scan.summary, scan.out);
+    }
+}
+
+/// Each blob carries one or more frames, like a calldata payload (base/base blob data).
+/// Unavailable or malformed blobs are reported and skipped: an inspector keeps going.
+fn add_blob_tx(
+    scan: *Scan,
+    blob_source: BlobSource,
+    tx: std.json.Value,
+    timestamp: u64,
+    l1_number: u64,
+) !void {
+    const listed = try rpc.field(tx, "blobVersionedHashes");
+    if (listed != .array or listed.array.items.len == 0) return error.MalformedResponse;
+    if (listed.array.items.len > blob_tx.blobs_per_tx_max) return error.MalformedResponse;
+    var hashes: [blob_tx.blobs_per_tx_max][32]u8 = undefined;
+    const count = listed.array.items.len;
+    for (listed.array.items, hashes[0..count]) |item, *hash| hash.* = try rpc.fixed(32, item);
+    const wanted = hashes[0..count];
+    const fetched = try fetch_blobs(scan, blob_source, timestamp, wanted, l1_number) orelse return;
+    if (fetched.len != count) return error.MalformedResponse;
+    for (fetched) |blob| {
+        const data = blobs.decode(blob, scan.input) catch |err| {
+            try scan.out.print("blob in L1 block {d}: undecodable: {t}\n", .{ l1_number, err });
+            scan.summary.unavailable_blob_txs += 1;
+            return;
+        };
+        try add_tx_data(scan, data, l1_number);
+    }
+}
+
+/// The blobs, or null after reporting them unavailable (the scan goes on).
+fn fetch_blobs(
+    scan: *Scan,
+    blob_source: BlobSource,
+    timestamp: u64,
+    hashes: []const [32]u8,
+    l1_number: u64,
+) !?[]const *const blobs.Blob {
+    assert(hashes.len > 0);
+    return blob_source.fetch_fn(blob_source.context, scan.arena, timestamp, hashes) catch |err| {
+        try scan.out.print("blob tx in L1 block {d}: blobs unavailable: {t}\n", .{
+            l1_number,
+            err,
+        });
+        scan.summary.unavailable_blob_txs += 1;
+        return null;
+    };
 }
 
 fn is_batcher_tx(tx: std.json.Value, params: Params) !bool {
@@ -188,6 +283,7 @@ fn print_batches(
 const testing = std.testing;
 const manager_module = @import("../channel/manager.zig");
 const source = @import("../source/root.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
 
 test "inspect: decodes the batches a channel manager produced" {
     var manager = try manager_module.Manager.init(testing.allocator, .{
@@ -249,4 +345,166 @@ test "inspect: decodes the batches a channel manager produced" {
     try testing.expectEqual(@as(u32, 3), summary.singular_batches);
     try testing.expectEqual(@as(u64, 3), summary.l2_transactions);
     try testing.expect(std.mem.indexOf(u8, output.written(), "timestamp 106, epoch 7") != null);
+}
+
+/// Canned blobs handed out in order, `hashes.len` at a time; `fail` refuses every fetch.
+const FakeBlobs = struct {
+    blobs: []const *const blobs.Blob,
+    next: usize = 0,
+    fail: bool = false,
+
+    fn source(fake: *FakeBlobs) BlobSource {
+        return .{ .context = fake, .fetch_fn = fetch };
+    }
+
+    fn fetch(
+        context: *anyopaque,
+        _: Allocator,
+        timestamp: u64,
+        hashes: []const [32]u8,
+    ) anyerror![]const *const blobs.Blob {
+        const fake: *FakeBlobs = @ptrCast(@alignCast(context));
+        assert(timestamp == 1234);
+        if (fake.fail) return error.NotFound;
+        if (fake.next + hashes.len > fake.blobs.len) return error.NotFound;
+        defer fake.next += hashes.len;
+        return fake.blobs[fake.next..][0..hashes.len];
+    }
+};
+
+/// An L1 block (timestamp 1234) with one blob tx per `per_tx` blobs, `count` blobs total.
+fn blob_block_json(arena: Allocator, count: usize, per_tx: usize) ![]const u8 {
+    assert(per_tx >= 1 and per_tx <= blob_tx.blobs_per_tx_max);
+    var block_json: Writer.Allocating = .init(arena);
+    const w = &block_json.writer;
+    try w.writeAll("{\"timestamp\":\"0x4d2\",\"transactions\":[");
+    var index: usize = 0;
+    while (index < count) : (index += per_tx) {
+        if (index > 0) try w.writeAll(",");
+        try w.print("{{\"type\":\"0x3\",\"to\":\"0x{x}\",\"input\":\"0x\"," ++
+            "\"blobVersionedHashes\":[", .{&@as([20]u8, @splat(0xff))});
+        for (0..@min(per_tx, count - index)) |position| {
+            if (position > 0) try w.writeAll(",");
+            try w.print("\"0x{x}\"", .{&@as([32]u8, @splat(0x01))});
+        }
+        try w.writeAll("]}");
+    }
+    try w.writeAll("]}");
+    return block_json.written();
+}
+
+fn inspect_blob_block(
+    arena: Allocator,
+    block_json: []const u8,
+    fake: *FakeBlobs,
+    out: *Writer,
+) !Summary {
+    var canned: rpc.CannedTransport = .{ .answers = &.{
+        .{ .method = "eth_getBlockByNumber", .result = block_json },
+    } };
+    var client = try rpc.Client.init(testing.allocator, canned.transport(), .{
+        .response_bytes_max = 64 * 1024,
+        .parse_bytes_max = 1 << 20,
+    });
+    defer client.deinit(testing.allocator);
+    return inspect(arena, &client, .{
+        .inbox = .{ .bytes = @splat(0xff) },
+        .from_block = 5,
+        .to_block = 5,
+        .blob_source = fake.source(),
+    }, .{}, out);
+}
+
+test "inspect: decodes channels from blob transactions through a blob source" {
+    var manager = try manager_module.Manager.init(testing.allocator, .{
+        .channel = .{ .frame_size_max = 40, .target_frames = 64, .input_bytes_max = 64 * 1024 },
+        .batch_bytes_max = 4096,
+    }, @splat(0x22));
+    defer manager.deinit(testing.allocator);
+    const txs = [_][]const u8{"\x02l2-tx"};
+    var parent: primitives.B256 = .zero;
+    for (1..4) |number| {
+        var hash: primitives.B256 = .zero;
+        hash.bytes[31] = @intCast(number);
+        try manager.add_block(&.{
+            .number = number,
+            .hash = hash,
+            .parent_hash = parent,
+            .timestamp = 100 + 2 * number,
+            .l1_origin = .{ .number = 7, .hash = .zero },
+            .sequence_number = number,
+            .transactions = &txs,
+        }, 0);
+        parent = hash;
+    }
+    manager.close_open();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var encoded: std.ArrayList(*const blobs.Blob) = .empty;
+    while (manager.next_tx_data()) |tx_data| {
+        const blob = try arena.create(blobs.Blob);
+        try blobs.encode(tx_data, blob);
+        try encoded.append(arena, blob);
+    }
+    // Two blobs per transaction, so the channel spans several blob txs.
+    try testing.expect(encoded.items.len > 2);
+    const block_json = try blob_block_json(arena, encoded.items.len, 2);
+    var fake: FakeBlobs = .{ .blobs = encoded.items };
+    var output: Writer.Allocating = .init(arena);
+    const summary = try inspect_blob_block(arena, block_json, &fake, &output.writer);
+    try testing.expectEqual(encoded.items.len, fake.next);
+    try testing.expectEqual(@as(u32, 1), summary.channels);
+    try testing.expectEqual(@as(u32, 3), summary.singular_batches);
+    try testing.expectEqual(@as(u32, 0), summary.unavailable_blob_txs);
+    try testing.expect(std.mem.indexOf(u8, output.written(), "timestamp 106, epoch 7") != null);
+    // Unavailable blobs are reported per transaction; the scan goes on.
+    var refusing: FakeBlobs = .{ .blobs = encoded.items, .fail = true };
+    output.clearRetainingCapacity();
+    const refused = try inspect_blob_block(arena, block_json, &refusing, &output.writer);
+    try testing.expectEqual(refused.blob_txs, refused.unavailable_blob_txs);
+    try testing.expectEqual(@as(u32, 0), refused.channels);
+}
+
+fn check_random_blobs(prng: *Prng, arena: Allocator) !void {
+    var list: [blob_tx.blobs_per_tx_max]*const blobs.Blob = undefined;
+    const count = 1 + prng.below(blob_tx.blobs_per_tx_max);
+    for (list[0..count]) |*slot| {
+        const blob = try arena.create(blobs.Blob);
+        if (prng.chance(1, 2)) {
+            prng.fill(blob);
+        } else {
+            var data: [512]u8 = undefined;
+            prng.fill(&data);
+            data[0] = 0; // Derivation version byte, so frames may parse.
+            try blobs.encode(data[0 .. 1 + prng.below(data.len - 1)], blob);
+        }
+        slot.* = blob;
+    }
+    var fake: FakeBlobs = .{ .blobs = list[0..count] };
+    var output: Writer.Allocating = .init(arena);
+    const block_json = try blob_block_json(arena, count, count);
+    const summary = try inspect_blob_block(arena, block_json, &fake, &output.writer);
+    try testing.expectEqual(@as(u32, 1), summary.blob_txs);
+    try testing.expect(summary.unavailable_blob_txs <= 1);
+}
+
+test "inspect: seeded fuzz of blob payloads" {
+    var prng = Prng.init(0xb10b);
+    for (0..24) |_| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try check_random_blobs(&prng, arena_state.allocator());
+    }
+}
+
+fn fuzz_blobs(_: void, smith: *testing.Smith) anyerror!void {
+    var prng = Prng.init(smith.value(u64));
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try check_random_blobs(&prng, arena_state.allocator());
+}
+
+test "inspect: fuzz blob payloads" {
+    try testing.fuzz({}, fuzz_blobs, .{});
 }

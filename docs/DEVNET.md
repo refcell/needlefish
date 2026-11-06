@@ -148,12 +148,15 @@ default profile blocks io_uring. State is the host's `.devnet/` and ports are pu
 
 0. **Liveness.** The sequencer EL head advances within 50 L2 block intervals (10 s at
    200 ms, polled every 200 ms via `L2_BLOCK_TIME_MS` in `devnet.env`); otherwise the
-   smoke fails at once and names the sequencer CL.
+   smoke fails at once and names the sequencer CL. Then at least 80% of the nominal
+   block count (20 of 25 at 200 ms) must land within 5 s.
 
 1. **Sequencing.** The smoke user sends an L2 transfer to the sequencer EL; it is in
    an L2 block (receipt status 1).
 2. **Batching.** `base devnet batches` decodes, from batcher transactions to the batch
-   inbox, a singular batch with that L2 block's timestamp.
+   inbox, a singular batch with that L2 block's timestamp. With `--beacon` it reads blob
+   transactions through the dev beacon (`/eth/v1/beacon/blobs/{slot}`), so the same check
+   covers `DEVNET_DA=blobs just devnet up`, which posts batches as EIP-4844 blobs.
 3. **Derivation.** The verifier's `optimism_syncStatus.safe_l2` reaches the L2 block
    from step 1, and its hash equals the sequencer's hash for that number. The verifier's
    `opp2p_peerCount` reports `connectedGossip >= 1` (it found the sequencer through discv5).

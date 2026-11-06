@@ -8,7 +8,8 @@
 #   devnet.sh smoke    end-to-end checks (docs/DEVNET.md "Smoke test")
 #
 # A component whose binary has not landed yet is reported and skipped, so `up` works
-# at every stage of the rewrite. Set DEVNET_OPTIMIZE=Debug for faster rebuilds.
+# at every stage of the rewrite. Set DEVNET_OPTIMIZE=Debug for faster rebuilds and
+# DEVNET_DA=blobs to post batches as EIP-4844 blobs (default calldata).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -111,7 +112,8 @@ up() {
   start_consensus
   start batcher batcher --rollup-config "$DIR/rollup.json" --l1 "$l1" \
     --sequencer-urls "$seq_el=http://127.0.0.1:$PORT_SEQUENCER_RPC" --key-index "$BATCHER_INDEX" \
-    --metrics.port "$PORT_BATCHER_METRICS" --blob-sidecar-version 0 # Dev L1: Osaka off.
+    --metrics.port "$PORT_BATCHER_METRICS" --data-availability "${DEVNET_DA:-calldata}" \
+    --blob-sidecar-version 0 # Dev L1: Osaka off.
   sleep 1
   all_alive
   log "up; 'just devnet status' to inspect, 'just devnet smoke' to verify"

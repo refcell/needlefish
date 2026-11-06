@@ -5,6 +5,7 @@
 //!   base devnet account INDEX
 //!   base devnet transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
 //!   base devnet batches --rpc L1_URL --from N [--to-block N] [--inbox 0x..] [--sender 0x..]
+//!     [--beacon URL]   (decodes blob transactions through the beacon API)
 //!
 //! `init` writes genesis files, rollup.json (genesis hashes computed in process),
 //! devnet.env and a fresh JWT secret. `rollup` rewrites rollup.json with given hashes.
@@ -16,6 +17,7 @@ const base = @import("base");
 const devnet = base.batcher.devnet;
 const Io = std.Io;
 const HttpTransport = @import("http_transport.zig").HttpTransport;
+const BeaconBlobs = @import("devnet_beacon.zig").BeaconBlobs;
 
 pub const usage =
     \\usage: base devnet <init|rollup|account> [flags]
@@ -23,7 +25,7 @@ pub const usage =
     \\  rollup  --out DIR --timestamp SECONDS --l1-hash 0x.. --l2-hash 0x..
     \\  account INDEX
     \\  transfer --rpc URL --chain-id N --key-index N --to 0x.. --value WEI [--gas N]
-    \\  batches --rpc L1_URL --from N [--to-block N] [--inbox 0x..] [--sender 0x..]
+    \\  batches --rpc L1_URL --from N [--to-block N] [--inbox 0x..] [--sender 0x..] [--beacon URL]
     \\
 ;
 
@@ -43,6 +45,7 @@ const Flags = struct {
     to_block: ?u64 = null,
     inbox: ?[20]u8 = null,
     sender: ?[20]u8 = null,
+    beacon_url: ?[]const u8 = null,
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
@@ -100,6 +103,8 @@ fn parse_batches_flag(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.inbox = try hex.decode_array(20, value);
     } else if (std.mem.eql(u8, arg, "--sender")) {
         flags.sender = try hex.decode_array(20, value);
+    } else if (std.mem.eql(u8, arg, "--beacon")) {
+        flags.beacon_url = value;
     } else {
         return error.UnknownFlag;
     }
@@ -230,6 +235,11 @@ fn command_batches(init: std.process.Init, flags: Flags) !u8 {
     const to_block = flags.to_block orelse
         try base.batcher.rpc.quantity(u64, try client.call("eth_blockNumber", "[]"));
     if (to_block < from_block) return usage_error();
+    var beacon: ?BeaconBlobs = if (flags.beacon_url) |beacon_url|
+        BeaconBlobs.init(init.gpa, init.io, beacon_url)
+    else
+        null;
+    defer if (beacon) |*blob_beacon| blob_beacon.deinit();
     const config: devnet.genesis.Config = .{ .genesis_timestamp = 0 };
     const batcher_index = @backingInt(devnet.accounts.Role.batcher);
     const params: devnet.inspect.Params = .{
@@ -239,6 +249,7 @@ fn command_batches(init: std.process.Init, flags: Flags) !u8 {
         ).address,
         .from_block = from_block,
         .to_block = to_block,
+        .blob_source = if (beacon) |*blob_beacon| blob_beacon.source() else null,
     };
     var buffer: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(init.io, &buffer);
@@ -256,4 +267,8 @@ fn command_batches(init: std.process.Init, flags: Flags) !u8 {
     });
     try out.flush();
     return 0;
+}
+
+test {
+    _ = @import("devnet_beacon.zig");
 }

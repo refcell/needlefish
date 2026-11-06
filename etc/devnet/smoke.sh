@@ -51,6 +51,16 @@ l2_advances || fail "sequencer L2 head stuck at $first_l2 for $((polls / 5))s: s
   "is not building blocks through the engine API (see $DIR/logs/seq-cl.log)"
 ok "sequencer L2 head advancing (block $(l2_head))"
 
+# 0b. Cadence: native subsecond blocks, one per L2_BLOCK_TIME_MS. Over 5 s at least 80% of
+# the nominal count must land (a regression to 1-2 s blocks yields 2-5 instead of ~25).
+cadence_from=$(l2_head)
+sleep 5
+cadence_blocks=$(($(l2_head) - cadence_from))
+cadence_min=$((5000 / interval_ms * 4 / 5))
+[ "$cadence_blocks" -ge "$cadence_min" ] || fail "only $cadence_blocks L2 blocks in 5 s" \
+  "(want >= $cadence_min at ${interval_ms} ms): sequencer is not on the subsecond schedule"
+ok "L2 cadence: $cadence_blocks blocks in 5 s (${interval_ms} ms blocks)"
+
 # L1 scan start for step 2, taken before the L2 transfer can possibly be batched.
 start_l1=$(($(rpc "$L1" eth_blockNumber '[]' | field result)))
 
@@ -69,7 +79,8 @@ ok "L2 transfer $tx included in block $block"
 # 2. Batching: a channel on L1 decodes to a batch for the transfer's L2 block.
 l2_timestamp=$(($(rpc "$SEQ" eth_getBlockByNumber "[\"$block_hex\",false]" | field timestamp)))
 batch_seen() {
-  "$BASE" devnet batches --rpc "$L1" --from "$start_l1" --inbox "$BATCH_INBOX" 2>/dev/null \
+  "$BASE" devnet batches --rpc "$L1" --from "$start_l1" --inbox "$BATCH_INBOX" \
+    --beacon "http://127.0.0.1:$PORT_L1_BEACON" 2>/dev/null \
     | grep -q "singular batch: timestamp $l2_timestamp,"
 }
 until_ok "batch for L2 block $block (timestamp $l2_timestamp) on L1" batch_seen
