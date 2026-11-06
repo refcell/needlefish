@@ -2,7 +2,7 @@
 
 Owns `src/infra/replay/*`, the `base replay`
 subcommand, `etc/replay/`, the `just replay` recipes, `docs/REPLAY.md`, and the README demo
-(`docs/assets/demo.*`).
+(`docs/assets/replay-demo.*`).
 
 Goal: **prove needlefish executes real Base mainnet blocks correctly.** Fetch 10 recent
 Base mainnet blocks plus a stateless witness of the state they touch, then replay
@@ -57,9 +57,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   clean theme, a minimal prompt such as `$ `), so nothing personal is visible: no
   username, hostname, home path, other windows, or notifications. Inspect sampled frames
   as images before committing; if anything personal or another window appears, re-record.
-- Output: `docs/assets/demo.mp4` (H.264, under ~8 MB) and `docs/assets/demo.gif` (under
+- Output: `docs/assets/replay-demo.mp4` (H.264, under ~8 MB) and `docs/assets/replay-demo.gif` (under
   ~10 MB). README: right under the intro paragraph,
-  `[![needlefish replaying Base mainnet blocks](docs/assets/demo.gif)](docs/assets/demo.mp4)`.
+  `[![needlefish replaying Base mainnet blocks](docs/assets/replay-demo.gif)](docs/assets/replay-demo.mp4)`.
 
 ## Backlog
 - [x] Archive format (`NFRP`, canonical body, strict decoder, seeded fuzz).
@@ -195,3 +195,5 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   withdrawals root and block hash. Archive 8.7 MB. The one divergence found was an EVM bug:
   a new frame inherited the previous call's RETURNDATASIZE, so EIP-1167 proxies forwarded
   zeroed calldata (block 53715983 tx 3). Fixed in `evm.zig` with a regression test.
+- 2026-11-06: demo re-cut to 15 s (fetch at 15x, gap check at 4x) and renamed to
+  `docs/assets/replay-demo.{mp4,gif}` so cached README images refresh.
