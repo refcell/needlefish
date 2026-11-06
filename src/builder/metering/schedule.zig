@@ -448,7 +448,7 @@ fn has_whitespace(text: []const u8) bool {
 }
 
 /// Rust `str::trim`: strips Unicode whitespace from both ends.
-fn trim(text: []const u8) []const u8 {
+pub fn trim(text: []const u8) []const u8 {
     var start: usize = 0;
     while (start < text.len) {
         const unit = decode(text[start..]);

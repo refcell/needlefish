@@ -18,6 +18,10 @@ const primitives = @import("../../common/primitives/root.zig");
 const metrics = @import("../../utilities/metrics/root.zig");
 
 pub const schedule = @import("schedule.zig");
+pub const sample = @import("sample.zig");
+pub const resource = @import("resource.zig");
+
+pub const Sample = sample.Sample;
 
 pub const B256 = primitives.B256;
 
@@ -54,6 +58,9 @@ pub const Metering = struct {
     total_gas_used: u64,
     total_execution_time_us: u64,
     state_block_number: u64 = 0,
+    /// This transaction's simulated gas and opcode rows (`TransactionResult` for the
+    /// hash), or null when the result had none or did not fit (resource metering fails open).
+    sample: ?Sample = null,
 };
 
 /// A fixed-capacity map with least-recently-used eviction and a time-to-live measured
@@ -123,6 +130,16 @@ pub fn LruTtl(comptime Value: type) type {
             table.unlink(index);
             table.link_newest(index);
             return table.nodes[index].value;
+        }
+
+        /// Like `get`, but borrows the value in place (valid until the next insert).
+        pub fn get_pointer(table: *Self, key: B256, now_ns: u64) ?*const Value {
+            const index = table.map.get(key.bytes) orelse return null;
+            if (table.expired(index, now_ns)) return null;
+            table.unlink(index);
+            table.link_newest(index);
+            assert(index < table.nodes.len);
+            return &table.nodes[index].value;
         }
 
         /// Inserts or replaces `key` (restarting its time-to-live). Returns why an entry
@@ -288,6 +305,15 @@ pub const MeteringStore = struct {
         return store.cache.get(hash, now_ns);
     }
 
+    /// The simulated sample for `hash` (base/base `ResourceSample::from_meter`), borrowed
+    /// until the next insert; null when disabled, unknown, expired, or without a sample.
+    pub fn sample_of(store: *MeteringStore, hash: B256, now_ns: u64) ?*const Sample {
+        if (!store.enabled) return null;
+        const metering = store.cache.get_pointer(hash, now_ns) orelse return null;
+        if (metering.sample) |*found| return found;
+        return null;
+    }
+
     /// base/base `insert`: a late arrival (the transaction was already included without
     /// metering) is counted and dropped; anything else is cached. Inserting works while
     /// disabled, as in base/base.
@@ -347,4 +373,6 @@ pub const MeteringStore = struct {
 test {
     _ = @import("root_test.zig");
     _ = schedule;
+    _ = sample;
+    _ = resource;
 }

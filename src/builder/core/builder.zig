@@ -15,6 +15,14 @@
 //! chain's state stays at the parent and the node imports the block like any other.
 //! The sealed header is exactly what `Chain` builds from the same transaction list.
 //!
+//! Resource metering (base/base `ResourceMeteringConfig` in `execute_best_transactions`) is
+//! optional: with a `resource` driver installed and active, attribute transactions are
+//! accounted unthrottled, each pool candidate is checked against its simulated sample before
+//! the gas/DA budget checks (an enforced overrun skips it with its sender's later nonces),
+//! included candidates add their executed usage, and transaction-scope excludes are evicted
+//! after the scan (rejection cache, metering store, pool). Without it, or inactive, the build
+//! is exactly the unmetered one.
+//!
 //! The builder is pinned (headers point into its extra-data buffer) and allocates only at
 //! `init`; the attributes passed to `start` must outlive the job except their transaction
 //! list, which is copied.
@@ -31,12 +39,16 @@ const txpool = @import("../../execution/txpool/root.zig");
 const chain_module = @import("../../execution/node/chain.zig");
 const executor_module = @import("../../execution/node/executor.zig");
 const best_txs = @import("best_txs.zig");
+const resource_module = @import("../metering/resource.zig");
+
+pub const ResourceMetering = resource_module.ResourceMetering;
 
 const Chain = chain_module.Chain;
 const Header = consensus.Header;
 const Hash = [32]u8;
 const Building = executor_module.Executor.Building;
 const consensus_deposit_type: u8 = @backingInt(consensus.tx.TxType.deposit);
+const B256 = primitives.B256;
 
 pub const Error = chain_module.Error || error{
     MissingParentBeaconBlockRoot,
@@ -106,6 +118,12 @@ pub const BlockBuilder = struct {
     senders: []primitives.Address,
     bytes: []u8,
     select_buffer: []*const txpool.Tx,
+    cache: *best_txs.RejectionCache,
+    /// Transaction-scope resource-metering excludes of the current build (pool evictions).
+    rejected: []B256,
+    rejected_count: u32 = 0,
+    /// Resource metering in transaction selection; null builds unmetered.
+    resource: ?*ResourceMetering = null,
     extra_data: [chainspec.basefee.jovian_extra_data_size]u8 = undefined,
     state: State = .idle,
 
@@ -125,10 +143,14 @@ pub const BlockBuilder = struct {
     da_used_bytes: u64 = 0,
     fees: u256 = 0,
     stop: Stop = .pool_exhausted,
+    /// The last clock reading of the build.
+    now_ns: u64 = 0,
+    /// The attribute transactions' resource usage is in the cumulative usage.
+    forced_accounted: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        rejection_cache: *const best_txs.RejectionCache,
+        rejection_cache: *best_txs.RejectionCache,
         config: Config,
     ) !BlockBuilder {
         assert(config.transactions_max > 0);
@@ -144,6 +166,8 @@ pub const BlockBuilder = struct {
         const bytes = try allocator.alloc(u8, config.transaction_bytes_max);
         errdefer allocator.free(bytes);
         const select_buffer = try allocator.alloc(*const txpool.Tx, config.select_max);
+        errdefer allocator.free(select_buffer);
+        const rejected = try allocator.alloc(B256, config.select_max);
         return .{
             .config = config,
             .best = best,
@@ -151,10 +175,13 @@ pub const BlockBuilder = struct {
             .senders = senders,
             .bytes = bytes,
             .select_buffer = select_buffer,
+            .cache = rejection_cache,
+            .rejected = rejected,
         };
     }
 
     pub fn deinit(builder: *BlockBuilder, allocator: std.mem.Allocator) void {
+        allocator.free(builder.rejected);
         allocator.free(builder.select_buffer);
         allocator.free(builder.bytes);
         allocator.free(builder.senders);
@@ -209,8 +236,16 @@ pub const BlockBuilder = struct {
         var building = try executor.begin_block(&builder.env);
         errdefer executor.abort_block();
         builder.best.reset_block();
+        builder.rejected_count = 0;
+        builder.forced_accounted = false;
+        if (builder.resource) |resource| resource.begin_build();
         try builder.apply_forced(&building);
         builder.stop = try builder.apply_best(&building, clock, cutoff_ns);
+        if (!builder.forced_accounted and builder.active_resource() != null) {
+            builder.now_ns = clock.now_ns();
+            builder.account_forced(&building);
+        }
+        builder.evict_rejected();
         assert(building.count == builder.count);
         const withdrawals = builder.job.attributes.withdrawals;
         const executed = try executor.finish_block(&building, withdrawals);
@@ -292,9 +327,12 @@ pub const BlockBuilder = struct {
         var offered: usize = 0;
         while (offered <= selected) : (offered += 1) {
             const now_ns = clock.now_ns();
+            builder.now_ns = now_ns;
+            if (!builder.forced_accounted) builder.account_forced(building);
             if (now_ns >= cutoff_ns) return .cutoff;
             const tx = builder.best.next(now_ns) orelse return .pool_exhausted;
             if (builder.count == builder.transactions.len) return .transactions_full;
+            const admission = builder.check_resources(tx, now_ns) orelse continue;
             if (building.gas_used +| tx.gas_limit > gas_budget) {
                 builder.best.mark_invalid(tx.sender, tx.nonce);
                 continue;
@@ -307,7 +345,11 @@ pub const BlockBuilder = struct {
                 builder.best.mark_invalid(tx.sender, tx.nonce);
                 continue;
             }
+            const gas_before = building.gas_used;
             if (!try builder.try_apply(building, tx, raw)) continue;
+            if (builder.active_resource()) |resource| {
+                _ = resource.account_executed(building.gas_used - gas_before, admission.sample);
+            }
             builder.senders[builder.count] = tx.sender;
             builder.append(raw);
             builder.best.mark_current_committed();
@@ -315,6 +357,66 @@ pub const BlockBuilder = struct {
         }
         // Each pass consumed one of at most `selected` snapshot entries or returned.
         unreachable;
+    }
+
+    /// Accounts the attribute transactions unthrottled (base/base
+    /// `execute_sequencer_transactions`), at the build's first clock reading so an unmetered
+    /// build reads the clock exactly as before. Each one's gas comes from its receipt.
+    fn account_forced(builder: *BlockBuilder, building: *const Building) void {
+        assert(!builder.forced_accounted);
+        assert(building.count >= builder.forced_count);
+        builder.forced_accounted = true;
+        const resource = builder.active_resource() orelse return;
+        var gas_before: u64 = 0;
+        for (builder.transactions[0..builder.forced_count], 0..) |raw, index| {
+            const gas_after = building.receipts[index].cumulative_gas_used;
+            const hash = primitives.keccak256(raw);
+            resource.account_unthrottled(hash, gas_after - gas_before, builder.now_ns);
+            gas_before = gas_after;
+        }
+    }
+
+    /// The resource-metering driver when installed and active.
+    fn active_resource(builder: *const BlockBuilder) ?*ResourceMetering {
+        const resource = builder.resource orelse return null;
+        if (!resource.is_active()) return null;
+        assert(resource.cumulative_usage().len > 0);
+        return resource;
+    }
+
+    /// The simulated resource check (base/base `check_simulated_usage`): null when an
+    /// enforced overrun excludes `tx` (skipped with its sender's later nonces; recorded for
+    /// eviction when transaction-scope).
+    fn check_resources(
+        builder: *BlockBuilder,
+        tx: *const txpool.Tx,
+        now_ns: u64,
+    ) ?resource_module.Admission {
+        const resource = builder.active_resource() orelse
+            return .{ .decision = .allow, .sample = null };
+        const admission = resource.check_simulated(tx.hash, now_ns);
+        if (!admission.should_exclude()) return admission;
+        builder.best.mark_invalid(tx.sender, tx.nonce);
+        if (admission.is_permanent()) {
+            // Each snapshot entry is offered at most once and `rejected` holds `select_max`.
+            assert(builder.rejected_count < builder.rejected.len);
+            builder.rejected[builder.rejected_count] = tx.hash;
+            builder.rejected_count += 1;
+        }
+        return null;
+    }
+
+    /// Evicts the build's transaction-scope excludes: no block can hold them (base/base
+    /// marks them in the rejection cache, drops their metering, and removes them from the
+    /// pool after the scan).
+    fn evict_rejected(builder: *BlockBuilder) void {
+        const rejected = builder.rejected[0..builder.rejected_count];
+        if (rejected.len == 0) return;
+        assert(builder.resource != null);
+        builder.cache.mark_rejected(rejected, builder.now_ns);
+        if (builder.resource.?.store) |store| store.remove(rejected, builder.now_ns);
+        const pool = builder.chain.pool orelse return;
+        for (rejected) |hash| _ = pool.remove(hash);
     }
 
     /// Gas the block may fill with pool transactions: the `miner_setGasLimit` target when

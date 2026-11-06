@@ -62,11 +62,19 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   - [x] `metering/schedule.zig`: schedule JSON (version 1, dimensions with block/tx limits,
     base gas weight, operation gas/count prices, `dryRun`), base/base validation, evaluator
     (`evaluate`, `check` ranking, `decide`, atomic `add_usage`), fail-open overflow.
-  - [ ] Wire into `BlockBuilder.apply_best`: per-build cumulative usage; simulated check
-    before execution (needs per-tx opcode rows from `base_meterBundle` in `MeteringStore`,
-    which holds only totals today; missing data fails open), executed check after
-    (actual gas used plus `STATE_*` post-state counts from the executor), deposits accounted
-    unthrottled; transaction-scope excludes evict from the pool, block-scope skip the build.
+  - [x] Wire into `BlockBuilder.apply_best`: per-build cumulative usage; simulated check
+    before execution from per-tx samples (`metering/sample.zig`) in `MeteringStore` (missing
+    data fails open), executed usage (actual gas plus simulated rows) accounted after,
+    attribute txs accounted unthrottled; transaction-scope excludes evicted (rejection cache,
+    store, pool), block-scope skip the build; dry-run only counts (`metering/resource.zig`).
+  - [ ] Executed-throttle exclusion: base/base drops a transaction whose *executed* usage is
+    over an enforced budget (`CommitChanges::No`); needlefish counts it
+    (`Build.executed_overruns`) and keeps it, because the executor cannot undo an applied
+    transaction. Needs a tx-level checkpoint/revert in `execution/node` executor (nf-node/evm).
+  - [ ] Executed `STATE_*` counts (new/changed/cleared slots, touched/changed accounts) from
+    the executor's post-transaction state, replacing the simulated `STATE_*` rows (kept today).
+  - [ ] Feed `MeteringStore` samples: `base_setMeteringInformation` / `base_meterBundle`
+    results (per-tx `opcodeGas`) into `Metering.sample` (nothing inserts samples yet).
   - [ ] Flags and metrics: `--builder.enable-resource-metering` plus a schedule file path
     (an empty file fails closed, `EmptySchedule`), `ResourceMeteringMetrics` (limit hits by
     dimension/scope/enforced, calculation failures, throttled per build).
@@ -130,6 +138,14 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   decimal u64 (no sign, fraction or exponent), matching serde's u64 for every file base/base
   accepts except the literal `-0`.
 
+- 2026-11-05: resource metering samples are fixed-size inside each `MeteringStore` entry (32
+  rows, 512 name bytes, trimmed names; rows whose name cannot match any rule are dropped); a
+  result that does not fit stores no sample, so the builder fails open as for missing data.
+  Attribute transactions are accounted at the build's first clock reading (their gas from the
+  receipts) so an unmetered build reads the injected clock exactly as before. Until the
+  executor reports post-state counts the executed sample keeps the simulated `STATE_*` rows
+  (closer than dropping them), and executed-only overruns are counted, not excluded.
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -185,3 +201,8 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - 2026-11-05: `builder/metering` resource-metering schedule (JSON load + validation, evaluator,
   ranked budget check, decisions); base/base cases ported, seeded + `std.testing.fuzz` model
   check against a wide-arithmetic reference, corrupted files and arbitrary bytes.
+- 2026-11-05: resource metering wired into `BlockBuilder.apply_best` (`metering/resource.zig`
+  driver, `metering/sample.zig` per-tx samples in `MeteringStore`): simulated check, executed
+  and unthrottled accounting, transaction-scope evictions, dry-run; unit, seeded and
+  `std.testing.fuzz` model checks, and a differential that metering off/disabled/slack builds
+  the same block as an unmetered build.
