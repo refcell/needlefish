@@ -1012,6 +1012,14 @@ With gas-sized state tables (`Config.state_gas_basis` = 2^26 gas: ~37k slot and 
 entries instead of 2^18 and 2^16, which reserved ~75 MB of slot table): 3 runs each,
 **5.46 ms/block (853 Mgas/s) vs 6.08 ms/block (765 Mgas/s)**, ~10%.
 
+Node-side profile of the replay bench (main thread, 803 samples, ~900 Mgas/s): EVM
+`transact` 416 (52%); replay backend 59 commit (`SparseState.apply_evm`), 54 witness loading
+(`NodeStore.add`), 74 storage reads (`Replayer.database_storage` under `State.slot_for`);
+sender recovery left on the main thread 47 (6%, `Pipeline.wait_for` helping); receipts root,
+bloom and block decode < 5 each. Recovery batch size 1, 2 and 8 measure the same (877-893
+Mgas/s), so 8 stays. No node-owned per-block cost outside the EVM is worth fixing; the
+next wins are in the evm and the replay backend (trie-db / nf-replay).
+
 ## 2026-11-06 db storage range for `debug_storageRangeAt` (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `zig build bench -Doptimize=ReleaseFast -- "db/history storage range"`: one account with
