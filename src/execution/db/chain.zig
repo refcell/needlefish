@@ -368,7 +368,7 @@ pub const ChainStore = struct {
 
     /// Makes the plan's branch canonical. The caller has moved state already.
     pub fn set_head(self: *ChainStore, plan: *const ReorgPlan) void {
-        if (self.head_meta == null) self.set_canonical(plan.ancestor);
+        if (self.head_meta == null) self.set_canonical_root(plan.ancestor);
         for (0..plan.unwind_len) |index| {
             const number = plan.ancestor.number + 1 + index;
             self.canonical[number % self.canonical.len].valid = false;
@@ -381,6 +381,33 @@ pub const ChainStore = struct {
         }
         self.head_meta = new_head;
         assert(self.is_canonical(new_head.hash));
+    }
+
+    /// First head whose block was evicted (a checkpoint keeps its metadata only): the head
+    /// and its parent become canonical, as `set_head` does for the oldest walked block.
+    pub fn restore_evicted_head(self: *ChainStore, head_meta: BlockMeta) void {
+        assert(self.head_meta == null);
+        assert(self.meta(head_meta.hash) == null);
+        self.set_canonical_root(head_meta);
+        self.head_meta = head_meta;
+        assert(self.canonical_hash(head_meta.number) != null);
+    }
+
+    /// The first head's oldest canonical block and its parent: the parent of a canonical
+    /// block is canonical even when evicted. A reopen rebuilds the index from the retained
+    /// blocks, and the history window reaches the state below the oldest retained one (its
+    /// parent), so without this entry a reopen forgets a window block the live index held.
+    fn set_canonical_root(self: *ChainStore, root: BlockMeta) void {
+        assert(self.head_meta == null);
+        self.set_canonical(root);
+        if (root.number == 0) return;
+        self.set_canonical(.{
+            .hash = root.parent_hash,
+            .parent_hash = @splat(0),
+            .number = root.number - 1,
+            .timestamp = 0,
+        });
+        assert(self.canonical[(root.number - 1) % self.canonical.len].number == root.number - 1);
     }
 
     fn set_canonical(self: *ChainStore, block_meta: BlockMeta) void {

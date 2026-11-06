@@ -634,9 +634,12 @@ fn run_seed(seed: u64, config: database.Config) !void {
 }
 
 test "database history: proofs at every block of the window across reorgs and reopen" {
-    // Two seeds keep Debug runtime low; raise the count locally for deeper runs.
-    for (0..2) |seed| run_seed(0xd8_4157 + seed, base_config) catch |err| {
-        std.debug.print("database history: failing seed={d}\n", .{seed});
+    // Eight seeds (~0.1 s each in Debug) and two that reopened from a checkpoint with the
+    // window's oldest block missing from the canonical index; raise the count locally.
+    var seeds: [10]u64 = .{ 0x77_0025, 0x77_002a } ++ @as([8]u64, undefined);
+    for (seeds[2..], 0..) |*seed, index| seed.* = 0xd8_4157 + index;
+    for (seeds) |seed| run_seed(seed, base_config) catch |err| {
+        std.debug.print("database history: failing seed=0x{x}\n", .{seed});
         return err;
     };
 }
@@ -696,6 +699,33 @@ test "database history: a reopen rebuilds only the blocks retention keeps" {
         std.debug.print("database history: failing retention seed\n", .{});
         return err;
     };
+}
+
+test "database history: a reopen from a checkpoint keeps the window's oldest canonical" {
+    // Four retained blocks and a six-block window: the window reaches the state below the
+    // oldest retained block (its parent, evicted). A checkpoint keeps only retained blocks,
+    // so the canonical index rebuilt from it lacked that parent while history still served
+    // it: `canonical_hash(window.oldest)` was null after the reopen (the node refused
+    // `eth_getProof` there). The parent of a canonical block is canonical even when evicted.
+    var config = base_config;
+    config.chain.blocks_max = 4;
+    config.chain.reorg_depth_max = 3;
+    const h = try Harness.create(0xc4c0, config);
+    defer h.destroy();
+    try h.format();
+    var builds: u32 = 0;
+    while (h.db.checkpoints_completed == 0) : (builds += 1) {
+        try testing.expect(builds < 256);
+        try h.build();
+    }
+    const head = h.db.head_info;
+    try h.crash_and_reopen();
+    try testing.expect(head.eql(h.db.head_info));
+    const window = h.db.history.?.window().?;
+    // Retained: head - 3 .. head; the window starts at the evicted parent of the oldest.
+    try testing.expectEqual(head.number - 4, window.oldest);
+    try testing.expect(h.db.chain.meta(h.db.chain.canonical_hash(window.oldest).?) == null);
+    _ = try h.check_rebuilt();
 }
 
 test "database history: without history a reopen serves only the head" {

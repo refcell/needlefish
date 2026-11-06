@@ -515,6 +515,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
             assert(config.chain.blocks_max > 0 and config.chain.bytes_max > 0);
+            // The canonical index covers the whole history window.
+            if (config.history) |history_config| {
+                assert(history_config.window_blocks <= config.chain.canonical_max);
+            }
             assert(config.checkpoint_staging_bytes >= checkpoint_header_size);
             const body_max = config.engine.entry_body_size_max;
             assert(body_max >= block_entry_fixed_size);
@@ -1371,6 +1375,9 @@ pub fn DatabaseType(comptime Storage: type) type {
             const head = self.head_info.number;
             const start = self.history_rebuild_unwind() orelse return;
             assert(start <= head);
+            // Every block of the window is canonical by number (the node checks a proof's
+            // block against the canonical index), its oldest included.
+            assert(self.chain.canonical_hash(start) != null);
             var history_ok = true;
             store.reset(&self.state.state_trie, start) catch {
                 history_ok = false;
@@ -1806,7 +1813,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 self.chain.set_head(&self.plan_restore);
             } else {
                 // The head block itself was evicted; only its metadata survives.
-                self.chain.head_meta = head_meta;
+                self.chain.restore_evicted_head(head_meta);
             }
             assert(self.chain.head() != null);
         }

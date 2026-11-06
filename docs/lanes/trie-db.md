@@ -192,11 +192,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   history: a move across branches that re-creates an account keeps history`,
   `Store.check_head` after every harness commit, seeded workload fuzz 32 seeds Debug / 256
   ReleaseSafe; reorg 1 block 2.8 ms typical, 4.5 ms heavy; see Decisions)
-- [ ] `database_history_test.zig` `run_seed` panics on a null `chain.canonical_hash(number)`
+- [x] `database_history_test.zig` `run_seed` panics on a null `chain.canonical_hash(number)`
   in `Harness.expect_matches_live` (the sweep after crash + reopen, `check_rebuilt`) for seeds
-  0x770025 and 0x77002a (`run_seed(0x77_0000 + i, base_config)`, i in 0..64). Not the
-  `unwind_to` bug: same panic with that fix reverted. Find whether the rebuilt window reaches
-  a block the canonical index no longer holds (database) or the harness asks for one.
+  0x770025 and 0x77002a. Database bug, not harness: a reopen from a checkpoint rebuilt the
+  canonical index from the retained blocks only, so the evicted parent of the oldest retained
+  canonical block lost its entry while the rebuilt history window starts at it (the live
+  index held it). `ChainStore.set_head` indexes that parent on the first head, an evicted
+  checkpoint head is indexed with its parent, and `history_rebuild_window` asserts the
+  window's oldest block is canonical. (`database history: a reopen from a checkpoint keeps
+  the window's oldest canonical`, `chain: a first head without its parent stored indexes the
+  parent as canonical`, both seeds in the harness loop; see Decisions)
 - [x] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
   117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
   (version allocation, path index probes, node re-encoding) and cut it, or move it off the
@@ -1002,6 +1007,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - Receipts JSON is converted with the consensus encoder after checking the reported bloom
   against the logs; the withdrawals root (Isthmus: the L2ToL1MessagePasser storage root) is
   not checked: that account is untouched in these blocks, so no proof of it is fetched.
+- Canonical index after a checkpoint reopen: the parent of a canonical block is canonical,
+  so the first head indexes the parent of its oldest walked block even when that block is
+  evicted (`set_canonical_root`). The checkpoint format is unchanged: only that one entry
+  is needed, because `history_rebuild_start` never goes below the oldest retained block's
+  parent. Older evicted canonical numbers stay unknown after a reopen (the live index still
+  remembers up to `canonical_max`); nothing in the database serves them. `Database.init`
+  asserts `window_blocks <= canonical_max` so the ring always covers the window.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
@@ -1426,3 +1438,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (32 Debug / 256 ReleaseSafe seeds, 2048 x 2 soak seeds clean), storage-range test on all 6
   seeds. Bench: reorg 1 block `unwind_to` p50 2.83 ms typical, 4.50 ms heavy. Found a
   separate database-harness panic on two seeds (backlog).
+- 2026-11-07: fixed the database-harness null `canonical_hash` panic (seeds 0x770025,
+  0x77002a). Reproduced with the history fix on main; shrunk to a four-block-retention
+  database that crashes right after its first checkpoint (window oldest = evicted parent of
+  the oldest retained block, `canonical_hash` null). Root cause in `ChainStore.set_head`'s
+  first-head path (checkpoint `restore_head`); fixed there, plus the evicted-head branch.
+  Impact before the fix: after a restart from a checkpoint, a durable node answered
+  `eth_getProof` / `debug_storageRangeAt` at the window's oldest block with
+  `HistoryUnavailable` (the canonical check in `node/durable.zig`) although history held it.
+  Harness loop widened to 10 seeds (~1 s Debug); 64 seeds of `0x77_0000 + i` pass (6.6 s).

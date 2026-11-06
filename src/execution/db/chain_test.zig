@@ -295,3 +295,47 @@ fn move_head(
     }
     store.set_head(plan);
 }
+
+test "chain: a first head without its parent stored indexes the parent as canonical" {
+    const config: chain_module.Config = .{
+        .blocks_max = 8,
+        .bytes_max = 1 << 12,
+        .transactions_max = 16,
+        .canonical_max = 8,
+        .reorg_depth_max = 8,
+    };
+    // A checkpoint's retained blocks 5..7: block 4 (block_hash(4)) is evicted.
+    const nodes = [_]Node{
+        .{ .parent = null, .number = 0 }, .{ .parent = 0, .number = 1 },
+        .{ .parent = 1, .number = 2 },    .{ .parent = 2, .number = 3 },
+        .{ .parent = 3, .number = 4 },    .{ .parent = 4, .number = 5 },
+        .{ .parent = 5, .number = 6 },    .{ .parent = 6, .number = 7 },
+    };
+    var store = try ChainStore.init(testing.allocator, config);
+    defer store.deinit(testing.allocator);
+    var plan = try ChainStore.plan_init(testing.allocator, config);
+    defer ChainStore.plan_deinit(testing.allocator, &plan);
+    for (5..8) |id| try insert_block(&store, &nodes, @intCast(id));
+    try store.plan_reorg(block_hash(7), &plan);
+    store.set_head(&plan);
+    for (5..8) |id| {
+        const hash = block_hash(@intCast(id));
+        try testing.expectEqualSlices(u8, &hash, &store.canonical_hash(id).?);
+    }
+    try testing.expectEqualSlices(u8, &block_hash(4), &store.canonical_hash(4).?);
+    try testing.expect(store.meta(block_hash(4)) == null);
+    try testing.expectEqual(@as(?Hash, null), store.canonical_hash(3));
+
+    // A head whose block is evicted: the head and its parent are canonical by number.
+    var evicted = try ChainStore.init(testing.allocator, config);
+    defer evicted.deinit(testing.allocator);
+    evicted.restore_evicted_head(.{
+        .hash = block_hash(7),
+        .parent_hash = block_hash(6),
+        .number = 7,
+        .timestamp = 14,
+    });
+    try testing.expectEqualSlices(u8, &block_hash(7), &evicted.canonical_hash(7).?);
+    try testing.expectEqualSlices(u8, &block_hash(6), &evicted.canonical_hash(6).?);
+    try testing.expectEqual(@as(?Hash, null), evicted.canonical_hash(5));
+}
