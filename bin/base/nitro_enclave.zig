@@ -1,8 +1,10 @@
 //! `base nitro-enclave`: the TEE enclave server in local mode (base/base
 //! `bin/prover/nitro-enclave` + `nitro-enclave/src/runtime.rs`). Real enclaves listen on vsock
 //! port 8000 and sign with an NSM-derived key; std has no vsock and the project links no NSM
-//! driver, so this binds TCP (default 127.0.0.1:8000) and takes the signer key from a flag.
-//! Each connection carries length-prefixed link frames, served one request at a time.
+//! driver, so this binds TCP (default 127.0.0.1:8000) and reads the signer key from
+//! `BASE_ENCLAVE_SIGNER_KEY` like base/base's local mode (never argv, which other local users
+//! can read). The link is unauthenticated: anyone who reaches the port gets proofs signed, so
+//! keep it on loopback. Each connection carries length-prefixed link frames.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -13,15 +15,15 @@ const kzg = base.common.crypto.kzg;
 const Io = std.Io;
 
 const usage =
-    \\usage: base nitro-enclave --signer-key <hex> [--listen <ip:port>] [--request-bytes-max <n>]
-    \\  --signer-key         secp256k1 signer key (local mode; real enclaves derive it)
+    \\usage: BASE_ENCLAVE_SIGNER_KEY=<hex> base nitro-enclave [--listen <ip:port>]
+    \\       [--request-bytes-max <n>]
+    \\  BASE_ENCLAVE_SIGNER_KEY  secp256k1 signer key (local mode; real enclaves derive it)
     \\  --listen             TCP address in place of vsock port 8000 (default 127.0.0.1:8000)
     \\  --request-bytes-max  largest request frame (default 268435456)
     \\
 ;
 
 pub const Flags = struct {
-    signer_key: []const u8 = "",
     host: [4]u8 = .{ 127, 0, 0, 1 },
     port: u16 = 8000,
     request_bytes_max: u32 = 256 << 20,
@@ -34,9 +36,7 @@ pub fn parse(args: []const []const u8) error{InvalidArguments}!Flags {
         if (index + 1 >= args.len) return error.InvalidArguments;
         const name = args[index];
         const value = args[index + 1];
-        if (std.mem.eql(u8, name, "--signer-key")) {
-            flags.signer_key = value;
-        } else if (std.mem.eql(u8, name, "--listen")) {
+        if (std.mem.eql(u8, name, "--listen")) {
             try parse_listen(value, &flags);
         } else if (std.mem.eql(u8, name, "--request-bytes-max")) {
             flags.request_bytes_max = std.fmt.parseInt(u32, value, 10) catch
@@ -44,7 +44,6 @@ pub fn parse(args: []const []const u8) error{InvalidArguments}!Flags {
             if (flags.request_bytes_max == 0) return error.InvalidArguments;
         } else return error.InvalidArguments;
     }
-    if (flags.signer_key.len == 0) return error.InvalidArguments;
     assert(flags.request_bytes_max > 0);
     return flags;
 }
@@ -66,10 +65,18 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     };
-    const signer = enclave.Signer.from_hex(flags.signer_key) catch {
-        std.debug.print("nitro-enclave: invalid --signer-key\n", .{});
+    const key = init.environ_map.get("BASE_ENCLAVE_SIGNER_KEY") orelse {
+        std.debug.print("nitro-enclave: BASE_ENCLAVE_SIGNER_KEY is not set\n{s}", .{usage});
         return 2;
     };
+    const signer = enclave.Signer.from_hex(key) catch {
+        std.debug.print("nitro-enclave: invalid BASE_ENCLAVE_SIGNER_KEY\n", .{});
+        return 2;
+    };
+    if (flags.host[0] != 127) {
+        std.debug.print("nitro-enclave: warning: the link is unauthenticated; " ++
+            "anyone reaching this address can get proofs signed\n", .{});
+    }
     const allocator = init.gpa;
     const server: enclave.Server = .init_local(signer);
     const storage = try allocator.create(kzg.blob.Settings.Storage);
@@ -126,13 +133,13 @@ fn serve_connection(io: Io, handler: *enclave.Handler, stream: Io.net.Stream) vo
 }
 
 test "nitro-enclave: argument parsing" {
-    const key = "0x1111111111111111111111111111111111111111111111111111111111111111";
-    const flags = try parse(&.{ "--signer-key", key, "--listen", "0.0.0.0:9000" });
+    const flags = try parse(&.{ "--listen", "0.0.0.0:9000" });
     try std.testing.expectEqual(@as(u16, 9000), flags.port);
     try std.testing.expectEqual(@as(u8, 0), flags.host[0]);
-    try std.testing.expectError(error.InvalidArguments, parse(&.{}));
-    const bad_listen = parse(&.{ "--signer-key", key, "--listen", "1.2.3:4" });
+    try std.testing.expectEqual(@as(u16, 8000), (try parse(&.{})).port);
+    try std.testing.expectError(error.InvalidArguments, parse(&.{"--signer-key"}));
+    const bad_listen = parse(&.{ "--listen", "1.2.3:4" });
     try std.testing.expectError(error.InvalidArguments, bad_listen);
-    const zero = parse(&.{ "--signer-key", key, "--request-bytes-max", "0" });
+    const zero = parse(&.{ "--request-bytes-max", "0" });
     try std.testing.expectError(error.InvalidArguments, zero);
 }
