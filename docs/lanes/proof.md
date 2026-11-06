@@ -172,7 +172,13 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   behind a fetcher, task set, reconciler. Left: prover client, discovery (static list in
   place of AWS target groups), driver loop, signer manager txs, service, `bin/base registrar`.
 
+- [ ] `proof/bin-tee`: base/base `bin/prover/{nitro-enclave,nitro-host}`: `base nitro-enclave`
+  (local-mode enclave server; TCP in place of vsock) and `base nitro-host` (host server feeding
+  enclaves, `enclave_*` and `prover_prove` JSON-RPC), plus a devnet smoke: TEE proof of a range.
+
 ## Decisions
+- Not ported: base/base `bin/challenger-e2e` (forks L1 into Anvil for a K8s job); the
+  challenger's deterministic sim tests and the devnet smoke cover its behaviour here.
 - Registrar: fixed limits (32 cert plans, 651 inverses per stream, 64 instances per cycle,
   256 pending tasks); the reconciler returns grace events and gauges instead of logging;
   attestation and certificates parse with the stricter `tee/nitro` parser.
