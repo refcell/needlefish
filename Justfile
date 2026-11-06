@@ -74,11 +74,13 @@ test-times count='20':
 assert-density prefix='src/':
     etc/scripts/assert-density.sh {{ prefix }}
 
-# Fetch the latest 10 Base mainnet blocks + witness from public RPC, replay them offline,
-# and check every header field (docs/REPLAY.md): just replay [count]
-replay count='10':
+# Fetch the latest Base mainnet blocks + witness from public RPC, replay them offline, and
+# check every header field (docs/REPLAY.md): just replay [count] [first block]. Responses are
+# cached, so an interrupted run resumes; a pinned first block reruns the same window.
+replay count='10' from='':
     zig build -Doptimize=ReleaseFast
-    zig-out/bin/base replay fetch --count {{ count }} --out .cache/replay/latest.nfrp
+    zig-out/bin/base replay fetch --count {{ count }} \
+        {{ if from == "" { "" } else { "--from " + from } }} --out .cache/replay/latest.nfrp
     zig-out/bin/base replay run .cache/replay/latest.nfrp
 
 # Replay a saved archive offline (default: the committed 10-block fixture)

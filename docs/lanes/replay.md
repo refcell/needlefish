@@ -73,8 +73,12 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 - [x] TUI + plain mode.
 - [x] `just replay` (fetch latest + run), `just replay-run`, `docs/REPLAY.md`, committed
   fixture (`src/infra/replay/testdata/`, 8.7 MB) replayed by `zig build test`.
-- [ ] Demo recording with burned-in subtitles; README embed near the top.
-- [ ] Fuzz the archive decoder; DST-style deterministic replay test.
+- [x] Demo recording with burned-in subtitles; README embed near the top.
+- [x] Fuzz the archive decoder; deterministic replay test (two replays, one in probe mode,
+  compute the same roots); fuzz the fetcher's batch-response parser.
+- [x] `just replay 100` from a cold cache: `[k/N]` progress, resumable cache, optional pinned
+  first block (`just replay 100 53750445`) for a deterministic window.
+- [ ] Collect missing keys of every failing block per round (today: the first one only).
 
 ## Decisions
 
@@ -108,6 +112,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
   keccak256, no duplicates; the decoder is strict.
 
 ## Log
+
+- 2026-11-06: cold `just replay 100` (build + fetch + run, one command): 53775088..53775187,
+  1571 txs, 271.9 Mgas, 3 gap rounds, 100/100 in 13m24s.
 
 - 2026-11-06: probe mode: the gap search reads a missing account as absent and a missing
   slot as zero, so one replay collects all of a block's missing keys. 50-block window

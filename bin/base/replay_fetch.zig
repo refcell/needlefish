@@ -250,6 +250,7 @@ fn fetch_window(f: *Fetcher, window: replay_cli.Window) !void {
     try fetch_headers(f, window);
     for (0..window.count) |offset| {
         _ = f.arena.reset(.retain_capacity);
+        std.debug.print("  [{d}/{d}] ", .{ offset + 1, window.count });
         try fetch_block(f, window.first + offset);
     }
 }
@@ -322,7 +323,7 @@ fn fetch_block(f: *Fetcher, number: u64) !void {
     try touched_keys(f, name, &keys);
     try fetch_proofs(f, name, "proofs_pre.json", &keys, number - 1);
     try fetch_proofs(f, name, "proofs_post.json", &keys, number);
-    std.debug.print("  block {d}: {d} accounts touched\n", .{ number, keys.map.count() });
+    std.debug.print("block {d}: {d} accounts touched\n", .{ number, keys.map.count() });
 }
 
 /// Accounts (lowercase hex) to the slots (hex) to prove, sorted on use.
@@ -562,4 +563,57 @@ fn write_extra(f: *Fetcher, number: u64, keys: *Keys) !void {
     }
     try list.writer.writeAll("}");
     try f.save(try extra_keys_path(f, number), list.written());
+}
+
+test "replay fetch: flags" {
+    const defaults = try parse(&.{});
+    try std.testing.expectEqual(@as(u32, default_count), defaults.count);
+    try std.testing.expect(defaults.from == null);
+    const pinned = try parse(&.{ "--count", "100", "--from", "53750445", "--out", "a.nfrp" });
+    try std.testing.expectEqual(@as(u32, 100), pinned.count);
+    try std.testing.expectEqual(@as(?u64, 53_750_445), pinned.from);
+    try std.testing.expectEqualStrings("a.nfrp", pinned.out);
+    try std.testing.expectError(error.InvalidArguments, parse(&.{"--count"}));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--count", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--count", "1025" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "--colour", "1" }));
+    try std.testing.expectError(error.InvalidCharacter, parse(&.{ "--from", "x" }));
+}
+
+test "replay fetch: batch responses are accepted only whole and in id order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var results: [2]json.Value = undefined;
+    const ok = "[{\"id\":1,\"result\":\"b\"},{\"id\":0,\"result\":\"a\"}]";
+    try std.testing.expect(try batch_results(arena, ok, &results));
+    try std.testing.expectEqualStrings("a", results[0].string);
+    try std.testing.expectEqualStrings("b", results[1].string);
+    const rejected = [_][]const u8{
+        "[{\"id\":0,\"result\":\"a\"},{\"id\":1,\"error\":{\"code\":429}}]",
+        "[{\"id\":0,\"result\":\"a\"},{\"id\":1,\"result\":null}]",
+        "[{\"id\":0,\"result\":\"a\"},{\"id\":2,\"result\":\"c\"}]",
+        "[{\"id\":0,\"result\":\"a\"}]",
+        "{\"error\":{\"code\":429}}",
+        "not json",
+    };
+    for (rejected) |text| try std.testing.expect(!try batch_results(arena, text, &results));
+}
+
+fn fuzz_batch(_: void, input: []const u8) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var results: [3]json.Value = undefined;
+    // Any server bytes: never crash; an accepted batch fills every slot.
+    if (try batch_results(arena_state.allocator(), input, &results)) {
+        for (results) |result| try std.testing.expect(result != .null);
+    }
+}
+
+test "replay fetch: fuzz batch responses" {
+    const corpus = [_][]const u8{
+        "[{\"id\":0,\"result\":1},{\"id\":1,\"result\":[2]},{\"id\":2,\"result\":{}}]",
+        "[{\"id\":0,\"result\":1},{\"id\":0,\"result\":1},{\"id\":2,\"result\":3}]",
+    };
+    try base.testing.fuzz.run_bytes({}, fuzz_batch, .{ .iterations = 512, .corpus = &corpus });
 }

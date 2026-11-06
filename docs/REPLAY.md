@@ -6,8 +6,10 @@ balance, nonce, storage slot, receipt, log or gas charge, the block's state root
 root or block hash would differ.
 
 ```sh
-just replay          # fetch the latest 10 blocks from public RPC, then replay them offline
-just replay-run      # replay the committed 10-block archive (no network)
+just replay                # fetch the latest 10 blocks from public RPC, replay offline
+just replay 100            # the latest 100 blocks (about 15 minutes from a cold cache)
+just replay 100 53750445   # a pinned window: the same blocks every run
+just replay-run            # replay the committed 10-block archive (no network)
 ```
 
 `just replay` needs only Zig and the network: `base replay fetch` downloads the blocks and

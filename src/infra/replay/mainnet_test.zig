@@ -56,3 +56,38 @@ test "replay: ten Base mainnet blocks reproduce every header field" {
     }
     try testing.expectEqual(@as(u64, 53_715_993), number);
 }
+
+/// Replays the fixture and returns each block's computed state root (all must pass).
+fn replay_roots(archive: *const archive_module.Archive, probe: bool) ![10][32]u8 {
+    const allocator = testing.allocator;
+    const replayer = try allocator.create(replayer_module.Replayer);
+    defer allocator.destroy(replayer);
+    const spec = &chainspec.ChainSpec.presets.base_mainnet;
+    try replayer.init(allocator, spec, archive, replayer_module.config_for(archive));
+    defer replayer.deinit(allocator);
+    replayer.probe = probe;
+    var roots: [10][32]u8 = undefined;
+    var index: usize = 0;
+    while (!replayer.done()) : (index += 1) {
+        const outcome = try replayer.replay_next();
+        try testing.expect(outcome.ok());
+        try testing.expect(replayer.gaps.empty());
+        roots[index] = outcome.computed_state_root;
+    }
+    try testing.expectEqual(@as(usize, 10), index);
+    return roots;
+}
+
+test "replay: a second replay, in probe mode, computes the same roots" {
+    // Deterministic: the replayer reads no clock, randomness or IO, so two fresh replays of
+    // one archive agree; probe mode only changes what a missing key reads as, so on a
+    // complete witness it must change nothing.
+    const allocator = testing.allocator;
+    var archive = try archive_module.Archive.init(allocator, fixture_config);
+    defer archive.deinit(allocator);
+    try archive_module.decode(allocator, fixture, &archive);
+    const first = try replay_roots(&archive, false);
+    const second = try replay_roots(&archive, true);
+    for (first, second) |a, b| try testing.expectEqualSlices(u8, &a, &b);
+    try testing.expect(!std.mem.eql(u8, &first[0], &first[9]));
+}

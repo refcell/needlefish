@@ -11,6 +11,10 @@ const base = @import("base");
 const replay = base.infra.replay;
 const tui = @import("replay_tui.zig");
 const fetch = @import("replay_fetch.zig");
+
+test {
+    _ = fetch;
+}
 const Archive = replay.Archive;
 const assert = std.debug.assert;
 
