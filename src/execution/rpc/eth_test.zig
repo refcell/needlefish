@@ -1319,3 +1319,80 @@ test "eth: seeded fuzz of base_meterBundle nonces" {
         if (ok) try testing.expectEqual(count, count_of(text, "\"gasUsed\":21000"));
     }
 }
+
+fn contract_call_raw(buffer: []u8, nonce: u64, to: [20]u8) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = nonce,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = .{ .call = .{ .bytes = to } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+fn trace_request(
+    h: *Harness,
+    method: []const u8,
+    hash: []const u8,
+    config: []const u8,
+) ![]const u8 {
+    var body: [512]u8 = undefined;
+    const format = request_prefix_format ++ "{s}\",\"params\":[\"0x{x}\",{s}]}}";
+    return h.request_runtime(try std.fmt.bufPrint(&body, format, .{ method, hash, config }));
+}
+
+test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const reverter = primitives.hex.decode_array(20, reverter_at[3..43]) catch unreachable;
+    try h.node.db.put_account(reverter, 0, 0, &.{ 0x5f, 0x5f, 0xfd });
+    // CALL(gas, counter, 0, 0, 0, 0, 0); STOP.
+    const caller: [20]u8 = @splat(0x57);
+    const caller_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++
+        [_]u8{ 0x5a, 0xf1, 0x00 };
+    try h.node.db.put_account(caller, 0, 0, &caller_code);
+    _ = try h.mine(12);
+    var buffers: [2][256]u8 = undefined;
+    const nested = try contract_call_raw(&buffers[0], 0, caller);
+    const reverting = try contract_call_raw(&buffers[1], 1, reverter);
+    try expect_contains(try send_raw(h, nested), "\"result\":\"0x");
+    try expect_contains(try send_raw(h, reverting), "\"result\":\"0x");
+    const block = try h.mine(24);
+    const call_tracer = "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"withLog\":true}}";
+    const nested_hash = primitives.keccak256(nested).bytes;
+    const text = try trace_request(h, "debug_traceTransaction", &nested_hash, call_tracer);
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"type\":\"CALL\""));
+    try expect_contains(text, "\"calls\":[{");
+    try expect_contains(text, "\"gas\":\"0x30d40\""); // The transaction's gas limit.
+    try expect_contains(text, "\"logs\":[{");
+    try expect_contains(text, "\"position\":\"0x0\"");
+    const top_only = "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":true}}";
+    const top = try trace_request(h, "debug_traceTransaction", &nested_hash, top_only);
+    try testing.expect(std.mem.indexOf(u8, top, "calls") == null);
+    const reverting_hash = primitives.keccak256(reverting).bytes;
+    const reverted = try trace_request(h, "debug_traceTransaction", &reverting_hash, call_tracer);
+    try expect_contains(reverted, "\"error\":\"execution reverted\"");
+    const by_hash = try trace_request(h, "debug_traceBlockByHash", &block.bytes, call_tracer);
+    try testing.expectEqual(@as(usize, 2), count_of(by_hash, "\"txHash\""));
+    const by_number = try h.request(
+        "debug_traceBlockByNumber",
+        "[\"latest\",{\"tracer\":\"callTracer\"}]",
+    );
+    try testing.expectEqual(@as(usize, 2), count_of(by_number, "\"txHash\""));
+    // The default struct logger is not supported.
+    const default = try h.request("debug_traceBlockByNumber", "[\"latest\"]");
+    try expect_contains(default, "only callTracer");
+}

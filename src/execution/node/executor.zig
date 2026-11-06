@@ -462,7 +462,7 @@ pub const Executor = struct {
     }
 
     /// Fills `senders` for `transactions` (decoded already by `recover_all`'s caller).
-    fn recover_all(executor: *Executor, transactions: []const []const u8) Error!void {
+    pub fn recover_all(executor: *Executor, transactions: []const []const u8) Error!void {
         assert(transactions.len <= executor.senders.len);
         for (transactions, 0..) |raw, index| {
             const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
