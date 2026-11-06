@@ -354,6 +354,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-06: paused (project paused by owner). Last pushed work: 23575ed5 (EIP-7702
+  delegation fuzz). Next on resume: lookup-count profiling (first unchecked backlog item).
 - 2026-11-05: 64-bit-limb big-endian word loads (MLOAD/MSTORE/PUSH/CALLDATALOAD):
   snailtracer 27.1 -> 21.8 ms.
 - 2026-11-05: `zig build test` (and `check`) now compiles the statetest runner.
