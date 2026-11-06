@@ -895,6 +895,18 @@ const Fixture = struct {
     }
 
     fn put_boot_claim(self: *Fixture, number: u64, claim_matches: bool) !void {
+        try self.put_boot_journal(number, claim_matches, null, null);
+    }
+
+    /// Boot values with the journal-only keys: the proposer (key 8) and the L1 head
+    /// number (key 10).
+    fn put_boot_journal(
+        self: *Fixture,
+        number: u64,
+        claim_matches: bool,
+        proposer: ?[20]u8,
+        l1_head_number: ?u64,
+    ) !void {
         assert(number <= self.scenario.blocks);
         self.agreed, const encoded = try self.output_root_of(self.blocks[0].hash);
         try testing.expectEqual(self.agreed, try self.store.put_keccak(&encoded));
@@ -910,6 +922,8 @@ const Fixture = struct {
             .chain_id = chains.devnet.chain_id,
             .rollup_config_json = out.buffered(),
             .intermediate_block_interval = self.scenario.interval,
+            .proposer = proposer,
+            .l1_head_number = l1_head_number,
         });
     }
 
@@ -1321,4 +1335,157 @@ test "e2e: the prover service's native backend proves a compressed range" {
     try testing.expect(verdict.holds);
     try testing.expectEqual(self.expected, verdict.claimed_output_root);
     try testing.expectEqual(@as(u64, 4), verdict.outcome.block_number);
+}
+
+/// The witness `store` recorded, as prove request preimages (slices into `witness`).
+fn witness_preimages(
+    allocator: std.mem.Allocator,
+    witness: *const host.Store,
+) ![]enclave.protocol.Preimage {
+    const preimages = try allocator.alloc(enclave.protocol.Preimage, witness.count());
+    var entries = witness.map.iterator();
+    var index: usize = 0;
+    while (entries.next()) |entry| : (index += 1) {
+        preimages[index] = .{
+            .key = try preimage.Key.from_bytes(entry.key_ptr.*),
+            .value = entry.value_ptr.*,
+        };
+    }
+    assert(index == preimages.len);
+    return preimages;
+}
+
+const enclave = @import("../tee/enclave/root.zig");
+const proof_primitives = @import("../primitives/root.zig");
+
+/// An enclave server (fake NSM), its handler and a host client, linked in process.
+const EnclaveLink = struct {
+    fake: enclave.nsm.Fake,
+    server: enclave.Server,
+    handler: enclave.Handler,
+    client: enclave.Client,
+    wire: [64 * 1024]u8,
+
+    fn create(options: client.Options, request_bytes_max: u32) !*EnclaveLink {
+        const link = try testing.allocator.create(EnclaveLink);
+        errdefer testing.allocator.destroy(link);
+        link.fake = .init(99);
+        link.server = try .init_enclave(link.fake.nsm());
+        link.handler = try .init(testing.allocator, &link.server, .{
+            .request_bytes_max = request_bytes_max,
+            .client_options = options,
+        });
+        errdefer link.handler.deinit();
+        link.client = try .init(testing.allocator, .{ .request_bytes_max = request_bytes_max });
+        return link;
+    }
+
+    fn destroy(link: *EnclaveLink) void {
+        link.client.deinit();
+        link.handler.deinit();
+        testing.allocator.destroy(link);
+    }
+
+    fn prove(
+        link: *EnclaveLink,
+        preimages: []const enclave.protocol.Preimage,
+    ) !enclave.protocol.Response {
+        const in_process: enclave.client.InProcess = .{
+            .handler = &link.handler,
+            .wire = &link.wire,
+        };
+        return in_process.call(&link.client, &.{ .prove = preimages });
+    }
+};
+
+/// Records the witness of the fixture's claim and sends it to an enclave.
+fn prove_in_enclave(self: *Fixture, link_out: **EnclaveLink) !enclave.protocol.Response {
+    var witness: host.Store = .init(testing.allocator, .{});
+    defer witness.deinit();
+    var recording: host.Recording = .{ .inner = self.store.fetcher(), .witness = &witness };
+    _ = try self.run_with(recording.fetcher(), self.handler.router());
+    try testing.expectEqual(@as(u64, 0), recording.dropped);
+    const preimages = try witness_preimages(testing.allocator, &witness);
+    defer testing.allocator.free(preimages);
+    var request_bytes: u64 = 64;
+    for (preimages) |entry| request_bytes += 48 + entry.value.len;
+    kzg.blob.fill_roots_brp(&kzg_storage.roots_brp);
+    enclave_settings = .{
+        .g1_lagrange = &kzg_storage.g1_lagrange,
+        .roots_brp = &kzg_storage.roots_brp,
+    };
+    const options: client.Options = .{
+        .builder = builder_config,
+        .resolver = .{ .bytes_max = 1 << 20, .entries_max = 4096 },
+        .l1 = .{ .items_max = 16, .logs_max = 16, .topics_max = 64, .blob_hashes_max = 16 },
+        .l2 = .{ .items_max = 16 },
+        .blobs = .{ .blobs_max = 2, .verify = false },
+        .kzg_settings = &enclave_settings,
+        .kzg_workspace = &kzg_workspace,
+    };
+    // The caller owns the link once it is set, also when the proof fails.
+    const link = try EnclaveLink.create(options, @intCast(request_bytes));
+    link_out.* = link;
+    return link.prove(preimages);
+}
+
+var enclave_settings: kzg.blob.Settings = undefined;
+
+test "e2e: the TEE enclave proves a range and its signature recovers the enclave address" {
+    const self = try Fixture.create(.{ .blocks = 4, .interval = 2 });
+    defer self.destroy();
+    const proposer: [20]u8 = @splat(0x77);
+    const l1_head_number: u64 = self.l1_count - 1;
+    try self.put_boot_journal(4, true, proposer, l1_head_number);
+    var link: *EnclaveLink = undefined;
+    const response = try prove_in_enclave(self, &link);
+    defer link.destroy();
+    const result = try enclave.client.expect_proof(response);
+    const proposal = &result.aggregate_proposal;
+    try testing.expectEqual(self.expected, proposal.output_root);
+    try testing.expectEqual(@as(u64, 4), proposal.l2_block_number);
+    try testing.expectEqual(self.agreed, proposal.prev_output_root);
+    try testing.expectEqual(self.l1_hashes[self.l1_count - 1], proposal.l1_origin_hash);
+    try testing.expectEqual(l1_head_number, proposal.l1_origin_number);
+    const config_hash = proof_primitives.config_hash_for_chain(chains.devnet.chain_id).?;
+    try testing.expectEqual(config_hash, proposal.config_hash);
+    try testing.expectEqual(link.server.signer_address(), result.tee_signer);
+    var buffer: [blocks_max]Hash = undefined;
+    const roots = try node_roots(self, &buffer);
+    try testing.expectEqual(@as(usize, 2), result.intermediate_roots.len);
+    try testing.expectEqual(roots[1], result.intermediate_roots[0]);
+    try testing.expectEqual(self.expected, result.intermediate_roots[1]);
+    // The journal `AggregateVerifier` rebuilds from the game recovers the enclave signer.
+    const journal: proof_primitives.ProofJournal = .{
+        .proposer = proposer,
+        .l1_origin_hash = proposal.l1_origin_hash,
+        .prev_output_root = self.agreed,
+        .starting_l2_block = 0,
+        .output_root = self.expected,
+        .ending_l2_block = 4,
+        .intermediate_roots = result.intermediate_roots,
+        .config_hash = config_hash,
+        .tee_image_hash = keccak.keccak256(&link.fake.pcr0),
+        .schedule_id = proposal.schedule_id,
+    };
+    var journal_buffer: [proof_primitives.proposal.proof_journal_length_max]u8 = undefined;
+    const encoded = journal.encode(&journal_buffer);
+    const signature = proposal.signature[0..enclave.crypto.signature_length];
+    const recovered = enclave.crypto.recover_address(encoded, signature).?;
+    try testing.expectEqual(result.tee_signer, recovered);
+    const public_key = link.server.signer_public_key();
+    try testing.expect(try enclave.crypto.verify(public_key, encoded, signature));
+    var proof_data: [proof_primitives.proof_encoder.tee_proof_bytes]u8 = undefined;
+    try proof_primitives.proposal.build_proof_data(proposal, &proof_data);
+    try testing.expect(proof_data[129] == 27 or proof_data[129] == 28);
+}
+
+test "e2e: the TEE enclave refuses to sign a claim that does not hold" {
+    const self = try Fixture.create(.{ .blocks = 2, .interval = 1 });
+    defer self.destroy();
+    try self.put_boot(false);
+    var link: *EnclaveLink = undefined;
+    try testing.expectError(error.EnclaveProofFailed, prove_in_enclave(self, &link));
+    defer link.destroy();
+    try testing.expectEqualStrings("InvalidClaim", link.client.last_failure.?.message);
 }
