@@ -11,6 +11,7 @@ const proof = @import("proof.zig");
 const proposer = @import("proposer.zig");
 const challenger = @import("challenger.zig");
 const prover_service = @import("prover_service.zig");
+const nitro_enclave = @import("nitro_enclave.zig");
 const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
 const withdrawer = @import("withdrawer.zig");
@@ -35,6 +36,7 @@ const usage =
     \\  challenger dispute invalid output-root games, claim bonds
     \\  prover-service  proof-request JSON-RPC service
     \\  prover-worker   claim and prove range jobs with the native host
+    \\  nitro-enclave   TEE enclave server in local mode (TCP in place of vsock)
     \\  balance-monitor  poll an account balance, serve metrics and health
     \\  load-test  send a seeded transaction workload, report inclusion latency
     \\  withdrawer  L2->L1 withdrawals: initiate, status, prove, finalize, run
@@ -56,6 +58,7 @@ test {
     _ = proposer;
     _ = challenger;
     _ = prover_service;
+    _ = nitro_enclave;
     _ = balance_monitor;
     _ = load_test;
     _ = withdrawer;
@@ -96,6 +99,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "prover-service")) {
         std.process.exit(try prover_service.service_main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "nitro-enclave")) {
+        std.process.exit(try nitro_enclave.main(init, args[2..]));
     }
     if (std.mem.eql(u8, command, "prover-worker")) {
         std.process.exit(try prover_service.worker_main(init, args[2..]));
