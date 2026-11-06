@@ -180,6 +180,10 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   Devnet smoke `etc/proof/devnet-tee.sh`: a TEE proof of a 4-block range, signed by the
   local-mode enclave. `nitro-host` is `prover-worker --backend tee` here.
 
+- [x] `proof/tee-verify`: offline TEE receipt check (base/base `snark-e2e` analog):
+  `tee/verify.zig` rebuilds the `AggregateVerifier` journal and recovers the signer;
+  `base proof verify-tee`; the devnet TEE smoke verifies its receipt with it.
+
 ## Decisions
 - Enclave chains: like base/base, only pinned config hashes are signed for. A local-mode-only
   opt-in (`--enclave-allow-custom-chain`, `nitro-enclave --allow-custom-chain`) hashes the
@@ -367,6 +371,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: `base proof verify-tee`; devnet TEE receipts verify offline.
 - 2026-11-05: live devnet TEE proof (`etc/proof/devnet-tee.sh`); `proof/bin-tee` done.
 - 2026-11-05: TEE host gates enclaves on `TEEProverRegistry.isValidSigner` via `eth_call`.
 - 2026-11-05: TEE nitro host + `prover-worker --backend tee`; registrar complete with `base registrar`.
