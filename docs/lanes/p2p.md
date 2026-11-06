@@ -70,6 +70,16 @@ behind a small interface and switch later.
   streams, waits out the timeout, then churns 2000 SYN+RST pairs and duplicate meshsub
   streams; inbound stays <= 12, gossip_in <= 1, gossip flows both ways throughout.
   Negative control: a 1000 s timeout fails it.
+- [x] Gossip validation parity audit against base/base `block_validity.rs` + `handler.rs`:
+  check order (timestamp, signature, signer, block hash, version fields, BaseTime
+  schedule, too-many-blocks before seen), BlockSeen -> ignore and all else -> reject,
+  Denim gating by block number (`is_subsecond_active_at_block`), BaseTime at tx[1],
+  seen table (1000 heights, 5 per height, prune lowest) all match. Added base/base's
+  missing cases: the topic-version x payload-version matrix (12 mismatches, none
+  accepted) and the schedule-replay rule (invalid schedules are never recorded as seen,
+  so a replay is rejected again, not ignored; negative control: inserting into the seen
+  table before the schedule check fails it). Score bans already propagate to discv5
+  (`ban_node`, base/base `BanAddrs`). Rate limits and req/resp: none in base/base.
 - [x] Scoring parity: `peers/score.zig` already mirrors base/base `score.rs` formula for
   formula (thresholds, topic and peer params, `score_decay`); covered by its tests.
 - [x] Req/resp sync at 5 blocks/s: not applicable; base/base has no p2p req/resp
@@ -501,3 +511,4 @@ behind a small interface and switch later.
 - 2026-11-05: gossip flood DST found accepted blocks evictable by junk; added a dedicated accepted-block store.
 - 2026-11-05: per-peer IWANT/IDONTWANT id budgets (control flood 3.8 ms -> 53 us per RPC).
 - 2026-11-05: inbound yamux stream negotiation timeout (10 s); many-streams bound test.
+- 2026-11-05: gossip validation parity audit; version-matrix and schedule-replay tests.

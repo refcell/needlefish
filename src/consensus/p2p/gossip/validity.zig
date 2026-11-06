@@ -624,6 +624,81 @@ test "validity: Denim BaseTime schedule" {
     try check_base_time(&plain, &base_time_payload(&storage, 6, 1, null));
 }
 
+test "validity: a payload on another version's topic is never accepted (base/base matrix)" {
+    // base/base `handler.rs` `test_decode`: v2 on v1, v3 on v2, v2 on v3, v4 on v3 all
+    // reject. Here every mismatched pair either fails to decode or fails validation.
+    const all = [_]ssz.Version{ .v1, .v2, .v3, .v4 };
+    var context: TestContext = undefined;
+    var rejected: u32 = 0;
+    for (all) |payload_version| {
+        const isthmus: []const rollup_config.Upgrade = &.{ .ecotone, .isthmus };
+        const pre_isthmus: []const rollup_config.Upgrade = &.{.ecotone};
+        try context.init(if (payload_version == .v4) isthmus else pre_isthmus);
+        var value = context.payload(payload_version, 10);
+        try context.rehash(&value);
+        const message = try block.encode_signed(
+            chain_id_test,
+            context.secret,
+            TestContext.root_for(payload_version),
+            value,
+            &context.scratch,
+            &context.compressor,
+            &context.out,
+        );
+        for (all) |topic_version| {
+            var validator = context.validator();
+            const envelope = block.decode(topic_version, message, &context.decoded) catch {
+                try testing.expect(topic_version != payload_version);
+                rejected += 1;
+                continue;
+            };
+            const result = validator.validate(&envelope, now_test);
+            if (topic_version == payload_version) {
+                try result;
+            } else {
+                try testing.expectEqual(Acceptance.reject, acceptance(result));
+                rejected += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 12), rejected);
+}
+
+test "validity: an invalid Denim schedule stays rejected on replay; valid becomes seen" {
+    // base/base `handler.rs`: only accepted blocks become seen, so a replayed block with a
+    // bad schedule is rejected again (never ignored as a duplicate).
+    var context: TestContext = undefined;
+    try context.init(&.{});
+    context.config = base_time_config();
+    context.config.upgrades.set(.ecotone, 0);
+    var storage: [1024]u8 = undefined;
+    const cases = [_]struct { number: u64, timestamp: u64, millis: ?u16, valid: bool }{
+        .{ .number = 5, .timestamp = 1_010, .millis = 0, .valid = true },
+        .{ .number = 6, .timestamp = 1_010, .millis = 200, .valid = true },
+        .{ .number = 6, .timestamp = 1_010, .millis = 400, .valid = false },
+        .{ .number = 7, .timestamp = 1_010, .millis = null, .valid = false },
+        .{ .number = 10, .timestamp = 1_011, .millis = 0, .valid = true },
+        .{ .number = 10, .timestamp = 1_010, .millis = 0, .valid = false },
+    };
+    for (cases) |case| {
+        var validator = context.validator();
+        var value = base_time_payload(&storage, case.number, case.timestamp, case.millis);
+        try context.rehash(&value);
+        const envelope = try context.sign(value);
+        for (0..2) |attempt| {
+            const result = validator.validate(&envelope, case.timestamp);
+            if (!case.valid) {
+                try testing.expectError(error.BaseTimeSchedule, result);
+                try testing.expectEqual(Acceptance.reject, acceptance(result));
+            } else if (attempt == 0) {
+                try result;
+            } else {
+                try testing.expectEqual(Acceptance.ignore, acceptance(result));
+            }
+        }
+    }
+}
+
 test "validity: seeded fuzz of the BaseTime schedule check" {
     const config = base_time_config();
     var storage: [1024]u8 = undefined;
