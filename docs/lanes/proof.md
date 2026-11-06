@@ -105,7 +105,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   `l2-account-storage-proof` hints served from `eth_getProof` (optional source method).
 - [x] `proof/schedule-id`: base/base `ScheduleId::pin` in `BootInfo` (upgrade-schedule hash
   chain committed by boot, as `ProtocolVersions.activatedScheduleId`).
-- [ ] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
+- [x] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
   COSE_Sign1 attestation documents, X.509 chain to the AWS Nitro root (std
   `crypto.Certificate`), P-384 ECDSA signature, PCRs, and the `VerifierJournal` ABI.
 - [x] `proof/challenger` (core): AggregateVerifier codecs; scanner/classification,
@@ -318,6 +318,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: AWS Nitro attestation verifier (CBOR, COSE_Sign1, X.509, P-384, journal ABI).
 - 2026-11-05: ScheduleId pinned at boot (golden value matches base/base).
 - 2026-11-05: host serves l2-account-storage-proof hints via eth_getProof.
 - 2026-11-05: EIP-2935 history leaps in the L2 chain provider (client side).
