@@ -36,6 +36,8 @@ pub const witness = @import("witness_bench.zig");
 pub const read = @import("read_bench.zig");
 /// History store bytes per retained block (`history_bench.zig`), run by `bench_main.zig`.
 pub const history = @import("history_bench.zig");
+/// Steady-state commit latency with automatic checkpoints (`steady_bench.zig`).
+pub const steady = @import("steady_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -622,6 +624,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
             std.debug.print("{s}: failed: {s}\n", .{ name_os, @errorName(err) });
         };
     }
+    steady.run(io, filter);
 }
 
 fn run_commit_sim(
@@ -697,6 +700,7 @@ test {
     _ = witness;
     _ = read;
     _ = history;
+    _ = steady;
 }
 
 test "bench: cases are well formed" {

@@ -97,6 +97,12 @@ const Harness = struct {
     /// (it overwrites the fallback zone) until a checkpoint completes, and after an open that
     /// fell back (no distinct fallback is left).
     fallback_intact: bool = true,
+    /// Checkpoint blocks granted at a checkpoint start and per acknowledged commit
+    /// (incremental checkpoints); `maxInt` writes checkpoints unpaced.
+    pace_blocks: u64 = std.math.maxInt(u64),
+    /// Times a paced checkpoint paused at a chunk boundary.
+    pauses: u64 = 0,
+    was_paused: bool = false,
 
     fn on_phase(engine: *Engine) void {
         const self: *Harness = @alignCast(@fieldParentPtr("engine", engine));
@@ -110,6 +116,7 @@ const Harness = struct {
         self.model.acknowledged = self.commit_sequence;
         apply(&self.model.state, self.commit_sequence, self.model.body(self.commit_sequence));
         self.commit_sequence = 0;
+        if (self.pace_blocks != std.math.maxInt(u64)) engine.checkpoint_grant(self.pace_blocks);
     }
 
     fn on_checkpoint(engine: *Engine) void {
@@ -235,8 +242,14 @@ const Harness = struct {
             self.prng.chance(1, 3))
         {
             try self.commit_random();
+        } else if (self.model.submitted == entries_max) {
+            // No more commits will grant: let a paced checkpoint finish.
+            engine.checkpoint_grant(std.math.maxInt(u64));
         }
         self.sim.tick();
+        const paused = engine.checkpoint_paused();
+        if (paused and !self.was_paused) self.pauses += 1;
+        self.was_paused = paused;
     }
 
     fn commit_random(self: *Harness) !void {
@@ -253,6 +266,8 @@ const Harness = struct {
         const sequence = self.engine.commit(body, &metadata, on_commit) catch |err| switch (err) {
             error.JournalFull => {
                 self.checkpoint_requested = true;
+                // A paced checkpoint must finish to free the journal.
+                self.engine.checkpoint_grant(std.math.maxInt(u64));
                 return;
             },
             else => return err,
@@ -265,7 +280,7 @@ const Harness = struct {
     fn checkpoint_start(self: *Harness) !void {
         self.snapshot_take();
         const producer: engine_module.Producer = .{ .context = self, .produce = produce };
-        try self.engine.checkpoint(producer, on_checkpoint);
+        try self.engine.checkpoint_paced(producer, self.pace_blocks, on_checkpoint);
         self.fallback_intact = false;
     }
 
@@ -298,6 +313,7 @@ const Harness = struct {
         self.phase_done = false;
         self.commit_sequence = 0;
         self.checkpoint_requested = false;
+        self.was_paused = false;
     }
 };
 
@@ -583,7 +599,9 @@ test "engine: fallback whose retained journal is rotten is CheckpointCorrupt" {
     try testing.expectError(error.CheckpointCorrupt, harness.open());
 }
 
-fn run_fault_seed(seed: u64) !u32 {
+const Pacing = enum { unpaced, paced };
+
+fn run_fault_seed(seed: u64, pacing: Pacing) !u32 {
     var prng = Prng.init(seed);
     var sim = try SimStorage.init(testing.allocator, .{
         .size_bytes = config.size_bytes(),
@@ -595,14 +613,14 @@ fn run_fault_seed(seed: u64) !u32 {
     defer sim.deinit(testing.allocator);
     const harness = try harness_create(&sim, prng.int(u64));
     defer harness_destroy(harness);
+    // The snapshot spans 3 blocks: 1 or 2 per chunk pauses once or twice per checkpoint.
+    if (pacing == .paced) harness.pace_blocks = prng.range(1, 2);
     try harness.format();
     _ = try harness.open();
     var fallbacks: u32 = 0;
     var cycle: u32 = 0;
     while (cycle < 4) : (cycle += 1) {
-        const crash_tick = prng.range(1, 1500);
-        var tick: u64 = 0;
-        while (tick < crash_tick) : (tick += 1) try harness.step();
+        try run_until_crash_point(harness, &prng, pacing);
         // A checkpoint in flight is overwriting the fallback zone: rotting the newest zone
         // too would be a double fault.
         const fallback_ready = harness.fallback_intact and
@@ -620,11 +638,75 @@ fn run_fault_seed(seed: u64) !u32 {
     return fallbacks;
 }
 
+/// Steps to a random tick; when paced, half the time instead to a random chunk boundary
+/// (the checkpoint paused after its `k`th chunk, nothing of it named by a superblock yet).
+fn run_until_crash_point(harness: *Harness, prng: *Prng, pacing: Pacing) !void {
+    const crash_tick = prng.range(1, 1500);
+    const at_boundary = pacing == .paced and prng.chance(1, 2);
+    // Drawn only when paced, so unpaced seeds replay their original workloads.
+    const pauses_target = if (at_boundary) harness.pauses + prng.range(1, 6) else 0;
+    var tick: u64 = 0;
+    while (tick < crash_tick or at_boundary) : (tick += 1) {
+        try harness.step();
+        if (at_boundary and harness.pauses >= pauses_target and harness.was_paused) {
+            assert(harness.engine.checkpoint_paused());
+            return;
+        }
+        if (tick >= 20_000) return error.NoChunkBoundary;
+    }
+}
+
+test "engine: paced checkpoint writes in chunks and resumes on grant" {
+    var sim = try sim_create(0x9ace);
+    defer sim.deinit(testing.allocator);
+    const harness = try harness_create(&sim, 0x9ace);
+    defer harness_destroy(harness);
+    try harness.format();
+    _ = try harness.open();
+    try harness.commit_durable(3);
+    harness.snapshot_take();
+    const producer: engine_module.Producer = .{ .context = harness, .produce = Harness.produce };
+    try harness.engine.checkpoint_paced(producer, 1, Harness.on_checkpoint);
+    const blocks = checkpoint_module.block_count(snapshot_size, config.checkpoint_block_size);
+    try testing.expect(blocks >= 3);
+    var chunk: u64 = 1;
+    while (chunk < blocks) : (chunk += 1) {
+        var ticks: u32 = 0;
+        while (!harness.engine.checkpoint_paused()) : (ticks += 1) {
+            if (ticks > 1_000) return error.Timeout;
+            sim.tick();
+        }
+        try testing.expectEqual(chunk, harness.engine.checkpoint_io.block_index);
+        // Paused: no superblock names the new checkpoint yet.
+        try testing.expectEqual(@as(u64, 0), harness.engine.superblock.working.checkpoint.sequence);
+        harness.engine.checkpoint_grant(1);
+        try testing.expect(!harness.engine.checkpoint_paused());
+    }
+    try engine_module.tick_until_idle(&sim, &harness.engine, 10_000);
+    if (harness.failure) |err| return err;
+    try testing.expectEqual(@as(u64, 1), harness.engine.superblock.working.checkpoint.sequence);
+    try harness.reinit();
+    const result = try harness.open();
+    try testing.expectEqual(@as(u64, 0), result.entries_replayed);
+}
+
+test "engine: seeded crashes mid paced checkpoint at chunk boundaries" {
+    var fallbacks: u32 = 0;
+    var seed: u64 = 0;
+    while (seed < 64) : (seed += 1) {
+        fallbacks += run_fault_seed(seed, .paced) catch |err| {
+            std.debug.print("engine paced fault injection: failing seed={d}\n", .{seed});
+            return err;
+        };
+    }
+    try testing.expect(fallbacks >= 8);
+}
+
 test "engine: seeded crash and corruption fault injection" {
     var fallbacks: u32 = 0;
     var seed: u64 = 0;
     while (seed < 64) : (seed += 1) {
-        fallbacks += run_fault_seed(seed) catch |err| {
+        fallbacks += run_fault_seed(seed, .unpaced) catch |err| {
             std.debug.print("engine fault injection: failing seed={d}\n", .{seed});
             return err;
         };

@@ -22,6 +22,12 @@
 //! frozen staging buffer streams out. `open` loads the checkpoint and replays the journal
 //! through the same code paths without journaling again, then checks the result against the
 //! last entry's metadata (head number, head hash, state root).
+//! Incremental checkpoints (`Config.checkpoint_bytes_per_commit`): the staging buffer is
+//! still serialized at once (it must be the state at one point), but the engine writes at
+//! most that many bytes of it per durable commit (`Engine.checkpoint_paced`, granted again
+//! in every commit callback), so no single commit's sync has to flush the whole image. If
+//! the journal runs out of room while a paced checkpoint runs, the pacing is lifted
+//! (`checkpoint_flush`) so the checkpoint finishes and frees the journal.
 //! If the newest checkpoint is rotten, the engine resets the staged bytes, streams the older
 //! fallback checkpoint instead, and replays the longer journal kept since it.
 //!
@@ -255,6 +261,11 @@ pub const Config = struct {
     queue_entries_max: u32,
     /// Largest serialized checkpoint (snapshot plus retained blocks).
     checkpoint_staging_bytes: u32,
+    /// Checkpoint bytes written per durable commit (rounded up to whole checkpoint blocks);
+    /// 0 writes a checkpoint as fast as the storage allows. Choose it so a whole checkpoint
+    /// (`checkpoint_staging_bytes`) finishes within the commits that fit in half the journal;
+    /// otherwise a full journal lifts the pacing and that commit waits for the rest.
+    checkpoint_bytes_per_commit: u32 = 0,
     /// Historical proofs window; null keeps no history (and no trie change tracking).
     history: ?history_module.Config = null,
     /// With history on, `open` rebuilds the window from the retained blocks' changesets
@@ -267,6 +278,16 @@ pub const Config = struct {
     /// a ring of capacity C >= budget + 3 * max(n) always has n contiguous free bytes.
     pub fn chain_bytes_capacity(config: Config) u32 {
         return config.chain.bytes_max + 3 * config.engine.entry_body_size_max;
+    }
+
+    /// Checkpoint blocks granted per durable commit (`maxInt` when not paced).
+    pub fn checkpoint_blocks_per_commit(config: Config) u64 {
+        if (config.checkpoint_bytes_per_commit == 0) return std.math.maxInt(u64);
+        const block_size = config.engine.checkpoint_block_size;
+        assert(block_size > 0);
+        // block_size > 0, asserted above.
+        return std.math.divCeil(u64, config.checkpoint_bytes_per_commit, block_size) catch
+            unreachable;
     }
 };
 
@@ -736,6 +757,15 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.checkpoint_maybe_start();
         }
 
+        /// Lifts the pacing of the running checkpoint, if any: it writes its remaining
+        /// blocks as fast as the storage allows (before a shutdown, or when the journal is
+        /// full). Later checkpoints are paced again.
+        pub fn checkpoint_flush(self: *Self) void {
+            if (self.phase != .ready) return;
+            self.engine.checkpoint_grant(std.math.maxInt(u64));
+            assert(!self.engine.checkpoint_paused());
+        }
+
         fn check_accepting(self: *Self, entries: u32, journal_bytes: u64) OperationError!void {
             if (self.phase != .ready) return error.NotReady;
             assert(self.queue_count <= self.config.queue_entries_max);
@@ -749,6 +779,8 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (needed > zone_size) {
                 self.checkpoint_wanted = true;
                 self.checkpoint_maybe_start();
+                // A paced checkpoint must finish to free the journal.
+                self.checkpoint_flush();
                 return error.Busy;
             }
         }
@@ -793,6 +825,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                     // Admission keeps room for every queued entry; a checkpoint frees more.
                     error.JournalFull => {
                         self.checkpoint_wanted = true;
+                        self.checkpoint_flush();
                         return;
                     },
                     // Ready and no commit in flight, both checked above.
@@ -814,6 +847,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.journal_bytes_pending -= self.in_flight_bytes;
             self.in_flight_bytes = 0;
             if (self.on_durable) |callback| callback(self.durable_context, self.durable_sequence);
+            // A paced checkpoint writes its next chunk after each durable commit.
+            if (self.config.checkpoint_bytes_per_commit > 0) {
+                self.engine.checkpoint_grant(self.config.checkpoint_blocks_per_commit());
+            }
             self.checkpoint_maybe_start();
             self.pump();
         }
@@ -1163,8 +1200,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             };
             self.staging_position = 0;
             const producer: engine_module.Producer = .{ .context = self, .produce = produce };
+            const blocks = self.config.checkpoint_blocks_per_commit();
+            assert(blocks > 0);
             // Ready, no commit in flight, and no checkpoint running: checked above.
-            self.engine.checkpoint(producer, on_checkpoint) catch unreachable;
+            self.engine.checkpoint_paced(producer, blocks, on_checkpoint) catch unreachable;
         }
 
         fn produce(context: *anyopaque, buffer: []u8) u32 {

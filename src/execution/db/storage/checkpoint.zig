@@ -6,6 +6,12 @@
 //! block are written. After the last block a sync makes the snapshot durable, and the result
 //! (zone, size, checksum of the whole payload stream, sequence) goes into the superblock.
 //!
+//! Pacing (incremental checkpoints): `write_start_paced` caps how many blocks the writer may
+//! write; once it has written them it pauses (`paused`) between blocks until `grant` allows
+//! more. Pausing changes only when blocks are written, never what or where: the snapshot is
+//! still synced after its last block and only then reported, so a crash while paused leaves
+//! a half-written zone that no superblock names (the same as a crash mid-write).
+//!
 //! The reader re-derives the block count from the size, verifies every block (including
 //! index and sequence, so blocks left over from an older checkpoint in the same zone are
 //! rejected) and the total checksum. A new checkpoint always goes into the zone the current
@@ -90,7 +96,7 @@ pub fn CheckpointType(comptime Storage: type) type {
 
         pub const Callback = *const fn (*Self) void;
         pub const read_attempts_max: u32 = 4;
-        pub const State = enum { idle, writing, syncing, reading };
+        pub const State = enum { idle, writing, paused, syncing, reading };
 
         storage: *Storage,
         config: Config,
@@ -104,6 +110,8 @@ pub fn CheckpointType(comptime Storage: type) type {
         /// Writing: the checkpoint being built. Reading: the checkpoint expected.
         checkpoint: Checkpoint = .{},
         block_index: u64 = 0,
+        /// Writing: blocks the writer may write before it pauses (`grant` raises it).
+        blocks_allowed: u64 = std.math.maxInt(u64),
         size_bytes: u64 = 0,
         total: checksum_module.Stream = undefined,
         producer: ?Producer = null,
@@ -152,6 +160,21 @@ pub fn CheckpointType(comptime Storage: type) type {
             producer: Producer,
             callback: Callback,
         ) void {
+            const unlimited = std.math.maxInt(u64);
+            self.write_start_paced(format_id, zone, sequence, producer, unlimited, callback);
+        }
+
+        /// Like `write_start`, but pauses after `blocks_allowed` blocks until `grant`.
+        pub fn write_start_paced(
+            self: *Self,
+            format_id: u128,
+            zone: u8,
+            sequence: u64,
+            producer: Producer,
+            blocks_allowed: u64,
+            callback: Callback,
+        ) void {
+            assert(blocks_allowed > 0);
             assert(self.state == .idle);
             assert(self.callback == null);
             assert(zone <= 1);
@@ -159,6 +182,7 @@ pub fn CheckpointType(comptime Storage: type) type {
             self.format_id = format_id;
             self.checkpoint = .{ .zone = zone, .sequence = sequence };
             self.block_index = 0;
+            self.blocks_allowed = blocks_allowed;
             self.size_bytes = 0;
             self.total = .init();
             self.producer = producer;
@@ -225,9 +249,30 @@ pub fn CheckpointType(comptime Storage: type) type {
             const self: *Self = @alignCast(@fieldParentPtr("write", write));
             assert(self.state == .writing);
             self.block_index += 1;
-            if (!self.producer_done) return self.write_block();
-            self.state = .syncing;
-            self.storage.sync(on_sync, &self.sync);
+            if (self.producer_done) {
+                self.state = .syncing;
+                return self.storage.sync(on_sync, &self.sync);
+            }
+            if (self.block_index < self.blocks_allowed) return self.write_block();
+            assert(self.block_index == self.blocks_allowed);
+            self.state = .paused;
+        }
+
+        /// True while a paced write waits for `grant`.
+        pub fn paused(self: *const Self) bool {
+            return self.state == .paused;
+        }
+
+        /// Allows `blocks` more blocks (saturating) and resumes a paused write. Only valid
+        /// while a write runs; the next block is submitted from this call.
+        pub fn grant(self: *Self, blocks: u64) void {
+            assert(blocks > 0);
+            assert(self.state == .writing or self.state == .paused or self.state == .syncing);
+            self.blocks_allowed +|= blocks;
+            if (self.state != .paused) return;
+            assert(self.block_index < self.blocks_allowed);
+            self.state = .writing;
+            self.write_block();
         }
 
         fn on_sync(sync: *storage.Sync) void {

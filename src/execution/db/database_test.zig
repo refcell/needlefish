@@ -101,19 +101,29 @@ const Harness = struct {
     /// checkpoint completes.
     fallback_intact: bool = true,
     checkpoints_seen: u64 = 0,
+    /// `config`, or a copy with paced (incremental) checkpoints.
+    config: database.Config = config,
+    /// Times a paced checkpoint paused at a chunk boundary.
+    pauses: u64 = 0,
+    was_paused: bool = false,
 
     fn create(sim: *SimStorage, seed: u64) !*Harness {
+        return create_with(sim, seed, config);
+    }
+
+    fn create_with(sim: *SimStorage, seed: u64, harness_config: database.Config) !*Harness {
         const self = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(self);
         const heads = try testing.allocator.alloc(HeadInfo, sequences_max + 1);
         errdefer testing.allocator.free(heads);
         heads[0] = .{};
         self.* = .{
-            .db = try Database.init(testing.allocator, sim, config),
+            .db = try Database.init(testing.allocator, sim, harness_config),
             .sim = sim,
             .prng = Prng.init(seed),
             .overlay = undefined,
             .heads = heads,
+            .config = harness_config,
         };
         self.overlay = try Overlay.init(testing.allocator, &self.db.state, overlay_config);
         return self;
@@ -175,7 +185,11 @@ const Harness = struct {
     /// Simulates a restart: a fresh database value over the same storage.
     fn reopen(self: *Harness) !void {
         self.db.deinit(testing.allocator);
-        self.db = try Database.init(testing.allocator, self.sim, config);
+        self.db = try Database.init(testing.allocator, self.sim, self.config);
+        self.was_paused = false;
+        // The fresh database counts checkpoints from zero: without this, `track_fallback`
+        // would see a "completed" checkpoint and wrongly mark the fallback intact.
+        self.checkpoints_seen = 0;
         self.overlay.discard();
         self.overlay.base = &self.db.state;
         try self.open();
@@ -315,6 +329,9 @@ const Harness = struct {
         if (self.db.checkpoint_error) |err| return err;
         self.sim.tick();
         self.track_fallback();
+        const paused = self.db.engine.checkpoint_paused();
+        if (paused and !self.was_paused) self.pauses += 1;
+        self.was_paused = paused;
     }
 
     fn track_fallback(self: *Harness) void {
@@ -372,19 +389,24 @@ fn sim_create(seed: u64, prng: *Prng) !SimStorage {
     });
 }
 
-fn run_crash_seed(seed: u64) !u32 {
+const Pacing = enum { unpaced, paced };
+
+fn run_crash_seed(seed: u64, pacing: Pacing) !u32 {
     var prng = Prng.init(seed);
     var sim = try sim_create(seed, &prng);
     defer sim.deinit(testing.allocator);
-    const harness = try Harness.create(&sim, prng.int(u64));
+    var harness_config = config;
+    if (pacing == .paced) {
+        const block_size = config.engine.checkpoint_block_size;
+        harness_config.checkpoint_bytes_per_commit = @intCast(prng.range(1, 3) * block_size);
+    }
+    const harness = try Harness.create_with(&sim, prng.int(u64), harness_config);
     defer harness.destroy();
     try harness.format(0xd8_0000 + seed);
     var fallbacks: u32 = 0;
     var cycle: u32 = 0;
     while (cycle < 4) : (cycle += 1) {
-        const crash_tick = prng.range(1, 1200);
-        var tick: u64 = 0;
-        while (tick < crash_tick) : (tick += 1) try harness.step();
+        try run_until_crash_point(harness, &prng, pacing);
         try harness.crash_and_check(if (prng.chance(1, 2)) .rot else .keep);
         if ((try harness.db.engine.open_result).checkpoint_fallback) fallbacks += 1;
     }
@@ -392,11 +414,41 @@ fn run_crash_seed(seed: u64) !u32 {
     return fallbacks;
 }
 
+/// Steps to a random tick; when paced, half the time instead to a random chunk boundary
+/// (a checkpoint paused after its `k`th chunk, not yet named by any superblock).
+fn run_until_crash_point(harness: *Harness, prng: *Prng, pacing: Pacing) !void {
+    const crash_tick = prng.range(1, 1200);
+    const at_boundary = pacing == .paced and prng.chance(1, 2);
+    // Drawn only when paced, so unpaced seeds replay their original workloads.
+    const pauses_target = if (at_boundary) harness.pauses + prng.range(1, 6) else 0;
+    var tick: u64 = 0;
+    while (tick < crash_tick or at_boundary) : (tick += 1) {
+        try harness.step();
+        if (at_boundary and harness.pauses >= pauses_target and harness.was_paused) {
+            assert(harness.db.engine.checkpoint_paused());
+            return;
+        }
+        if (tick >= 50_000) return error.NoChunkBoundary;
+    }
+}
+
+test "database: seeded crashes mid incremental checkpoint at chunk boundaries" {
+    var fallbacks: u32 = 0;
+    var seed: u64 = 0;
+    while (seed < 24) : (seed += 1) {
+        fallbacks += run_crash_seed(seed, .paced) catch |err| {
+            std.debug.print("database paced crash recovery: failing seed={d}\n", .{seed});
+            return err;
+        };
+    }
+    try testing.expect(fallbacks >= 4);
+}
+
 test "database: seeded crash recovery matches a point between acknowledged and submitted" {
     var fallbacks: u32 = 0;
     var seed: u64 = 0;
     while (seed < 24) : (seed += 1) {
-        fallbacks += run_crash_seed(seed) catch |err| {
+        fallbacks += run_crash_seed(seed, .unpaced) catch |err| {
             std.debug.print("database crash recovery: failing seed={d}\n", .{seed});
             return err;
         };

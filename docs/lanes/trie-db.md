@@ -177,11 +177,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`TrieType.clear_changes` replaces the drain walk; version kind/mask/fingerprint;
   `db/path_index.zig`; interleaved medians heavy 17.0 -> 5.7 ms p50, typical 10.0 -> 3.8 ms;
   stays on the critical path, see Decisions and PERF.md)
-- [ ] Checkpoint stalls at 200 ms blocks: measure the durable commit latency distribution
+- [x] Checkpoint stalls at 200 ms blocks: measure the durable commit latency distribution
   (p50/p99/max) over thousands of blocks on a real file (`IoStorage` over the os backend),
   including the blocks that trigger a checkpoint; if a checkpoint's state write exceeds the
   slot budget, spread it over commits (incremental checkpoint chunks per commit) so no
   single commit stalls. Crash tests must still pass.
+  (`db/steady_bench.zig`; serialization 2-6 ms, no 50 ms stall attributable to it; checkpoint
+  writes bounded per commit with `checkpoint_bytes_per_commit`, node 4 MiB; see Decisions)
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -310,6 +312,31 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   tail > half the journal), which now counts two checkpoints of entries, so checkpoints run
   about twice as often (each covers ~1/4 of the journal) and Busy/JournalFull clears after at
   most two back-to-back checkpoints.
+- Incremental checkpoints (`Config.checkpoint_bytes_per_commit`, node 4 MiB): measured
+  first (`zig build bench -Doptimize=ReleaseFast -- "db/commit steady"`, PERF.md). At 200 ms
+  slots with the node's 2 ms storage tick, a 31 MB checkpoint already spreads over ~7 commits
+  (the checkpoint writer submits one 64 KiB block per tick), and the only synchronous part,
+  serializing the staging image, takes 2-6 ms. Commits that overlap a checkpoint were
+  slower (p50 +5.6 ms, >50 ms 10% vs 3.4% in the cleaner run) because each journal fsync also
+  flushes the checkpoint blocks written since the last one, and that amount was bounded only
+  by tick rate x idle time (a faster tick or io_uring could put a whole image on one fsync).
+  So the writer is now paced: `CheckpointType.write_start_paced` pauses after a block budget,
+  `Engine.checkpoint_paced`/`checkpoint_grant`, and the database grants the budget again in
+  every durable-commit callback. The image is still serialized at once (it must be the state
+  at one journal point; 2-6 ms is in budget), and the protocol is unchanged: the superblock
+  is written only after the last block is synced, the journal releases nothing earlier, so a
+  crash at a chunk boundary is a crash mid-write. A full journal lifts the pacing
+  (`checkpoint_flush`, also from `pump` on `JournalFull`) so the checkpoint can free it. Fixed
+  per-commit budget over adaptive pacing: simple, deterministic; size it so the staging
+  image finishes within half the journal (node: 40 MiB / 4 MiB = 10 commits x 2 MiB largest
+  entry = 20 MiB < 32 MiB). Default 0 (unpaced) keeps tests and tools that wait for `idle()`
+  after a checkpoint unchanged. Cost: a checkpoint holds the fallback zone (only the newest
+  checkpoint recoverable) for at least `staging / budget` commits instead of ~7 slots, and a
+  paced checkpoint started on an idle chain stays paused until the next commit (harmless:
+  nothing new needs journal room). Found while adding paced crash tests: the database crash
+  harness kept `checkpoints_seen` across `reopen`, so a fresh database's counter looked like
+  a completed checkpoint and the test could rot the newest zone while the fallback zone was
+  half overwritten (a double fault reported as `CheckpointCorrupt`); a test bug, fixed.
 - Witness evm differential (`db/witness_evm_test.zig`) drives the evm directly
   (`transaction.transact` over a `TxEnv` list), not the node executor: the executor takes
   signed RLP transactions over `node.StateDb` and adds system calls, so it has no entry over
@@ -601,6 +628,9 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - One rotten checkpoint zone is survived; it is data loss (`CheckpointCorrupt`) only with a
   second fault: rot in the fallback zone, rot in a journal entry between the two checkpoint
   starts, or a crash during a checkpoint write combined with rot in the newest zone.
+- Paced (incremental) checkpoints keep the fallback zone half-written for longer: at least
+  `checkpoint_staging_bytes / checkpoint_bytes_per_commit` commits (node: 10). A crash in that
+  window plus rot in the newest zone is the double fault above.
 - A transient read fault while streaming the fallback after it was chosen fails open (no third
   option); reopening retries.
 - A cleanly closed journal can report `journal_stop = header_corrupt`: the sector after the
@@ -885,3 +915,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   reorgs, random key sets with duplicates and absent keys, absent account, empty storage,
   every block of the window, before and after pruning) against per-key `get_proof`, a fuzz
   target, and `proofs_at` vs `proof_at` in the database history workload.
+- 2026-11-05: checkpoint stalls at 200 ms blocks: `db/steady_bench.zig` (`db/commit steady`
+  sim/os, paced and unpaced) commits 1k acct + 1k slot blocks over 100k accounts with the
+  node layout and automatic checkpoints, latency per commit by checkpoint activity. Os at
+  200 ms slots (kqueue, F_FULLFSYNC, 2k blocks, 51 checkpoints of 31.2 MB): p50 15.6 ms,
+  p99 95 ms, max 154 ms; checkpoint-overlapping commits p50 20.3 vs 14.7 ms; serialization
+  2-6 ms; the loaded machine (load 100-150) puts 3-11% of commits without a checkpoint over
+  50 ms too. Incremental checkpoints added anyway as a hard bound (`checkpoint_bytes_per_commit`,
+  node 4 MiB). Tests: paced checkpoint chunk/resume (engine), 64 engine seeds and 24
+  database seeds crashing at random ticks or at a random chunk boundary of a paced
+  checkpoint (with rot of the newest zone when the fallback is intact).

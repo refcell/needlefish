@@ -36,6 +36,13 @@
 //! overwriting the fallback zone (between the zone write starting and the superblock being
 //! durable, the fallback zone holds the half-written new checkpoint).
 //!
+//! Incremental checkpoints: `checkpoint_paced` writes at most a given number of checkpoint
+//! blocks, then pauses until `checkpoint_grant` allows more (the database grants a budget per
+//! durable commit), so the snapshot's write and its flush spread over several commits. The
+//! protocol above is unchanged: the superblock is written only after the last block is
+//! synced, and the journal releases nothing before then. Pacing only lengthens the window in
+//! which the fallback zone holds a partial checkpoint (only the newest is recoverable).
+//!
 //! Concurrency: one commit and one checkpoint may run at the same time. A checkpoint cannot
 //! start while a commit is in flight, so its snapshot covers exactly the entries committed
 //! before `checkpoint()` was called; the producer must keep serving that snapshot while later
@@ -290,6 +297,18 @@ pub fn EngineType(comptime Storage: type) type {
             producer: Producer,
             callback: Callback,
         ) error{ NotReady, Busy }!void {
+            return self.checkpoint_paced(producer, std.math.maxInt(u64), callback);
+        }
+
+        /// Like `checkpoint`, but writes at most `blocks_allowed` checkpoint blocks before it
+        /// pauses for `checkpoint_grant`.
+        pub fn checkpoint_paced(
+            self: *Self,
+            producer: Producer,
+            blocks_allowed: u64,
+            callback: Callback,
+        ) error{ NotReady, Busy }!void {
+            assert(blocks_allowed > 0);
             if (self.phase != .ready) return error.NotReady;
             if (self.checkpoint_phase != .idle or self.commit_callback != null) return error.Busy;
             assert(self.journal.idle());
@@ -305,13 +324,29 @@ pub fn EngineType(comptime Storage: type) type {
             self.checkpoint_metadata = self.commit_metadata;
             self.checkpoint_phase = .writing;
             self.checkpoint_callback = callback;
-            self.checkpoint_io.write_start(
+            self.checkpoint_io.write_start_paced(
                 working.format_id,
                 zone,
                 working.checkpoint.sequence + 1,
                 producer,
+                blocks_allowed,
                 on_checkpoint_io,
             );
+        }
+
+        /// Lets a paced checkpoint write `blocks` more blocks (saturating); resumes it if it
+        /// paused. A no-op unless the checkpoint is still writing its blocks.
+        pub fn checkpoint_grant(self: *Self, blocks: u64) void {
+            assert(blocks > 0);
+            assert(self.phase == .ready);
+            if (self.checkpoint_phase != .writing) return;
+            assert(self.checkpoint_io.state != .idle);
+            self.checkpoint_io.grant(blocks);
+        }
+
+        /// True while a paced checkpoint waits for `checkpoint_grant`.
+        pub fn checkpoint_paused(self: *const Self) bool {
+            return self.checkpoint_phase == .writing and self.checkpoint_io.paused();
         }
 
         fn on_superblock(superblock: *SuperBlockType) void {

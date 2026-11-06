@@ -240,6 +240,9 @@ pub const Limits = struct {
         .changeset = undefined,
         .queue_entries_max = 8,
         .checkpoint_staging_bytes = 40 << 20,
+        // Incremental checkpoints: a 40 MiB image takes at least 10 commits, which journal
+        // at most 10 * 2 MiB, well inside the half of the journal left when one starts.
+        .checkpoint_bytes_per_commit = 4 << 20,
     },
     /// Storage callbacks run from a timer at this interval.
     storage_tick_ns: u64 = 2 * std.time.ns_per_ms,

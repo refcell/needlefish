@@ -591,6 +591,52 @@ The remaining cost is linear in the output: every key still gets its full node l
 slot. The 256-key case is 4x the keys for 2x the time of 64 because most of the extra keys
 are absent and end at the shared upper nodes.
 
+## 2026-11-05 db commit with checkpoints at 200 ms blocks (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/commit steady"` (`db/steady_bench.zig`; only
+runs when the filter names "steady"; ~20 min). Typical block = 1k account + 1k slot writes
+(~200 transactions, 281 KB entry) over 100k accounts (1k contracts x 64 slots), node layout:
+64 MiB journal, 16 MiB / 1024 retained blocks, so each checkpoint is 31.2 MB (14.6 MB
+snapshot + ~57 retained blocks) and checkpoints start on their own when the journal passes
+half full. Latency = `execute_and_commit` until its entry is durable, classified by the
+checkpoint: `start` (serializes the staging image in that commit's tick), `advance` (a
+checkpoint writing before and after), `finish`, `none`. Os = `IoStorage` on kqueue, scratch
+file (~160 MB, deleted), F_FULLFSYNC, 2k blocks paced at 200 ms slots: after a block is
+durable the storage ticks every 2 ms (the node's `storage_tick_ns`) until the slot ends. Sim
+= zero-latency `SimStorage`, 3k blocks back to back with 8 idle ticks (CPU only). The machine
+was heavily loaded (load average 100-150), so p99/max are mostly scheduling noise: compare
+`advance` against `none` from the same run. One run each.
+
+| Case | n | p50 | p90 | p99 | max | > 50 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| os unpaced, all | 2000 | 15.6 ms | 37.0 ms | 95.0 ms | 153.7 ms | 91 |
+| os unpaced, none | 1641 | 14.7 ms | 33.8 ms | 85.4 ms | 142.5 ms | 55 |
+| os unpaced, start | 16 | 20.8 ms | 93.5 ms | 105.5 ms | 105.5 ms | 2 |
+| os unpaced, advance | 342 | 20.3 ms | 49.6 ms | 107.7 ms | 153.7 ms | 34 |
+| os paced 4 MiB, all | 2000 | 17.5 ms | 59.2 ms | 157.8 ms | 505.0 ms | 244 |
+| os paced 4 MiB, none | 1571 | 16.6 ms | 55.5 ms | 149.2 ms | 505.0 ms | 178 |
+| os paced 4 MiB, advance | 412 | 20.3 ms | 77.1 ms | 205.9 ms | 295.2 ms | 65 |
+| sim unpaced, all | 3000 | 4.44 ms | 10.9 ms | 36.5 ms | 111.2 ms | 18 |
+| sim paced 4 MiB, all | 3000 | 4.50 ms | 9.7 ms | 22.4 ms | 86.2 ms | 7 |
+
+Serializing the 31.2 MB staging image (`request_checkpoint` on an idle database): sim
+2.2 ms, os 3.3-5.7 ms (one 23.5 ms sample, noise). Os unpaced: 51 checkpoints in 2k blocks
+(one per ~39 blocks), 0 slot overruns, longest idle tick 157 ms; os paced: 12 slot overruns,
+longest idle tick 200 ms (the paced run hit a noisier period: its `none` p90 is 55 vs 34 ms).
+No `error.Busy` in any run. The sim's `start`/`finish` rows are 1 and 12 samples (checkpoints
+run back to back there, so starts land in `finish` commits); its outliers are scheduling.
+
+Reading: no stall is attributable to serialization (2-6 ms). A checkpoint spreads over ~7
+commits already at the 2 ms tick (the writer submits one 64 KiB block per tick), and
+overlapping commits cost p50 +5.6 ms and exceed 50 ms 3x as often as the rest (10% vs 3.4%,
+unpaced run), because each journal fsync also flushes the checkpoint blocks written since
+the previous one: up to ~6.4 MB per 200 ms slot at the 2 ms tick, unbounded with a faster
+tick or io_uring. `checkpoint_bytes_per_commit` (node 4 MiB) makes that bound explicit; its
+gain is not measurable on this machine (same p50 for `advance`, noise elsewhere). Before
+first measurements (back to back, no slot pacing, not committed): the journal outran the
+checkpoint (12.7k Busy retries, `finish` commits p50 420 ms) — an artifact of committing 20x
+faster than 200 ms slots, which is why the os case paces.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI
