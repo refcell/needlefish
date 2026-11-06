@@ -47,12 +47,23 @@ const config: db_module.database.Config = .{
     .checkpoint_staging_bytes = 1 << 20,
 };
 
-var genesis_accounts: [fixture.senders]genesis_module.state.Account = undefined;
+var genesis_accounts: [fixture.senders + 1]genesis_module.state.Account = undefined;
+
+/// An account with two storage slots (for `debug_storageRangeAt` through the journal).
+const storage_holder: [20]u8 = @as([18]u8, @splat(0)) ++ [2]u8{ 0x57, 0x07 };
+const storage_holder_slots = [_]genesis_module.state.StorageSlot{
+    .{ .key = .{ .bytes = @splat(0x01) }, .value = 7 },
+    .{ .key = .{ .bytes = @splat(0x02) }, .value = 9 },
+};
 
 fn genesis() genesis_module.Genesis {
-    for (&genesis_accounts, 0..) |*account, index| {
+    for (genesis_accounts[0..fixture.senders], 0..) |*account, index| {
         account.* = .{ .address = fixture.address_of(@intCast(index + 1)), .balance = fixture.eth };
     }
+    genesis_accounts[fixture.senders] = .{
+        .address = .{ .bytes = storage_holder },
+        .storage = &storage_holder_slots,
+    };
     return .{ .accounts = &genesis_accounts };
 }
 
@@ -484,4 +495,86 @@ fn fuzz_durable(_: void, smith: *testing.Smith) anyerror!void {
 
 test "durable: fuzz" {
     try testing.fuzz({}, fuzz_durable, .{});
+}
+
+/// The holder's slots in hashed-key order: `[0]` is the smaller hashed key.
+fn holder_leaves() [2]db_module.history.StorageEntry {
+    var leaves: [2]db_module.history.StorageEntry = undefined;
+    for (&leaves, storage_holder_slots) |*leaf, slot| {
+        leaf.* = .{ .key_hash = primitives.keccak256(&slot.key.bytes).bytes, .value = slot.value };
+    }
+    if (std.mem.order(u8, &leaves[0].key_hash, &leaves[1].key_hash) == .gt) {
+        std.mem.swap(db_module.history.StorageEntry, &leaves[0], &leaves[1]);
+    }
+    return leaves;
+}
+
+fn check_storage_range(database_config: db_module.database.Config) !void {
+    const h = try Harness.create_with(9, database_config);
+    defer h.destroy();
+    var buffers: [3][256]u8 = undefined;
+    var hashes: [4]B256 = undefined;
+    hashes[0] = h.head();
+    for (1..4) |number| {
+        try fixture.submit(h.node.?, 1, number - 1, 5, &buffers[number - 1]);
+        hashes[number] = try h.build_head(hashes[number - 1], 12 * number, 0xfe);
+    }
+    const chain = &h.node.?.chain;
+    try testing.expect(chain.journal != null); // Served through the journal hook.
+    const holder_hash = primitives.keccak256(&storage_holder).bytes;
+    const leaves = holder_leaves();
+    const zero: [32]u8 = @splat(0);
+    var out: [4]db_module.history.StorageEntry = undefined;
+    // The head, and (with history) an older block in the window.
+    const history = database_config.history != null;
+    for ([_]u64{ 3, 2 }) |number| {
+        const hash = hashes[number].bytes;
+        const result = chain.storage_range_at(hash, number, holder_hash, zero, 4, &out);
+        if (number != 3 and !history) {
+            try testing.expectError(error.HistoryUnavailable, result);
+            continue;
+        }
+        const range = try result;
+        try testing.expectEqual(@as(u32, 2), range.count);
+        try testing.expect(range.next == null);
+        for (out[0..2], leaves) |got, want| {
+            try testing.expectEqualSlices(u8, &want.key_hash, &got.key_hash);
+            try testing.expectEqual(want.value, got.value);
+        }
+        // One at a time: the next key is the second slot's.
+        const first = try chain.storage_range_at(hash, number, holder_hash, zero, 1, &out);
+        try testing.expectEqual(@as(u32, 1), first.count);
+        try testing.expectEqualSlices(u8, &leaves[1].key_hash, &first.next.?);
+    }
+    // Seeded starts and limits against the two-leaf model.
+    var prng = Prng.init(0x7372);
+    for (0..32) |_| {
+        var start: [32]u8 = undefined;
+        if (prng.chance(1, 3)) {
+            start = leaves[prng.below(2)].key_hash;
+        } else prng.fill(&start);
+        const max: u32 = @intCast(prng.below(4));
+        var from: usize = 0;
+        while (from < 2 and std.mem.order(u8, &leaves[from].key_hash, &start) == .lt) from += 1;
+        const range = try chain.storage_range_at(hashes[3].bytes, 3, holder_hash, start, max, &out);
+        const count = @min(max, 2 - from);
+        try testing.expectEqual(@as(u32, @intCast(count)), range.count);
+        for (out[0..count], leaves[from..][0..count]) |got, want| {
+            try testing.expectEqualSlices(u8, &want.key_hash, &got.key_hash);
+        }
+        if (from + count < 2) {
+            try testing.expectEqualSlices(u8, &leaves[from + count].key_hash, &range.next.?);
+        } else try testing.expect(range.next == null);
+    }
+    const absent = primitives.keccak256(&@as([20]u8, @splat(0xab))).bytes;
+    const missing = chain.storage_range_at(hashes[3].bytes, 3, absent, zero, 4, &out);
+    try testing.expectError(error.UnknownAccount, missing);
+    // A hash that is not canonical at that number is refused.
+    const side = chain.storage_range_at(hashes[1].bytes, 2, holder_hash, zero, 4, &out);
+    try testing.expectError(error.HistoryUnavailable, side);
+}
+
+test "durable: storage ranges come through the journal at the head and from history" {
+    try check_storage_range(history_config);
+    try check_storage_range(config);
 }

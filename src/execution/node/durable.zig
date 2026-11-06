@@ -223,7 +223,8 @@ pub fn Durable(comptime Storage: type) type {
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
                 .proofs = if (self.database.history != null) proofs else null,
-                .storage_range = if (self.database.history != null) storage_range else null,
+                // The head needs no history; older blocks fail inside without it.
+                .storage_range = storage_range,
                 .history_window = if (self.database.history != null) history_window else null,
             };
         }

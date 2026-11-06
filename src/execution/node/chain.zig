@@ -197,8 +197,8 @@ pub const Journal = struct {
         account_proof: *StateTrie.AccountProof,
         set: *db_history.ProofSet,
     ) db_database.ProofError!?db_history.AccountState = null,
-    /// `debug_storageRangeAt` at canonical block `hash` (`Database.storage_range_at`); null
-    /// when the journal keeps no history.
+    /// `debug_storageRangeAt` at canonical block `hash` (`Database.storage_range_at`: the
+    /// head without history, older blocks from its window); null when unsupported.
     storage_range: ?*const fn (
         context: *anyopaque,
         hash: Hash,
