@@ -98,6 +98,9 @@ pub const Gaps = struct {
     codes_len: u32 = 0,
     block_hashes: [gaps_max]u64 = undefined,
     block_hashes_len: u32 = 0,
+    /// Accounts whose code the witness lacks (owner of each `codes` entry, when known).
+    code_owners: [gaps_max]Address = undefined,
+    code_owners_len: u32 = 0,
     dropped: u32 = 0,
 
     pub fn clear(gaps: *Gaps) void {
@@ -139,6 +142,34 @@ pub const Gaps = struct {
 
     fn block_hash(gaps: *Gaps, number: u64) void {
         gaps.push(u64, &gaps.block_hashes, &gaps.block_hashes_len, number);
+    }
+
+    fn code_owner(gaps: *Gaps, address: Address) void {
+        gaps.push(Address, &gaps.code_owners, &gaps.code_owners_len, address);
+    }
+};
+
+/// Recent (code hash, address) pairs from account reads, so a missing code can be traced
+/// back to an account the fetcher can ask for. A ring: old pairs are overwritten.
+const CodeOwners = struct {
+    const capacity = 1024;
+    hashes: [capacity]Hash = undefined,
+    addresses: [capacity]Address = undefined,
+    len: u32 = 0,
+    next: u32 = 0,
+
+    fn put(owners: *CodeOwners, hash: Hash, address: Address) void {
+        owners.hashes[owners.next] = hash;
+        owners.addresses[owners.next] = address;
+        owners.next = (owners.next + 1) % capacity;
+        owners.len = @min(owners.len + 1, capacity);
+    }
+
+    fn get(owners: *const CodeOwners, hash: Hash) ?Address {
+        for (0..owners.len) |index| {
+            if (std.mem.eql(u8, &owners.hashes[index], &hash)) return owners.addresses[index];
+        }
+        return null;
     }
 };
 
@@ -227,6 +258,7 @@ pub const Replayer = struct {
     changeset: db.Changeset,
     executor: Executor,
     gaps: Gaps = .{},
+    code_owners: CodeOwners = .{},
     /// keccak256 of every archive header, in archive order.
     header_hashes: []Hash,
     /// Number of the first archive header.
@@ -254,6 +286,7 @@ pub const Replayer = struct {
         self.spec = spec;
         self.archive = archive;
         self.gaps = .{};
+        self.code_owners = .{};
         self.current_number = 0;
         self.next_block = 0;
         self.backend_error = null;
@@ -486,7 +519,9 @@ pub const Replayer = struct {
     }
 
     fn fallback_code(context: *anyopaque, hash: *const Hash) ?[]const u8 {
-        from(context).gaps.code(hash.*);
+        const self = from(context);
+        self.gaps.code(hash.*);
+        if (self.code_owners.get(hash.*)) |owner| self.gaps.code_owner(owner);
         return null;
     }
 
@@ -523,10 +558,14 @@ pub const Replayer = struct {
         address: evm.Address,
     ) evm.state.Error!?evm.state.AccountInfo {
         const self = from(context);
-        return self.inner().basic(address) catch |err| {
+        const info = self.inner().basic(address) catch |err| {
             self.gaps.account(address);
             return err;
         };
+        if (info) |account| {
+            if (account.has_code()) self.code_owners.put(account.code_hash, address);
+        }
+        return info;
     }
 
     fn database_code_by_hash(context: *anyopaque, hash: evm.B256) evm.state.Error![]const u8 {
