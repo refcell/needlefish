@@ -407,9 +407,63 @@ pub const Executor = struct {
         transaction_gas: []u64,
     ) Error!Metered {
         assert(executor.known_sender == null);
-        assert(transaction_ns.len >= transactions.len and transaction_gas.len >= transactions.len);
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
         const recovery_start = clock.read();
+        try executor.recover_all(transactions);
+        const recovery_end = clock.read();
+        var building = try executor.begin_block(block);
+        try executor.apply_timed(&building, transactions, clock, transaction_ns, transaction_gas);
+        return .{
+            .signer_recovery_ns = recovery_end -| recovery_start,
+            .execution_ns = clock.read() -| recovery_end,
+            .gas_used = building.gas_used,
+        };
+    }
+
+    /// The farthest a bundle's first nonce may run ahead of the sender's (base/base).
+    pub const bundle_nonce_ahead_max: u64 = 10_000;
+
+    /// Runs a bundle (`base_meterBundle`) like `meter_block` in `block`, after setting each
+    /// sender's nonce to that of its first transaction, so a bundle can be metered ahead of
+    /// the sender's pending transactions. The caller ends with `abort_block`.
+    pub fn meter_bundle(
+        executor: *Executor,
+        block: *const BlockEnv,
+        transactions: []const []const u8,
+        clock: Clock,
+        transaction_ns: []u64,
+        transaction_gas: []u64,
+    ) Error!Metered {
+        assert(executor.known_sender == null);
+        if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        const recovery_start = clock.read();
+        try executor.recover_all(transactions);
+        const recovery_end = clock.read();
+        var building = try executor.begin_block(block);
+        for (transactions, 0..) |raw, index| {
+            const sender = executor.senders[index] orelse return error.InvalidTransaction;
+            const first = for (executor.senders[0..index]) |earlier| {
+                if (earlier != null and earlier.?.eql(sender)) break false;
+            } else true;
+            if (!first) continue;
+            const nonce = (Envelope.decode(raw) catch unreachable).nonce() orelse continue;
+            const account = try executor.state.load(sender.bytes);
+            if (nonce > account.info.nonce +| bundle_nonce_ahead_max) {
+                return error.InvalidTransaction;
+            }
+            try executor.state.set_nonce(account, nonce);
+        }
+        try executor.apply_timed(&building, transactions, clock, transaction_ns, transaction_gas);
+        return .{
+            .signer_recovery_ns = recovery_end -| recovery_start,
+            .execution_ns = clock.read() -| recovery_end,
+            .gas_used = building.gas_used,
+        };
+    }
+
+    /// Fills `senders` for `transactions` (decoded already by `recover_all`'s caller).
+    fn recover_all(executor: *Executor, transactions: []const []const u8) Error!void {
+        assert(transactions.len <= executor.senders.len);
         for (transactions, 0..) |raw, index| {
             const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
             // Deposits name their sender; EIP-8130 transactions authorize their own.
@@ -420,23 +474,26 @@ pub const Executor = struct {
                     return error.InvalidTransaction,
             };
         }
-        const recovery_end = clock.read();
-        var building = try executor.begin_block(block);
+    }
+
+    fn apply_timed(
+        executor: *Executor,
+        building: *Building,
+        transactions: []const []const u8,
+        clock: Clock,
+        transaction_ns: []u64,
+        transaction_gas: []u64,
+    ) Error!void {
+        assert(transaction_ns.len >= transactions.len and transaction_gas.len >= transactions.len);
         defer executor.known_sender = null;
         for (transactions, 0..) |raw, index| {
             executor.known_sender = executor.senders[index];
             const before = building.gas_used;
             const start = clock.read();
-            try executor.apply(&building, raw);
+            try executor.apply(building, raw);
             transaction_ns[index] = clock.read() -| start;
             transaction_gas[index] = building.gas_used - before;
         }
-        const end = clock.read();
-        return .{
-            .signer_recovery_ns = recovery_end -| recovery_start,
-            .execution_ns = end -| recovery_end,
-            .gas_used = building.gas_used,
-        };
     }
 
     /// A message call against the current state (eth_call / eth_estimateGas).

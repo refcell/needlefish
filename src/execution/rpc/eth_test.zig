@@ -1247,3 +1247,75 @@ test "eth: seeded fuzz of base_meterBlock over random blocks" {
         }
     }
 }
+
+fn meter_bundle_request(h: *Harness, raws: []const []const u8) ![]const u8 {
+    var body: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&body);
+    try writer.writeAll(request_prefix ++ "base_meterBundle\",\"params\":[{\"txs\":[");
+    for (raws, 0..) |raw, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.print("\"0x{x}\"", .{raw});
+    }
+    try writer.writeAll("]}]}");
+    return h.request_runtime(writer.buffered());
+}
+
+test "eth: base_meterBundle meters a bundle ahead of the sender's nonce" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffers: [2][256]u8 = undefined;
+    const raws = [_][]const u8{
+        try transfer_raw(&buffers[0], 5),
+        try transfer_raw(&buffers[1], 6),
+    };
+    const text = try meter_bundle_request(h, &raws);
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"gasUsed\":21000"));
+    try expect_contains(text, "\"totalGasUsed\":42000");
+    try expect_contains(text, "\"stateBlockNumber\":0");
+    // gasUsed * maxFeePerGas (10 gwei).
+    try expect_contains(text, "\"gasFees\":\"0x17dfcdece4000\"");
+    try expect_contains(text, "\"bundleGasPrice\":\"0x2540be400\"");
+    var hashes: [64]u8 = undefined;
+    hashes[0..32].* = primitives.keccak256(raws[0]).bytes;
+    hashes[32..64].* = primitives.keccak256(raws[1]).bytes;
+    var expected: [96]u8 = undefined;
+    const bundle_hash = try std.fmt.bufPrint(&expected, "\"bundleHash\":\"0x{x}\"", .{
+        &primitives.keccak256(&hashes).bytes,
+    });
+    try expect_contains(text, bundle_hash);
+    // Nothing committed: the sender's nonce is unchanged.
+    const count = "[" ++ "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"latest\"]";
+    try testing.expectEqualStrings("\"result\":\"0x0\"", try h.request(
+        "eth_getTransactionCount",
+        count,
+    ));
+    // Too far ahead of the sender's nonce.
+    const far = [_][]const u8{try transfer_raw(&buffers[0], 20_000)};
+    try expect_contains(try meter_bundle_request(h, &far), "InvalidTransaction");
+    // An empty bundle meters nothing; malformed bundles are invalid params.
+    try expect_contains(try meter_bundle_request(h, &.{}), "\"totalGasUsed\":0");
+    try expect_contains(try h.request("base_meterBundle", "[{}]"), "-32602");
+    try expect_contains(try h.request("base_meterBundle", "[{\"txs\":[\"0x7e\"]}]"), "-32602");
+    try expect_contains(try h.request("base_meterBundle", "[{\"txs\":1}]"), "-32602");
+}
+
+test "eth: seeded fuzz of base_meterBundle nonces" {
+    var prng = Prng.init(0x6275);
+    const h = try Harness.create();
+    defer h.destroy();
+    for (0..16) |_| {
+        var buffers: [4][256]u8 = undefined;
+        var raws: [4][]const u8 = undefined;
+        const count = prng.range(1, 4);
+        const start = prng.below(12_000);
+        for (raws[0..count], 0..) |*raw, index| {
+            // Mostly consecutive; sometimes a gap, which fails at execution.
+            const gap: u64 = if (prng.chance(1, 8)) 1 else 0;
+            raw.* = try transfer_raw(&buffers[index], start + index + gap);
+        }
+        const text = try meter_bundle_request(h, raws[0..count]);
+        const ok = std.mem.indexOf(u8, text, "\"result\"") != null;
+        if (start > 10_000) try testing.expect(!ok);
+        if (ok) try testing.expectEqual(count, count_of(text, "\"gasUsed\":21000"));
+    }
+}
