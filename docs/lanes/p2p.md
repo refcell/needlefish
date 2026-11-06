@@ -48,6 +48,11 @@ behind a small interface and switch later.
   enabled, skip connected and other-chain nodes, and wait for the interval after a failure.
 - [ ] Peer-based backfill: base/base has no req/resp. The viable path is devp2p eth/68
   against reth (SYNC_PLAN M8); see docs/UNSAFE_TIP.md.
+  - [x] RLPx and eth/68 codecs (`src/execution/p2p`), with seeded and coverage fuzz of
+    the handshake, frames and message decoders; `base el-fetch` fetches and checks a
+    linked range from one peer (verified live from the snapshot's next block).
+  - [ ] More peers: discv4 discovery or a peer list, parallel fetch, reconnect and
+    resume, and binding to the snapshot hash and the signed gossip head.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.

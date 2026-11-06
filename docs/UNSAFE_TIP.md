@@ -96,12 +96,30 @@ Peer-based ways to fetch the catch-up range and any missing block:
   is deliberately absent from base/base (`service/tests/actors/network/p2p.rs` asserts it
   is not advertised), and no Sepolia peer we identified advertises it. Their identify
   protocols are meshsub 1.0 to 1.2, floodsub, identify, identify push and ping.
-- **Execution p2p (devp2p eth/68 `GetBlockHeaders` / `GetBlockBodies`): viable, not built
-  yet.** reth serves history to any eth peer, and Base Sepolia publishes execution
-  enodes (`common/chains`). Bodies plus headers are exactly the executor's input, and
-  they can be bound to the gossip head by walking parent hashes back. This needs RLPx
-  (ECIES handshake, framing) and the eth wire subprotocol (SYNC_PLAN M8). It is the
-  path that removes RPC from catch-up too.
+- **Execution p2p (devp2p eth/68 `GetBlockHeaders` / `GetBlockBodies`): works, one peer
+  is too slow.** `src/execution/p2p` implements RLPx (EIP-8 ECIES handshake, frames,
+  MACs) and the eth/68 messages a fetcher needs; `base el-fetch --enode <enode> --from N
+  --count K` connects, exchanges Hello and Status (mirroring the peer's fork id), and
+  fetches headers then bodies. It checks each header's parent hash against the one
+  before and each body's transactions root (and empty ommers) against its header. Run
+  live against a Base Sepolia reth node (base v1.5.4, fork id `0xc6757f44`): blocks
+  55006661 onward, parent-linked, every body matching, from the snapshot's next block.
+  Limits found:
+  - Peers are scarce. The execution bootnodes in `common/chains` refused TCP when tried,
+    discv5 showed no Base execution nodes, and a discv4 crawl found one Base Sepolia
+    reth node. Finding more needs discv4 (or a peer list) and more crawling time.
+  - One peer serves bodies at about 25 KB/s, which is about 3 to 4 blocks/s. geth's own
+    eth/68 client sees the same rate from that peer, and headers return in 0.3 s, so the
+    limit is the peer, not our stack. Pipelining body requests (16 hashes each, all in
+    flight) does not raise it. Catching up (faster than the chain's 5 blocks/s) needs
+    several peers in parallel.
+  - A session ended with disconnect reason 11 (timeout) after 512 blocks. Likely cause
+    (not confirmed): at 25 KB/s, the peer's Ping waits behind tens of seconds of queued
+    body data, so our Pong is late. The fetcher must keep less in flight per peer, and
+    reconnect and resume from its last linked block.
+  - Fetched blocks are bound only by their own parent links. They must still be bound to
+    a trusted hash: the snapshot block's hash at the bottom, and a signed gossip block (or
+    the sequencer-signed head) at the top.
 - **RPC catch-up: bounded, one-time.** This is what the sync lane plans for M4: trusted
   L2 RPC blocks, validated by the hash chain back from the target head. It sits outside
   the steady-state path, but it is rate limited. At 100 blocks per request, 300k blocks

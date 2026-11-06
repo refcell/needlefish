@@ -50,7 +50,7 @@ const Flags = struct {
 
 fn parse_flags(args: []const []const u8) !Flags {
     var flags: Flags = .{};
-    var index: usize = 2;
+    var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.startsWith(u8, arg, "--p2p.")) {
@@ -194,7 +194,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     const rollup = rollup_for(flags.chain);
-    var options = try p2p.options.parse(args[2..]);
+    var options = try p2p.options.parse(args);
     const signer = options.unsafe_block_signer orelse flags.chain.unsafe_block_signer.?;
     if (flags.check_archive) |path| return check_archive(init, &rollup, signer, path);
     // Without inbound reachability (NAT), keep asking known peers for a slot.
@@ -464,6 +464,6 @@ test "unsafe-watch: rollup config from the built-in chain" {
     const rollup = rollup_for(&chains.sepolia);
     try std.testing.expectEqual(@as(u64, 84532), rollup.l2_chain_id);
     try std.testing.expect(rollup.upgrades.get(.denim) != null);
-    const flags = try parse_flags(&.{ "base", "unsafe-watch", "--p2p.peers.hi", "4", "--quiet" });
+    const flags = try parse_flags(&.{ "--p2p.peers.hi", "4", "--quiet" });
     try std.testing.expect(flags.quiet);
 }
