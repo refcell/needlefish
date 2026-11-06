@@ -143,6 +143,9 @@ pub const Executor = struct {
     recovery_done: []std.atomic.Value(u32),
     /// The sender of the transaction being applied, when already known.
     known_sender: ?primitives.Address = null,
+    /// Senders the caller vouches for, one per transaction of the next `apply_list` (the
+    /// node's own builder recovered them): no recovery runs. Deposits ignore theirs.
+    given_senders: ?[]const primitives.Address = null,
     /// Index of the last transaction rejected by `execute_block`.
     invalid_index: ?u32 = null,
 
@@ -237,7 +240,10 @@ pub const Executor = struct {
             return error.TooManyTransactions;
         }
         assert(executor.known_sender == null);
-        const recovered = executor.recovery_pool != null and transactions.len > 1;
+        const given = executor.given_senders;
+        if (given) |senders| assert(senders.len == transactions.len);
+        const recovered = given == null and executor.recovery_pool != null and
+            transactions.len > 1;
         var pipeline: senders_module.Pipeline = undefined;
         if (recovered) {
             const senders = executor.senders[0..transactions.len];
@@ -250,7 +256,9 @@ pub const Executor = struct {
         for (transactions, 0..) |raw, index| {
             executor.invalid_index = @intCast(index);
             executor.known_sender = null;
-            if (recovered) {
+            if (given) |senders| {
+                executor.known_sender = senders[index];
+            } else if (recovered) {
                 pipeline.wait_for(index);
                 executor.known_sender = executor.senders[index];
             }

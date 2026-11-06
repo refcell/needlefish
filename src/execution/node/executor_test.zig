@@ -544,3 +544,61 @@ test "executor: a Denim block without the BaseTime proxy or its admin is rejecte
     try f.db.put_storage(base_time.proxy_address, base_time.admin_slot, admin);
     _ = try f.executor.execute_block(&block_env(1), &.{}, &.{});
 }
+
+/// A block of transfers from up to 4 funded senders, executed with recovered senders and
+/// again (rolled back first) with the given ones: the same root and receipts.
+fn given_senders_scenario(seed: u64) !void {
+    var prng = Prng.init(seed);
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    for (1..5) |n| try f.db.put_account(address_of(@intCast(n)), eth, 0, &.{});
+    var buffers: [12][256]u8 = undefined;
+    var raws: [12][]const u8 = undefined;
+    var senders: [12]primitives.Address = undefined;
+    var nonces: [5]u64 = @splat(0);
+    const count = prng.range(1, 12);
+    for (raws[0..count], senders[0..count], 0..) |*raw, *sender, index| {
+        const from: u8 = @intCast(prng.range(1, 4));
+        const to: [20]u8 = @splat(@intCast(0x30 + prng.below(8)));
+        raw.* = try transfer(&buffers[index], from, nonces[from], to, prng.below(1000), 2);
+        nonces[from] += 1;
+        sender.* = .{ .bytes = address_of(from) };
+    }
+    const recovered = try f.executor.execute_block(&block_env(1), raws[0..count], null);
+    const root = recovered.state_root;
+    try f.db.rollback();
+    f.executor.given_senders = senders[0..count];
+    defer f.executor.given_senders = null;
+    const given = try f.executor.execute_block(&block_env(1), raws[0..count], null);
+    try testing.expectEqualSlices(u8, &root, &given.state_root);
+    try testing.expectEqual(recovered.gas_used, given.gas_used);
+    for (given.senders, senders[0..count]) |got, want| try testing.expect(got.eql(want));
+}
+
+test "executor: given senders replace recovery" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.db.put_account(address_of(1), eth, 0, &.{});
+    var buffer: [256]u8 = undefined;
+    const raw = try transfer(&buffer, 1, 0, @splat(0x22), 1, 1);
+    // A wrong (unfunded) sender is taken as given: the block fails without recovering.
+    const wrong = [_]primitives.Address{.{ .bytes = address_of(9) }};
+    f.executor.given_senders = &wrong;
+    try testing.expectError(error.InvalidTransaction, f.executor.execute_block(
+        &block_env(1),
+        &.{raw},
+        null,
+    ));
+    f.executor.given_senders = null;
+    for (0..32) |seed| try given_senders_scenario(seed);
+}
+
+fn fuzz_given_senders(_: void, smith: *testing.Smith) anyerror!void {
+    try given_senders_scenario(smith.value(u64));
+}
+
+test "executor: fuzz given senders" {
+    try testing.fuzz({}, fuzz_given_senders, .{});
+}

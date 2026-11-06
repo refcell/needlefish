@@ -70,6 +70,9 @@ pub const SealedPayload = struct {
     block_value: u256,
     transactions: []const []const u8,
     withdrawals: ?[]const payload.Withdrawal,
+    /// The builder's senders, one per transaction (any address for deposits), so the
+    /// import skips signature recovery; empty recovers them.
+    senders: []const primitives.Address = &.{},
 };
 
 pub const Resolved = union(enum) {
@@ -498,6 +501,10 @@ pub const Chain = struct {
             .execution_requests = if (sealed.header.requests_hash != null) requests else null,
         };
         const known = chain.store.ref(sealed.block_hash.bytes) != null;
+        if (sealed.senders.len == sealed.transactions.len and sealed.senders.len > 0) {
+            chain.executor.given_senders = sealed.senders;
+        }
+        defer chain.executor.given_senders = null;
         if (!known and chain.insert(&execution_payload, &params) != .valid) return null;
         const entry: Built = .{
             .id = id,

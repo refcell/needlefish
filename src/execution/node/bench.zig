@@ -106,6 +106,20 @@ fn run_execute_parallel(iterations: u32) u64 {
     return run_execute(iterations);
 }
 
+var given_storage: [transfers]primitives.Address = undefined;
+
+/// Import with the builder's senders (`SealedPayload.senders`): no recovery.
+fn run_execute_given(iterations: u32) u64 {
+    const s = setup();
+    for (&given_storage, 0..) |*sender, index| {
+        const key = sender_key(@intCast(index));
+        sender.* = consensus.signature.address_from_private(key).?;
+    }
+    s.executor.given_senders = &given_storage;
+    defer s.executor.given_senders = null;
+    return run_execute(iterations);
+}
+
 fn run_recover(iterations: u32) u64 {
     const s = setup();
     var sink: u64 = 0;
@@ -130,6 +144,12 @@ pub const cases = [_]Case{
         .name = "node: execute block, 500 transfers, parallel recovery (Mgas/s)",
         .iterations = 20,
         .run = run_execute_parallel,
+        .bytes_per_op = transfers * transfer_gas,
+    },
+    .{
+        .name = "node: execute block, 500 transfers, given senders (Mgas/s)",
+        .iterations = 20,
+        .run = run_execute_given,
         .bytes_per_op = transfers * transfer_gas,
     },
     .{
