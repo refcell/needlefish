@@ -146,6 +146,7 @@ pub fn NodeBuilder(comptime IO: type) type {
                 .block_hash = best.block_hash,
                 .block_value = best.block_value,
                 .transactions = best.transactions,
+                .senders = best.senders,
                 .withdrawals = best.withdrawals,
             } };
         }

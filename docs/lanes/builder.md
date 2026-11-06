@@ -206,3 +206,6 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   and unthrottled accounting, transaction-scope evictions, dry-run; unit, seeded and
   `std.testing.fuzz` model checks, and a differential that metering off/disabled/slack builds
   the same block as an unmetered build.
+- 2026-11-05: sealed payloads carry the builder's senders (zero for deposits; empty when a
+  forced tx is not a deposit), so the sequencer's self-import skips ecrecover (nf-node
+  `SealedPayload.senders`).
