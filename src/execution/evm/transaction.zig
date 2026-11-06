@@ -258,18 +258,23 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
 }
 
 /// The coinbase (EIP-3651), the precompiles, and the implemented native singletons.
+/// Precompiles and natives are warm by predicate (`State.static_warm`), not loaded per tx.
 pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!void {
+    evm.state.static_warm = .{};
     if (!fork.at_least(.berlin)) return;
     if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
     const op_upgrade = evm.op_upgrade();
-    var number: u64 = 1;
+    var warm: state_module.StaticWarm = .{ .natives = native.warm_addresses(op_upgrade) };
+    var number: u32 = 1;
     while (number <= 0x11) : (number += 1) {
         const address = primitives.address_from_int(number);
-        if (precompiles.is_precompile(fork, op_upgrade, address)) _ = try evm.state.access(address);
+        if (precompiles.is_precompile(fork, op_upgrade, address)) {
+            warm.precompiles |= @as(u32, 1) << @intCast(number);
+        }
     }
-    const p256 = primitives.address_from_int(0x100);
-    if (precompiles.is_precompile(fork, op_upgrade, p256)) _ = try evm.state.access(p256);
-    for (native.warm_addresses(op_upgrade)) |address| _ = try evm.state.access(address);
+    warm.p256 = precompiles.is_precompile(fork, op_upgrade, primitives.address_from_int(0x100));
+    assert(warm.precompiles & 1 == 0);
+    evm.state.static_warm = warm;
 }
 
 /// EIP-7702: apply valid authorizations. Returns the refund for existing authorities.

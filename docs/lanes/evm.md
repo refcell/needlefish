@@ -126,6 +126,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Performance: keccak256 — investigated, no change: the crypto lane's Keccak-f already
   matches std (~146 vs ~139 ns per 32 B, docs/PERF.md) and has a 2-lane NEON batch path; the
   EVM loop's ~185 ns per 64 B is that hash plus memory pricing. Left to the crypto lane.
+- [x] Performance: precompiles and native singletons are warm by predicate
+  (`State.static_warm`, consulted only on a stale stamp) instead of `state.access` loading
+  and journaling ~20 accounts per transaction (nf-node profile: `warm_addresses` ~5% and
+  `State.load` ~8% of a 500-transfer block).
+- [ ] Replay focus (owner, priority over the rest): audit EVM-side fee accounting at Base
+  mainnet 53715983+ (Denim): L1 info deposit, L1 data fee, operator fee, DA footprint fee,
+  fee vault credits, BaseTime deposit, 7702/system calls. Act first on nf-replay repros.
+- [ ] Tracer hook for nf-node's debug_trace* (callTracer): `Evm.tracer: ?*const Tracer` with
+  enter(kind, from, to, value, gas, input) / exit(gas_used, output, status) / log; null is
+  zero cost.
 - [ ] Fuzz: SSTORE gas and refund state machine (EIP-2200/2929/3529: original, current,
   new values; warm/cold; stipend check) against a table-driven reference model.
 - [ ] Fuzz: CREATE/CREATE2 address derivation, init-code limits (EIP-3860), collision

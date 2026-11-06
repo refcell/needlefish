@@ -211,6 +211,28 @@ pub const Checkpoint = struct {
     log_data_len: u32,
 };
 
+/// Addresses that are warm in every transaction of a fork without a state load: active
+/// precompiles (0x01..0x1f by bit, P256 at 0x100) and the implemented native singletons.
+pub const StaticWarm = struct {
+    /// Bit `n` set: the precompile at address `n` is active.
+    precompiles: u32 = 0,
+    p256: bool = false,
+    natives: []const Address = &.{},
+
+    pub fn contains(warm: *const StaticWarm, address: Address) bool {
+        if (std.mem.allEqual(u8, address[0..18], 0)) {
+            const number = std.mem.readInt(u16, address[18..20], .big);
+            if (number < 32) return (warm.precompiles >> @intCast(number)) & 1 == 1;
+            if (number == 0x100) return warm.p256;
+        }
+        assert(warm.natives.len <= 16);
+        for (warm.natives) |native| {
+            if (std.mem.eql(u8, &native, &address)) return true;
+        }
+        return false;
+    }
+};
+
 pub const State = struct {
     database: Database,
     limits: Limits,
@@ -227,6 +249,9 @@ pub const State = struct {
     code_store_len: u32 = 0,
     /// Current transaction id; starts at 1 so a zero stamp is never current.
     tx_id: u32 = 1,
+    /// Addresses warm in the current transaction without being loaded (precompiles and
+    /// native singletons, EIP-2929); consulted only when an account's stamp is stale.
+    static_warm: StaticWarm = .{},
 
     pub fn init(allocator: std.mem.Allocator, database: Database, limits: Limits) !State {
         var state = State{
@@ -267,6 +292,7 @@ pub const State = struct {
         state.log_data_len = 0;
         state.code_store_len = 0;
         state.tx_id = 1;
+        state.static_warm = .{};
         assert(state.accounts.count() == 0);
     }
 
@@ -394,7 +420,7 @@ pub const State = struct {
     /// Load and warm an account (EIP-2929), reporting whether it was cold.
     pub fn access(state: *State, address: Address) Error!Access {
         const account = try state.load(address);
-        const is_cold = account.warm_tx != state.tx_id;
+        const is_cold = account.warm_tx != state.tx_id and !state.static_warm.contains(address);
         if (is_cold) {
             try state.record(.account_warmed, @intFromPtr(account), 0, 0);
             account.warm_tx = state.tx_id;
@@ -403,6 +429,7 @@ pub const State = struct {
     }
 
     pub fn is_warm(state: *State, address: Address) bool {
+        if (state.static_warm.contains(address)) return true;
         const account = state.accounts.getPtr(address) orelse return false;
         return account.warm_tx == state.tx_id;
     }
