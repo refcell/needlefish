@@ -37,6 +37,8 @@ const ancestors = replay.archive.ancestors_max;
 const beacon_roots = "0x000f3df6d732807ef1319fb7b8bb8522d0beac02";
 const history = "0x0000f90827f1c53a10cb7a02335b175320002935";
 const message_passer = "0x4200000000000000000000000000000000000016";
+/// The system caller of the pre-block calls.
+const system_address = "0xfffffffffffffffffffffffffffffffffffffffe";
 const history_buffer_length = 8191;
 
 const Flags = struct {
@@ -80,7 +82,7 @@ const Endpoint = struct {
             endpoint.calls += 1;
             const text = endpoint.http.transport().send(body, endpoint.response) catch |err| {
                 const wait_s: i64 = @min(@as(i64, 1) << @intCast(attempt), 30);
-                std.debug.print("  {s}: {t}, retrying in {d}s\n", .{
+                if (attempt > 0) std.debug.print("  {s}: {t}, retrying in {d}s\n", .{
                     endpoint.http.url,
                     err,
                     wait_s,
@@ -92,7 +94,9 @@ const Endpoint = struct {
                 std.mem.indexOf(u8, text, "\"result\"") == null)
             {
                 const wait_s: i64 = @min(@as(i64, 1) << @intCast(attempt), 30);
-                std.debug.print("  {s}: rate limited, retrying\n", .{endpoint.http.url});
+                if (attempt > 0) {
+                    std.debug.print("  {s}: rate limited, retrying\n", .{endpoint.http.url});
+                }
                 try io.sleep(.fromSeconds(wait_s), .awake);
                 continue;
             }
@@ -146,7 +150,9 @@ const Fetcher = struct {
         while (attempt < retries_max) : (attempt += 1) {
             const text = try endpoint.post(f.init.io, body.written());
             if (try batch_results(f.alloc(), text, results)) return results;
-            std.debug.print("  {s}: rate limited, retrying\n", .{endpoint.http.url});
+            if (attempt > 0) {
+                std.debug.print("  {s}: rate limited, retrying\n", .{endpoint.http.url});
+            }
             try f.init.io.sleep(.fromSeconds(@min(@as(i64, 1) << @intCast(attempt), 30)), .awake);
         }
         return error.EndpointFailed;
@@ -487,6 +493,7 @@ fn seed_extra(f: *Fetcher, window: replay_cli.Window) !void {
         const parent_slot = (number - 1) % history_buffer_length;
         try keys.add_slot(f.alloc(), history, try slot_hex(f, parent_slot));
         try keys.add_account(f.alloc(), message_passer);
+        try keys.add_account(f.alloc(), system_address);
         if (offset == 0) {
             for ([_]u16{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 0x100 }) |id| {
                 const address = try std.fmt.allocPrint(f.alloc(), "0x{x:0>40}", .{id});

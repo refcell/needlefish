@@ -524,11 +524,36 @@ fn find_slot(proof: Value, slot: u256) Error!u256 {
     return error.Inconsistent;
 }
 
+/// The proof's nodes, without embedded ones: some servers also list a node shorter than 32
+/// bytes that its parent inlines, which no hash references (a root is always hashed, so
+/// the first node stays).
 fn node_list(arena: std.mem.Allocator, nodes: Value) Error![]const []const u8 {
     if (nodes != .array) return error.Malformed;
     const list = try arena.alloc([]const u8, nodes.array.items.len);
-    for (list, nodes.array.items) |*node, item| node.* = try data(arena, item);
-    return list;
+    var count: usize = 0;
+    for (nodes.array.items, 0..) |item, index| {
+        const node = try data(arena, item);
+        if (index > 0 and node.len < 32) continue;
+        list[count] = node;
+        count += 1;
+    }
+    assert(count <= list.len);
+    assert(count > 0 or list.len == 0);
+    return list[0..count];
+}
+
+test "node_list drops embedded nodes a server lists after their parent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const quarter = "aaaaaaaaaaaaaaaaaaaa"; // 10 bytes.
+    const long = "\"0x" ++ quarter ++ quarter ++ quarter ++ quarter ++ "\"";
+    const text = "[\"0xc100\"," ++ long ++ ",\"0xc20102\"]";
+    const nodes = try parse(arena, text);
+    const list = try node_list(arena, nodes);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0xc1, 0x00 }, list[0]);
+    try std.testing.expectEqual(@as(usize, 40), list[1].len);
 }
 
 fn parse(arena: std.mem.Allocator, raw: []const u8) Error!Value {
