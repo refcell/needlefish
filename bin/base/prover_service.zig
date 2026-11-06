@@ -1,6 +1,9 @@
 //! `base prover-service` and `base prover-worker` (base/base `bin/prover-service`,
 //! `crates/proof/worker`): the proof-request JSON-RPC service over HTTP, and a worker
-//! that claims `compressed` range jobs from it and proves them with the native host.
+//! that claims `compressed` range jobs from it and proves them with the native host, or
+//! (`--backend tee`, base/base `nitro-host`) claims AWS Nitro TEE jobs and proves them
+//! through a local-mode enclave in this process, optionally serving the enclave signer
+//! JSON-RPC (`enclave_signerPublicKey`, `enclave_signerAttestation`) on `--signer-rpc`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,6 +25,8 @@ const Server = http.Server(io.IO, *Service, Service.handle_http);
 const Client = proof.prover_service.client.Client(io.IO);
 const Worker = proof.prover_service.worker.Worker(io.IO);
 const Native = proof.prover_service.native_backend.Native(io.IO);
+const tee_host = proof.tee.host;
+const SignerServer = http.Server(io.IO, *tee_host.Server, tee_host.Server.handle_http);
 const Endpoint = proof.rpc.Endpoint(io.IO);
 const exporters = proof.prover_service.exporter;
 const ServiceTelemetry = telemetry_servers.Servers(exporters.ServiceExporter);
@@ -34,7 +39,15 @@ pub const ServiceFlags = struct {
     telemetry: telemetry_servers.Flags = .{},
 };
 
+pub const Backend = enum { native, tee };
+
 pub const WorkerFlags = struct {
+    backend: Backend = .native,
+    /// TEE: a file holding the local-mode enclave signer key (hex).
+    enclave_key_file: ?[]const u8 = null,
+    /// TEE: where to serve the enclave signer and health JSON-RPC.
+    signer_rpc: ?[]const u8 = null,
+    enclave_request_bytes_max: u32 = 64 << 20,
     prover_rpc: ?[]const u8 = null,
     l1: ?[]const u8 = null,
     l2: ?[]const u8 = null,
@@ -84,9 +97,10 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
         const name = args[index];
         const value = args[index + 1];
         const fields = .{
-            .{ "--prover-rpc", "prover_rpc" }, .{ "--l1", "l1" },
-            .{ "--l2", "l2" },                 .{ "--rollup-config", "rollup_config" },
-            .{ "--l1-genesis", "l1_genesis" }, .{ "--l1-beacon", "l1_beacon" },
+            .{ "--prover-rpc", "prover_rpc" },             .{ "--l1", "l1" },
+            .{ "--l2", "l2" },                             .{ "--rollup-config", "rollup_config" },
+            .{ "--l1-genesis", "l1_genesis" },             .{ "--l1-beacon", "l1_beacon" },
+            .{ "--enclave-key-file", "enclave_key_file" }, .{ "--signer-rpc", "signer_rpc" },
         };
         var matched = false;
         inline for (fields) |field| {
@@ -103,8 +117,15 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
             flags.poll_interval_ms = try parse_u32(value);
         } else if (std.mem.eql(u8, name, "--proof-bytes-max")) {
             flags.proof_bytes_max = try parse_u32(value);
+        } else if (std.mem.eql(u8, name, "--backend")) {
+            flags.backend = std.meta.stringToEnum(Backend, value) orelse
+                return error.InvalidArguments;
+        } else if (std.mem.eql(u8, name, "--enclave-request-bytes-max")) {
+            flags.enclave_request_bytes_max = try parse_u32(value);
         } else return error.InvalidArguments;
     }
+    if (flags.backend == .tee and flags.enclave_key_file == null) return error.MissingFlag;
+    if (flags.signer_rpc) |url| _ = try consensus_cli.parse_url(url);
     const required = [_]?[]const u8{ flags.prover_rpc, flags.l1, flags.l2, flags.rollup_config };
     for (required) |present| if (present == null) return error.MissingFlag;
     return flags;
@@ -205,6 +226,7 @@ pub fn worker_main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("prover-worker: {t}\nusage: base prover-worker --prover-rpc <url> " ++
             "--l1 <url> --l2 <url> --rollup-config <file> [--l1-genesis <file>] " ++
             "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n         " ++
+            "[--backend native|tee] [--enclave-key-file <file>] [--signer-rpc <url>]\n         " ++
             telemetry_servers.Flags.usage ++ "\n", .{err});
         return 2;
     };
@@ -280,15 +302,41 @@ fn run_worker(init: std.process.Init, process: *WorkerProcess, flags: *const Wor
         blobs = try .create(allocator, os_io, url, settings, http_options, process.pump());
         process.source.blobs = blobs.?.fetcher();
     }
-    var native: Native = try .init(allocator, &process.source, .{
-        .rollup_config_json = rollup_json,
-        .l1_config_json = l1_config,
+    const inputs: WorkerInputs = .{
+        .rollup_json = rollup_json,
+        .l1_config = l1_config,
         .chain_id = rollup.l2_chain_id,
         .client_options = .{
             .builder = proof.client.client.default_builder_config,
             .kzg_settings = &process.settings,
             .kzg_workspace = &process.kzg_workspace,
         },
+    };
+    return switch (flags.backend) {
+        .native => run_native(init, process, flags, &inputs),
+        .tee => run_tee(init, process, flags, &inputs),
+    };
+}
+
+/// What every backend needs from the rollup and the proof client.
+const WorkerInputs = struct {
+    rollup_json: []const u8,
+    l1_config: []const u8,
+    chain_id: u64,
+    client_options: proof.client.client.Options,
+};
+
+fn run_native(
+    init: std.process.Init,
+    process: *WorkerProcess,
+    flags: *const WorkerFlags,
+    inputs: *const WorkerInputs,
+) !u8 {
+    var native: Native = try .init(init.gpa, &process.source, .{
+        .rollup_config_json = inputs.rollup_json,
+        .l1_config_json = inputs.l1_config,
+        .chain_id = inputs.chain_id,
+        .client_options = inputs.client_options,
         .roots_brp = &process.roots,
         .proof_bytes_max = flags.proof_bytes_max,
     });
@@ -301,6 +349,73 @@ fn run_worker(init: std.process.Init, process: *WorkerProcess, flags: *const Wor
         .zk_backends = &.{.cluster},
         .poll_interval_ns = flags.poll_interval_ms * std.time.ns_per_ms,
     });
+    return run_loop(init, process, flags, &worker);
+}
+
+/// base/base `nitro-host` in local mode: one in-process enclave behind the TEE backend.
+fn run_tee(
+    init: std.process.Init,
+    process: *WorkerProcess,
+    flags: *const WorkerFlags,
+    inputs: *const WorkerInputs,
+) !u8 {
+    const allocator = init.gpa;
+    var key_buffer: [256]u8 = undefined;
+    const key_text = try Io.Dir.cwd().readFile(init.io, flags.enclave_key_file.?, &key_buffer);
+    const key_hex = std.mem.trim(u8, key_text, " \t\r\n");
+    const signer = try proof.tee.enclave.Signer.from_hex(key_hex);
+    const local = try tee_host.LocalEnclave.create(allocator, .init_local(signer), .{
+        .request_bytes_max = flags.enclave_request_bytes_max,
+        .client_options = inputs.client_options,
+    });
+    defer local.destroy();
+    const signer_address = local.server.signer_address();
+    std.debug.print("prover-worker: local-mode enclave signer 0x{x}\n", .{&signer_address});
+    const links = [_]*tee_host.Link{&local.link};
+    var pool: tee_host.Pool = try .init(&links);
+    var generator: tee_host.Generator = try .init(allocator, process.source.as_source(), .{
+        .rollup_config_json = inputs.rollup_json,
+        .l1_config_json = inputs.l1_config,
+        .chain_id = inputs.chain_id,
+        .client_options = inputs.client_options,
+        .roots_brp = &process.roots,
+    }, &pool);
+    defer generator.deinit();
+    var signer_server: tee_host.Server = .init(&links, .{ .version = "needlefish" });
+    const http_server = try allocator.create(SignerServer);
+    defer allocator.destroy(http_server);
+    if (flags.signer_rpc) |url| {
+        try http_server.init(allocator, &process.os_io, &signer_server, signer_http_options);
+        const bound = try http_server.listen(try consensus_cli.parse_url(url));
+        std.debug.print("prover-worker: enclave signer rpc on {f}\n", .{bound});
+    }
+    defer if (flags.signer_rpc != null) http_server.deinit();
+    const host_config: tee_host.config.Config = .{
+        .prover_service_url = flags.prover_rpc.?,
+        .worker_id = flags.worker_id,
+        .poll_interval_ns = flags.poll_interval_ms * std.time.ns_per_ms,
+    };
+    try host_config.validate();
+    const clock = service_module.Clock.of(io.IO, &process.os_io);
+    const backend = generator.backend();
+    var worker: Worker = .init(&process.client, backend, clock, host_config.worker_config());
+    return run_loop(init, process, flags, &worker);
+}
+
+const signer_http_options: http.server.Options = .{
+    .connections_max = 8,
+    .recv_buffer_size = 64 * 1024,
+    .send_buffer_size = 512 * 1024,
+    .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 32 * 1024 },
+};
+
+fn run_loop(
+    init: std.process.Init,
+    process: *WorkerProcess,
+    flags: *const WorkerFlags,
+    worker: *Worker,
+) !u8 {
+    const allocator = init.gpa;
     const servers = try allocator.create(WorkerTelemetry);
     defer allocator.destroy(servers);
     const loop_ns = 100 * std.time.ns_per_ms;
@@ -333,6 +448,16 @@ test "prover service: command flags" {
     try std.testing.expectEqual(@as(?[]const u8, null), worker.l1_beacon);
     try std.testing.expectError(error.MissingFlag, parse_worker(&.{ "--l1", "http://a:1" }));
     try std.testing.expectError(error.InvalidArguments, parse_worker(&.{"--bogus"}));
+    const tee_args = [_][]const u8{
+        "--prover-rpc",    "http://127.0.0.1:7300", "--l1",      "http://127.0.0.1:8545",
+        "--l2",            "http://127.0.0.1:9545", "--backend", "tee",
+        "--rollup-config", "rollup.json",
+    };
+    try std.testing.expectError(error.MissingFlag, parse_worker(&tee_args));
+    const tee = try parse_worker(&(tee_args ++ [_][]const u8{ "--enclave-key-file", "key.hex" }));
+    try std.testing.expectEqual(Backend.tee, tee.backend);
+    try std.testing.expectEqualStrings("key.hex", tee.enclave_key_file.?);
+    try std.testing.expectError(error.InvalidArguments, parse_worker(&.{ "--backend", "sp1" }));
     const served = try parse_service(&.{ "--metrics.enabled", "--jobs-max", "4" });
     try std.testing.expect(served.telemetry.metrics_enabled);
     try std.testing.expectEqual(@as(u32, 4), served.jobs_max);
