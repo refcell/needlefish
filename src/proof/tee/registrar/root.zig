@@ -13,6 +13,10 @@ pub const crl = @import("crl.zig");
 pub const registration_tasks = @import("registration_tasks.zig");
 pub const reconciler = @import("reconciler.zig");
 pub const prover = @import("prover.zig");
+pub const l1 = @import("l1.zig");
+pub const metrics = @import("metrics.zig");
+pub const signer_manager = @import("signer_manager.zig");
+pub const fakes = @import("fakes.zig");
 
 pub const P384Hints = hints.P384Hints;
 pub const AttestationPlanner = planner.AttestationPlanner;
@@ -20,6 +24,7 @@ pub const CertManagerKeys = planner.CertManagerKeys;
 pub const pinned_root_cert_hash = planner.pinned_root_cert_hash;
 pub const SignerReconciler = reconciler.SignerReconciler;
 pub const RegistrationTaskSet = registration_tasks.RegistrationTaskSet;
+pub const SignerManager = signer_manager.SignerManager;
 
 test {
     std.testing.refAllDecls(@This());
