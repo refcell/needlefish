@@ -2204,3 +2204,85 @@ fn fuzz_raw_by_index(_: void, smith: *testing.Smith) anyerror!void {
 test "eth: fuzz eth_getRawTransactionByBlockNumberAndIndex indexes" {
     try testing.fuzz({}, fuzz_raw_by_index, .{});
 }
+
+const transfer_sender_hex = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+
+fn sender_nonce_request(h: *Harness, sender_hex: []const u8, nonce: u64) ![]const u8 {
+    var body: [256]u8 = undefined;
+    return h.request_runtime(try std.fmt.bufPrint(&body, request_prefix_format ++
+        "eth_getTransactionBySenderAndNonce\",\"params\":[\"{s}\",\"0x{x}\"]}}", .{
+        sender_hex, nonce,
+    }));
+}
+
+fn expect_hash_of(text: []const u8, raw: []const u8) !void {
+    var expected: [80]u8 = undefined;
+    const hash = primitives.keccak256(raw).bytes;
+    try expect_contains(text, try std.fmt.bufPrint(&expected, "\"hash\":\"0x{x}\"", .{&hash}));
+}
+
+/// Mines `blocks` blocks of one transfer each (nonces 0..blocks), then pools nonce `blocks`.
+fn sender_nonce_chain(h: *Harness, buffers: [][256]u8, raws: [][]const u8, blocks: u64) !void {
+    std.debug.assert(raws.len == blocks + 1);
+    for (raws, 0..) |*raw, nonce| {
+        raw.* = try transfer_raw(&buffers[nonce], nonce);
+        try expect_contains(try send_raw(h, raw.*), "\"result\":\"0x");
+        if (nonce < blocks) _ = try h.mine(12 + 2 * nonce);
+    }
+}
+
+test "eth: eth_getTransactionBySenderAndNonce finds pooled and mined transactions" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffers: [4][256]u8 = undefined;
+    var raws: [4][]const u8 = undefined;
+    try sender_nonce_chain(h, &buffers, &raws, 3);
+    for (raws, 0..) |raw, nonce| {
+        const text = try sender_nonce_request(h, transfer_sender_hex, nonce);
+        try expect_hash_of(text, raw);
+        const mined = if (nonce < 3) "\"blockNumber\":\"0x" else "\"blockNumber\":null";
+        try expect_contains(text, mined);
+    }
+    try expect_contains(try sender_nonce_request(h, transfer_sender_hex, 4), "\"result\":null");
+    const stranger = "0x00000000000000000000000000000000000000aa";
+    try expect_contains(try sender_nonce_request(h, stranger, 0), "\"result\":null");
+}
+
+fn sender_nonce_scenario(seed: u64) !void {
+    var prng = Prng.init(seed);
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    if (prng.chance(2, 3)) {
+        try h.node.db.trie().track_changes(testing.allocator);
+        try h.node.chain.attach_history(&store);
+    }
+    // Up to 12 blocks against an 8-block window: some lookups fall below it.
+    const blocks = prng.range(1, 12);
+    var buffers: [13][256]u8 = undefined;
+    var raws: [13][]const u8 = undefined;
+    try sender_nonce_chain(h, buffers[0 .. blocks + 1], raws[0 .. blocks + 1], blocks);
+    for (0..8) |_| {
+        const nonce = prng.below(blocks + 3);
+        const text = try sender_nonce_request(h, transfer_sender_hex, nonce);
+        if (nonce <= blocks) try expect_hash_of(text, raws[nonce]) else {
+            try expect_contains(text, "\"result\":null");
+        }
+    }
+}
+
+test "eth: seeded fuzz of eth_getTransactionBySenderAndNonce" {
+    for (0..6) |seed| try sender_nonce_scenario(seed);
+}
+
+fn fuzz_sender_nonce(_: void, smith: *testing.Smith) anyerror!void {
+    const h = try Harness.create();
+    defer h.destroy();
+    const text = try sender_nonce_request(h, transfer_sender_hex, smith.value(u64));
+    try expect_contains(text, "\"result\":null"); // Nothing sent: no nonce matches.
+}
+
+test "eth: fuzz eth_getTransactionBySenderAndNonce nonces" {
+    try testing.fuzz({}, fuzz_sender_nonce, .{});
+}

@@ -192,6 +192,22 @@ pub const Pool = struct {
         return pool.entries[index].pending;
     }
 
+    /// The pooled transaction `address` sent with `nonce`, pending or queued.
+    pub fn find_by_sender_nonce(pool: *const Pool, address: Address, nonce: u64) ?*const Tx {
+        const sender_index = pool.by_sender.get(address) orelse return null;
+        var cursor = pool.senders[sender_index].head;
+        var steps: u32 = 0;
+        while (cursor != none) : (steps += 1) {
+            assert(steps < pool.config.account_slots_max);
+            const entry = &pool.entries[cursor];
+            assert(pool.entry_live[cursor]);
+            if (entry.tx.nonce == nonce) return &entry.tx;
+            if (entry.tx.nonce > nonce) return null; // Ascending nonces.
+            cursor = entry.next;
+        }
+        return null;
+    }
+
     /// Highest pending nonce + 1 for `address`, i.e. the next nonce it should use.
     pub fn next_nonce(pool: *const Pool, address: Address, account_nonce: u64) u64 {
         const sender_index = pool.by_sender.get(address) orelse return account_nonce;
