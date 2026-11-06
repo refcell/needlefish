@@ -41,6 +41,17 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - [ ] DST: builder in the cluster simulator at 200 ms blocks; invariants: every slot gets
   exactly one block (or an explained skip), sealed blocks replay identically on the
   verifier, no getPayload ever waits past the slot end.
+  - [x] Builder-side hooks: `Service.observer` job events (started, sealed with cutoff,
+    resolved with arrival time, ended with reason: cancelled/expired/failed, start_failed)
+    and `slot_audit.SlotAudit`, which checks the three invariants from those events plus the
+    verifier's replay hashes; cadence DST uses it with cancelled and expired (skipped) slots.
+  - [ ] Cluster: blocked on dst-fuzz "Sim at native 200 ms blocks" (the sim's real execution
+    is Granite at 2 s and builds through `Chain`, not `builder/core`). When it lands: install
+    `NodeBuilder(SimIo)` on the real sequencer engine, set
+    `node_builder.service.observer = Observer.of(SlotAudit, &audit)`, call
+    `audit.on_replay(number, hash)` on each verifier import, `audit.reset(head)` on reorgs,
+    and fail the seed on `audit.violation`, `resolves_late` without an injected delay, or
+    `unreplayed()` at settle.
 - [x] Benchmarks: build+seal latency per 200 ms slot at full gas limit; target well under
   the 150 ms cutoff. Record in docs/PERF.md.
 
@@ -88,6 +99,13 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   `Chain.payload_builder` + `builder/core` `NodeBuilder(IO)`, landed before this ownership
   change; nf-node maintains it from here, the builder lane keeps only `src/builder` helpers.)
 
+- 2026-11-05: DST slot invariants live on the builder side as an event auditor
+  (`SlotAudit` over `Service.observer`) rather than inside the cluster simulator, because the
+  cluster's 200 ms mode is the dst-fuzz lane's backlog item; the cluster only has to forward
+  events and replay hashes. A getPayload arriving after the slot end is counted
+  (`resolves_late`), not a violation: under injected network delay it is the consensus side's
+  lateness, and the service still answers without waiting.
+
 ## Log
 - 2026-11-05: `common/flashblocks` `encode_json`/`encode_brotli`, byte-exact random round-trip
   seeded + `std.testing.fuzz` tests.
@@ -134,3 +152,6 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - 2026-11-05: builder slot bench (`builder:`): FCU+build+seal+getPayload at a full 60 M gas
   block (3000 transfers + 64 storage-heavy calls pooled), 2610 txs/block, 19.8 ms p50 / 26.6 ms
   p99 thread CPU; recorded in docs/PERF.md.
+- 2026-11-05: `builder/core` `Service.observer` job events and `SlotAudit` (one block per
+  slot or explained skip, seal cutoff inside the slot, verifier replay hashes); model fuzz with
+  injected faults; cadence DST now skips slots (cancel, expiry) and runs through the audit.

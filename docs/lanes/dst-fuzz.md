@@ -33,6 +33,11 @@ provably robust.
   Invariants: one block per slot or an explained skip; verifiers replay sealed blocks
   identically; no getPayload past the slot end. Swarm keeps a pre-Denim (2 s) config
   family so legacy derivation stays covered.
+  Builder hooks ready (nf-builder): `builder/core` `NodeBuilder(SimIo)` on the real
+  sequencer engine (`Chain.payload_builder`), `Service.observer` events into
+  `builder.core.slot_audit.SlotAudit`; feed `on_replay(number, hash)` per verifier import,
+  `reset(head)` on reorg; check `violation == null`, `unreplayed() == 0` at settle (see
+  docs/lanes/builder.md DST item).
 - [ ] Sim: drop the `BUG(batcher)` gates (admin ops, reorg tx loss, `evict_reorged`) when
   the batcher tracks confirmation depth and re-queues reorged frames (reported to
   nf-batcher-devnet). Partly fixed in 371cb6d4 (seeds 2562, 2856, 850 pass ungated);

@@ -4,10 +4,14 @@
 //! service builds and seals by the 150 ms cutoff (or seals at once on an early resolve),
 //! and the sealed block is imported by both the sequencer and a verifier.
 //!
-//! Invariants checked per slot: exactly one block per slot, at the Denim schedule's
-//! timestamp; no resolve runs past the slot end; the verifier replays every sealed block
-//! to the same hash; at the end both chains share head and state root. Seeded runs plus a
-//! `std.testing.fuzz` target.
+//! Some slots are skipped on purpose: a newer FCU cancels the slot's first job, or the job
+//! is never resolved and expires (no block that slot; the next block takes the next slot).
+//!
+//! Invariants checked per slot: exactly one block per slot (or an explained skip), at the
+//! Denim schedule's timestamp; no resolve runs past the slot end; the verifier replays every
+//! sealed block to the same hash; at the end both chains share head and state root. The
+//! builder-side invariants also go through `SlotAudit` on the service's job events, as the
+//! cluster simulator would use it. Seeded runs plus a `std.testing.fuzz` target.
 
 const std = @import("std");
 const testing = std.testing;
@@ -26,6 +30,7 @@ const builder_module = @import("builder.zig");
 const builder_test = @import("builder_test.zig");
 const service_module = @import("service.zig");
 const timing = @import("timing.zig");
+const SlotAudit = @import("slot_audit.zig").SlotAudit;
 
 const types = engine.types;
 const B256 = primitives.B256;
@@ -51,6 +56,9 @@ const Harness = struct {
     builder: builder_module.BlockBuilder,
     clock: StepClock,
     service: Service,
+    audit: SlotAudit = .init(0),
+    /// Slots that produced no block so far: wall time runs ahead of the block schedule.
+    skipped_slots: u64 = 0,
     pool_buffers: [pool_transactions_max][256]u8 = undefined,
     pool_count: u32 = 0,
     nonces: [fixture.senders]u64 = @splat(0),
@@ -85,6 +93,7 @@ const Harness = struct {
         const clock = builder_module.Clock.of(StepClock, &harness.clock);
         const chain = &harness.sequencer.chain;
         harness.service = try Service.init(&harness.builder, chain, clock, .{});
+        harness.service.observer = service_module.Observer.of(SlotAudit, &harness.audit);
         return harness;
     }
 
@@ -155,18 +164,24 @@ fn import(node: *Node, sealed: *const service_module.Payload) !void {
     try testing.expectEqual(types.Status.valid, updated.payload_status.status);
 }
 
-/// One slot: start the job at the slot start, maybe tick it (build to the cutoff with a
-/// random per-transaction cost), resolve no later than the slot end, import on both nodes.
-/// Returns the pool transactions included.
-fn run_slot(harness: *Harness, prng: *Prng, number: u64) !u64 {
+/// One slot: start the job at the slot start (maybe cancelled once by a newer FCU), maybe
+/// tick it (build to the cutoff with a random per-transaction cost), then either resolve no
+/// later than the slot end and import on both nodes, or never resolve and let it expire (a
+/// skipped slot). Returns the pool transactions included, or null for a skipped slot.
+fn run_slot(harness: *Harness, prng: *Prng, number: u64) !?u64 {
     const schedule = harness.sequencer.chain.denim_schedule().?;
-    // The block's slot is the 200 ms before its scheduled timestamp.
-    const slot_start_ns = (schedule.timestamp_ms(number) - 200) * ns_per_ms + 1;
+    // The block's slot is the 200 ms before its scheduled timestamp, plus skipped slots.
+    const slot_ms = schedule.timestamp_ms(number) - 200 + harness.skipped_slots * 200;
+    const slot_start_ns = slot_ms * ns_per_ms + 1;
     const service = &harness.service;
     service.tick(slot_start_ns);
     const attributes = harness.attributes(number);
     const head = harness.sequencer.chain.head_hash();
     const id: service_module.PayloadId = @splat(@truncate(number));
+    if (prng.chance(1, 8)) {
+        // A newer FCU in the same slot replaces this job (explained skip: cancelled).
+        try service.send_new_payload(@splat(0xcc), head, &attributes);
+    }
     try service.send_new_payload(id, head, &attributes);
     const slot = timing.Slot.init(service.config, slot_start_ns);
     if (prng.chance(3, 4)) {
@@ -174,8 +189,29 @@ fn run_slot(harness: *Harness, prng: *Prng, number: u64) !u64 {
         harness.clock = .{ .now = slot_start_ns, .step_ns = prng.below(60 * ns_per_ms) };
         service.tick(slot_start_ns);
     }
-    // getPayload arrives anywhere inside the slot and never runs past its end.
-    const resolve_ns = slot_start_ns + prng.below(slot.end_ns - slot_start_ns);
+    if (prng.chance(1, 10)) {
+        // getPayload never comes: the job expires and the slot has no block. The next slot
+        // starts after the expiry (leeway 500 ms = 2.5 slots past the end).
+        harness.clock = .{ .now = slot.expires_ns, .step_ns = 0 };
+        service.tick(slot.expires_ns);
+        try testing.expect(service.active_id() == null);
+        harness.skipped_slots += 5;
+        return null;
+    }
+    return try resolve_slot(harness, prng, number, id, slot, &attributes);
+}
+
+/// getPayload anywhere inside the slot, then the import on both nodes and the replay check.
+fn resolve_slot(
+    harness: *Harness,
+    prng: *Prng,
+    number: u64,
+    id: service_module.PayloadId,
+    slot: timing.Slot,
+    attributes: *const payload.PayloadAttributes,
+) !u64 {
+    const service = &harness.service;
+    const resolve_ns = slot.start_ns + prng.below(slot.end_ns - slot.start_ns);
     harness.clock = .{ .now = resolve_ns, .step_ns = 0 };
     service.set_now(resolve_ns);
     const sealed = try (service.resolve(id) orelse return error.TestUnexpectedResult);
@@ -193,6 +229,7 @@ fn run_slot(harness: *Harness, prng: *Prng, number: u64) !u64 {
     for ([_]*Node{ harness.sequencer, harness.verifier }) |node| {
         try testing.expectEqualSlices(u8, &sealed.block_hash.bytes, &node.chain.head_hash());
     }
+    harness.audit.on_replay(number, .{ .bytes = harness.verifier.chain.head_hash() });
     return sealed.transactions.len - 2;
 }
 
@@ -200,16 +237,30 @@ fn random_cadence(prng: *Prng) !u64 {
     const harness = try Harness.create();
     defer harness.destroy();
     var included: u64 = 0;
+    var blocks: u64 = 0;
     const slots = 1 + prng.below(slots_max);
-    for (1..slots + 1) |number| {
+    for (0..slots) |_| {
         try harness.submit(prng, prng.below(4));
-        included += try run_slot(harness, prng, number);
+        const pool_included = try run_slot(harness, prng, blocks + 1) orelse continue;
+        included += pool_included;
+        blocks += 1;
     }
+    try check_audit(&harness.audit, blocks);
     const sequencer_root = try harness.sequencer.db.root();
     try testing.expectEqualSlices(u8, &sequencer_root, &(try harness.verifier.db.root()));
     const head = harness.verifier.chain.header(harness.verifier.chain.head_hash()).?;
-    try testing.expectEqual(@as(u64, slots), head.number);
+    try testing.expectEqual(blocks, head.number);
     return included;
+}
+
+/// Every started job ended once (a block or an explained skip), nothing late, all replayed.
+fn check_audit(audit: *const SlotAudit, blocks: u64) !void {
+    try testing.expectEqual(@as(?@import("slot_audit.zig").Violation, null), audit.violation);
+    try testing.expectEqual(blocks, audit.blocks_resolved);
+    try testing.expectEqual(audit.jobs_started, audit.blocks_resolved + audit.skips_total());
+    try testing.expectEqual(@as(u64, 0), audit.resolves_late);
+    try testing.expectEqual(@as(u32, 0), audit.unreplayed());
+    try testing.expectEqual(@as(u64, 0), audit.starts_failed);
 }
 
 test "cadence: one block per 200 ms slot, replayed identically by the verifier" {

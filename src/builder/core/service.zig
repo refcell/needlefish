@@ -71,6 +71,43 @@ pub const Metrics = struct {
     build_failed: metrics.Counter = .{},
 };
 
+/// Why a started job ended without a sealed block reaching getPayload.
+pub const EndReason = enum {
+    /// A newer FCU replaced it (`ensure_only_one_payload`).
+    cancelled,
+    /// It reached its expiry unresolved.
+    expired,
+    /// Its build failed; getPayload answered `BuildFailed`.
+    failed,
+};
+
+/// A job lifecycle event, for an external auditor (the DST slot invariants).
+pub const Event = union(enum) {
+    started: struct { id: PayloadId, number: u64, slot: timing.Slot },
+    /// FCU with attributes that could not start a job (nothing is active afterwards).
+    start_failed: struct { id: PayloadId },
+    sealed: struct { id: PayloadId, number: u64, block_hash: B256, cutoff_ns: u64, stop: Stop },
+    /// getPayload returned the sealed block; `now_ns` is when it arrived (it never waits).
+    resolved: struct { id: PayloadId, number: u64, now_ns: u64 },
+    ended: struct { id: PayloadId, number: u64, reason: EndReason },
+};
+
+pub const Observer = struct {
+    context: *anyopaque,
+    on_event: *const fn (context: *anyopaque, event: *const Event) void,
+
+    /// An observer over any `*T` with `fn on_event(*T, *const Event) void`.
+    pub fn of(comptime T: type, target: *T) Observer {
+        const Adapter = struct {
+            fn call(context: *anyopaque, event: *const Event) void {
+                const typed: *T = @ptrCast(@alignCast(context));
+                typed.on_event(event);
+            }
+        };
+        return .{ .context = target, .on_event = Adapter.call };
+    }
+};
+
 pub const Service = struct {
     const JobState = enum { pending, sealed, failed };
 
@@ -79,6 +116,7 @@ pub const Service = struct {
         timestamp: u64,
         slot: timing.Slot,
         state: JobState,
+        number: u64,
         /// Valid once `sealed`.
         best: Payload,
     };
@@ -93,6 +131,8 @@ pub const Service = struct {
     attributes: PayloadAttributes = undefined,
     withdrawals: [chain_module.withdrawals_max]payload.Withdrawal = undefined,
     metrics: Metrics = .{},
+    /// Receives every job event when set (simulation and tests).
+    observer: ?Observer = null,
 
     /// The service must not move while a job is active (the builder points into it).
     /// `clock` is read during a build to stop at the cutoff; `tick` supplies the time
@@ -118,7 +158,7 @@ pub const Service = struct {
     ) Error!void {
         service.cancel();
         const withdrawals = attributes.withdrawals orelse &.{};
-        if (withdrawals.len > service.withdrawals.len) return service.start_failed();
+        if (withdrawals.len > service.withdrawals.len) return service.start_failed(id);
         // base/base: a zero parent hash builds on the latest block.
         const zero: [32]u8 = @splat(0);
         const parent_hash = if (std.mem.eql(u8, &parent, &zero))
@@ -133,7 +173,7 @@ pub const Service = struct {
             .payload_id = id,
             .parent_hash = parent_hash,
             .attributes = &service.attributes,
-        }) catch return service.start_failed();
+        }) catch return service.start_failed(id);
         // The builder copied the attribute transactions; drop the caller's slices so the
         // job holds no borrowed memory.
         service.attributes.transactions = null;
@@ -142,23 +182,34 @@ pub const Service = struct {
             .timestamp = attributes.timestamp,
             .slot = timing.Slot.init(service.config, service.now_ns),
             .state = .pending,
+            .number = service.builder.template.number,
             .best = undefined,
         };
         service.metrics.jobs_started.increment();
         assert(service.builder.state == .started);
+        const job = &service.job.?;
+        service.emit(.{ .started = .{ .id = id, .number = job.number, .slot = job.slot } });
     }
 
-    fn start_failed(service: *Service) Error {
+    fn emit(service: *const Service, event: Event) void {
+        const observer = service.observer orelse return;
+        assert(event != .started or service.job != null);
+        observer.on_event(observer.context, &event);
+    }
+
+    fn start_failed(service: *Service, id: PayloadId) Error {
         assert(service.job == null);
         service.metrics.job_start_failed.increment();
+        service.emit(.{ .start_failed = .{ .id = id } });
         return error.BuildFailed;
     }
 
     /// Ends the active job unresolved (a newer FCU replaces it).
     fn cancel(service: *Service) void {
-        if (service.job == null) return;
+        const job = service.job orelse return;
         service.job = null;
         service.metrics.jobs_cancelled.increment();
+        service.emit(.{ .ended = .{ .id = job.id, .number = job.number, .reason = .cancelled } });
         assert(service.job == null);
     }
 
@@ -172,8 +223,14 @@ pub const Service = struct {
         if (job.state == .pending) service.seal(job, job.slot.cutoff_ns);
         assert(job.state != .pending);
         if (now_ns >= job.slot.expires_ns) {
+            const ended: Event = .{ .ended = .{
+                .id = job.id,
+                .number = job.number,
+                .reason = .expired,
+            } };
             service.job = null;
             service.metrics.jobs_expired.increment();
+            service.emit(ended);
         }
     }
 
@@ -216,6 +273,14 @@ pub const Service = struct {
         service.metrics.blocks_sealed.increment();
         if (stop == .cutoff) service.metrics.builds_cut_off.increment();
         assert(job.best.header.timestamp == job.timestamp);
+        assert(job.best.header.number == job.number);
+        service.emit(.{ .sealed = .{
+            .id = job.id,
+            .number = job.number,
+            .block_hash = job.best.block_hash,
+            .cutoff_ns = cutoff_ns,
+            .stop = stop,
+        } });
     }
 
     /// When `tick` must run next: now for a pending job, its expiry for a built one; null
@@ -256,10 +321,16 @@ pub const Service = struct {
         assert(job.state != .pending);
         const state = job.state;
         const best = job.best;
+        const number = job.number;
         service.job = null;
         service.metrics.jobs_resolved.increment();
-        if (state == .failed) return error.BuildFailed;
+        if (state == .failed) {
+            service.emit(.{ .ended = .{ .id = id, .number = number, .reason = .failed } });
+            return error.BuildFailed;
+        }
         assert(std.mem.eql(u8, &best.id, &id));
+        const now_ns = service.now_ns;
+        service.emit(.{ .resolved = .{ .id = id, .number = number, .now_ns = now_ns } });
         return best;
     }
 };
