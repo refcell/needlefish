@@ -6,6 +6,7 @@ const HttpTransport = @import("http_transport.zig").HttpTransport;
 const Servers = @import("batcher_servers.zig").Servers;
 const sequencer_clients = @import("batcher_sequencers.zig");
 const shadow_mode = @import("batcher_shadow.zig");
+const l1_ws = @import("batcher_l1_ws.zig");
 
 const Io = std.Io;
 const batcher = base.batcher;
@@ -24,7 +25,7 @@ const usage =
     \\         --brotli-quality 0-11 --publish-max-retries N --publish-retry-delay D
     \\         --blob-sidecar-version 0|1 (1: EIP-7594 cell proofs, for Osaka L1s)
     \\         --throttle-{start,full}-threshold B --throttle-{block,tx}-size-{lower,upper}-limit B
-    \\         [--no-force-blobs-when-throttling]
+    \\         [--no-force-blobs-when-throttling] [--l1-ws-url ws://HOST:PORT]
     \\         [--shadow.enabled --shadow.inbox ADDR --shadow.validator-rollup-rpc URL
     \\          --shadow.validator-l2-rpc URL (requires --no-throttle)]
     \\         [--sequencer-urls URL|L2_URL=ROLLUP_URL,... (instead of --l2/--rollup-rpc)]
@@ -83,6 +84,8 @@ const Flags = struct {
     force_blobs_when_throttling: bool = true,
     /// Per-request RPC timeout (base/base `--network-timeout`, seconds); 0 disables it.
     network_timeout_ms: u64 = 10 * std.time.ms_per_s,
+    /// base/base `--l1-ws-url`: a `newHeads` subscription wakes the step loop early.
+    l1_ws_url: ?[]const u8 = null,
     /// Compressed bytes a channel aims for before it closes; 0 = one full frame.
     compressed_size_target: u32 = 0,
     brotli_quality: u4 = batcher.comp.brotli.quality_default,
@@ -276,6 +279,7 @@ fn run(
     var admin: batcher.admin.Admin = .{ .service = service };
     var servers: Servers = undefined;
     const serving = start_servers(&servers, init.gpa, flags, &metrics, &admin);
+    const l1_heads = start_l1_ws(init, flags);
     var throttle_logged: batcher.throttle.Outcome = .idle;
     var blobs_forced_logged = false;
     while (true) {
@@ -301,12 +305,44 @@ fn run(
             std.debug.print("batcher: step failed: {t} {s}\n", .{ err, l1.last_error() });
         }
         if (shadow) |validator| validator.check(clients.l2);
-        if (serving) {
-            try servers.serve_for(flags.poll_interval_ms);
-        } else {
-            try init.io.sleep(.fromMilliseconds(@intCast(flags.poll_interval_ms)), .awake);
-        }
+        const wait_servers = if (serving) &servers else null;
+        try wait_next_step(init.io, flags.poll_interval_ms, wait_servers, l1_heads);
     }
+}
+
+/// The `--l1-ws-url` subscription, or null (unset, wss, or no memory: polling only).
+fn start_l1_ws(init: std.process.Init, flags: Flags) ?*l1_ws.L1HeadSubscription {
+    const url = flags.l1_ws_url orelse return null;
+    const target = l1_ws.parse_url(url) catch {
+        std.debug.print("batcher: --l1-ws-url {s}: only ws:// is supported; polling\n", .{url});
+        return null;
+    };
+    const sub = init.gpa.create(l1_ws.L1HeadSubscription) catch return null;
+    sub.* = .{ .io = init.io, .target = target };
+    sub.start();
+    return sub;
+}
+
+const WaitContext = struct { io: Io, servers: ?*Servers };
+
+fn wait_slice(context: WaitContext, duration_ms: u64) anyerror!void {
+    if (context.servers) |servers| return servers.serve_for(duration_ms);
+    try context.io.sleep(.fromMilliseconds(@intCast(duration_ms)), .awake);
+}
+
+/// One poll interval of admin/metrics serving (or sleep), cut short by a new L1 head when
+/// subscribed: in 50 ms slices, the head latency base/base's hybrid source gives.
+fn wait_next_step(
+    io: Io,
+    poll_interval_ms: u64,
+    servers: ?*Servers,
+    l1_heads: ?*l1_ws.L1HeadSubscription,
+) !void {
+    std.debug.assert(poll_interval_ms > 0);
+    const context: WaitContext = .{ .io = io, .servers = servers };
+    const sub = l1_heads orelse return wait_slice(context, poll_interval_ms);
+    const seen = sub.heads.load(.monotonic);
+    _ = try l1_ws.wait_for_head(&sub.heads, seen, poll_interval_ms, 50, context, wait_slice);
 }
 
 fn start_shadow(init: std.process.Init, flags: Flags) !*shadow_mode.Shadow {
@@ -419,6 +455,15 @@ fn apply_alias_settings(flags: *Flags, arg: []const u8, value: []const u8) !bool
     const parse = std.fmt.parseInt;
     if (eql(u8, arg, "--l1-rpc-url")) {
         flags.l1 = value;
+    } else if (eql(u8, arg, "--l1-ws-url")) {
+        // wss parses (base/base takes it) but runs as polling only: no TLS here.
+        _ = l1_ws.parse_url(value) catch |err| switch (err) {
+            error.UnsupportedScheme => if (!std.mem.startsWith(u8, value, "wss://")) {
+                return error.InvalidL1WsUrl;
+            },
+            error.InvalidUrl => return error.InvalidL1WsUrl,
+        };
+        flags.l1_ws_url = value;
     } else if (eql(u8, arg, "--poll-interval")) {
         const seconds = try parse(u64, value, 10);
         if (seconds == 0 or seconds > 3600) return error.InvalidPollInterval;
@@ -726,10 +771,22 @@ test "batcher: flags" {
 test {
     _ = sequencer_clients;
     _ = shadow_mode;
+    _ = l1_ws;
     _ = @import("http_transport.zig");
 }
 
+test "batcher flags: --l1-ws-url takes ws and wss, refuses other URLs" {
+    const ws_flags = try parse_flags(&.{ "--l1-ws-url", "ws://127.0.0.1:8546" });
+    try std.testing.expectEqualStrings("ws://127.0.0.1:8546", ws_flags.l1_ws_url.?);
+    const wss_flags = try parse_flags(&.{ "--l1-ws-url", "wss://node.example/key" });
+    try std.testing.expect(wss_flags.l1_ws_url != null);
+    try std.testing.expectEqual(@as(?[]const u8, null), (try parse_flags(&.{})).l1_ws_url);
+    try std.testing.expectError(error.InvalidL1WsUrl, parse_flags(&.{ "--l1-ws-url", "http://x" }));
+    try std.testing.expectError(error.InvalidL1WsUrl, parse_flags(&.{ "--l1-ws-url", "ws://:1" }));
+}
+
 const fuzz_flag_names = [_][]const u8{
+    "--l1-ws-url",
     "--poll-interval",
     "--max-blobs-per-tx",
     "--resubmission-timeout",

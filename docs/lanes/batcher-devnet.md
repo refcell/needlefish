@@ -240,7 +240,7 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
 - [x] Smoke asserts the 200 ms cadence (>= 80% of nominal blocks over 5 s).
 - [x] Blob-DA devnet mode: `DEVNET_DA=blobs just devnet up` runs the batcher with
   `--data-availability blobs` and the smoke still passes (dev L1 beacon serves the blobs).
-- [ ] `--l1-ws-url` (the last base/base batcher flag we lack): accept it and use a
+- [x] `--l1-ws-url` (the last base/base batcher flag we lack): accept it and use a
   WebSocket `newHeads` subscription to wake the step loop instead of waiting a poll interval.
 - [ ] (coordinator) Drop the sim BUG(batcher) gate: (a) seed 329, an older tx wins a reused
   nonce, so confirm contested nonces by receipt (all attempt hashes) and re-post when none is
@@ -285,4 +285,11 @@ Owns `src/batcher/*`, `bin/batcher`, `etc/devnet/`, `docs/DEVNET.md`, and the
   posts batches as blobs, and `base devnet batches --beacon URL` decodes blob txs through an
   injected `BlobSource` (the bin GETs `/eth/v1/beacon/blobs/{slot}`, the consensus
   endpoint). The smoke passes in both modes.
+- 2026-11-05: `--l1-ws-url ws://HOST:PORT`. A concurrent reader task keeps an `eth_subscribe`
+  `newHeads` subscription (RFC 6455 handshake, frame codec from `utilities/ws`). The step
+  loop waits in 50 ms slices and wakes on a new head, like base/base's hybrid L1 head source.
+  It fails safe: wss (no TLS in std), refused connects and dropped sessions log and fall back
+  to polling, and the reader reconnects with a 1-30 s backoff. There is no connect timeout,
+  because the std panics on TCP connect timeouts in 0.17.1. Our dev L1 serves no WebSocket,
+  so a loopback test with a scripted server covers it.
 
