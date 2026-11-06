@@ -42,6 +42,11 @@ order: **safety, performance, developer experience**.
   network/disk/time with fault injection (latency, reorder, drop, partition, crash,
   restart, disk faults). Every run reproduces from its seed.
 - Every decoder, parser, and state transition is fuzzed.
+- Zig 0.17.1's debug backend (the self-hosted x86_64 one `zig build test` uses) miscompiles
+  `==`/`!=` between two runtime optional error sets (`?anyerror`, `?SomeError`): two nulls
+  or two equal errors can compare unequal, depending on stale stack bytes. Unwrap first and
+  compare the plain errors. Null checks and other optional types are fine; LLVM builds are
+  correct.
 
 ## Naming and docs
 

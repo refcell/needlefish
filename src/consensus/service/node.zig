@@ -1065,16 +1065,19 @@ pub fn Node(comptime IO: type) type {
         fn log_progress(node: *Self) void {
             node.log_waiting();
             const state = node.driver.sync_state();
-            if (node.driver.last_error != node.logged_error) {
-                node.logged_error = node.driver.last_error;
-                // A cleared error (back to null) is not logged.
-                if (node.driver.last_error) |err| {
-                    node.logger.log(.warn, "consensus", "driver error", .{
-                        .err = @errorName(err),
-                        .phase = @tagName(node.driver.phase),
-                        .count = node.driver.error_sequence,
-                    });
-                }
+            // Unwraps before comparing: the debug backend miscompiles `!=` between two
+            // `?anyerror` (docs/TIGER_STYLE.md): two nulls compared unequal (a "cleared" error).
+            const fresh_error: ?anyerror = if (node.driver.last_error) |err| blk: {
+                const logged = node.logged_error orelse break :blk err;
+                break :blk if (logged != err) err else null;
+            } else null;
+            if (fresh_error) |err| {
+                node.logged_error = err;
+                node.logger.log(.warn, "consensus", "driver error", .{
+                    .err = @errorName(err),
+                    .phase = @tagName(node.driver.phase),
+                    .count = node.driver.error_sequence,
+                });
             }
             if (node.driver.phase != node.logged_phase) {
                 node.logged_phase = node.driver.phase;
