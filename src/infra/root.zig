@@ -12,6 +12,7 @@ pub const fee_jobs = @import("fee_jobs/root.zig");
 pub const roxy = @import("roxy/root.zig");
 pub const basectl = @import("basectl/root.zig");
 pub const withdrawer = @import("withdrawer/root.zig");
+pub const audit = @import("audit/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
