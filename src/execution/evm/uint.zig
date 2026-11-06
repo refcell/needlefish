@@ -62,10 +62,35 @@ inline fn limb(x: anytype, index: u32) u64 {
     return @truncate(x >> @intCast(index * limb_bits));
 }
 
+/// 11-bit seeds for the reciprocal: 0x7fd00 / (256 + i), indexed by the divisor's top 9 bits.
+const reciprocal_table: [256]u16 = table: {
+    var table: [256]u16 = undefined;
+    for (&table, 0..) |*item, index| item.* = @intCast(0x7fd00 / (256 + index));
+    break :table table;
+};
+
+inline fn high_product(a: u64, b: u64) u64 {
+    return @truncate((@as(u128, a) * b) >> 64);
+}
+
 /// Möller-Granlund reciprocal of a normalized divisor: floor((2^128 - 1) / d) - 2^64.
+/// Table seed plus Newton steps (algorithm 2 of the paper, as in intx) instead of a
+/// software 128-bit division.
 fn reciprocal(d: u64) u64 {
     assert(d >> 63 == 1);
-    return @truncate(~@as(u128, 0) / d);
+    const d9 = d >> 55;
+    const v0: u64 = reciprocal_table[d9 - 256];
+    assert(v0 >= 1024 and v0 <= 2045);
+    const d40 = (d >> 24) + 1;
+    const v1 = (v0 << 11) -% @as(u64, @as(u32, @truncate((v0 *% v0 *% d40) >> 40))) -% 1;
+    const v2 = (v1 << 13) +% ((v1 *% ((1 << 60) -% v1 *% d40)) >> 47);
+    const d0 = d & 1;
+    const d63 = (d >> 1) + d0;
+    const e = ((v2 >> 1) & (0 -% d0)) -% v2 *% d63;
+    const v3 = (high_product(v2, e) >> 1) +% (v2 << 31);
+    const product = @as(u128, v3) * d +% d;
+    const v4 = v3 -% @as(u64, @truncate(product >> 64)) -% d;
+    return v4;
 }
 
 const QuotientRemainder = struct { quotient: u64, remainder: u64 };
@@ -203,6 +228,17 @@ fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
 }
 
 // ------------------------------------------------------------------------- tests
+
+test "uint: table-and-Newton reciprocal equals the 128-bit division" {
+    var prng = Prng.init(0x2ec1_0001);
+    const edges = [_]u64{ 1 << 63, (1 << 63) + 1, std.math.maxInt(u64), std.math.maxInt(u64) - 1 };
+    for (edges) |d| try testing.expectEqual(@as(u64, @truncate(~@as(u128, 0) / d)), reciprocal(d));
+    var round: u32 = 0;
+    while (round < 100_000) : (round += 1) {
+        const d = prng.int(u64) | (1 << 63);
+        try testing.expectEqual(@as(u64, @truncate(~@as(u128, 0) / d)), reciprocal(d));
+    }
+}
 
 const testing = std.testing;
 

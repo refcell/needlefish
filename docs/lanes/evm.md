@@ -181,8 +181,13 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   message once full; init code and overflow use the frame arena; ReleaseSafe asserts the
   cached code equals the frame's). `node: replay` 387 -> 740 Mgas/s; block bench 0.72 ->
   0.68 ms; txcheck 1745/1745 and both state suites still pass.
-- [ ] Performance: `StorageKeyContext.eql` + `slot_for` are ~16% of the block bench; try
-  a stored hash fingerprint compared before the 52-byte key, or fewer lookups per SSTORE.
+- [x] Performance: `slot_for` (~16% of the block bench). Tried one probe per miss
+  (`getOrPut` first, remove on a database error): no measurable change (storage loop
+  10.5 us, block 0.675 ms), not kept. The cost is memory: `slots_max` 2^18 reserves ~2^19
+  buckets of a 64 B key plus a 96 B `Slot` (~75 MB), so each access misses cache and TLB.
+- [ ] Performance: size the slot/account tables from the block gas limit (every new slot
+  costs >= 2100 gas, so a 37.5M-gas block touches < 18k slots) instead of the 2^18
+  default; needs the executor (node lane) to pass `State.Limits` per block size.
 - [ ] Performance: `transact` self time is ~10% of the block bench; profile with inlining
   off to find which validation or settlement step dominates.
 - [x] Performance: re-profiled `node: replay` after the analysis cache. Keccak (~1000
@@ -192,8 +197,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   Division now runs on 64-bit limbs with Möller-Granlund 2-by-1 reciprocal steps (was
   32-bit limbs): new `evm: mulmod+div loop` bench 286 -> 150 us, replay ~723 -> ~752
   Mgas/s; the uint differential fuzz catches a skipped add-back.
-- [ ] Performance: `reciprocal` still costs one u128 division (`__udivti3`) per DIV/MOD;
-  a table + Newton reciprocal (as in intx) would remove it.
+- [x] Performance: `reciprocal` is now a 256-entry seed table plus Newton steps (intx's
+  `reciprocal_2by1`) instead of a `__udivti3` call; exact against the u128 division on
+  100k random divisors and the edges. mulmod+div loop 150 -> 144 us.
 - [ ] Note for the db lane: the harness's `db.overlay` account map (`AutoContext([20]u8)`,
   `getIndex` + `meta.eql`) is ~19% of the block bench; an address-specific hash context
   there would help cold account loads.
