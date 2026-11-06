@@ -344,3 +344,7 @@ provably robust.
   discount, every actor slot, account state, logs, partial effects of failing batches, and
   checkpoint revert. Mutants 3/4 caught; the survivor (no inline-self disable on explicit
   self revoke) is equivalent: an explicit self entry implies the inline self is disabled.
+- 2026-11-05: fix swarm regression after nf-node 45bd6aa7 (built blocks unwound until FCU):
+  real-sequencer liveness now asks for a full catch-up or, when an outage ending at healing
+  leaves more backlog than the window covers, 1 block/s after healing; real execution gets
+  4 blocks of slack (build, unwind, re-apply per block). Seeds 345/346/41144/42284 fixed.

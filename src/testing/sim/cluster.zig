@@ -294,6 +294,8 @@ pub const Cluster = struct {
     /// Print a diagnosis on violation. Negative tests turn it off: the test runner treats
     /// stderr output as a failure.
     log_failures: bool = true,
+    /// The model sequencer head when the cluster first healed (null before healing).
+    head_at_heal: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, seed: u64, config: Config) !Cluster {
         config.validate();
@@ -450,7 +452,10 @@ pub const Cluster = struct {
         while (step < steps_max) : (step += 1) {
             cluster.now_ns += step_ns;
             if (cluster.now_ns < cluster.config.fault_end_ns) cluster.inject_faults();
-            if (cluster.now_ns >= cluster.config.fault_end_ns) cluster.heal_all();
+            if (cluster.now_ns >= cluster.config.fault_end_ns) {
+                cluster.heal_all();
+                if (cluster.head_at_heal == null) cluster.head_at_heal = cluster.sequencer.head;
+            }
             if (cluster.now_ns >= cluster.config.production_end_ns) {
                 cluster.sequencer.producing = false;
             }
@@ -934,7 +939,8 @@ pub const Cluster = struct {
     }
 
     /// After healing the real sequencer is up and linked for the rest of production, so it
-    /// must catch up with its clock (minus the largest skew), and its own derivation must
+    /// must catch up with its clock (minus the largest skew) or, when the backlog is too
+    /// large for the window, build at twice the block rate; its own derivation must
     /// confirm its whole chain.
     fn check_real_sequencer_liveness(cluster: *Cluster) Failure!void {
         const sequencer = cluster.real_sequencer orelse return;
@@ -943,8 +949,19 @@ pub const Cluster = struct {
         const window_ns = config.production_end_ns - config.fault_end_ns;
         if (window_ns >= 10 * ns_per_s) {
             const end_ns = config.production_end_ns -| config.clock_skew_ns_max;
-            const expected = @min(end_ns / config.l2_block_time_ns, config.block_count_max());
-            if (cluster.sequencer.head + 2 < expected) {
+            const caught_up = @min(end_ns / config.l2_block_time_ns, config.block_count_max());
+            // A long outage that ends at healing can leave more backlog than the window
+            // covers (each block costs a build plus a durable write): then the sequencer
+            // must at least build at twice the block rate for the whole window.
+            const healed = cluster.head_at_heal.?;
+            const window_blocks = 2 * window_ns / config.l2_block_time_ns;
+            const expected = @min(caught_up, healed + window_blocks);
+            assert(expected <= caught_up);
+            // Real execution trails the clock by a few slots: each block is built, unwound
+            // (it is not the forkchoice head yet), and re-applied on forkchoiceUpdated, each
+            // a durable write with simulated storage latency.
+            const slack: u64 = if (sequencer.exec != null) 4 else 2;
+            if (cluster.sequencer.head + slack < expected) {
                 return cluster.fail("real sequencer did not produce on time", node);
             }
         }
