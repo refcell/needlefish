@@ -162,6 +162,22 @@ pub const Executed = struct {
     senders: []const primitives.Address = &.{},
 };
 
+/// Benchmarks only: one block split at the phase boundaries docs/BENCHMARKS.md uses (zero
+/// without a `phase_clock`). Transactions are the execution time minus `pre_block_ns` and
+/// `recovery_ns`.
+pub const Phases = struct {
+    /// `begin_block`: the state cache reset and the pre-block system calls.
+    pre_block_ns: u64 = 0,
+    /// Inline sender recovery, or with recovery workers the time spent waiting for them.
+    recovery_ns: u64 = 0,
+    /// Withdrawals and (L1) requests.
+    post_block_ns: u64 = 0,
+    receipts_root_ns: u64 = 0,
+    /// Folding the block's changes into the backend (`Backend.commit`).
+    commit_ns: u64 = 0,
+    state_root_ns: u64 = 0,
+};
+
 pub const Executor = struct {
     spec: *const chainspec.ChainSpec,
     backend: Backend,
@@ -199,9 +215,11 @@ pub const Executor = struct {
     invalid_index: ?u32 = null,
     /// Benchmarks only: when set, `execute_block` records `last_execution_ns`, the time from
     /// its start to the end of the last transaction (system calls, sender recovery wait,
-    /// execution), before withdrawals, receipts root, commit and state root.
+    /// execution), before withdrawals, receipts root, commit and state root, and splits the
+    /// block into `last_phases`.
     phase_clock: ?Clock = null,
     last_execution_ns: u64 = 0,
+    last_phases: Phases = .{},
     /// Owns the state cache's tables (`fit_state` reallocates them).
     allocator: std.mem.Allocator,
     /// The limits the state cache was configured with (`Config.limits`).
@@ -295,11 +313,15 @@ pub const Executor = struct {
         const next = executor.next_transactions;
         executor.next_transactions = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
-        const start_ns = if (executor.phase_clock) |clock| clock.read() else 0;
+        executor.last_phases = .{};
+        const start_ns = executor.phase_now();
         var building = try executor.begin_block(block);
         errdefer executor.abort_block();
+        executor.last_phases.pre_block_ns = executor.phase_now() -| start_ns;
         try executor.apply_list(&building, transactions);
-        if (executor.phase_clock) |clock| executor.last_execution_ns = clock.read() -| start_ns;
+        executor.last_execution_ns = executor.phase_now() -| start_ns;
+        const phases = &executor.last_phases;
+        assert(phases.pre_block_ns + phases.recovery_ns <= executor.last_execution_ns);
         // This block's recovery is over: the pool takes the next block's while it commits.
         if (next) |transactions_next| executor.prefetch(transactions_next);
         return executor.finish_block(&building, withdrawals);
@@ -387,7 +409,9 @@ pub const Executor = struct {
             if (given) |senders| {
                 executor.known_sender = senders[index];
             } else if (recovered) {
+                const wait_ns = executor.phase_now();
                 pipeline.wait_for(index);
+                executor.last_phases.recovery_ns += executor.phase_now() -| wait_ns;
                 executor.known_sender = executor.senders[index];
             }
             try executor.apply(building, raw);
@@ -456,17 +480,27 @@ pub const Executor = struct {
         withdrawals: ?[]const payload.Withdrawal,
     ) Error!Executed {
         errdefer executor.abort_block();
+        const phases = &executor.last_phases;
+        const start_ns = executor.phase_now();
         const requests = try executor.finish_changes(building.fork, withdrawals);
+        const post_ns = executor.phase_now();
         const receipts = building.receipts[0..building.count];
         const receipts_root_hash = try executor.receipts_root(receipts);
+        const receipts_ns = executor.phase_now();
         try executor.backend.commit(executor.backend.context, executor.state);
+        const commit_ns = executor.phase_now();
+        const state_root = try executor.backend.root(executor.backend.context);
+        phases.post_block_ns = post_ns -| start_ns;
+        phases.receipts_root_ns = receipts_ns -| post_ns;
+        phases.commit_ns = commit_ns -| receipts_ns;
+        phases.state_root_ns = executor.phase_now() -| commit_ns;
         return .{
             .receipts = receipts,
             .gas_used = building.gas_used,
             .blob_gas_used = building.blob_gas_used,
             .logs_bloom = building.logs_bloom,
             .receipts_root = receipts_root_hash,
-            .state_root = try executor.backend.root(executor.backend.context),
+            .state_root = state_root,
             .requests = requests,
             .fees = building.fees,
             .senders = building.senders[0..building.count],
@@ -1001,11 +1035,26 @@ pub const Executor = struct {
         };
     }
 
+    /// Inline sender recovery, timed into `last_phases` under a `phase_clock`.
+    fn recover_sender(executor: *Executor, envelope: Envelope) ?primitives.Address {
+        assert(envelope != .deposit);
+        const start_ns = executor.phase_now();
+        const sender = envelope.recover_sender(executor.recoverer);
+        executor.last_phases.recovery_ns += executor.phase_now() -| start_ns;
+        return sender;
+    }
+
+    /// The `phase_clock` reading, or 0 without one (no phase is timed).
+    fn phase_now(executor: *const Executor) u64 {
+        const clock = executor.phase_clock orelse return 0;
+        return clock.read();
+    }
+
     /// Converts a decoded envelope into the evm's transaction environment.
     fn tx_env(executor: *Executor, envelope: Envelope, raw: []const u8) Error!TxEnv {
         if (envelope == .deposit) return executor.deposit_env(envelope.deposit);
         const sender = executor.known_sender orelse
-            envelope.recover_sender(executor.recoverer) orelse return error.InvalidTransaction;
+            executor.recover_sender(envelope) orelse return error.InvalidTransaction;
         var tx: TxEnv = .{
             .tx_type = @fromBackingInt(@intCast(@backingInt(envelope.tx_type()))),
             .caller = sender.bytes,

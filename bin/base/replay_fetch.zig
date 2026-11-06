@@ -426,7 +426,7 @@ fn fill_gaps(f: *Fetcher, window: replay_cli.Window, sub: []const u8) !void {
     var round: u32 = 0;
     while (round < gap_rounds_max) : (round += 1) {
         _ = f.arena.reset(.retain_capacity);
-        var archive = try Archive.init(gpa, replay_cli.archive_config);
+        var archive = try Archive.init(gpa, replay_cli.archive_config_for(window.count));
         defer archive.deinit(gpa);
         try replay_cli.import_blocks(f.init, f.dir, &archive, window);
         const reports = try replay_cli.check_archive(gpa, f.alloc(), &archive) orelse {

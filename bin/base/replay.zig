@@ -4,6 +4,10 @@
 //!     base replay import <raw dir> [--out <archive>]   saved JSON-RPC results -> archive
 //!     base replay run [<archive>] [--blocks <n>]       replay offline, report per block
 //!     base replay bench <archive> [<warm runs>]        timing lines (docs/BENCHMARKS.md)
+//!
+//! `run` and `bench` take `--recovery-threads <n>`: sender-recovery workers (0 recovers
+//! inline in the executor; default one per spare core, at most 7). Results do not depend
+//! on it.
 
 const std = @import("std");
 const Io = std.Io;
@@ -25,8 +29,8 @@ pub const default_archive = "replay.nfrp";
 const usage =
     \\usage: base replay fetch [--count <n>] [--from <block>] [--cache <dir>] [--out <archive>]
     \\       base replay import <raw dir> [--out <archive>]
-    \\       base replay run [<archive>] [--blocks <n>] [--plain]
-    \\       base replay bench <archive> [<warm runs>]
+    \\       base replay run [<archive>] [--blocks <n>] [--plain] [--recovery-threads <n>]
+    \\       base replay bench <archive> [<warm runs>] [--recovery-threads <n>]
     \\
 ;
 pub const file_bytes_max = 1 << 30;
@@ -46,6 +50,46 @@ pub const archive_config: Archive.Config = .{
     .accounts_max = 1 << 16,
     .slots_max = 1 << 18,
 };
+
+/// Windows longer than this many blocks use `archive_config_large`.
+pub const archive_blocks_small: u32 = 128;
+
+/// Limits for windows of up to `archive.blocks_max` (1024) blocks. They cost resident memory
+/// up front, so shorter windows keep `archive_config`.
+pub const archive_config_large: Archive.Config = .{
+    .witness = .{
+        .state_nodes_max = 1 << 21,
+        .state_bytes_max = 1 << 30,
+        .codes_max = 1 << 15,
+        .code_bytes_max = 384 << 20,
+        .keys_max = 1,
+        .headers_max = 1024,
+        .header_bytes_max = 1 << 20,
+    },
+    .transactions_max = 1 << 17,
+    .transaction_bytes_max = 256 << 20,
+    .accounts_max = 1 << 20,
+    .slots_max = 1 << 22,
+};
+
+pub fn archive_config_for(blocks: u32) Archive.Config {
+    assert(blocks > 0 and blocks <= replay.archive.blocks_max);
+    return if (blocks <= archive_blocks_small) archive_config else archive_config_large;
+}
+
+/// Decodes `file` into `archive`, initialized with `archive_config`, or with
+/// `archive_config_large` when the archive does not fit it. The caller deinits `archive`.
+pub fn decode_archive(gpa: std.mem.Allocator, file: []const u8, archive: *Archive) !void {
+    archive.* = try Archive.init(gpa, archive_config);
+    replay.archive.decode(gpa, file, archive) catch |err| {
+        archive.deinit(gpa);
+        if (err != error.WitnessFull) return err;
+        archive.* = try Archive.init(gpa, archive_config_large);
+        errdefer archive.deinit(gpa);
+        try replay.archive.decode(gpa, file, archive);
+    };
+    assert(archive.block_count > 0);
+}
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (args.len == 0) {
@@ -73,9 +117,9 @@ fn import_main(init: std.process.Init, args: []const []const u8) !u8 {
     const gpa = init.gpa;
     var dir = try Io.Dir.cwd().openDir(init.io, args[0], .{});
     defer dir.close(init.io);
-    var archive = try Archive.init(gpa, archive_config);
-    defer archive.deinit(gpa);
     const window = try read_window(init, dir);
+    var archive = try Archive.init(gpa, archive_config_for(window.count));
+    defer archive.deinit(gpa);
     try import_blocks(init, dir, &archive, window);
     try write_archive(init, &archive, window, out_path);
     return 0;
@@ -89,7 +133,8 @@ pub fn write_archive(
     out_path: []const u8,
 ) !void {
     const gpa = init.gpa;
-    const body = try replay.archive.encode_body(gpa, archive, archive_config.witness);
+    const witness_config = archive_config_for(window.count).witness;
+    const body = try replay.archive.encode_body(gpa, archive, witness_config);
     defer gpa.free(body);
     var output: Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
@@ -179,10 +224,15 @@ fn run_main(init: std.process.Init, args: []const []const u8) !u8 {
     var path: []const u8 = default_archive;
     var blocks_limit: ?u32 = null;
     var plain = false;
+    var recovery_threads = recovery_threads_default();
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--plain")) {
             plain = true;
+        } else if (std.mem.eql(u8, args[index], "--recovery-threads")) {
+            if (index + 1 == args.len) return error.InvalidArguments;
+            recovery_threads = try parse_recovery_threads(args[index + 1]);
+            index += 1;
         } else if (std.mem.eql(u8, args[index], "--blocks")) {
             if (index + 1 == args.len) return error.InvalidArguments;
             blocks_limit = try std.fmt.parseInt(u32, args[index + 1], 10);
@@ -194,9 +244,9 @@ fn run_main(init: std.process.Init, args: []const []const u8) !u8 {
     const gpa = init.gpa;
     const file = try Io.Dir.cwd().readFileAlloc(init.io, path, gpa, .limited(file_bytes_max));
     defer gpa.free(file);
-    var archive = try Archive.init(gpa, archive_config);
+    var archive: Archive = undefined;
+    try decode_archive(gpa, file, &archive);
     defer archive.deinit(gpa);
-    try replay.archive.decode(gpa, file, &archive);
     var buffer: [4096]u8 = undefined;
     const stdout = Io.File.stdout();
     var writer = stdout.writer(init.io, &buffer);
@@ -210,15 +260,20 @@ fn run_main(init: std.process.Init, args: []const []const u8) !u8 {
     const first = base.execution.db.witness.header_number(archive.block_header(0)) catch
         return error.InvalidArchive;
     try view.header(first, file.len);
-    return run_archive(init, &archive, &view);
+    return run_archive(init, &archive, &view, recovery_threads);
 }
 
-fn run_archive(init: std.process.Init, archive: *const Archive, view: *tui.View) !u8 {
+fn run_archive(
+    init: std.process.Init,
+    archive: *const Archive,
+    view: *tui.View,
+    recovery_threads: u32,
+) !u8 {
     const gpa = init.gpa;
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
-    try replayer.init(gpa, spec, archive, replayer_config(archive));
+    try replayer.init(gpa, spec, archive, replayer_config(archive, recovery_threads));
     defer replayer.deinit(gpa);
     try view.progress();
     var replayed: u32 = 0;
@@ -325,7 +380,8 @@ pub fn check_archive(
     const spec = &base.execution.chainspec.ChainSpec.presets.base_mainnet;
     const replayer = try gpa.create(replay.Replayer);
     defer gpa.destroy(replayer);
-    try replayer.init(gpa, spec, archive, replayer_config(archive));
+    const config = replayer_config(archive, recovery_threads_default());
+    try replayer.init(gpa, spec, archive, config);
     defer replayer.deinit(gpa);
     replayer.probe = true;
     var reports: std.ArrayList(GapReport) = .empty;
@@ -353,12 +409,29 @@ pub fn check_archive(
     return if (reports.items.len == 0) null else reports.items;
 }
 
-/// The replayer limits for `archive`, recovering senders on one worker per spare core (at
-/// most 7) as `base node` does; results do not depend on the worker count.
-pub fn replayer_config(archive: *const Archive) replay.replayer.Config {
+/// The replayer limits for `archive`, recovering senders on `recovery_threads` workers (0:
+/// inline); results do not depend on the worker count.
+pub fn replayer_config(archive: *const Archive, recovery_threads: u32) replay.replayer.Config {
+    assert(recovery_threads <= recovery_threads_max);
     var config = replay.replayer.config_for(archive);
-    const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
-    config.executor.recovery_threads = @min(cores - 1, 7);
+    config.executor.recovery_threads = recovery_threads;
     config.executor.state_gas_basis = base.execution.node.executor.default_state_gas_basis;
     return config;
+}
+
+/// Most `--recovery-threads` (the executor's recovery pool bound).
+pub const recovery_threads_max: u32 = base.execution.node.senders.threads_max;
+
+/// One sender-recovery worker per spare core, at most 7, as `base node` runs.
+pub fn recovery_threads_default() u32 {
+    const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
+    const threads = @min(cores - 1, 7);
+    assert(threads < cores);
+    return threads;
+}
+
+pub fn parse_recovery_threads(text: []const u8) !u32 {
+    const threads = try std.fmt.parseInt(u32, text, 10);
+    if (threads > recovery_threads_max) return error.InvalidArguments;
+    return threads;
 }

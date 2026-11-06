@@ -12,6 +12,8 @@ pub const replayer = @import("replayer.zig");
 pub const import = @import("import.zig");
 pub const Archive = archive.Archive;
 pub const Replayer = replayer.Replayer;
+/// The committed 10-block mainnet fixture and the limits that hold it (tests only).
+pub const mainnet_fixture = @import("mainnet_test.zig");
 
 test {
     std.testing.refAllDecls(@This());
