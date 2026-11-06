@@ -51,6 +51,9 @@ pub const WorkerFlags = struct {
     /// TEE: route proofs only to enclaves whose signer `TEEProverRegistry` (read over `--l1`)
     /// finds valid; without it every local enclave is used.
     tee_prover_registry: ?[20]u8 = null,
+    /// TEE: let the local-mode enclave sign for a chain without a pinned config hash (a local
+    /// devnet) by hashing its rollup config; a real enclave never does.
+    enclave_allow_custom_chain: bool = false,
     prover_rpc: ?[]const u8 = null,
     l1: ?[]const u8 = null,
     l2: ?[]const u8 = null,
@@ -94,7 +97,13 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
     var flags: WorkerFlags = .{};
     var index: usize = 0;
     while (index < args.len) : (index += 2) {
-        while (index < args.len and try flags.telemetry.parse_one(args, &index)) {}
+        // Flags without a value.
+        while (index < args.len) {
+            if (try flags.telemetry.parse_one(args, &index)) continue;
+            if (!std.mem.eql(u8, args[index], "--enclave-allow-custom-chain")) break;
+            flags.enclave_allow_custom_chain = true;
+            index += 1;
+        }
         if (index == args.len) break;
         if (index + 1 == args.len) return error.InvalidArguments;
         const name = args[index];
@@ -133,7 +142,8 @@ pub fn parse_worker(args: []const []const u8) !WorkerFlags {
         } else return error.InvalidArguments;
     }
     if (flags.backend == .tee and flags.enclave_key_file == null) return error.MissingFlag;
-    if (flags.backend != .tee and flags.tee_prover_registry != null) {
+    const tee_only = flags.tee_prover_registry != null or flags.enclave_allow_custom_chain;
+    if (flags.backend != .tee and tee_only) {
         return error.InvalidArguments;
     }
     if (flags.signer_rpc) |url| _ = try consensus_cli.parse_url(url);
@@ -238,7 +248,7 @@ pub fn worker_main(init: std.process.Init, args: []const []const u8) !u8 {
             "--l1 <url> --l2 <url> --rollup-config <file> [--l1-genesis <file>] " ++
             "[--l1-beacon <url>] [--worker-id native] [--poll-interval-ms 1000]\n         " ++
             "[--backend native|tee] [--enclave-key-file <file>] [--signer-rpc <url>]\n         " ++
-            "[--tee-prover-registry-address <addr>]\n         " ++
+            "[--tee-prover-registry-address <addr>] [--enclave-allow-custom-chain]\n         " ++
             telemetry_servers.Flags.usage ++ "\n", .{err});
         return 2;
     };
@@ -376,7 +386,9 @@ fn run_tee(
     const key_text = try Io.Dir.cwd().readFile(init.io, flags.enclave_key_file.?, &key_buffer);
     const key_hex = std.mem.trim(u8, key_text, " \t\r\n");
     const signer = try proof.tee.enclave.Signer.from_hex(key_hex);
-    const local = try tee_host.LocalEnclave.create(allocator, .init_local(signer), .{
+    var server: proof.tee.enclave.Server = .init_local(signer);
+    server.derive_unknown_chain_config = flags.enclave_allow_custom_chain;
+    const local = try tee_host.LocalEnclave.create(allocator, server, .{
         .request_bytes_max = flags.enclave_request_bytes_max,
         .client_options = inputs.client_options,
     });
@@ -495,6 +507,14 @@ test "prover service: command flags" {
         "--tee-prover-registry-address", "0x0000000000000000000000000000000000000000",
     };
     try std.testing.expectError(error.InvalidArguments, parse_worker(&(keyed ++ zero)));
+    const custom = [_][]const u8{"--enclave-allow-custom-chain"};
+    const allowed = try parse_worker(&(custom ++ keyed ++ custom));
+    try std.testing.expect(allowed.enclave_allow_custom_chain);
+    try std.testing.expect(!gated.enclave_allow_custom_chain);
+    const native_custom = parse_worker(&(tee_args[0..6].* ++ [_][]const u8{
+        "--rollup-config", "rollup.json",
+    } ++ custom));
+    try std.testing.expectError(error.InvalidArguments, native_custom);
     const served = try parse_service(&.{ "--metrics.enabled", "--jobs-max", "4" });
     try std.testing.expect(served.telemetry.metrics_enabled);
     try std.testing.expectEqual(@as(u32, 4), served.jobs_max);

@@ -16,11 +16,12 @@ const Io = std.Io;
 
 const usage =
     \\usage: BASE_ENCLAVE_SIGNER_KEY=<hex> base nitro-enclave [--listen <ip:port>]
-    \\       [--request-bytes-max <n>]
+    \\       [--request-bytes-max <n>] [--allow-custom-chain]
     \\  BASE_ENCLAVE_SIGNER_KEY  secp256k1 signer key (local mode; real enclaves derive it)
     \\  --listen             loopback TCP address in place of vsock port 8000
     \\                       (default 127.0.0.1:8000)
     \\  --request-bytes-max  largest request frame (default 268435456)
+    \\  --allow-custom-chain sign for chains without a pinned config hash (local devnets)
     \\
 ;
 
@@ -28,12 +29,18 @@ pub const Flags = struct {
     host: [4]u8 = .{ 127, 0, 0, 1 },
     port: u16 = 8000,
     request_bytes_max: u32 = 256 << 20,
+    allow_custom_chain: bool = false,
 };
 
 pub fn parse(args: []const []const u8) error{InvalidArguments}!Flags {
     var flags: Flags = .{};
     var index: usize = 0;
     while (index < args.len) : (index += 2) {
+        if (std.mem.eql(u8, args[index], "--allow-custom-chain")) {
+            flags.allow_custom_chain = true;
+            index += 1;
+            if (index == args.len) break;
+        }
         if (index + 1 >= args.len) return error.InvalidArguments;
         const name = args[index];
         const value = args[index + 1];
@@ -78,7 +85,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     const allocator = init.gpa;
-    const server: enclave.Server = .init_local(signer);
+    var server: enclave.Server = .init_local(signer);
+    server.derive_unknown_chain_config = flags.allow_custom_chain;
     const storage = try allocator.create(kzg.blob.Settings.Storage);
     defer allocator.destroy(storage);
     const workspace = try allocator.create(kzg.blob.Workspace);
@@ -139,6 +147,11 @@ test "nitro-enclave: argument parsing" {
     const remote = parse(&.{ "--listen", "0.0.0.0:9000" });
     try std.testing.expectError(error.InvalidArguments, remote);
     try std.testing.expectEqual(@as(u16, 8000), (try parse(&.{})).port);
+    try std.testing.expect(!(try parse(&.{})).allow_custom_chain);
+    const custom = try parse(&.{ "--allow-custom-chain", "--listen", "127.0.0.1:9001" });
+    try std.testing.expect(custom.allow_custom_chain);
+    try std.testing.expectEqual(@as(u16, 9001), custom.port);
+    try std.testing.expect((try parse(&.{"--allow-custom-chain"})).allow_custom_chain);
     try std.testing.expectError(error.InvalidArguments, parse(&.{"--signer-key"}));
     const bad_listen = parse(&.{ "--listen", "1.2.3:4" });
     try std.testing.expectError(error.InvalidArguments, bad_listen);
