@@ -591,6 +591,47 @@ pub const Store = struct {
         if (fingerprint(reference.slice()) != current.tag.fingerprint) return error.HistoryCorrupt;
     }
 
+    /// Tests: the head block's view equals `state_trie` (which must hold the head state, with
+    /// no pending change marks: the walk clears them): every live node has a version at its
+    /// path at the head with its encoding, and no other path has a live version at the head
+    /// (a missing tombstone would leave a stale node that later diffs walk into). O(paths).
+    pub fn check_head(self: *const Store, state_trie: *StateTrie) Error!u64 {
+        const head = (self.window() orelse return error.NotInitialized).head;
+        const Checker = struct {
+            store: *const Store,
+            head: u64,
+            nodes: u64 = 0,
+            pub fn visit(checker: *@This(), node: StateTrie.NodeVisit) error{HistoryCorrupt}!void {
+                const id = checker.store.lookup(node.owner, node.path, checker.head) orelse
+                    return error.HistoryCorrupt;
+                const bytes = checker.store.encoding(id);
+                if (!std.mem.eql(u8, bytes, node.encoding)) return error.HistoryCorrupt;
+                checker.nodes += 1;
+            }
+        };
+        var checker: Checker = .{ .store = self, .head = head };
+        _ = try state_trie.root();
+        try state_trie.visit_nodes(.all, &checker);
+        var live: u64 = 0;
+        for (self.path_index.slots) |slot| {
+            if (slot.id == none) continue;
+            var id = self.paths[slot.id].head;
+            var steps: u64 = 0;
+            while (id != none) : (steps += 1) {
+                assert(steps <= self.versions_total());
+                const current = self.version(id);
+                if (current.block <= head) {
+                    if (current.len > 0) live += 1;
+                    break;
+                }
+                id = current.prev;
+            }
+        }
+        assert(live <= self.paths_fresh - self.path_free_len);
+        if (live != checker.nodes) return error.HistoryCorrupt;
+        return live;
+    }
+
     fn versions_total(self: *const Store) u64 {
         return self.small.versions.len + self.large.versions.len;
     }
@@ -824,13 +865,23 @@ pub const Store = struct {
         }
     }
 
-    /// Reorg: forgets every block above `number`, which must be in the window. The state
-    /// trie must be moved back to `number` too (`State.unwind`); the nodes that move rehashes
+    /// Reorg: forgets every block above `number`, which must be in the window. `state_trie`
+    /// must already hold the state of `number` (`State.unwind`); the nodes the move rehashed
     /// are written again (unchanged encodings are skipped) by the next `commit_block`.
-    pub fn unwind_to(self: *Store, number: u64) Error!void {
+    ///
+    /// The unwound trie is hashed here: `commit_block` diffs only nodes rehashed since the
+    /// store's head, and the trie defers account writes until a flush. Unhashed, the unwind
+    /// and the next block's writes coalesce (an account the unwind deletes and the block
+    /// re-creates is one put), so nodes that moved at `number` but are back where they were
+    /// at the old head are never rehashed, and the next block misses their versions.
+    pub fn unwind_to(self: *Store, state_trie: *StateTrie, number: u64) Error!void {
         self.invalidate_verified();
         const current = self.window() orelse return error.NotInitialized;
         if (number < current.oldest or number > current.head) return error.BlockOutOfWindow;
+        const root = try state_trie.root();
+        // The change marks are only a diff against `number` when the trie holds `number`.
+        const expected = self.block_at(@intCast(number - current.oldest)).state_root;
+        assert(std.mem.eql(u8, &root, &expected));
         while (self.block_at(self.blocks_len - 1).number > number) self.pop_head_block();
         assert(self.window().?.head == number);
     }

@@ -1,8 +1,10 @@
 //! Historical proofs store tests: proofs from history at every block of the window equal the
-//! proofs of a live `State` moved back to that block (random workloads with reorgs), window
-//! edges, capacity, and fuzzed node/value decoders.
+//! proofs of a live `State` moved back to that block (random workloads with reorgs), the head
+//! view equals the live trie after every commit (`Store.check_head`), window edges, capacity,
+//! a seeded workload fuzz over store shapes, and fuzzed node/value decoders.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 
 const history = @import("history.zig");
@@ -11,6 +13,7 @@ const overlay_module = @import("overlay.zig");
 const changeset_module = @import("changeset.zig");
 const trie = @import("../trie/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
+const fuzz = @import("../../testing/fuzz.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -215,6 +218,10 @@ const Harness = struct {
         const root = try self.overlay.commit(self.changeset(number));
         try self.store.commit_block(&self.state.state_trie, number);
         try testing.expectEqual(root, try self.store.state_root_at(number));
+        _ = self.store.check_head(&self.state.state_trie) catch |err| {
+            std.debug.print("check_head failed at block {d}\n", .{number});
+            return err;
+        };
     }
 
     fn reorg(self: *Harness, prng: *Prng, head: u64) !u64 {
@@ -224,7 +231,7 @@ const Harness = struct {
         while (height > head - depth) : (height -= 1) {
             try self.state.unwind(self.changeset(height));
         }
-        try self.store.unwind_to(height);
+        try self.store.unwind_to(&self.state.state_trie, height);
         return height;
     }
 
@@ -232,7 +239,10 @@ const Harness = struct {
     /// the oldest block), then drains the prune queue and checks that exactly the nodes of
     /// the oldest block's trie remain at or before it (deleted paths are freed).
     fn sweep(self: *Harness) !void {
-        try testing.expect(try self.store.check_metadata() > 0);
+        // At least the head's nodes (the state holds the head; hashing applies its pending
+        // account writes to the trie); an empty state has none.
+        _ = try self.state.state_root();
+        try testing.expect(try self.store.check_metadata() >= state_nodes(&self.state));
         const window = self.store.window().?;
         var number = window.head;
         while (true) : (number -= 1) {
@@ -282,6 +292,87 @@ test "history: proofs at every block of the window match an unwound state" {
     for (0..2) |seed| try run_seed(0x415700 + seed);
 }
 
+/// One seeded workload over a random store shape: window, prune budget (a small one keeps a
+/// prune queue across blocks), and on a near-full state sometimes a byte budget that
+/// shrinks the window. Random blocks and reorgs; every commit checks the head view against
+/// the live trie (`Harness.commit_writes`). Nothing flushes the trie between a reorg and
+/// the next block's writes, so the unwind and the writes reach the trie together (the
+/// coalescing `Store.unwind_to` must materialize). `sweep` ends one seed in four: proofs
+/// at every block of the window, then the pruned base.
+fn run_workload_seed(seed: u64) !void {
+    var prng = Prng.init(seed);
+    const window: u32 = @intCast(prng.range(2, window_blocks));
+    const prune: u32 = if (prng.chance(1, 2)) block_versions_max else @intCast(prng.range(1, 64));
+    var harness: Harness = undefined;
+    try harness.init(sized_config(window, prune));
+    defer harness.deinit();
+    const full_state = prng.chance(1, 3);
+    const writes: u64 = if (full_state) addresses_max * slots_max else prng.range(1, 40);
+    for (0..writes) |_| try random_write(&prng, &harness.overlay);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    try harness.store.reset(&harness.state.state_trie, 0);
+    if (full_state and prng.chance(1, 2)) {
+        harness.store.config.bytes_max = harness.store.bytes_used() * prng.range(2, 3);
+    }
+    var head: u64 = 0;
+    const blocks = prng.range(8, 40);
+    for (0..blocks) |_| {
+        const oldest = harness.store.window().?.oldest;
+        if (head > oldest and prng.chance(1, 4)) {
+            head = try harness.reorg(&prng, head);
+            continue;
+        }
+        head += 1;
+        try workload_commit(&harness, &prng, head);
+        const index = prng.below(addresses_max + 1);
+        try expect_matches_live(&harness.store, &harness.state, head, index, harness.proofs);
+        if (harness.store.config.bytes_max) |bytes_max| {
+            try testing.expect(harness.store.usage().bytes <= bytes_max);
+        }
+    }
+    const current = harness.store.window().?;
+    try testing.expectEqual(head, current.head);
+    try testing.expect(current.head - current.oldest < window);
+    if (prng.chance(1, 4)) try harness.sweep();
+}
+
+/// `Harness.commit`, except that a head state above the byte budget (`HistoryFull` after the
+/// window shrank to the head) is handled like the database does: history restarts at the
+/// head, here under a doubled budget.
+fn workload_commit(harness: *Harness, prng: *Prng, number: u64) !void {
+    harness.commit(prng, number) catch |err| {
+        const bytes_max = harness.store.config.bytes_max orelse return err;
+        if (err != error.HistoryFull) return err;
+        try testing.expectEqual(number, harness.store.window().?.head);
+        try testing.expectEqual(number, harness.store.window().?.oldest);
+        harness.store.config.bytes_max = 2 * bytes_max;
+        try harness.store.reset(&harness.state.state_trie, number);
+    };
+}
+
+/// Seeds per run: Debug keeps the suite fast; optimized builds (`just fuzz-soak`, long
+/// fuzz) run eight times as many, times the soak factor.
+const workload_seeds: u32 = (if (builtin.mode == .debug) 32 else 256) * fuzz.soak_factor;
+
+test "history: seeded workload fuzz (reorgs, prune budgets, byte budget)" {
+    // Without the `unwind_to` hash, 0x5aa6 fails at its first commit after a reorg.
+    for (0..workload_seeds) |index| {
+        const seed = (0x5a9e + index) ^ fuzz.soak_seed;
+        run_workload_seed(seed) catch |err| {
+            std.debug.print("history workload: failing seed=0x{x}\n", .{seed});
+            return err;
+        };
+    }
+}
+
+fn fuzz_workload(_: void, smith: *testing.Smith) anyerror!void {
+    try run_workload_seed(smith.value(u64));
+}
+
+test "history: fuzz workload (reorgs, prune budgets, byte budget)" {
+    try testing.fuzz({}, fuzz_workload, .{});
+}
+
 test "history: window edges and errors" {
     var prng = Prng.init(0xed6e);
     var harness: Harness = undefined;
@@ -290,7 +381,8 @@ test "history: window edges and errors" {
     var proof: StateTrie.AccountProof = .{};
     const address = address_of(1);
     try testing.expectError(error.NotInitialized, harness.store.prove_account(0, address, &proof));
-    try testing.expectError(error.NotInitialized, harness.store.unwind_to(0));
+    const state_trie = &harness.state.state_trie;
+    try testing.expectError(error.NotInitialized, harness.store.unwind_to(state_trie, 0));
     for (0..20) |_| try random_write(&prng, &harness.overlay);
     _ = try harness.overlay.commit(harness.changeset(0));
     // Start the window at block 5: earlier blocks were never recorded.
@@ -311,9 +403,57 @@ test "history: window edges and errors" {
         harness.store.prove_account(window.oldest - 1, address, &proof),
     );
     _ = try harness.store.prove_account(window.oldest, address, &proof);
-    try testing.expectError(error.BlockOutOfWindow, harness.store.unwind_to(window.oldest - 1));
-    try testing.expectError(error.BlockOutOfWindow, harness.store.unwind_to(head + 1));
+    try testing.expectError(error.BlockOutOfWindow, store.unwind_to(state_trie, window.oldest - 1));
+    try testing.expectError(error.BlockOutOfWindow, store.unwind_to(state_trie, head + 1));
     try expect_matches_live(&harness.store, &harness.state, head, 1, harness.proofs);
+}
+
+/// Two harness addresses whose hashed keys share the first nibble: the second one's leaf
+/// pushes the first one's leaf one level down (a branch at that nibble replaces it).
+fn sibling_addresses() [2]usize {
+    var first_by_nibble: [16]?usize = @splat(null);
+    for (0..addresses_max) |index| {
+        const nibble = trie.node.keccak256(&address_of(index))[0] >> 4;
+        if (first_by_nibble[nibble]) |first| return .{ first, index };
+        first_by_nibble[nibble] = index;
+    }
+    unreachable; // 24 addresses over 16 nibbles: two share one.
+}
+
+fn expect_head_matches(harness: *Harness) !void {
+    const nodes = try harness.store.check_head(&harness.state.state_trie);
+    try testing.expectEqual(@as(u64, state_nodes(&harness.state)), nodes);
+}
+
+test "history: a reorg that re-creates an account rewrites the leaf it moves" {
+    // Block 1 creates B next to A (A's leaf moves under a new branch); the reorg back to
+    // block 0 deletes B (A's leaf moves back up); block 1' creates B again. The trie defers
+    // account writes, so without a materialized unwound trie the delete and the re-create
+    // coalesce into one put: A's leaf never moves in the trie, is never rehashed, and
+    // block 1' has no version at its path (bury_frames later failed with HistoryCorrupt).
+    var harness: Harness = undefined;
+    try harness.init(history_config);
+    defer harness.deinit();
+    const pair = sibling_addresses();
+    const account: AccountInfo = .{ .nonce = 1, .balance = 7 };
+    try harness.overlay.set_account(address_of(pair[0]), account);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    try harness.store.reset(&harness.state.state_trie, 0);
+    for (0..2) |_| {
+        try harness.overlay.set_account(address_of(pair[1]), account);
+        _ = try harness.overlay.commit(harness.changeset(1));
+        try harness.store.commit_block(&harness.state.state_trie, 1);
+        try expect_head_matches(&harness);
+        try harness.state.unwind(harness.changeset(1));
+        try harness.store.unwind_to(&harness.state.state_trie, 0);
+    }
+    try harness.overlay.set_account(address_of(pair[1]), account);
+    _ = try harness.overlay.commit(harness.changeset(1));
+    try harness.store.commit_block(&harness.state.state_trie, 1);
+    try expect_head_matches(&harness);
+    for (pair) |index| {
+        try expect_matches_live(&harness.store, &harness.state, 1, index, harness.proofs);
+    }
 }
 
 test "history: a full store refuses the block and keeps its head" {
@@ -929,8 +1069,8 @@ fn run_range_seed(seed: u64, blocks: u32, coverage: *RangeCoverage) !void {
 
 test "history: storage ranges at every block of the window match an unwound state" {
     var coverage: RangeCoverage = .{};
-    // Seeds 0x5a9f and 0x5aa3 hit a pre-existing `commit_block` HistoryCorrupt (lane backlog).
-    for ([_]u64{ 0x5a9e, 0x5aa0 }) |seed| try run_range_seed(seed, blocks_total, &coverage);
+    // 0x5a9f and 0x5aa3 hit the reorg coalescing bug (`Store.unwind_to`) before the fix.
+    for (0..6) |index| try run_range_seed(0x5a9e + index, blocks_total, &coverage);
     try testing.expect(coverage.unknown > 0);
     try testing.expect(coverage.empty > 0);
     try testing.expect(coverage.truncated > 0);

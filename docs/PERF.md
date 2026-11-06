@@ -1133,6 +1133,21 @@ it re-recovers every sender (parallel recovery threads starve under this load) a
 re-executes the block (see the builder lane's Engine API decision); a direct commit of the
 builder's state, or handing the builder's known senders to the import, would remove most of it.
 
+## 2026-11-06 db history: reorg cost of hashing the unwound trie (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/history`, same state and blocks as "db history
+commit at 200 ms blocks". `history.Store.unwind_to` now hashes the unwound trie (the reorg
+fix, see the trie-db lane), timed after `State.unwind` of one block, 16 samples:
+
+| Case | `unwind_to` p50 | max | commit p50 (same run) |
+| --- | ---: | ---: | ---: |
+| typical 1k acct + 1k slot | 2.83 ms | 3.07 ms | 3.02 ms |
+| heavy 1k acct + 4k slot | 4.50 ms | 4.86 ms | 4.88 ms |
+
+Before, the unwound paths were hashed once, together with the next block's writes. Now they
+are hashed at the reorg, and paths the next block touches again are hashed twice, so the
+added cost per reorg is at most the `unwind_to` time above. Reorgs are rare next to commits.
+
 ## Test suite time
 
 `zig build test` runs on every push of every lane, so its wall time is a shared budget.

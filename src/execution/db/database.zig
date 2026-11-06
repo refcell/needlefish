@@ -1231,7 +1231,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 try self.flat_write(false);
             }
             if (store) |tracked| if (self.plan.unwind_len > 0) {
-                tracked.unwind_to(self.plan.ancestor.number) catch {
+                tracked.unwind_to(&self.state.state_trie, self.plan.ancestor.number) catch {
                     self.history_stale = true;
                 };
             };

@@ -916,7 +916,7 @@ pub const Chain = struct {
             if (number == window.head + 1 and chain.history_extends(header_now)) {
                 if (store.commit_block(chain.db.trie(), number)) |_| return else |_| {}
             } else if (number <= window.head and chain.history_has(number, root)) {
-                if (store.unwind_to(number)) |_| return else |_| {}
+                if (store.unwind_to(chain.db.trie(), number)) |_| return else |_| {}
             }
         }
         chain.history_resets += 1;

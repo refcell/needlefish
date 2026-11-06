@@ -181,12 +181,22 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`history.Store.storage_range`), surfaced as `Database.storage_range_at`.
   (`trie/storage_range_test.zig`, history/database differentials; range of 256 on a 10k-slot
   account: head 26-29 µs, history 84-90 µs; docs/PERF.md "db storage range"; see Decisions)
-- [ ] `history.Store.commit_block` returns `HistoryCorrupt` from `bury_frames` (an old path
+- [x] `history.Store.commit_block` returns `HistoryCorrupt` from `bury_frames` (an old path
   has no version at `number - 1`) on some seeds of the `history_test.zig` harness workload
-  with reorgs: `run_seed`-style loops over seeds 0x5a9e + i hit it at i = 24 and 42 (also
-  0x5a9f and 0x5aa3 in the storage-range test's prng stream). Found by the storage-range
-  test, present on main before it; reproduce with the harness loop (40 writes, reset, 32
-  blocks of commits and 1-in-5 reorgs) and fix.
+  with reorgs (storage-range test seeds 0x5a9f and 0x5aa3). Root cause: after a reorg,
+  `StateTrie` coalesced the unwind with the next block's writes (account writes wait in the
+  dirty list until a flush), so nodes that moved at the reorg target but sit where they sat at
+  the old head were never rehashed and the next block missed their versions. Fixed:
+  `Store.unwind_to(state_trie, number)` hashes the unwound trie and asserts its root.
+  (`history: a reorg that re-creates an account rewrites the leaf it moves`, `database
+  history: a move across branches that re-creates an account keeps history`,
+  `Store.check_head` after every harness commit, seeded workload fuzz 32 seeds Debug / 256
+  ReleaseSafe; reorg 1 block 2.8 ms typical, 4.5 ms heavy; see Decisions)
+- [ ] `database_history_test.zig` `run_seed` panics on a null `chain.canonical_hash(number)`
+  in `Harness.expect_matches_live` (the sweep after crash + reopen, `check_rebuilt`) for seeds
+  0x770025 and 0x77002a (`run_seed(0x77_0000 + i, base_config)`, i in 0..64). Not the
+  `unwind_to` bug: same panic with that fix reverted. Find whether the rebuilt window reaches
+  a block the canonical index no longer holds (database) or the harness asks for one.
 - [x] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
   117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
   (version allocation, path index probes, node re-encoding) and cut it, or move it off the
@@ -695,6 +705,31 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   block waiting or falling back) and the extra ordering under DST. Remaining cost: the trie
   re-encodes each visited node and its encoding is copied into a pool slot; taking encodings
   from a trie-side cache would need the trie to keep full encodings.
+- History after a reorg (`history.Store.unwind_to(state_trie, number)`): `commit_block` writes
+  only nodes rehashed since the store's head (the trie's change marks), and `StateTrie` defers
+  account writes to a flush. Before the fix, `unwind_to` took only the number, so the unwind
+  and the next block's writes reached the account trie in one flush. An account the unwind
+  deletes and the block re-creates became one put, and an account the unwind creates and the
+  block deletes became nothing. The neighbours those moved at the target block (a leaf pushed
+  under a new branch, or pulled back up) sat where they sat at the old head, were never
+  rehashed, and the next block got no version at their new path (or no tombstone at the old
+  one). A later diff walked into the stale path: `bury_frames` `HistoryCorrupt`, and the
+  database dropped and rebuilt history. `Database.move_state` (unwind, `unwind_to`, apply,
+  no root in between) and `Chain.move_state` without a journal (rollback, `sync_history`,
+  re-execute) both did this. `unwind_to` now hashes the unwound trie, so the moves are applied
+  and marked before any new write. It also asserts that the root equals the stored root of
+  `number`, because the marks are a diff against `number` only when the trie holds it.
+  Chosen over a full `.all` diff on the first commit after a reorg (O(state) per reorg) and
+  over flushing in `State.unwind` (a storage rehash per unwound block, also on a trie-unwind
+  rebuild at open). Cost: one rehash of the unwound paths per reorg, 2.8 ms (typical) and
+  4.5 ms (heavy) for a one-block reorg; the next commit hashes only its own writes.
+  Detection: `Store.check_head` (tests) checks the head view against the live trie (every
+  live node at its path with its encoding, no other live path), after every harness commit.
+  It catches a missed version at the commit that loses it, where `bury_frames` only failed
+  blocks later. The seeded workload fuzz (random window, prune budget, byte budget, reorgs
+  with no flush before the next writes) runs 32 seeds in Debug, 256 times the soak factor
+  optimized, plus `std.testing.fuzz`. Without the fix, 0x5aa6 fails at its first commit after
+  a reorg.
 - Multi-key historical proofs (`db/proof_set.zig`, `history.Store.get_proofs`): one account
   walk, then the slots are hashed, sorted and deduplicated into a caller-owned `ProofSet`
   and the storage trie is walked once (`Store.walk_frames`, the depth-first core now shared
@@ -1382,3 +1417,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   head/older/out-of-window/no-history cases, and coverage fuzz on both walkers. Bench (range of
   256 on a 10k-slot account): head 26-29 µs, history 84-90 µs. The test found a
   `commit_block` `HistoryCorrupt` on some harness seeds that was already on main (backlog).
+- 2026-11-06: fixed history `HistoryCorrupt` after reorgs: `Store.unwind_to` takes the state
+  trie, hashes the unwound trie (the unwind and the next block's writes used to coalesce in
+  the trie's deferred account writes, hiding moved nodes from the next commit), and asserts
+  its root. One-line callers in `Database.move_state` and `node/chain.zig`. Tests: minimal
+  store reorg (A, B under one nibble; B created, reorged away, created again), database move
+  across sibling blocks, `Store.check_head` after every harness commit, seeded workload fuzz
+  (32 Debug / 256 ReleaseSafe seeds, 2048 x 2 soak seeds clean), storage-range test on all 6
+  seeds. Bench: reorg 1 block `unwind_to` p50 2.83 ms typical, 4.50 ms heavy. Found a
+  separate database-harness panic on two seeds (backlog).

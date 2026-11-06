@@ -641,6 +641,52 @@ test "database history: proofs at every block of the window across reorgs and re
     };
 }
 
+/// Two harness addresses whose hashed keys share the first nibble.
+fn sibling_addresses() [2]u64 {
+    var first_by_nibble: [16]?u64 = @splat(null);
+    for (0..addresses_max) |index| {
+        const nibble = trie.node.keccak256(&address_of(index))[0] >> 4;
+        if (first_by_nibble[nibble]) |first| return .{ first, index };
+        first_by_nibble[nibble] = index;
+    }
+    unreachable; // 24 addresses over 16 nibbles: two share one.
+}
+
+test "database history: a move across branches that re-creates an account keeps history" {
+    // Genesis holds A; block X and its sibling X' (both number 1) create B next to A, which
+    // moves A's leaf under a new branch. Moving the head from X' to X unwinds X' (B goes,
+    // A's leaf moves back up), unwinds history to genesis, and applies X (B again) with no
+    // root in between: before `Store.unwind_to` hashed the unwound trie, the trie coalesced
+    // the delete and the re-create, A's leaf never moved or rehashed, and history at X had
+    // no node at its path (later commits failed with HistoryCorrupt and dropped history).
+    const h = try Harness.create(0x5ab6, base_config);
+    defer h.destroy();
+    h.db.format(0x4157_0000);
+    try h.tick_until(Harness.not_formatting);
+    try h.open();
+    const pair = sibling_addresses();
+    try h.overlay.set_account(address_of(pair[0]), .{ .balance = 1 });
+    const genesis = hash_of(h.block_id_next);
+    try h.commit(@splat(0), 0);
+    for (0..2) |_| {
+        h.overlay.discard();
+        try h.overlay.set_account(address_of(pair[1]), .{ .balance = 2 });
+        try h.commit(genesis, 1);
+        _ = try h.db.set_head(genesis);
+        try h.tick_until(Harness.idle);
+    }
+    // Head: genesis; X = block id 1, X' = block id 2. Head to X', then across to X.
+    _ = try h.db.set_head(hash_of(2));
+    try h.tick_until(Harness.idle);
+    _ = try h.db.set_head(hash_of(1));
+    try h.tick_until(Harness.idle);
+    try testing.expectEqual(@as(u64, 0), h.db.history_drops);
+    const store = &h.db.history.?;
+    try testing.expectEqual(@as(u64, 1), store.window().?.head);
+    _ = try store.check_head(&h.db.state.state_trie);
+    for (pair) |index| try h.expect_matches_live(1, index);
+}
+
 test "database history: a reopen rebuilds only the blocks retention keeps" {
     var config = base_config;
     // Fewer retained blocks than the window: the rebuilt window is bounded by retention.

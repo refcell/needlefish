@@ -65,7 +65,13 @@ pub const Result = struct {
     budget_bytes: u64,
     budget_window_min: u64,
     budget_shrinks: u64,
+    /// One-block reorg: `unwind_to` after `State.unwind` (hashes the unwound trie).
+    reorg_ns_p50: u64,
+    reorg_ns_max: u64,
 };
+
+/// One-block reorgs timed per case.
+const reorg_samples = 16;
 
 const Fixture = struct {
     state: State,
@@ -177,9 +183,33 @@ pub fn measure(io: std.Io, allocator: std.mem.Allocator, shape: Shape, window: u
         .budget_bytes = state_bytes + (steady_bytes - state_bytes) / 2,
         .budget_window_min = window,
         .budget_shrinks = 0,
+        .reorg_ns_p50 = 0,
+        .reorg_ns_max = 0,
     };
+    try measure_reorg(io, fixture, &result, number);
     try measure_budget(io, fixture, &result, number);
     return result;
+}
+
+/// Commits block `head + 1`, unwinds the state back to `head`, and times the history
+/// `unwind_to(head)`: popping one block plus the root of the unwound trie (the extra cost
+/// of a reorg; the next commit rehashes only its own writes). Ends at `head`.
+fn measure_reorg(io: std.Io, fixture: *Fixture, result: *Result, head: u64) !void {
+    var samples: [reorg_samples]u64 = undefined;
+    for (&samples) |*sample| {
+        _ = try fixture.commit(io, head + 1);
+        try fixture.state.unwind(&fixture.changeset);
+        const start = bench.now_ns(io);
+        try fixture.store.unwind_to(&fixture.state.state_trie, head);
+        const end = bench.now_ns(io);
+        assert(end >= start);
+        sample.* = end - start;
+    }
+    assert(fixture.store.window().?.head == head);
+    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+    result.reorg_ns_p50 = samples[reorg_samples / 2];
+    result.reorg_ns_max = samples[reorg_samples - 1];
+    assert(result.reorg_ns_p50 <= result.reorg_ns_max);
 }
 
 /// Commits one more window under `result.budget_bytes`; records the shortest window.
@@ -394,6 +424,14 @@ fn print(name: []const u8, result: *const Result) void {
             result.budget_shrinks,
         },
     );
+    std.debug.print(
+        "{s:<44} reorg 1 block: unwind_to p50 {d:.2} ms max {d:.2} ms\n",
+        .{
+            name,
+            @as(f64, @floatFromInt(result.reorg_ns_p50)) / 1e6,
+            @as(f64, @floatFromInt(result.reorg_ns_max)) / 1e6,
+        },
+    );
 }
 
 /// `debug_storageRangeAt(contract, random start, 256)` on one account with `slots` slots: the
@@ -558,6 +596,7 @@ test "history bench: steady state and budget (small shape)" {
     try std.testing.expect(result.state_nodes > 0);
     try std.testing.expect(result.budget_window_min < window);
     try std.testing.expect(result.budget_shrinks > 0);
+    try std.testing.expect(result.reorg_ns_p50 <= result.reorg_ns_max);
     for (cases) |case| try std.testing.expect(bench.matches(case.name, "db/history"));
 }
 
