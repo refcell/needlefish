@@ -184,6 +184,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   single commit stalls. Crash tests must still pass.
   (`db/steady_bench.zig`; serialization 2-6 ms, no 50 ms stall attributable to it; checkpoint
   writes bounded per commit with `checkpoint_bytes_per_commit`, node 4 MiB; see Decisions)
+- [ ] Rerun `db/commit steady` (os backend, paced vs unpaced, interleaved) on a quiet machine
+  and under `just test-linux` io_uring; confirm or revert the 4 MiB checkpoint pacing default.
+- [ ] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
+  (checkpoint load, journal replay, trie rebuild from flat tables, history rebuild-on-open
+  over a 300-block window, path index fill); cut the dominant step (e.g. batched rehash on
+  load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
+- [ ] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
+  typical and heavy blocks end to end through rpc; provers poll every block, so keep it well
+  under the slot (history-sourced path, no state disturbance).
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
