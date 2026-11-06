@@ -1510,3 +1510,6 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   state, 2 seeds x 3 crash/reopen cycles each; digest of window, usage, prune queue, proofs
   of every address at every block); mutation `>` -> `>=` in the shrink check fails it.
 - 2026-11-06: address_map: u160 equality context for the db account maps (lookup ~25% faster).
+- 2026-11-06: paused (project paused by owner). Phase 2b rest (flat_trees: checkpoint without flat
+  tables, open rebuild from trees) is unfinished and untested on local branch
+  `wip/flat-trees-phase2b` (dfd9449e, base 1c2362e9); resume from there.
