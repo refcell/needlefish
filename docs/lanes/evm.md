@@ -256,9 +256,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
 - [x] Performance: `reciprocal` is now a 256-entry seed table plus Newton steps (intx's
   `reciprocal_2by1`) instead of a `__udivti3` call; exact against the u128 division on
   100k random divisors and the edges. mulmod+div loop 150 -> 144 us.
-- [ ] Fuzz: MODEXP precompile against a simple square-and-multiply model over random
-  base/exponent/modulus lengths (including zero-length and leading-zero inputs) plus the
-  EIP-2565/7883 gas formula.
+- [x] Fuzz: MODEXP precompile (`modexp_fuzz.zig`): output vs a u512 square-and-multiply
+  model over random 0..64-byte base/exponent and 0..32-byte modulus (leading zeros, zero
+  lengths, zero/one moduli) at Byzantium/Berlin/Osaka; one gas short of the charge fails
+  with all gas consumed. Gas formulas stay covered by crypto-lane vectors and EEST.
 - [ ] Vectors: P256VERIFY (RIP-7212, used on Base) against the public Wycheproof
   ecdsa_secp256r1_sha256 vectors (fetched into `.cache`), checking the 32-byte output and
   the fixed gas.

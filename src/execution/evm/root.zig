@@ -42,6 +42,7 @@ test {
     _ = @import("sstore_fuzz.zig");
     _ = @import("create_fuzz.zig");
     _ = @import("journal_fuzz.zig");
+    _ = @import("modexp_fuzz.zig");
     _ = @import("tx_check.zig");
 }
 
