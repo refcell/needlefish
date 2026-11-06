@@ -219,13 +219,11 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   writes bounded per commit with `checkpoint_bytes_per_commit`, node 4 MiB; see Decisions)
 - [x] Rerun `db/commit steady` (os backend, paced vs unpaced, interleaved) on a quiet machine
   and under `just test-linux` io_uring; confirm or revert the 4 MiB checkpoint pacing default.
-- [x] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
   (kept 4 MiB: neutral on kqueue, overlap commits at or below unpaced on io_uring; PERF.md)
-- [ ] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
+- [x] Node restart time: measure `Database.open` end to end at 100k and 1M+ accounts
   (checkpoint load, journal replay, trie rebuild from flat tables, history rebuild-on-open
   over a 300-block window, path index fill); cut the dominant step (e.g. batched rehash on
   load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
-- [x] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
   (`db/restart_bench.zig`; bulk trie build from sorted flat tables and table-only history
   unwind; 1m open 3.0 -> 1.1-1.4 s, with history 9.5 -> 5.8-7.5 s; see Decisions, PERF.md)
 - [ ] History rebuild at open re-applies the whole 300-block window even when the byte budget
@@ -233,7 +231,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   again). Start the rebuild at the window the budget will keep: a rebuild started later
   that still shrinks ends at the same window (the shrink point is the max over blocks of
   the first start that fits), so try a short window and widen it until no shrink happens.
-- [ ] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
+- [x] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
   typical and heavy blocks end to end through rpc; provers poll every block, so keep it well
   under the slot (history-sourced path, no state disturbance).
   (`db/witness_rpc_bench.zig`, `-- "db/witness rpc"`; history reads memoized per call
