@@ -3,6 +3,7 @@
 //!
 //!     base replay import <raw dir> [--out <archive>]   saved JSON-RPC results -> archive
 //!     base replay run [<archive>] [--blocks <n>]       replay offline, report per block
+//!     base replay bench <archive> [<warm runs>]        timing lines (docs/BENCHMARKS.md)
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,9 +12,11 @@ const base = @import("base");
 const replay = base.infra.replay;
 const tui = @import("replay_tui.zig");
 const fetch = @import("replay_fetch.zig");
+const bench = @import("replay_bench.zig");
 
 test {
     _ = fetch;
+    _ = bench;
 }
 const Archive = replay.Archive;
 const assert = std.debug.assert;
@@ -23,9 +26,10 @@ const usage =
     \\usage: base replay fetch [--count <n>] [--from <block>] [--cache <dir>] [--out <archive>]
     \\       base replay import <raw dir> [--out <archive>]
     \\       base replay run [<archive>] [--blocks <n>] [--plain]
+    \\       base replay bench <archive> [<warm runs>]
     \\
 ;
-const file_bytes_max = 1 << 30;
+pub const file_bytes_max = 1 << 30;
 
 pub const archive_config: Archive.Config = .{
     .witness = .{
@@ -51,6 +55,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, args[0], "import")) return import_main(init, args[1..]);
     if (std.mem.eql(u8, args[0], "run")) return run_main(init, args[1..]);
     if (std.mem.eql(u8, args[0], "fetch")) return fetch.main(init, args[1..]);
+    if (std.mem.eql(u8, args[0], "bench")) return bench.main(init, args[1..]);
     std.debug.print("unknown replay command: {s}\n{s}", .{ args[0], usage });
     return 2;
 }
@@ -350,7 +355,7 @@ pub fn check_archive(
 
 /// The replayer limits for `archive`, recovering senders on one worker per spare core (at
 /// most 7) as `base node` does; results do not depend on the worker count.
-fn replayer_config(archive: *const Archive) replay.replayer.Config {
+pub fn replayer_config(archive: *const Archive) replay.replayer.Config {
     var config = replay.replayer.config_for(archive);
     const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
     config.executor.recovery_threads = @min(cores - 1, 7);

@@ -197,6 +197,11 @@ pub const Executor = struct {
     given_senders: ?[]const primitives.Address = null,
     /// Index of the last transaction rejected by `execute_block`.
     invalid_index: ?u32 = null,
+    /// Benchmarks only: when set, `execute_block` records `last_execution_ns`, the time from
+    /// its start to the end of the last transaction (system calls, sender recovery wait,
+    /// execution), before withdrawals, receipts root, commit and state root.
+    phase_clock: ?Clock = null,
+    last_execution_ns: u64 = 0,
     /// Owns the state cache's tables (`fit_state` reallocates them).
     allocator: std.mem.Allocator,
     /// The limits the state cache was configured with (`Config.limits`).
@@ -290,9 +295,11 @@ pub const Executor = struct {
         const next = executor.next_transactions;
         executor.next_transactions = null;
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        const start_ns = if (executor.phase_clock) |clock| clock.read() else 0;
         var building = try executor.begin_block(block);
         errdefer executor.abort_block();
         try executor.apply_list(&building, transactions);
+        if (executor.phase_clock) |clock| executor.last_execution_ns = clock.read() -| start_ns;
         // This block's recovery is over: the pool takes the next block's while it commits.
         if (next) |transactions_next| executor.prefetch(transactions_next);
         return executor.finish_block(&building, withdrawals);
