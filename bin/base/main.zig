@@ -18,6 +18,7 @@ const sidecrush = @import("sidecrush.zig");
 const fee_jobs = @import("fee_jobs.zig");
 const roxy = @import("roxy.zig");
 const basectl = @import("basectl.zig");
+const audit = @import("audit.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -40,6 +41,7 @@ const usage =
     \\  fee-jobs  one-shot fee jobs: disburse, process, sweep
     \\  roxy       JSON-RPC reverse proxy: load balancing, retries, method allowlist
     \\  basectl    operator commands: sync-status, block, txpool, doctor, ...
+    \\  audit      transaction-event audit archiver: Vector ingest, JSON-RPC queries
     \\
 ;
 
@@ -59,6 +61,7 @@ test {
     _ = fee_jobs;
     _ = roxy;
     _ = basectl;
+    _ = audit;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -123,6 +126,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "basectl")) {
         std.process.exit(try basectl.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "audit")) {
+        std.process.exit(try audit.main(init, args[2..]));
     }
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);
