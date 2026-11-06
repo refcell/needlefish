@@ -9,6 +9,7 @@ pub const best_txs = @import("best_txs.zig");
 pub const builder = @import("builder.zig");
 pub const service = @import("service.zig");
 pub const node_builder = @import("node_builder.zig");
+pub const bench = @import("bench.zig");
 
 test {
     std.testing.refAllDecls(@This());

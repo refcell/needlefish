@@ -628,6 +628,33 @@ noise, so it was not kept), Keccak-f ~2%, memmove/memset ~1%. No call-frame cost
 snailtracer makes almost no calls. The call-frame path is covered by `evm: call loop`
 (~117 ns per frame push/pop).
 
+## 2026-11-05 builder slot at full gas (aarch64-macos, Apple Silicon, 14 cores, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- builder:` (`src/builder/core/bench.zig`). Each
+200 ms slot goes through the payload `Service` and `BlockBuilder`: `send_new_payload` (FCU
+with attributes), the build tick (L1-info + BaseTime deposits, then best pool transactions
+until the gas limit, the pool end, or the 150 ms cutoff on the real clock), and `resolve`
+(getPayload). The pool holds one transaction per sender: 3000 transfers (tip 1) and 64 calls
+into a contract writing 16 storage slots each (tip 2, ~102k gas steady state), more than one
+60 M gas block. The sequencer then imports its own block (newPayload + FCU, timed apart) and
+the pool is refilled outside the clock. 4 warm-up slots, 64 measured (p99 = max).
+
+| Metric | p50 | p99 / max |
+| --- | ---: | ---: |
+| FCU..getPayload, thread CPU | 19.8 ms | 26.6 ms |
+| FCU..getPayload, wall | 21.0 ms | 259 ms |
+| import (newPayload + FCU), wall | 55.4 ms | 313 ms |
+| transactions / block | 2610 | 2610 |
+| gas / block | 59.99 M | 59.99 M |
+
+Load average was 140-160 on 14 cores (other agents), so wall times include waiting for a
+core: the CPU column is the build cost (~7.6 us per transaction, single-threaded), well under
+the 150 ms cutoff; no slot was cut off. Same run, `node: 200 ms slot ... 500 transfers` read
+11.5 ms (b78026d4 recorded 11.7 ms). The sequencer's self-import costs more than the build:
+it re-recovers every sender (parallel recovery threads starve under this load) and
+re-executes the block (see the builder lane's Engine API decision); a direct commit of the
+builder's state, or handing the builder's known senders to the import, would remove most of it.
+
 ## Test suite time
 
 `zig build test` runs on every push of every lane, so its wall time is a shared budget.

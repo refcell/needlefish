@@ -27,4 +27,5 @@ pub fn main(init: std.process.Init) !void {
     bench.run_cases(init.io, base.execution.node.bench.cases, filter);
     bench.run_cases(init.io, base.execution.node.bench_engine.cases, filter);
     bench.run_cases(init.io, base.consensus.p2p.bench.cases, filter);
+    base.builder.core.bench.run(init.io, filter);
 }

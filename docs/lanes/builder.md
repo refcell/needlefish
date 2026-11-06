@@ -41,7 +41,7 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
 - [ ] DST: builder in the cluster simulator at 200 ms blocks; invariants: every slot gets
   exactly one block (or an explained skip), sealed blocks replay identically on the
   verifier, no getPayload ever waits past the slot end.
-- [ ] Benchmarks: build+seal latency per 200 ms slot at full gas limit; target well under
+- [x] Benchmarks: build+seal latency per 200 ms slot at full gas limit; target well under
   the 150 ms cutoff. Record in docs/PERF.md.
 
 ## Decisions
@@ -131,3 +131,6 @@ Reference: base/base `crates/consensus/protocol/src/timing.rs`, `crates/common/g
   until gas/DA budget, pool end, or the injected-clock cutoff; sealed block hash-equals a
   `Chain` build), `timing` reworked to 200 ms slots + 150 ms seal offset (ports base/base
   `block_seal_target` tests), `Service` FCU/tick/resolve; seeded + `std.testing.fuzz` tests.
+- 2026-11-05: builder slot bench (`builder:`): FCU+build+seal+getPayload at a full 60 M gas
+  block (3000 transfers + 64 storage-heavy calls pooled), 2610 txs/block, 19.8 ms p50 / 26.6 ms
+  p99 thread CPU; recorded in docs/PERF.md.
