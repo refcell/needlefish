@@ -33,5 +33,6 @@ test {
     _ = @import("journal_test.zig");
     _ = @import("table_test.zig");
     _ = @import("engine_test.zig");
+    _ = @import("engine_grid_test.zig");
     _ = @import("io_storage_test.zig");
 }

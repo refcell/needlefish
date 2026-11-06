@@ -5,6 +5,7 @@
 //!   [A, A + checkpoint)     checkpoint zone A
 //!   [B, B + checkpoint)     checkpoint zone B
 //!   [J, J + journal)        journal ring
+//!   [G, G + grid)           grid blocks (optional, `Config.grid_block_count`)
 //!
 //! Protocol:
 //! - `commit(body, metadata)` appends a journal entry; the callback fires once it is durable.
@@ -43,6 +44,16 @@
 //! synced, and the journal releases nothing before then. Pacing only lengthens the window in
 //! which the fallback zone holds a partial checkpoint (only the newest is recoverable).
 //!
+//! Grid: callers write immutable blocks (tables) into the grid and name them in their own
+//! checkpoint bytes. The engine owns the free set and records it in every checkpoint, ahead
+//! of the producer's bytes: `checkpoint` snapshots it (`FreeSet.checkpoint_begin`), the
+//! durable superblock frees what no retained checkpoint references (`checkpoint_durable`),
+//! a failed checkpoint undoes the snapshot (`checkpoint_abort`), and open restores it from
+//! the checkpoint it loads (the fallback's own free set after a fallback). Grid writes that
+//! a checkpoint names must have completed before `checkpoint` is called, so the checkpoint's
+//! final sync makes them durable before the superblock names them. A grid block is checked
+//! when it is read (`grid.zig`); rot in one is not survived by the checkpoint fallback.
+//!
 //! Concurrency: one commit and one checkpoint may run at the same time. A checkpoint cannot
 //! start while a commit is in flight, so its snapshot covers exactly the entries committed
 //! before `checkpoint()` was called; the producer must keep serving that snapshot while later
@@ -56,6 +67,8 @@ const checksum_module = @import("checksum.zig");
 const superblock_module = @import("superblock.zig");
 const journal_module = @import("journal.zig");
 const checkpoint_module = @import("checkpoint.zig");
+const grid_module = @import("grid.zig");
+const free_set_module = @import("free_set.zig");
 
 const sector_size = storage.sector_size;
 const SuperBlock = superblock_module.SuperBlock;
@@ -66,12 +79,15 @@ pub const StopReason = journal_module.StopReason;
 pub const Producer = checkpoint_module.Producer;
 pub const metadata_size = superblock_module.commit_metadata_size;
 pub const Metadata = [metadata_size]u8;
+pub const FreeSet = free_set_module.FreeSet;
 
 pub const Config = struct {
     journal_size_bytes: u64,
     checkpoint_zone_size_bytes: u64,
     entry_body_size_max: u32,
     checkpoint_block_size: u32 = 64 * 1024,
+    /// Grid blocks of `checkpoint_block_size` after the journal; zero means no grid.
+    grid_block_count: u64 = 0,
 
     pub fn layout(config: Config) superblock_module.Layout {
         return .{
@@ -79,6 +95,7 @@ pub const Config = struct {
             .journal_size_bytes = config.journal_size_bytes,
             .checkpoint_block_size = config.checkpoint_block_size,
             .entry_body_size_max = config.entry_body_size_max,
+            .grid_block_count = config.grid_block_count,
         };
     }
 
@@ -91,9 +108,13 @@ pub const Config = struct {
         return config.checkpoint_zone_offset(1) + config.checkpoint_zone_size_bytes;
     }
 
+    pub fn grid_offset(config: Config) u64 {
+        return config.journal_offset() + config.journal_size_bytes;
+    }
+
     /// The storage size this layout needs.
     pub fn size_bytes(config: Config) u64 {
-        return config.journal_offset() + config.journal_size_bytes;
+        return config.grid_offset() + config.grid_block_count * config.checkpoint_block_size;
     }
 };
 
@@ -146,6 +167,7 @@ pub fn EngineType(comptime Storage: type) type {
         pub const SuperBlockType = superblock_module.SuperBlockType(Storage);
         pub const JournalType = journal_module.JournalType(Storage);
         pub const CheckpointType = checkpoint_module.CheckpointType(Storage);
+        pub const Grid = grid_module.GridType(Storage);
         pub const Callback = *const fn (*Self) void;
         pub const Phase = enum {
             closed,
@@ -187,6 +209,15 @@ pub fn EngineType(comptime Storage: type) type {
         checkpoint_start: JournalStart = undefined,
         checkpoint_tail: u64 = 0,
         checkpoint_metadata: Metadata = @splat(0),
+        /// The grid and its free set (null without a grid). `free_set_image` holds the free
+        /// set's checkpoint bytes: written at a checkpoint's snapshot point and streamed
+        /// ahead of the producer's bytes, or filled from the checkpoint at open.
+        grid: ?Grid = null,
+        free_set: ?FreeSet = null,
+        free_set_image: []u8 = &.{},
+        free_set_position: u64 = 0,
+        free_set_invalid: bool = false,
+        checkpoint_producer: ?Producer = null,
 
         pub fn init(allocator: std.mem.Allocator, storage_: *Storage, config: Config) !Self {
             assert(config.size_bytes() <= storage_.size_bytes());
@@ -207,13 +238,32 @@ pub fn EngineType(comptime Storage: type) type {
                 .zone_size_bytes = config.checkpoint_zone_size_bytes,
                 .block_size = config.checkpoint_block_size,
             });
-            return .{
+            var self: Self = .{
                 .storage = storage_,
                 .config = config,
                 .superblock = superblock,
                 .journal = journal,
                 .checkpoint_io = checkpoint_io,
             };
+            if (config.grid_block_count > 0) try self.init_grid(allocator);
+            return self;
+        }
+
+        fn init_grid(self: *Self, allocator: std.mem.Allocator) !void {
+            const config = self.config;
+            assert(config.grid_block_count > 0);
+            self.grid = Grid.init(self.storage, .{
+                .zone_offset = config.grid_offset(),
+                .block_size = config.checkpoint_block_size,
+                .block_count = config.grid_block_count,
+            });
+            self.free_set = try FreeSet.init(allocator, config.grid_block_count);
+            errdefer self.free_set.?.deinit(allocator);
+            const image_size = self.free_set.?.encoded_size();
+            // The free set must fit a checkpoint zone with room to spare for the caller.
+            assert(image_size < config.checkpoint_zone_size_bytes / 2);
+            self.free_set_image = try allocator.alloc(u8, @intCast(image_size));
+            @memset(self.free_set_image, 0);
         }
 
         /// Frees memory. Operations may be in flight only if the storage dropped them (crash).
@@ -221,6 +271,10 @@ pub fn EngineType(comptime Storage: type) type {
             self.superblock.deinit(allocator);
             self.journal.deinit(allocator);
             self.checkpoint_io.deinit(allocator);
+            if (self.free_set) |*free_set| {
+                free_set.deinit(allocator);
+                allocator.free(self.free_set_image);
+            }
             self.* = undefined;
         }
 
@@ -253,6 +307,7 @@ pub fn EngineType(comptime Storage: type) type {
             superblock.journal_start_previous = superblock.journal_start;
             superblock.layout = self.config.layout();
             self.superblock.working = superblock_module.zero();
+            if (self.grid) |*grid| grid.format_id = format_id;
             self.phase = .formatting;
             self.phase_callback = callback;
             self.superblock.write_superblock(superblock, on_superblock);
@@ -268,6 +323,7 @@ pub fn EngineType(comptime Storage: type) type {
             self.consumer = consumer;
             self.superblock_repaired = false;
             self.open_fallback = false;
+            self.free_set_reset();
             self.superblock.open(on_superblock);
         }
 
@@ -324,11 +380,14 @@ pub fn EngineType(comptime Storage: type) type {
             self.checkpoint_metadata = self.commit_metadata;
             self.checkpoint_phase = .writing;
             self.checkpoint_callback = callback;
+            self.checkpoint_producer = producer;
+            self.free_set_position = 0;
+            if (self.free_set) |*free_set| free_set.checkpoint_begin(self.free_set_image);
             self.checkpoint_io.write_start_paced(
                 working.format_id,
                 zone,
                 working.checkpoint.sequence + 1,
-                producer,
+                .{ .context = self, .produce = produce_checkpoint },
                 blocks_allowed,
                 on_checkpoint_io,
             );
@@ -347,6 +406,29 @@ pub fn EngineType(comptime Storage: type) type {
         /// True while a paced checkpoint waits for `checkpoint_grant`.
         pub fn checkpoint_paused(self: *const Self) bool {
             return self.checkpoint_phase == .writing and self.checkpoint_io.paused();
+        }
+
+        /// The free set's image first, then the caller's bytes.
+        fn produce_checkpoint(context: *anyopaque, buffer: []u8) u32 {
+            const self: *Self = @ptrCast(@alignCast(context));
+            assert(self.checkpoint_phase == .writing);
+            assert(buffer.len > 0);
+            if (self.free_set_position < self.free_set_image.len) {
+                const rest = self.free_set_image[@intCast(self.free_set_position)..];
+                const chunk = @min(rest.len, buffer.len);
+                @memcpy(buffer[0..chunk], rest[0..chunk]);
+                self.free_set_position += chunk;
+                return @intCast(chunk);
+            }
+            const producer = self.checkpoint_producer.?;
+            return producer.produce(producer.context, buffer);
+        }
+
+        /// Every block free, ready to receive a checkpoint's free set.
+        fn free_set_reset(self: *Self) void {
+            self.free_set_position = 0;
+            self.free_set_invalid = false;
+            if (self.free_set) |*free_set| free_set.reset();
         }
 
         fn on_superblock(superblock: *SuperBlockType) void {
@@ -381,6 +463,7 @@ pub fn EngineType(comptime Storage: type) type {
                 return self.open_failed(error.LayoutMismatch);
             }
             self.commit_metadata = working.commit_metadata;
+            if (self.grid) |*grid| grid.format_id = working.format_id;
             if (selection.copies_current < superblock_module.copy_count) {
                 // A crash interrupted a superblock write. Rewrite every copy before anything
                 // else is written, so no stale copy can be chosen later.
@@ -404,8 +487,10 @@ pub fn EngineType(comptime Storage: type) type {
             const working = &self.superblock.working;
             const checkpoint_ = self.open_target();
             if (checkpoint_.size_bytes == 0) {
+                // With a grid, every real checkpoint holds at least the free set.
                 const empty_ok = checkpoint_.sequence == 0 or
-                    checkpoint_.checksum == checksum_module.checksum("");
+                    (self.free_set == null and
+                        checkpoint_.checksum == checksum_module.checksum(""));
                 if (!empty_ok) return self.open_checkpoint_failed();
                 return self.open_journal();
             }
@@ -432,6 +517,7 @@ pub fn EngineType(comptime Storage: type) type {
             }
             self.open_fallback = true;
             self.commit_metadata = working.commit_metadata_previous;
+            self.free_set_reset();
             self.consumer.?.on_checkpoint_reset(self.consumer.?.context);
             self.open_checkpoint();
         }
@@ -439,19 +525,44 @@ pub fn EngineType(comptime Storage: type) type {
         fn forward_checkpoint(context: *anyopaque, chunk: []const u8) void {
             const self: *Self = @ptrCast(@alignCast(context));
             assert(self.phase == .opening_checkpoint);
-            self.consumer.?.on_checkpoint(self.consumer.?.context, chunk);
+            var rest = chunk;
+            if (self.free_set_position < self.free_set_image.len) {
+                const image = self.free_set_image[@intCast(self.free_set_position)..];
+                const length = @min(image.len, rest.len);
+                @memcpy(image[0..length], rest[0..length]);
+                self.free_set_position += length;
+                rest = rest[length..];
+                if (self.free_set_position == self.free_set_image.len) {
+                    self.free_set.?.decode(self.free_set_image) catch {
+                        self.free_set_invalid = true;
+                    };
+                }
+            }
+            if (rest.len == 0) return;
+            self.consumer.?.on_checkpoint(self.consumer.?.context, rest);
+        }
+
+        /// The loaded checkpoint carried a whole, valid free set (trivially without a grid).
+        fn free_set_loaded(self: *const Self) bool {
+            if (self.free_set == null) return true;
+            return self.free_set_position == self.free_set_image.len and !self.free_set_invalid;
         }
 
         fn on_checkpoint_io(checkpoint_io: *CheckpointType) void {
             const self: *Self = @alignCast(@fieldParentPtr("checkpoint_io", checkpoint_io));
             if (self.phase == .opening_checkpoint) {
                 checkpoint_io.result catch return self.open_checkpoint_failed();
+                if (!self.free_set_loaded()) return self.open_checkpoint_failed();
                 return self.open_journal();
             }
             assert(self.phase == .ready);
             assert(self.checkpoint_phase == .writing);
+            self.checkpoint_producer = null;
             checkpoint_io.result catch |err| switch (err) {
-                error.CheckpointTooLarge => return self.checkpoint_finish(error.CheckpointTooLarge),
+                error.CheckpointTooLarge => {
+                    if (self.free_set) |*free_set| free_set.checkpoint_abort();
+                    return self.checkpoint_finish(error.CheckpointTooLarge);
+                },
                 error.CheckpointCorrupt => unreachable, // Only reads report corruption.
             };
             var superblock = self.superblock.working;
@@ -473,6 +584,7 @@ pub fn EngineType(comptime Storage: type) type {
             assert(self.journal_start_position <= self.checkpoint_tail);
             self.journal.release(self.journal_start_position);
             self.journal_start_position = self.checkpoint_tail;
+            if (self.free_set) |*free_set| free_set.checkpoint_durable();
             self.checkpoint_finish(self.superblock.working.checkpoint);
         }
 

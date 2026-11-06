@@ -20,7 +20,13 @@ const sector_size = storage.sector_size;
 
 /// "nfsuperb" read as a little-endian u64.
 pub const magic: u64 = 0x6272_6570_7573_666e;
-pub const version: u32 = 2;
+/// Version 3 adds the grid (`Layout.grid_block_count`, the field version 2 kept reserved and
+/// zero). Open also accepts version 2 copies, which always describe a grid-less layout; the
+/// next superblock write upgrades the file to version 3. So a version 2 file opens unchanged
+/// in an engine configured without a grid, and fails `LayoutMismatch` (never misreads) in one
+/// configured with a grid.
+pub const version: u32 = 3;
+pub const version_min: u32 = 2;
 pub const copy_count: u32 = 4;
 pub const commit_metadata_size: u32 = 128;
 pub const zone_size_bytes: u64 = copy_count * sector_size;
@@ -50,7 +56,8 @@ pub const Layout = extern struct {
     journal_size_bytes: u64,
     checkpoint_block_size: u32,
     entry_body_size_max: u32,
-    reserved: u64 = 0,
+    /// Grid blocks after the journal (block size = `checkpoint_block_size`). Zero: no grid.
+    grid_block_count: u64 = 0,
 };
 
 const header_size = 16 + 16 + 8 + 4 + 4 + 8 + 8 + 2 * @sizeOf(JournalStart) +
@@ -103,11 +110,12 @@ pub const SuperBlock = extern struct {
     /// Checksum, constants, reserved bytes, and field ranges. Never trusts an unverified byte.
     pub fn valid(superblock: *const SuperBlock) bool {
         if (superblock.checksum != superblock.compute_checksum()) return false;
-        if (superblock.magic != magic or superblock.version != version) return false;
+        if (superblock.magic != magic) return false;
+        if (superblock.version < version_min or superblock.version > version) return false;
+        if (superblock.version == 2 and superblock.layout.grid_block_count != 0) return false;
         if (superblock.reserved_a != 0 or superblock.reserved_b != 0) return false;
         if (!all_zero(&superblock.reserved)) return false;
         if (!all_zero(&superblock.checkpoint.reserved)) return false;
-        if (superblock.layout.reserved != 0) return false;
         if (superblock.sequence == 0) return false;
         if (superblock.journal_start.sequence == 0) return false;
         if (superblock.journal_start.offset % sector_size != 0) return false;
@@ -479,6 +487,25 @@ fn fuzz_decode(_: void, input: []const u8) anyerror!void {
     var copies: [copy_count * sector_size]u8 = @splat(0);
     @memcpy(copies[0..sector_size], &sector);
     try testing.expectEqual(Selection.Status.missing, select(&copies).status);
+}
+
+test "superblock: version 2 copies decode as grid-less layouts, nothing else does" {
+    var prng = Prng.init(6);
+    var superblock = sample(&prng, 3);
+    try testing.expect(decode(std.mem.asBytes(&superblock)) != null);
+    superblock.version = 2;
+    superblock.checksum = superblock.compute_checksum();
+    const decoded = decode(std.mem.asBytes(&superblock)).?;
+    try testing.expectEqual(@as(u64, 0), decoded.layout.grid_block_count);
+    superblock.layout.grid_block_count = 1; // Version 2 kept this field reserved and zero.
+    superblock.checksum = superblock.compute_checksum();
+    try testing.expect(decode(std.mem.asBytes(&superblock)) == null);
+    for ([_]u32{ 0, 1, 4 }) |other| {
+        superblock.layout.grid_block_count = 0;
+        superblock.version = other;
+        superblock.checksum = superblock.compute_checksum();
+        try testing.expect(decode(std.mem.asBytes(&superblock)) == null);
+    }
 }
 
 test "superblock: fuzz decode arbitrary bytes" {
