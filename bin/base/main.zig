@@ -13,6 +13,7 @@ const challenger = @import("challenger.zig");
 const prover_service = @import("prover_service.zig");
 const balance_monitor = @import("balance_monitor.zig");
 const load_test = @import("load_test.zig");
+const withdrawer = @import("withdrawer.zig");
 const snapshotter = @import("snapshotter.zig");
 const sidecrush = @import("sidecrush.zig");
 const fee_jobs = @import("fee_jobs.zig");
@@ -36,6 +37,7 @@ const usage =
     \\  prover-worker   claim and prove range jobs with the native host
     \\  balance-monitor  poll an account balance, serve metrics and health
     \\  load-test  send a seeded transaction workload, report inclusion latency
+    \\  withdrawer  L2->L1 withdrawals: initiate, status, prove, finalize, run
     \\  snapshotter  create, restore, or verify node datadir snapshots
     \\  sidecrush  block-production health sidecar (metrics, readiness)
     \\  fee-jobs  one-shot fee jobs: disburse, process, sweep
@@ -56,6 +58,7 @@ test {
     _ = prover_service;
     _ = balance_monitor;
     _ = load_test;
+    _ = withdrawer;
     _ = snapshotter;
     _ = sidecrush;
     _ = fee_jobs;
@@ -106,30 +109,40 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "proof")) {
         std.process.exit(try proof.main(init, args[2..]));
     }
-    if (std.mem.eql(u8, command, "balance-monitor")) {
-        std.process.exit(try balance_monitor.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "fee-jobs")) {
-        std.process.exit(try fee_jobs.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "sidecrush")) {
-        std.process.exit(try sidecrush.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "snapshotter")) {
-        std.process.exit(try snapshotter.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "load-test")) {
-        std.process.exit(try load_test.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "roxy")) {
-        std.process.exit(try roxy.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "basectl")) {
-        std.process.exit(try basectl.main(init, args[2..]));
-    }
-    if (std.mem.eql(u8, command, "audit")) {
-        std.process.exit(try audit.main(init, args[2..]));
-    }
+    if (try infra_main(init, command, args[2..])) |status| std.process.exit(status);
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });
     std.process.exit(2);
+}
+
+/// Infra-lane tools (`src/infra`); null when `command` is not one of them.
+fn infra_main(init: std.process.Init, command: []const u8, args: []const []const u8) !?u8 {
+    std.debug.assert(command.len > 0);
+    if (std.mem.eql(u8, command, "balance-monitor")) {
+        return try balance_monitor.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "fee-jobs")) {
+        return try fee_jobs.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "sidecrush")) {
+        return try sidecrush.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "snapshotter")) {
+        return try snapshotter.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "withdrawer")) {
+        return try withdrawer.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "load-test")) {
+        return try load_test.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "roxy")) {
+        return try roxy.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "basectl")) {
+        return try basectl.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "audit")) {
+        return try audit.main(init, args);
+    }
+    return null;
 }

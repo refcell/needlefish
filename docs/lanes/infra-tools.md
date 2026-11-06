@@ -33,9 +33,10 @@ allocation after startup.
   public test-junk mnemonic, transfer/ERC-20/calldata payload mixes, key stream),
   open-loop rate runner, latency/inclusion metrics, report (port `load-tests/src/*`).
   `bin/base load-test` against the devnet; deterministic in sim with a fixed seed.
-- [ ] `infra/withdrawer`: L2→L1 withdrawal flow: initiate on L2, prove against an
+- [x] `infra/withdrawer`: L2→L1 withdrawal flow: initiate on L2, prove against an
   output root/dispute game, finalize after the challenge window; journal so a restart
-  resumes (port `withdrawer/src/*`). Sim/devnet test over the proof lane's contracts.
+  resumes (port `withdrawer/src/*`). Fake-chain tests over the public Base Sepolia proof
+  fixture; devnet e2e waits on the smoke item below (stand-in portal cannot prove).
 - [x] `bin/base balance-monitor`: wire `src/utilities/balance_monitor` into a
   subcommand with metrics + health endpoints (`src/infra/balance_monitor` exporter).
 - [x] `infra/basectl` core: `sync-status`, `block`, `txpool`, `batcher`, `p2p`,
@@ -203,6 +204,16 @@ allocation after startup.
 - tx_manager `Candidate.to` and `txdata.Request.to` are optional: null sends a contract
   creation (estimateGas omits `to`; blob candidates must have a recipient).
 - load-test senders_max is 64 (each sender owns a driver: about 140 KB of buffers).
+- withdrawer: proofs are verified locally (output root v0 against the game's root claim, then
+  account and storage proofs, geth/reth inline-node shapes both accepted) before any prove
+  is sent, as base/base. Every broadcast hash is journaled (92-byte CRC32 records, fsync)
+  from a new tx_manager `publish_hook` before `eth_sendRawTransaction`; a restart settles
+  journaled hashes by receipt and only resends after `pending_wait_ms` (180 s). A journal
+  write failure blocks the broadcast. Initiation is keyed by the calldata hash: re-running
+  `initiate` with identical parameters resumes the journaled one instead of sending again.
+  Status and not-ready waits poll every `--poll-interval-s` rather than sleeping until
+  `ready_at`. The signer is required for every command (`checkWithdrawal` is called from
+  it); `--dev-account` uses the public dev mnemonic.
 
 ## Log
 - 2026-11-05: tx_manager core (fees, error classification, nonce tracker, send state,
@@ -252,3 +263,7 @@ allocation after startup.
   tx_manager contract creation. Devnet: smoke passes (step 5 now deploys and runs the contract
   mix, 99/99, 0 reverted); `--senders 50` at 100 tx/s for 20 s with all six payloads: 50
   funded + 50 minted, 1996/1996 confirmed, 0 reverted, p50 399 ms, p99 669 ms.
+- 2026-11-05: withdrawer core (MessagePassed decode, withdrawal hash, output root and MPT
+  proof verification, portal calldata, status decider + game search, journal) and
+  `base withdrawer initiate|status|prove|finalize|run` (reader, step-driven flow over
+  tx_manager, fake L1/L2 tests: prove→finalize, paused, crash resume, initiate).

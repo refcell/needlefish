@@ -10,9 +10,12 @@ pub const withdrawal = @import("withdrawal.zig");
 pub const calldata = @import("calldata.zig");
 pub const status = @import("status.zig");
 pub const journal = @import("journal.zig");
+pub const reader = @import("reader.zig");
+pub const flow = @import("flow.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("withdrawal_test.zig");
     _ = @import("status_test.zig");
+    _ = @import("flow_test.zig");
 }
