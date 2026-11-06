@@ -88,7 +88,12 @@ for _ in $(seq 1 600); do
   *'"status":"succeeded"'*)
     printf '%s\n' "$response" | grep -q '"tee_signer"' ||
       { echo "devnet-tee: no TEE signer in $response"; exit 1; }
-    echo "devnet-tee: signer $(printf '%s' "$response" | field tee_signer)"
+    printf '%s' "$response" >"$work/proof.json"
+    zero=0x$(printf '00%.0s' $(seq 1 20))
+    "$BASE" proof verify-tee --response "$work/proof.json" --proposer "$zero" \
+      --starting-block "$agreed" --prev-output-root "$agreed_root" \
+      --claimed-output-root "$claimed_root" --claimed-block "$safe" \
+      --signer 0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266
     echo "devnet-tee: ok"
     exit 0
     ;;
