@@ -1489,3 +1489,211 @@ test "e2e: the TEE enclave refuses to sign a claim that does not hold" {
     defer link.destroy();
     try testing.expectEqualStrings("InvalidClaim", link.client.last_failure.?.message);
 }
+
+const tee_host = @import("../tee/host/root.zig");
+const sim_io = @import("../../utilities/io/root.zig");
+const sim_http = @import("../../utilities/http/root.zig");
+const service_root = @import("../prover_service/root.zig");
+const service_endpoint = @import("../rpc/endpoint.zig");
+
+/// The prover service on one simulated host; a requester and a TEE worker on another.
+const TeeService = struct {
+    const Service = service_root.service.Service;
+    const HttpServer = sim_http.Server(sim_io.SimIo, *Service, Service.handle_http);
+    const Endpoint = service_endpoint.Endpoint(sim_io.SimIo);
+    const ServiceClient = service_root.client.Client(sim_io.SimIo);
+    const Node = struct { rpc: Endpoint.Client, endpoint: Endpoint, client: ServiceClient };
+
+    world: sim_io.SimWorld,
+    server_io: sim_io.SimIo,
+    client_io: sim_io.SimIo,
+    store: service_root.store.Store,
+    service: Service,
+    server: HttpServer,
+    requester: Node,
+    worker: Node,
+
+    fn create() !*TeeService {
+        const allocator = testing.allocator;
+        const self = try allocator.create(TeeService);
+        errdefer allocator.destroy(self);
+        self.world = try sim_io.SimWorld.init(allocator, .{ .seed = 0x7ee });
+        errdefer self.world.deinit();
+        const server_host = sim_io.Address.ip4(.{ 10, 0, 0, 1 }, 0);
+        try sim_io.SimIo.init(&self.server_io, allocator, &self.world, .{ .host = server_host });
+        errdefer self.server_io.deinit();
+        const client_host = sim_io.Address.ip4(.{ 10, 0, 0, 2 }, 0);
+        try sim_io.SimIo.init(&self.client_io, allocator, &self.world, .{ .host = client_host });
+        errdefer self.client_io.deinit();
+        self.store = try .init(allocator, .{ .jobs_max = 4, .proof_bytes_max = 4096, .seed = 5 });
+        errdefer self.store.deinit(allocator);
+        const clock = service_root.service.Clock.of(sim_io.SimIo, &self.server_io);
+        const service_options: service_root.service.Options = .{ .request_arena_bytes = 64 << 10 };
+        self.service = try .init(allocator, &self.store, clock, service_options);
+        errdefer self.service.deinit(allocator);
+        try self.server.init(allocator, &self.server_io, &self.service, .{
+            .connections_max = 4,
+            .recv_buffer_size = 32 * 1024,
+            .send_buffer_size = 32 * 1024,
+            .limits = .{ .head_size_max = 2048, .body_size_max = 16 * 1024 },
+        });
+        errdefer self.server.deinit();
+        const bound = try self.server.listen(sim_io.Address.ip4(.{ 10, 0, 0, 1 }, 8545));
+        try self.connect(&self.requester, bound);
+        try self.connect(&self.worker, bound);
+        return self;
+    }
+
+    fn connect(self: *TeeService, node: *Node, address: sim_io.Address) !void {
+        const allocator = testing.allocator;
+        node.rpc = try .init(allocator, &self.client_io, address, .{
+            .send_buffer_size = 32 * 1024,
+            .recv_buffer_size = 64 * 1024,
+            .limits = .{ .head_size_max = 2048, .body_size_max = 32 * 1024 },
+        }, 16 * 1024);
+        node.endpoint = .init(allocator, &node.rpc, .{ .context = self, .step = step }, 10_000);
+        node.client = try .init(allocator, &node.endpoint, .{
+            .request_bytes_max = 16 * 1024,
+            .response_arena_bytes = 64 * 1024,
+        });
+    }
+
+    fn step(context: *anyopaque) anyerror!void {
+        const self: *TeeService = @ptrCast(@alignCast(context));
+        self.world.run_for_ns(std.time.ns_per_ms);
+    }
+
+    fn destroy(self: *TeeService) void {
+        const allocator = testing.allocator;
+        for ([_]*Node{ &self.requester, &self.worker }) |node| {
+            node.client.deinit(allocator);
+            node.endpoint.deinit();
+            node.rpc.deinit();
+        }
+        self.server.stop();
+        var rounds: u32 = 0;
+        while (!self.server.stopped() and rounds < 10_000) : (rounds += 1) {
+            self.world.run_for_ns(std.time.ns_per_ms);
+        }
+        self.server.deinit();
+        self.service.deinit(allocator);
+        self.store.deinit(allocator);
+        self.client_io.deinit();
+        self.server_io.deinit();
+        self.world.deinit();
+        allocator.destroy(self);
+    }
+};
+
+fn tee_client_options() client.Options {
+    kzg.blob.fill_roots_brp(&kzg_storage.roots_brp);
+    enclave_settings = .{
+        .g1_lagrange = &kzg_storage.g1_lagrange,
+        .roots_brp = &kzg_storage.roots_brp,
+    };
+    return .{
+        .builder = builder_config,
+        .resolver = .{ .bytes_max = 1 << 20, .entries_max = 4096 },
+        .l1 = .{ .items_max = 16, .logs_max = 16, .topics_max = 64, .blob_hashes_max = 16 },
+        .l2 = .{ .items_max = 16 },
+        .blobs = .{ .blobs_max = 2, .verify = false },
+        .kzg_settings = &enclave_settings,
+        .kzg_workspace = &kzg_workspace,
+    };
+}
+
+test "e2e: the prover service serves a TEE request through the host and an enclave" {
+    const self = try Fixture.create(.{ .blocks = 4, .interval = 2 });
+    defer self.destroy();
+    const proposer: [20]u8 = @splat(0x77);
+    const l1_head_number: u64 = self.l1_count - 1;
+    try self.put_boot_journal(4, true, proposer, l1_head_number);
+    const options = tee_client_options();
+    var fake: enclave.nsm.Fake = .init(42);
+    const nitro: enclave.Server = try .init_enclave(fake.nsm());
+    const local = try tee_host.LocalEnclave.create(testing.allocator, nitro, .{
+        .request_bytes_max = 8 << 20,
+        .client_options = options,
+    });
+    defer local.destroy();
+    const links = [_]*tee_host.Link{&local.link};
+    var pool: tee_host.Pool = try .init(&links);
+    var registry: tee_host.registration.FakeRegistry = .{};
+    registry.allow(local.server.signer_address());
+    var checker: tee_host.Checker = try .init(&links, registry.registry());
+    try pool.set_checker(&checker);
+    var rollup_out: std.Io.Writer = .fixed(&self.rollup_json);
+    var rollup_writer = json.Writer.init(&rollup_out);
+    try protocol.rollup_json.write(&rollup_writer, &self.rollup);
+    var generator: tee_host.Generator = try .init(testing.allocator, self.source.as_source(), .{
+        .rollup_config_json = rollup_out.buffered(),
+        .chain_id = chains.devnet.chain_id,
+        .client_options = options,
+    }, &pool);
+    defer generator.deinit();
+
+    const service = try TeeService.create();
+    defer service.destroy();
+    const requested = try service.requester.client.prove_block_range(&.{ .proof = .{
+        .session_id = .from("tee-e2e"),
+        .request = .{ .tee = .{ .tee_kind = .aws_nitro, .proof = .{
+            .l1_head = self.l1_hashes[self.l1_count - 1],
+            .agreed_l2_head_hash = self.blocks[0].hash,
+            .agreed_l2_output_root = self.agreed,
+            .claimed_l2_output_root = self.expected,
+            .claimed_l2_block_number = 4,
+            .proposer = proposer,
+            .l1_head_number = l1_head_number,
+            .intermediate_block_interval = 2,
+        } } },
+    } });
+    try testing.expectEqualStrings("tee-e2e", requested.session_id.slice());
+    const host_config: tee_host.config.Config = .{
+        .prover_service_url = "http://10.0.0.1:8545",
+        .worker_id = "tee-worker",
+    };
+    try host_config.validate();
+    const clock = service_root.service.Clock.of(sim_io.SimIo, &service.client_io);
+    const Worker = service_root.worker.Worker(sim_io.SimIo);
+    var worker: Worker = .init(
+        &service.worker.client,
+        generator.backend(),
+        clock,
+        host_config.worker_config(),
+    );
+    var ticks: u32 = 0;
+    while (worker.stats.submitted == 0 and ticks < 8) : (ticks += 1) worker.tick();
+    try testing.expectEqual(@as(u64, 1), worker.stats.submitted);
+    try testing.expectEqual(@as(u64, 1), generator.stats.proved);
+
+    const answer = try service.requester.client.get_proof(&.{ .session_id = .from("tee-e2e") });
+    try testing.expectEqual(service_root.protocol.ProofStatus.succeeded, answer.status);
+    const result = answer.result.?.tee;
+    const proposal = &result.aggregate_proposal;
+    try testing.expectEqual(local.server.signer_address(), result.tee_signer);
+    try testing.expectEqual(self.expected, proposal.output_root);
+    try testing.expectEqual(@as(u64, 4), proposal.l2_block_number);
+    try testing.expectEqual(l1_head_number, proposal.l1_origin_number);
+    try testing.expectEqual(@as(usize, 2), result.intermediate_roots.len);
+    const config_hash = proof_primitives.config_hash_for_chain(chains.devnet.chain_id).?;
+    const journal: proof_primitives.ProofJournal = .{
+        .proposer = proposer,
+        .l1_origin_hash = proposal.l1_origin_hash,
+        .prev_output_root = self.agreed,
+        .starting_l2_block = 0,
+        .output_root = self.expected,
+        .ending_l2_block = 4,
+        .intermediate_roots = result.intermediate_roots,
+        .config_hash = config_hash,
+        .tee_image_hash = keccak.keccak256(&fake.pcr0),
+        .schedule_id = proposal.schedule_id,
+    };
+    var journal_buffer: [proof_primitives.proposal.proof_journal_length_max]u8 = undefined;
+    const encoded = journal.encode(&journal_buffer);
+    const signature = proposal.signature[0..enclave.crypto.signature_length];
+    // The proposal returned by the service verifies against the enclave's address.
+    try testing.expectEqual(local.server.signer_address(), enclave.crypto.recover_address(
+        encoded,
+        signature,
+    ).?);
+}
