@@ -26,7 +26,7 @@ block, and Mgas/s. `just replay-check` on an Apple M-series laptop under load (l
 | 53775088..53775187 | 100 | 1571 | 271.9 Mgas | 274-280 ms | 2.7-2.8 ms | 972-991 Mgas/s |
 | 53811190..53811209 | 20 | 314 | 70.6 Mgas | 71-79 ms | 3.6-4.0 ms | 894-991 Mgas/s |
 | 53840091..53840100 | 10 | 221 | 31.5 Mgas | 34-38 ms | 3.4-3.8 ms | 837-927 Mgas/s |
-| 53864562..53864581 | 20 | 311 | 56.6 Mgas | 65 ms (1 run) | 3.2 ms | 872 Mgas/s |
+| 53864562..53864581 | 20 | 311 | 56.6 Mgas | 57-66 ms | 2.9-3.3 ms | 860-987 Mgas/s |
 
 Before sender prefetch the first two windows ran at 820-907 Mgas/s. Loading the 100-block
 archive (read, digest check, parse, witness index) adds about 180 ms to a run: 0.45 s wall
@@ -35,7 +35,7 @@ in total (version 1 deflated archives took 0.72 s, mostly inflating).
 A drop well outside these ranges on the same machine is a regression to bisect.
 
 `just replay` needs only Zig and the network: `base replay fetch` downloads the blocks and
-the witness from public keyless endpoints (about 80 s for 10 blocks), caching every
+the witness from public keyless endpoints (about 70 s for 10 blocks), caching every
 response under `.cache/replay/`, and writes `.cache/replay/latest.nfrp`; `base replay run`
 then replays that archive with no network access.
 
