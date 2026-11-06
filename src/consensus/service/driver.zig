@@ -169,10 +169,15 @@ pub const SafeCheck = struct {
     cap: ?BlockId = null,
     /// Entries exist but none of their L1 blocks is canonical.
     unsupported: bool = false,
+    /// Ticks spent waiting for L1 lookups.
+    ticks: u32 = 0,
 };
 
 /// L1 lookups per tick for the safedb check.
 const safe_check_lookups_max = 16;
+/// Ticks the safedb check waits for L1 (a provider behind the recorded blocks) before it
+/// gives up without a cap.
+const safe_check_ticks_max = 3000;
 
 fn optional(comptime T: type, result: ProviderError!T) ProviderError!?T {
     return result catch |err| switch (err) {
@@ -335,22 +340,30 @@ pub const Driver = struct {
             const L1 = @typeInfo(@TypeOf(providers.l1)).pointer.child;
             if (@hasDecl(L1, "forget_numbers")) providers.l1.forget_numbers();
         }
+        check.ticks += 1;
+        if (check.ticks > safe_check_ticks_max) {
+            check.done = true; // L1 never caught up: keep the labels (base/base).
+            return true;
+        }
         var lookups: u32 = 0;
         while (check.remaining.? > 0 and lookups < safe_check_lookups_max) : (lookups += 1) {
             const entry = db.entries[check.remaining.? - 1];
             const result = providers.l1.l1_block_info_by_number(entry.l1_block.number);
-            const block = optional(BlockInfo, result) catch |err| {
-                if (err == error.NotAvailable) return false;
-                driver.note(err);
-                check.done = true;
-                return true;
+            // Unknown (not yet seen by the provider) is no evidence of a reorg: wait.
+            const canonical = result catch |err| switch (err) {
+                error.NotAvailable, error.NotFound => return false,
+                else => {
+                    driver.note(err);
+                    check.done = true;
+                    return true;
+                },
             };
-            if (block) |canonical| if (canonical.hash.eql(entry.l1_block.hash)) {
+            if (canonical.hash.eql(entry.l1_block.hash)) {
                 check.cap = entry.safe_head;
                 check.done = true;
                 if (check.remaining.? < db.count) driver.stats.safe_unwinds += 1;
                 return true;
-            };
+            }
             check.remaining.? -= 1;
         }
         if (check.remaining.? > 0) return false;

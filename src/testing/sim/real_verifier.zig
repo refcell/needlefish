@@ -823,7 +823,7 @@ pub const RealVerifier = struct {
     /// The first block to request from the sequencer when the unsafe head lags the gossip
     /// seen, at most once per `sync_timeout_ns`; null when nothing is missing.
     pub fn sync_request(verifier: *RealVerifier, now_ns: u64) ?u64 {
-        if (verifier.driver.phase != .running or verifier.driver.queue.len() > 0) return null;
+        if (verifier.driver.phase != .running) return null;
         const unsafe = verifier.unsafe_number();
         if (verifier.sequencer_head_known <= unsafe) return null;
         if (now_ns < verifier.sync_ns + sync_timeout_ns) return null;

@@ -68,6 +68,8 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] `--sequencer.recover` (initial recover mode)
   - [x] `--rpc.disabled`
   - [x] `--rpc.execution-forwarding-endpoint`: unserved HTTP RPC methods go to the EL
+- [x] L1 reorg orphaning batch data: startup/reset caps the safe label at the newest safedb entry whose L1 block is still canonical (coordinator; dst seed 850)
+  - [ ] reset records (base/base writes the reset head at its L1 origin) still vouch for that head; 3/3000 ungated swarm seeds (1097, 1310, 2622) keep safe beyond L1 data that way
   - [x] `--safedb.path` persistence of the L1→safe-head mapping
   - [x] admin error parity with base/base: sequencer methods on a verifier -32001, start/stop
     idempotent, redacted -32603 start/stop failures, postUnsafePayload fire-and-forget
@@ -105,6 +107,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- Safe head after L1 reorgs: base/base discovery trusts a safe label whose L1 origin is canonical even when the blocks that carried its batch data are gone. We also check the safedb (L1 block -> safe head) at every startup/reset and lower the safe label to what canonical L1 still supports, so the batcher re-posts. A safe head may therefore drop after a reorg (the sim allows it at resets).
 - execution forwarding: single requests over HTTP only; batches and WebSocket stay local (unknown methods -32601), because the servers cannot defer one batch entry or a WS frame. base/base forwards per batch entry.
 - safedb persistence: one rewritten image (like checkpoints) instead of redb; the in-memory safedb stays on without a path (base/base disables tracking), since the RPC is useful anyway.
 - Subsecond (Denim) blocks follow base/base timing: build at the parent's timestamp, `getPayload` at T - 50 ms. Pre-Denim blocks keep build-at-T, seal-on-payload-id (base/base builds one slot early); the devnet runs Denim from genesis so this only affects legacy chains.
@@ -234,6 +237,7 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   is the message passer storage root).
 
 ## Log
+- 2026-11-05: reorg: `driver.SafeCheck` checks the safedb against canonical L1 before discovery and caps the safe label at the newest supported safe head (finalized when none; unknown blocks wait, 3000-tick budget). The sim real verifier keeps its safedb across restarts (`--safedb.path`); the cluster's safe-decrease check re-latches on driver resets. Seed 850 and 15/16/2562/2856/329 pass with the batcher gate removed; gated 3000-seed sweep clean, ungated 2997/3000.
 - 2026-11-05: rpc: `service/forwarding.zig` forwards single HTTP JSON-RPC calls for methods the router does not serve to `--rpc.execution-forwarding-endpoint` (deferred responses, 4 keep-alive clients, -32603 on failure or when all are busy).
 - 2026-11-05: rpc: `--rpc.disabled` starts no HTTP or WebSocket RPC server (`Options.rpc_address` is optional; `start` returns null and logs "rpc disabled").
 - 2026-11-05: safedb: `service/safedb_store.zig` persists the L1->safe-head entries (`--safedb.path`) as one crc-checked image (`magic | count | 80-byte records | crc32`) through `store_file`; `SafeDB.version` drives writes; the driver waits for the load.
