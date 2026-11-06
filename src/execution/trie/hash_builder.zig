@@ -46,7 +46,8 @@ pub const BranchNode = struct {
     extension_len: u8 = 0,
     /// Nibbles of the extension above the branch, `extension_len` of them.
     extension: [extension_nibbles_max]u8 = undefined,
-    /// One bit per present child (bit n = nibble n). At least two bits.
+    /// One bit per present child (bit n = nibble n). At least two bits, or none for the
+    /// leaf-root record of a single-leaf trie (its key in `leaf_keys[0]`, nothing else set).
     state_mask: u16 = 0,
     /// Children that are branch records themselves (subset of `state_mask`); the other
     /// present children are leaves.
@@ -78,7 +79,8 @@ pub const BranchNode = struct {
 /// Receives every branch of a 32-byte-key trie as a `BranchNode` (with the extension above it
 /// folded in), keyed by its hang path: the parent branch's path plus this child's nibble,
 /// empty for the root. Branches arrive in post-order (descendants first, siblings by
-/// nibble), the order the builder finishes them, so no reordering is needed. Kept apart
+/// nibble), the order the builder finishes them, so no reordering is needed. A trie that is
+/// one leaf emits a leaf-root record instead (empty hang, `state_mask` 0). Kept apart
 /// from the hash-keyed `NodeSink`: this one is path-aware and needs per-entry state, which
 /// lives here so a builder without a sink stays as small as before.
 pub const BranchSink = struct {
@@ -166,6 +168,13 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
             }
             assert(self.stack_len <= 1);
             if (self.stack_len == 0) return node.empty_root;
+            if (self.branch_sink) |sink| if (sink.leaf[0]) {
+                // A single-leaf trie has no branch: its root gets a leaf-root record.
+                var record: BranchNode = .{};
+                record.leaf_keys[0] = sink.leaf_keys[0];
+                assert(record.state_mask == 0 and !sink.pending_set);
+                sink.emit(sink.context, &.{}, &record);
+            };
             // An inline root is still hashed: its encoding is a preimage too.
             if (self.node_sink) |sink| if (!self.stack[0].is_hash()) {
                 sink.write(sink.context, self.stack[0].slice());

@@ -27,6 +27,10 @@
 //! leaf_keys        per state_mask & ~tree_mask bit, nibble order: the leaf's 32-byte key
 //! ```
 //!
+//! A trie that is a single leaf has no branch, so its root would have no record and the
+//! leaf's key could not be found by a point lookup. It gets a leaf-root record at the empty
+//! hang instead: `extension_len` 0, both masks 0, then the leaf's 32-byte key (37 bytes).
+//!
 //! Values come from disk, so `decode` checks every field and never asserts on input.
 
 const std = @import("std");
@@ -111,9 +115,27 @@ pub fn decode_path_key(key: *const [path_key_bytes]u8) Error!Nibbles {
     return result;
 }
 
+/// The leaf-root record of a trie that is the single leaf `key` (stored at the empty hang).
+pub fn leaf_root(key: *const Hash) Record {
+    var record: Record = .{};
+    record.leaf_keys[0] = key.*;
+    assert(is_leaf_root(&record));
+    assert(record.extension_len == 0 and record.tree_mask == 0);
+    return record;
+}
+
+/// Whether `record` is a leaf-root record (no branch: masks 0, one leaf key).
+pub fn is_leaf_root(record: *const Record) bool {
+    return record.state_mask == 0;
+}
+
 /// Asserts the record invariants `decode` checks; for records built in memory.
 fn assert_valid(record: *const Record) void {
     assert(record.extension_len <= Record.extension_nibbles_max);
+    if (is_leaf_root(record)) {
+        assert(record.extension_len == 0 and record.tree_mask == 0);
+        return;
+    }
     assert(record.child_count() >= 2);
     assert(record.tree_mask & ~record.state_mask == 0);
     for (record.extension_slice()) |nibble| assert(nibble < 16);
@@ -145,7 +167,8 @@ pub fn encode(record: *const Record, out: *[value_bytes_max]u8) []u8 {
         @memcpy(out[offset + 1 ..][0..bytes.len], bytes);
         offset += 1 + bytes.len;
     }
-    for (record.leaf_keys[0..record.leaf_count()]) |*key| {
+    const keys: u32 = if (is_leaf_root(record)) 1 else record.leaf_count();
+    for (record.leaf_keys[0..keys]) |*key| {
         out[offset..][0..32].* = key.*;
         offset += 32;
     }
@@ -171,6 +194,7 @@ pub fn decode(value: []const u8, out: *Record) Error!void {
     out.state_mask = std.mem.readInt(u16, value[offset..][0..2], .big);
     out.tree_mask = std.mem.readInt(u16, value[offset + 2 ..][0..2], .big);
     offset += 4;
+    if (out.state_mask == 0) return decode_leaf_root(value[offset..], out);
     if (@popCount(out.state_mask) < 2) return error.Corrupt;
     if (out.tree_mask & ~out.state_mask != 0) return error.Corrupt;
     for (out.children[0..out.child_count()]) |*child| {
@@ -199,10 +223,24 @@ pub fn decode(value: []const u8, out: *Record) Error!void {
     assert_valid(out);
 }
 
+/// The rest of a leaf-root record after its masks (both 0): exactly one key.
+fn decode_leaf_root(rest: []const u8, out: *Record) Error!void {
+    assert(out.state_mask == 0);
+    if (out.extension_len != 0 or out.tree_mask != 0) return error.Corrupt;
+    if (rest.len != 32) return error.Corrupt;
+    out.leaf_keys[0] = rest[0..32].*;
+    assert(is_leaf_root(out));
+}
+
 /// Checks a decoded record against the hang path it was stored under: the branch fits in
-/// a 64-nibble trie and every leaf key runs through hang ++ extension ++ its nibble.
+/// a 64-nibble trie and every leaf key runs through hang ++ extension ++ its nibble. A
+/// leaf-root record hangs only at the root.
 pub fn validate_path(hang: []const u8, record: *const Record) Error!void {
     assert(hang.len <= hang_nibbles_max);
+    if (is_leaf_root(record)) {
+        if (hang.len != 0) return error.Corrupt;
+        return;
+    }
     const branch_depth = hang.len + record.extension_len;
     if (branch_depth > hang_nibbles_max) return error.Corrupt;
     const extension = record.extension_slice();
@@ -226,6 +264,7 @@ pub fn validate_path(hang: []const u8, record: *const Record) Error!void {
 /// the reference its extension, or else its parent, holds.
 pub fn branch_encoding(record: *const Record, out: *[branch_bytes_max]u8) []const u8 {
     assert_valid(record);
+    assert(!is_leaf_root(record));
     var sink: node.BufferSink = .{ .buffer = out };
     const children = record.children[0..record.child_count()];
     node.encode_branch(&sink, record.state_mask, children, &.{});
@@ -248,6 +287,7 @@ pub fn extension_encoding(
 
 pub fn branch_reference(record: *const Record) RlpNode {
     assert_valid(record);
+    assert(!is_leaf_root(record));
     return node.branch_ref(record.state_mask, record.children[0..record.child_count()], &.{});
 }
 
@@ -390,6 +430,12 @@ test "branch record: path key layout" {
 
 /// A random record that satisfies every invariant.
 fn random_record(prng: *Prng, out: *Record) void {
+    if (prng.chance(1, 16)) {
+        var key: Hash = undefined;
+        prng.fill(&key);
+        out.* = leaf_root(&key);
+        return;
+    }
     out.extension_len = @intCast(prng.below(Record.extension_nibbles_max + 1));
     for (out.extension[0..out.extension_len]) |*nibble| nibble.* = @intCast(prng.below(16));
     out.state_mask = 0;
@@ -431,8 +477,10 @@ test "branch record: seeded fuzz: round trip, mutations rejected or canonical" {
         try decode(value, &decoded);
         try testing.expectEqualSlices(u8, value, encode(&decoded, &again));
         try testing.expectEqualSlices(u8, record.extension_slice(), decoded.extension_slice());
-        const want = reference(&record);
-        try testing.expectEqualSlices(u8, want.slice(), reference(&decoded).slice());
+        if (!is_leaf_root(&record)) {
+            const want = reference(&record);
+            try testing.expectEqualSlices(u8, want.slice(), reference(&decoded).slice());
+        }
         // Truncations always fail; extensions always fail; byte flips fail or stay canonical.
         try testing.expectError(error.Corrupt, decode(value[0..prng.below(value.len)], &decoded));
         @memcpy(mutated[0..value.len], value);
@@ -469,6 +517,25 @@ test "branch record: decode rejects inconsistent masks and refs" {
     try testing.expectError(error.Corrupt, decode(bad[0..value.len], &decoded));
     try testing.expectError(error.Corrupt, decode(&.{ 1, 0x10 }, &decoded));
     try testing.expectError(error.Corrupt, decode(&.{}, &decoded));
+    // Leaf roots: exactly one key, no extension or tree bits, only at the root.
+    const key: Hash = @splat(0x5a);
+    const leaf = leaf_root(&key);
+    const leaf_value = encode(&leaf, &buffer);
+    try testing.expectEqual(@as(usize, 37), leaf_value.len);
+    try decode(leaf_value, &decoded);
+    try testing.expect(is_leaf_root(&decoded));
+    try testing.expectEqualSlices(u8, &key, &decoded.leaf_keys[0]);
+    try validate_path(&.{}, &decoded);
+    try testing.expectError(error.Corrupt, validate_path(&.{3}, &decoded));
+    try testing.expectError(error.Corrupt, decode(leaf_value[0..36], &decoded));
+    @memcpy(bad[0..leaf_value.len], leaf_value);
+    bad[4] = 0x01; // Tree bit without a state bit.
+    try testing.expectError(error.Corrupt, decode(bad[0..leaf_value.len], &decoded));
+    var with_extension: [38]u8 = undefined;
+    with_extension[0] = 1;
+    with_extension[1] = 0x30;
+    @memcpy(with_extension[2..], leaf_value[1..]);
+    try testing.expectError(error.Corrupt, decode(&with_extension, &decoded));
 }
 
 fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
@@ -485,6 +552,7 @@ fn fuzz_decode(_: void, smith: *testing.Smith) anyerror!void {
     const hang: [hang_nibbles_max]u8 = @splat(0);
     const hang_len = @min(length % 64, hang_nibbles_max - record.extension_len);
     validate_path(hang[0..hang_len], &record) catch |err| assert(err == error.Corrupt);
+    if (is_leaf_root(&record)) return;
     var out: [branch_bytes_max]u8 = undefined;
     _ = branch_encoding(&record, &out);
     _ = reference(&record);

@@ -286,7 +286,8 @@ var discard_context: u8 = 0;
 
 fn discard(_: *anyopaque, _: ?*const Hash, hang: []const u8, branch: *const BranchNode) void {
     assert(hang.len < 64);
-    assert(branch.child_count() >= 2);
+    // A branch, or a single-leaf trie's leaf-root record at the root.
+    assert(branch.child_count() >= 2 or (branch.state_mask == 0 and hang.len == 0));
 }
 const record_test = @import("../db/branch_record_test.zig");
 

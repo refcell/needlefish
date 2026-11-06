@@ -350,6 +350,19 @@ pub fn derive_records(arena: std.mem.Allocator, state: *StateTrie) !RecordSets {
     }
     var sets: RecordSets = .{};
     for (nodes.items, 0..) |*visited, index| {
+        if (visited.kind == .leaf and visited.path.len == 0) {
+            // A single-leaf trie: its leaf-root record.
+            const record = branch_record.leaf_root(&try leaf_key(&.{}, visited.encoding));
+            var buffer: [branch_record.value_bytes_max]u8 = undefined;
+            const value = try arena.dupe(u8, branch_record.encode(&record, &buffer));
+            const key = if (visited.owner) |owner|
+                try arena.dupe(u8, &branch_record.storage_key(&owner, &.{}))
+            else
+                try arena.dupe(u8, &branch_record.path_key(&.{}));
+            const list = if (visited.owner == null) &sets.accounts else &sets.storage;
+            try list.append(arena, .{ .key = key, .value = value });
+            continue;
+        }
         if (visited.kind != .branch) continue;
         const derived = try derive_one(arena, nodes.items, &lookup, index);
         const list = if (visited.owner == null) &sets.accounts else &sets.storage;
@@ -390,8 +403,10 @@ test "branch record: records from the in-memory trie synthesize its nodes" {
         var root: Hash = undefined;
         const sets = try reference_records(arena, accounts, &root);
         if (round < 3) {
-            try testing.expectEqual(@as(usize, 0), sets.accounts.items.len);
-            try testing.expectEqual(@as(usize, 0), sets.storage.items.len);
+            // Empty, then single-leaf tries: a leaf-root record each.
+            const leaf_roots: usize = if (round == 0) 0 else 1;
+            try testing.expectEqual(leaf_roots, sets.accounts.items.len);
+            try testing.expectEqual(@intFromBool(round == 2), sets.storage.items.len);
         }
         for ([_][]const Derived{ sets.accounts.items, sets.storage.items }) |list| {
             for (list) |derived| {
