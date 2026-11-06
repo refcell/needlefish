@@ -38,6 +38,8 @@ pub const read = @import("read_bench.zig");
 pub const history = @import("history_bench.zig");
 /// Steady-state commit latency with automatic checkpoints (`steady_bench.zig`).
 pub const steady = @import("steady_bench.zig");
+/// `debug_executionWitness` end to end from history (`witness_rpc_bench.zig`).
+pub const witness_rpc = @import("witness_rpc_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -701,6 +703,7 @@ test {
     _ = read;
     _ = history;
     _ = steady;
+    _ = witness_rpc;
 }
 
 test "bench: cases are well formed" {

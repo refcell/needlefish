@@ -196,7 +196,7 @@ fn SetList(comptime T: type) type {
         }
 
         /// The insertion index of `item`, or null when absent.
-        fn index_of(self: *const Self, item: T) ?u32 {
+        pub fn index_of(self: *const Self, item: T) ?u32 {
             const found = self.index.get(item) orelse return null;
             assert(found < self.len);
             return found;

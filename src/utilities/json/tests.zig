@@ -337,3 +337,43 @@ fn fuzz_scan(context: void, smith: *std.testing.Smith) anyerror!void {
 test "json: fuzz scanner" {
     try std.testing.fuzz({}, fuzz_scan, .{});
 }
+
+/// The per-byte `Writer.data` encoding `write_hex` replaced.
+fn hex_reference(out: []u8, bytes: []const u8) []const u8 {
+    const digits = "0123456789abcdef";
+    for (bytes, 0..) |byte, index| {
+        out[2 * index] = digits[byte >> 4];
+        out[2 * index + 1] = digits[byte & 0xf];
+    }
+    return out[0 .. 2 * bytes.len];
+}
+
+test "json: hex_encode and write_hex equal the per-byte encoding (seeded)" {
+    const allocator = std.testing.allocator;
+    var prng = Prng.init(0x4e58);
+    var source: [300]u8 = undefined;
+    var expected: [600]u8 = undefined;
+    var encoded: [600]u8 = undefined;
+    for (0..400) |_| {
+        const length = prng.below(source.len + 1);
+        prng.fill(source[0..length]);
+        const reference = hex_reference(&expected, source[0..length]);
+        json.hex_encode(encoded[0 .. 2 * length], source[0..length]);
+        try expectEqualStrings(reference, encoded[0 .. 2 * length]);
+        // A small growing buffer splits the output into chunks at varying offsets.
+        const capacity = 2 + prng.below(40);
+        var buffer = try std.Io.Writer.Allocating.initCapacity(allocator, capacity);
+        defer buffer.deinit();
+        const prefix = prng.below(capacity);
+        try buffer.writer.splatByteAll('-', prefix);
+        try json.write_hex(&buffer.writer, source[0..length]);
+        try expectEqualStrings(reference, buffer.written()[prefix..]);
+    }
+}
+
+test "json: write_hex without a buffer writes digit by digit" {
+    var sink: [8]u8 = undefined;
+    var fixed: std.Io.Writer = .fixed(sink[0..1]);
+    try expectError(error.WriteFailed, json.write_hex(&fixed, &.{0xab}));
+    try expectEqualStrings("a", fixed.buffered());
+}

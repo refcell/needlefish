@@ -355,8 +355,31 @@ fn node_shape(bytes: []const u8) StepError!Shape {
 /// oldest blocks (`fit_budget`): the effective window (`window`) shrinks, proofs at blocks
 /// that left it return `BlockOutOfWindow`, and history is only dropped when the head state
 /// alone is above the budget.
+/// Slots of the verified-node cache (`Store.verified`, 40 B each: 1.25 MiB, allocated and
+/// cleared at `init`). Walks keccak-check every node they enter against its parent's
+/// reference; one witness or multi-proof call enters the shared upper nodes thousands of
+/// times (a heavy block's execution walks ~26k nodes over ~10k distinct ones, and the
+/// witness walk enters them all again), so a hit skips the keccak of an already checked
+/// version. Direct-mapped by id: a collision only costs a recomputation.
+pub const verified_slots = 1 << 15;
+
+const VerifiedNode = struct { generation: u32, id: u32, hash: Hash };
+
+fn verified_slot(id: u32) u32 {
+    comptime assert(std.math.isPowerOfTwo(verified_slots));
+    // Fibonacci hashing spreads the small and large pool ids (high bit) over the table.
+    const mixed = id *% 0x9e3779b9;
+    return mixed >> (32 - @ctz(@as(u32, verified_slots)));
+}
+
 pub const Store = struct {
     config: Config,
+    /// Verified-node cache (see `verified_slots`): direct-mapped by version id, valid for
+    /// the current `generation` only.
+    verified: []VerifiedNode,
+    /// Bumped by every public mutation (`reset`, `commit_block`, `prune_step`,
+    /// `unwind_to`); 0 is never current.
+    generation: u32,
     path_index: PathIndex,
     paths: []Path,
     path_free: []u32,
@@ -394,8 +417,13 @@ pub const Store = struct {
         const blocks = try allocator.alloc(BlockEntry, config.window_blocks + 1);
         errdefer allocator.free(blocks);
         const bury_stack = try allocator.alloc(BuryFrame, bury_frames_max);
+        errdefer allocator.free(bury_stack);
+        const verified = try allocator.alloc(VerifiedNode, verified_slots);
+        @memset(verified, .{ .generation = 0, .id = none, .hash = @splat(0) });
         var self: Store = .{
             .config = config,
+            .verified = verified,
+            .generation = 1,
             .path_index = path_index,
             .paths = paths,
             .path_free = path_free,
@@ -418,6 +446,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store, allocator: std.mem.Allocator) void {
+        allocator.free(self.verified);
         allocator.free(self.bury_stack);
         allocator.free(self.blocks);
         self.large.deinit(allocator);
@@ -426,6 +455,16 @@ pub const Store = struct {
         lazy_alloc.free(allocator, self.paths);
         self.path_index.deinit(allocator);
         self.* = undefined;
+    }
+
+    /// Forgets every verified node: a mutation may release or reuse version ids.
+    fn invalidate_verified(self: *Store) void {
+        if (self.generation == std.math.maxInt(u32)) {
+            @memset(self.verified, .{ .generation = 0, .id = none, .hash = @splat(0) });
+            self.generation = 0;
+        }
+        self.generation += 1;
+        assert(self.generation > 0);
     }
 
     fn clear(self: *Store) void {
@@ -612,6 +651,7 @@ pub const Store = struct {
     /// oldest block and head. `state_trie` must have change tracking enabled; after this, only
     /// nodes rehashed later are fed by `commit_block`.
     pub fn reset(self: *Store, state_trie: *StateTrie, number: u64) Error!void {
+        self.invalidate_verified();
         self.clear();
         self.blocks_len = 1;
         const root = try state_trie.root();
@@ -651,6 +691,7 @@ pub const Store = struct {
     /// state alone exceeds also returns `HistoryFull`, after the block is written and the
     /// window shrank to that one block (callers drop history then, see `fit_budget`).
     pub fn commit_block(self: *Store, state_trie: *StateTrie, number: u64) Error!void {
+        self.invalidate_verified();
         const current = self.window() orelse return error.NotInitialized;
         if (number != current.head + 1) return error.NotNextBlock;
         const root = try state_trie.root();
@@ -736,6 +777,7 @@ pub const Store = struct {
     /// versions examined; less than `budget` only when the queue is empty. Proofs at every
     /// block of the window are unchanged.
     pub fn prune_step(self: *Store, budget: u32) u32 {
+        self.invalidate_verified();
         var examined: u32 = 0;
         while (examined < budget and self.prune_head != none) : (examined += 1) {
             assert(self.prune_count > 0);
@@ -784,6 +826,7 @@ pub const Store = struct {
     /// trie must be moved back to `number` too (`State.unwind`); the nodes that move rehashes
     /// are written again (unchanged encodings are skipped) by the next `commit_block`.
     pub fn unwind_to(self: *Store, number: u64) Error!void {
+        self.invalidate_verified();
         const current = self.window() orelse return error.NotInitialized;
         if (number < current.oldest or number > current.head) return error.BlockOutOfWindow;
         while (self.block_at(self.blocks_len - 1).number > number) self.pop_head_block();
@@ -1356,11 +1399,26 @@ pub const Store = struct {
         const bytes = self.encoding(id);
         assert(bytes.len > 0);
         const matches = switch (reference) {
-            .hash => |hash| std.mem.eql(u8, &trie.node.keccak256(bytes), &hash),
+            .hash => |hash| self.hash_matches(id, bytes, &hash),
             .embedded => |inline_bytes| std.mem.eql(u8, inline_bytes, bytes),
         };
         if (!matches) return error.HistoryCorrupt;
         return bytes;
+    }
+
+    /// Whether `bytes` (the encoding of version `id`) hash to `hash`. A version checked
+    /// against the same digest since the last mutation is not hashed again: versions are
+    /// immutable between mutations, and every mutation invalidates the cache, so a hit is
+    /// exactly the check that already passed. Single-threaded, as every `Store` read.
+    fn hash_matches(self: *const Store, id: u32, bytes: []const u8, hash: *const Hash) bool {
+        assert(id != none and bytes.len > 0);
+        const entry = &self.verified[verified_slot(id)];
+        if (entry.generation == self.generation and entry.id == id and
+            std.mem.eql(u8, &entry.hash, hash)) return true;
+        if (!std.mem.eql(u8, &trie.node.keccak256(bytes), hash)) return false;
+        entry.* = .{ .generation = self.generation, .id = id, .hash = hash.* };
+        assert(self.generation > 0);
+        return true;
     }
 
     /// The account of `address_hash` at block `number` (null when absent), without a proof.
@@ -1849,4 +1907,31 @@ pub fn decode_storage_value(value: []const u8) ValueError!u256 {
     const result = try decode_integer(u256, item);
     if (result == 0) return error.InvalidValue;
     return result;
+}
+
+test "history: verified-node cache hits only the same id, digest, and generation" {
+    var store = try Store.init(std.testing.allocator, .{
+        .window_blocks = 1,
+        .paths_max = 16,
+        .small_versions_max = 16,
+        .large_versions_max = 16,
+        .prune_per_commit = 4,
+    });
+    defer store.deinit(std.testing.allocator);
+    const bytes = "a node encoding of some length";
+    const other = "another node encoding, longer";
+    const digest = trie.node.keccak256(bytes);
+    try std.testing.expect(!store.hash_matches(7, other, &digest));
+    try std.testing.expect(store.hash_matches(7, bytes, &digest));
+    // A cached digest still never vouches for another id or digest.
+    try std.testing.expect(store.hash_matches(7, bytes, &digest));
+    try std.testing.expect(!store.hash_matches(8, other, &digest));
+    const other_digest = trie.node.keccak256(other);
+    try std.testing.expect(!store.hash_matches(7, bytes, &other_digest));
+    // After a mutation the entry is stale: the same id with other bytes is hashed again.
+    try std.testing.expect(store.hash_matches(7, bytes, &digest));
+    store.invalidate_verified();
+    try std.testing.expect(!store.hash_matches(7, other, &digest));
+    _ = store.prune_step(1);
+    try std.testing.expect(!store.hash_matches(7, other, &digest));
 }

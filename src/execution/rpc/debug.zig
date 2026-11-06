@@ -23,6 +23,7 @@ const eth = @import("eth.zig");
 const json = @import("../../utilities/json/root.zig");
 const witness_module = @import("../db/witness.zig");
 const ByteList = witness_module.ByteList;
+const witness_json = @import("../db/witness_json.zig");
 const engine_json = @import("engine_json.zig");
 const payload = @import("../payload/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
@@ -227,26 +228,10 @@ pub fn proofs_sync_status(api: *eth.Api, call: *Call) HandlerError!void {
     try w.end_object();
 }
 
-/// Exact length of the `{state, codes, keys, headers}` object `execution_witness` writes.
+/// Exact length of the `{state, codes, keys, headers}` object `execution_witness` writes
+/// (`db.witness_json.length`: O(1) per list).
 pub fn witness_json_length(built: *const witness_module.Witness) u64 {
-    const lists = [_]struct { []const u8, *const ByteList }{
-        .{ "state", &built.state },
-        .{ "codes", &built.codes },
-        .{ "keys", &built.keys },
-        .{ "headers", &built.headers },
-    };
-    var length: u64 = 2 + (lists.len - 1); // Braces and the commas between members.
-    for (lists) |entry| {
-        const name, const list = entry;
-        length += name.len + 3 + 2; // `"name":` and the brackets.
-        if (list.count > 0) length += list.count - 1; // Commas.
-        var index: u32 = 0;
-        while (index < list.count) : (index += 1) {
-            length += 4 + 2 * @as(u64, list.get(index).len); // `"0x` + hex + `"`.
-        }
-    }
-    assert(length >= 2 + 4 * 5 + 3);
-    return length;
+    return witness_json.length(built);
 }
 
 fn write_list(w: *json.Writer, name: []const u8, list: *const ByteList) HandlerError!void {

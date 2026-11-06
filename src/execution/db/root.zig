@@ -7,6 +7,7 @@
 //! - `witness`: execution witness (`debug_executionWitness`) and stateless `SparseState`.
 //! - `witness_block`: the witness of a stored block (unwind to its parent, run, restore).
 //! - `witness_codec`: canonical witness encoding and its keccak256 preimage view (proof lane).
+//! - `witness_json`: the witness's `debug_executionWitness` JSON shape and exact length.
 //! - `witness_diff`: compare two witnesses down to accounts and slots (`witness-diff` tool).
 
 const std = @import("std");
@@ -25,6 +26,7 @@ pub const witness = @import("witness.zig");
 pub const witness_block = @import("witness_block.zig");
 pub const witness_codec = @import("witness_codec.zig");
 pub const witness_diff = @import("witness_diff.zig");
+pub const witness_json = @import("witness_json.zig");
 pub const database = @import("database.zig");
 pub const bench = @import("bench.zig");
 

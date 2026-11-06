@@ -555,13 +555,73 @@ pub const Writer = struct {
     pub fn data(writer: *Writer, bytes: []const u8) WriteError!void {
         try writer.separate();
         try writer.out.writeAll("\"0x");
-        for (bytes) |byte| {
-            try writer.out.writeByte(hex_digits[byte >> 4]);
-            try writer.out.writeByte(hex_digits[byte & 0xf]);
-        }
+        try write_hex(writer.out, bytes);
         try writer.out.writeByte('"');
     }
 };
+
+/// Lowercase hex of `bytes`, encoded straight into `out`'s buffer (`hex_encode`), in
+/// chunks of whatever room the buffer has: no intermediate copy. A buffer under two bytes
+/// (an unbuffered writer) takes one digit at a time.
+pub fn write_hex(out: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    if (out.buffer.len < 2) {
+        for (bytes) |byte| {
+            try out.writeByte(hex_digits[byte >> 4]);
+            try out.writeByte(hex_digits[byte & 0xf]);
+        }
+        return;
+    }
+    var rest = bytes;
+    var chunks: usize = 0;
+    while (rest.len > 0) : (chunks += 1) {
+        assert(chunks < bytes.len); // Every chunk encodes at least one byte.
+        const room = try out.writableSliceGreedy(2);
+        const count = @min(rest.len, room.len / 2);
+        assert(count > 0);
+        hex_encode(room[0 .. 2 * count], rest[0..count]);
+        out.advance(2 * count);
+        rest = rest[count..];
+    }
+}
+
+const hex_lanes = 16;
+const HexVector = @Vector(hex_lanes, u8);
+
+/// Interleaves the high-nibble digits (first operand) with the low ones (second).
+const hex_interleave: [2 * hex_lanes]i32 = blk: {
+    var mask: [2 * hex_lanes]i32 = undefined;
+    for (0..hex_lanes) |lane| {
+        mask[2 * lane] = lane;
+        mask[2 * lane + 1] = ~@as(i32, lane);
+    }
+    break :blk mask;
+};
+
+/// Lowercase hex of `source` into `target` (twice as long), 16 bytes per vector step.
+pub fn hex_encode(target: []u8, source: []const u8) void {
+    assert(target.len == 2 * source.len);
+    var index: usize = 0;
+    while (index + hex_lanes <= source.len) : (index += hex_lanes) {
+        const bytes: HexVector = source[index..][0..hex_lanes].*;
+        const high = hex_digits_of(bytes >> @splat(4));
+        const low = hex_digits_of(bytes & @as(HexVector, @splat(0xf)));
+        const pairs: [2 * hex_lanes]u8 = @shuffle(u8, high, low, hex_interleave);
+        target[2 * index ..][0 .. 2 * hex_lanes].* = pairs;
+    }
+    for (source[index..], index..) |byte, position| {
+        target[2 * position] = hex_digits[byte >> 4];
+        target[2 * position + 1] = hex_digits[byte & 0xf];
+    }
+    assert(index <= source.len);
+}
+
+/// ASCII digit of each nibble (0..15).
+fn hex_digits_of(nibbles: HexVector) HexVector {
+    const letters = nibbles > @as(HexVector, @splat(9));
+    const letter: HexVector = @splat('a' - 10);
+    const digit: HexVector = @splat('0');
+    return nibbles + @select(u8, letters, letter, digit);
+}
 
 pub fn write_string_escaped(out: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
     try out.writeByte('"');

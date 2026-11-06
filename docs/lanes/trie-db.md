@@ -190,9 +190,19 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (checkpoint load, journal replay, trie rebuild from flat tables, history rebuild-on-open
   over a 300-block window, path index fill); cut the dominant step (e.g. batched rehash on
   load, parallel storage-trie rebuild via `rehash_threads`, lazy history rebuild).
-- [ ] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
+- [x] `debug_executionWitness(head)` latency at 200 ms blocks: generator + JSON encode for
   typical and heavy blocks end to end through rpc; provers poll every block, so keep it well
   under the slot (history-sourced path, no state disturbance).
+  (`db/witness_rpc_bench.zig`, `-- "db/witness rpc"`; history reads memoized per call
+  (`witness_block.HistoryMemo`), verified-node cache in `history.Store`, vector hex in
+  `json.write_hex`, O(1)-per-list `db/witness_json.length`; heavy head 87 -> 28 ms, head-1
+  126 -> 27 ms, typical head 39 -> 12 ms; docs/PERF.md "db witness rpc")
+- [ ] The head witness is now ~60% `Builder.build_from` (sparse apply + post-root rehash
+  for the `WitnessMismatch` check, ~15 ms heavy) and ~40% history reads during execution
+  (~10 ms heavy: path-index probes per node, keccak of each distinct node once). Options:
+  keep the block's read set and changeset from its original execution (bounded cache of the
+  last N blocks, compared against the re-execution path in tests) so the head skips
+  re-execution; or the wider keccak batch from the sparse-apply item above.
 
 ## Decisions
 - Local minimal RLP in `trie/rlp.zig` (strict, canonical-only decoder) until `common/rlp` lands;
@@ -747,6 +757,24 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   proving the recent head; the 1 GiB budget holds the devnet-scale 100k-account state
   (79 MiB) plus 300 typical blocks (~925 MiB) and shrinks to ~202 blocks (40 s) under
   sustained storage-heavy blocks. A longer window needs a disk-backed store (not done).
+- Witness latency (`debug_executionWitness` from history): history walks keccak-check
+  every node they enter against the parent's reference, and one call entered the same nodes
+  many times (an account walk per slot read for its storage root, a second walk per written
+  key to fold the changeset's old values, the witness walk over all of them again). Two
+  caches, both exact: (1) `witness_block.HistoryMemo` keeps the parent values read in the
+  call, indexed like the recorder's key sets (the recorder adds a key before the read
+  reaches history), so each account is walked once and the changeset takes old values from
+  what execution read (the evm loads every account and slot before writing it; history at
+  B - 1 cannot change during the call; missing keys still read history); (2)
+  `history.Store.verified`, a 1.25 MiB direct-mapped (version id, digest) cache valid for one
+  store generation, bumped by every public mutation (`reset`, `commit_block`, `prune_step`,
+  `unwind_to`), so a hit is exactly a check that already passed on immutable bytes; it also
+  serves `eth_getProof`. Allocated and cleared at `Store.init` (not lazily: its contents
+  must be known). Not done: dropping the per-node check (it is ~18 ms of the old 39 ms heavy
+  head and guards history against index bugs), reusing the original execution's read set
+  (needs node integration and a cache of per-block inputs; the head is already 28 ms of a
+  200 ms slot). `json.Writer.data` encodes hex 16 bytes per vector step straight into the
+  response buffer (`json.write_hex`), byte-identical to the per-byte loop it replaced.
 
 ## Log
 - 2026-11-05: MPT (rlp, nibbles, node, HashBuilder, mutable trie, proofs, ordered root);
@@ -934,3 +962,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   node 4 MiB). Tests: paced checkpoint chunk/resume (engine), 64 engine seeds and 24
   database seeds crashing at random ticks or at a random chunk boundary of a paced
   checkpoint (with rot of the newest zone when the fallback is intact).
+- 2026-11-05: `debug_executionWitness` latency at 200 ms blocks: `db/witness_rpc_bench.zig`
+  witnesses the head and head - 1 from history over the 100k-account bench state, per step
+  (re-execution, `Builder.build_from`, changeset fold, JSON length and write). Before: heavy
+  (1k acct + 4k slot) head 88.9 ms, head-1 127.5 ms, typical (1k + 1k) head 40.0 ms; after
+  per-call history memo + verified-node cache + vector hex: heavy 27.7 / 27.3 ms, typical
+  12.1 / 12.7 ms; JSON write 1.6 -> 0.14 ms for 3.2 MB. Tests: seeded blocks (JSON equals the
+  per-byte reference, witness of a block identical before and after another commit),
+  existing history-vs-unwind witness workload, cache unit test, seeded `write_hex`
+  differential with chunked buffers, rpc witness tests (length now `db/witness_json`).

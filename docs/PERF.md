@@ -637,6 +637,65 @@ first measurements (back to back, no slot pacing, not committed): the journal ou
 checkpoint (12.7k Busy retries, `finish` commits p50 420 ms) — an artifact of committing 20x
 faster than 200 ms slots, which is why the os case paces.
 
+## 2026-11-05 db witness rpc: `debug_executionWitness` at 200 ms blocks (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/witness rpc"` (`db/witness_rpc_bench.zig`).
+State: the db bench state (100k accounts, 1k contracts x 64 slots) with a 4-block history
+window; four `write_block` blocks committed, then the head and head - 1 are witnessed from
+history (`Generator.generate_history`, the node's path, state untouched). The executor
+replays each block's changeset through an evm `State` over the recorded database (the
+block's read/write set without the interpreter: a lower bound of real re-execution). JSON
+is the `{state, codes, keys, headers}` object written through `json.Writer` into a
+response-sized buffer, as `rpc/debug.zig` does; it is checked byte-identical to the old
+per-byte writer every sample. Medians of 11 (ms); the machine was loaded (load average
+70-85), so single steps move by ~10-20% between runs. "build" is `Builder.build_from`
+timed again on its own after the call; "fold" is total - execute - build (`commit_evm`,
+history changeset, headers), clamped at 0.
+
+| Block | Step | Before | After |
+| --- | --- | ---: | ---: |
+| heavy head (6.0k nodes, 6.0k keys, 3.20 MB JSON) | execute (history reads) | 31.5 | 10.7 |
+| | build | 19.9 | 16.1 |
+| | fold | 35.8 | 0.8 |
+| | JSON write | 1.61 | 0.14 |
+| | **end to end** | **88.9** | **27.7** |
+| heavy head-1 | execute | 46.6 | 10.5 |
+| | build | 20.2 | 15.7 |
+| | fold | 59.2 | 0.7 |
+| | JSON write | 1.58 | 0.14 |
+| | **end to end** | **127.5** | **27.3** |
+| typical head (5.3k nodes, 2.8k keys, 2.61 MB JSON) | execute | 13.4 | 4.7 |
+| | build | 11.8 | 7.2 |
+| | fold | 13.5 | 0.0 |
+| | JSON write | 1.31 | 0.11 |
+| | **end to end** | **40.0** | **12.1** |
+| typical head-1 | execute | 13.5 | 5.2 |
+| | build | 11.3 | 7.6 |
+| | fold | 16.9 | 0.2 |
+| | JSON write | 1.26 | 0.10 |
+| | **end to end** | **43.0** | **12.7** |
+
+What changed:
+- Every history walk keccak-checks each node it enters. Disabling the check (experiment,
+  not kept) took the heavy head from 39 to 22 ms, so most of the old cost was hashing the
+  same nodes again: an account walk per slot read (for its storage root), a second walk per
+  written key to fold the changeset's old values, the witness walk over all of them.
+- `witness_block.HistoryMemo`: parent values read in the call, indexed like the recorder's
+  key sets. Each account is walked once; the changeset's old values come from what execution
+  read. Heavy head 87 -> 45 ms, head-1 126 -> 42 ms (this step alone).
+- `history.Store.verified`: (version id, digest) cache for one store generation (every
+  public mutation bumps it). Heavy 45 -> 28 ms. 1.25 MiB per store, cleared at `init`.
+- `json.write_hex`: 16 bytes per vector step (nibble -> digit with a select, interleave with
+  a shuffle) straight into the writer's buffer: 1.6 -> 0.14 ms for 3.2 MB (~23 GB/s).
+- `db/witness_json.length` is O(1) per list (the byte total is the list's last end);
+  `rpc/debug.zig` `witness_json_length` delegates to it.
+
+Remaining: `Builder.build_from` (~60%: sparse apply + post-root rehash for the
+`WitnessMismatch` check) and the history reads of execution (~40%: path-index probes per
+node, one keccak per distinct node). A real block also pays the interpreter (the 200-call
+evm block in "db witness" above). End to end through HTTP adds the socket send of 3.2 MB
+(not measured here; the large send buffer is filled by the same write).
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

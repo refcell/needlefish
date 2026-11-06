@@ -31,6 +31,14 @@
 //! head, and its journal are never touched, so the database keeps accepting commits between
 //! calls and the cost does not grow with B's depth. `database_witness` prefers it and falls
 //! back to the unwind when history is off or B - 1 is outside the window.
+//!
+//! History reads are memoized for the call (`HistoryMemo`): every node a history walk
+//! enters is keccak-checked, so an account walk per slot read (for its storage root) and a
+//! second walk per written key to fold the changeset's old values were most of the cost of
+//! a head witness. Each account is walked once (with its address hash), and the changeset
+//! takes old values from the values execution read: the evm loads every account and slot
+//! from the database before it writes it, history at B - 1 does not change during the call,
+//! and keys the memo lacks are read from history as before.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -44,6 +52,8 @@ const chain_module = @import("chain.zig");
 const evm_backend = @import("evm_backend.zig");
 const history = @import("history.zig");
 const node = @import("../trie/root.zig").node;
+
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -111,6 +121,72 @@ pub const Config = struct {
     response_bytes_max: u32 = std.math.maxInt(u32),
 };
 
+/// One account of the history path's parent state, read once per call.
+const MemoAccount = struct {
+    filled: bool,
+    address_hash: Hash,
+    state: ?history.AccountState,
+};
+
+const MemoSlot = struct { filled: bool, value: u256 };
+
+/// Parent-state values the history path read in the current call, indexed like the
+/// recorder's key sets (the recorder adds a key before the read reaches history). Entries
+/// at or above a list's high-water mark were never written (the buffers are lazily
+/// committed, their contents undefined); `begin` resets only the written prefix.
+const HistoryMemo = struct {
+    accounts: []MemoAccount,
+    slots: []MemoSlot,
+    accounts_high: u32 = 0,
+    slots_high: u32 = 0,
+
+    fn init(allocator: std.mem.Allocator, keys: witness.KeySet.Config) !HistoryMemo {
+        const accounts = try lazy.alloc(allocator, MemoAccount, keys.accounts_max);
+        errdefer lazy.free(allocator, accounts);
+        const slots = try lazy.alloc(allocator, MemoSlot, keys.slots_max);
+        return .{ .accounts = accounts, .slots = slots };
+    }
+
+    fn deinit(self: *HistoryMemo, allocator: std.mem.Allocator) void {
+        lazy.free(allocator, self.slots);
+        lazy.free(allocator, self.accounts);
+        self.* = undefined;
+    }
+
+    fn begin(self: *HistoryMemo) void {
+        assert(self.accounts_high <= self.accounts.len);
+        assert(self.slots_high <= self.slots.len);
+        for (self.accounts[0..self.accounts_high]) |*entry| entry.filled = false;
+        for (self.slots[0..self.slots_high]) |*entry| entry.filled = false;
+    }
+
+    fn account(self: *const HistoryMemo, index: u32) ?*const MemoAccount {
+        if (index >= self.accounts_high or !self.accounts[index].filled) return null;
+        return &self.accounts[index];
+    }
+
+    fn slot(self: *const HistoryMemo, index: u32) ?u256 {
+        if (index >= self.slots_high or !self.slots[index].filled) return null;
+        return self.slots[index].value;
+    }
+
+    fn put_account(self: *HistoryMemo, index: u32, entry: MemoAccount) void {
+        assert(entry.filled);
+        while (self.accounts_high <= index) : (self.accounts_high += 1) {
+            self.accounts[self.accounts_high].filled = false;
+        }
+        self.accounts[index] = entry;
+    }
+
+    fn put_slot(self: *HistoryMemo, index: u32, value: u256) void {
+        while (self.slots_high <= index) : (self.slots_high += 1) {
+            self.slots[self.slots_high].filled = false;
+        }
+        self.slots[index] = .{ .filled = true, .value = value };
+        assert(self.slots_high > index);
+    }
+};
+
 /// Where a witness's parent state came from.
 pub const Source = enum { unwind, history };
 
@@ -134,6 +210,7 @@ pub const Generator = struct {
     /// How the last witness was generated (null before the first success).
     source: ?Source = null,
     response_bytes_max: u32,
+    memo: HistoryMemo,
 
     pub fn init(allocator: std.mem.Allocator, state: *State, config: Config) !Generator {
         assert(config.depth_max > 0);
@@ -156,6 +233,8 @@ pub const Generator = struct {
         const changesets = try allocator.alloc([]const u8, config.depth_max);
         errdefer allocator.free(changesets);
         const headers = try allocator.alloc([]const u8, headers_max);
+        errdefer allocator.free(headers);
+        const memo = try HistoryMemo.init(allocator, config.builder.keys);
         return .{
             .state = state,
             .builder = builder,
@@ -167,10 +246,12 @@ pub const Generator = struct {
             .changesets = changesets,
             .headers = headers,
             .response_bytes_max = config.response_bytes_max,
+            .memo = memo,
         };
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        self.memo.deinit(allocator);
         allocator.free(self.headers);
         allocator.free(self.changesets);
         self.changeset_built.deinit(allocator);
@@ -218,6 +299,7 @@ pub const Generator = struct {
         const expected_root = try store.state_root_at(number);
         self.history_store = store;
         self.history_number = parent;
+        self.memo.begin();
         defer {
             self.history_store = null;
             self.blocks = null;
@@ -352,20 +434,48 @@ pub const Generator = struct {
         changeset.sort();
     }
 
+    /// The parent account of `address` (memoized when the recorder holds the address).
     fn history_account(self: *Generator, address: *const evm.Address) Error!?history.AccountState {
-        const store = self.history_store.?;
-        return store.account_at(self.history_number, &node.keccak256(address));
+        return (try self.memo_account(address)).state;
     }
 
-    fn history_slot(self: *Generator, address: *const evm.Address, slot: u256) Error!u256 {
+    fn memo_account(self: *Generator, address: *const evm.Address) Error!MemoAccount {
         const store = self.history_store.?;
+        const index = self.recorder.keys.accounts.index_of(address.*);
+        if (index) |found| {
+            if (self.memo.account(found)) |entry| return entry.*;
+        }
         const address_hash = node.keccak256(address);
-        const account = try store.account_at(self.history_number, &address_hash) orelse return 0;
+        const account: MemoAccount = .{
+            .filled = true,
+            .address_hash = address_hash,
+            .state = try store.account_at(self.history_number, &address_hash),
+        };
+        if (index) |found| self.memo.put_account(found, account);
+        return account;
+    }
+
+    /// The parent value of a slot (memoized when the recorder holds the slot).
+    fn history_slot(self: *Generator, address: *const evm.Address, slot: u256) Error!u256 {
+        const key: state_module.SlotKey = .{ .address = address.*, .slot = slot };
+        const index = self.recorder.keys.slots.index_of(key);
+        if (index) |found| {
+            if (self.memo.slot(found)) |value| return value;
+        }
+        const value = try self.history_slot_read(address, slot);
+        if (index) |found| self.memo.put_slot(found, value);
+        return value;
+    }
+
+    fn history_slot_read(self: *Generator, address: *const evm.Address, slot: u256) Error!u256 {
+        const store = self.history_store.?;
+        const account = try self.memo_account(address);
+        const state = account.state orelse return 0;
         var slot_bytes: [32]u8 = undefined;
         std.mem.writeInt(u256, &slot_bytes, slot, .big);
         const slot_hash = node.keccak256(&slot_bytes);
-        const storage_root = account.storage_root;
-        return store.storage_at(self.history_number, &address_hash, storage_root, &slot_hash);
+        const address_hash = &account.address_hash;
+        return store.storage_at(self.history_number, address_hash, state.storage_root, &slot_hash);
     }
 
     /// Ancestor headers from the lowest BLOCKHASH number read up to the parent, oldest
@@ -445,11 +555,8 @@ pub const Generator = struct {
         address: evm.Address,
     ) evm.state.Error!?evm.state.AccountInfo {
         const self = from(context);
-        const store = self.history_store.?;
-        const address_hash = node.keccak256(&address);
-        const account = store.account_at(self.history_number, &address_hash) catch {
-            return error.DatabaseFailure;
-        } orelse return null;
+        const memo = self.memo_account(&address) catch return error.DatabaseFailure;
+        const account = memo.state orelse return null;
         return .{
             .balance = account.balance,
             .nonce = account.nonce,
