@@ -20,6 +20,13 @@
 //! other failure is reported as corruption. After a crash the uncommitted, torn last entry
 //! usually shows up as corruption: the scan cannot tell a torn write from bit rot, and it
 //! must not, since in both cases the only safe result is the valid prefix.
+//!
+//! So that a clean end reads as one, each append also zeroes the sector after its entry, in
+//! the same write, when that sector is free (before the zone end and outside the live span).
+//! Without it, the end of the newest entry can fall inside an older lap's body, whose bytes
+//! look like a damaged header, and a clean restart would report corruption. When the trailer
+//! is skipped the end is clean anyway: at the zone end the scan reads the zone start (zeroes
+//! or a header, since wraps always begin there), and a full ring ends at the tail.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -155,6 +162,8 @@ pub fn JournalType(comptime Storage: type) type {
         write: storage.Write = .{},
         sync: storage.Sync = .{},
         append_position: u64 = 0,
+        /// Bytes of the entry being appended (the write may add a zeroed trailer sector).
+        append_size: u64 = 0,
         append_checksum: u128 = 0,
         recover_position: u64 = 0,
         recover_consumer: ?Consumer = null,
@@ -174,10 +183,11 @@ pub fn JournalType(comptime Storage: type) type {
             // Twice the largest entry: after a checkpoint any entry fits, even when wrapping.
             assert(config.zone_size_bytes >= 2 * entry_size_max(config));
             assert(config.zone_offset + config.zone_size_bytes <= storage_.size_bytes());
+            // The largest entry plus its zeroed trailer sector.
             const buffer = try allocator.alignedAlloc(
                 u8,
                 .fromByteUnits(sector_size),
-                @intCast(entry_size_max(config)),
+                @intCast(entry_size_max(config) + sector_size),
             );
             @memset(buffer, 0);
             return .{ .storage = storage_, .config = config, .buffer = buffer };
@@ -288,19 +298,33 @@ pub fn JournalType(comptime Storage: type) type {
             header.metadata = metadata.*;
             header.checksum = header.compute_checksum();
             @memcpy(self.buffer[sector_size..][0..body.len], body);
-            @memset(self.buffer[sector_size + body.len .. @intCast(size)], 0);
+            // Pads the body and, when written, zeroes the trailer sector.
+            const write_size = size + if (self.trailer_free(position, size)) sector_size else 0;
+            @memset(self.buffer[sector_size + body.len .. @intCast(write_size)], 0);
+            assert(write_size <= self.buffer.len);
 
             self.append_position = position;
+            self.append_size = size;
             self.append_checksum = header.checksum;
             self.state = .append_write;
             self.callback = callback;
             self.storage.write_sectors(
                 on_append_write,
                 &self.write,
-                self.buffer[0..@intCast(size)],
+                self.buffer[0..@intCast(write_size)],
                 self.config.zone_offset + position % self.config.zone_size_bytes,
             );
             return self.sequence_next;
+        }
+
+        /// Whether the sector after an entry at `position` of `size` bytes may be zeroed: it
+        /// lies before the zone end and outside the live span (never over the tail's entries).
+        fn trailer_free(self: *const Self, position: u64, size: u64) bool {
+            const zone_size = self.config.zone_size_bytes;
+            const end = position + size;
+            assert(end <= self.tail + zone_size);
+            return end % zone_size != 0 and end + sector_size <= self.tail + zone_size and
+                position % zone_size + size + sector_size <= zone_size;
         }
 
         fn on_append_write(write: *storage.Write) void {
@@ -314,7 +338,8 @@ pub fn JournalType(comptime Storage: type) type {
             const self: *Self = @alignCast(@fieldParentPtr("sync", sync));
             assert(self.state == .append_sync);
             assert(self.append_position >= self.head);
-            self.head = self.append_position + self.write.buffer.len;
+            assert(self.write.buffer.len >= self.append_size);
+            self.head = self.append_position + self.append_size;
             self.sequence_next += 1;
             self.previous_checksum = self.append_checksum;
             assert(self.head <= self.tail + self.config.zone_size_bytes);

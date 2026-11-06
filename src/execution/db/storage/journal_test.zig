@@ -167,6 +167,9 @@ test "journal: full ring, release, wrap, recover across the wrap" {
         try testing.expectEqual(count - start_index, harness.recovered_count);
         try testing.expectEqual(head, harness.journal.head);
         try expect_recovered(harness, &bodies, start_index);
+        // Nothing crashed, so the scan must end clean, wherever the end falls after a wrap.
+        const stop = harness.journal.recover_result.stop;
+        try testing.expectEqual(journal_module.StopReason.clean, stop);
         wraps = @intCast(head / zone_size);
         start = harness.journal.start_point();
         start_index = count;
@@ -174,6 +177,38 @@ test "journal: full ring, release, wrap, recover across the wrap" {
         if (count >= entries_max - 8) break;
     }
     try testing.expect(wraps >= 1);
+}
+
+// The newest entry ends inside an older lap's body: those bytes look like a damaged header
+// unless the writer zeroed the sector after the entry, so a clean restart reported corruption.
+test "journal: a clean end inside an older lap's body is reported clean" {
+    var sim = try SimStorage.init(testing.allocator, .{ .size_bytes = 1 << 20, .seed = 3 });
+    defer sim.deinit(testing.allocator);
+    const zone_size = 8 * 4 * sector_size;
+    const harness = try setup(&sim, zone_size);
+    defer teardown(harness);
+    var body: [body_size_max]u8 = undefined;
+    @memset(&body, 0x5a);
+    // Eight 4-sector entries fill the ring exactly; release them all.
+    for (0..8) |_| _ = try harness.append(&sim, &body);
+    const metadata: [metadata_size]u8 = @splat(0);
+    const full = harness.journal.append(&body, &metadata, Harness.on_done);
+    try testing.expectError(error.JournalFull, full);
+    harness.journal.reset(format_id, harness.journal.start_point());
+    const start = harness.journal.start_point();
+    // A 2-sector entry at the zone start ends on sector 2: the middle of the old first body.
+    _ = try harness.append(&sim, body[0..100]);
+    try testing.expectEqual(@as(u64, 2 * sector_size), harness.journal.head % zone_size);
+    try harness.recover(&sim, start);
+    try testing.expectEqual(@as(u32, 1), harness.recovered_count);
+    const stop = harness.journal.recover_result.stop;
+    try testing.expectEqual(journal_module.StopReason.clean, stop);
+    // A stray non-zero sector at the end is still corruption (the scan did not go lax).
+    // The zone starts one sector into the disk.
+    sim.corrupt_sector(1 + @as(u32, @intCast(harness.journal.head % zone_size / sector_size)));
+    try harness.recover(&sim, start);
+    try testing.expectEqual(@as(u32, 1), harness.recovered_count);
+    try testing.expect(harness.journal.recover_result.stop != .clean);
 }
 
 test "journal: corrupt body and header are detected, never delivered" {
