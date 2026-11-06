@@ -162,9 +162,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (`history.Config.bytes_max`, `Store.fit_budget`/`bytes_used`/`window_shrinks`,
   `db/history_bench.zig`; typical 2.82 MiB/block, heavy 4.68 MiB/block; node default
   window 300 = 60 s, `Limits.history_bytes_max` 1 GiB; see Decisions, PERF.md)
-- [ ] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
+- [x] Multi-key historical proofs sharing one walk (base/base `cursor_cache.rs` analogue):
   `eth_getProof` with many storage keys at an older block walks the history trie once per
   key; reuse `path_targets` + `history.Store.walk_paths` for one sorted walk per trie.
+  (`db/proof_set.zig`, `history.Store.get_proofs`/`walk_frames`, `Database.proofs_at`,
+  `Chain.proofs_at` + `Journal.proofs`, historical `rpc/eth_proof.zig`; 1 account + 64 keys
+  344-384 -> 48-56 µs, + 256 keys 1307-1314 -> 96-98 µs; docs/PERF.md "db history:
+  multi-key"; see Decisions)
 - [x] History commit is the largest step of a 200 ms slot on heavy blocks (34 ms p50,
   117 ms max for 1k acct + 4k slots; ~12 ms typical): profile `history.Store.commit_block`
   (version allocation, path index probes, node re-encoding) and cut it, or move it off the
@@ -358,6 +362,22 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   block waiting or falling back) and the extra ordering under DST. Remaining cost: the trie
   re-encodes each visited node and its encoding is copied into a pool slot; taking encodings
   from a trie-side cache would need the trie to keep full encodings.
+- Multi-key historical proofs (`db/proof_set.zig`, `history.Store.get_proofs`): one account
+  walk, then the slots are hashed, sorted and deduplicated into a caller-owned `ProofSet`
+  and the storage trie is walked once (`Store.walk_frames`, the depth-first core now shared
+  with the witness `walk_paths` through a frame visitor). Each node is looked up,
+  keccak-checked and decoded once; every key entering it appends a slice into the store (no
+  copy), and leaves give the values with `walk_path`'s rules, so each key's proof and value
+  are byte for byte `get_proof`'s (seeded differential at every window block, plus fuzz).
+  Duplicate keys share one walk entry (binary search back from the input order). The slices
+  are valid until the store changes, which the single-threaded RPC handler satisfies (walk,
+  then write the response). base/base memoizes cursor results per request
+  (`cursor_cache.rs`, concurrent proof jobs over one snapshot); we have no cursors or
+  concurrent jobs, so the sorted walk gives the sharing structurally. Not memoized across
+  requests. `Database.proofs_at` needs history (no live fallback at the head: the RPC serves
+  the head from the live trie and only sends older blocks here). The RPC carves the set from
+  the API scratch after its proof buffers, sized by the request's key count (~1.1 KiB per
+  key: 256 keys ~ 290 KiB of the node's 16 MiB scratch).
 - History is not journaled: it is derived data. After a restart the durable database
   rebuilds the window from the retained blocks' changesets (see "History rebuild on open").
   Journaling every node version would multiply the journal volume per block for data the
@@ -856,3 +876,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   head, in-window proofs equal the unwound state, pruned blocks out of window), a state over
   the budget is refused, and a database workload with crash/reopen under a budget (no
   `history_drops`, rebuilt window within the budget).
+- 2026-11-05: multi-key historical `eth_getProof`: `history.Store.get_proofs` walks the
+  account path once and the storage trie once for all keys (sorted, deduplicated `ProofSet`
+  of slices into the store), wired through `Database.proofs_at`, `Journal.proofs`,
+  `Chain.proofs_at` into the historical RPC path. Bench (`db/history proof`, 16-block heavy
+  window, oldest + 1): 1 acct + 64 keys 344-384 -> 48-56 µs, + 256 keys 1307-1314 -> 96-98
+  µs vs the old per-key path. Tests: seeded store differential (random workloads with
+  reorgs, random key sets with duplicates and absent keys, absent account, empty storage,
+  every block of the window, before and after pruning) against per-key `get_proof`, a fuzz
+  target, and `proofs_at` vs `proof_at` in the database history workload.

@@ -18,6 +18,7 @@ const state_module = @import("state.zig");
 const overlay_module = @import("overlay.zig");
 const changeset_module = @import("changeset.zig");
 const history = @import("history.zig");
+const proof_set = @import("proof_set.zig");
 const trie = @import("../trie/root.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -104,6 +105,19 @@ const Proofs = struct {
     values: [slots_max]u256 = undefined,
     live_account: StateTrie.AccountProof = .{},
     live_storage: StateTrie.StorageProof = .{},
+    multi_account: StateTrie.AccountProof = .{},
+    filled: StateTrie.StorageProof = .{},
+    set_storage: proof_set.Storage(2 * slots_max) = undefined,
+};
+
+/// Every slot, then every slot again in reverse (duplicates, unsorted).
+const multi_slots: [2 * slots_max]u256 = blk: {
+    var slots: [2 * slots_max]u256 = undefined;
+    for (all_slots, 0..) |slot, index| {
+        slots[index] = slot;
+        slots[2 * slots_max - 1 - index] = slot;
+    }
+    break :blk slots;
 };
 
 fn expect_same_proof(expected: anytype, got: anytype) !void {
@@ -354,6 +368,33 @@ const Harness = struct {
             const value = try verify(storage_root, &slot_hash, &proofs.storage[index]);
             try testing.expectEqual(proofs.values[index] != 0, value != null);
         }
+        try self.expect_multi_matches(number, address, account);
+    }
+
+    /// `proofs_at` (one storage walk) equals the `proof_at` results just computed.
+    fn expect_multi_matches(
+        self: *Harness,
+        number: u64,
+        address: state_module.Address,
+        account: ?history.AccountState,
+    ) !void {
+        const proofs = self.proofs;
+        var set = proofs.set_storage.set();
+        const multi = try self.db.proofs_at(
+            number,
+            address,
+            &multi_slots,
+            &proofs.multi_account,
+            &set,
+        );
+        try testing.expectEqual(account, multi);
+        try expect_same_proof(&proofs.account, &proofs.multi_account);
+        for (multi_slots, 0..) |slot, index| {
+            const single = @as(usize, @intCast(slot));
+            set.fill(@intCast(index), &proofs.filled);
+            try expect_same_proof(&proofs.storage[single], &proofs.filled);
+            try testing.expectEqual(proofs.values[single], set.value(@intCast(index)));
+        }
     }
 
     fn load_changeset(self: *Harness, number: u64) !void {
@@ -540,6 +581,9 @@ test "database history: without history a reopen serves only the head" {
         &.{},
         &.{},
     ));
+    var set = h.proofs.set_storage.set();
+    const proofs_at = h.db.proofs_at(head.number, address_of(1), &.{}, &h.proofs.account, &set);
+    try testing.expectError(error.HistoryUnavailable, proofs_at);
 }
 
 test "database history: a full store drops history and the database stays healthy" {

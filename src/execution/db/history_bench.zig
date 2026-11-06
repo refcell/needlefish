@@ -29,6 +29,7 @@ const State = state_module.State;
 const Overlay = overlay_module.Overlay;
 const Changeset = changeset_module.Changeset;
 const Shape = bench.Shape;
+const StateTrie = @import("../trie/root.zig").StateTrie;
 
 pub const window_blocks_bench = 64;
 /// L2 blocks per second at Base's native 200 ms block time.
@@ -207,6 +208,157 @@ pub fn run(io: std.Io, filter: ?[]const u8) void {
         };
         print(case.name, &result);
     }
+    run_proofs(io, filter);
+}
+
+/// `eth_getProof(contract, [k1..kn], older block)` from history: 1 account + n keys of one
+/// contract (its 64 slots, the rest absent) at the block after the window's oldest.
+const ProofCase = struct { name: []const u8, keys: u32 };
+
+pub const proof_cases = [_]ProofCase{
+    .{ .name = "db/history proof 1 acct+64 keys", .keys = 64 },
+    .{ .name = "db/history proof 1 acct+256 keys", .keys = 256 },
+};
+
+/// Window of the proof benchmarks (heavy blocks; shorter than the memory benchmark's).
+pub const proof_window_blocks = 16;
+const proof_iterations = 64;
+
+pub const ProofResult = struct {
+    keys: u32,
+    /// Old RPC path: an account proof, then `get_proof` per key (account + storage walk).
+    per_key_ns_p50: u64,
+    /// `get_proof` with every key at once (one account walk, one storage walk per key).
+    per_slot_ns_p50: u64,
+    /// `get_proofs` (one account walk, one sorted storage walk) plus `fill` of every key.
+    multi_ns_p50: u64,
+};
+
+/// Proof buffers of the proof benchmarks (heap: proofs are large).
+const ProofBuffers = struct {
+    account: StateTrie.AccountProof = .{},
+    storage: [256]StateTrie.StorageProof = undefined,
+    values: [256]u256 = undefined,
+    slots: [256]u256 = undefined,
+};
+
+pub fn measure_proofs(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    shape: Shape,
+    window: u32,
+    keys: u32,
+) !ProofResult {
+    assert(keys > 0 and keys <= 256 and window > 1);
+    const fixture = try allocator.create(Fixture);
+    defer allocator.destroy(fixture);
+    try fixture.init(allocator, shape, window);
+    defer fixture.deinit(allocator);
+    var number: u64 = 0;
+    while (number < 2 * window) {
+        number += 1;
+        _ = try fixture.commit(io, number);
+    }
+    const buffers = try allocator.create(ProofBuffers);
+    defer allocator.destroy(buffers);
+    buffers.* = .{};
+    for (buffers.slots[0..keys], 0..) |*slot, index| slot.* = index;
+    var set = try history.ProofSet.init(allocator, keys);
+    defer set.deinit(allocator);
+    const samples = try allocator.alloc(u64, 3 * proof_iterations);
+    defer allocator.free(samples);
+    const at = fixture.store.window().?.oldest + 1;
+    const proof_run: ProofRun = .{ .store = &fixture.store, .number = at, .keys = keys };
+    for (0..proof_iterations) |index| {
+        samples[index] = try proof_run.per_key(io, buffers);
+        samples[proof_iterations + index] = try proof_run.per_slot(io, buffers);
+        samples[2 * proof_iterations + index] = try proof_run.multi(io, buffers, &set);
+    }
+    return .{
+        .keys = keys,
+        .per_key_ns_p50 = median(samples[0..proof_iterations]),
+        .per_slot_ns_p50 = median(samples[proof_iterations .. 2 * proof_iterations]),
+        .multi_ns_p50 = median(samples[2 * proof_iterations ..]),
+    };
+}
+
+fn median(samples: []u64) u64 {
+    assert(samples.len > 0);
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return samples[samples.len / 2];
+}
+
+/// One timed `eth_getProof` of the proof benchmarks, three ways.
+const ProofRun = struct {
+    store: *const history.Store,
+    number: u64,
+    keys: u32,
+
+    const address = bench.address_of(0);
+
+    fn per_key(self: ProofRun, io: std.Io, buffers: *ProofBuffers) !u64 {
+        const start = bench.now_ns(io);
+        _ = try self.store.get_proof(self.number, address, &.{}, &buffers.account, &.{}, &.{});
+        for (buffers.slots[0..self.keys]) |slot| {
+            const proofs = buffers.storage[0..1];
+            const values = buffers.values[0..1];
+            const slots = [1]u256{slot};
+            const account = &buffers.account;
+            _ = try self.store.get_proof(self.number, address, &slots, account, proofs, values);
+        }
+        const end = bench.now_ns(io);
+        assert(buffers.account.count > 0);
+        return end - start;
+    }
+
+    fn per_slot(self: ProofRun, io: std.Io, buffers: *ProofBuffers) !u64 {
+        const slots = buffers.slots[0..self.keys];
+        const proofs = buffers.storage[0..self.keys];
+        const values = buffers.values[0..self.keys];
+        const start = bench.now_ns(io);
+        _ = try self.store.get_proof(self.number, address, slots, &buffers.account, proofs, values);
+        const end = bench.now_ns(io);
+        assert(buffers.storage[0].count > 0);
+        return end - start;
+    }
+
+    fn multi(self: ProofRun, io: std.Io, buffers: *ProofBuffers, set: *history.ProofSet) !u64 {
+        const slots = buffers.slots[0..self.keys];
+        const start = bench.now_ns(io);
+        _ = try self.store.get_proofs(self.number, address, slots, &buffers.account, set);
+        for (0..self.keys) |index| {
+            set.fill(@intCast(index), &buffers.storage[0]);
+            buffers.values[0] = set.value(@intCast(index));
+        }
+        const end = bench.now_ns(io);
+        assert(buffers.storage[0].count > 0);
+        return end - start;
+    }
+};
+
+fn run_proofs(io: std.Io, filter: ?[]const u8) void {
+    for (proof_cases) |case| {
+        if (!bench.matches(case.name, filter)) continue;
+        const allocator = std.heap.page_allocator;
+        const shape = bench.shape_bench;
+        const window = proof_window_blocks;
+        const result = measure_proofs(io, allocator, shape, window, case.keys) catch |err| {
+            std.debug.print("{s}: failed: {s}\n", .{ case.name, @errorName(err) });
+            continue;
+        };
+        std.debug.print(
+            "{s:<44} at oldest+1: per-key {d:.1} us, per-slot {d:.1} us, " ++
+                "multi {d:.1} us ({d:.1}x vs per-key)\n",
+            .{
+                case.name,
+                @as(f64, @floatFromInt(result.per_key_ns_p50)) / 1e3,
+                @as(f64, @floatFromInt(result.per_slot_ns_p50)) / 1e3,
+                @as(f64, @floatFromInt(result.multi_ns_p50)) / 1e3,
+                @as(f64, @floatFromInt(result.per_key_ns_p50)) /
+                    @as(f64, @floatFromInt(@max(result.multi_ns_p50, 1))),
+            },
+        );
+    }
 }
 
 fn print(name: []const u8, result: *const Result) void {
@@ -251,4 +403,12 @@ test "history bench: steady state and budget (small shape)" {
     try std.testing.expect(result.budget_window_min < window);
     try std.testing.expect(result.budget_shrinks > 0);
     for (cases) |case| try std.testing.expect(bench.matches(case.name, "db/history"));
+}
+
+test "history bench: multi-key proofs (small shape)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const result = try measure_proofs(io, allocator, bench.shape_test, 4, 32);
+    try std.testing.expectEqual(@as(u32, 32), result.keys);
+    for (proof_cases) |case| try std.testing.expect(bench.matches(case.name, "db/history"));
 }

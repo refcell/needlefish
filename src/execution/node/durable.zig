@@ -221,6 +221,7 @@ pub fn Durable(comptime Storage: type) type {
                 .move_head = move_head,
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
+                .proofs = if (self.database.history != null) proofs else null,
                 .history_window = if (self.database.history != null) history_window else null,
             };
         }
@@ -253,6 +254,27 @@ pub fn Durable(comptime Storage: type) type {
                 return error.HistoryUnavailable;
             if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
             return database.proof_at(number, address, slots, account_proof, storage_proofs, values);
+        }
+
+        /// Historical multi-slot `eth_getProof` (one storage walk) from the database's
+        /// history window; the canonical index decides as for `proof`.
+        fn proofs(
+            context: *anyopaque,
+            hash: Hash,
+            number: u64,
+            address: [20]u8,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            set: *db_module.history.ProofSet,
+        ) db_module.database.ProofError!?db_module.history.AccountState {
+            const self = from(context);
+            assert(self.phase == .ready);
+            assert(slots.len <= set.capacity());
+            const database = &self.database;
+            const canonical = database.chain.canonical_hash(number) orelse
+                return error.HistoryUnavailable;
+            if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+            return database.proofs_at(number, address, slots, account_proof, set);
         }
 
         /// From the history window when it holds the block's parent (state untouched), else

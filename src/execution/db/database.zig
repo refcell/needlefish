@@ -1105,6 +1105,25 @@ pub fn DatabaseType(comptime Storage: type) type {
             return self.proof_live(address, slots, account_proof, storage_proofs, values);
         }
 
+        /// `proof_at` for many slots in one storage walk (`history.Store.get_proofs`): the
+        /// account proof, and in `set` each slot's proof and value (byte for byte
+        /// `proof_at`'s), valid until the next head move. History only: without it every
+        /// block, the head too, is `HistoryUnavailable` (the head is served by `proof_at`).
+        pub fn proofs_at(
+            self: *Self,
+            number: u64,
+            address: history_module.Address,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            set: *history_module.ProofSet,
+        ) ProofError!?history_module.AccountState {
+            assert(slots.len <= set.capacity());
+            if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            const store = self.history_tracking() orelse return error.HistoryUnavailable;
+            assert(store.window() != null);
+            return store.get_proofs(number, address, slots, account_proof, set);
+        }
+
         fn proof_live(
             self: *Self,
             address: history_module.Address,

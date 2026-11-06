@@ -563,6 +563,34 @@ in the same runs (machine shared with other builds; the spread is noise). The
 show up next to execution. Real-disk write latency is not measured (journal writes run
 asynchronously off the slot).
 
+## 2026-11-05 db history: multi-key `eth_getProof` in one walk (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- "db/history proof"`: the db bench state (100k
+accounts, 1k contracts x 64 slots), a 16-block history window of heavy blocks (1k acct + 4k
+slot) committed twice over, then `eth_getProof(contract 0, [slot 0..n-1], oldest + 1)`:
+1 account and n keys (its 64 slots present, the rest absent). Medians of 64 iterations, two
+runs (the machine was loaded by other builds).
+
+| Keys | per-key (old RPC path) | per-slot `get_proof` | multi `get_proofs` + fill | vs old |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 344-384 µs | 102-114 µs | 48-56 µs | 6.9-7.2x |
+| 256 | 1307-1314 µs | 343 µs | 96-98 µs | 13.4-13.7x |
+
+- per-key: what `eth_getProof` at an older block did before: an account proof, then one
+  `Chain.proof_at` per key, each re-walking the account path and walking the storage path
+  (n + 1 account walks, n storage walks, every node looked up and keccak-checked each time).
+- per-slot: `Store.get_proof` with every slot (one account walk, n storage walks).
+- multi: `Store.get_proofs` (`db/proof_set.zig`): the slots are hashed, sorted and
+  deduplicated (`trie.path_targets`), and the storage trie is walked once depth-first
+  (`Store.walk_frames`, shared with the witness `walk_paths`): each node on a shared prefix
+  is looked up, keccak-checked and decoded once, and every key whose path enters it records a
+  slice to it. `fill` then copies one key's proof into the RPC buffer (included in the time).
+
+The remaining cost is linear in the output: every key still gets its full node list copied
+(root and upper branches repeated per key, as `eth_getProof` requires), plus one keccak per
+slot. The 256-key case is 4x the keys for 2x the time of 64 because most of the extra keys
+are absent and end at the shared upper nodes.
+
 ## Targets
 
 - Simulator: keep a full seed under 50 ms as real components replace the models, so CI

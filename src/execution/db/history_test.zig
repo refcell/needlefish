@@ -651,3 +651,152 @@ test "history: seeded fuzz node and value decoders" {
         check_decoders(buffer[0..length]);
     }
 }
+
+// Multi-key proofs (`Store.get_proofs`): one sorted storage walk must give, for every
+// requested key, byte for byte the proof and value of `get_proof` for that key alone.
+
+const multi_keys_max = 40;
+
+/// Buffers of the multi-key differential (heap: proofs are large).
+const MultiProofs = struct {
+    single_account: StateTrie.AccountProof = .{},
+    multi_account: StateTrie.AccountProof = .{},
+    single_storage: [1]StateTrie.StorageProof = undefined,
+    filled: StateTrie.StorageProof = .{},
+    set_storage: history.proof_set.Storage(multi_keys_max) = undefined,
+    keys: [multi_keys_max]u256 = undefined,
+};
+
+/// Coverage of one differential run: each case must occur.
+const MultiCoverage = struct {
+    absent_accounts: u32 = 0,
+    empty_storage: u32 = 0,
+    storage: u32 = 0,
+    duplicates: u32 = 0,
+    absent_keys: u32 = 0,
+};
+
+/// Up to `multi_keys_max` keys: written slots, never-written slots (absent), random keys,
+/// and duplicates of earlier keys, in random order.
+fn random_keys(prng: *Prng, keys: *[multi_keys_max]u256) []const u256 {
+    const count = prng.below(multi_keys_max + 1);
+    for (keys[0..count], 0..) |*key, index| {
+        if (index > 0 and prng.chance(1, 5)) {
+            key.* = keys[prng.below(index)];
+        } else if (prng.chance(1, 8)) {
+            key.* = prng.int(u256);
+        } else {
+            key.* = prng.below(slots_max + 4);
+        }
+    }
+    return keys[0..count];
+}
+
+fn expect_multi_matches_single(
+    store: *const history.Store,
+    number: u64,
+    address_index: usize,
+    keys: []const u256,
+    proofs: *MultiProofs,
+    coverage: *MultiCoverage,
+) !void {
+    const address = address_of(address_index);
+    var set = proofs.set_storage.set();
+    const multi = try store.get_proofs(number, address, keys, &proofs.multi_account, &set);
+    const single_account = try store.prove_account(number, address, &proofs.single_account);
+    try testing.expectEqual(single_account, multi);
+    try expect_same_proof(&proofs.single_account, &proofs.multi_account);
+    for (keys, 0..) |key, index| {
+        var value: [1]u256 = undefined;
+        const single = try store.get_proof(
+            number,
+            address,
+            &.{key},
+            &proofs.single_account,
+            &proofs.single_storage,
+            &value,
+        );
+        try testing.expectEqual(single, multi);
+        set.fill(@intCast(index), &proofs.filled);
+        try expect_same_proof(&proofs.single_storage[0], &proofs.filled);
+        try testing.expectEqual(value[0], set.value(@intCast(index)));
+        if (value[0] == 0) coverage.absent_keys += 1;
+    }
+    if (multi == null) coverage.absent_accounts += 1;
+    const storage_root = if (multi) |found| found.storage_root else trie.empty_root;
+    const has_storage = !std.mem.eql(u8, &storage_root, &trie.empty_root);
+    if (multi != null and !has_storage) coverage.empty_storage += 1;
+    if (has_storage) coverage.storage += 1;
+    if (set.unique < keys.len) coverage.duplicates += 1;
+}
+
+/// Every block of the window, every address (and the never-written one), random key sets;
+/// also every slot at once and no keys.
+fn sweep_multi(
+    store: *const history.Store,
+    prng: *Prng,
+    proofs: *MultiProofs,
+    coverage: *MultiCoverage,
+) !void {
+    const window = store.window().?;
+    var number = window.oldest;
+    while (number <= window.head) : (number += 1) {
+        for (0..addresses_max + 1) |index| {
+            const keys = random_keys(prng, &proofs.keys);
+            try expect_multi_matches_single(store, number, index, keys, proofs, coverage);
+        }
+        const index = prng.below(addresses_max + 1);
+        try expect_multi_matches_single(store, number, index, &all_slots, proofs, coverage);
+        try expect_multi_matches_single(store, number, index, &.{}, proofs, coverage);
+    }
+}
+
+fn run_multi_seed(seed: u64, blocks: u32, coverage: *MultiCoverage) !void {
+    var prng = Prng.init(seed);
+    var harness: Harness = undefined;
+    try harness.init(history_config);
+    defer harness.deinit();
+    const proofs = try testing.allocator.create(MultiProofs);
+    defer testing.allocator.destroy(proofs);
+    proofs.* = .{};
+    for (0..40) |_| try random_write(&prng, &harness.overlay);
+    _ = try harness.overlay.commit(harness.changeset(0));
+    try harness.store.reset(&harness.state.state_trie, 0);
+    var head: u64 = 0;
+    for (0..blocks) |_| {
+        const oldest = harness.store.window().?.oldest;
+        if (head > oldest and prng.chance(1, 5)) {
+            head = try harness.reorg(&prng, head);
+        } else {
+            head += 1;
+            try harness.commit(&prng, head);
+        }
+        const number = prng.range(harness.store.window().?.oldest, head);
+        const index = prng.below(addresses_max + 1);
+        const keys = random_keys(&prng, &proofs.keys);
+        try expect_multi_matches_single(&harness.store, number, index, keys, proofs, coverage);
+    }
+    try sweep_multi(&harness.store, &prng, proofs, coverage);
+    _ = harness.store.prune_step(harness.store.usage().prune_queue);
+    try sweep_multi(&harness.store, &prng, proofs, coverage);
+}
+
+test "history: multi-key proofs equal per-key proofs at every block of the window" {
+    var coverage: MultiCoverage = .{};
+    for (0..3) |seed| try run_multi_seed(0x3a17 + seed, blocks_total, &coverage);
+    try testing.expect(coverage.absent_accounts > 0);
+    try testing.expect(coverage.empty_storage > 0);
+    try testing.expect(coverage.storage > 0);
+    try testing.expect(coverage.duplicates > 0);
+    try testing.expect(coverage.absent_keys > 0);
+}
+
+fn fuzz_multi_proofs(_: void, smith: *testing.Smith) anyerror!void {
+    var coverage: MultiCoverage = .{};
+    const blocks = smith.valueRangeAtMost(u32, 1, 16);
+    try run_multi_seed(smith.value(u64), blocks, &coverage);
+}
+
+test "history: fuzz multi-key proofs against per-key proofs" {
+    try testing.fuzz({}, fuzz_multi_proofs, .{});
+}

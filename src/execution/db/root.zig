@@ -20,6 +20,7 @@ pub const snapshot = @import("snapshot.zig");
 pub const evm_backend = @import("evm_backend.zig");
 pub const history = @import("history.zig");
 pub const path_index = @import("path_index.zig");
+pub const proof_set = @import("proof_set.zig");
 pub const witness = @import("witness.zig");
 pub const witness_block = @import("witness_block.zig");
 pub const witness_codec = @import("witness_codec.zig");

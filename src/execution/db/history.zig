@@ -26,6 +26,8 @@ const changeset_module = @import("changeset.zig");
 const lazy_alloc = @import("../../utilities/lazy_alloc/root.zig");
 const PathIndex = @import("path_index.zig").PathIndex;
 const IndexSlot = @import("path_index.zig").Slot;
+pub const proof_set = @import("proof_set.zig");
+pub const ProofSet = proof_set.ProofSet;
 const rlp = trie.rlp;
 const nibbles_module = trie.nibbles;
 const StateTrie = trie.StateTrie;
@@ -1163,6 +1165,30 @@ pub const Store = struct {
         return account;
     }
 
+    /// `get_proof` for many slots in one storage walk (`proof_set.zig`): one account proof,
+    /// then the slots are hashed, sorted, and deduplicated into `set`, and the storage trie is
+    /// walked once (`walk_frames`), each shared node looked up and hash-checked once. Each
+    /// requested slot's proof and value in `set` equal `get_proof`'s for that slot alone; the
+    /// proof nodes point into the store, valid until the store next changes.
+    pub fn get_proofs(
+        self: *const Store,
+        number: u64,
+        address: Address,
+        slots: []const u256,
+        account_proof: *StateTrie.AccountProof,
+        set: *ProofSet,
+    ) Error!?AccountState {
+        assert(slots.len <= set.capacity());
+        const account = try self.prove_account(number, address, account_proof);
+        const storage_root = if (account) |found| found.storage_root else trie.empty_root;
+        set.prepare(slots);
+        assert(set.unique <= slots.len);
+        const owner: ?Hash = trie.node.keccak256(&address);
+        const visitor: ProofVisitor = .{ .keys = set.keys_unique() };
+        try self.walk_frames(owner, storage_root, set.targets_unique(), number, visitor);
+        return account;
+    }
+
     /// The account proof at block `number`; returns the account or null when absent.
     pub fn prove_account(
         self: *const Store,
@@ -1429,6 +1455,28 @@ pub const Store = struct {
         number: u64,
         sink: anytype,
     ) !void {
+        const visitor: PathVisitor(@TypeOf(sink)) = .{
+            .store = self,
+            .owner = owner,
+            .number = number,
+            .sink = sink,
+        };
+        try self.walk_frames(owner, root, targets, number, visitor);
+    }
+
+    /// The depth-first multi-key walk shared by `walk_paths` and `get_proofs`: every node
+    /// that some target's path enters is looked up, checked against its parent's reference,
+    /// and decoded once, then passed to `visitor.frame(frame, range, bytes, view)` with the
+    /// targets entering it (`range`, `targets[frame.start..frame.end]`). Each target sees the
+    /// nodes of its path in root-to-leaf order, exactly the nodes `walk_path` walks for it.
+    fn walk_frames(
+        self: *const Store,
+        owner: ?Hash,
+        root: Hash,
+        targets: []const trie.PathTarget,
+        number: u64,
+        visitor: anytype,
+    ) !void {
         assert(trie.path_targets.sorted(targets));
         if (std.mem.eql(u8, &root, &trie.empty_root) or targets.len == 0) return;
         var stack: [trie.path_targets.stack_frames_max]PathFrame = undefined;
@@ -1446,15 +1494,8 @@ pub const Store = struct {
             const prefix = trie.Nibbles.from_bytes(&range[0].path);
             const path = prefix.slice()[0..frame.consumed];
             const bytes = try self.checked_node(owner, path, number, frame.reference);
-            if (frame.consumed == 0 or bytes.len >= 32) {
-                assert(frame.reference == .hash);
-                const marked = trie.path_targets.any_mark(range);
-                try sink.visit(&frame.reference.hash, bytes, marked);
-            }
             const view = node_view(bytes) catch return error.HistoryCorrupt;
-            const off_path = view == .branch and frame.consumed < path_nibbles_max and
-                trie.path_targets.any_siblings(range);
-            if (off_path) try self.visit_off_path(owner, number, &view.branch, frame, range, sink);
+            try visitor.frame(frame, range, bytes, &view);
             stack_len = push_children(&view, frame, targets, &stack, stack_len);
         }
     }
@@ -1570,6 +1611,79 @@ pub const Store = struct {
 
 /// A node of `Store.walk_paths` (by its parent's reference) and the targets entering it.
 const PathFrame = struct { reference: Reference, start: u32, end: u32, consumed: u32 };
+
+/// `Store.walk_paths` frame visitor: the witness sink's proof nodes (hashed or root) and,
+/// for `siblings` targets, the hashed children off their paths.
+fn PathVisitor(comptime Sink: type) type {
+    return struct {
+        store: *const Store,
+        owner: ?Hash,
+        number: u64,
+        sink: Sink,
+
+        fn frame(
+            self: @This(),
+            path_frame: PathFrame,
+            range: []const trie.PathTarget,
+            bytes: []const u8,
+            view: *const NodeView,
+        ) !void {
+            assert(range.len == path_frame.end - path_frame.start);
+            if (path_frame.consumed == 0 or bytes.len >= 32) {
+                assert(path_frame.reference == .hash);
+                const marked = trie.path_targets.any_mark(range);
+                try self.sink.visit(&path_frame.reference.hash, bytes, marked);
+            }
+            const off_path = view.* == .branch and path_frame.consumed < path_nibbles_max and
+                trie.path_targets.any_siblings(range);
+            if (!off_path) return;
+            const children = &view.branch;
+            const owner = self.owner;
+            const number = self.number;
+            try self.store.visit_off_path(owner, number, children, path_frame, range, self.sink);
+        }
+    };
+}
+
+/// `Store.get_proofs` frame visitor: appends each proof node (hashed or root) to the proof of
+/// every target entering it, and decodes the values at leaves (`walk_path`'s rules).
+const ProofVisitor = struct {
+    /// Per unique target, in target order.
+    keys: []proof_set.KeyProof,
+
+    fn frame(
+        self: ProofVisitor,
+        path_frame: PathFrame,
+        range: []const trie.PathTarget,
+        bytes: []const u8,
+        view: *const NodeView,
+    ) Error!void {
+        assert(path_frame.end <= self.keys.len);
+        const keys = self.keys[path_frame.start..path_frame.end];
+        assert(keys.len == range.len and keys.len > 0);
+        if (path_frame.consumed == 0 or bytes.len >= 32) {
+            for (keys) |*key| key.append(bytes);
+        }
+        const at_end = switch (view.*) {
+            .leaf => true,
+            .branch => path_frame.consumed == path_nibbles_max,
+            .extension => false,
+        };
+        if (!at_end) return;
+        for (range, keys) |*target, *key| {
+            const path = trie.Nibbles.from_bytes(&target.path);
+            const rest = path.slice()[path_frame.consumed..];
+            const step = step_node(bytes, rest) catch return error.HistoryCorrupt;
+            switch (step) {
+                .found => |value| {
+                    key.value = decode_storage_value(value) catch return error.HistoryCorrupt;
+                },
+                .absent => {},
+                .next => return error.HistoryCorrupt, // A leaf or a full-depth branch ends.
+            }
+        }
+    }
+};
 
 /// The children of one decoded trie node (`Store.walk_paths`).
 const NodeView = union(enum) {

@@ -180,6 +180,18 @@ pub const Journal = struct {
         storage_proofs: []StateTrie.StorageProof,
         values: []u256,
     ) db_database.ProofError!?db_history.AccountState = null,
+    /// `proof` for many slots in one storage walk (`Database.proofs_at`): the slots'
+    /// proofs and values land in `set`, valid until the journal's next head move; null
+    /// when the journal keeps no history.
+    proofs: ?*const fn (
+        context: *anyopaque,
+        hash: Hash,
+        number: u64,
+        address: [20]u8,
+        slots: []const u256,
+        account_proof: *StateTrie.AccountProof,
+        set: *db_history.ProofSet,
+    ) db_database.ProofError!?db_history.AccountState = null,
     /// The journal's history window (oldest and newest block); null when it keeps none.
     history_window: ?*const fn (context: *anyopaque) ?HistoryWindow = null,
 };
@@ -801,6 +813,34 @@ pub const Chain = struct {
             return error.HistoryUnavailable; // The window holds another branch there.
         }
         return store.get_proof(number, address, slots, account_proof, storage_proofs, values);
+    }
+
+    /// `proof_at` for many slots in one storage walk (`history.Store.get_proofs`): each
+    /// slot's proof and value land in `set` (byte for byte `proof_at`'s), valid until the
+    /// next block or head move.
+    pub fn proofs_at(
+        chain: *Chain,
+        hash: Hash,
+        number: u64,
+        address: [20]u8,
+        slots: []const u256,
+        account_proof: *StateTrie.AccountProof,
+        set: *db_history.ProofSet,
+    ) db_database.ProofError!?db_history.AccountState {
+        assert(slots.len <= set.capacity());
+        if (chain.journal) |journal| {
+            const proofs = journal.proofs orelse return error.HistoryUnavailable;
+            return proofs(journal.context, hash, number, address, slots, account_proof, set);
+        }
+        const store = chain.history orelse return error.HistoryUnavailable;
+        const canonical = chain.store.canonical_hash(number) orelse
+            return error.HistoryUnavailable;
+        if (!std.mem.eql(u8, &canonical, &hash)) return error.HistoryUnavailable;
+        const header_at = chain.header(hash) orelse return error.HistoryUnavailable;
+        if (!chain.history_has(number, header_at.state_root.bytes)) {
+            return error.HistoryUnavailable; // The window holds another branch there.
+        }
+        return store.get_proofs(number, address, slots, account_proof, set);
     }
 
     /// The block number `number` is served from the window when the window holds that

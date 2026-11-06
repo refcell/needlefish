@@ -15,6 +15,7 @@ const state_trie = @import("../trie/state_trie.zig");
 const trie = @import("../trie/root.zig");
 const db_database = @import("../db/database.zig");
 const db_history = @import("../db/history.zig");
+const db_proof_set = @import("../db/proof_set.zig");
 const eth = @import("eth.zig");
 
 const Hash = [32]u8;
@@ -102,9 +103,20 @@ fn get_proof_at(
     const scratch = scratch_of(api) orelse {
         return call.fail(rpc.code.internal_error, "proof scratch too small");
     };
-    const hash = block.hash;
-    const number = block.number;
-    const found = chain.proof_at(hash, number, address, &.{}, &scratch.account, &.{}, &.{});
+    var set = proof_set_of(api, @intCast(keys.len)) orelse {
+        return call.fail(rpc.code.internal_error, "proof scratch too small");
+    };
+    var slots: [storage_keys_max]u256 = undefined;
+    for (keys, slots[0..keys.len]) |*key, *slot| slot.* = std.mem.readInt(u256, key, .big);
+    // One account walk and one sorted storage walk for every key (`Chain.proofs_at`).
+    const found = chain.proofs_at(
+        block.hash,
+        block.number,
+        address,
+        slots[0..keys.len],
+        &scratch.account,
+        &set,
+    );
     const account = found catch |err| return fail_history(call, err);
     const w = call.writer;
     try write_account(w, &address, &scratch.account, account orelse .{
@@ -114,19 +126,23 @@ fn get_proof_at(
         .code_hash = (state_trie.Account{}).code_hash,
     });
     try w.begin_array();
-    for (keys) |*slot| {
-        const slots = [1]u256{std.mem.readInt(u256, slot, .big)};
-        var values: [1]u256 = undefined;
-        // One slot per call; the account proof it refills was already written.
-        const proofs: *[1]StorageProof = (&scratch.storage)[0..1];
-        const account_proof = &scratch.account;
-        const result =
-            chain.proof_at(hash, number, address, &slots, account_proof, proofs, &values);
-        _ = result catch |err| return fail_history(call, err);
-        try write_slot(w, slot, values[0], &proofs[0]);
+    for (keys, 0..) |*slot, index| {
+        set.fill(@intCast(index), &scratch.storage);
+        try write_slot(w, slot, set.value(@intCast(index)), &scratch.storage);
     }
     try w.end_array();
     try w.end_object();
+}
+
+/// The multi-key proof set of a historical call for `keys_count` keys, carved after
+/// `Scratch` in the API scratch.
+fn proof_set_of(api: *eth.Api, keys_count: u32) ?db_proof_set.ProofSet {
+    assert(keys_count <= storage_keys_max);
+    const scratch = scratch_of(api) orelse return null;
+    const base = @intFromPtr(api.scratch.ptr);
+    const start = @intFromPtr(scratch) + @sizeOf(Scratch) - base;
+    assert(start <= api.scratch.len);
+    return db_proof_set.ProofSet.carve(api.scratch[start..], @max(keys_count, 1));
 }
 
 pub fn fail_history(call: *Call, err: db_database.ProofError) HandlerError {
