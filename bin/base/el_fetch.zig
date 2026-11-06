@@ -4,8 +4,13 @@
 //! `transactionsRoot`. This is the peer-based block source for snapshot-to-tip catch-up
 //! (docs/UNSAFE_TIP.md).
 //!
-//!     base el-fetch --enode <enode://...> --from <block> [--count <n>] [--batch <n>]
-//!                   [--chain base-sepolia|base-mainnet]
+//!     base el-fetch --enode <enode://...> --from <block|tip> [--count <n>] [--batch <n>]
+//!                   [--follow] [--duration <s>] [--chain base-sepolia|base-mainnet]
+//!
+//! `--from tip` starts at the peer's head. `--follow` keeps going past `--count`: it polls
+//! for the next block every 100 ms and prints each one with its tip lag (now minus the
+//! block's scheduled time), for `--duration` seconds. A dropped connection is reopened and
+//! the range resumes from the last linked block.
 //!
 //! Blocks are bound only to each other here. A consumer binds the range to a trusted
 //! hash (the snapshot block, or a sequencer-signed gossip block).
@@ -21,12 +26,13 @@ const enode = base.consensus.p2p.peers.enode;
 const curve = base.common.crypto.secp256k1;
 const keccak = base.common.crypto.keccak;
 const Header = base.common.consensus.Header;
+const unsafe_watch = @import("unsafe_watch.zig");
 const Io = std.Io;
 const assert = std.debug.assert;
 
 const usage =
-    \\usage: base el-fetch --enode <enode://...> --from <block> [--count <n>] [--batch <n>]
-    \\                     [--chain base-sepolia|base-mainnet]
+    \\usage: base el-fetch --enode <enode://...> --from <block|tip> [--count <n>] [--batch <n>]
+    \\                     [--follow] [--duration <s>] [--chain base-sepolia|base-mainnet]
     \\
 ;
 
@@ -37,6 +43,9 @@ const transactions_max = 1 << 14;
 const Flags = struct {
     enode: ?[]const u8 = null,
     from: ?u64 = null,
+    from_tip: bool = false,
+    follow: bool = false,
+    duration_s: u64 = 0,
     count: u64 = 1000,
     batch: u32 = 128,
     chain: *const base.common.chains.ChainConfig = &base.common.chains.sepolia,
@@ -45,13 +54,25 @@ const Flags = struct {
 fn parse_flags(args: []const []const u8) !Flags {
     var flags: Flags = .{};
     var index: usize = 0;
-    while (index + 1 < args.len) : (index += 2) {
+    while (index < args.len) : (index += 1) {
         const name = args[index];
-        const value = args[index + 1];
+        if (std.mem.eql(u8, name, "--follow")) {
+            flags.follow = true;
+            continue;
+        }
+        index += 1;
+        if (index == args.len) return error.InvalidArguments;
+        const value = args[index];
         if (std.mem.eql(u8, name, "--enode")) {
             flags.enode = value;
+        } else if (std.mem.eql(u8, name, "--duration")) {
+            flags.duration_s = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--from")) {
-            flags.from = try std.fmt.parseInt(u64, value, 10);
+            if (std.mem.eql(u8, value, "tip")) {
+                flags.from_tip = true;
+            } else {
+                flags.from = try std.fmt.parseInt(u64, value, 10);
+            }
         } else if (std.mem.eql(u8, name, "--count")) {
             flags.count = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--batch")) {
@@ -63,7 +84,7 @@ fn parse_flags(args: []const []const u8) !Flags {
                 &base.common.chains.sepolia;
         } else return error.InvalidArguments;
     }
-    if (index != args.len or flags.enode == null or flags.from == null) {
+    if (flags.enode == null or (flags.from == null) == !flags.from_tip) {
         return error.InvalidArguments;
     }
     if (flags.batch == 0 or flags.batch > 1024 or flags.count == 0) return error.InvalidArguments;
@@ -76,6 +97,9 @@ const Peer = struct {
     stream: Io.net.Stream,
     reader: Io.net.Stream.Reader,
     writer: Io.net.Stream.Writer,
+    read_buffer: []u8,
+    write_buffer: []u8,
+    connected: bool = false,
     session: rlpx.Session = undefined,
     compressor: snappy.Compressor = .{},
     /// Frames in and out, and decompressed message data.
@@ -165,7 +189,11 @@ fn random_secret(io: Io) [32]u8 {
 }
 
 /// Hello both ways, then Status both ways (ours mirrors the peer's head and fork id).
-fn greet(peer: *Peer, secret: [32]u8, chain: *const base.common.chains.ChainConfig) !void {
+fn greet(
+    peer: *Peer,
+    secret: [32]u8,
+    chain: *const base.common.chains.ChainConfig,
+) !eth.Status {
     const node_id = try curve.public_key(secret);
     var buffer: [512]u8 = undefined;
     try peer.send(.hello, try eth.encode_hello(&buffer, "needlefish", &node_id), false);
@@ -182,6 +210,7 @@ fn greet(peer: *Peer, secret: [32]u8, chain: *const base.common.chains.ChainConf
     ours.version = eth.eth_version;
     ours.total_difficulty = 0;
     try peer.send(.status, try eth.encode_status(&buffer, &ours), true);
+    return status;
 }
 
 const Progress = struct {
@@ -192,12 +221,14 @@ const Progress = struct {
     bytes: u64 = 0,
 };
 
-/// Fetches and checks one batch of headers and bodies starting at `progress.next`.
-fn fetch_batch(peer: *Peer, progress: *Progress, amount: u32) !void {
+/// Fetches and checks one batch of headers and bodies starting at `progress.next`; returns
+/// how many blocks came (zero once past the peer's head).
+fn fetch_batch(peer: *Peer, progress: *Progress, amount: u32) !usize {
     var request: [64]u8 = undefined;
     peer.request_id += 1;
     const id = peer.request_id;
-    const get_headers = try eth.encode_get_block_headers(&request, id, progress.next, amount);
+    const origin: eth.Origin = .{ .number = progress.next };
+    const get_headers = try eth.encode_get_block_headers(&request, id, origin, amount);
     try peer.send(.get_block_headers, get_headers, true);
     const headers_data = try peer.expect(.block_headers);
     var response = try eth.decode_response(headers_data);
@@ -217,12 +248,13 @@ fn fetch_batch(peer: *Peer, progress: *Progress, amount: u32) !void {
         hashes[count] = keccak.keccak256(raw);
         roots[count] = header.transactions_root.bytes;
     }
-    if (count == 0) return error.NoHeaders;
     progress.bytes += headers_data.len;
+    if (count == 0) return 0;
     try fetch_bodies(peer, progress, hashes[0..count], roots[0..count]);
     progress.parent = hashes[count - 1];
     progress.next += count;
     progress.blocks += count;
+    return count;
 }
 
 /// Bodies per request when pipelining: small requests let the peer answer them in parallel.
@@ -310,6 +342,48 @@ fn check_bodies(
     return index - range[0];
 }
 
+fn close(peer: *Peer) void {
+    if (!peer.connected) return;
+    peer.stream.close(peer.io);
+    peer.connected = false;
+}
+
+/// Reopens the connection after a drop, retrying once a second.
+fn reopen(peer: *Peer, target: *const Target, attempts: *u32) !void {
+    close(peer);
+    while (true) {
+        attempts.* += 1;
+        if (attempts.* > reconnects_max) return error.TooManyReconnects;
+        try peer.io.sleep(.fromSeconds(1), .awake);
+        _ = open(peer, target) catch |err| {
+            std.debug.print("el-fetch: reconnect failed ({s})\n", .{@errorName(err)});
+            continue;
+        };
+        assert(peer.connected);
+        return;
+    }
+}
+
+/// Everything needed to (re)open the connection.
+const Target = struct {
+    address: Io.net.IpAddress,
+    remote: curve.PublicKey,
+    secret: [32]u8,
+    chain: *const base.common.chains.ChainConfig,
+};
+
+fn open(peer: *Peer, target: *const Target) !eth.Status {
+    assert(!peer.connected);
+    peer.stream = try target.address.connect(peer.io, .{ .mode = .stream });
+    peer.connected = true;
+    errdefer close(peer);
+    peer.reader = peer.stream.reader(peer.io, peer.read_buffer);
+    peer.writer = peer.stream.writer(peer.io, peer.write_buffer);
+    peer.compressor = .{};
+    try handshake(peer, target.secret, target.remote);
+    return greet(peer, target.secret, target.chain);
+}
+
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse_flags(args) catch {
         std.debug.print("{s}", .{usage});
@@ -320,14 +394,15 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     const remote_compressed = node.public_key;
-    const remote = curve.decompress_public_key(&remote_compressed) orelse return error.InvalidKey;
-    const address: Io.net.IpAddress = switch (node.address) {
-        .ip4 => |bytes| .{ .ip4 = .{ .bytes = bytes, .port = node.tcp_port } },
-        .ip6 => |bytes| .{ .ip6 = .{ .bytes = bytes, .port = node.tcp_port } },
+    const target: Target = .{
+        .address = switch (node.address) {
+            .ip4 => |bytes| .{ .ip4 = .{ .bytes = bytes, .port = node.tcp_port } },
+            .ip6 => |bytes| .{ .ip6 = .{ .bytes = bytes, .port = node.tcp_port } },
+        },
+        .remote = curve.decompress_public_key(&remote_compressed) orelse return error.InvalidKey,
+        .secret = random_secret(init.io),
+        .chain = flags.chain,
     };
-    const io = init.io;
-    const stream = try address.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
     const allocator = init.gpa;
     const wire = try allocator.alloc(u8, message_size_max + 64);
     defer allocator.free(wire);
@@ -338,37 +413,109 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     var read_buffer: [64 * 1024]u8 = undefined;
     var write_buffer: [64 * 1024]u8 = undefined;
     var peer: Peer = .{
-        .io = io,
-        .stream = stream,
-        .reader = stream.reader(io, &read_buffer),
-        .writer = stream.writer(io, &write_buffer),
+        .io = init.io,
+        .stream = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .read_buffer = &read_buffer,
+        .write_buffer = &write_buffer,
         .wire = wire,
         .plain = plain,
         .message = message,
     };
-    const secret = random_secret(io);
-    try handshake(&peer, secret, remote);
-    try greet(&peer, secret, flags.chain);
-    return run(&peer, &flags);
+    const status = try open(&peer, &target);
+    defer close(&peer);
+    const from = flags.from orelse try head_number(&peer, status.head);
+    return run(&peer, &target, &flags, from);
 }
 
-fn run(peer: *Peer, flags: *const Flags) !u8 {
-    var progress: Progress = .{ .next = flags.from.? };
-    const end = flags.from.? + flags.count;
+/// The block number of the peer's head, from its Status head hash.
+fn head_number(peer: *Peer, head: [32]u8) !u64 {
+    var request: [64]u8 = undefined;
+    peer.request_id += 1;
+    const id = peer.request_id;
+    const message = try eth.encode_get_block_headers(&request, id, .{ .hash = head }, 1);
+    try peer.send(.get_block_headers, message, true);
+    var response = try eth.decode_response(try peer.expect(.block_headers));
+    if (response.request_id != id or response.items.is_empty()) return error.NoHead;
+    const header = try Header.decode(try response.items.raw());
+    std.debug.print("el-fetch: peer head {d}\n", .{header.number});
+    return header.number;
+}
+
+const reconnects_max = 32;
+
+const Lag = struct {
+    count: u64 = 0,
+    sum_ms: u64 = 0,
+    max_ms: u64 = 0,
+};
+
+fn run(peer: *Peer, target: *const Target, flags: *const Flags, from: u64) !u8 {
+    var progress: Progress = .{ .next = from };
+    const end = if (flags.follow) std.math.maxInt(u64) else from + flags.count;
+    const rollup = unsafe_watch.rollup_for(flags.chain);
     const start = Io.Clock.awake.now(peer.io);
+    var reconnects: u32 = 0;
+    var at_tip = false;
+    var lag: Lag = .{};
     while (progress.next < end) {
-        const amount: u32 = @intCast(@min(flags.batch, end - progress.next));
-        try fetch_batch(peer, &progress, amount);
         const elapsed = start.durationTo(Io.Clock.awake.now(peer.io));
         const elapsed_ms: u64 = @intCast(@max(1, elapsed.toMilliseconds()));
+        if (flags.duration_s > 0 and elapsed_ms >= flags.duration_s * 1000) break;
+        const amount: u32 = @intCast(@min(flags.batch, end - progress.next));
+        const count = fetch_batch(peer, &progress, amount) catch |err| switch (err) {
+            error.Disconnected, error.EndOfStream, error.ReadFailed, error.WriteFailed => {
+                std.debug.print("el-fetch: reconnecting at {d} ({s})\n", .{
+                    progress.next, @errorName(err),
+                });
+                try reopen(peer, target, &reconnects);
+                continue;
+            },
+            else => return err,
+        };
+        if (count == 0) {
+            at_tip = true;
+            try peer.io.sleep(.fromMilliseconds(100), .awake);
+            continue;
+        }
+        if (at_tip) {
+            const now = Io.Clock.real.now(peer.io);
+            const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+            const lag_ms = now_ms -| rollup.l2_block_timestamp_ms(progress.next - 1);
+            lag.count += 1;
+            lag.sum_ms += lag_ms;
+            lag.max_ms = @max(lag.max_ms, lag_ms);
+            std.debug.print("el-fetch: tip block {d} hash 0x{x} lag_ms {d}\n", .{
+                progress.next - 1, &progress.parent.?, lag_ms,
+            });
+            continue;
+        }
         std.debug.print("el-fetch: blocks {d}..{d} txs {d} bytes {d} blocks_per_s {d}\n", .{
-            flags.from.?,                        progress.next - 1,
+            from,                                progress.next - 1,
             progress.transactions,               progress.bytes,
             progress.blocks * 1000 / elapsed_ms,
         });
     }
-    std.debug.print("el-fetch: ok, {d} linked blocks, last hash 0x{x}\n", .{
-        progress.blocks, &progress.parent.?,
+    if (progress.parent == null) return error.NoBlocks;
+    std.debug.print("el-fetch: ok, {d} linked blocks, last hash 0x{x}, reconnects {d}\n", .{
+        progress.blocks, &progress.parent.?, reconnects,
+    });
+    if (lag.count > 0) std.debug.print("el-fetch: tip batches {d} lag_ms avg {d} max {d}\n", .{
+        lag.count, lag.sum_ms / lag.count, lag.max_ms,
     });
     return 0;
+}
+
+test "el-fetch: flags take a number or the tip, and a valueless --follow anywhere" {
+    const enode_text = "enode://00@127.0.0.1:1";
+    const tip = try parse_flags(&.{ "--follow", "--enode", enode_text, "--from", "tip" });
+    try std.testing.expect(tip.follow and tip.from_tip and tip.from == null);
+    const number = try parse_flags(&.{ "--from", "7", "--enode", enode_text, "--follow" });
+    try std.testing.expectEqual(@as(?u64, 7), number.from);
+    try std.testing.expect(number.follow and !number.from_tip);
+    const missing = parse_flags(&.{ "--enode", enode_text });
+    try std.testing.expectError(error.InvalidArguments, missing);
+    const no_value = parse_flags(&.{ "--enode", enode_text, "--from" });
+    try std.testing.expectError(error.InvalidArguments, no_value);
 }

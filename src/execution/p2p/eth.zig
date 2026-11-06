@@ -158,22 +158,32 @@ pub fn decode_status(data: []const u8) Error!Status {
     return status;
 }
 
-/// `[request_id, [origin, amount, skip, reverse]]`, ascending from block number `origin`.
+/// Where a header query starts: a block number or a block hash.
+pub const Origin = union(enum) { number: u64, hash: [32]u8 };
+
+/// `[request_id, [origin, amount, skip, reverse]]`, ascending from `origin`.
 pub fn encode_get_block_headers(
     output: []u8,
     request_id: u64,
-    origin: u64,
+    origin: Origin,
     amount: u64,
 ) Error![]u8 {
     const zero: u8 = 0;
-    const query = rlp.int_length(origin) + rlp.int_length(amount) + 2 * rlp.int_length(zero);
+    const origin_length = switch (origin) {
+        .number => |number| rlp.int_length(number),
+        .hash => |*hash| rlp.bytes_length(hash),
+    };
+    const query = origin_length + rlp.int_length(amount) + 2 * rlp.int_length(zero);
     const payload = rlp.int_length(request_id) + rlp.list_length(query);
     if (output.len < rlp.list_length(payload)) return error.BufferTooSmall;
     var encoder = rlp.Encoder.init(output);
     encoder.list_header(payload);
     encoder.int(request_id);
     encoder.list_header(query);
-    encoder.int(origin);
+    switch (origin) {
+        .number => |number| encoder.int(number),
+        .hash => |*hash| encoder.bytes(hash),
+    }
     encoder.int(amount);
     encoder.int(zero);
     encoder.int(zero);

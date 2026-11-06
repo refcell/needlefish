@@ -54,8 +54,10 @@ behind a small interface and switch later.
   - [x] discv4 codec (`execution.p2p.discv4`, fuzzed) and `base el-peers`, a crawler that
     keeps nodes with the chain's fork id (`opel` first, then `eth`). Found a second Base
     Sepolia reth node, serving 8 to 9 blocks/s.
-  - [ ] Parallel fetch from several peers, reconnect and resume, and binding to the
-    snapshot hash and the signed gossip head.
+  - [x] `el-fetch --from tip --follow`: follows the tip from one peer at 5 blocks/s with
+    about 250 ms average lag, reconnecting and resuming from the last linked block.
+  - [ ] Parallel fetch from several peers, and binding to the snapshot hash and to signed
+    gossip blocks.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.

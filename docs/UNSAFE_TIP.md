@@ -137,6 +137,22 @@ Peer-based ways to fetch the catch-up range and any missing block:
 During steady state, a block missed by gossip (a link of `gap`) can only be recovered by
 the same fetch path. The demo counts it as a failure; it does not skip or re-anchor.
 
+### Following the tip from an execution peer
+
+Behind NAT, gossip delivery is intermittent: one run received 159 consecutive blocks, and
+later runs of 15 minutes and 2 hours received none (no block-carrying peer gave us a mesh
+slot). An execution peer does not depend on that. `base el-fetch --from tip --follow`
+asks the peer for the next block number every 100 ms. Measured against a Base Sepolia
+reth node for 180 s: 901 consecutive linked blocks (the chain's full 5 blocks/s), each
+body checked against its header, 0 reconnects, tip lag (arrival minus the block's
+scheduled time) averaging 251 ms, median 158 ms, p99 1.5 s, max 2.8 s.
+
+The cost is trust. Execution headers are not signed, so this source proves continuity
+and body integrity, not that the sequencer produced the blocks. Local execution then
+proves the header outputs follow from our state. Tying the chain to the sequencer needs a
+signed gossip block at the same height (whenever gossip delivers one, its hash must be on
+the followed chain) or the snapshot hash at the bottom of the range.
+
 ## Integration contract (to the executor)
 
 The p2p side hands the executor, in block-number order, payloads that are signed,
