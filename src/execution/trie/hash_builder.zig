@@ -75,6 +75,26 @@ pub const BranchNode = struct {
     }
 };
 
+/// Receives every branch of a 32-byte-key trie as a `BranchNode` (with the extension above it
+/// folded in), keyed by its hang path: the parent branch's path plus this child's nibble,
+/// empty for the root. Branches arrive in post-order (descendants first, siblings by
+/// nibble), the order the builder finishes them, so no reordering is needed. Kept apart
+/// from the hash-keyed `NodeSink`: this one is path-aware and needs per-entry state, which
+/// lives here so a builder without a sink stays as small as before.
+pub const BranchSink = struct {
+    /// The stack capacity of a 64-nibble builder.
+    pub const entries_max = 64 * 16 + 1;
+
+    context: *anyopaque,
+    emit: *const fn (context: *anyopaque, hang: []const u8, branch: *const BranchNode) void,
+    /// Builder scratch, parallel to its stack: whether each entry is a leaf, and its key.
+    leaf: [entries_max]bool = undefined,
+    leaf_keys: [entries_max]Hash = undefined,
+    /// The branch built last, waiting for its extension (known one fold later).
+    pending: BranchNode = .{},
+    pending_set: bool = false,
+};
+
 pub fn HashBuilderType(comptime depth_max: u32) type {
     comptime assert(depth_max > 0 and depth_max <= nibbles_module.nibbles_max);
     return struct {
@@ -98,6 +118,9 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
         stack_len: u32 = 0,
         /// Optional: receives every hashed node's encoding.
         node_sink: ?NodeSink = null,
+        /// Optional: receives every branch as a path-keyed record (64-nibble keys only, no
+        /// `add_branch`). Must outlive the builder's use; `reset` clears it.
+        branch_sink: ?*BranchSink = null,
 
         pub fn init() Self {
             return .{};
@@ -111,6 +134,7 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
         pub fn add_leaf(self: *Self, key: []const u8, value: []const u8) void {
             assert(key.len > 0 and key.len <= depth_max);
             assert(value.len > 0);
+            assert(self.branch_sink == null or (depth_max == 64 and key.len == 64));
             self.advance(key);
             self.value = .{ .leaf = value };
         }
@@ -119,6 +143,8 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
         /// node whose encoding is at least 32 bytes, as every stored branch node's is.
         pub fn add_branch(self: *Self, key: []const u8, hash: Hash) void {
             assert(key.len <= depth_max);
+            // A precomputed subtrie has no records to emit.
+            assert(self.branch_sink == null);
             self.advance(key);
             self.value = .{ .hash = hash };
         }
@@ -182,6 +208,7 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
         /// Folds the current entry into the stack given the key that follows it (empty at the
         /// end). Every iteration moves up at least one level, so the loop is bounded.
         fn update(self: *Self, succeeding: []const u8) void {
+            if (self.branch_sink) |sink| assert(!sink.pending_set);
             var current = self.key;
             var build_extensions = false;
             var iterations: u32 = 0;
@@ -202,6 +229,7 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
                         .leaf => |value| {
                             self.emit_leaf(short_key, value);
                             self.push(node.leaf_ref(short_key, value));
+                            if (self.branch_sink) |sink| self.track_leaf(sink);
                         },
                         .hash => |hash| {
                             self.push(RlpNode.from_hash(hash));
@@ -220,10 +248,22 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
                     }
                     self.push(node.extension_ref(short_key, &child));
                 }
+                // The branch folded last now has its extension and hang path.
+                if (self.branch_sink) |sink| if (sink.pending_set) {
+                    assert(build_extensions);
+                    emit_branch(sink, current.slice()[0..len_from], short_key);
+                };
                 if (preceding_len <= common and succeeding.len > 0) return;
                 if (succeeding.len > 0 or preceding_exists) self.push_branch(len);
                 self.groups_len = len;
-                if (preceding_len == 0) return;
+                if (preceding_len == 0) {
+                    // Only the root branch returns before its fold: no extension, no hang.
+                    if (self.branch_sink) |sink| if (sink.pending_set) {
+                        assert(succeeding.len == 0 and len == 0);
+                        emit_branch(sink, &.{}, &.{});
+                    };
+                    return;
+                }
                 current.truncate(preceding_len);
                 while (self.groups_len > 0 and self.groups[self.groups_len - 1] == 0) {
                     self.groups_len -= 1;
@@ -246,9 +286,57 @@ pub fn HashBuilderType(comptime depth_max: u32) type {
                     sink.end(sink.context);
                 }
             }
+            if (self.branch_sink) |sink| self.track_branch(sink, mask, first);
             const reference = node.branch_ref(mask, self.stack[first..self.stack_len], &.{});
             self.stack_len = first;
             self.push(reference);
+            if (self.branch_sink) |sink| sink.leaf[first] = false;
+        }
+
+        fn track_leaf(self: *Self, sink: *BranchSink) void {
+            assert(self.stack_len > 0 and self.stack_len <= BranchSink.entries_max);
+            assert(self.key.len == 64);
+            const index = self.stack_len - 1;
+            sink.leaf[index] = true;
+            _ = self.key.pack(&sink.leaf_keys[index]);
+        }
+
+        /// Records the branch about to replace `stack[first..]`; emitted once its extension
+        /// (or lack of one) is known.
+        fn track_branch(self: *Self, sink: *BranchSink, mask: u16, first: u32) void {
+            assert(!sink.pending_set);
+            assert(self.stack_len - first == @popCount(mask));
+            const branch = &sink.pending;
+            branch.* = .{ .state_mask = mask };
+            var leaves: u32 = 0;
+            var child: u32 = 0;
+            var nibble: u8 = 0;
+            while (nibble < 16) : (nibble += 1) {
+                const bit = @as(u16, 1) << @intCast(nibble);
+                if (mask & bit == 0) continue;
+                const index = first + child;
+                branch.children[child] = self.stack[index];
+                child += 1;
+                if (sink.leaf[index]) {
+                    branch.leaf_keys[leaves] = sink.leaf_keys[index];
+                    leaves += 1;
+                } else {
+                    branch.tree_mask |= bit;
+                }
+            }
+            assert(child == branch.child_count());
+            assert(leaves == branch.leaf_count());
+            sink.pending_set = true;
+        }
+
+        fn emit_branch(sink: *BranchSink, hang: []const u8, extension: []const u8) void {
+            assert(sink.pending_set);
+            assert(hang.len + extension.len < 64);
+            const branch = &sink.pending;
+            branch.extension_len = @intCast(extension.len);
+            @memcpy(branch.extension[0..extension.len], extension);
+            sink.pending_set = false;
+            sink.emit(sink.context, hang, branch);
         }
     };
 }

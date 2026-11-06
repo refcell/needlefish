@@ -109,7 +109,7 @@ fn append_trimmed(out: []u8, value: u256) []u8 {
 test "hashed state: root of reth-encoded tables equals StateTrie's (seeded)" {
     const allocator = testing.allocator;
     var prng = Prng.init(0x6861_7368);
-    for (0..12) |_| {
+    for (0..12) |round| {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -167,6 +167,9 @@ test "hashed state: root of reth-encoded tables equals StateTrie's (seeded)" {
         const builder = try allocator.create(state_root.StateRootBuilder);
         defer allocator.destroy(builder);
         builder.* = .{};
+        // Odd rounds stream branch records too; the root must not change.
+        var sinks: state_root.RecordSinks = .{ .target = state_root.discard_sink };
+        if (round % 2 == 1) builder.set_record_sink(&sinks);
         const root = try compute(builder, account_source.source(), storage_source.source(), null);
         try testing.expectEqualSlices(u8, &try reference.root(), &root);
         // Orphaned storage (an entry below the first account) is corrupt.

@@ -8,6 +8,10 @@
 //!
 //! Input is untrusted (a third-party snapshot): out-of-order or duplicate keys and zero
 //! slot values are errors, never asserts.
+//!
+//! Optionally (`set_record_sink`), every branch of the account trie and of each storage
+//! trie streams out as a path-keyed branch record (`db/branch_record.zig`), in post-order
+//! per trie, so a disk import can bulk load them without sorting.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,6 +22,8 @@ const state_trie = trie.state_trie;
 
 const Hash = node.Hash;
 const HashBuilder = trie.HashBuilder;
+const BranchNode = trie.BranchNode;
+const BranchSink = trie.hash_builder.BranchSink;
 const Nibbles = trie.Nibbles;
 
 pub const Account = state_trie.Account;
@@ -38,6 +44,26 @@ pub const Stats = struct {
     storage_accounts: u64 = 0,
 };
 
+/// Receives the branch records of the account trie (`owner` null) and of each storage trie
+/// (`owner` the account's address hash). Per trie, records arrive in post-order, which is
+/// ascending branch-record key order.
+pub const RecordSink = struct {
+    context: *anyopaque,
+    emit: *const fn (
+        context: *anyopaque,
+        owner: ?*const Hash,
+        hang: []const u8,
+        branch: *const BranchNode,
+    ) void,
+};
+
+/// Scratch for the two builders' branch sinks (~70 KiB), owned by the caller.
+pub const RecordSinks = struct {
+    target: RecordSink,
+    account: BranchSink = undefined,
+    storage: BranchSink = undefined,
+};
+
 pub const StateRootBuilder = struct {
     accounts: HashBuilder = .init(),
     storage: HashBuilder = .init(),
@@ -51,6 +77,34 @@ pub const StateRootBuilder = struct {
     /// The account whose slots are being added.
     open: ?Account = null,
     stats: Stats = .{},
+    /// Optional branch record output; see `set_record_sink`.
+    record_sinks: ?*RecordSinks = null,
+
+    /// Streams every branch record to `sinks.target`. Call before the first account; the
+    /// builder must not move afterwards (the sinks point back at it).
+    pub fn set_record_sink(self: *StateRootBuilder, sinks: *RecordSinks) void {
+        assert(self.last_account == null and self.open == null);
+        assert(self.record_sinks == null);
+        sinks.account = .{ .context = self, .emit = emit_account };
+        sinks.storage = .{ .context = self, .emit = emit_storage };
+        self.record_sinks = sinks;
+        self.accounts.branch_sink = &sinks.account;
+        assert(self.accounts.branch_sink != null);
+    }
+
+    fn emit_account(context: *anyopaque, hang: []const u8, branch: *const BranchNode) void {
+        const self: *StateRootBuilder = @ptrCast(@alignCast(context));
+        const target = self.record_sinks.?.target;
+        target.emit(target.context, null, hang, branch);
+    }
+
+    fn emit_storage(context: *anyopaque, hang: []const u8, branch: *const BranchNode) void {
+        const self: *StateRootBuilder = @ptrCast(@alignCast(context));
+        // Storage branches finish while their account is open, before `end_account` ends.
+        assert(self.open != null);
+        const target = self.record_sinks.?.target;
+        target.emit(target.context, &self.last_account.?, hang, branch);
+    }
 
     /// Opens the account at `address_hash`; its slots follow, then `end_account`.
     pub fn begin_account(
@@ -66,6 +120,7 @@ pub const StateRootBuilder = struct {
         self.last_slot = null;
         self.open = account;
         self.storage.reset();
+        if (self.record_sinks) |sinks| self.storage.branch_sink = &sinks.storage;
         assert(self.open != null);
     }
 
@@ -183,6 +238,11 @@ test "import state root: seeded differential against StateTrie" {
         const builder = try allocator.create(StateRootBuilder);
         defer allocator.destroy(builder);
         builder.* = .{};
+        // Odd rounds stream branch records too; the root must not change.
+        const sinks = try allocator.create(RecordSinks);
+        defer allocator.destroy(sinks);
+        sinks.* = .{ .target = discard_sink };
+        if (round % 2 == 1) builder.set_record_sink(sinks);
         for (entries) |entry| {
             try builder.begin_account(&entry.address_hash, entry.account);
             for (entry.slots) |slot| try builder.add_slot(&slot.hash, slot.value);
@@ -216,4 +276,111 @@ test "import state root: untrusted input is rejected" {
 test "import state root: empty state is the empty root" {
     var builder: StateRootBuilder = .{};
     try testing.expectEqualSlices(u8, &node.empty_root, &try builder.root());
+}
+
+const branch_record = @import("../db/branch_record.zig");
+
+/// A record sink for tests that only need the root.
+pub const discard_sink: RecordSink = .{ .context = @constCast(&discard_context), .emit = discard };
+var discard_context: u8 = 0;
+
+fn discard(_: *anyopaque, _: ?*const Hash, hang: []const u8, branch: *const BranchNode) void {
+    assert(hang.len < 64);
+    assert(branch.child_count() >= 2);
+}
+const record_test = @import("../db/branch_record_test.zig");
+
+/// Collects emitted records as encoded (key, value) pairs, in emission order.
+const RecordCollector = struct {
+    arena: std.mem.Allocator,
+    sets: record_test.RecordSets = .{},
+    failed: bool = false,
+
+    fn sink(self: *RecordCollector) RecordSink {
+        return .{ .context = self, .emit = emit };
+    }
+
+    fn emit(
+        context: *anyopaque,
+        owner: ?*const Hash,
+        hang: []const u8,
+        branch: *const BranchNode,
+    ) void {
+        const self: *RecordCollector = @ptrCast(@alignCast(context));
+        self.add(owner, hang, branch) catch {
+            self.failed = true;
+        };
+    }
+
+    fn add(
+        self: *RecordCollector,
+        owner: ?*const Hash,
+        hang: []const u8,
+        branch: *const BranchNode,
+    ) !void {
+        try branch_record.validate_path(hang, branch);
+        var buffer: [branch_record.value_bytes_max]u8 = undefined;
+        const value = try self.arena.dupe(u8, branch_record.encode(branch, &buffer));
+        const key = if (owner) |hash|
+            try self.arena.dupe(u8, &branch_record.storage_key(hash, hang))
+        else
+            try self.arena.dupe(u8, &branch_record.path_key(hang));
+        const list = if (owner == null) &self.sets.accounts else &self.sets.storage;
+        try list.append(self.arena, .{ .key = key, .value = value });
+    }
+};
+
+fn expect_strictly_ascending(list: []const record_test.Derived) !void {
+    for (list[0..list.len -| 1], list[@min(1, list.len)..]) |a, b| {
+        try testing.expect(std.mem.order(u8, a.key, b.key) == .lt);
+    }
+}
+
+fn expect_same_records(want: []const record_test.Derived, got: []const record_test.Derived) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |a, b| {
+        try testing.expectEqualSlices(u8, a.key, b.key);
+        try testing.expectEqualSlices(u8, a.value, b.value);
+    }
+}
+
+/// Streams `accounts` through a builder with record sinks; checks the root against the
+/// in-memory trie's and the record sets against those derived from its nodes.
+fn check_records(arena: std.mem.Allocator, accounts: []const record_test.TestAccount) !void {
+    var expected_root: Hash = undefined;
+    const want = try record_test.reference_records(arena, accounts, &expected_root);
+    const builder = try testing.allocator.create(StateRootBuilder);
+    defer testing.allocator.destroy(builder);
+    builder.* = .{};
+    const sinks = try testing.allocator.create(RecordSinks);
+    defer testing.allocator.destroy(sinks);
+    var collector: RecordCollector = .{ .arena = arena };
+    sinks.* = .{ .target = collector.sink() };
+    builder.set_record_sink(sinks);
+    for (accounts) |entry| {
+        try builder.begin_account(&entry.key, entry.account);
+        for (entry.slots) |slot| try builder.add_slot(&slot.key, slot.value);
+        _ = try builder.end_account();
+    }
+    try testing.expectEqualSlices(u8, &expected_root, &try builder.root());
+    try testing.expect(!collector.failed);
+    // Emission order is already key order (storage owners ascend with the accounts).
+    try expect_strictly_ascending(collector.sets.accounts.items);
+    try expect_strictly_ascending(collector.sets.storage.items);
+    try expect_same_records(want.accounts.items, collector.sets.accounts.items);
+    try expect_same_records(want.storage.items, collector.sets.storage.items);
+}
+
+test "import state root: branch records equal the in-memory trie's (seeded, edge cases)" {
+    var prng = Prng.init(0x5747_b4a2);
+    for (0..60 + record_test.edge_cases) |round| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const accounts = if (round < record_test.edge_cases)
+            try record_test.edge_state(arena, @intCast(round))
+        else
+            try record_test.random_state(arena, &prng, 48);
+        try check_records(arena, accounts);
+    }
 }
