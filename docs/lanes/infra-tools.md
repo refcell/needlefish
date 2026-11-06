@@ -247,9 +247,10 @@ allocation after startup.
   proxy code hash, proxy admin, implementation (LinkedInitial), metadata, metadata receipt,
   storage millis part, and the 200 ms cadence (256 edges) pass. Real node defects reported,
   checks not weakened (execution lane):
-  - Blocks carry no `timestampMs` (`execution/rpc/format.zig` header writer) and
-    transactions/logs/receipts no `blockTimestampMs` (`rpc_types` has the field, nothing sets
-    it): header_timestamp_ms and every served wire check fail.
+  - ~~Blocks carry no `timestampMs`, transactions no `blockTimestampMs`~~: stale build. Rerun
+    on main after `1826436b`: header_timestamp_ms, getBlockBy*, and the three tx-by-* wire
+    checks pass. Log/receipt-log wire checks need a post-Denim log (indeterminate on a fresh
+    devnet); still unverified.
   - `eth_getHeaderByHash`/`eth_getHeaderByNumber` are not served (indeterminate).
   - `eth_call`/`eth_estimateGas` without `gas` fail with `gas_cap_exceeded` (the default gas
     exceeds the Osaka EIP-7825 tx cap; geth/reth clamp it), so both BaseTime getters fail.
@@ -317,3 +318,5 @@ allocation after startup.
   the fake transport with hash-pin matching); live on the devnet: 7 pass, 8 fail, 7
   indeterminate (no logs) / 13 fail with a log-emitting tx, all failures node defects listed
   under Findings.
+- 2026-11-05: `basectl denim` rerun on a fresh devnet from main: block/tx millisecond fields
+  pass; remaining fail is the BaseTime getters (`eth_call` default gas over the Osaka cap).
