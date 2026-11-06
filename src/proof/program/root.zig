@@ -10,6 +10,7 @@ pub const intermediate_roots = @import("intermediate_roots.zig");
 pub const l1_chain_provider = @import("l1_chain_provider.zig");
 pub const l1_blob_provider = @import("l1_blob_provider.zig");
 pub const l2_chain_provider = @import("l2_chain_provider.zig");
+pub const schedule_id = @import("schedule_id.zig");
 pub const sync = @import("sync.zig");
 
 pub const BootInfo = boot.BootInfo;

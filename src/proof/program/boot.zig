@@ -17,8 +17,8 @@
 //! The proposer (key 8), the intermediate block interval (key 9, required, non-zero) and
 //! the schedule block (key 11, at or above the claim; 0 or absent means the claim) are
 //! commitments of base/base's TEE and ZK proof journals. The fault-proof client samples
-//! intermediate roots at the interval (`intermediate_roots.zig`); the schedule ID that
-//! base/base pins from the schedule block has no consumer here yet.
+//! intermediate roots at the interval (`intermediate_roots.zig`); the schedule ID is pinned
+//! at the schedule block's timestamp (`schedule_id.zig`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,6 +26,7 @@ const assert = std.debug.assert;
 const preimage = @import("../preimage/root.zig");
 const chains = @import("../../common/chains/root.zig");
 const protocol = @import("../../consensus/protocol/root.zig");
+const schedule_id = @import("schedule_id.zig");
 
 const Hash = [32]u8;
 const Address = [20]u8;
@@ -93,6 +94,9 @@ pub const BootInfo = struct {
     l1_head_number: u64,
     /// The L2 block the claim schedules against; defaults to the claim block.
     schedule_block_number: u64,
+    /// The schedule ID pinned at the schedule block (`schedule_id.zig`); the rollup config
+    /// keeps only the upgrades of that activated prefix.
+    schedule_id: [32]u8,
 
     /// Loads every boot value through `oracle`. `scratch` holds the rollup config JSON.
     pub fn load(oracle: preimage.OracleReader, scratch: []u8) Error!BootInfo {
@@ -122,6 +126,9 @@ pub const BootInfo = struct {
         if (info.schedule_block_number < info.claimed_l2_block_number) {
             return error.ScheduleBlockBeforeClaim;
         }
+        const schedule_timestamp =
+            info.rollup_config.l2_block_timestamp(info.schedule_block_number);
+        info.schedule_id = schedule_id.pin(&info.rollup_config, schedule_timestamp);
         assert(info.rollup_config.l2_chain_id == info.chain_id);
         assert(info.intermediate_block_interval > 0);
         return info;
@@ -273,6 +280,10 @@ test "boot: loads devnet inputs with defaults for optional keys" {
     try testing.expectEqual(@as(Hash, @splat(3)), info.claimed_l2_output_root);
     try testing.expectEqual(@as(u64, 40), info.claimed_l2_block_number);
     try testing.expectEqual(@as(u64, 40), info.schedule_block_number);
+    // Pinning is idempotent: the loaded config already holds only the activated prefix.
+    var pinned = info.rollup_config;
+    const timestamp = pinned.l2_block_timestamp(40);
+    try testing.expectEqual(info.schedule_id, schedule_id.pin(&pinned, timestamp));
     try testing.expectEqual(@as(u64, 0), info.l1_head_number);
     try testing.expectEqual(@as(Address, @splat(0)), info.proposer);
     try testing.expectEqual(chains.devnet.chain_id, info.rollup_config.l2_chain_id);

@@ -103,7 +103,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   EIP-2935 history ring from Isthmus (base/base `eip_2935_history_lookup`), falling back to
   the parent walk: `mpt/key_reader.zig`, `program/eip2935.zig`, provider leaps, and host
   `l2-account-storage-proof` hints served from `eth_getProof` (optional source method).
-- [ ] `proof/schedule-id`: base/base `ScheduleId::pin` in `BootInfo` (upgrade-schedule hash
+- [x] `proof/schedule-id`: base/base `ScheduleId::pin` in `BootInfo` (upgrade-schedule hash
   chain committed by boot, as `ProtocolVersions.activatedScheduleId`).
 - [ ] `proof/tee-nitro-verifier`: base/base `crates/proof/tee/nitro-verifier` — CBOR
   COSE_Sign1 attestation documents, X.509 chain to the AWS Nitro root (std
@@ -159,6 +159,8 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   replays the returned archive offline to the node's root.
 
 ## Decisions
+- Boot pins the schedule ID like base/base but skips its Zenith and Everest refusals: our
+  `Upgrade` set has no Zenith and the executor runs every upgrade it knows.
 - Preimage protocol is synchronous (no async runtime). In-memory `Duplex` endpoints run a
   `Pump` (one host server step) when a client read would block, so client and host
   interleave deterministically on one thread. Channel writes are all-or-nothing over a
@@ -316,6 +318,7 @@ program can run against an in-memory oracle in tests and the cluster simulator.
   (base/base uses substring matching for all but `InvalidProof`).
 
 ## Log
+- 2026-11-05: ScheduleId pinned at boot (golden value matches base/base).
 - 2026-11-05: host serves l2-account-storage-proof hints via eth_getProof.
 - 2026-11-05: EIP-2935 history leaps in the L2 chain provider (client side).
 - 2026-11-05: prover-service and prover-worker metrics and health.
