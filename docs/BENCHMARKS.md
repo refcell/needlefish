@@ -61,6 +61,9 @@ Where the gap comes from:
 
 ## What these numbers are not
 
+Known biases in these numbers (laptop, thread count, build settings, few runs) and the plan
+to remove them are in [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md).
+
 They compare **stateless** executors: both read state from a witness of trie nodes, not from
 a database. base/base's executor over a witness is `base-proof-executor`
 (`StatelessL2Builder`), the block builder of its fault-proof program. base/base's node
