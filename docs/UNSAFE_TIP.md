@@ -106,20 +106,29 @@ Peer-based ways to fetch the catch-up range and any missing block:
   55006661 onward, parent-linked, every body matching, from the snapshot's next block.
   Limits found:
   - Peers are scarce. The execution bootnodes in `common/chains` refused TCP when tried,
-    discv5 showed no Base execution nodes, and a discv4 crawl found one Base Sepolia
-    reth node. Finding more needs discv4 (or a peer list) and more crawling time.
-  - One peer serves bodies at about 25 KB/s, which is about 3 to 4 blocks/s. geth's own
-    eth/68 client sees the same rate from that peer, and headers return in 0.3 s, so the
-    limit is the peer, not our stack. Pipelining body requests (16 hashes each, all in
-    flight) does not raise it. Catching up (faster than the chain's 5 blocks/s) needs
-    several peers in parallel.
+    and discv5 showed no Base execution nodes. `base el-peers` crawls discv4 from those
+    bootnodes (they answer UDP), asks each bonded node for its ENR, and keeps the nodes
+    whose fork id (the `opel` ENR key that Base nodes advertise and read first, else
+    `eth`) is Base Sepolia's `0xc6757f44`. The discv4 table is shared with every
+    Ethereum-family network: crawls of 20,000 to 32,000 nodes and 2,400 to 3,000 records
+    found 0 or 1 Base Sepolia node each, and no `opel` entries at all. Two distinct
+    Base Sepolia reth nodes found so far.
+  - Bandwidth differs by peer. One serves bodies at about 25 KB/s (3 to 4 blocks/s;
+    geth's own eth/68 client sees the same rate from it, and headers return in 0.3 s, so
+    the limit is the peer, not our stack). The other serves 8 to 9 blocks/s. The chain
+    makes 5 blocks/s, so one good peer can follow the tip, but closing a 300k-block
+    snapshot gap at a net 3 to 4 blocks/s takes a day: catch-up stays on RPC (M4) unless
+    many more peers turn up. Pipelining body requests (16 hashes each, all in flight)
+    does not raise a slow peer's rate.
   - A session ended with disconnect reason 11 (timeout) after 512 blocks. Likely cause
     (not confirmed): at 25 KB/s, the peer's Ping waits behind tens of seconds of queued
     body data, so our Pong is late. The fetcher must keep less in flight per peer, and
     reconnect and resume from its last linked block.
-  - Fetched blocks are bound only by their own parent links. They must still be bound to
-    a trusted hash: the snapshot block's hash at the bottom, and a signed gossip block (or
-    the sequencer-signed head) at the top.
+  - Fetched blocks are bound only by their own parent links; execution headers carry no
+    sequencer signature, so a lying peer could serve a self-consistent fake chain. They
+    must still be bound to a trusted hash: the snapshot block's hash at the bottom, and a
+    sequencer-signed gossip block at the top. Executing them locally checks each header's
+    outputs against our own state, but not that the sequencer produced them.
 - **RPC catch-up: bounded, one-time.** This is what the sync lane plans for M4: trusted
   L2 RPC blocks, validated by the hash chain back from the target head. It sits outside
   the steady-state path, but it is rate limited. At 100 blocks per request, 300k blocks
