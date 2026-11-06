@@ -59,8 +59,10 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   time; base/base metering crate).
 - [x] rpc: debug_traceTransaction/traceBlockByNumber/traceBlockByHash /traceCall with callTracer and prestateTracer (diffMode);
   needs an evm call-frame hook (asked nf-evm 2026-11-05).
-- [ ] rpc: base_sendRawTransactionValidity (validity predicates; needs pool storage and
-  builder enforcement, cross-lane with nf-builder).
+- [x] rpc: base_sendRawTransactionValidity node part (ingress checks, `txpool.validity`
+  predicates + `matches`, `Api.validity_sink`).
+- [ ] validity sink: pool storage of predicates + builder enforcement via
+  `txpool.validity.all_match` (cross-lane with nf-builder).
 - [x] rpc: tooling methods: block tx counts, tx by block+index, uncle stubs, eth_accounts,
   web3_sha3, txpool_status.
 - [x] rpc: filters (eth_newFilter/newBlockFilter/newPendingTransactionFilter,
@@ -97,6 +99,7 @@ Reference: base/base `crates/execution/*`, `bin/node`, op-reth.
   update is applied before attributes are checked.
 
 ## Log
+- 2026-11-05: base_sendRawTransactionValidity: base/base ingress order (flashblock_index rejected once Denim builds 200 ms blocks, batch rules, finite block expiry within 60 s of blocks from head+1, stateless tx validation, 8130 only from Everest); signature mode Off (accepted, not verified, as base/base's default). Accepted txs go to `Api.validity_sink` (pool storage + builder enforcement); with no sink the node rejects them after validation instead of pooling them unenforced (safer than silently ignoring the predicates). `txpool/validity.zig` holds the predicate types, parser and `matches` for the pool/builder.
 - 2026-11-05: prestateTracer (+diffMode) for all four debug_trace* methods, no evm hook: after the traced tx, accounts/slots stamped with its tx id (warm or changed) are reported; pre-state from a snapshot of the cache taken before the tx, else the session database; `collect` copies into scratch; block traces stage per-tx JSON in scratch and splice it (`json.Writer.raw`); traceCall uses a new `Executor.Call.inspect` hook. Gap: accounts/slots touched only in reverted frames lose their warm stamp and are missed (geth includes them).
 - 2026-11-05: debug_traceCall: eth_call's parser, view and `eth.simulate` with the recorder on the executor (detached after); recorder space is the scratch between the parsed call data and the proof tail; top gas = request gas or the default call gas.
 - 2026-11-05: debug_traceTransaction / debug_traceBlockByNumber / debug_traceBlockByHash with geth's callTracer (onlyTopCall, withLog) on nf-evm's call-frame hook (d61b345f): re-execution over `HistoryDatabase` at the parent in a session; the RPC drives begin_block/apply per transaction so the tracer attaches only to traced ones; frames recorded flat (depth, copies into a scratch arena, `full` -> error), written nested with an explicit stack. geth semantics: top frame gas = tx gas limit / gas used, failed frames drop their (and descendants') logs, log `position` = prior child calls, revertReason from Error(string). EIP-8130 later phase calls nest under the first. Struct logger and prestateTracer: "only callTracer" (invalid params).

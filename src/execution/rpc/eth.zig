@@ -45,12 +45,16 @@ pub const Api = struct {
     sync: ?*send_sync.Request = null,
     /// Monotonic clock for `base_meterBlock*` timings; null reports zero times.
     clock: ?node.executor.Executor.Clock = null,
+    /// Pool storage and builder enforcement for `base_sendRawTransactionValidity`; null
+    /// rejects validity transactions.
+    validity_sink: ?@import("validity.zig").Sink = null,
 };
 
 pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_module.methods ++
     @import("txpool.zig").methods ++ @import("eth_config.zig").methods ++
     @import("access_list.zig").methods ++ @import("simulate.zig").methods ++ send_sync.methods ++
-    @import("metering.zig").methods ++ @import("trace.zig").methods;
+    @import("metering.zig").methods ++ @import("trace.zig").methods ++
+    @import("validity.zig").methods;
 const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");

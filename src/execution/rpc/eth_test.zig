@@ -1484,3 +1484,64 @@ test "eth: debug_trace prestateTracer reports pre-transaction state and diffs" {
     try expect_contains(call, "\"0x" ++ zeros_62 ++ "02\"");
     try expect_contains(call, "\"0x" ++ zeros_62 ++ "03\"");
 }
+
+const ValiditySinkRecorder = struct {
+    count: u32 = 0,
+    predicates: u32 = 0,
+
+    fn submit(
+        context: *anyopaque,
+        _: *const txpool.Tx,
+        predicates: []const txpool.validity.Predicate,
+    ) anyerror!void {
+        const recorder: *ValiditySinkRecorder = @ptrCast(@alignCast(context));
+        recorder.count += 1;
+        recorder.predicates = @intCast(predicates.len);
+    }
+};
+
+fn validity_request(h: *Harness, raw: []const u8, predicates: []const u8) ![]const u8 {
+    var body: [2048]u8 = undefined;
+    const format = request_prefix_format ++ "base_sendRawTransactionValidity\"," ++
+        "\"params\":[\"0x{x}\",{{\"validity\":{s}}}]}}";
+    return h.request_runtime(try std.fmt.bufPrint(&body, format, .{ raw, predicates }));
+}
+
+test "eth: base_sendRawTransactionValidity validates and hands off to the sink" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var buffer: [256]u8 = undefined;
+    const raw = try transfer_raw(&buffer, 0);
+    const expiry = "{\"type\":\"block_number\",\"params\":{\"op\":\"<=\",\"value\":\"0x10\"}}";
+    const balance = "{\"type\":\"balance\",\"params\":{\"address\":" ++
+        "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"op\":\">\",\"value\":0}}";
+    const valid = "[" ++ expiry ++ "," ++ balance ++ "]";
+    // Without a sink the transaction is rejected after validation.
+    try expect_contains(try validity_request(h, raw, valid), "no pool enforces");
+    var recorder: ValiditySinkRecorder = .{};
+    h.api.validity_sink = .{ .context = &recorder, .submit = ValiditySinkRecorder.submit };
+    var expected: [80]u8 = undefined;
+    const hash = try std.fmt.bufPrint(&expected, "\"result\":\"0x{x}\"", .{
+        &primitives.keccak256(raw).bytes,
+    });
+    try expect_contains(try validity_request(h, raw, valid), hash);
+    try testing.expectEqual(@as(u32, 1), recorder.count);
+    try testing.expectEqual(@as(u32, 2), recorder.predicates);
+    // Denim builds 200 ms blocks: flashblock predicates are rejected (accepted before).
+    const flash = "[" ++ expiry ++ ",{\"type\":\"flashblock_index\",\"params\":" ++
+        "{\"op\":\">\",\"value\":1}}]";
+    const flash_text = try validity_request(h, raw, flash);
+    if (h.api.spec.is_upgrade_active(.denim, 2)) {
+        try expect_contains(flash_text, "not supported after Denim");
+    } else {
+        try expect_contains(flash_text, hash);
+        recorder.count -= 1;
+    }
+    try expect_contains(try validity_request(h, raw, "[" ++ balance ++ "]"), "upper bound");
+    try expect_contains(try validity_request(h, raw, "[]"), "must not be empty");
+    // 60 s of blocks from block 1 ends by block 301 (200 ms) or 31 (2 s).
+    const far = "[{\"type\":\"block_number\",\"params\":{\"op\":\"=\",\"value\":302}}]";
+    try expect_contains(try validity_request(h, raw, far), "too far in the future");
+    try expect_contains(try validity_request(h, &.{ 0x02, 0x01 }, valid), "-32602");
+    try testing.expectEqual(@as(u32, 1), recorder.count);
+}
