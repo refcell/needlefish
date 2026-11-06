@@ -12,6 +12,7 @@ pub const engine = @import("engine/root.zig");
 pub const node = @import("node/root.zig");
 pub const rpc = @import("rpc/root.zig");
 pub const evm = @import("evm/root.zig");
+pub const import = @import("import/root.zig");
 
 test {
     std.testing.refAllDecls(@This());
