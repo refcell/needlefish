@@ -594,6 +594,7 @@ pub fn Service(comptime IO: type) type {
                 limits.http.io_timeout_ns == 0);
             service.sync_request = .{ .timeout_ms_max = sync_timeout_ms };
             service.api.sync = &service.sync_request;
+            service.api.clock = .{ .context = service.io, .now_ns = clock_now };
             const filters = try allocator.create(filters_module.Filters);
             filters.* = .{};
             service.filters = filters;
@@ -770,6 +771,11 @@ pub fn Service(comptime IO: type) type {
             const delay_ns = service.options.limits.send_raw_tx_sync_poll_ns;
             const completion = &service.sync_completion;
             service.io.timeout(*Self, service, on_sync_poll, completion, delay_ns);
+        }
+
+        fn clock_now(context: *anyopaque) u64 {
+            const io: *IO = @ptrCast(@alignCast(context));
+            return io.now_monotonic_ns();
         }
 
         fn on_sync_poll(

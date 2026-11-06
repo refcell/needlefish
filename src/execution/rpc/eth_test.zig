@@ -1164,3 +1164,86 @@ test "eth: EIP-8130 requests are refused before Everest" {
         address_target ++ "}]";
     try expect_contains(try h.request("eth_call", request), "not active before Everest");
 }
+
+/// Advances one microsecond per read.
+const StepClock = struct {
+    now_ns: u64 = 0,
+
+    fn read(context: *anyopaque) u64 {
+        const clock: *StepClock = @ptrCast(@alignCast(context));
+        clock.now_ns += std.time.ns_per_us;
+        return clock.now_ns;
+    }
+};
+
+fn meter_scenario(h: *Harness, transfers: u64, timestamp: u64, nonce: *u64) !void {
+    var buffers: [8][256]u8 = undefined;
+    for (0..transfers) |index| {
+        const raw = try transfer_raw(&buffers[index], nonce.*);
+        nonce.* += 1;
+        try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    }
+    const hash = try h.mine(timestamp);
+    const by_number = try h.request("base_meterBlockByNumber", "[\"latest\"]");
+    try expect_contains(by_number, "\"signerRecoveryTimeUs\":");
+    try expect_contains(by_number, "\"stateRootTimeUs\":0");
+    try testing.expectEqual(@as(usize, transfers), count_of(by_number, "\"gasUsed\":21000"));
+    var body: [256]u8 = undefined;
+    const format = request_prefix_format ++ "base_meterBlockByHash\",\"params\":[\"0x{x}\"]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{&hash.bytes});
+    const by_hash = try h.request_runtime(request);
+    try testing.expectEqual(@as(usize, transfers), count_of(by_hash, "\"gasUsed\":21000"));
+}
+
+fn meter_history() !history_module.Store {
+    return history_module.Store.init(testing.allocator, .{
+        .window_blocks = 8,
+        .paths_max = 1 << 12,
+        .small_versions_max = 1 << 12,
+        .large_versions_max = 1 << 10,
+        .prune_per_commit = 256,
+    });
+}
+
+test "eth: base_meterBlock re-executes a block and times its transactions" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    _ = try h.mine(12); // History starts here: block 2's parent is in it.
+    var clock: StepClock = .{};
+    h.api.clock = .{ .context = &clock, .now_ns = StepClock.read };
+    var nonce: u64 = 0;
+    try meter_scenario(h, 2, 24, &nonce);
+    // Each transfer's execution reads the clock twice: one microsecond each.
+    const latest = try h.request("base_meterBlockByNumber", "[\"latest\"]");
+    try testing.expectEqual(@as(usize, 2), count_of(latest, "\"executionTimeUs\":1}"));
+    try expect_contains(latest, "\"blockNumber\":2,");
+    // The state is untouched: the head still serves reads, and the next block builds.
+    try meter_scenario(h, 1, 36, &nonce);
+    // Genesis has no parent; an unknown block is not found.
+    try expect_contains(try h.request("base_meterBlockByNumber", "[\"0x0\"]"), "genesis");
+    const unknown = "[\"0x" ++ @as([64]u8, @splat('a')) ++ "\"]";
+    try expect_contains(try h.request("base_meterBlockByHash", unknown), "block not found");
+}
+
+test "eth: seeded fuzz of base_meterBlock over random blocks" {
+    var prng = Prng.init(0x6d65);
+    for (0..4) |_| {
+        const h = try Harness.create();
+        defer h.destroy();
+        var store = try meter_history();
+        defer store.deinit(testing.allocator);
+        try h.node.db.trie().track_changes(testing.allocator);
+        try h.node.chain.attach_history(&store);
+        _ = try h.mine(12);
+        var nonce: u64 = 0;
+        var timestamp: u64 = 24;
+        for (0..prng.range(1, 3)) |_| {
+            try meter_scenario(h, prng.below(4), timestamp, &nonce);
+            timestamp += 12;
+        }
+    }
+}

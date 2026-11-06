@@ -379,6 +379,66 @@ pub const Executor = struct {
         assert(building.count == transactions.len);
     }
 
+    /// A monotonic clock (the service's IO), injected so library code never reads time.
+    pub const Clock = struct {
+        context: *anyopaque,
+        now_ns: *const fn (context: *anyopaque) u64,
+
+        pub fn read(clock: Clock) u64 {
+            return clock.now_ns(clock.context);
+        }
+    };
+
+    pub const Metered = struct {
+        signer_recovery_ns: u64,
+        execution_ns: u64,
+        gas_used: u64,
+    };
+
+    /// Re-executes a block like `execute_uncommitted` (the caller ends with `abort_block`),
+    /// timing sender recovery (all senders first, as base/base `meter_block`) and each
+    /// transaction's execution: `transaction_ns[i]` and `transaction_gas[i]` for each.
+    pub fn meter_block(
+        executor: *Executor,
+        block: *const BlockEnv,
+        transactions: []const []const u8,
+        clock: Clock,
+        transaction_ns: []u64,
+        transaction_gas: []u64,
+    ) Error!Metered {
+        assert(executor.known_sender == null);
+        assert(transaction_ns.len >= transactions.len and transaction_gas.len >= transactions.len);
+        if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
+        const recovery_start = clock.read();
+        for (transactions, 0..) |raw, index| {
+            const envelope = Envelope.decode(raw) catch return error.InvalidTransaction;
+            // Deposits name their sender; EIP-8130 transactions authorize their own.
+            executor.senders[index] = switch (envelope) {
+                .deposit => |deposit| deposit.from,
+                .eip8130 => null,
+                else => envelope.recover_sender(executor.recoverer) orelse
+                    return error.InvalidTransaction,
+            };
+        }
+        const recovery_end = clock.read();
+        var building = try executor.begin_block(block);
+        defer executor.known_sender = null;
+        for (transactions, 0..) |raw, index| {
+            executor.known_sender = executor.senders[index];
+            const before = building.gas_used;
+            const start = clock.read();
+            try executor.apply(&building, raw);
+            transaction_ns[index] = clock.read() -| start;
+            transaction_gas[index] = building.gas_used - before;
+        }
+        const end = clock.read();
+        return .{
+            .signer_recovery_ns = recovery_end -| recovery_start,
+            .execution_ns = end -| recovery_end,
+            .gas_used = building.gas_used,
+        };
+    }
+
     /// A message call against the current state (eth_call / eth_estimateGas).
     pub const Call = struct {
         from: Address = @splat(0),
