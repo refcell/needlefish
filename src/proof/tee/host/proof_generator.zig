@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const log = std.log.scoped(.tee_host);
 
 const host = @import("../../host/root.zig");
 const protocol = @import("../../prover_service/protocol.zig");
@@ -142,6 +143,7 @@ pub const Generator = struct {
         const proved = generator.pool.prove(preimages) catch |err| {
             generator.stats.enclave_failed += 1;
             generator.last_error = err;
+            log.info("block {d}: enclave failed: {t}", .{ request.claimed_l2_block_number, err });
             return error.Failed;
         };
         const result = try generator.keep(&proved.result);
@@ -157,6 +159,7 @@ pub const Generator = struct {
             generator.stats.witness_failed += 1;
         }
         generator.last_error = err;
+        log.info("witness failed: {t}", .{err});
         return error.Failed;
     }
 

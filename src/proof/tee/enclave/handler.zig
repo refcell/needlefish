@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const log = std.log.scoped(.enclave);
 
 const proof_client = @import("../../client/root.zig");
 const protocol = @import("protocol.zig");
@@ -100,6 +101,7 @@ pub const Handler = struct {
                     handler.config.client_options,
                     handler.proof,
                 ) catch |err| {
+                    log.info("prove failed: {t}", .{err});
                     return .{ .failure = .{ .kind = .proof, .message = @errorName(err) } };
                 };
                 return .{ .prove = .{ .tee = handler.proof.result() } };
