@@ -235,6 +235,74 @@ fn erc20_transfer(iterations: u32) u64 {
     return gas_used;
 }
 
+const block_transactions = 1000;
+const block_senders = 100;
+const block_recipients = 200;
+var block_data: [block_transactions / 2][68]u8 = undefined;
+
+fn block_sender(index: usize) Address {
+    return primitives.address_from_int(0x5e0000 + index);
+}
+
+fn block_recipient(index: usize) Address {
+    return primitives.address_from_int(0x2e0000 + index);
+}
+
+/// 100 funded senders with token balances; the erc20 calldata for every other transaction.
+fn block_setup(h: *Harness) void {
+    h.database.put_account(contract, 0, 1, &erc20_code) catch @panic("bench: put token");
+    for (0..block_senders) |index| {
+        const sender = block_sender(index);
+        h.database.put_account(sender, 1 << 80, 0, &.{}) catch @panic("bench: put sender");
+        var key: [64]u8 = @splat(0);
+        key[12..32].* = sender;
+        const slot = std.mem.readInt(u256, &keccak256(&key), .big);
+        h.database.put_storage(contract, slot, 1 << 64) catch @panic("bench: put balance");
+    }
+    for (&block_data, 0..) |*data, index| {
+        data.* = @splat(0);
+        data[0..4].* = .{ 0xa9, 0x05, 0x9c, 0xbb }; // transfer(address,uint256)
+        data[16..36].* = block_recipient(index % block_recipients);
+        data[67] = 1;
+    }
+    h.evm.block = .{
+        .base_fee = 7,
+        .gas_limit = 150_000_000,
+        .op = .{ .upgrade = .denim },
+    };
+}
+
+/// One Denim-era block: 1000 EIP-1559 transactions (alternating ETH and erc20 transfers)
+/// from 100 senders to 200 recipients, one state reset per block, no per-tx reset.
+fn block(iterations: u32) u64 {
+    const h = harness();
+    block_setup(h);
+    defer h.evm.block = .{};
+    var gas_used: u64 = 0;
+    var iteration: u32 = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        h.state.reset(h.database.interface());
+        for (0..block_transactions) |index| {
+            const is_token = index % 2 == 1;
+            const tx = transaction.TxEnv{
+                .tx_type = .eip1559,
+                .caller = block_sender(index % block_senders),
+                .nonce = @intCast(index / block_senders),
+                .gas_limit = if (is_token) 100_000 else 21_000,
+                .gas_price = 10,
+                .gas_priority_fee = 1,
+                .to = if (is_token) contract else block_recipient(index % block_recipients),
+                .value = if (is_token) 0 else 1,
+                .data = if (is_token) &block_data[index / 2] else &.{},
+            };
+            const result = transaction.transact(&h.evm, fork, &tx) catch @panic("bench: block");
+            assert(result.executed.status == .success);
+            gas_used += result.executed.gas_used;
+        }
+    }
+    return gas_used;
+}
+
 const keccak256 = @import("../../common/crypto/root.zig").keccak256;
 const bench = @import("../../testing/bench.zig");
 const Case = bench.Case;
@@ -310,6 +378,8 @@ pub const cases = [_]Case{
     .{ .name = "evm: value transfer transaction", .iterations = 10_000, .run = transfer },
     // ~51k gas: the common token transfer path end to end.
     .{ .name = "evm: erc20 transfer transaction", .iterations = 10_000, .run = erc20_transfer },
+    // ~36M gas: 500 transfers + 500 erc20 transfers through the OP (Denim) tx envelope.
+    .{ .name = "evm: block of 1000 transactions", .iterations = 20, .run = block },
 };
 
 test "evm bench: cases execute successfully" {

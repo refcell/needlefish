@@ -161,6 +161,12 @@ pub const Tracer = struct {
     ) void,
 };
 
+pub const StaticWarmCache = struct {
+    fork: Fork,
+    upgrade: ?@import("op.zig").Upgrade,
+    warm: state_module.StaticWarm,
+};
+
 pub const TraceKind = enum {
     call,
     callcode,
@@ -200,6 +206,8 @@ pub const Evm = struct {
     pending: Pending = .none,
     fatal_error: ?Error = null,
     tracer: ?*const Tracer = null,
+    /// The last fork/upgrade's precompile and native warm set (it depends on nothing else).
+    static_warm_cache: ?StaticWarmCache = null,
 
     pub fn init(allocator: std.mem.Allocator, config: env.Config, state: *State) !Evm {
         config.validate();

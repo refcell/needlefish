@@ -264,6 +264,18 @@ pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!
     if (!fork.at_least(.berlin)) return;
     if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
     const op_upgrade = evm.op_upgrade();
+    if (evm.static_warm_cache) |cache| {
+        if (cache.fork == fork and cache.upgrade == op_upgrade) {
+            evm.state.static_warm = cache.warm;
+            return;
+        }
+    }
+    const warm = static_warm_set(fork, op_upgrade);
+    evm.static_warm_cache = .{ .fork = fork, .upgrade = op_upgrade, .warm = warm };
+    evm.state.static_warm = warm;
+}
+
+fn static_warm_set(comptime fork: Fork, op_upgrade: ?op.Upgrade) state_module.StaticWarm {
     var warm: state_module.StaticWarm = .{ .natives = native.warm_addresses(op_upgrade) };
     var number: u32 = 1;
     while (number <= 0x11) : (number += 1) {
@@ -274,7 +286,8 @@ pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!
     }
     warm.p256 = precompiles.is_precompile(fork, op_upgrade, primitives.address_from_int(0x100));
     assert(warm.precompiles & 1 == 0);
-    evm.state.static_warm = warm;
+    assert(warm.natives.len <= 16);
+    return warm;
 }
 
 /// EIP-7702: apply valid authorizations. Returns the refund for existing authorities.
