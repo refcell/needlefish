@@ -295,3 +295,11 @@ together. Refills of the block cache never wait on a write and are bounded per b
   checkpoint spends the checkpoint's per-commit block budget; when the table list is full,
   all codes are rewritten from RAM and the old blocks freed through the free set. Measured in
   docs/PERF.md "db code tables".
+- Phase 2a (LSM tree primitive, done; see docs/PERF.md "db LSM tree"): a checkpoint may start
+  in the middle of a compaction job instead of only at a bar boundary. The tree's checkpoint
+  bytes carry the manifest (the job's inputs, still live), both memtables (so no flush is
+  forced before a checkpoint), and the blocks the job acquired so far; open releases those
+  orphans and the job reruns. Filters are rebuilt by the open scan rather than stored (open
+  scans every table in phase 2 anyway); they move to the grid with phase 3's scan-free open.
+  Measured write amplification at ~2.6M storage entries is 6.8x (whole blocks over logical
+  bytes), consistent with the 10-20x planned for the full-size tree.

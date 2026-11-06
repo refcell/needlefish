@@ -48,6 +48,8 @@ pub const footprint = @import("footprint_bench.zig");
 pub const table = @import("table_bench.zig");
 /// Code tables vs codes in the checkpoint image (`code_bench.zig`).
 pub const codes = @import("code_bench.zig");
+/// LSM tree for flat state: puts, compaction, write amplification, lookups (`lsm_bench.zig`).
+pub const lsm = @import("lsm_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -660,6 +662,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     footprint.run(io, filter);
     table.run(io, filter);
     codes.run(io, filter);
+    lsm.run(io, filter);
 }
 
 fn run_commit_sim(

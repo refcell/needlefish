@@ -905,6 +905,41 @@ codes into the image. Open barely moves: both variants keccak every code once at
 (`State.insert_code`), which dominates the 41 ms scan (0.7 GB/s); the scan reads its blocks
 one at a time. Phase 4 (codes out of RAM) removes the scan altogether.
 
+## 2026-11-06 db LSM tree for flat state (aarch64-macos, Apple M4 Pro, ReleaseFast)
+
+`zig build bench -Doptimize=ReleaseFast -- db/lsm` (`db/lsm_bench.zig`). Disk state phase 2,
+first piece: the LSM tree primitive (`storage/lsm.zig`), not yet wired into `State`. Two trees
+on one grid of 64 KiB blocks: accounts (32-byte key, 80-byte value) and storage (64-byte key,
+32-byte value). 1000 blocks of 1k account + 4k slot puts (mainnet-sized 200 ms blocks),
+uniform random keys over 1M accounts / 4M slots, memtables 32k / 64k entries (swap at half),
+tables of up to 64k records, level 0 up to 4 tables, growth 8, 256 blocks of compaction
+budget per tree per block, a simulated checkpoint every 50 blocks. `SimStorage` with one tick
+of latency: IO costs only its CPU side. One run:
+
+| Case | Result |
+| --- | ---: |
+| put (memtable insert) | 25 ns |
+| compaction CPU per block (merge, seal, checksum, copy) | 5.53 ms |
+| compaction IO per block, mean (max) | 97.7 (512) blocks |
+| write amplification, all (accounts, storage) | 6.81 (5.13, 7.30) |
+| busy puts, stalls (no free block) | 0, 0 |
+| storage lookup, warm hit (10k hot keys, cache holds them) | 295 ns |
+| storage lookup, cold (16-block cache, 63% present) | 24.3 us |
+| storage lookup, absent key (cold) | 1.03 us |
+
+Final shape: accounts L1 2 tables / 131k records, L2 9 / 526k; storage L1 4 / 198k, L2 33 /
+2.07M, L3 5 / 328k. Write amplification counts whole blocks written over logical key + value
+bytes; at this size each record is rewritten ~once per level it passes (memtable -> L0 -> L1
+-> L2, plus partial L3), and every further level adds roughly one more rewrite at growth 8
+with partial-overlap merges. The plan point (2B slots) needs ~4 more levels, so expect ~10-12x,
+in the 10-20x the design assumed. Compaction IO averages ~6 MiB per block (~30 MiB/s at 5
+blocks/s); a commit spent its full budget only when both trees were mid-merge. A cold hit
+reads up to two blocks per probed table (index, data) of 64 KiB at ~25 us each (CPU only, see
+"db sorted tables"); filters keep absent keys off every level but the last (442k filter
+skips vs 59k table probes over the three lookup runs), and the last level's partial key
+coverage keeps most absent keys off it too. Next: read only the sectors a block uses and keep
+fences resident so a cold hit is one data-block read.
+
 ## 2026-11-06 node mainnet replay (aarch64-macos, Apple M4 Pro, ReleaseFast)
 
 `zig build bench -Doptimize=ReleaseFast -- "node: replay"`: the ten committed Base mainnet

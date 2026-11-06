@@ -256,10 +256,23 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   see "code store read path"). Smaller follow-ups: parallel table reads at open (the scan
   reads one block at a time), skip the redundant keccak per code at open (grid checksums
   already cover the bytes), a code lookup hit/miss bench through the database.
-- [ ] Disk state phase 2: hashed account and storage LSM trees (memtables, leveled compaction
-  paced per durable commit, filters on all but the last level, fences, static block cache);
-  `State` reads through them; checkpoints stop serializing the flat tables. Differential test
-  against the in-memory `State`.
+- [x] Disk state phase 2a: the LSM tree primitive for flat state (`storage/lsm.zig`,
+  `lsm_memtable.zig`, `lsm_filter.zig`, `lsm_compaction.zig`): fixed-size keys and values, two
+  static memtables (`error.Busy` when full), leveled tables (level 0 overlapping, growth 8),
+  split-block Bloom filters on all but the last level, table fence keys, tombstones,
+  compaction paced in grid blocks per commit, manifest + memtables + orphan blocks in the
+  caller's checkpoint bytes, compacted tables released through the free set. Tests:
+  differential vs `std.AutoHashMap` (32- and 64-byte keys, clean reopen), 24-seed crash test
+  over the engine (mid flush, mid merge, mid checkpoint, fallback; orphan release), workload
+  and decoder fuzz. (`lsm_test.zig`; `db/lsm` bench: put 25 ns, write amplification 6.8,
+  warm hit 295 ns, cold hit 24 us, absent 1.0 us; see Decisions)
+- [ ] Disk state phase 2b (rest): shadow-write account/storage changesets into the trees from
+  `Database` behind a config flag with a differential test against `State`'s flat tables;
+  then `State` reads through the trees, checkpoints stop serializing the flat tables, open
+  builds the trie by range scan. Smaller follow-ups: resident per-block fences (a cold hit
+  reads the index block too), batched/parallel lookups (one lookup at a time per tree today),
+  read only a block's used sectors, persisted filters (open rebuilds them by scanning every
+  table), parallel reads in a compaction job (one block in flight).
 - [ ] Disk state phase 3: trie branch store keyed (owner, path) and a sparse state root over
   it with a bounded node cache (top account-trie levels pinned); drop the full in-memory node
   pools; manifest-only checkpoints, open without a trie rebuild.
@@ -328,6 +341,33 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   half-full-block reservation): 2116 blocks (132 MiB) at the default 32 MiB of code; set in
   `service.init_durable` unless the limits set a grid. Existing durable datadirs written
   without a grid now fail `LayoutMismatch` at open (devnet datadirs are regenerated).
+- Disk state phase 2a (LSM tree primitive). One tree per key space with comptime key and
+  value sizes; a tombstone is an empty table value. Memtables: two fixed arrays with an
+  open-addressing hash index (a key once per memtable), swapped when the mutable one holds
+  `flush_entries_min` and the other is empty, sorted once at swap; normal puts keep
+  `replay_entries_max` entries free so journal replay after open never overflows (size it to
+  the most puts the journal holds); `put_replay` may also swap. Levels: level 1 holds a full
+  level 0's records, each next level `growth_factor` more; per-level table slots are static
+  (`3 x capacity/table_records_max + 2 x growth + 4`), a level is due when over capacity or
+  over half its slots; jobs: level 0 full > pending flush > deepest due level, and a job whose
+  output does not fit makes room one level down first (a full last level panics: a config
+  error). Level i merges pick one table round robin by key and merge the overlapping tables
+  of level i+1 as one stream; level 0 merges take every level-0 table. Tombstones drop when
+  no level below the output holds tables (a flush only into an empty tree). Pacing: each
+  `compact(blocks)` sets (does not add to) the budget; every block read or write spends one;
+  one IO in flight per tree. The builder's `Source` is synchronous, so the job stages merged
+  records in a ring and grants the builder one block at a time once the ring holds
+  `records_per_block_max + 1` records (a new optional `Builder.pause_callback` reports each
+  block write). Blocks: a one-block reservation right before each write, closed right after,
+  so a job never holds a reservation across ticks (the code store can reserve between steps;
+  a job seeing another reservation, or no free block, stalls to the next commit). Checkpoint
+  at any time: manifest, both memtables, and the running job's acquired blocks (orphans);
+  open releases the orphans after the scan verifies the tables, and the job reruns. Jobs never
+  install while a lookup is pending (deferred to its completion), so a lookup sees one
+  manifest. Filters live in RAM and are rebuilt by the open scan (which reads and verifies
+  every table, as phase 2's trie rebuild must scan anyway); persisting them comes with
+  phase 3's scan-free open. Fences are the tables' `key_min`/`key_max`; per-block fences stay
+  in the index block (through the block cache).
 - Code store read path (why codes are still in RAM after phase 1d): `State.code_by_hash` is synchronous and
   its callers outside the lane (evm `State.code`, which caches the slice in the account for
   the whole block; node `StateDb`, witness, rpc) hold the returned slice for a block or
@@ -1225,3 +1265,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (100k accounts + 4096 codes, 28 MiB): image 44.7 -> 17.7 MiB, checkpoint 34-35 -> 13-14 ms
   steady (27-28 ms right after deploying all codes), open 161 -> 151 ms. Codes out of RAM
   (phase 1e / 4) remains.
+- 2026-11-06: disk state phase 2a: LSM tree primitive for flat state (memtables, leveled
+  tables, Bloom filters, tombstones, compaction paced per commit in grid blocks, manifest +
+  memtables + orphans in the checkpoint, checkpoint-staged release). Tests: differential vs a
+  hash map (32/64-byte keys), 24-seed engine crash test (mid flush/merge/checkpoint,
+  fallback, orphan release), workload + decoder fuzz. `db/lsm` (1000 blocks of 1k accounts +
+  4k slots): put 25 ns, compaction 5.5 ms and 98 blocks per block, write amplification 6.8,
+  lookup warm 295 ns / cold 24 us / absent 1.0 us. Shadow writes and `State` reads (2b) remain.
