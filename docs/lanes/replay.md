@@ -115,6 +115,9 @@ response under `.cache/replay/`, retry with backoff on 429, cap concurrency.
 
 ## Log
 
+- 2026-11-06: unit test for replaying past a failed block: the fixture without its pre-state
+  root node; normal mode stops after block 1, probe mode replays all 10 recording gaps.
+
 - 2026-11-06: one gap round fills every block lacking state: cached window 53775088..+100
   with its 3 gap blocks cleared needs 1 round (was 3), same archive bytes, 100/100.
 
