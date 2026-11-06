@@ -351,3 +351,7 @@ provably robust.
 - 2026-11-05: nf-node c47babca keeps executed blocks pending in memory (no unwind/re-apply):
   restored the strict real-sequencer liveness check (full catch-up, slack 2). Swarm 1-3000
   and 40000-44999: all pass except 44150/44794 (safe-head lag, handed to the 200 ms work).
+- 2026-11-05: paused for replay focus (owner decision). The 200 ms sim work in progress is
+  on the local branch `wip/dst-fuzz-200ms` (not pushed, not green): Denim 200 ms family for
+  model nodes, real components at 200 ms, FCU-head restart asserts, `sim/slots.zig` slot
+  invariants. Open seeds on main: 44150, 44794 (safe-head lag by 1).
