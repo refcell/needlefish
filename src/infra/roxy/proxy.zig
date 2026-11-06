@@ -21,6 +21,12 @@
 //! answers are reassembled in request order. With `splits_max == 0` such a batch gets
 //! JSON-RPC error -32600 instead.
 //!
+//! With `consensus_tags` (needs `lag`), the consensus head is the lowest head among admitted,
+//! non-lagging upstreams, never decreasing (unless every head fell more than `lag.max_blocks`
+//! below it). A `latest` block parameter is rewritten to it (`tags.zig`) in a fixed per-slot
+//! buffer (overflow: forwarded unmodified and counted), and a request for block N prefers
+//! upstreams whose head is at least N (falling back to any when none is).
+//!
 //! With `rate_limit.requests_per_s > 0`, each client IP (resolved through `trusted_proxy`,
 //! so clients behind a trusted load balancer are told apart) has a token bucket; a client
 //! over its rate gets 429 and JSON-RPC error -32016 before anything else is checked.
@@ -49,6 +55,7 @@ const trusted_proxy = @import("../../utilities/trusted_proxy/root.zig");
 const rate_limit = @import("rate_limit.zig");
 const Routes = @import("routes.zig").Routes;
 const split_module = @import("split.zig");
+const tags = @import("tags.zig");
 const Split = split_module.Split;
 
 /// Client buckets tracked at once (about 40 bytes each).
@@ -84,6 +91,10 @@ pub const Options = struct {
     lag: Lag = .{},
     /// Batches being split at once (0: a batch whose routes share no upstream gets -32600).
     splits_max: u32 = 4,
+    /// Rewrite `latest` block parameters to the consensus head (needs `lag.enabled()`).
+    consensus_tags: bool = false,
+    /// Per-slot buffer for a rewritten body; a larger one is forwarded unmodified.
+    rewrite_size_max: u32 = 16 * 1024,
     /// Proxies whose forwarding header is trusted when resolving the client IP.
     trusted_proxy: trusted_proxy.Config = .{},
     server: http.server.Options = .{},
@@ -92,7 +103,7 @@ pub const Options = struct {
 };
 
 const label_size_max = 24;
-const metrics_max = 11 + 4 * upstreams_max;
+const metrics_max = 14 + 4 * upstreams_max;
 const split_none = std.math.maxInt(u32);
 const content_type_json = [_]http.parser.Header{
     .{ .name = "Content-Type", .value = "application/json" },
@@ -115,6 +126,8 @@ pub fn Proxy(comptime IO: type) type {
             body: []const u8 = "",
             tried: Mask = 0,
             attempts: u32 = 0,
+            /// Lowest upstream head preferred for this request (consensus tags; 0: any).
+            height_min: u64 = 0,
             /// The split this slot is a part of, or `split_none`.
             split: u32 = split_none,
             part: u8 = 0,
@@ -164,12 +177,17 @@ pub fn Proxy(comptime IO: type) type {
         /// Scratch for the allowlist check.
         entries: [methods.batch_max]methods.Entry = undefined,
         entries_count: u32 = 0,
-        /// Scratch for routing and splitting, parallel to `entries`.
+        /// Scratch for routing, splitting, and tag rewriting, parallel to `entries`.
         entry_masks: [methods.batch_max]Mask = undefined,
         entry_part: [methods.batch_max]u8 = undefined,
         part_masks: [split_module.parts_max]Mask = undefined,
+        plans: [methods.batch_max]tags.Plan = undefined,
         splits: []Split = &.{},
         split_memory: []u8 = &.{},
+        /// `pending_max` buffers of `rewrite_size_max` bytes (consensus tags only).
+        rewrite_memory: []u8 = &.{},
+        consensus_floor: u64 = 0,
+        consensus_known: bool = false,
         head_clients: []HeadClient = &.{},
         heads: [upstreams_max]u64 = @splat(0),
         head_known: Mask = 0,
@@ -187,6 +205,9 @@ pub fn Proxy(comptime IO: type) type {
         rejected_route: metrics.Counter = .{},
         unavailable: metrics.Counter = .{},
         split_batches: metrics.Counter = .{},
+        tag_rewrites: metrics.Counter = .{},
+        tag_rewrite_overflows: metrics.Counter = .{},
+        consensus_head_gauge: metrics.Gauge = .{},
         pending: metrics.Gauge = .{},
         upstream_failures: [upstreams_max]metrics.Counter = @splat(.{}),
         upstream_ejections: [upstreams_max]metrics.Counter = @splat(.{}),
@@ -205,6 +226,8 @@ pub fn Proxy(comptime IO: type) type {
             assert(count > 0 and count <= upstreams_max);
             assert(options.clients_per_upstream > 0 and options.pending_max > 0);
             assert(options.attempts_max > 0);
+            assert(!options.consensus_tags or options.lag.enabled());
+            assert(!options.consensus_tags or options.rewrite_size_max > 0);
             proxy.* = .{
                 .io = io,
                 .allocator = allocator,
@@ -235,6 +258,11 @@ pub fn Proxy(comptime IO: type) type {
             errdefer if (proxy.limiter) |limiter| allocator.destroy(limiter);
             try proxy.init_splits();
             errdefer proxy.deinit_splits();
+            if (options.consensus_tags) {
+                const size = @as(usize, options.pending_max) * options.rewrite_size_max;
+                proxy.rewrite_memory = try allocator.alloc(u8, size);
+            }
+            errdefer if (options.consensus_tags) allocator.free(proxy.rewrite_memory);
             try proxy.init_clients(count);
             errdefer proxy.deinit_clients();
             if (options.lag.enabled()) try proxy.init_head_clients(count);
@@ -341,6 +369,7 @@ pub fn Proxy(comptime IO: type) type {
             proxy.deinit_clients();
             proxy.deinit_head_clients();
             proxy.deinit_splits();
+            if (proxy.options.consensus_tags) proxy.allocator.free(proxy.rewrite_memory);
             if (proxy.limiter) |limiter| proxy.allocator.destroy(limiter);
             proxy.allocator.free(proxy.free);
             proxy.allocator.free(proxy.queue);
@@ -371,13 +400,33 @@ pub fn Proxy(comptime IO: type) type {
                 &proxy.unavailable,
             );
             try registry.gauge("roxy_pending", "Requests queued or in flight.", &proxy.pending);
+            try proxy.register_split_and_tags();
+            for (0..count) |index| try proxy.register_upstream(@intCast(index));
+            assert(registry.count == 13 + 4 * count);
+        }
+
+        fn register_split_and_tags(proxy: *Self) !void {
+            const registry = &proxy.registry;
             try registry.counter(
                 "roxy_split_batches_total",
                 "Batches split into one sub-batch per route group.",
                 &proxy.split_batches,
             );
-            for (0..count) |index| try proxy.register_upstream(@intCast(index));
-            assert(registry.count == 10 + 4 * count);
+            try registry.counter(
+                "roxy_tag_rewrites_total",
+                "Requests whose latest block parameter was rewritten to the consensus head.",
+                &proxy.tag_rewrites,
+            );
+            try registry.counter(
+                "roxy_tag_rewrite_overflows_total",
+                "Rewrites that did not fit the per-slot buffer (forwarded unmodified).",
+                &proxy.tag_rewrite_overflows,
+            );
+            try registry.gauge(
+                "roxy_consensus_head",
+                "Consensus head used for tag rewriting (0: unknown or disabled).",
+                &proxy.consensus_head_gauge,
+            );
         }
 
         fn rejected_entry(comptime reason: []const u8, counter: *metrics.Counter) metrics.Entry {
@@ -517,6 +566,48 @@ pub fn Proxy(comptime IO: type) type {
             return mask;
         }
 
+        /// The consensus head (see the file comment), or null while unknown or disabled.
+        /// Advances the never-decreasing floor.
+        pub fn consensus_head(proxy: *Self) ?u64 {
+            if (!proxy.options.consensus_tags) return null;
+            const now_ns = proxy.io.now_monotonic_ns();
+            const lag = proxy.lagging();
+            var lowest: ?u64 = null;
+            var best: u64 = 0;
+            for (0..proxy.pool.count) |index| {
+                const upstream: u32 = @intCast(index);
+                if (proxy.head_known & pool_module.bit(upstream) == 0) continue;
+                best = @max(best, proxy.heads[index]);
+                if (lag & pool_module.bit(upstream) != 0) continue;
+                if (proxy.pool.ejected(upstream, now_ns)) continue;
+                lowest = @min(lowest orelse proxy.heads[index], proxy.heads[index]);
+            }
+            if (lowest) |head| {
+                // Every head fell far below the floor (a restart or deep reorg): start over.
+                const fell = best +| proxy.options.lag.max_blocks < proxy.consensus_floor;
+                if (!proxy.consensus_known or fell) proxy.consensus_floor = head;
+                proxy.consensus_floor = @max(proxy.consensus_floor, head);
+                proxy.consensus_known = true;
+            }
+            if (!proxy.consensus_known) return null;
+            const floor = proxy.consensus_floor;
+            proxy.consensus_head_gauge.set(@intCast(@min(floor, std.math.maxInt(i64))));
+            return floor;
+        }
+
+        /// Upstreams whose head is unknown or below `height` (0: none).
+        fn below_height(proxy: *const Self, height: u64) Mask {
+            if (height == 0) return 0;
+            var mask: Mask = 0;
+            for (0..proxy.pool.count) |index| {
+                const upstream: u32 = @intCast(index);
+                const known = proxy.head_known & pool_module.bit(upstream) != 0;
+                if (!known or proxy.heads[index] < height) mask |= pool_module.bit(upstream);
+            }
+            assert(mask & ~pool_module.mask_all(proxy.pool.count) == 0);
+            return mask;
+        }
+
         /// Listening with at least one upstream not ejected.
         pub fn ready(proxy: *const Self) bool {
             if (!proxy.listening) return false;
@@ -555,19 +646,23 @@ pub fn Proxy(comptime IO: type) type {
             if (proxy.over_rate_limit(request, response)) return;
             const decision = proxy.inspect(request.body, response) orelse return;
             assert(decision.parts >= 1 and (decision.mask != 0) == (decision.parts == 1));
-            if (decision.parts > 1) return proxy.accept_split(request, response, decision);
+            const head = proxy.plan_tags(request.body, decision.parsed);
+            if (decision.parts > 1) return proxy.accept_split(request, response, decision, head);
             if (proxy.free_count == 0) {
                 proxy.rejected_overload.increment();
                 return response.fail(503);
             }
             const index = proxy.slot_take();
-            proxy.slots[index] = .{
+            const slot = &proxy.slots[index];
+            const rewritten = proxy.rewrite(index, request.body, decision.parsed, head);
+            slot.* = .{
                 .state = .queued,
                 .token = response.defer_response(),
                 .target = request.target,
-                .body = request.body,
+                .body = rewritten.body,
                 // Upstreams outside the route count as tried, so retries stay inside it.
                 .tried = ~decision.mask,
+                .height_min = rewritten.height,
             };
             proxy.requests.increment();
             proxy.queue_push(index);
@@ -582,6 +677,65 @@ pub fn Proxy(comptime IO: type) type {
             return index;
         }
 
+        /// Fills `plans[0..entries_count]` (no edits unless consensus tags are on and the
+        /// body was parsed); returns the head the edits use.
+        fn plan_tags(proxy: *Self, body: []const u8, parsed: bool) u64 {
+            const count = if (parsed) proxy.entries_count else 0;
+            assert(count <= methods.batch_max);
+            for (proxy.plans[0..count]) |*plan| plan.* = .{};
+            if (!parsed or !proxy.options.consensus_tags) return 0;
+            const head = proxy.consensus_head();
+            for (proxy.entries[0..count], proxy.plans[0..count]) |*entry, *plan| {
+                plan.* = tags.plan(body, entry, head);
+                assert(plan.edit == .none or head != null);
+            }
+            return head orelse 0;
+        }
+
+        const Rewritten = struct { body: []const u8, height: u64 };
+
+        /// Applies `plans` to `body` in slot `index`'s rewrite buffer; on overflow the body is
+        /// forwarded unmodified (the height preference still applies).
+        fn rewrite(proxy: *Self, index: u32, body: []const u8, parsed: bool, head: u64) Rewritten {
+            if (!parsed or !proxy.options.consensus_tags) return .{ .body = body, .height = 0 };
+            const entries = proxy.entries[0..proxy.entries_count];
+            const plans = proxy.plans[0..proxy.entries_count];
+            var height: u64 = 0;
+            var edits: u32 = 0;
+            for (plans) |plan| {
+                height = @max(height, plan.height);
+                edits += @intFromBool(plan.edit != .none);
+            }
+            if (edits == 0) return .{ .body = body, .height = height };
+            const size = proxy.options.rewrite_size_max;
+            var writer: std.Io.Writer = .fixed(proxy.rewrite_memory[index * size ..][0..size]);
+            write_plans(&writer, body, entries, plans, head) catch {
+                proxy.tag_rewrite_overflows.increment();
+                return .{ .body = body, .height = height };
+            };
+            proxy.tag_rewrites.increment();
+            assert(writer.end > 0);
+            return .{ .body = writer.buffered(), .height = height };
+        }
+
+        fn write_plans(
+            out: *std.Io.Writer,
+            body: []const u8,
+            entries: []const methods.Entry,
+            plans: []const tags.Plan,
+            head: u64,
+        ) std.Io.Writer.Error!void {
+            assert(entries.len == plans.len and entries.len > 0);
+            var previous: u32 = 0;
+            for (entries, plans) |*entry, plan| {
+                assert(entry.start >= previous);
+                try out.writeAll(body[previous..entry.start]);
+                try tags.copy(out, body, entry.start, entry.end, plan, head);
+                previous = entry.end;
+            }
+            try out.writeAll(body[previous..]);
+        }
+
         /// Queues one slot per part of a split batch (all or nothing: 503 when the pending
         /// set or the split table is full).
         fn accept_split(
@@ -589,6 +743,7 @@ pub fn Proxy(comptime IO: type) type {
             request: *const http.Request,
             response: *http.ResponseBuilder,
             decision: Decision,
+            head: u64,
         ) void {
             assert(decision.parsed and decision.parts >= 2);
             const split_index = for (proxy.splits, 0..) |*entry, index| {
@@ -605,8 +760,9 @@ pub fn Proxy(comptime IO: type) type {
             const entries = proxy.entries[0..count];
             const masks = proxy.part_masks[0..decision.parts];
             // The request buffer holds the body plus `request_overhead_max`, which bounds the
-            // brackets and commas the parts add.
-            split.begin(token, request.body, entries, masks) catch unreachable;
+            // brackets, commas, and rewrites the parts add.
+            split.begin(token, request.body, entries, proxy.plans[0..count], head, masks) catch
+                unreachable;
             for (0..decision.parts) |part| {
                 const index = proxy.slot_take();
                 proxy.slots[index] = .{
@@ -615,6 +771,7 @@ pub fn Proxy(comptime IO: type) type {
                     .target = request.target,
                     .body = split.part_body(@intCast(part)),
                     .tried = ~split.parts[part].mask,
+                    .height_min = split.parts[part].height,
                     .split = @intCast(split_index.?),
                     .part = @intCast(part),
                 };
@@ -644,12 +801,13 @@ pub fn Proxy(comptime IO: type) type {
 
         /// How to proxy `body`, or null when it was answered here: invalid, a disallowed
         /// method (in a batch every entry gets an error), or (splitting disabled) a batch
-        /// whose routes share no upstream. Parses the body only when an allowlist or routes are
-        /// set.
+        /// whose routes share no upstream. Parses the body only when an allowlist, routes, or
+        /// consensus tags are set.
         fn inspect(proxy: *Self, body: []const u8, response: *http.ResponseBuilder) ?Decision {
             const all = pool_module.mask_all(proxy.pool.count);
             const allows_all = proxy.options.allowlist.allows_all();
-            const parse = !allows_all or !proxy.options.routes.empty();
+            const parse = !allows_all or !proxy.options.routes.empty() or
+                proxy.options.consensus_tags;
             if (!parse) return .{ .mask = all, .parsed = false };
             if (!allows_all and proxy.reject_disallowed(body, response)) return null;
             if (allows_all) {
@@ -820,9 +978,19 @@ pub fn Proxy(comptime IO: type) type {
                 return true;
             }
             const now_ns = proxy.io.now_monotonic_ns();
-            // Skip lagging upstreams unless nothing else is eligible (fail open).
-            var excluded = slot.tried | proxy.lagging();
-            if (pool_module.mask_all(proxy.pool.count) & ~excluded == 0) excluded = slot.tried;
+            // Skip lagging upstreams and those below the request's height unless nothing else
+            // is eligible (fail open: height first, then anything not tried).
+            const all = pool_module.mask_all(proxy.pool.count);
+            const below = proxy.below_height(slot.height_min);
+            const choices = [_]Mask{ slot.tried | proxy.lagging() | below, slot.tried | below };
+            var excluded = slot.tried;
+            for (choices) |choice| {
+                if (all & ~choice != 0) {
+                    excluded = choice;
+                    break;
+                }
+            }
+            assert(excluded & slot.tried == slot.tried);
             switch (proxy.pool.select(now_ns, excluded, proxy.busy_mask())) {
                 .wait => return false,
                 .exhausted => proxy.answer_unavailable(index),

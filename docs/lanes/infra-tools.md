@@ -82,7 +82,7 @@ allocation after startup.
   and the 12 HTTP timestamp wire fields; table or `--json`, exit 1 on any fail.
 - [x] `infra/roxy` batch splitting: a batch whose methods route to different upstreams is split
   per route and the responses reassembled in request order (proxyd parity; today -32600).
-- [ ] `infra/roxy` consensus tags: rewrite `latest` (and default block params) to the highest
+- [x] `infra/roxy` consensus tags: rewrite `latest` (and default block params) to the highest
   block every admitted upstream has, so reads spread over replicas never go backwards
   (proxyd consensus mode); builds on the lag poller.
 - [ ] `basectl node-metrics`: port upstream `commands/node_metrics.rs` (scrape and summarize a
@@ -123,7 +123,25 @@ allocation after startup.
   The key is env-only (`BASE_FEE_JOBS_PRIVATE_KEY`), never a flag.
 - roxy lag: one dedicated poll client per upstream (polls never queue behind requests); an
   unknown head never counts as lagging, and a route whose only upstreams lag still serves.
-  No "latest" tag rewriting to the common head (proxyd consensus mode) yet.
+  Tag rewriting is the separate `--consensus-tags` opt-in below.
+- roxy consensus tags (`--consensus-tags`, requires `--lag-max-blocks` > 0): the consensus head
+  is the lowest head among admitted, non-lagging upstreams with a known head, and never
+  decreases (proxyd moves its consensus block forward only), except that it restarts from the
+  current lowest when even the best head is more than `--lag-max-blocks` below it (chain reset
+  or deep reorg). `latest` block params are rewritten to its hex number; an omitted optional
+  block param is appended. Method table (`tags.zig`) = proxyd `RewriteRequest` positions minus
+  `eth_getLogs`/`eth_newFilter` ranges, `eth_blockNumber` answering, and `debug_getRawReceipts`,
+  plus `eth_estimateGas`, `eth_createAccessList` (pos 1, default latest), `eth_feeHistory`
+  (pos 1, required) and `eth_getBlockReceipts` (pos 0, EIP-1898 object allowed). `safe`,
+  `finalized`, `pending`, `earliest`, block hashes, and repeated `params` keys are left alone.
+  Deviation from proxyd: a number above the consensus head is not rejected (-32019); every
+  numeric block param (given or rewritten) makes the request prefer upstreams whose polled head
+  is at least that number, failing open to any upstream when none is (lag exclusion applies
+  first, then height, then anything not yet tried). This preference is what keeps answers
+  monotonic when the floor is above a replica's head. Rewrites go into a fixed per-slot buffer
+  (`--consensus-rewrite-bytes`, default 16 KiB); a body that does not fit is forwarded
+  unmodified and counted (`roxy_tag_rewrite_overflows_total`). Split parts are rewritten into
+  the split's request buffer, which reserves 21 bytes per entry, so they never overflow.
 - roxy routes: a failing pinned upstream is never failed over outside its route.
 - roxy batch splitting: entries are grouped first-fit (an entry joins the first group whose
   narrowed route mask intersects its own), so unrouted entries ride along with a routed group
@@ -270,6 +288,12 @@ allocation after startup.
   base/base `bytecode/proxy.hex`).
 
 ## Findings
+- 2026-11-06 roxy consensus tags against needlefish nodes: state reads rewritten to the
+  consensus number fail with "head state unavailable" on any upstream whose head moved past
+  it, because needlefish serves state only at the forkchoice head (execution lane, see the
+  basectl denim finding below). Block reads work. Live run also saw the second `--dev-l1`
+  node (started 10 s after the first from the same genesis) stop at block 10 with
+  `miner: block failed err=HeadRejected`/`BuildRejected` (not investigated; not roxy).
 - 2026-11-05 `basectl denim` on the 200 ms devnet (sequencer and verifier, Denim at genesis):
   proxy code hash, proxy admin, implementation (LinkedInitial), metadata, metadata receipt,
   storage millis part, and the 200 ms cadence (256 edges) pass. Real node defects reported,
@@ -349,6 +373,13 @@ allocation after startup.
   method served by its upstream, a dead pinned upstream returns 502 without failover.
 - 2026-11-05: roxy block-lag exclusion (SimIo test, `--lag-max-blocks/--lag-poll-ms`,
   `roxy_upstream_head`); live: two dev-l1 nodes, all traffic to the leading one.
+- 2026-11-06: roxy consensus tags (`tags.zig` + seeded/std.testing fuzz, SimIo tests with
+  upstreams at different heads: rewritten params, explicit numbers above the head, a falling
+  replica not moving the head back, batch and split rewrites, buffer overflow; flags
+  `--consensus-tags`, `--consensus-rewrite-bytes`). Live with two dev-l1 nodes (heads 0x1d and
+  0xa): with `--lag-max-blocks 1000` every `eth_getBlockByNumber("latest")` answered 0xa
+  (`roxy_consensus_head 10`) and `0x14` was served (only by the leading node); with 20 the
+  stalled node lagged out and the head moved forward to the leader's, answers never decreasing.
 - 2026-11-06: roxy batch splitting (`split.zig` + seeded/std.testing fuzz of reassembly, SimIo
   tests for order, a failing part, a timed-out split, slot exhaustion; `--split-batches-max`).
   Live with two dev-l1 nodes and a dead third upstream, routes `eth_chainId=0;net_version=1;

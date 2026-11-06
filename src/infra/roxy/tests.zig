@@ -1,7 +1,7 @@
 //! roxy over SimIo: three fake upstreams (utilities/rpc Router behind utilities/http), the
 //! proxy, and a test client. Covers retry and ejection with re-admission, the allowlist,
-//! the pending-limit 503, rate limits, routing with batch splitting, and block-lag
-//! exclusion.
+//! the pending-limit 503, rate limits, routing with batch splitting, block-lag exclusion,
+//! and consensus tag rewriting.
 
 const std = @import("std");
 const testing = std.testing;
@@ -25,6 +25,27 @@ const FakeUpstream = struct {
     calls: u32 = 0,
     head: u64 = 100,
     head_polls: u32 = 0,
+    /// Raw block parameter of the last `eth_getBalance` ("" when omitted).
+    last_block: [32]u8 = undefined,
+    last_block_size: usize = 0,
+
+    /// Answers the block number it served at: the given number, or its own head.
+    fn get_balance(upstream: *FakeUpstream, call: *rpc.Call) rpc.HandlerError!void {
+        _ = try call.params.string();
+        const block = try call.params.optional_raw() orelse "";
+        try call.params.finish();
+        const size = @min(block.len, upstream.last_block.len);
+        upstream.last_block_size = size;
+        @memcpy(upstream.last_block[0..size], block[0..size]);
+        const text = std.mem.trim(u8, block, "\"");
+        const number = @import("../../utilities/json/root.zig").parse_quantity(u64, text) catch
+            upstream.head;
+        try call.writer.quantity(number);
+    }
+
+    fn last_block_text(upstream: *const FakeUpstream) []const u8 {
+        return upstream.last_block[0..upstream.last_block_size];
+    }
 
     fn chain_id(upstream: *FakeUpstream, call: *rpc.Call) rpc.HandlerError!void {
         try call.params.finish();
@@ -48,6 +69,7 @@ const FakeUpstream = struct {
         .{ .name = "eth_chainId", .handler = chain_id },
         .{ .name = "eth_sendRawTransaction", .handler = send_raw },
         .{ .name = "eth_blockNumber", .handler = block_number },
+        .{ .name = "eth_getBalance", .handler = get_balance },
     };
     const Router = rpc.Router(*FakeUpstream, &methods);
 
@@ -585,4 +607,85 @@ test "roxy: an upstream trailing the best head is skipped, failing open" {
     try testing.expectEqual(@as(roxy.Mask, 0), harness.proxy.lagging());
     for (0..6) |_| _ = try harness.call("/", chain_id_body);
     try testing.expect(harness.upstreams[2].calls > 1);
+}
+
+fn balance_body(comptime id: []const u8, comptime block: []const u8) []const u8 {
+    const tail = if (block.len == 0) "]}" else ",\"" ++ block ++ "\"]}";
+    return "{\"jsonrpc\":\"2.0\",\"id\":" ++ id ++ ",\"method\":\"eth_getBalance\"," ++
+        "\"params\":[\"0x01\"" ++ tail;
+}
+
+const pair_body = "[" ++ balance_body("5", "latest") ++ "," ++ balance_body("6", "") ++ "]";
+const big_body = "[" ++ balance_body("7", "latest") ++ "," ++ balance_body("8", "latest") ++ "," ++
+    balance_body("9", "latest") ++ "]";
+const split_tags_body = "[" ++ balance_body("1", "") ++ "," ++ split_send_1 ++ "," ++
+    balance_body("2", "latest") ++ "]";
+
+fn expect_result(harness: *Harness, body: []const u8, expected: []const u8) !void {
+    const result = try harness.call("/", body);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expect(contains(result.text(), expected));
+}
+
+test "roxy: consensus tags rewrite latest to the lowest admitted head, never backwards" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.lag = .{ .max_blocks = 10, .poll_interval_ns = 200 * ms };
+    options.consensus_tags = true;
+    options.rewrite_size_max = 200;
+    try harness.init(64, .{ true, true, true }, options);
+    defer harness.deinit();
+    harness.upstreams[0].head = 100;
+    harness.upstreams[1].head = 105;
+    harness.upstreams[2].head = 103;
+    harness.run_ticking(1000 * ms);
+    try testing.expectEqual(@as(?u64, 100), harness.proxy.consensus_head());
+    for (0..6) |_| try expect_result(&harness, balance_body("1", "latest"), "\"result\":\"0x64\"");
+    for (0..3) |_| try expect_result(&harness, balance_body("2", ""), "\"result\":\"0x64\"");
+    for (&harness.upstreams) |*upstream| {
+        if (upstream.calls == 0) continue;
+        try testing.expectEqualStrings("\"0x64\"", upstream.last_block_text());
+    }
+    try testing.expectEqual(@as(u64, 9), harness.proxy.tag_rewrites.get());
+    // Block 103 is above the consensus head: only upstreams at or above it serve it.
+    const calls_zero = harness.upstreams[0].calls;
+    for (0..6) |_| try expect_result(&harness, balance_body("3", "0x67"), "\"result\":\"0x67\"");
+    try testing.expectEqual(calls_zero, harness.upstreams[0].calls);
+    // Upstream 0 falls back (not far enough to lag): the head does not go backwards, and
+    // upstream 0 no longer serves latest reads.
+    harness.upstreams[0].head = 98;
+    harness.run_ticking(1000 * ms);
+    try testing.expectEqual(@as(roxy.Mask, 0), harness.proxy.lagging());
+    for (0..6) |_| try expect_result(&harness, balance_body("4", "latest"), "\"result\":\"0x64\"");
+    try testing.expectEqual(calls_zero, harness.upstreams[0].calls);
+    // Everyone advances: so does the head; a batch has every entry rewritten.
+    for (&harness.upstreams, [_]u64{ 120, 125, 122 }) |*upstream, head| upstream.head = head;
+    harness.run_ticking(1000 * ms);
+    const result = try harness.call("/", pair_body);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.text(), "\"0x78\""));
+    // A rewritten body over the per-slot buffer goes out unmodified and is counted.
+    _ = try harness.call("/", big_body);
+    try testing.expectEqual(@as(u64, 1), harness.proxy.tag_rewrite_overflows.get());
+    var buffer: [8192]u8 = undefined;
+    var metrics_response = harness.get("/metrics", &buffer);
+    try testing.expect(contains(metrics_response.body.buffered(), "roxy_consensus_head 120"));
+}
+
+test "roxy: consensus tags apply to every part of a split batch" {
+    var harness: Harness = undefined;
+    var options = base_options;
+    options.lag = .{ .max_blocks = 10, .poll_interval_ns = 200 * ms };
+    options.consensus_tags = true;
+    options.routes = try roxy.Routes.parse("eth_sendRawTransaction=2;eth_getBalance=0|1", 3);
+    try harness.init(65, .{ true, true, true }, options);
+    defer harness.deinit();
+    for (&harness.upstreams, [_]u64{ 50, 52, 51 }) |*upstream, head| upstream.head = head;
+    harness.run_ticking(1000 * ms);
+    const result = try harness.call("/", split_tags_body);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    const first = try position(result.text(), "\"id\":1,\"result\":\"0x32\"");
+    const second = try position(result.text(), "\"id\":2,\"result\":\"0x32\"");
+    try testing.expect(first < second);
+    try testing.expectEqual(@as(u32, 1), harness.upstreams[2].calls);
+    try testing.expectEqual(@as(u64, 1), harness.proxy.split_batches.get());
 }

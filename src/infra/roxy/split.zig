@@ -6,7 +6,7 @@
 //! original order. A part that fails yields a JSON-RPC error per entry, keeping its id.
 //!
 //! A `Split` owns fixed buffers sized at startup: the part request bodies (at most the
-//! original body plus brackets and commas) and an arena for the part
+//! original body plus brackets, commas, and tag rewrites) and an arena for the part
 //! responses (their sum is bounded by one upstream response). No allocation after `init`.
 
 const std = @import("std");
@@ -18,6 +18,7 @@ const rpc = @import("../../utilities/rpc/root.zig");
 const methods = @import("methods.zig");
 const pool = @import("pool.zig");
 const routes = @import("routes.zig");
+const tags = @import("tags.zig");
 
 pub const Mask = pool.Mask;
 pub const batch_max = methods.batch_max;
@@ -26,7 +27,7 @@ pub const batch_max = methods.batch_max;
 pub const parts_max = routes.rules_max + 1;
 
 /// Bytes the part bodies may add to the original body.
-pub const request_overhead_max = 2 * parts_max;
+pub const request_overhead_max = 2 * parts_max + batch_max * tags.replacement_size_max;
 /// Upper bound of one error entry written for a failed part, id excluded.
 const error_size_max = 160;
 
@@ -74,6 +75,8 @@ pub const Part = struct {
     /// The part's response body in `arena`.
     response_start: u32 = 0,
     response_end: u32 = 0,
+    /// Highest block height any of its entries needs (consensus tags).
+    height: u64 = 0,
 };
 
 pub const Split = struct {
@@ -99,15 +102,17 @@ pub const Split = struct {
     }
 
     /// Fills the split from a body already grouped by `assign`: builds one sub-batch body per
-    /// part and remembers ids for reassembly.
+    /// part (applying `plans` with `head`), and remembers ids for reassembly.
     pub fn begin(
         split: *Split,
         token: http.Deferred,
         body: []const u8,
         entries: []const methods.Entry,
+        plans: []const tags.Plan,
+        head: u64,
         part_masks: []const Mask,
     ) error{WriteFailed}!void {
-        assert(!split.active and entries.len > 0);
+        assert(!split.active and entries.len == plans.len);
         assert(part_masks.len >= 2 and part_masks.len <= parts_max);
         split.active = true;
         split.token = token;
@@ -122,12 +127,14 @@ pub const Split = struct {
         var writer: std.Io.Writer = .fixed(split.request_buffer);
         for (part_masks, 0..) |mask, part| {
             const start: u32 = @intCast(writer.end);
+            var height: u64 = 0;
             try writer.writeByte('[');
             var written: u32 = 0;
-            for (entries, 0..) |*entry, index| {
+            for (entries, plans, 0..) |*entry, plan, index| {
                 if (split.entry_part[index] != part) continue;
                 if (written > 0) try writer.writeByte(',');
-                try writer.writeAll(body[entry.start..entry.end]);
+                try tags.copy(&writer, body, entry.start, entry.end, plan, head);
+                height = @max(height, plan.height);
                 written += 1;
             }
             try writer.writeByte(']');
@@ -136,6 +143,7 @@ pub const Split = struct {
                 .mask = mask,
                 .body_start = start,
                 .body_end = @intCast(writer.end),
+                .height = height,
             };
         }
     }
@@ -278,8 +286,10 @@ fn test_split(request_buffer: []u8, arena: []u8, body: []const u8) !Split {
     const masks = [_]Mask{ 0b01, 0b10, 0b01 };
     var part_masks: [parts_max]Mask = undefined;
     const count = assign(masks[0..summary.count], &split.entry_part, &part_masks);
+    var plans: [batch_max]tags.Plan = @splat(.{});
     const token: http.Deferred = .{ .index = 0, .generation = 0 };
-    try split.begin(token, body, entries[0..summary.count], part_masks[0..count]);
+    const entries_used = entries[0..summary.count];
+    try split.begin(token, body, entries_used, plans[0..summary.count], 0, part_masks[0..count]);
     return split;
 }
 

@@ -1,6 +1,6 @@
 //! `base roxy`: JSON-RPC reverse proxy over N upstreams with retries, passive health
 //! (ejection with exponential backoff), a method allowlist, method routing with batch
-//! splitting, and block-lag exclusion. Serves `/healthz`,
+//! splitting, block-lag exclusion, and consensus block tags. Serves `/healthz`,
 //! `/readyz`, and `/metrics` on the same port. See `src/infra/roxy`.
 
 const std = @import("std");
@@ -35,6 +35,8 @@ pub const Spec = struct {
     lag_max_blocks: u64 = 0,
     lag_poll_ms: u32 = 1_000,
     split_batches_max: u32 = 4,
+    consensus_tags: bool = false,
+    consensus_rewrite_bytes: u32 = 16 * 1024,
 
     pub const help = .{
         .listen_addr = "Address to serve on, IPv4:PORT",
@@ -55,6 +57,8 @@ pub const Spec = struct {
         .lag_max_blocks = "Skip upstreams this many blocks behind the best head (0: off)",
         .lag_poll_ms = "eth_blockNumber polling interval for --lag-max-blocks",
         .split_batches_max = "Batches split across routes at once (0: reject such batches)",
+        .consensus_tags = "Rewrite latest block params to the consensus head (needs lag)",
+        .consensus_rewrite_bytes = "Per-request rewrite buffer; larger bodies go unmodified",
         .routes = "Pin methods to upstreams: m1,m2=0|1;m3=2 (indices into --upstreams)",
     };
 };
@@ -113,7 +117,11 @@ pub fn settings_of(spec: Spec) !Settings {
     settings.options = options_of(spec, settings.options.allowlist);
     settings.options.routes = try roxy.Routes.parse(spec.routes, settings.upstream_count);
     if (spec.lag_poll_ms == 0) return error.InvalidValue;
+    if (spec.consensus_tags and spec.lag_max_blocks == 0) return error.ConsensusTagsNeedLag;
+    if (spec.consensus_rewrite_bytes == 0) return error.InvalidValue;
     settings.options.splits_max = spec.split_batches_max;
+    settings.options.consensus_tags = spec.consensus_tags;
+    settings.options.rewrite_size_max = spec.consensus_rewrite_bytes;
     settings.options.lag = .{
         .max_blocks = spec.lag_max_blocks,
         .poll_interval_ns = @as(u64, spec.lag_poll_ms) * std.time.ns_per_ms,
@@ -247,11 +255,21 @@ test "roxy: flags to settings" {
         "eth_sendRawTransaction",
     ));
     try testing.expectEqual(@as(u32, 4), routed.options.splits_max);
-    const unsplit = try settings_of(.{
-        .upstreams = "http://127.0.0.1:8545",
+    try testing.expect(!routed.options.consensus_tags);
+    const tagged = try settings_of(.{
+        .upstreams = "http://127.0.0.1:8545,http://127.0.0.1:9545",
+        .lag_max_blocks = 4,
+        .consensus_tags = true,
+        .consensus_rewrite_bytes = 4096,
         .split_batches_max = 0,
     });
-    try testing.expectEqual(@as(u32, 0), unsplit.options.splits_max);
+    try testing.expect(tagged.options.consensus_tags);
+    try testing.expectEqual(@as(u32, 4096), tagged.options.rewrite_size_max);
+    try testing.expectEqual(@as(u32, 0), tagged.options.splits_max);
+    try testing.expectError(error.ConsensusTagsNeedLag, settings_of(.{
+        .upstreams = "http://127.0.0.1:8545",
+        .consensus_tags = true,
+    }));
     try testing.expectError(error.UpstreamIndexTooLarge, settings_of(.{
         .upstreams = "http://127.0.0.1:8545",
         .routes = "eth_call=1",
@@ -273,7 +291,10 @@ test "roxy: flags to settings" {
 
 test "roxy: cli spec parses with env fallback" {
     var diagnostic: cli.Diagnostic = .{};
-    const args = [_][]const u8{ "--listen-addr", "127.0.0.1:9000", "--split-batches-max", "8" };
+    const args = [_][]const u8{
+        "--listen-addr",    "127.0.0.1:9000", "--consensus-tags",
+        "--lag-max-blocks", "3",
+    };
     const Lookup = struct {
         fn get(context: ?*const anyopaque, name: []const u8) ?[]const u8 {
             _ = context;
@@ -286,5 +307,6 @@ test "roxy: cli spec parses with env fallback" {
     try testing.expectEqualStrings("127.0.0.1:9000", spec.listen_addr);
     try testing.expectEqualStrings("http://127.0.0.1:8545", spec.upstreams);
     try testing.expectEqual(@as(u32, 2), spec.retries);
-    try testing.expectEqual(@as(u32, 8), spec.split_batches_max);
+    try testing.expect(spec.consensus_tags);
+    try testing.expectEqual(@as(u64, 3), spec.lag_max_blocks);
 }
