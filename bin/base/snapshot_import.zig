@@ -7,14 +7,19 @@
 //!
 //!     base snapshot-import --db <path/mdbx.dat> [--chain base-sepolia|base-mainnet]
 //!                          [--rpc <url>] [--state-root <hex>] [--blake3 <hex>]
+//!                          [--out <path> [--headers <file>] [--test-head]]
 //!
 //! `--blake3` first checks the file against the snapshot manifest's blake3 of `mdbx.dat`.
+//! `--out` also writes a needlefish disk-mode database in the same pass
+//! (`snapshot_import_out.zig`); `--headers` reads the 256 headers from a file instead of
+//! `--rpc`; `--test-head` (test-only, with `--state-root`) uses synthetic block hashes.
 
 const std = @import("std");
 const Io = std.Io;
 const base = @import("base");
 
 const HttpTransport = @import("http_transport.zig").HttpTransport;
+const snapshot_import_out = @import("snapshot_import_out.zig");
 const import = base.execution.import;
 const mdbx = import.mdbx;
 const json = std.json;
@@ -25,6 +30,10 @@ const Hash = [32]u8;
 const usage =
     \\usage: base snapshot-import --db <path/mdbx.dat> [--chain base-sepolia|base-mainnet]
     \\                            [--rpc <url>] [--state-root <hex>] [--blake3 <hex>]
+    \\                            [--out <path> [--headers <file>] [--test-head]]
+    \\  --out        also write a needlefish disk-mode database (and <path>.counts)
+    \\  --headers    headers N-255..N from a file (one eth_getBlockByNumber result per line)
+    \\  --test-head  TEST ONLY, needs --state-root: synthetic block hashes, no headers
     \\
 ;
 
@@ -33,6 +42,10 @@ const Flags = struct {
     rpc: []const u8 = "https://sepolia.base.org",
     state_root: ?Hash = null,
     blake3: ?Hash = null,
+    genesis_hash: Hash = base.common.chains.sepolia.genesis_l2_hash.bytes,
+    out: ?[]const u8 = null,
+    headers: ?[]const u8 = null,
+    test_head: bool = false,
 };
 
 fn parse_hash(value: []const u8) !Hash {
@@ -48,6 +61,10 @@ fn parse(args: []const []const u8) !Flags {
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
+        if (std.mem.eql(u8, arg, "--test-head")) {
+            flags.test_head = true;
+            continue;
+        }
         if (index + 1 >= args.len) return error.InvalidArguments;
         index += 1;
         const value = args[index];
@@ -58,16 +75,28 @@ fn parse(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, arg, "--chain")) {
             if (std.mem.eql(u8, value, "base-sepolia")) {
                 flags.rpc = "https://sepolia.base.org";
+                flags.genesis_hash = base.common.chains.sepolia.genesis_l2_hash.bytes;
             } else if (std.mem.eql(u8, value, "base-mainnet")) {
                 flags.rpc = "https://mainnet.base.org";
+                flags.genesis_hash = base.common.chains.mainnet.genesis_l2_hash.bytes;
             } else return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--state-root")) {
             flags.state_root = try parse_hash(value);
         } else if (std.mem.eql(u8, arg, "--blake3")) {
             flags.blake3 = try parse_hash(value);
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            flags.out = value;
+        } else if (std.mem.eql(u8, arg, "--headers")) {
+            flags.headers = value;
         } else return error.InvalidArguments;
     }
     if (flags.db == null) return error.InvalidArguments;
+    if (flags.out == null and (flags.headers != null or flags.test_head)) {
+        return error.InvalidArguments;
+    }
+    if (flags.test_head and (flags.state_root == null or flags.headers != null)) {
+        return error.InvalidArguments;
+    }
     return flags;
 }
 
@@ -92,7 +121,7 @@ const FileSource = struct {
 };
 
 /// `hashed_state.EntrySource` over an MDBX cursor.
-const CursorEntries = struct {
+pub const CursorEntries = struct {
     cursor: mdbx.Cursor,
     /// The longest run of entries under one key (the largest storage trie, for DUPSORT).
     run_key: Hash = @splat(0),
@@ -100,7 +129,7 @@ const CursorEntries = struct {
     run_max: u64 = 0,
     run_max_key: Hash = @splat(0),
 
-    fn source(self: *CursorEntries) import.hashed_state.EntrySource {
+    pub fn source(self: *CursorEntries) import.hashed_state.EntrySource {
         return .{ .context = self, .next = next };
     }
 
@@ -244,9 +273,19 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     };
     const number = try import.reth.decode_stage_block(finish);
     std.debug.print("snapshot block (Finish checkpoint): {d}\n", .{number});
+    if (flags.out) |out| {
+        return snapshot_import_out.run(init, .{
+            .out = out,
+            .rpc = flags.rpc,
+            .headers = flags.headers,
+            .test_head = flags.test_head,
+            .state_root = flags.state_root,
+            .genesis_hash = flags.genesis_hash,
+        }, &reader, number);
+    }
     const expected = flags.state_root orelse try header_state_root(init, flags.rpc, number);
     std.debug.print("expected state root {x}\n", .{expected});
-    try code_stats(gpa, &reader);
+    _ = try code_stats(gpa, &reader);
     const root = try compute(init, &reader, &file_source);
     if (!std.mem.eql(u8, &root, &expected)) {
         std.debug.print("STATE ROOT MISMATCH: computed {x}, header {x}\n", .{ root, expected });
@@ -320,8 +359,10 @@ fn compute(init: std.process.Init, reader: *mdbx.Reader, source: *const FileSour
     return root;
 }
 
+pub const CodeStats = struct { count: u64, bytes: u64 };
+
 /// Counts `Bytecodes` and checks every code against its key (keccak256 of the code).
-fn code_stats(gpa: std.mem.Allocator, reader: *mdbx.Reader) !void {
+pub fn code_stats(gpa: std.mem.Allocator, reader: *mdbx.Reader) !CodeStats {
     const tree = try reader.table(gpa, "Bytecodes");
     var cursor = try mdbx.Cursor.init(gpa, reader, &tree);
     defer cursor.deinit(gpa);
@@ -340,4 +381,5 @@ fn code_stats(gpa: std.mem.Allocator, reader: *mdbx.Reader) !void {
     if (codes != tree.items) return error.ItemCountMismatch;
     std.debug.print("Bytecodes: {d} codes, {d} bytes ({d} MiB), largest {d} bytes, " ++
         "every hash checked\n", .{ codes, code_bytes, code_bytes >> 20, code_bytes_max });
+    return .{ .count = codes, .bytes = code_bytes };
 }
