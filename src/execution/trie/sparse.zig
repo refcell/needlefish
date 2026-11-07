@@ -277,6 +277,44 @@ pub const Resolver = struct {
     resolve: *const fn (context: *anyopaque, hash: *const Hash) ?[]const u8,
 };
 
+/// What `visit_records` knows about a branch child: a loaded leaf, a loaded extension or
+/// branch (a record of its own), or a reference only (not loaded, or not yet decoded).
+pub const ChildKind = enum(u8) { leaf, record, unknown };
+
+pub const VisitChild = struct {
+    ref: RlpNode = .{},
+    kind: ChildKind = .unknown,
+    /// A loaded leaf's path: the key's nibbles after the branch's path and this nibble.
+    leaf_path: []const u8 = &.{},
+};
+
+/// One record position of a trie as `visit_records` reports it: a branch together with the
+/// extension above it, hanging below its parent branch's path and nibble (empty at the root),
+/// or the leaf of a trie that is one leaf. Slices are valid during the callback only.
+pub const RecordVisit = struct {
+    hang: []const u8,
+    /// The extension above the branch; empty when the branch is the top node.
+    extension: []const u8 = &.{},
+    /// Set for a single-leaf trie: the leaf's whole path (64 nibbles); no branch then.
+    root_leaf_path: ?[]const u8 = null,
+    /// The top node, or the branch below it, was built or changed since `clear`.
+    changed: bool,
+    /// The parent branch was built or changed: the record may hang elsewhere than before.
+    parent_changed: bool,
+    /// The reference the parent (or the root hash) holds for the top node.
+    top_ref: RlpNode,
+    /// The preimages the top node and the branch were decoded from; empty when built here
+    /// or embedded in their parent.
+    top_source: []const u8 = &.{},
+    branch_source: []const u8 = &.{},
+    branch_ref: RlpNode = .{},
+    /// False when the branch below a loaded extension is not loaded: children unknown.
+    branch_loaded: bool = false,
+    state_mask: u16 = 0,
+    /// By nibble; set where `state_mask` has a bit.
+    children: [16]VisitChild = @splat(.{}),
+};
+
 const Kind = enum(u8) { free, unresolved, leaf, extension, branch };
 
 const Body = union { value: [value_bytes_max]u8, children: [16]NodeIndex };
@@ -287,6 +325,9 @@ const Node = struct {
     value_len: u8 = 0,
     /// The node's reference while clean; `len == 0` once it or a descendant changed.
     ref: RlpNode = .{},
+    /// Set when the node is built or changed (its `ref` cleared) since `clear`; unlike a
+    /// cleared `ref` it survives the root computation, for `visit_records`.
+    changed: bool = false,
     /// The witness preimage of a decoded extension or branch: its unloaded children
     /// (`unloaded_at`) are item offsets into it.
     source: []const u8 = &.{},
@@ -506,6 +547,7 @@ pub const SparseTrie = struct {
         assert(value.len > 0 and value.len <= value_bytes_max);
         const index = try self.alloc(.leaf);
         const leaf = &self.nodes[index];
+        leaf.changed = true;
         leaf.path_len = @intCast(path.len);
         @memcpy(leaf.path[0..path.len], path);
         leaf.body = .{ .value = undefined };
@@ -517,6 +559,7 @@ pub const SparseTrie = struct {
     fn new_branch(self: *SparseTrie) Error!NodeIndex {
         const index = try self.alloc(.branch);
         self.nodes[index].body = .{ .children = @splat(none) };
+        self.nodes[index].changed = true;
         return index;
     }
 
@@ -524,6 +567,7 @@ pub const SparseTrie = struct {
         assert(path.len > 0 and target != none and !is_unloaded(target));
         const index = try self.alloc(.extension);
         const extension = &self.nodes[index];
+        extension.changed = true;
         extension.path_len = @intCast(path.len);
         @memcpy(extension.path[0..path.len], path);
         extension.body = .{ .children = @splat(none) };
@@ -540,6 +584,7 @@ pub const SparseTrie = struct {
         std.mem.copyForwards(u8, current.path[0..len], current.path[count..current.path_len]);
         current.path_len = @intCast(len);
         current.ref = .{};
+        current.changed = true;
     }
 
     /// Prepends `prefix` to a leaf or extension path; the node becomes dirty.
@@ -552,6 +597,7 @@ pub const SparseTrie = struct {
         @memcpy(current.path[0..prefix.len], prefix);
         current.path_len = @intCast(len);
         current.ref = .{};
+        current.changed = true;
     }
 
     /// Puts a branch where leaf or extension `index` diverges from `rest` after `common`
@@ -640,6 +686,7 @@ pub const SparseTrie = struct {
             if (slot.* == none) continue;
             assert(self.nodes[slot.*].kind != .free and self.nodes[slot.*].kind != .unresolved);
             self.nodes[slot.*].ref = .{};
+            self.nodes[slot.*].changed = true;
         }
     }
 
@@ -775,6 +822,7 @@ pub const SparseTrie = struct {
                 current.body.children[0] = kept;
                 current.source = &.{};
                 current.ref = .{};
+                current.changed = true;
                 return branch;
             },
             .free, .unresolved => unreachable, // `collapse_sibling` resolved it.
@@ -1110,6 +1158,143 @@ pub const SparseTrie = struct {
         self.update_refs_serial(root);
         assert(self.nodes[root].ref.len > 0);
         return self.nodes[root].ref.root_hash();
+    }
+
+    /// Reports every record position reachable through loaded nodes of the trie at `root` to
+    /// `visitor.record(*const RecordVisit)`, in pre-order: each loaded extension-and-branch or
+    /// bare branch, and the leaf of a single-leaf trie. Children that are not loaded are
+    /// reported by reference only (`ChildKind.unknown`); loaded extension and branch children
+    /// are visited in turn. Call after the root computation (every loaded node has its
+    /// reference). Clean subtries are walked too, as far as they are loaded. No recursion.
+    pub fn visit_records(self: *const SparseTrie, root: NodeIndex, visitor: anytype) !void {
+        if (root == none) return;
+        const top = &self.nodes[root];
+        if (top.kind == .unresolved) return;
+        assert(top.ref.len > 0);
+        if (top.kind == .leaf) {
+            assert(top.path_len == key_nibbles);
+            return visitor.record(&RecordVisit{
+                .hang = &.{},
+                .root_leaf_path = top.path[0..top.path_len],
+                .changed = top.changed,
+                .parent_changed = false,
+                .top_ref = top.ref,
+            });
+        }
+        const Frame = struct { index: NodeIndex, hang_len: u8, nibble: u8, parent_changed: bool };
+        // Each pop pushes at most sixteen frames, one branch deeper.
+        var stack: [depth_max * 16]Frame = undefined;
+        stack[0] = .{ .index = root, .hang_len = 0, .nibble = 0, .parent_changed = false };
+        var stack_len: u32 = 1;
+        // The path to the frame being visited; ancestors' nibbles stay in place below it.
+        var path: [key_nibbles]u8 = undefined;
+        var steps: u64 = 0;
+        while (stack_len > 0) : (steps += 1) {
+            assert(steps < self.nodes.len);
+            stack_len -= 1;
+            const frame = stack[stack_len];
+            if (frame.hang_len > 0) path[frame.hang_len - 1] = frame.nibble;
+            var visit: RecordVisit = undefined;
+            const hang = path[0..frame.hang_len];
+            const branch = self.record_at(frame.index, hang, frame.parent_changed, &path, &visit);
+            try visitor.record(&visit);
+            if (branch == none) continue;
+            const branch_len = frame.hang_len + visit.extension.len;
+            assert(branch_len < key_nibbles);
+            var nibble: u8 = 16;
+            while (nibble > 0) {
+                nibble -= 1;
+                const child = self.nodes[branch].body.children[nibble];
+                if (child == none or is_unloaded(child)) continue;
+                const kind = self.nodes[child].kind;
+                if (kind != .branch and kind != .extension) continue;
+                assert(stack_len < stack.len);
+                stack[stack_len] = .{
+                    .index = child,
+                    .hang_len = @intCast(branch_len + 1),
+                    .nibble = nibble,
+                    .parent_changed = self.nodes[branch].changed,
+                };
+                stack_len += 1;
+            }
+        }
+    }
+
+    /// Fills `visit` for the record whose top node is the loaded extension or branch `index`
+    /// (an extension's nibbles go into `path` after `hang`). Returns the branch's pool node
+    /// when it is loaded, else `none`.
+    fn record_at(
+        self: *const SparseTrie,
+        index: NodeIndex,
+        hang: []const u8,
+        parent_changed: bool,
+        path: *[key_nibbles]u8,
+        visit: *RecordVisit,
+    ) NodeIndex {
+        const top = &self.nodes[index];
+        assert(top.kind == .extension or top.kind == .branch);
+        assert(top.ref.len > 0);
+        visit.* = .{
+            .hang = hang,
+            .changed = top.changed,
+            .parent_changed = parent_changed,
+            .top_ref = top.ref,
+            .top_source = top.source,
+        };
+        var branch = index;
+        if (top.kind == .extension) {
+            visit.extension = top.path[0..top.path_len];
+            assert(hang.len + visit.extension.len < key_nibbles);
+            @memcpy(path[hang.len..][0..top.path_len], visit.extension);
+            const target = top.body.children[0];
+            assert(target != none);
+            if (is_unloaded(target)) {
+                visit.branch_ref = child_ref_at(top.source, unloaded_offset(target));
+                return none;
+            }
+            if (self.nodes[target].kind == .unresolved) {
+                visit.branch_ref = self.nodes[target].ref;
+                return none;
+            }
+            // An extension's child is a branch (a leaf below would have merged into it).
+            assert(self.nodes[target].kind == .branch);
+            branch = target;
+        }
+        const current = &self.nodes[branch];
+        visit.changed = visit.changed or current.changed;
+        visit.branch_ref = current.ref;
+        visit.branch_source = current.source;
+        visit.branch_loaded = true;
+        self.visit_children(branch, visit);
+        assert(visit.branch_ref.len > 0);
+        return branch;
+    }
+
+    fn visit_children(self: *const SparseTrie, branch: NodeIndex, visit: *RecordVisit) void {
+        const current = &self.nodes[branch];
+        assert(current.kind == .branch);
+        for (current.body.children, &visit.children, 0..) |child_index, *child, nibble| {
+            if (child_index == none) continue;
+            visit.state_mask |= @as(u16, 1) << @intCast(nibble);
+            if (is_unloaded(child_index)) {
+                child.* = .{ .ref = child_ref_at(current.source, unloaded_offset(child_index)) };
+                continue;
+            }
+            const loaded = &self.nodes[child_index];
+            assert(loaded.ref.len > 0);
+            child.* = .{
+                .ref = loaded.ref,
+                .kind = switch (loaded.kind) {
+                    .leaf => .leaf,
+                    .extension, .branch => .record,
+                    .unresolved => .unknown,
+                    .free => unreachable, // A branch never points at a freed node.
+                },
+            };
+            if (loaded.kind == .leaf) child.leaf_path = loaded.path[0..loaded.path_len];
+        }
+        // Deletes collapse a branch left with one child.
+        assert(@popCount(visit.state_mask) >= 2);
     }
 
     /// Turns every clean node decoded from the preimage `source` (compared by address) back
@@ -1469,6 +1654,206 @@ test "sparse: seeded differential of the batched root against the serial root" {
                 try testing.expectEqual(serial.root_hash_serial(b), batched.root_hash(a));
             }
             try testing.expectEqual(full.root_hash(), batched.root_hash(batched_roots[0]));
+        }
+    }
+}
+
+const hash_builder = @import("hash_builder.zig");
+
+/// Records keyed by hang path, from `HashBuilder`'s branch sink or from `visit_records`.
+const RecordList = struct {
+    const capacity = 64;
+
+    hangs: [capacity]Nibbles = undefined,
+    records: [capacity]hash_builder.BranchNode = undefined,
+    /// Whether the visit saw every child (no `unknown` kinds).
+    complete: [capacity]bool = undefined,
+    changed: [capacity]bool = undefined,
+    count: u32 = 0,
+
+    fn emit(context: *anyopaque, hang: []const u8, branch: *const hash_builder.BranchNode) void {
+        const self: *RecordList = @ptrCast(@alignCast(context));
+        assert(self.count < capacity);
+        self.hangs[self.count] = Nibbles.from_nibbles(hang);
+        self.records[self.count] = branch.*;
+        self.complete[self.count] = true;
+        self.changed[self.count] = true;
+        self.count += 1;
+    }
+
+    fn find(self: *const RecordList, hang: []const u8) ?u32 {
+        for (self.hangs[0..self.count], 0..) |*entry, index| {
+            if (std.mem.eql(u8, entry.slice(), hang)) return @intCast(index);
+        }
+        return null;
+    }
+
+    /// `visit_records` callback: the record as the trie holds it (leaf keys rebuilt from
+    /// the loaded leaves' paths).
+    pub fn record(self: *RecordList, visit: *const RecordVisit) !void {
+        assert(self.count < capacity);
+        var branch: hash_builder.BranchNode = .{};
+        var complete = true;
+        if (visit.root_leaf_path) |leaf_path| {
+            _ = Nibbles.from_nibbles(leaf_path).pack(&branch.leaf_keys[0]);
+        } else if (visit.branch_loaded) {
+            branch.extension_len = @intCast(visit.extension.len);
+            @memcpy(branch.extension[0..visit.extension.len], visit.extension);
+            branch.state_mask = visit.state_mask;
+            var children: u32 = 0;
+            var leaves: u32 = 0;
+            for (&visit.children, 0..) |*child, nibble| {
+                if (visit.state_mask & (@as(u16, 1) << @intCast(nibble)) == 0) continue;
+                branch.children[children] = child.ref;
+                children += 1;
+                switch (child.kind) {
+                    .record => branch.tree_mask |= @as(u16, 1) << @intCast(nibble),
+                    .unknown => complete = false,
+                    .leaf => {
+                        var key = Nibbles.from_nibbles(visit.hang);
+                        key.append(visit.extension);
+                        key.push(@intCast(nibble));
+                        key.append(child.leaf_path);
+                        try testing.expectEqual(@as(usize, key_nibbles), @as(usize, key.len));
+                        _ = key.pack(&branch.leaf_keys[leaves]);
+                        leaves += 1;
+                    },
+                }
+            }
+        } else {
+            complete = false;
+        }
+        self.hangs[self.count] = Nibbles.from_nibbles(visit.hang);
+        self.records[self.count] = branch;
+        self.complete[self.count] = complete;
+        self.changed[self.count] = visit.changed;
+        self.count += 1;
+    }
+};
+
+fn expect_same_record(
+    want: *const hash_builder.BranchNode,
+    got: *const hash_builder.BranchNode,
+) !void {
+    try testing.expectEqualSlices(u8, want.extension_slice(), got.extension_slice());
+    try testing.expectEqual(want.state_mask, got.state_mask);
+    try testing.expectEqual(want.tree_mask, got.tree_mask);
+    for (want.children[0..want.child_count()], got.children[0..got.child_count()]) |a, b| {
+        try testing.expectEqualSlices(u8, a.slice(), b.slice());
+    }
+    const leaves: u32 = if (want.state_mask == 0) 1 else want.leaf_count();
+    for (want.leaf_keys[0..leaves], got.leaf_keys[0..leaves]) |a, b| {
+        try testing.expectEqualSlices(u8, &a, &b);
+    }
+}
+
+/// The records `HashBuilder` emits for the sorted `keys` (values `value_of`); the root.
+fn build_records(keys: []const [32]u8, out: *RecordList) Hash {
+    var sink: hash_builder.BranchSink = .{ .context = out, .emit = RecordList.emit };
+    var builder = hash_builder.HashBuilder.init();
+    builder.branch_sink = &sink;
+    var values: [2][3]u8 = undefined;
+    for (keys, 0..) |*key, index| {
+        // The builder borrows the previous value until the next leaf.
+        values[index % 2] = value_of(key);
+        const path = Nibbles.from_bytes(key);
+        builder.add_leaf(path.slice(), &values[index % 2]);
+    }
+    return builder.root();
+}
+
+fn value_of(key: *const [32]u8) [3]u8 {
+    return .{ 0x82, key[31], key[30] | 1 };
+}
+
+fn sort_unique(keys: [][32]u8) [][32]u8 {
+    const Less = struct {
+        fn less(_: void, a: [32]u8, b: [32]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    };
+    std.mem.sort([32]u8, keys, {}, Less.less);
+    var count: usize = 0;
+    for (keys) |key| {
+        if (count > 0 and std.mem.eql(u8, &keys[count - 1], &key)) continue;
+        keys[count] = key;
+        count += 1;
+    }
+    return keys[0..count];
+}
+
+/// A sparse sink that keeps every hashed node in a `TestStore` (arena-owned copies).
+const KeepStore = struct {
+    store: TestStore = .{},
+    arena: std.mem.Allocator,
+
+    fn add(context: *anyopaque, hash: *const Hash, bytes: []const u8) void {
+        const self: *KeepStore = @ptrCast(@alignCast(context));
+        const copy = self.arena.dupe(u8, bytes) catch @panic("test arena");
+        self.store.preimages.put(self.arena, hash.*, copy) catch @panic("test arena");
+    }
+};
+
+test "sparse: visit_records reports the records HashBuilder emits, changed ones after updates" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    for (0..16) |seed| {
+        var prng = Prng.init(0x7e5c + seed);
+        var keep: KeepStore = .{ .arena = arena_state.allocator() };
+        var keys_buffer: [40][32]u8 = undefined;
+        for (&keys_buffer) |*key| key.* = clustered_key(&prng);
+        const keys = sort_unique(keys_buffer[0..prng.range(1, keys_buffer.len)]);
+        var sparse = try SparseTrie.init(testing.allocator, 1024, .{
+            .context = &keep.store,
+            .resolve = TestStore.resolve,
+        });
+        defer sparse.deinit(testing.allocator);
+        sparse.sink = .{ .context = &keep, .add = KeepStore.add };
+        // A trie built here: every node is new and loaded, so the visit sees all records.
+        var root = try sparse.root_from_hash(node.empty_root);
+        for (keys) |*key| try sparse.put(&root, key, &value_of(key));
+        var want: RecordList = .{};
+        try testing.expectEqual(build_records(keys, &want), sparse.root_hash(root));
+        var got: RecordList = .{};
+        try sparse.visit_records(root, &got);
+        try testing.expectEqual(want.count, got.count);
+        for (0..got.count) |index| {
+            const at = want.find(got.hangs[index].slice()) orelse
+                return error.TestUnexpectedResult;
+            try testing.expect(got.complete[index] and got.changed[index]);
+            try expect_same_record(&want.records[at], &got.records[index]);
+        }
+        // From the root hash: delete and add a few keys; every record the visit reports
+        // completely is the fresh build's record at that hang, and every changed one exists.
+        const pre_root = sparse.root_hash(root);
+        sparse.clear();
+        root = try sparse.root_from_hash(pre_root);
+        var after_buffer: [48][32]u8 = undefined;
+        var after_len: usize = 0;
+        for (keys) |key| {
+            if (prng.chance(1, 3)) {
+                try sparse.delete(&root, &key);
+            } else {
+                after_buffer[after_len] = key;
+                after_len += 1;
+            }
+        }
+        for (0..prng.below(8)) |_| {
+            const key = clustered_key(&prng);
+            try sparse.put(&root, &key, &value_of(&key));
+            after_buffer[after_len] = key;
+            after_len += 1;
+        }
+        const after = sort_unique(after_buffer[0..after_len]);
+        var fresh: RecordList = .{};
+        try testing.expectEqual(build_records(after, &fresh), sparse.root_hash(root));
+        var visited: RecordList = .{};
+        try sparse.visit_records(root, &visited);
+        for (0..visited.count) |index| {
+            const at = fresh.find(visited.hangs[index].slice()) orelse
+                return error.TestUnexpectedResult;
+            if (!visited.complete[index]) continue;
+            try expect_same_record(&fresh.records[at], &visited.records[index]);
         }
     }
 }
