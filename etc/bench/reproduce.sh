@@ -241,9 +241,9 @@ summarize() { # summarize <name>
     echo
 }
 
-isolate() {
+isolate() { # isolate <cpus|"">: confine everything else to <cpus>; "" lifts it
     for unit in system.slice user.slice init.scope; do
-        sudo systemctl set-property --runtime "$unit" AllowedCPUs="$system_cpus"
+        sudo systemctl set-property --runtime "$unit" AllowedCPUs="$1"
     done
 }
 
@@ -252,7 +252,10 @@ if [ "${BENCH_SKIP_BUILD:-0}" != 1 ]; then
     build_needlefish
     build_base
 fi
-[ "${BENCH_ISOLATE:-0}" = 1 ] && isolate
+if [ "${BENCH_ISOLATE:-0}" = 1 ]; then
+    isolate "$system_cpus"
+    trap 'isolate ""' EXIT
+fi
 
 echo "== archives"
 parent_json 53715983 "$out/parent-fixture.json"
