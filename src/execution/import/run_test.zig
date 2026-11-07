@@ -337,6 +337,8 @@ const Harness = struct {
     runner: *Runner,
     /// Every account the blocks touch.
     addresses: [senders + 6 + blocks_count]Address,
+    /// The runner's phase clock (`clock_read`).
+    clock_ns: u64 = 0,
 
     fn create(arena: std.mem.Allocator, keys: *const Keys, seed: u64) !*Harness {
         const self = try arena.create(Harness);
@@ -344,6 +346,7 @@ const Harness = struct {
         const source = try arena.create(to_disk_test.Source);
         source.* = try source_of(arena, &genesis);
         self.arena = arena;
+        self.clock_ns = 0;
         self.oracle = try Oracle.create(&genesis, keys);
         errdefer self.oracle.destroy();
         try testing.expectEqualSlices(u8, &source.root, &(try self.oracle.state_db.root()));
@@ -387,7 +390,15 @@ const Harness = struct {
     fn runner_create(self: *Harness) !*Runner {
         return Runner.create(testing.allocator, self.disk.db, spec, self.disk.driver(), .{
             .executor = executor_config,
+            .clock = .{ .context = &self.clock_ns, .now_ns = clock_read },
         });
+    }
+
+    /// A clock that advances 1 us per read: every timed phase reads it at both ends.
+    fn clock_read(context: *anyopaque) u64 {
+        const clock_ns: *u64 = @ptrCast(@alignCast(context));
+        clock_ns.* += std.time.ns_per_us;
+        return clock_ns.*;
     }
 
     fn destroy(self: *Harness) void {
@@ -536,6 +547,11 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
         for (head.number - head_number..blocks_count) |index| _ = try harness.pass(@intCast(index));
         try harness.runner.flush();
         try harness.expect_oracle_state();
+        // Every phase of the committed blocks was timed.
+        const time = harness.runner.stats.time;
+        try testing.expect(time.transactions_ns > 0 and time.commit_ns > 0);
+        try testing.expect(time.state_root_ns > 0 and time.receipts_root_ns > 0);
+        try testing.expect(time.check_ns > 0 and time.journal_ns > 0 and time.room_ns > 0);
         checkpoints += harness.disk.db.checkpoints_completed;
         requested += harness.runner.stats.checkpoints_requested;
     }

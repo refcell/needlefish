@@ -136,6 +136,29 @@ pub const Error = error{
 
 pub const Config = struct {
     executor: executor_module.Config,
+    /// Times the phases into `Stats.time` (and the executor's `last_phases`); none: zeros.
+    clock: ?Executor.Clock = null,
+};
+
+/// Summed wall time per phase of the committed blocks, under `Config.clock`.
+pub const Time = struct {
+    /// Pre-block system calls and the state cache reset.
+    pre_block_ns: u64 = 0,
+    /// Sender recovery (inline, or waiting for the recovery workers).
+    recovery_ns: u64 = 0,
+    /// The transactions themselves (execution minus pre-block and recovery).
+    transactions_ns: u64 = 0,
+    post_block_ns: u64 = 0,
+    receipts_root_ns: u64 = 0,
+    /// Folding the block into the state: on disk, the sparse root and record write-back.
+    commit_ns: u64 = 0,
+    state_root_ns: u64 = 0,
+    /// The header checks after execution.
+    check_ns: u64 = 0,
+    /// `commit_applied`: the journal entry and the head move.
+    journal_ns: u64 = 0,
+    /// Waiting for storage room (checkpoints, compaction) before the block.
+    room_ns: u64 = 0,
 };
 
 pub const Stats = struct {
@@ -146,6 +169,7 @@ pub const Stats = struct {
     checkpoints_requested: u64 = 0,
     /// Storage ticks spent making room, quieting, or rolling back.
     ticks: u64 = 0,
+    time: Time = .{},
 };
 
 /// Attempts per block before the runner gives up (`Stalled`).
@@ -214,6 +238,7 @@ pub fn RunnerType(comptime Storage: type) type {
         state_db: StateDb,
         executor: Executor,
         stats: Stats = .{},
+        clock: ?Executor.Clock = null,
 
         /// Executes on `db`, an open disk-mode database with a head (an import's head N or
         /// a block this runner committed). Heap-pinned: the executor points at the StateDb.
@@ -249,6 +274,8 @@ pub fn RunnerType(comptime Storage: type) type {
             }, &db.state);
             errdefer self.state_db.deinit(allocator);
             self.executor = try Executor.init(allocator, spec, &self.state_db, config.executor);
+            self.executor.phase_clock = config.clock;
+            self.clock = config.clock;
             return self;
         }
 
@@ -275,7 +302,9 @@ pub fn RunnerType(comptime Storage: type) type {
                 return error.NotNextBlock;
             }
             for (0..attempts_max) |_| {
+                const room_start_ns = self.now_ns();
                 try self.make_room();
+                self.stats.time.room_ns += self.now_ns() -| room_start_ns;
                 var outcome: Outcome = .{
                     .number = block.number,
                     .hash = block.hash,
@@ -323,6 +352,7 @@ pub fn RunnerType(comptime Storage: type) type {
             };
             outcome.gas_used = executed.gas_used;
             outcome.computed_state_root = executed.state_root;
+            const check_start_ns = self.now_ns();
             outcome.passed = check_header(
                 self.spec,
                 &db.state,
@@ -331,14 +361,40 @@ pub fn RunnerType(comptime Storage: type) type {
                 transactions,
                 &executed,
             );
+            const check_ns = self.now_ns() -| check_start_ns;
             if (!outcome.ok()) {
                 try self.rollback();
                 return true;
             }
+            const journal_start_ns = self.now_ns();
             const sequence = try self.commit(block, header);
             outcome.sequence = sequence orelse return false;
+            self.add_time(check_ns, self.now_ns() -| journal_start_ns);
             assert(std.mem.eql(u8, &db.head_info.state_root, &executed.state_root));
             return true;
+        }
+
+        fn now_ns(self: *const Runner) u64 {
+            const clock = self.clock orelse return 0;
+            return clock.read();
+        }
+
+        /// Adds the committed block's phases (the executor's, then the runner's own).
+        fn add_time(self: *Runner, check_ns: u64, journal_ns: u64) void {
+            const phases = &self.executor.last_phases;
+            const execution_ns = self.executor.last_execution_ns;
+            assert(phases.pre_block_ns + phases.recovery_ns <= execution_ns);
+            const time = &self.stats.time;
+            time.pre_block_ns += phases.pre_block_ns;
+            time.recovery_ns += phases.recovery_ns;
+            time.transactions_ns += execution_ns - phases.pre_block_ns - phases.recovery_ns;
+            time.post_block_ns += phases.post_block_ns;
+            time.receipts_root_ns += phases.receipts_root_ns;
+            time.commit_ns += phases.commit_ns;
+            time.state_root_ns += phases.state_root_ns;
+            time.check_ns += check_ns;
+            time.journal_ns += journal_ns;
+            assert(self.clock != null or time.journal_ns == 0);
         }
 
         /// Journals the applied block; null when the database was busy (rolled back).
