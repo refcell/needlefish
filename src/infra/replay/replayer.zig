@@ -69,6 +69,13 @@ pub const Config = struct {
     executor: node_executor.Config,
 };
 
+/// Trie pool headroom for the nodes each block's changes create. Freed nodes are reused, so
+/// a long window needs far less per block than a short one; 65,536 per block for 1,000 blocks
+/// would reserve several GiB (more than a small machine can map).
+const trie_nodes_per_block: u32 = 65536;
+const trie_nodes_per_block_long: u32 = 8192;
+const blocks_generous: u32 = 128;
+
 /// Sizes for an archive: every pool fits the whole archive, since nothing is reset.
 pub fn config_for(archive: *const Archive) Config {
     const witness = &archive.witness;
@@ -85,7 +92,8 @@ pub fn config_for(archive: *const Archive) Config {
             .codes_max = @max(witness.codes.count, 1) + 1024 * blocks,
             .code_bytes_max = byte_list_used(&witness.codes) + (8 << 20),
             .headers_max = 1,
-            .trie_nodes_max = 4 * nodes + 65536 * blocks,
+            .trie_nodes_max = 4 * nodes + trie_nodes_per_block * @min(blocks, blocks_generous) +
+                trie_nodes_per_block_long * (blocks -| blocks_generous),
             .storage_tries_max = 4096 + 2048 * blocks,
         },
         .changeset = .{
