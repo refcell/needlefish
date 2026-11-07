@@ -25,6 +25,7 @@ const audit = @import("audit.zig");
 const replay = @import("replay.zig");
 const follow = @import("follow.zig");
 const snapshot_import = @import("snapshot_import.zig");
+const import_run = @import("import_run.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 const el_fetch = @import("el_fetch.zig");
 const el_peers = @import("el_peers.zig");
@@ -57,6 +58,7 @@ const usage =
     \\  replay     replay real Base blocks offline and check every header field
     \\  follow     follow a live Base chain over RPC, re-executing and checking every block
     \\  snapshot-import  verify a reth snapshot database: state root against the block header
+    \\  import-run  execute blocks N+1.. on an imported disk-mode database, checking headers
     \\  unsafe-watch  join a Base chain's p2p gossip (no RPC), check signer and continuity
     \\  el-fetch   fetch and check a block range from an execution peer (devp2p eth/68)
     \\  el-peers   find a Base chain's execution peers over discv4
@@ -86,6 +88,7 @@ test {
     _ = replay;
     _ = follow;
     _ = snapshot_import;
+    _ = import_run;
     _ = unsafe_watch;
     _ = el_fetch;
     _ = el_peers;
@@ -184,6 +187,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "snapshot-import")) {
         return try snapshot_import.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "import-run")) {
+        return try import_run.main(init, args);
     }
     if (std.mem.eql(u8, command, "unsafe-watch")) {
         return try unsafe_watch.main(init, args);

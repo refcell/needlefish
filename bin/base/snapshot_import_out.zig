@@ -43,7 +43,7 @@ pub const Options = struct {
 };
 
 /// How long one storage tick lets IO run (a busy loader or a checkpoint waits in these).
-const tick_ns: u64 = 50 * std.time.ns_per_us;
+pub const tick_ns: u64 = 50 * std.time.ns_per_us;
 const headers_file_bytes_max = 64 << 20;
 
 pub fn run(init: std.process.Init, options: Options, reader: *mdbx.Reader, number: u64) !u8 {
@@ -92,7 +92,7 @@ pub fn run(init: std.process.Init, options: Options, reader: *mdbx.Reader, numbe
     return reopen(init, &backend, options.out, counts_path, chain, samples);
 }
 
-fn backend_init() !IO {
+pub fn backend_init() !IO {
     return if (builtin.os.tag == .linux) IO.init(.{}) else IO.init();
 }
 
@@ -266,11 +266,11 @@ fn print_sizing(sizing: *const to_disk.Sizing) void {
 }
 
 /// Storage ticks: let IO run briefly, then deliver completions.
-const Ticker = struct {
+pub const Ticker = struct {
     backend: *IO,
     storage: *Storage,
 
-    fn driver(self: *Ticker) to_disk.Driver {
+    pub fn driver(self: *Ticker) to_disk.Driver {
         return .{ .context = self, .tick = tick };
     }
 
@@ -310,18 +310,20 @@ const Progress = struct {
 };
 
 /// The open storage file and the database over it (pinned: heap-allocated).
-const Opened = struct {
+pub const Opened = struct {
     fd: IO.Fd,
     storage: *Storage,
     db: *Database,
 
-    fn init(
+    /// Opens `path` (creating it when `create`, else it must exist).
+    pub fn init(
         gpa: std.mem.Allocator,
         backend: *IO,
         path: []const u8,
         config: base.execution.db.database.Config,
+        create: bool,
     ) !Opened {
-        const fd = try backend.open_file(path, .create);
+        const fd = try backend.open_file(path, if (create) .create else .read_write);
         errdefer backend.close_now(fd);
         const storage = try gpa.create(Storage);
         errdefer gpa.destroy(storage);
@@ -336,7 +338,7 @@ const Opened = struct {
         return .{ .fd = fd, .storage = storage, .db = db };
     }
 
-    fn deinit(self: *Opened, gpa: std.mem.Allocator, backend: *IO) void {
+    pub fn deinit(self: *Opened, gpa: std.mem.Allocator, backend: *IO) void {
         self.db.deinit(gpa);
         gpa.destroy(self.db);
         self.storage.deinit(gpa);
@@ -356,7 +358,7 @@ fn write(
     samples: *to_disk.Samples,
 ) !void {
     const gpa = init.gpa;
-    var opened = try Opened.init(gpa, backend, path, sizing.config);
+    var opened = try Opened.init(gpa, backend, path, sizing.config, true);
     defer opened.deinit(gpa, backend);
     var ticker: Ticker = .{ .backend = backend, .storage = opened.storage };
     var progress: Progress = .{
@@ -471,7 +473,7 @@ fn reopen(
     const bytes = try Io.Dir.cwd().readFile(init.io, counts_path, &buffer);
     const counts = try to_disk.Counts.decode(bytes);
     const sizing = try to_disk.sizing(Storage, counts, to_disk.shape_node);
-    var opened = try Opened.init(gpa, backend, path, sizing.config);
+    var opened = try Opened.init(gpa, backend, path, sizing.config, false);
     defer opened.deinit(gpa, backend);
     var ticker: Ticker = .{ .backend = backend, .storage = opened.storage };
     try Importer.open(opened.db, ticker.driver());
