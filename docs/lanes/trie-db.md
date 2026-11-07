@@ -1125,6 +1125,54 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (reads absent/0, `apply` `Corrupt`). A block's branch puts per tree must stay below
   `flat_branch_flush_entries_min` (the memtable is twice it) or `Busy` never clears; step 8's
   reserve must size it.
+- 2026-11-07: disk mode (disk-state import step 8, `Database.Config.disk_state`, off by
+  default; needs flat trees, refuses history). `State.disk` is a type-erased `state.Disk`
+  (account/storage/root/apply function pointers) that `Database` binds at `open` (the
+  database moves after `init`); `basic`, `account`, `has_storage`, `storage`, `state_root`,
+  `apply`, `unwind` dispatch to `DiskState`, codes and block hashes stay in `State`, and the
+  RAM tables and `StateTrie` stay empty (asserted). `has_storage` is "storage root != empty
+  root", and `account().storage_slots` is only a 0/1 flag. `State.Error` gains
+  `StateCorrupt`, `Busy`, `Unsupported` (DiskState's `Corrupt`/`Busy`/`Unsupported`; its
+  `Full` maps to `StateFull`, a config bound that fails the database like other capacities).
+  `Overlay.add_wiped_slots` in disk mode returns `Unsupported` when the wiped account has a
+  storage root (valid after Cancun: EIP-6780 destroys only same-transaction creations,
+  EIP-7610 forbids creating over storage). Proofs, `proofs_at`, `storage_range_at`:
+  `HistoryUnavailable` in disk mode.
+  Head moves write the trees through `State` (`flat_write`/`flat_reserve_applied` skip).
+  The branch-put bound: a live move reserves `record_writes_max` branch puts per moved block
+  per branch tree (unwinds + applies + the first head's genesis, at most
+  `2 x reorg_depth_max + 1`), and in disk mode each branch tree's memtable is
+  `2 x flush + record_writes_max x move_blocks_max + replay`: below the flush trigger a
+  whole move always fits, so a refused move clears once the memtables swap, whatever the
+  flush trigger (the test runs a trigger of 4 under blocks of up to 9 branch writes; with no
+  operation room every move is refused forever, checked). Replay cannot compact, so the
+  branch trees keep a replay reserve (`replay_record_writes_max`) and `DiskState` gets a
+  replay mode (`put_replay`, room `Tree.replay_capacity_free`). Admission bounds what a replay
+  from the fallback checkpoint writes: branch writes are counted per checkpoint interval
+  (`closed` = the interval before the newest completed checkpoint, `pending` = intervals whose
+  checkpoint has not completed, `current` = since the last snapshot point); a live move (or a
+  caller's `State.apply`) whose `blocks x record_writes_max` would push the sum past the
+  reserve is `Busy` and wants a checkpoint. Counting real writes (not the bound) is
+  deterministic, so replay redoes exactly the counted writes. Version 5 carries `pending` at
+  its snapshot point; an open from it restores `closed` from it, and an open from the
+  fallback (newest rotten) assumes the whole reserve (the next operation waits for a
+  checkpoint). The alternative, a reserve sized from journal bytes like the account trees',
+  is ~65 records per changeset entry (a 64 MiB journal would need tens of GB of memtable).
+  Replay reads the trees synchronously (`Tree.get`) during the open; only compaction is
+  barred there.
+  Checkpoint version 5 (disk mode only; v4 only without it): v4's layout, then u64 branch
+  writes, then the usual snapshot with zero accounts and slots (codes no table holds, block
+  hashes). Open sets `DiskState`'s root from the header's state root (the empty root without
+  a head) and `check_root` resolves the root record (or leaf root) and checks its hash, or
+  that no root record exists for the empty root; a mismatch is `CheckpointInvalid`.
+  Imported start: `Database.import_head(head_meta, state_root)` after a bulk load, codes and
+  256 block hashes set by the caller: checks the root resolves (`StateCorrupt`, nothing
+  changed), `ChainStore.restore_evicted_head`, journals a `head` entry (so the engine's commit
+  metadata names head N), wants a checkpoint. Durable once that checkpoint completes; an open
+  before it fails `ReplayFailed` (the head entry names an unstored block) and the importer
+  formats again. `ChainStore.plan_reorg` treats an evicted head as canonical (`evicted_head`),
+  so block N+1 commits on head N with zero stored blocks (before, its parent walk failed
+  `UnknownParent`); `insert_check` already skips the parent check with an empty chain.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as
