@@ -53,8 +53,10 @@ Gaps that block a real sync:
 - **Catch-up sync.** No staged sync pipeline yet (docs/lanes/sync-perf.md backlog).
 - **Mainnet interop.** Derivation and p2p have only run against the local devnet and
   public spec vectors, never against real Base mainnet peers and L1 data.
-- **Execution-layer p2p.** There is no devp2p (RLPx, eth/68, snap/1), so block backfill and
-  transaction gossip must come from RPC or the consensus layer for now.
+- **Execution-layer p2p.** An eth/68 client exists (`bin/base/el_source.zig`, `el-peers`,
+  `el-run`): discv4 peer discovery and header and body download from one peer, parent-linked
+  and checked against each header's transactions root. Multi-peer backfill, snap/1 and
+  serving do not exist yet.
 
 ## Hardware and external services
 
@@ -144,9 +146,14 @@ Get verified mainnet state at a recent block into the needlefish database.
 
 The staged pipeline from docs/lanes/sync-perf.md.
 
+- Block source (decided 2026-11-07): catch-up blocks come from the execution-layer p2p
+  network only (eth/68, multi-peer backfill owned by the p2p lane), never from RPC. The first
+  block must name the verified snapshot head's hash as its parent and every later block its
+  predecessor's; transactions are checked against each header's transactions root, and
+  execution checks every other header field. RPC block fetching (`base import-run`) stays a
+  short debugging tool, not the bridge to the tip.
 - Build: staged driver with per-stage checkpoints, unwind on reorg and crash resume
-  (`src/execution/sync`); headers and bodies stages from an L2 block source (trusted L2 RPC
-  with full transactions first, validated by the hash chain back from the target head);
+  (`src/execution/sync`); headers and bodies stages from that devp2p block source;
   sender recovery on a worker pool; execution in batches with one commit per N blocks;
   Merkle stage that checks the state root at each batch end. Wire EL sync into the node:
   forkchoice to an unknown head answers `SYNCING`, runs the pipeline, then `VALID`.
@@ -193,10 +200,12 @@ Join the Base mainnet consensus p2p network.
 - Check: the 7-day definition of done above, including deliberate `kill -9`, reboots, a
   full-disk warning drill, and an upgrade activation on Sepolia before it reaches mainnet.
 
-### M8. Execution-layer p2p (optional for syncing)
+### M8. Execution-layer p2p
 
 - Build: RLPx (ECIES handshake, framing), devp2p Hello, eth/68 (status, block headers and
-  bodies, transactions), then snap/1 for state sync (enables M3 option B) and serving.
+  bodies, transactions). Multi-peer header and body backfill is on the critical path: it is
+  M4's only block source. snap/1 for state sync (enables M3 option B) and serving are
+  optional.
 - Check: interop with a reth peer on Sepolia: exchange status, download a header and body
   range, receive transaction gossip.
 
@@ -228,7 +237,7 @@ needlefish did not produce.
 | snapshot | M3 | new `src/execution/import`, `src/infra/snapshotter` |
 | sync-perf | M4 | `src/execution/sync` |
 | consensus | M5 | `src/consensus/{derive,engine,service,sources}` |
-| p2p | M6, later M8 | `src/consensus/p2p`, new `src/execution/p2p` |
+| p2p | M6, M8 (devp2p backfill for M4) | `src/consensus/p2p`, `src/execution/p2p`, `bin/base/el_*` |
 | ops | M7 | `etc/`, `docs/`, `src/infra/basectl` |
 
 Each lane keeps its backlog in `docs/lanes/<lane>.md` and follows AGENTS.md: zero
@@ -238,18 +247,20 @@ dependencies, TigerStyle, deterministic simulation tests for every state machine
 ## Order of work
 
 Revised 2026-11-06 after the first live follower runs (below). The critical path is the
-stateful node: it fetches only block bodies from RPC, never state.
+stateful node: it takes block bodies from execution-layer peers (devp2p), never state, and
+never uses RPC for catch-up.
 
 1. M3 on Sepolia: import the public state snapshot (state component only) and match its
    header state root.
 2. M2 in parallel, first as far as the imported Sepolia state needs: `State` reads through
    the trees (2b), codes on disk (1e), branch store and sparse root (3). Proofs, history and
    the 1B-entry scale proof follow before mainnet.
-3. M4 on Sepolia: staged catch-up from the snapshot block to the tip, then stay there on RPC
-   blocks.
+3. M4 on Sepolia: staged catch-up from the snapshot block to the tip with blocks from
+   devp2p peers (M8 multi-peer backfill), then stay there on peer and gossip blocks.
+   Execution on disk state must keep up with what the peers deliver.
 4. M5 and M6 on Sepolia: safe heads from L1, unsafe head from gossip.
 5. The same on mainnet, then the M7 soak.
-6. M8 when you want to stop depending on RPC for backfill.
+6. M8 beyond backfill (snap/1, serving) when wanted.
 
 M1 (the stateless follower) is a bounded correctness oracle, not a gate. Measured on Base
 Sepolia with keyless endpoints: 69 consecutive blocks verified with zero mismatches, but 5 to
