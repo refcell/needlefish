@@ -89,6 +89,7 @@ test {
     _ = unsafe_watch;
     _ = el_fetch;
     _ = el_peers;
+    _ = @import("el_source.zig");
     _ = @import("metrics_server.zig");
 }
 

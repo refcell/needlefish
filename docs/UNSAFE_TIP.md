@@ -137,21 +137,36 @@ Peer-based ways to fetch the catch-up range and any missing block:
 During steady state, a block missed by gossip (a link of `gap`) can only be recovered by
 the same fetch path. The demo counts it as a failure; it does not skip or re-anchor.
 
+### Block source API
+
+`bin/base/el_source.zig` is the devp2p block source behind `el-fetch`: `Source.init`
+connects (retrying with backoff) from a block number or the peer's head, optionally
+binding the first block to a known parent hash; `Source.next` hands out ascending blocks
+as header RLP, hash and EIP-2718 transactions, checked as above, and returns false at the
+peer's head. It is shaped to plug into the catch-up stage's block-source interface.
+Verified: 512 blocks from 55006661 bound to the hash of 55006660 (the snapshot block), and
+a wrong parent hash rejected.
+
 ### Following the tip from an execution peer
 
 Behind NAT, gossip delivery is intermittent: one run received 159 consecutive blocks, and
 later runs of 15 minutes and 2 hours received none (no block-carrying peer gave us a mesh
 slot). An execution peer does not depend on that. `base el-fetch --from tip --follow`
 asks the peer for the next block number every 100 ms. Measured against a Base Sepolia
-reth node for 180 s: 901 consecutive linked blocks (the chain's full 5 blocks/s), each
-body checked against its header, 0 reconnects, tip lag (arrival minus the block's
-scheduled time) averaging 251 ms, median 158 ms, p99 1.5 s, max 2.8 s.
+reth node for 30 minutes: 9,002 consecutive linked blocks (55686214 to 55695215, the
+chain's full 5 blocks/s), each body checked against its header, 0 gaps, 0 reconnects.
+Tip lag (arrival minus the block's scheduled time) per block: average 793 ms, median
+356 ms, p90 1.5 s, p99 10.6 s, max 19.9 s; the tail is the peer stalling, then catching
+up in a burst. An earlier 180 s run averaged 251 ms.
 
 The cost is trust. Execution headers are not signed, so this source proves continuity
 and body integrity, not that the sequencer produced the blocks. Local execution then
 proves the header outputs follow from our state. Tying the chain to the sequencer needs a
 signed gossip block at the same height (whenever gossip delivers one, its hash must be on
-the followed chain) or the snapshot hash at the bottom of the range.
+the followed chain) or the snapshot hash at the bottom of the range. Checked offline: the
+159 sequencer-signed gossip blocks one `unsafe-watch` run received (55318947 to
+55319105) match the blocks the execution peer serves at those heights (the run logged
+64-bit hash prefixes; compared with `el-fetch --verbose`).
 
 ## Integration contract (to the executor)
 
