@@ -1067,11 +1067,14 @@ pub fn Node(comptime IO: type) type {
             const state = node.driver.sync_state();
             if (node.driver.last_error != node.logged_error) {
                 node.logged_error = node.driver.last_error;
-                node.logger.log(.warn, "consensus", "driver error", .{
-                    .err = @errorName(node.driver.last_error.?),
-                    .phase = @tagName(node.driver.phase),
-                    .count = node.driver.error_sequence,
-                });
+                // A cleared error (back to null) is not logged.
+                if (node.driver.last_error) |err| {
+                    node.logger.log(.warn, "consensus", "driver error", .{
+                        .err = @errorName(err),
+                        .phase = @tagName(node.driver.phase),
+                        .count = node.driver.error_sequence,
+                    });
+                }
             }
             if (node.driver.phase != node.logged_phase) {
                 node.logged_phase = node.driver.phase;
