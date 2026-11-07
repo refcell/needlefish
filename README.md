@@ -45,21 +45,38 @@ exactly.
 
 ## Benchmarks
 
-needlefish and the Rust [base/base](https://github.com/base/base) stateless block executor
-(`base-proof-executor`) replay the same 100 consecutive Base mainnet blocks (53775088..53775187,
-1571 transactions, 271.9 Mgas) from the same witness on one Apple M4 Pro. Both reproduce every
-canonical header. Median of 10 warm runs:
+Measured on a 4-vCPU cloud VM (not a dedicated server). The comparison is executor against
+executor: needlefish's block executor and base/base's stateless executor
+(`base-proof-executor`, the block builder of its fault-proof program) replay the same Base
+mainnet blocks from the same witness, single-threaded, needlefish `ReleaseSafe` against
+base/base `maxperf`, both tuned for the native CPU. Both reproduce every canonical header.
+Medians of the window time over 30 warm runs (5 for 1,000 blocks), with the 95% interval
+of the speedup:
 
-| Phase | needlefish | base/base |
-| --- | ---: | ---: |
-| Execution | 1717 Mgas/s, 1.23 ms/block | 626 Mgas/s, 3.83 ms/block |
-| Execution + state root + receipts root | 1182 Mgas/s, 1.84 ms/block | 202 Mgas/s, 14.25 ms/block |
-| Peak RSS | 289 MiB | 253 MiB |
+| Blocks | Phase | needlefish | base/base | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| 100 (53775088..) | execution | 5.17 ms/block | 8.86 ms/block | 1.72x (1.64-1.75) |
+| 100 (53775088..) | execution + state and receipts roots | 8.06 ms/block | 61.26 ms/block | 7.60x (7.33-7.73) |
+| 1,000 (54048836..) | execution + state and receipts roots | 6.88 ms/block | 169.34 ms/block | 24.62x (24.19-24.79) |
+| 100, EVM only | transactions over a flat in-memory state | 3.92 ms/block | 3.33 ms/block | 0.85x (0.78-0.98) |
 
-base/base uses less memory. Its node (reth with a database and a parallel state root) is a
-different code path and is not measured here. [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the
-methodology, the 10-block fixture, cold runs, p90s, and `etc/bench/reproduce.sh`.
-Micro benchmarks (`just bench`) are in [docs/PERF.md](docs/PERF.md).
+- The execution gap is reading state from the witness: with state reads taken out (EVM
+  only), base/base's interpreter (revm) is about 15% faster than needlefish's.
+- The root gap is an algorithm: base/base's proof executor re-hashes every trie node it
+  holds on every block, so its root time grows with the window; needlefish caches node
+  hashes and re-hashes only dirty nodes. base/base's node (reth) computes roots
+  differently; it is compared separately below.
+- base/base wins on the interpreter, on sender recovery (C libsecp256k1), and on the
+  executor's memory (181 MiB peak against needlefish's 780 MiB in `ReleaseSafe`, 224 MiB in
+  `ReleaseFast`, on 100 blocks).
+- Node to node, on a small synthetic devnet chain (332 blocks, 12,778 transactions, a
+  10,000-account state), needlefish's node answers `engine_newPayload` in 4.00 ms median
+  against `base-reth-node`'s 8.03 ms. needlefish cannot hold mainnet state yet, so there
+  is no mainnet node comparison.
+
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the full build matrix, the phase breakdown and
+profiles, the environment, and `etc/bench/reproduce.sh`. Micro benchmarks (`just bench`)
+are in [docs/PERF.md](docs/PERF.md).
 
 ## Installation
 

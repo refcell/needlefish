@@ -27,7 +27,11 @@ README.
       flame graphs.
 - [x] Plan B3: `base replay bench --evm-only` and the harness's `--evm-only` over one
       recorded flat pre-state (`NFPS`).
-- [ ] Plan B4: node to node through the Engine API.
+- [x] Plan B4: node to node through the Engine API (`etc/bench/node-bench.sh`), on a
+      10,000-account synthetic devnet chain. Mainnet-state import waits for SYNC_PLAN M2/M3.
+- [x] Plan B5: BENCHMARKS.md and the README Benchmarks section rewritten from B1-B4.
+- [ ] Rerun on a dedicated server (frequency control, PMU, `perf stat` instructions and
+      cycles per block); this round ran on a 4-vCPU cloud VM.
 
 ## Decisions
 
@@ -87,6 +91,26 @@ README.
   server" item stays open.
 - **Machine state.** No other builds ran. Endpoint security agents could not be stopped
   (about 3 cores of load), which is recorded in the doc.
+- **1,000-block window (2026-11-07).** Blocks 54048836..54049835. It first failed at
+  54049206 (B-20 `permit` 100 gas short) and 54049777 (an account the B-20 factory created
+  was not persisted); both were needlefish bugs, fixed in `execution/evm` with regression
+  tests, and the window now reproduces every header. The trie pool reserved 65,536 nodes
+  per block, more than an 8 GiB machine can map for 1,000 blocks; blocks past the first
+  128 get 8,192. It runs the headline configurations only (10 rounds): base/base's state
+  root grows with the window, so one base/base pass takes minutes.
+- **Isolation.** `systemctl set-property AllowedCPUs=` (empty) does not widen a cpuset
+  again, and the first runs confined only `system.slice`, `user.slice` and `init.scope`, not
+  the sandbox agent's `amp.slice`. `isolate` now confines every top-level unit but
+  `bench.slice` and restores the full CPU range on exit. The fixture, 100-block and EVM-only
+  results predate this; BENCHMARKS.md says so.
+- **B4 limits.** needlefish's node has fixed devnet-sized limits (65,536 state-trie
+  accounts, 16,384 changed accounts per block, genesis included) and no flag to raise them,
+  so the prefill is 10,000 accounts, not the plan's 10M and 100M. Import timing is curl's
+  `time_total` per `newPayload`; disk is the allocated size (MDBX's map file is sparse).
+- **Profiles.** needlefish's replayer re-adds every changed contract's code to the code
+  store after each block, hashing up to 24 KB just to find it present (about 21% of replay
+  time). Left in place so the published numbers describe the measured code; checking the
+  account's code hash first would remove it.
 - **README.** Removed Status, Performance, Releases, Testing, and Development. Added
   Benchmarks and a short Contributing pointer. `just release` now downloads Zig 0.17.1 into
   `.cache/zig` when it is not on `PATH`, so installation is clone plus `just release`.
@@ -95,3 +119,8 @@ README.
 
 - 2026-11-06: base/base harness verifies all 110 blocks (100-block window + fixture) in
   11 runs each. Results, methodology, reproduce script, and README pushed.
+- 2026-11-07: second round on a 4-vCPU cloud VM: build matrix with 30 interleaved
+  fresh-process rounds (fixture, 100-block window, EVM only), 1,000-block window (headline
+  configurations), phase attribution and flame graphs, and the first node-to-node result.
+  The 1,000-block window found two B-20 precompile bugs (fixed). BENCHMARKS.md and the
+  README rewritten.
