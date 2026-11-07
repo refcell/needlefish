@@ -2,10 +2,12 @@
 # Phase B4 of docs/BENCHMARK_PLAN.md: node to node through the Engine API, on a synthetic
 # chain both nodes import from genesis.
 #
-#   etc/bench/node-bench.sh [accounts] [load seconds]     (defaults 1000000, 120)
+#   etc/bench/node-bench.sh [accounts] [load seconds]     (defaults 10000, 60)
 #
 # 1. Writes a devnet genesis (`base devnet init`) and prefills it with <accounts> funded
-#    accounts, so the account trie is deeper than a fresh devnet's.
+#    accounts, so the account trie is deeper than a fresh devnet's. needlefish's node has
+#    devnet-sized limits (16,384 changed accounts per block, the genesis included), so
+#    more than about 16,000 fails with ChangesetFull.
 # 2. Runs the needlefish devnet (etc/devnet/devnet.sh: L1, sequencer, batcher, verifier) and
 #    `base load-test` against the sequencer for <load seconds> with a transfer, ERC-20 and
 #    storage-write mix, then exports every L2 block as an Engine API payload
@@ -21,8 +23,8 @@
 # GNU time, sudo for drop_caches.
 set -euo pipefail
 
-accounts=${1:-1000000}
-seconds=${2:-120}
+accounts=${1:-10000}
+seconds=${2:-60}
 out=.cache/bench/node
 rust_dir=${BENCH_RUST_DIR:-.cache/bench/base}
 needlefish=.cache/bench/bin/nf-ReleaseFast-native/bin/base
@@ -62,8 +64,8 @@ chain() { # devnet with a prefilled genesis, a load test, and the exported paylo
     DEVNET_KEEP=1 DEVNET_OPTIMIZE=ReleaseFast etc/devnet/devnet.sh up
     . .devnet/devnet.env
     local l2=http://127.0.0.1:$PORT_SEQUENCER_HTTP
-    zig-out/bin/base load-test --rpc-url "$l2" --chain-id 901  --rate 200 \
-        --duration-s "$seconds" --mix transfer=40,erc20_transfer=30,storage=30 --senders 200 \
+    zig-out/bin/base load-test --rpc-url "$l2" --chain-id 901 --rate 200 \
+        --duration-s "$seconds" --mix transfer=40,erc20_transfer=30,storage=30 --senders 64 \
         >"$out/load-test.txt" 2>&1
     local head
     head=$(curl -sf -X POST -H 'content-type: application/json' \
@@ -96,13 +98,18 @@ import_into() { # import_into <name> <cold|warm>
             --disable-discovery --log.stdout.filter warn >"$out/$name-$mode.log" 2>&1 &
     fi
     pid=$!
+    trap "kill $pid 2>/dev/null" EXIT # a failed import must not leave the node running
     wait_engine 18551
     [ "$mode" = cold ] && { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
     etc/bench/node-import.sh import http://127.0.0.1:18551 "$out/jwt.hex" \
         "$out/payloads.jsonl" "$out/$name-$mode.txt"
+    awk -v n="$name" -v m="$mode" '/^VmHWM/ { print n, m, "peak RSS KiB", $2 }' \
+        "/proc/$pid/status" >>"$out/disk.txt"
     kill "$pid"
     wait "$pid" 2>/dev/null || true
-    du -sb "$data" | awk -v n="$name" -v m="$mode" '{ print n, m, "datadir bytes", $1 }' \
+    trap - EXIT
+    # Allocated bytes, not apparent size: MDBX preallocates a sparse multi-GB map file.
+    du -s -B1 "$data" | awk -v n="$name" -v m="$mode" '{ print n, m, "datadir bytes", $1 }' \
         >>"$out/disk.txt"
 }
 

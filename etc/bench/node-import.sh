@@ -20,18 +20,21 @@ rpc() { # rpc <url> <method> <params json>
 }
 
 export_blocks() { # export_blocks <rpc> <first> <last> <out>
-    local url=$1 first=$2 last=$3 out=$4 number hex block count index raws
+    local url=$1 first=$2 last=$3 out=$4 number hex block raws
     : >"$out"
     for ((number = first; number <= last; number++)); do
         hex=$(printf '0x%x' "$number")
         block=$(rpc "$url" eth_getBlockByNumber "[\"$hex\",false]" | jq -c .result)
-        count=$(jq '.transactions | length' <<<"$block")
-        raws='[]'
-        for ((index = 0; index < count; index++)); do
-            raw=$(rpc "$url" eth_getRawTransactionByBlockNumberAndIndex \
-                "[\"$hex\",\"$(printf '0x%x' "$index")\"]" | jq -r .result)
-            raws=$(jq -c --arg raw "$raw" '. + [$raw]' <<<"$raws")
-        done
+        # One JSON-RPC batch per block for its raw transactions, in index order.
+        raws=$(jq -c --arg hex "$hex" '[range(.transactions | length) | {jsonrpc: "2.0",
+            id: ., method: "eth_getRawTransactionByBlockNumberAndIndex",
+            params: [$hex, ("0x" + (if . == 0 then "0" else
+                ([recurse(if . >= 16 then (. / 16 | floor) else empty end) | . % 16]
+                | reverse | map("0123456789abcdef"[.:.+1]) | join("")) end))]}]' <<<"$block")
+        if [ "$raws" != '[]' ]; then
+            raws=$(curl -sf -X POST -H 'content-type: application/json' --data "$raws" "$url" |
+                jq -c 'sort_by(.id) | map(.result)')
+        fi
         jq -c --argjson transactions "$raws" '{
             payload: {
                 parentHash, feeRecipient: .miner, stateRoot, receiptsRoot, logsBloom,
@@ -56,11 +59,12 @@ jwt() { # jwt <hex secret file>
     printf '%s.%s.%s' "$header" "$payload" "$signature"
 }
 
-engine() { # engine <url> <jwt file> <body file>: prints "<seconds> <response>"
+engine() { # engine <url> <jwt file> <body file>: prints "<seconds> <response>" and a newline
     local token
     token=$(jwt "$2")
     curl -s -X POST -H 'content-type: application/json' -H "authorization: Bearer $token" \
-        --data-binary "@$3" -w '\n%{time_total}' "$1" | tac | tr '\n' ' '
+        --data-binary "@$3" -w '\n%{time_total}\n' "$1" | tac | tr '\n' ' '
+    echo
 }
 
 import_blocks() { # import_blocks <engine url> <jwt file> <payloads> <out>
