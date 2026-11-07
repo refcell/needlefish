@@ -20,7 +20,8 @@
 #   BENCH_ISOLATE      1: confine every other systemd slice to BENCH_SYSTEM_CPUS (needs sudo)
 #   BENCH_WORKLOADS    any of: fixture window100 window1000 evm100 (default all four;
 #                      evm100 is the 100-block window with --evm-only, phase B3)
-#   BENCH_RUNS_1000    runs for the 1,000-block window (default 10; headline configs only)
+#   BENCH_RUNS_1000    runs for the 1,000-block window (default 5; headline configs only,
+#                      no in-process repeat: one base/base pass takes minutes)
 #   BENCH_SKIP_BUILD   1: reuse the binaries under .cache/bench
 #
 # Needs: Zig 0.17.1, git, curl, a Rust toolchain (base/base pins 1.96.0 via
@@ -35,7 +36,7 @@ window_count=100
 long_first=54048836
 long_count=1000
 runs=${1:-30}
-runs_long=${BENCH_RUNS_1000:-10}
+runs_long=${BENCH_RUNS_1000:-5}
 cpus=${BENCH_CPUS:-2-3}
 cpu_single=${BENCH_CPU_SINGLE:-2}
 threads=${BENCH_THREADS:-1}
@@ -158,6 +159,8 @@ run_one() { # run_one <dir> <iteration> <mode> <label> <cpus> <kind> <binary> [<
     dir=$1 iteration=$2 mode=$3 label=$4 pin=$5 kind=$6 binary=$7
     passes=1
     [ "$mode" = cold ] && passes=0
+    # No in-process repeat on the 1,000-block window: one base/base pass takes minutes.
+    [ "$dir" = "$out/results/window1000" ] && passes=0
     case $kind in
     nf) set -- "$binary" replay bench "$archive" "$passes" --recovery-threads "$8" ;;
     nf-evm) set -- "$binary" replay bench "$archive" "$passes" --evm-only ;;
@@ -241,11 +244,15 @@ summarize() { # summarize <name>
     echo
 }
 
-isolate() { # isolate <cpus|"">: confine everything else to <cpus>; "" lifts it
-    for unit in system.slice user.slice init.scope; do
+isolate() { # isolate <cpus>: confine every top-level unit but bench.slice to <cpus>
+    # An empty AllowedCPUs does not widen a cpuset again, so lifting passes every CPU.
+    for path in /sys/fs/cgroup/*.slice /sys/fs/cgroup/*.scope; do
+        unit=$(basename "$path")
+        [ "$unit" = bench.slice ] && continue
         sudo systemctl set-property --runtime "$unit" AllowedCPUs="$1"
     done
 }
+all_cpus=0-$(($(nproc --all) - 1))
 
 etc/bench/env.sh
 if [ "${BENCH_SKIP_BUILD:-0}" != 1 ]; then
@@ -254,7 +261,7 @@ if [ "${BENCH_SKIP_BUILD:-0}" != 1 ]; then
 fi
 if [ "${BENCH_ISOLATE:-0}" = 1 ]; then
     isolate "$system_cpus"
-    trap 'isolate ""' EXIT
+    trap 'isolate "$all_cpus"' EXIT
 fi
 
 echo "== archives"
