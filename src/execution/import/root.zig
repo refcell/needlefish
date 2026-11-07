@@ -6,6 +6,7 @@
 //! - `reth`: decoders for the reth table values the import reads.
 //! - `hashed_state`: the state root of reth's `HashedAccounts` + `HashedStorages` tables.
 //! - `to_disk`: one pass of that state into a needlefish disk-mode database (bulk loaders).
+//! - `run`: executes blocks N+1.. on that database, checking every header field.
 
 const std = @import("std");
 
@@ -15,9 +16,11 @@ pub const mdbx = @import("mdbx.zig");
 pub const reth = @import("reth.zig");
 pub const hashed_state = @import("hashed_state.zig");
 pub const to_disk = @import("to_disk.zig");
+pub const run = @import("run.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = @import("mdbx_test.zig");
     _ = @import("to_disk_test.zig");
+    _ = @import("run_test.zig");
 }

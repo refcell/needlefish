@@ -364,6 +364,21 @@ pub const State = struct {
         return self.storage_table.get(.{ .address = address, .slot = slot }) orelse 0;
     }
 
+    /// The storage root of `address`, the empty root when it is absent: disk mode reads the
+    /// account record's root, memory mode the state trie (current after `state_root`). For
+    /// the Isthmus withdrawals root (the L2ToL1MessagePasser's storage root).
+    pub fn storage_root(self: *State, address: Address) Hash {
+        assert(!self.trie_stale);
+        const address_hash = node.keccak256(&address);
+        if (self.disk) |disk| {
+            assert(self.state_trie.account_count() == 0);
+            const record = disk.account(disk.context, &address_hash) orelse
+                return node.empty_root;
+            return record.storage_root;
+        }
+        return self.state_trie.storage_root(address_hash);
+    }
+
     pub fn code_by_hash(self: *const State, hash: Hash) ?[]const u8 {
         if (std.mem.eql(u8, &hash, &node.empty_code_hash)) return &.{};
         const code = self.code_table.get(hash) orelse return null;

@@ -32,7 +32,7 @@ const sector_size = storage.sector_size;
 const record_writes_max = 64;
 const reorg_depth_max = 4;
 
-const shape_test: to_disk.Shape = .{
+pub const shape_test: to_disk.Shape = .{
     .block_size = 4 * sector_size,
     .journal_size_bytes = 256 * sector_size,
     .entry_body_size_max = 8 * sector_size,
@@ -67,13 +67,13 @@ const shape_test: to_disk.Shape = .{
     .code_bytes_headroom = 4096,
 };
 
-const head_number: u64 = 5_000_000;
+pub const head_number: u64 = 5_000_000;
 
 // The source state, reth-encoded.
 
-const Slot = struct { hash: Hash, word: u256 };
+pub const Slot = struct { hash: Hash, word: u256 };
 
-const Account = struct {
+pub const Account = struct {
     key: Hash,
     nonce: u64,
     balance: u256,
@@ -81,7 +81,7 @@ const Account = struct {
     slots: []Slot,
 };
 
-const Source = struct {
+pub const Source = struct {
     accounts: []Account,
     account_entries: []Entry,
     storage_entries: []Entry,
@@ -89,7 +89,7 @@ const Source = struct {
     codes: [][]const u8,
     root: Hash,
 
-    fn counts(source: *const Source) to_disk.Counts {
+    pub fn counts(source: *const Source) to_disk.Counts {
         var code_bytes: u64 = 0;
         for (source.codes) |code| code_bytes += code.len;
         return .{
@@ -101,11 +101,11 @@ const Source = struct {
     }
 };
 
-const SliceEntries = struct {
+pub const SliceEntries = struct {
     entries: []const Entry,
     index: usize = 0,
 
-    fn source(self: *SliceEntries) hashed_state.EntrySource {
+    pub fn source(self: *SliceEntries) hashed_state.EntrySource {
         return .{ .context = self, .next = next };
     }
 
@@ -144,7 +144,7 @@ fn encode_account(arena: std.mem.Allocator, account: *const Account) ![]u8 {
 }
 
 /// A `Bytecodes` value: raw, or analyzed legacy (padded with a STOP, then a jump table).
-fn encode_code(arena: std.mem.Allocator, code: []const u8, analyzed: bool) ![]u8 {
+pub fn encode_code(arena: std.mem.Allocator, code: []const u8, analyzed: bool) ![]u8 {
     var value: std.ArrayList(u8) = .empty;
     const stored_len: u32 = @intCast(code.len + @intFromBool(analyzed));
     try value.appendSlice(arena, &std.mem.toBytes(std.mem.nativeToBig(u32, stored_len)));
@@ -173,15 +173,15 @@ fn random_key(prng: *Prng, previous: ?*const Hash) Hash {
     return key;
 }
 
-fn less_account(_: void, a: Account, b: Account) bool {
+pub fn less_account(_: void, a: Account, b: Account) bool {
     return std.mem.order(u8, &a.key, &b.key) == .lt;
 }
 
-fn less_slot(_: void, a: Slot, b: Slot) bool {
+pub fn less_slot(_: void, a: Slot, b: Slot) bool {
     return std.mem.order(u8, &a.hash, &b.hash) == .lt;
 }
 
-fn less_entry(_: void, a: Entry, b: Entry) bool {
+pub fn less_entry(_: void, a: Entry, b: Entry) bool {
     return std.mem.order(u8, a.key, b.key) == .lt;
 }
 
@@ -244,7 +244,7 @@ fn random_source(arena: std.mem.Allocator, prng: *Prng, accounts_count: u64) !So
     return source;
 }
 
-fn encode_tables(arena: std.mem.Allocator, accounts: []Account, source: *Source) !void {
+pub fn encode_tables(arena: std.mem.Allocator, accounts: []Account, source: *Source) !void {
     var account_entries: std.ArrayList(Entry) = .empty;
     var storage_entries: std.ArrayList(Entry) = .empty;
     for (accounts) |*account| {
@@ -279,13 +279,17 @@ fn encode_tables(arena: std.mem.Allocator, accounts: []Account, source: *Source)
 
 // The database under test.
 
-const Run = struct {
+pub const Run = struct {
     sim: *SimStorage,
     db: *Database,
     config: @import("../db/database.zig").Config,
 
-    fn init(source: *const Source, seed: u64) !Run {
-        const sizing = try to_disk.sizing(SimStorage, source.counts(), shape_test);
+    pub fn init(source: *const Source, seed: u64) !Run {
+        return init_shaped(source, seed, shape_test);
+    }
+
+    pub fn init_shaped(source: *const Source, seed: u64, shape: to_disk.Shape) !Run {
+        const sizing = try to_disk.sizing(SimStorage, source.counts(), shape);
         const sim = try testing.allocator.create(SimStorage);
         errdefer testing.allocator.destroy(sim);
         sim.* = try SimStorage.init(testing.allocator, .{
@@ -299,14 +303,14 @@ const Run = struct {
         return .{ .sim = sim, .db = db, .config = sizing.config };
     }
 
-    fn deinit(self: *Run) void {
+    pub fn deinit(self: *Run) void {
         self.db.deinit(testing.allocator);
         testing.allocator.destroy(self.db);
         self.sim.deinit(testing.allocator);
         testing.allocator.destroy(self.sim);
     }
 
-    fn driver(self: *Run) to_disk.Driver {
+    pub fn driver(self: *Run) to_disk.Driver {
         return .{ .context = self.sim, .tick = tick };
     }
 
@@ -315,11 +319,11 @@ const Run = struct {
         sim.tick();
     }
 
-    fn importer(self: *Run) Importer {
+    pub fn importer(self: *Run) Importer {
         return .{ .allocator = testing.allocator, .db = self.db, .driver = self.driver() };
     }
 
-    fn reopen(self: *Run) !void {
+    pub fn reopen(self: *Run) !void {
         self.db.deinit(testing.allocator);
         self.db.* = try Database.init(testing.allocator, self.sim, self.config);
         try Importer.open(self.db, self.driver());
@@ -340,7 +344,7 @@ const Sources = struct {
     }
 };
 
-fn import_into(
+pub fn import_into(
     importer: *Importer,
     source: *const Source,
     chain: *const to_disk.HeaderChain,
@@ -355,7 +359,7 @@ fn import_into(
     );
 }
 
-fn synthetic_chain(root: Hash, chain: *to_disk.HeaderChain) !void {
+pub fn synthetic_chain(root: Hash, chain: *to_disk.HeaderChain) !void {
     var headers: to_disk.SyntheticHeaders = .{ .head_number = head_number, .state_root = root };
     try to_disk.fetch_chain(headers.source(), head_number, chain);
 }
