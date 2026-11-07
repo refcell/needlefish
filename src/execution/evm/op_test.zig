@@ -795,6 +795,69 @@ test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
     try testing.expectEqual(owner, std.mem.readInt(u256, bad_v.output[36..68], .big));
 }
 
+fn keccak_of(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(bytes, &digest, .{});
+    return digest;
+}
+
+/// The EIP-712 permit digest, built from the EIP-2612 type strings (not the token's constants).
+fn permit_digest(chain_id: u64, owner: Address, spender: Address, value: u256) [32]u8 {
+    const deadline: u256 = 1 << 40;
+    var domain: [5 * 32]u8 = @splat(0);
+    domain[0..32].* = keccak_of(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    domain[32..64].* = keccak_of("Token");
+    domain[64..96].* = keccak_of("1");
+    std.mem.writeInt(u256, domain[96..128], chain_id, .big);
+    domain[140..160].* = token_address;
+    var permit: [6 * 32]u8 = @splat(0);
+    permit[0..32].* = keccak_of(
+        "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+    );
+    permit[44..64].* = owner;
+    permit[76..96].* = spender;
+    std.mem.writeInt(u256, permit[96..128], value, .big);
+    std.mem.writeInt(u256, permit[160..192], deadline, .big); // Nonce 0.
+    var message: [66]u8 = undefined;
+    message[0..2].* = .{ 0x19, 0x01 };
+    message[2..34].* = keccak_of(&domain);
+    message[34..66].* = keccak_of(&permit);
+    return keccak_of(&message);
+}
+
+test "op: B-20 permit meters base/base's second, warm nonce read" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .cobalt, .activation_admin = sender_address };
+    const secp256k1 = @import("../../common/crypto/root.zig").secp256k1;
+    const key: [32]u8 = @splat(0x42);
+    const owner = try secp256k1.address(key);
+    const deadline: u256 = 1 << 40;
+    const digest = permit_digest(h.evm.config.chain_id, owner, holder, 77);
+    const signature = try secp256k1.sign(key, digest);
+    const v = 27 + @as(u256, signature.recovery_id);
+    const r = std.mem.readInt(u256, &signature.r, .big);
+    const s = std.mem.readInt(u256, &signature.s, .big);
+    var buffer: [4 + 32 * 8]u8 = undefined;
+    const words = [_]u256{ address_int(owner), address_int(holder), 77, deadline, v, r, s };
+    const input = token_input(&buffer, .permit, &words);
+    const executed = try native_call(&h, token_address, input, 0);
+    try testing.expectEqual(evm_module.Status.success, executed.status);
+    const allowance = try token_call(&h, .allowance, &.{ address_int(owner), address_int(holder) });
+    try testing.expectEqual(@as(u256, 77), output_int(allowance));
+    // base/base v2 permit, in order: 8 calldata words; the warm `is_initialized` account read;
+    // the cold name read and the three domain hashes; the cold nonce read; the struct and
+    // message hashes; recovery; `increment_nonce` reads the nonce again (warm, the 100 gas
+    // mainnet block 54049206 charged) and sets it; the cold allowance set; the Approval log
+    // (3 topics, 1 data word).
+    const native_gas: u64 = 6 * 8 + 100 + 2_100 + (30 + 6) + (30 + 6) + (30 + 6 * 5) + 2_100 +
+        (30 + 6 * 6) + (30 + 6 * 3) + 3_000 + 100 + 20_000 + 22_100 + (375 * 4 + 8 * 32);
+    try testing.expectEqual(21_000 + calldata_gas(input) + native_gas, executed.gas_used);
+}
+
 const token_roles = [_]u256{ 0, b20.role_mint, b20.role_pause, b20.role_burn, b20.role_metadata };
 
 /// Argument words that reach deep token paths: pool accounts, small amounts, role and scope

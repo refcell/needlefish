@@ -1034,8 +1034,12 @@ fn permit(context: *Context, arguments: *const Arguments) Error!void {
             address_word(owner),
         });
     }
-    if (nonce == std.math.maxInt(u256)) return b20.overflow(context);
-    try context.sstore(nonce_slot, nonce + 1);
+    // base/base's `increment_nonce` reads the slot again (a warm SLOAD, 100 gas) before the
+    // write; mainnet charges it, so it is metered here too.
+    const current = try context.sload(nonce_slot);
+    assert(current == nonce);
+    if (current == std.math.maxInt(u256)) return b20.overflow(context);
+    try context.sstore(nonce_slot, current + 1);
     try b20.approve(context, owner, arguments.address(1), arguments.uint256(2));
 }
 
