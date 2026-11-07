@@ -29,6 +29,7 @@ const import_run = @import("import_run.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 const el_fetch = @import("el_fetch.zig");
 const el_peers = @import("el_peers.zig");
+const el_run = @import("el_run.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -62,6 +63,7 @@ const usage =
     \\  unsafe-watch  join a Base chain's p2p gossip (no RPC), check signer and continuity
     \\  el-fetch   fetch and check a block range from an execution peer (devp2p eth/68)
     \\  el-peers   find a Base chain's execution peers over discv4
+    \\  el-run     execute blocks from an execution peer (devp2p) on an imported database
     \\
 ;
 
@@ -92,6 +94,7 @@ test {
     _ = unsafe_watch;
     _ = el_fetch;
     _ = el_peers;
+    _ = el_run;
     _ = @import("el_source.zig");
     _ = @import("metrics_server.zig");
 }
@@ -199,6 +202,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "el-peers")) {
         return try el_peers.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "el-run")) {
+        return try el_run.main(init, args);
     }
     return null;
 }

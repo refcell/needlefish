@@ -147,6 +147,19 @@ peer's head. It is shaped to plug into the catch-up stage's block-source interfa
 Verified: 512 blocks from 55006661 bound to the hash of 55006660 (the snapshot block), and
 a wrong parent hash rejected.
 
+### Executing peer blocks: `base el-run`
+
+`base el-run --db <path> --enode <enode>` opens a disk-mode database (written by
+`snapshot-import --out`, possibly advanced by `import-run`) and feeds `Source.next` into
+`execution.import.run`'s `Runner.execute`, starting at the database head + 1 with the
+head's hash as the required parent. The runner refuses any block that is not the head's
+child and commits a block only when every recomputed header field matches, so the head
+advances by exactly one executed block at a time; the first failure exits 1 with nothing
+skipped. Each block's line carries its tip lag; lag statistics count from the first time
+the source reaches the peer's head. With `--duration 1800` this is the demo's acceptance
+run. Planned order: catch up from the snapshot with `import-run` (RPC, one time), then
+stay at the tip with `el-run` (no RPC).
+
 ### Following the tip from an execution peer
 
 Behind NAT, gossip delivery is intermittent: one run received 159 consecutive blocks, and

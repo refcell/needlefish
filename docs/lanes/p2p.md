@@ -57,8 +57,11 @@ behind a small interface and switch later.
   - [x] `el-fetch --from tip --follow`: followed the tip from one peer for 30 minutes,
     9,002 consecutive blocks, median lag 356 ms (p99 10.6 s), reconnecting with backoff and
     resuming from the last linked block. `bin/base/el_source.zig` is the reusable source.
-  - [ ] Parallel fetch from several peers, and binding to the snapshot hash and to signed
-    gossip blocks.
+  - [x] `base el-run`: devp2p blocks into `execution.import.run`'s runner, bound to the
+    database head, with tip lag per block. Not yet run on real state (waiting for the
+    Sepolia disk import).
+  - [ ] Parallel fetch from several peers, and cross-checks against signed gossip blocks
+    while running.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.

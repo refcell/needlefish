@@ -50,14 +50,14 @@ const usage =
     \\
 ;
 
-const Chain = struct {
+pub const Chain = struct {
     name: []const u8,
     spec: *const base.execution.chainspec.ChainSpec,
     genesis_hash: Hash,
     rpc: []const u8,
 };
 
-const chains = [_]Chain{
+pub const chains = [_]Chain{
     .{
         .name = "base-sepolia",
         .spec = &base.execution.chainspec.ChainSpec.presets.base_sepolia,
@@ -253,7 +253,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
 }
 
 /// The database belongs to the chain and holds a real head.
-fn usable(db: *Database, chain: *const Chain) bool {
+pub fn usable(db: *Database, chain: *const Chain) bool {
     assert(db.phase == .ready);
     const head = db.head_info;
     if (!head.present) {
