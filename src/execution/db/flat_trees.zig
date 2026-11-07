@@ -310,35 +310,16 @@ pub fn FlatTreesType(comptime Storage: type) type {
             errdefer allocator.destroy(cache);
             cache.* = try BlockCache.init(allocator, block_size, config.cache_blocks);
             errdefer cache.deinit(allocator);
-            var accounts = try AccountTree.init(allocator, grid, cache, tree_config(
-                config,
-                account_put_bytes_min,
-                config.accounts_max,
-                table_records_cap(AccountTree, block_size),
-            ));
+            const configs = tree_configs(config);
+            var accounts = try AccountTree.init(allocator, grid, cache, configs.accounts);
             errdefer accounts.deinit(allocator);
-            var storage = try StorageTree.init(allocator, grid, cache, tree_config(
-                config,
-                storage_put_bytes_min,
-                config.slots_max,
-                table_records_cap(StorageTree, block_size),
-            ));
+            var storage = try StorageTree.init(allocator, grid, cache, configs.storage);
             errdefer storage.deinit(allocator);
-            const account_branches_config = branch_tree_config(
-                config,
-                config.account_branches_max,
-                table_records_cap(AccountBranchTree, block_size),
-            );
             var account_branches =
-                try AccountBranchTree.init(allocator, grid, cache, account_branches_config);
+                try AccountBranchTree.init(allocator, grid, cache, configs.account_branches);
             errdefer account_branches.deinit(allocator);
-            const storage_branches_config = branch_tree_config(
-                config,
-                config.storage_branches_max,
-                table_records_cap(StorageBranchTree, block_size),
-            );
             const storage_branches =
-                try StorageBranchTree.init(allocator, grid, cache, storage_branches_config);
+                try StorageBranchTree.init(allocator, grid, cache, configs.storage_branches);
             return .{
                 .cache = cache,
                 .accounts = accounts,
@@ -346,6 +327,58 @@ pub fn FlatTreesType(comptime Storage: type) type {
                 .account_branches = account_branches,
                 .storage_branches = storage_branches,
             };
+        }
+
+        pub const TreeConfigs = struct {
+            accounts: lsm.Config,
+            storage: lsm.Config,
+            account_branches: lsm.Config,
+            storage_branches: lsm.Config,
+        };
+
+        /// The four trees' configs (`init` builds them from these).
+        pub fn tree_configs(config: Config) TreeConfigs {
+            const block_size = config.block_size;
+            const configs: TreeConfigs = .{
+                .accounts = tree_config(
+                    config,
+                    account_put_bytes_min,
+                    config.accounts_max,
+                    table_records_cap(AccountTree, block_size),
+                ),
+                .storage = tree_config(
+                    config,
+                    storage_put_bytes_min,
+                    config.slots_max,
+                    table_records_cap(StorageTree, block_size),
+                ),
+                .account_branches = branch_tree_config(
+                    config,
+                    config.account_branches_max,
+                    table_records_cap(AccountBranchTree, block_size),
+                ),
+                .storage_branches = branch_tree_config(
+                    config,
+                    config.storage_branches_max,
+                    table_records_cap(StorageBranchTree, block_size),
+                ),
+            };
+            assert(configs.accounts.block_size == block_size);
+            assert(configs.storage_branches.block_size == block_size);
+            return configs;
+        }
+
+        /// `checkpoint_size_max` of trees with `config`, without building them (sizing a
+        /// database's checkpoint staging before `init`).
+        pub fn checkpoint_size_max_of(config: Config) u64 {
+            const configs = tree_configs(config);
+            var size: u64 = 4 * tree_count;
+            size += AccountTree.checkpoint_size_max_of(configs.accounts);
+            size += StorageTree.checkpoint_size_max_of(configs.storage);
+            size += AccountBranchTree.checkpoint_size_max_of(configs.account_branches);
+            size += StorageBranchTree.checkpoint_size_max_of(configs.storage_branches);
+            assert(size > 4 * tree_count);
+            return size;
         }
 
         /// Frees memory. Grid IO may be in flight only if the storage dropped it (crash).

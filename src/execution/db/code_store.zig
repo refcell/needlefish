@@ -136,14 +136,14 @@ pub fn CodeStoreType(comptime Storage: type) type {
             assert(config.tables_max >= 2);
             assert(config.block_size == grid.config.block_size);
             const capacity = Table.index_capacity(config.block_size);
-            const room = grid_module.payload_capacity_of(config.block_size) - payload_header_size;
-            const table_bytes_max = @as(u64, room) * ((capacity - 1) / 2);
+            const table_bytes_max = table_bytes_max_of(config.block_size);
             const value_size_max = Table.value_size_max(config.block_size);
             // Every code fits half the table list, so a rewrite always leaves room.
-            const all_bytes = @as(u64, config.code_bytes_max) + @as(u64, config.codes_max) * 36;
-            const record_max = 36 + @as(u64, value_size_max);
-            assert(table_bytes_max > 2 * record_max);
-            assert((all_bytes / (table_bytes_max - record_max) + 1) * 2 <= config.tables_max);
+            assert(config.tables_max >= tables_max_min(
+                config.block_size,
+                config.codes_max,
+                config.code_bytes_max,
+            ));
             var tables = try manifest_init(allocator, config.tables_max, capacity + 1);
             errdefer manifest_deinit(allocator, &tables);
             var pending = try manifest_init(allocator, config.tables_max, capacity + 1);
@@ -170,6 +170,25 @@ pub fn CodeStoreType(comptime Storage: type) type {
                 .scan_index = scan_index,
                 .scan_data = scan_data,
             };
+        }
+
+        /// Record bytes (key + value + end offset) one table holds at most.
+        fn table_bytes_max_of(block_size: u32) u64 {
+            const capacity = Table.index_capacity(block_size);
+            const room = grid_module.payload_capacity_of(block_size) - payload_header_size;
+            return @as(u64, room) * ((capacity - 1) / 2);
+        }
+
+        /// The fewest `Config.tables_max` `init` accepts for these code limits: every code
+        /// fits half the table list, so a rewrite always leaves room.
+        pub fn tables_max_min(block_size: u32, codes_max: u32, code_bytes_max: u32) u32 {
+            const table_bytes_max = table_bytes_max_of(block_size);
+            const all_bytes = @as(u64, code_bytes_max) + @as(u64, codes_max) * 36;
+            const record_max = 36 + @as(u64, Table.value_size_max(block_size));
+            assert(table_bytes_max > 2 * record_max);
+            const tables = (all_bytes / (table_bytes_max - record_max) + 1) * 2;
+            assert(tables >= 2);
+            return @intCast(tables);
         }
 
         fn manifest_init(allocator: std.mem.Allocator, tables_max: u32, per_table: u32) !Manifest {

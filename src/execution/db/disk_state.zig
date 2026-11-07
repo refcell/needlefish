@@ -56,6 +56,7 @@ const Changeset = changeset_module.Changeset;
 const AccountInfo = changeset_module.AccountInfo;
 const Address = changeset_module.Address;
 const SparseState = witness.SparseState;
+const AccountState = @import("history.zig").AccountState;
 
 pub const Account = flat_trees_module.Account;
 
@@ -299,6 +300,36 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 return error.Corrupt;
             }
             assert(std.mem.eql(u8, &node.keccak256(bytes.?), &self.state_root));
+        }
+
+        /// What `verify_leaf` read through the trie.
+        pub const Leaf = struct { account: ?AccountState, word: u256 };
+
+        /// Reads the account at `address_hash` (and the slot at `slot_hash`) through the
+        /// trie from the root: every node is rebuilt from branch records and flat leaves and
+        /// checked against the hash its parent names, so a missing or wrong record on the
+        /// path is `error.Corrupt` (an import's self-check). Writes nothing; starts a fresh
+        /// walk, as a block does.
+        pub fn verify_leaf(
+            self: *Self,
+            address_hash: *const Hash,
+            slot_hash: ?*const Hash,
+        ) Error!Leaf {
+            if (self.fault) return error.Corrupt;
+            self.begin_block();
+            const leaf_account = self.sparse_state.account_hashed(address_hash) catch |err| {
+                return self.sparse_error(err);
+            };
+            var word: u256 = 0;
+            if (slot_hash) |slot| {
+                word = self.sparse_state.storage_hashed(address_hash, slot) catch |err| {
+                    return self.sparse_error(err);
+                };
+            }
+            if (self.fault or self.corrupt) return error.Corrupt;
+            if (self.memo_full) return error.Full;
+            assert(leaf_account != null or word == 0);
+            return .{ .account = leaf_account, .word = word };
         }
 
         /// The records `apply` wrote for the last block (puts and tombstones), for tests.

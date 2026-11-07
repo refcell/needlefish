@@ -884,9 +884,20 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         }
 
         pub fn checkpoint_size_max(self: *const Tree) u32 {
-            const slots = self.layout.slot_base[self.config.levels_count];
+            return checkpoint_size_of(self.config, &self.layout);
+        }
+
+        /// `checkpoint_size_max` of a tree with `config`, without building it (sizing).
+        pub fn checkpoint_size_max_of(config: Config) u32 {
+            const layout = layout_of(config);
+            return checkpoint_size_of(config, &layout);
+        }
+
+        fn checkpoint_size_of(config: Config, layout: *const Layout) u32 {
+            const slots = layout.slot_base[config.levels_count];
+            assert(slots > 0);
             return checkpoint_header_size + slots * info_size +
-                2 * self.config.memtable_entries_max * entry_size + self.layout.orphans_max * 8;
+                2 * config.memtable_entries_max * entry_size + layout.orphans_max * 8;
         }
 
         /// Checkpoint bytes of a memtable's entries.

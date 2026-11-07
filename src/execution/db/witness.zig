@@ -936,6 +936,26 @@ pub const SparseState = struct {
         return history.decode_storage_value(value) catch error.InvalidWitness;
     }
 
+    /// The account leaf at `address_hash` (a caller that has only trie keys: an importer's
+    /// self-check); null when absent.
+    pub fn account_hashed(
+        self: *SparseState,
+        address_hash: *const Hash,
+    ) Error!?history.AccountState {
+        return self.account_state(address_hash);
+    }
+
+    /// `storage` by trie keys; 0 when absent.
+    pub fn storage_hashed(
+        self: *SparseState,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+    ) Error!u256 {
+        const root = (try self.storage_root_slot(address_hash)).*;
+        const value = try self.trie.get(root, slot_hash) orelse return 0;
+        return history.decode_storage_value(value) catch error.InvalidWitness;
+    }
+
     /// Hashes `address` and the not yet memoized `slots` ahead of `storage` reads of them,
     /// with batched keccak. Optional: `storage` gives the same values without it.
     pub fn prefetch_storage(self: *SparseState, address: Address, slots: []const u256) void {
