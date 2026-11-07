@@ -81,7 +81,9 @@ pub fn run(init: std.process.Init, options: Options, reader: *mdbx.Reader, numbe
     defer init.gpa.destroy(samples);
     const format_id = @as(u128, std.mem.readInt(u64, options.genesis_hash[0..8], .big)) << 64 |
         number;
-    write(init, &backend, options.out, reader, &sizing, chain, format_id, samples) catch |err| {
+    const out = options.out;
+    const written = write(init, &backend, out, reader, &sizing, chain, format_id, samples);
+    const codes = written catch |err| {
         std.debug.print("IMPORT FAILED: {t}; delete {s} and import again\n", .{ err, options.out });
         return 1;
     };
@@ -89,7 +91,7 @@ pub fn run(init: std.process.Init, options: Options, reader: *mdbx.Reader, numbe
     defer init.gpa.free(counts_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = counts_path, .data = &counts.encode() });
     std.debug.print("wrote {s} and {s}\n", .{ options.out, counts_path });
-    return reopen(init, &backend, options.out, counts_path, chain, samples);
+    return reopen(init, &backend, options.out, counts_path, chain, samples, codes);
 }
 
 pub fn backend_init() !IO {
@@ -356,7 +358,7 @@ fn write(
     chain: *const to_disk.HeaderChain,
     format_id: u128,
     samples: *to_disk.Samples,
-) !void {
+) !u64 {
     const gpa = init.gpa;
     var opened = try Opened.init(gpa, backend, path, sizing.config, true);
     defer opened.deinit(gpa, backend);
@@ -392,6 +394,7 @@ fn write(
         importer.stats.storage_records,
         importer.stats.blocks_written * sizing.config.engine.checkpoint_block_size >> 20,
     });
+    return importer.stats.codes;
 }
 
 /// MDBX cursors over the three tables the import reads.
@@ -467,6 +470,7 @@ fn reopen(
     counts_path: []const u8,
     chain: *const to_disk.HeaderChain,
     samples: *const to_disk.Samples,
+    codes_stored: u64,
 ) !u8 {
     const gpa = init.gpa;
     var buffer: [to_disk.Counts.encoded_size]u8 = undefined;
@@ -500,10 +504,12 @@ fn reopen(
         std.debug.print("SELF-CHECK FAILED: codes: {t}\n", .{err});
         return 1;
     };
-    if (codes != counts.codes) {
+    // `codes_stored` omits the empty code `counts.codes` may include.
+    assert(codes_stored <= counts.codes);
+    if (codes != codes_stored) {
         std.debug.print("SELF-CHECK FAILED: {d} codes reopened, {d} imported\n", .{
             codes,
-            counts.codes,
+            codes_stored,
         });
         return 1;
     }

@@ -208,7 +208,9 @@ fn random_codes(arena: std.mem.Allocator, prng: *Prng, source: *Source) !void {
     source.codes = try arena.alloc([]const u8, count);
     source.code_entries = try arena.alloc(Entry, count);
     for (source.codes, source.code_entries, 0..) |*code, *entry, index| {
-        const bytes = try arena.alloc(u8, prng.range(1, 300));
+        // The first is the empty code, which reth's Bytecodes holds (Base Sepolia does).
+        const length = if (index == 0) 0 else prng.range(1, 300);
+        const bytes = try arena.alloc(u8, length);
         prng.fill(bytes);
         code.* = bytes;
         const hash = try arena.dupe(u8, &node.keccak256(bytes));
@@ -430,10 +432,12 @@ test "to_disk: a random reth state imports, reopens as head N with its root and 
         const counts = source.counts();
         try testing.expectEqual(counts.accounts, importer.stats.accounts);
         try testing.expectEqual(counts.slots, importer.stats.slots);
-        try testing.expectEqual(counts.codes, importer.stats.codes);
+        // Every code but the empty one is stored, and a reopen loads exactly those.
+        try testing.expectEqual(counts.codes - 1, importer.stats.codes);
         try testing.expect(importer.stats.account_records > 0);
         try testing.expect(importer.stats.blocks_written > 0);
         try run.reopen();
+        try testing.expectEqual(importer.stats.codes, run.db.state.code_table.count());
         try check_head(run.db, &source);
         try check_state(run.db, &source, &prng);
         try Importer.verify_samples(run.db, &importer.samples);

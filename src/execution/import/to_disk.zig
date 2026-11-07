@@ -531,6 +531,9 @@ pub fn ImporterType(comptime Storage: type) type {
                 const code = try reth.decode_bytecode(entry.value);
                 const hash = node.keccak256(code);
                 if (!std.mem.eql(u8, &hash, entry.key)) return error.CodeHashMismatch;
+                // reth may keep the empty code; the state never stores zero-length code, so
+                // `stats.codes` counts the codes stored (what a reopen loads).
+                if (code.len == 0) continue;
                 const inserted = try state.insert_code(code);
                 assert(std.mem.eql(u8, &inserted.hash, &hash));
                 self.stats.codes += 1;

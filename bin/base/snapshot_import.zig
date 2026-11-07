@@ -369,17 +369,25 @@ pub fn code_stats(gpa: std.mem.Allocator, reader: *mdbx.Reader) !CodeStats {
     var codes: u64 = 0;
     var code_bytes: u64 = 0;
     var code_bytes_max: u64 = 0;
+    var codes_empty: u64 = 0;
     while (try cursor.next()) |entry| {
         if (entry.key.len != 32) return error.Corrupt;
         const code = try import.reth.decode_bytecode(entry.value);
         const hash = base.execution.trie.node.keccak256(code);
         if (!std.mem.eql(u8, &hash, entry.key)) return error.CodeHashMismatch;
         codes += 1;
+        codes_empty += @intFromBool(code.len == 0);
         code_bytes += code.len;
         code_bytes_max = @max(code_bytes_max, code.len);
     }
     if (codes != tree.items) return error.ItemCountMismatch;
-    std.debug.print("Bytecodes: {d} codes, {d} bytes ({d} MiB), largest {d} bytes, " ++
-        "every hash checked\n", .{ codes, code_bytes, code_bytes >> 20, code_bytes_max });
+    std.debug.print("Bytecodes: {d} codes ({d} empty), {d} bytes ({d} MiB), largest {d} " ++
+        "bytes, every hash checked\n", .{
+        codes,
+        codes_empty,
+        code_bytes,
+        code_bytes >> 20,
+        code_bytes_max,
+    });
     return .{ .count = codes, .bytes = code_bytes };
 }
