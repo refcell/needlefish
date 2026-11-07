@@ -33,6 +33,7 @@ pub const witness_json = @import("witness_json.zig");
 pub const replay_roots = @import("replay_roots.zig");
 pub const code_store = @import("code_store.zig");
 pub const flat_trees = @import("flat_trees.zig");
+pub const disk_state = @import("disk_state.zig");
 pub const branch_record = @import("branch_record.zig");
 pub const database = @import("database.zig");
 pub const bench = @import("bench.zig");
@@ -64,4 +65,5 @@ test {
     _ = @import("database_code_test.zig");
     _ = @import("database_flat_test.zig");
     _ = @import("branch_record_test.zig");
+    _ = @import("disk_state_test.zig");
 }

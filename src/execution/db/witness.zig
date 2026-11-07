@@ -698,6 +698,10 @@ pub const SparseState = struct {
     /// `DatabaseFailure`).
     incomplete: bool = false,
     fallback: ?Fallback = null,
+    /// `apply` deletes a destroyed account's storage slot by slot (its changeset lists every
+    /// slot; the trie must end empty) instead of dropping the trie whole, so a caller that
+    /// writes the trie's changes back (`DiskState`) sees every node it removed.
+    delete_destroyed_storage: bool = false,
 
     /// Source for trie nodes, codes and block hashes missing from the loaded witness, for
     /// a verifier that fetches them on demand (the fault-proof program's preimage
@@ -1005,7 +1009,8 @@ pub const SparseState = struct {
         try self.apply_accounts(&cursor, runs);
     }
 
-    /// Writes the storage runs of every account that is not destroyed, recording each run in
+    /// Writes the storage runs of every account that is not destroyed (of every account with
+    /// `delete_destroyed_storage`), recording each run in
     /// `runs` and `run_roots`. Returns the number of runs.
     fn apply_storage(self: *SparseState, cursor: *KeyCursor) Error!u32 {
         const accounts = cursor.changeset.account_changes();
@@ -1022,7 +1027,7 @@ pub const SparseState = struct {
             const destroyed = account_index < accounts.len and
                 std.mem.eql(u8, &accounts[account_index].address, address) and
                 accounts[account_index].new == null;
-            if (!destroyed) {
+            if (!destroyed or self.delete_destroyed_storage) {
                 if (runs == self.runs.len) return error.SparseFull;
                 try self.apply_slots(cursor, start, end, runs);
                 runs += 1;
@@ -1114,7 +1119,11 @@ pub const SparseState = struct {
     ) Error!void {
         if (change) |account_change| {
             if (account_change.new == null) {
-                assert(run == null);
+                // A destroyed account's storage run deleted every slot, or it had none.
+                if (run) |index| {
+                    assert(self.delete_destroyed_storage);
+                    if (self.run_roots[index] != sparse.none) return error.InvalidWitness;
+                }
                 try self.trie.delete(&self.account_root, address_hash);
                 _ = self.storage_roots.remove(address_hash.*);
                 return;
