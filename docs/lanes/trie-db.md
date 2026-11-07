@@ -1098,6 +1098,33 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   (no filter; blocks verified when read); its tables' block lists stay zero until a merge's
   walker reads their index block, and `level_remove` asserts the list is known. A rotted
   last-level block is now found by the first `get`/`lookup`/merge (sticky fault), not by open.
+- 2026-11-06: leaf-root branch records. A trie that is a single leaf has no branch, so its
+  leaf's key would need a range seek; instead it gets a record at the empty hang with both
+  masks 0 and the leaf's 32-byte key (37 bytes; `branch_record.leaf_root`, `is_leaf_root`).
+  `HashBuilder`'s branch sink emits it from `root`; `decode` accepts it only exactly so, and
+  `validate_path` only at the root.
+- 2026-11-06: `DiskState` (disk-state import step 7, `db/disk_state.zig`). Per block:
+  `SparseState.reset(root)` and `apply` (an unwind applies the changeset with old and new
+  swapped), nodes resolved through a `Fallback` over a hash-keyed locator memo (record at
+  owner + hang, or leaf at owner + key + depth; account leaves register their storage root),
+  every synthesized preimage checked against the hash asked for (`Corrupt`). The extension's
+  branch bytes are stored when its record resolves, so an extension whose child stays unloaded
+  can still be rewritten. Write-back does not use a sparse walk of changed nodes: the root
+  computation's `Sink` stores every new node in the memo, and a paired walk of the pre- and
+  post-state tries by reference (positions, not memo locators, give hang paths and owners)
+  descends only where (reference, extension offset, hangs-off-a-branch) differ; a record
+  position only in the post-state is a put, only in the pre-state a tombstone. Reason: equal
+  storage tries of two accounts share memo entries, which a node-identity walk would confuse;
+  the paired walk needs no per-node bookkeeping. `sparse.zig` still gains the `changed` bit and
+  `visit_records` (tested against `HashBuilder`'s records) for later use (proofs, profiling).
+  `SparseState.delete_destroyed_storage` applies a destroyed account's slot deletes so its
+  records are tombstoned; a destroyed account with storage not listed slot by slot is
+  `Unsupported`. Account values (incl. storage-only addresses) are collected before any put;
+  nothing is put unless every put fits the memtables (`Busy`: compact and retry). Reads
+  (`account`, `basic`, `storage`) are point lookups; a read error sets a sticky `fault`
+  (reads absent/0, `apply` `Corrupt`). A block's branch puts per tree must stay below
+  `flat_branch_flush_entries_min` (the memtable is twice it) or `Busy` never clears; step 8's
+  reserve must size it.
 
 ## Known limitations (storage)
 - Bit rot in an acknowledged journal entry truncates replay at that entry (reported as

@@ -1,7 +1,8 @@
 //! Flat trees: the LSM trees of flat state on the grid (disk state phase 2b; `Config.flat_trees`).
 //! `Database` shadow-writes every committed changeset into the account and storage trees;
 //! `State`'s flat hash tables stay the source of truth, and the trees are derived data that
-//! must equal them. The two branch-record trees are written only by a bulk import for now.
+//! must equal them. The two branch-record trees are written by a bulk import and by
+//! `DiskState` (`disk_state.zig`), which also writes accounts and slots in disk mode.
 //!
 //! - Account tree: key keccak256(address) (32 B), value the account record (104 B: nonce u64
 //!   big-endian, balance u256 big-endian, code hash, storage root; the empty trie root for an
