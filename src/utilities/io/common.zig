@@ -105,6 +105,9 @@ pub const SetupError = error{
     SystemFdQuotaExceeded,
     SystemResources,
     NoSpaceLeft,
+    /// A writable open found the file locked by another open descriptor (another process,
+    /// or this one): one writer per file.
+    FileLocked,
     Unexpected,
 };
 

@@ -220,6 +220,23 @@ fn run_until_completed(io: *IO, state: *const FileState, count: u32) !void {
     try std.testing.expectEqual(count, state.completed);
 }
 
+test "os io: one writable open per file; read-only opens and a reopen after close work" {
+    var io = try init_io();
+    defer io.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.posix.PATH_MAX]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/data.db", .{tmp.sub_path});
+    const fd = try io.open_file(path, .create);
+    try std.testing.expectError(error.FileLocked, io.open_file(path, .read_write));
+    try std.testing.expectError(error.FileLocked, io.open_file(path, .create));
+    const reader = try io.open_file(path, .read_only);
+    io.close_now(reader);
+    io.close_now(fd);
+    const reopened = try io.open_file(path, .read_write);
+    io.close_now(reopened);
+}
+
 test "os io: file write fsync read" {
     var io = try init_io();
     defer io.deinit();

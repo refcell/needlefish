@@ -276,17 +276,44 @@ pub fn open_file(path: []const u8, mode: common.OpenMode) common.SetupError!fd_t
     if (mode == .create) flags.CREAT = true;
     const permissions: std.posix.mode_t = 0o644;
     const rc = system.openat(std.posix.AT.FDCWD, path_z, flags, permissions);
-    return switch (errno(rc)) {
+    const fd: fd_t = switch (errno(rc)) {
         .SUCCESS => @intCast(rc),
-        .ACCES, .PERM => error.AccessDenied,
-        .NOENT => error.FileNotFound,
-        .NAMETOOLONG => error.NameTooLong,
-        .MFILE => error.ProcessFdQuotaExceeded,
-        .NFILE => error.SystemFdQuotaExceeded,
-        .NOSPC => error.NoSpaceLeft,
-        .NOMEM => error.SystemResources,
-        else => error.Unexpected,
+        .ACCES, .PERM => return error.AccessDenied,
+        .NOENT => return error.FileNotFound,
+        .NAMETOOLONG => return error.NameTooLong,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
     };
+    assert(fd >= 0);
+    // One writer per file: two processes writing one database corrupt it.
+    if (mode != .read_only) try lock_exclusive(fd);
+    return fd;
+}
+
+/// Takes an exclusive advisory lock on `fd` without waiting; closes `fd` when another open
+/// descriptor holds it. The lock lasts until `fd` is closed.
+fn lock_exclusive(fd: fd_t) common.SetupError!void {
+    assert(fd >= 0);
+    if (comptime !@hasDecl(system, "flock")) return;
+    const rc = system.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB);
+    switch (errno(rc)) {
+        .SUCCESS => {},
+        .AGAIN => {
+            close(fd);
+            return error.FileLocked;
+        },
+        .NOLCK => {
+            close(fd);
+            return error.SystemResources;
+        },
+        else => {
+            close(fd);
+            return error.Unexpected;
+        },
+    }
 }
 
 /// Blocking positional read: the bytes read (0 at end of file). Retries interrupted calls a
