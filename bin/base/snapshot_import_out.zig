@@ -442,6 +442,22 @@ const Cursors = struct {
 
 /// Opens the written file again with the sizing from its counts record, and checks the
 /// head, its root, the block hashes, and the samples (read through the trie).
+/// Hashes every code the reopened state holds (loaded from the code tables at their arena
+/// offsets, which pass 4 GiB at snapshot scale) and returns how many there are.
+fn check_codes(state: *const base.execution.db.State) error{CodeHashMismatch}!u64 {
+    var count: u64 = 0;
+    var codes = state.code_table.iterator();
+    while (codes.next()) |entry| : (count += 1) {
+        const code = state.code_by_hash(entry.key_ptr.*).?;
+        assert(code.len == entry.value_ptr.len);
+        var hash: Hash = undefined;
+        std.crypto.hash.sha3.Keccak256.hash(code, &hash, .{});
+        if (!std.mem.eql(u8, &hash, entry.key_ptr)) return error.CodeHashMismatch;
+    }
+    assert(count == state.code_table.count());
+    return count;
+}
+
 fn reopen(
     init: std.process.Init,
     backend: *IO,
@@ -478,6 +494,19 @@ fn reopen(
         const hash = opened.db.state.block_hash(link.number) orelse return error.NoBlockHash;
         if (!std.mem.eql(u8, &hash, &link.hash)) return error.BlockHashMismatch;
     }
+    const codes = check_codes(&opened.db.state) catch |err| {
+        std.debug.print("SELF-CHECK FAILED: codes: {t}\n", .{err});
+        return 1;
+    };
+    if (codes != counts.codes) {
+        std.debug.print("SELF-CHECK FAILED: {d} codes reopened, {d} imported\n", .{
+            codes,
+            counts.codes,
+        });
+        return 1;
+    }
+    std.debug.print("self-check: {d} codes reopened from the code tables, every hash " ++
+        "matches\n", .{codes});
     Importer.verify_samples(opened.db, samples) catch |err| {
         std.debug.print("SELF-CHECK FAILED: samples: {t}\n", .{err});
         return 1;

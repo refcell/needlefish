@@ -60,7 +60,7 @@ fn block_hash_count(state: *const State) u32 {
 /// in the code arena or is longer than `length_max`. The others are stored elsewhere (the
 /// database's code tables) and must be in the state before the snapshot loads.
 pub const CodeFilter = struct {
-    offset_min: u32 = 0,
+    offset_min: u64 = 0,
     length_max: u32 = std.math.maxInt(u32),
 
     pub fn includes(filter: CodeFilter, code: state_module.CodeRef) bool {

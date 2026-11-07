@@ -38,7 +38,7 @@ pub const Config = struct {
     accounts_max: u32,
     storage_slots_max: u32,
     codes_max: u32,
-    code_bytes_max: u32,
+    code_bytes_max: u64,
     account_nodes_max: u32,
     storage_nodes_max: u32,
     /// Storage-rehash worker threads (`StateTrie.Config.rehash_threads`); zero for DST.
@@ -76,7 +76,9 @@ pub const SlotKey = struct {
     slot: u256,
 };
 
-pub const CodeRef = struct { offset: u32, len: u32 };
+/// A code in the arena: arena offsets are u64 (snapshots hold tens of GiB of code), one
+/// code is at most 24 KiB before EIP-7907 and always below 4 GiB.
+pub const CodeRef = struct { offset: u64, len: u32 };
 
 const BlockHashEntry = struct { number: u64, hash: Hash, valid: bool };
 
@@ -267,7 +269,7 @@ pub const State = struct {
     storage_table: std.AutoHashMapUnmanaged(SlotKey, u256),
     code_table: std.AutoHashMapUnmanaged(Hash, CodeRef),
     code_arena: []u8,
-    code_arena_len: u32 = 0,
+    code_arena_len: u64 = 0,
     block_hashes: [block_hashes_max]BlockHashEntry = @splat(.{
         .number = 0,
         .hash = @splat(0),

@@ -598,9 +598,18 @@ test "to_disk: sizing at Base Sepolia scale" {
     const tree_bytes = sizing.tree_blocks * config.engine.checkpoint_block_size;
     const leaf_bytes = counts.accounts * (32 + 104 + 4) + counts.slots * (64 + 32 + 4);
     try testing.expect(tree_bytes > leaf_bytes and tree_bytes < 3 * leaf_bytes);
+    // Base Sepolia at block 55006660 (measured): 22 GiB of code, past u32 arena offsets.
     var large = counts;
-    large.code_bytes = 5 << 30;
-    const refused = to_disk.sizing(SimStorage, large, to_disk.shape_node);
+    large.codes = 4_765_573;
+    large.code_bytes = 23_171_111_820;
+    const sized = try to_disk.sizing(SimStorage, large, to_disk.shape_node);
+    try testing.expect(sized.config.state.code_bytes_max >= large.code_bytes);
+    try testing.expect(sized.config.state.codes_max >= large.codes);
+    try testing.expect(sized.code_blocks * config.engine.checkpoint_block_size >
+        4 * large.code_bytes);
+    var too_many = counts;
+    too_many.codes = std.math.maxInt(u32);
+    const refused = to_disk.sizing(SimStorage, too_many, to_disk.shape_node);
     try testing.expectError(error.CodesTooLarge, refused);
 }
 

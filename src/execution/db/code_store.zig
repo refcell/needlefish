@@ -49,7 +49,7 @@ pub const Config = struct {
     block_count: u64,
     tables_max: u32,
     codes_max: u32,
-    code_bytes_max: u32,
+    code_bytes_max: u64,
     /// New code bytes below which a flush is skipped (they stay in the image).
     flush_bytes_min: u32,
 };
@@ -76,7 +76,7 @@ pub fn CodeStoreType(comptime Storage: type) type {
         pub const Callback = *const fn (*Self) void;
         pub const info_size: u32 = @sizeOf(Info);
 
-        const Entry = struct { hash: Hash, offset: u32, len: u32 };
+        const Entry = struct { hash: Hash, offset: u64, len: u32 };
 
         /// A table list with every block address of every table (index block first).
         const Manifest = struct {
@@ -105,14 +105,14 @@ pub fn CodeStoreType(comptime Storage: type) type {
         tables: Manifest,
         pending: Manifest,
         /// Arena bytes the tables cover (see the file comment).
-        arena_flushed: u32 = 0,
+        arena_flushed: u64 = 0,
         entries: []Entry,
         entries_len: u32 = 0,
         builder: Table.Builder,
         reservation: Reservation = undefined,
         flush_state: FlushState = .idle,
         flush_rewrite: bool = false,
-        flush_cut: u32 = 0,
+        flush_cut: u64 = 0,
         flush_arena: []const u8 = &.{},
         flush_callback: ?Callback = null,
         /// Next entry to write, and the end of the table being built.
@@ -181,9 +181,9 @@ pub fn CodeStoreType(comptime Storage: type) type {
 
         /// The fewest `Config.tables_max` `init` accepts for these code limits: every code
         /// fits half the table list, so a rewrite always leaves room.
-        pub fn tables_max_min(block_size: u32, codes_max: u32, code_bytes_max: u32) u32 {
+        pub fn tables_max_min(block_size: u32, codes_max: u32, code_bytes_max: u64) u32 {
             const table_bytes_max = table_bytes_max_of(block_size);
-            const all_bytes = @as(u64, code_bytes_max) + @as(u64, codes_max) * 36;
+            const all_bytes = code_bytes_max + @as(u64, codes_max) * 36;
             const record_max = 36 + @as(u64, Table.value_size_max(block_size));
             assert(table_bytes_max > 2 * record_max);
             const tables = (all_bytes / (table_bytes_max - record_max) + 1) * 2;
@@ -467,7 +467,7 @@ pub fn CodeStoreType(comptime Storage: type) type {
 
         /// Fills `entries` with the table-sized codes at arena offsets in `[low, high)`,
         /// sorted by hash; returns their code bytes.
-        fn collect(self: *Self, state: *const State, low: u32, high: u32) u64 {
+        fn collect(self: *Self, state: *const State, low: u64, high: u64) u64 {
             assert(low < high);
             self.entries_len = 0;
             var bytes: u64 = 0;

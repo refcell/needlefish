@@ -183,9 +183,8 @@ pub fn sizing(comptime Storage: type, counts: Counts, shape: Shape) SizingError!
     assert(shape.block_size % 4096 == 0);
     const codes_max = counts.codes + shape.codes_headroom;
     const code_bytes_max = counts.code_bytes + shape.code_bytes_headroom;
-    // Code limits are u32 (plan step 9 widens them only when a snapshot needs it).
+    // The code count is u32; code bytes are u64 (a code arena of tens of GiB).
     if (codes_max > std.math.maxInt(u32)) return error.CodesTooLarge;
-    if (code_bytes_max > std.math.maxInt(u32) - (64 << 20)) return error.CodesTooLarge;
     // ~0.4 branch records per leaf (the design's measure); the trees are sized for 0.5.
     // Storage tries add at most one root record each (at most one trie per account, per
     // slot); a single-slot trie's root record is a 37-byte leaf root.
@@ -202,7 +201,7 @@ pub fn sizing(comptime Storage: type, counts: Counts, shape: Shape) SizingError!
         tree_blocks_for(storage_tries, 65 + 37, block_size);
     var config = base_config(shape);
     config.state.codes_max = @intCast(codes_max);
-    config.state.code_bytes_max = @intCast(code_bytes_max);
+    config.state.code_bytes_max = code_bytes_max;
     config.flat_accounts_max = counts.accounts + counts.accounts / 4 + 1024;
     config.flat_slots_max = counts.slots + counts.slots / 4 + 1024;
     config.flat_account_branches_max = account_branches;
@@ -775,6 +774,11 @@ pub fn ImporterType(comptime Storage: type) type {
                 }
                 const record = disk.account(&sample.key) orelse return error.SampleMismatch;
                 if (!record.eql(expected)) return error.SampleMismatch;
+                // The code came back from the code tables at its arena offset.
+                const code = db.state.code_by_hash(account.code_hash) orelse
+                    return error.CodeMissing;
+                const code_hash = node.keccak256(code);
+                if (!std.mem.eql(u8, &code_hash, &account.code_hash)) return error.SampleMismatch;
             }
             for (samples.slot_list()) |*sample| {
                 const leaf = disk.verify_leaf(&sample.owner, &sample.slot) catch
