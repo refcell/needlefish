@@ -28,6 +28,10 @@
 //! error sets a sticky `fault`: reads then return absent / zero and `apply` fails with
 //! `error.Corrupt`, so no block commits over a state that could not be read.
 //!
+//! Modes (`mode`): live puts keep the trees' replay reserves free (`Tree.put`); during journal
+//! replay after open (no compaction yet) puts may use them (`Tree.put_replay`). Either way
+//! nothing is written unless every put of the block fits.
+//!
 //! Wipes: a destroyed account whose storage is not spelled out slot by slot in the changeset is
 //! `error.Unsupported` (post-Cancun only an account created in the same block can be destroyed,
 //! and its storage is in the changeset).
@@ -170,6 +174,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// This block's account records (a null value removes the account).
         account_writes: []AccountWrite,
         account_writes_len: u32 = 0,
+        /// Live puts, or journal replay puts (`FlatTrees.Mode`).
+        mode: FlatTrees.Mode = .live,
         /// Sticky: a tree read failed.
         fault: bool = false,
         /// This block: a preimage could not be built or did not hash to its reference.
@@ -272,6 +278,27 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 self.fault = true;
                 return 0;
             };
+        }
+
+        /// Checks that the state root resolves: the root record (and for a leaf root, its
+        /// leaf) rebuilds a node hashing to the root; for the empty root, no root record.
+        /// `error.Corrupt` otherwise (a checkpoint whose trees do not hold its root).
+        pub fn check_root(self: *Self) Error!void {
+            if (self.fault) return error.Corrupt;
+            if (std.mem.eql(u8, &self.state_root, &node.empty_root)) {
+                const record = self.trees.get_branch(null, &.{}) catch {
+                    self.fault = true;
+                    return error.Corrupt;
+                };
+                if (record != null) return error.Corrupt;
+                return;
+            }
+            self.begin_block();
+            const bytes = fallback_node(self, &self.state_root);
+            if (bytes == null or self.fault or self.corrupt or self.memo_full) {
+                return error.Corrupt;
+            }
+            assert(std.mem.eql(u8, &node.keccak256(bytes.?), &self.state_root));
         }
 
         /// The records `apply` wrote for the last block (puts and tombstones), for tests.
@@ -858,11 +885,28 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             }
             const storage_branches = self.record_writes_len - account_branches;
             const accounts = changeset.accounts_len + changeset.storage_len;
-            const fits = accounts <= self.trees.accounts.capacity_free() and
-                changeset.storage_len <= self.trees.storage.capacity_free() and
-                account_branches <= self.trees.account_branches.capacity_free() and
-                storage_branches <= self.trees.storage_branches.capacity_free();
+            const fits = accounts <= self.room(&self.trees.accounts) and
+                changeset.storage_len <= self.room(&self.trees.storage) and
+                account_branches <= self.room(&self.trees.account_branches) and
+                storage_branches <= self.room(&self.trees.storage_branches);
             if (!fits) return error.Busy;
+        }
+
+        fn room(self: *const Self, tree: anytype) u32 {
+            return switch (self.mode) {
+                .live => tree.capacity_free(),
+                .replay => tree.replay_capacity_free(),
+            };
+        }
+
+        /// A reserved put (`reserve` counted it), live or replay.
+        fn put(self: *const Self, tree: anytype, key: anytype, value: anytype) void {
+            const result = switch (self.mode) {
+                .live => tree.put(key, value),
+                .replay => tree.put_replay(key, value),
+            };
+            // Reserved by `reserve`: the tree has room for every put of the block.
+            result catch unreachable;
         }
 
         /// The post-state record of every address with an account or storage change: new
@@ -915,7 +959,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             for (self.account_writes[0..self.account_writes_len]) |*write| {
                 const value = if (write.value) |*bytes| bytes else null;
                 // Reserved: `reserve` counted a put per account and per storage entry.
-                self.trees.accounts.put(&write.key, value) catch unreachable;
+                self.put(&self.trees.accounts, &write.key, value);
             }
         }
 
@@ -935,21 +979,19 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 var value: [flat_trees_module.storage_value_size]u8 = undefined;
                 std.mem.writeInt(u256, &value, change.new, .big);
                 const value_pointer = if (change.new == 0) null else &value;
-                // Reserved by `reserve`.
-                self.trees.storage.put(&key, value_pointer) catch unreachable;
+                self.put(&self.trees.storage, &key, value_pointer);
             }
         }
 
         fn write_records(self: *Self) void {
             for (self.last_record_writes()) |*write| {
                 const value = self.record_value(write);
-                // Reserved by `reserve`.
                 if (write.owner) |*owner| {
                     const key = branch_record.storage_key(owner, write.hang.slice());
-                    self.trees.storage_branches.put(&key, value) catch unreachable;
+                    self.put(&self.trees.storage_branches, &key, value);
                 } else {
                     const key = branch_record.path_key(write.hang.slice());
-                    self.trees.account_branches.put(&key, value) catch unreachable;
+                    self.put(&self.trees.account_branches, &key, value);
                 }
             }
         }

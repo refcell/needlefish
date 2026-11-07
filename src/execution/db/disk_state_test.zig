@@ -220,9 +220,9 @@ const Harness = struct {
 
 // The model: the state as accounts by address, the source of every changeset.
 
-const Slot = struct { slot: u256, value: u256 };
+pub const Slot = struct { slot: u256, value: u256 };
 
-const ModelAccount = struct {
+pub const ModelAccount = struct {
     address: Address,
     info: AccountInfo,
     slots: std.ArrayList(Slot) = .empty,
@@ -235,7 +235,7 @@ const ModelAccount = struct {
     }
 };
 
-const Model = struct {
+pub const Model = struct {
     arena: std.mem.Allocator,
     accounts: std.ArrayList(ModelAccount) = .empty,
 
@@ -529,10 +529,10 @@ fn apply_model(model: *Model, reference: *StateTrie, cs: *const Changeset, forwa
 
 // The fresh bulk build: what an import of the model's state writes.
 
-const AccountEntry = struct { key: Hash, account: Account };
-const SlotEntry = struct { key: [64]u8, word: u256 };
+pub const AccountEntry = struct { key: Hash, account: Account };
+pub const SlotEntry = struct { key: [64]u8, word: u256 };
 
-const Built = struct {
+pub const Built = struct {
     root: Hash,
     accounts: std.ArrayList(AccountEntry) = .empty,
     slots: std.ArrayList(SlotEntry) = .empty,
@@ -609,7 +609,7 @@ fn hashed_accounts(arena: std.mem.Allocator, model: *const Model) ![]HashedAccou
 
 /// Streams the model's state through `StateRootBuilder` with a record sink, as an import
 /// does: records, account records (with storage roots), and slots, each list sorted.
-fn build_state(arena: std.mem.Allocator, model: *const Model) !Built {
+pub fn build_state(arena: std.mem.Allocator, model: *const Model) !Built {
     const accounts = try hashed_accounts(arena, model);
     const builder = try arena.create(state_root_module.StateRootBuilder);
     builder.* = .{};

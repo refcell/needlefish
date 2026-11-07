@@ -433,18 +433,18 @@ test "database flat trees: seeded blocks, reorgs, checkpoints, and crashes match
 test "database flat trees: checkpoint versions per config, version 3 refused" {
     const valid = database.checkpoint_version_valid;
     try testing.expectEqual(@as(u16, 4), database.checkpoint_version_flat);
-    try testing.expect(valid(database.checkpoint_version_flat, true, true));
-    try testing.expect(!valid(database.checkpoint_version_flat, false, true));
+    try testing.expect(valid(database.checkpoint_version_flat, true, true, false));
+    try testing.expect(!valid(database.checkpoint_version_flat, false, true, false));
     // Version 3 (72-byte account records, two trees) opens with no config.
     for ([_]bool{ false, true }) |grid| {
         for ([_]bool{ false, true }) |flat| {
             if (flat and !grid) continue;
-            try testing.expect(!valid(database.checkpoint_version_flat_v3, flat, grid));
+            try testing.expect(!valid(database.checkpoint_version_flat_v3, flat, grid, false));
         }
     }
-    try testing.expect(!valid(database.checkpoint_version_tables, true, true));
-    try testing.expect(valid(database.checkpoint_version_tables, false, true));
-    try testing.expect(!valid(database.checkpoint_version, true, true));
+    try testing.expect(!valid(database.checkpoint_version_tables, true, true, false));
+    try testing.expect(valid(database.checkpoint_version_tables, false, true, false));
+    try testing.expect(!valid(database.checkpoint_version, true, true, false));
 }
 
 test "database flat trees: a checkpoint written without flat trees is refused with them" {

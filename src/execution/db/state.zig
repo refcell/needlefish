@@ -11,6 +11,12 @@
 //! and overlay slots written under an older epoch are ignored.
 //!
 //! All tables are sized at init from `Config` and never grow.
+//!
+//! Disk mode (`disk` set, `Database.Config.disk_state`): accounts, slots, the state root, and
+//! every apply and unwind go to `DiskState` (`disk_state.zig`) over the flat trees; the account
+//! and storage tables and the `StateTrie` stay empty. Codes and block hashes stay here. Reads
+//! hash the address (and slot) per call; `has_storage` is the account's storage root, so
+//! `account().storage_slots` is only a flag (0 or 1) in disk mode.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,6 +25,7 @@ const changeset_module = @import("changeset.zig");
 const address_map = @import("address_map.zig");
 const trie = @import("../trie/root.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
+const flat_trees_module = @import("flat_trees.zig");
 const node = trie.node;
 
 pub const Address = changeset_module.Address;
@@ -38,7 +45,31 @@ pub const Config = struct {
     rehash_threads: u32 = 0,
 };
 
-pub const Error = error{ StateFull, CodeFull } || trie.state_trie.Error;
+/// Disk mode adds: `StateCorrupt` (a tree read failed or a record does not hash to its
+/// reference), `Busy` (the trees' memtables lack room: compact and retry), and `Unsupported`
+/// (a wipe of an account with storage whose slots are not listed).
+pub const Error = error{ StateFull, CodeFull, StateCorrupt, Busy, Unsupported } ||
+    trie.state_trie.Error;
+
+/// The disk-mode backend (`State.disk`): `DiskState` behind its owner (`Database`), which
+/// reserves memtable room and paces compaction. Type-erased because `State` is not generic
+/// over the storage.
+pub const Disk = struct {
+    context: *anyopaque,
+    /// The account record of keccak256(address); null when absent.
+    account: *const fn (context: *anyopaque, address_hash: *const Hash) ?DiskAccount,
+    /// The slot word, 0 when absent.
+    storage: *const fn (
+        context: *anyopaque,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+    ) u256,
+    root: *const fn (context: *anyopaque) Hash,
+    /// Moves the state by one block (`forward`, or its old values); on error nothing moved.
+    apply: *const fn (context: *anyopaque, changeset: *const Changeset, forward: bool) Error!void,
+};
+
+pub const DiskAccount = flat_trees_module.Account;
 
 pub const SlotKey = struct {
     address: Address,
@@ -246,6 +277,8 @@ pub const State = struct {
     config: Config,
     /// The tables moved without the trie (`unwind_tables`) until `rebuild_trie`.
     trie_stale: bool = false,
+    /// Disk mode: accounts, slots, and the root live in `DiskState` (see the file comment).
+    disk: ?Disk = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !State {
         var account_table: address_map.Map(AccountEntry) = .empty;
@@ -285,23 +318,47 @@ pub const State = struct {
     }
 
     pub fn basic(self: *const State, address: Address) ?AccountInfo {
+        if (self.disk) |disk| {
+            const record = disk.account(disk.context, &node.keccak256(&address)) orelse
+                return null;
+            return record.info;
+        }
         const entry = self.account_table.get(address) orelse return null;
         return entry.info;
     }
 
-    /// The account with its storage slot count, in one table lookup.
+    /// The account with its storage slot count, in one table lookup. Disk mode: the count is
+    /// 1 when the storage root is not the empty root, else 0.
     pub fn account(self: *const State, address: Address) ?AccountEntry {
+        if (self.disk) |disk| {
+            const record = disk.account(disk.context, &node.keccak256(&address)) orelse
+                return null;
+            const empty = std.mem.eql(u8, &record.storage_root, &node.empty_root);
+            return .{ .info = record.info, .storage_slots = @intFromBool(!empty) };
+        }
         return self.account_table.get(address);
     }
 
-    /// True when the account holds at least one nonzero storage slot.
+    /// True when the account holds at least one nonzero storage slot (disk mode: its storage
+    /// root is not the empty root).
     pub fn has_storage(self: *const State, address: Address) bool {
+        if (self.disk != null) {
+            const entry = self.account(address) orelse return false;
+            assert(entry.storage_slots <= 1);
+            return entry.storage_slots == 1;
+        }
         const entry = self.account_table.get(address) orelse return false;
         assert(entry.storage_slots <= self.storage_table.count());
         return entry.storage_slots > 0;
     }
 
     pub fn storage(self: *const State, address: Address, slot: u256) u256 {
+        if (self.disk) |disk| {
+            var slot_bytes: [32]u8 = undefined;
+            std.mem.writeInt(u256, &slot_bytes, slot, .big);
+            const address_hash = node.keccak256(&address);
+            return disk.storage(disk.context, &address_hash, &node.keccak256(&slot_bytes));
+        }
         return self.storage_table.get(.{ .address = address, .slot = slot }) orelse 0;
     }
 
@@ -354,11 +411,17 @@ pub const State = struct {
 
     pub fn state_root(self: *State) Error!Hash {
         assert(!self.trie_stale);
+        if (self.disk) |disk| {
+            assert(self.state_trie.account_count() == 0);
+            return disk.root(disk.context);
+        }
         return self.state_trie.root();
     }
 
     /// Writes one account directly (genesis), outside any changeset. Keeps its storage.
+    /// Not in disk mode (state moves only by changesets there).
     pub fn put_account(self: *State, address: Address, info: AccountInfo) Error!void {
+        assert(self.disk == null);
         const table = &self.account_table;
         if (!table.contains(address) and table.count() == self.config.accounts_max) {
             return error.StateFull;
@@ -372,6 +435,7 @@ pub const State = struct {
 
     /// Writes one storage slot of an existing account directly (genesis); zero deletes it.
     pub fn put_storage(self: *State, address: Address, slot: u256, value: u256) Error!void {
+        assert(self.disk == null);
         const entry = self.account_table.getPtr(address) orelse return error.UnknownAccount;
         const key: SlotKey = .{ .address = address, .slot = slot };
         if (value != 0 and !self.storage_table.contains(key) and
@@ -421,6 +485,7 @@ pub const State = struct {
     /// entry. `scratch` holds the sorted keys (`build_trie_scratch_bytes`). On error the
     /// state must be discarded.
     pub fn build_trie(self: *State, scratch: []u8) Error!void {
+        assert(self.disk == null);
         assert(!self.trie_stale);
         assert(self.state_trie.account_count() == 0);
         assert(scratch.len >= self.build_trie_scratch_bytes());
@@ -457,6 +522,7 @@ pub const State = struct {
     /// (no reads of the root, applies, or unwinds in between). Same tables as `unwind`.
     /// Fails before any change if the tables could overflow.
     pub fn unwind_tables(self: *State, changeset: *const Changeset) Error!void {
+        assert(self.disk == null);
         const accounts = changeset.account_changes();
         if (self.account_table.count() + accounts.len > self.config.accounts_max) {
             return error.StateFull;
@@ -557,7 +623,12 @@ pub const State = struct {
 
     /// Applies a block forward.
     pub fn apply(self: *State, changeset: *const Changeset) Error!void {
-        try self.apply_direction(changeset, true);
+        if (self.disk) |disk| {
+            assert(self.account_table.count() == 0);
+            try disk.apply(disk.context, changeset, true);
+        } else {
+            try self.apply_direction(changeset, true);
+        }
         for (0..changeset.codes_len) |index| {
             _ = try self.insert_code(changeset.code(@intCast(index)));
         }
@@ -565,6 +636,10 @@ pub const State = struct {
 
     /// Reverts a block: applies its changeset backward.
     pub fn unwind(self: *State, changeset: *const Changeset) Error!void {
+        if (self.disk) |disk| {
+            assert(self.account_table.count() == 0);
+            return disk.apply(disk.context, changeset, false);
+        }
         try self.apply_direction(changeset, false);
     }
 

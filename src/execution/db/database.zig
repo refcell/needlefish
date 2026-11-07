@@ -50,6 +50,21 @@
 //! A checkpoint waits until both trees are `checkpoint_ready` (a replay that filled into the
 //! reserve while a flush was pending: the flush runs unpaced and installs first), so the next
 //! replay always has a full reserve.
+//! Disk mode (`Config.disk_state`, needs flat trees, no history): `State` dispatches accounts,
+//! slots, the root, and every apply and unwind to a `DiskState` over the four flat trees
+//! (`state.zig`), so head moves write the trees through `State` and there is no shadow write.
+//! A live head move first reserves the account and storage puts as above plus
+//! `record_writes_max` branch puts per block per branch tree; the branch trees hold one
+//! largest move above their flush trigger (`branch_operation_entries`), so a refused move
+//! always fits once the memtables swap. Replay cannot compact, so the branch trees also keep a
+//! replay reserve (`replay_record_writes_max`), and admission keeps the branch writes the
+//! journal can replay within it: the writes since the fallback checkpoint's snapshot (counted
+//! per checkpoint interval, the last closed one carried in the checkpoint) plus the move's
+//! bound must fit, or the operation is `error.Busy` and a checkpoint is wanted. The
+//! checkpoint (version 5) is version 4 plus that count, with no account or slot image (the
+//! snapshot keeps codes no table holds and block hashes); open restores the root from the
+//! head's state root and checks that its root record resolves to it. `import_head` makes a
+//! bulk-imported state the head of an empty database.
 //!
 //! Historical proofs (optional, `Config.history`): the database owns a `history.Store` and
 //! updates it on every live head move: `unwind_to` the fork point, then `commit_block` for
@@ -83,6 +98,7 @@ const snapshot_module = @import("snapshot.zig");
 const history_module = @import("history.zig");
 const code_store_module = @import("code_store.zig");
 const flat_trees_module = @import("flat_trees.zig");
+const disk_state_module = @import("disk_state.zig");
 const trie_module = @import("../trie/root.zig");
 
 const StateTrie = trie_module.StateTrie;
@@ -281,16 +297,22 @@ pub const checkpoint_version_tables: u16 = 2;
 /// refused: no migration, the datadir is formatted again.
 pub const checkpoint_version_flat: u16 = 4;
 pub const checkpoint_version_flat_v3: u16 = 3;
+/// Version 5 (disk mode): version 4 with the branch writes of the checkpoint interval it
+/// closes (u64, after the flat trees' bytes), and a snapshot without accounts or slots.
+pub const checkpoint_version_disk: u16 = 5;
 
 /// Whether a checkpoint of `version` opens with the given config (`flat` trees on, a
-/// `grid`): version 1 (no tables) only without flat trees, version 2 only with a grid and
-/// without flat trees, version 4 only with flat trees; version 3 never.
-pub fn checkpoint_version_valid(version: u16, flat: bool, grid: bool) bool {
+/// `grid`, `disk` mode): version 1 (no tables) only without flat trees, version 2 only with
+/// a grid and without flat trees, version 4 only with flat trees outside disk mode, version 5
+/// only in disk mode; version 3 never.
+pub fn checkpoint_version_valid(version: u16, flat: bool, grid: bool, disk: bool) bool {
     assert(!flat or grid);
+    assert(!disk or flat);
     return switch (version) {
         checkpoint_version => !flat,
         checkpoint_version_tables => grid and !flat,
-        checkpoint_version_flat => flat,
+        checkpoint_version_flat => flat and !disk,
+        checkpoint_version_disk => disk,
         else => false,
     };
 }
@@ -343,6 +365,32 @@ pub const Config = struct {
     flat_storage_branches_max: ?u64 = null,
     /// Mutable memtable entries at which a branch tree flushes (entries ~1.1 KiB each).
     flat_branch_flush_entries_min: u32 = 1024,
+    /// Disk mode (needs `flat_trees`, no `history`); null keeps state in RAM.
+    disk_state: ?DiskStateConfig = null,
+
+    /// Head-move blocks one live operation moves State by at most: the reorg plan's unwinds
+    /// and applies, plus the first head's oldest walked block.
+    pub fn move_blocks_max(config: Config) u64 {
+        return 2 * @as(u64, config.chain.reorg_depth_max) + 1;
+    }
+
+    /// `DiskState`'s config, null outside disk mode.
+    pub fn disk_state_config(config: Config) ?disk_state_module.Config {
+        const disk = config.disk_state orelse return null;
+        assert(config.flat_trees and config.history == null);
+        assert(disk.record_writes_max > 0);
+        // One largest move always fits the replay reserve once the journal is clear.
+        assert(disk.replay_record_writes_max >= disk.record_writes_max * config.move_blocks_max());
+        return .{
+            .trie_nodes_max = disk.trie_nodes_max,
+            .storage_tries_max = disk.storage_tries_max,
+            .memo_entries_max = disk.memo_entries_max,
+            .memo_bytes_max = disk.memo_bytes_max,
+            .record_writes_max = disk.record_writes_max,
+            .record_write_bytes_max = disk.record_write_bytes_max,
+            .changeset = config.changeset,
+        };
+    }
 
     /// The flat trees' config, null when off.
     pub fn flat_trees_config(config: Config) ?flat_trees_module.Config {
@@ -362,6 +410,14 @@ pub const Config = struct {
             .storage_branches_max = config.flat_storage_branches_max orelse slots_max,
             .flush_entries_min = config.flat_flush_entries_min,
             .branch_flush_entries_min = config.flat_branch_flush_entries_min,
+            .branch_operation_entries = if (config.disk_state) |disk|
+                @intCast(disk.record_writes_max * config.move_blocks_max())
+            else
+                0,
+            .branch_replay_entries = if (config.disk_state) |disk|
+                disk.replay_record_writes_max
+            else
+                0,
             .cache_blocks = config.flat_cache_blocks,
         };
     }
@@ -395,6 +451,23 @@ pub const Config = struct {
         return std.math.divCeil(u64, config.checkpoint_bytes_per_commit, block_size) catch
             unreachable;
     }
+};
+
+/// Disk mode (`Config.disk_state`): `DiskState`'s per-block bounds and the branch trees'
+/// replay reserve.
+pub const DiskStateConfig = struct {
+    /// Sparse trie nodes, storage tries, and locator memo entries and bytes per block.
+    trie_nodes_max: u32,
+    storage_tries_max: u32,
+    memo_entries_max: u32,
+    memo_bytes_max: u32,
+    /// Branch-record writes (puts and tombstones, both trees) and their bytes per block; a
+    /// block that makes more is refused (`StateFull`).
+    record_writes_max: u32,
+    record_write_bytes_max: u32,
+    /// Branch-record writes the journal since the fallback checkpoint may replay (each
+    /// branch tree's replay reserve); at least one largest move's bound.
+    replay_record_writes_max: u32,
 };
 
 /// Grid blocks for the code tables of `state` (the node default): four times the blocks
@@ -504,6 +577,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         pub const Engine = engine_module.EngineType(Storage);
         pub const CodeStore = code_store_module.CodeStoreType(Storage);
         pub const FlatTrees = flat_trees_module.FlatTreesType(Storage);
+        pub const DiskState = disk_state_module.DiskStateType(FlatTrees);
         pub const DurableCallback = *const fn (context: ?*anyopaque, sequence: u64) void;
 
         engine: Engine,
@@ -574,6 +648,19 @@ pub fn DatabaseType(comptime Storage: type) type {
         code_flushed: bool = false,
         /// Flat account and storage trees (`Config.flat_trees`), null when off.
         flat: ?FlatTrees = null,
+        /// Disk mode (`Config.disk_state`): the state over `flat`, bound at `open`.
+        disk: ?DiskState = null,
+        /// Disk mode admission: branch writes of the checkpoint interval before the newest
+        /// completed checkpoint (`closed`), of intervals whose checkpoint has not completed
+        /// (`pending`), and since the last checkpoint snapshot (`current`). Their sum bounds
+        /// what a replay from the fallback checkpoint writes.
+        disk_writes_closed: u64 = 0,
+        disk_writes_pending: u64 = 0,
+        disk_writes_current: u64 = 0,
+        /// Operations refused because the journal's branch writes could outgrow the reserve.
+        disk_admission_busy: u64 = 0,
+        /// This open streams the fallback checkpoint (the newest did not verify).
+        open_fallback: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, storage: *Storage, config: Config) !Self {
             assert(config.queue_entries_max > 0);
@@ -620,8 +707,11 @@ pub fn DatabaseType(comptime Storage: type) type {
                 flat = try FlatTrees.init(allocator, &engine.grid.?, flat_config);
             }
             errdefer if (flat) |*trees| trees.deinit(allocator);
+            var disk = try disk_init(allocator, config, if (flat) |*trees| trees else null);
+            errdefer if (disk) |*state_disk| state_disk.deinit(allocator);
             const buffers = try Buffers.init(allocator, config);
             return .{
+                .disk = disk,
                 .flat = flat,
                 .code_store = code_store,
                 .engine = engine,
@@ -639,6 +729,14 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .staging = buffers.staging,
                 .history = history_store,
             };
+        }
+
+        /// Disk mode's state over `trees`; its trees pointer is bound again at `open` (the
+        /// database moves after init).
+        fn disk_init(allocator: std.mem.Allocator, config: Config, trees: ?*FlatTrees) !?DiskState {
+            const disk_config = config.disk_state_config() orelse return null;
+            const root = trie_module.node.empty_root;
+            return try DiskState.init(allocator, trees.?, root, disk_config);
         }
 
         const Buffers = struct {
@@ -672,6 +770,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// Frees memory. After a simulated crash, engine operations may still be in flight.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.disk) |*disk| disk.deinit(allocator);
             if (self.flat) |*trees| trees.deinit(allocator);
             if (self.code_store) |*store| store.deinit(allocator);
             if (self.history) |*store| store.deinit(allocator);
@@ -718,7 +817,13 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(self.phase == .closed);
             assert(self.chain.block_count() == 0);
             assert(self.state.account_table.count() == 0);
+            if (self.disk) |*disk| {
+                // Pinned from here on: bind the state to the trees and to this database.
+                disk.trees = &self.flat.?;
+                self.state.disk = self.disk_backend();
+            }
             self.phase = .opening;
+            self.open_fallback = false;
             self.staging_len = 0;
             self.load_done = false;
             self.load_error = null;
@@ -752,6 +857,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             // Staging overflow is the only load error before the first entry.
             self.staging_len = 0;
             self.load_error = null;
+            self.open_fallback = true;
         }
 
         /// The engine paused after loading the checkpoint: read the code tables it names into
@@ -834,7 +940,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         fn checkpoint_version_expected(self: *const Self, version: u16) !u16 {
             const flat = self.flat != null;
             const grid = self.code_store != null;
-            if (!checkpoint_version_valid(version, flat, grid)) return error.CheckpointInvalid;
+            const disk = self.disk != null;
+            if (!checkpoint_version_valid(version, flat, grid, disk)) {
+                return error.CheckpointInvalid;
+            }
             assert(version != checkpoint_version_flat_v3);
             return version;
         }
@@ -1064,6 +1173,45 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(std.mem.eql(u8, &self.head_info.hash, &block.hash));
             const body = encode_block_and_head(block, self.queue_slot());
             return self.queue_push(@intCast(body.len));
+        }
+
+        /// Disk mode, an importer's first head: the trees hold block `head_meta`'s post-state
+        /// with root `state_root` (bulk-loaded, `FlatTrees.bulk_begin`..`bulk_end`), and the
+        /// caller has inserted the codes (`state.insert_code`) and set the block hashes
+        /// (`state.set_block_hash`). Checks that the root resolves in the trees
+        /// (`StateCorrupt` otherwise, nothing changed), makes the block the head with no
+        /// stored block (`ChainStore.restore_evicted_head`; the next block builds on it),
+        /// journals a `head` entry, and wants a checkpoint. Durable once that checkpoint
+        /// completes; an open before then fails (`ReplayFailed`: the journal's head names a
+        /// block it does not store) and the importer formats again.
+        pub fn import_head(
+            self: *Self,
+            head_meta: BlockMeta,
+            state_root: Hash,
+        ) OperationError!u64 {
+            const disk = &self.disk.?;
+            assert(!self.head_info.present and self.chain.block_count() == 0);
+            assert(self.chain.head() == null);
+            assert(self.flat.?.bulk == null);
+            try self.check_accepting(1, journal_module.entry_size_bytes(head_entry_size));
+            disk.set_root(state_root);
+            disk.check_root() catch {
+                disk.set_root(trie_module.node.empty_root);
+                return error.StateCorrupt;
+            };
+            self.chain.restore_evicted_head(head_meta);
+            self.head_info = .{
+                .present = true,
+                .number = head_meta.number,
+                .hash = head_meta.hash,
+                .state_root = state_root,
+            };
+            const body = encode_head(&head_meta.hash, self.queue_slot());
+            const sequence = self.queue_push(@intCast(body.len));
+            self.checkpoint_wanted = true;
+            self.checkpoint_maybe_start();
+            assert(std.mem.eql(u8, &self.chain.head().?.hash, &head_meta.hash));
+            return sequence;
         }
 
         /// Holds (or releases) checkpoint starts; see `checkpoints_held`.
@@ -1308,14 +1456,17 @@ pub fn DatabaseType(comptime Storage: type) type {
         }
 
         /// Live head moves only: fails with `error.Busy` before any change when the flat
-        /// trees lack memtable room for every put the planned move can make.
+        /// trees lack memtable room for every put the planned move can make (disk mode: also
+        /// `record_writes_max` branch puts per moved block, and the replay admission).
         fn flat_reserve_plan(self: *Self) OperationError!void {
             const trees = if (self.flat) |*trees| trees else return;
             if (self.phase != .ready) return; // Replay writes into the replay reserve.
             var puts: flat_trees_module.Puts = .{};
+            var blocks: u64 = 0;
             if (self.chain.head() == null) {
                 const view = self.chain.block(self.plan.ancestor.hash).?;
                 FlatTrees.puts_add(&puts, view.changeset) catch return error.InvalidChangeset;
+                blocks += 1;
             }
             for ([2][]const Hash{ self.plan.unwind_hashes(), self.plan.apply_hashes() }) |hashes| {
                 for (hashes) |hash| {
@@ -1323,14 +1474,23 @@ pub fn DatabaseType(comptime Storage: type) type {
                     FlatTrees.puts_add(&puts, view.changeset) catch
                         return error.InvalidChangeset;
                 }
+                blocks += hashes.len;
+            }
+            assert(blocks <= self.config.move_blocks_max());
+            if (self.config.disk_state) |disk_config| {
+                puts.account_branches = blocks * disk_config.record_writes_max;
+                puts.storage_branches = blocks * disk_config.record_writes_max;
             }
             try trees.reserve(puts, self.config.checkpoint_blocks_per_commit());
+            try self.disk_admit(blocks);
         }
 
         /// `commit_applied`: reserves the flat trees' room for the block's changeset and
-        /// decodes it into `self.changeset` for `flat_write` (State already holds it).
+        /// decodes it into `self.changeset` for `flat_write` (State already holds it). Disk
+        /// mode: nothing to do, the caller's `State.apply` reserved and wrote the trees.
         fn flat_reserve_applied(self: *Self, input: *const BlockInput) OperationError!void {
             const trees = if (self.flat) |*trees| trees else return;
+            if (self.disk != null) return;
             assert(self.phase == .ready);
             var puts: flat_trees_module.Puts = .{};
             FlatTrees.puts_add(&puts, input.changeset) catch return error.InvalidChangeset;
@@ -1344,6 +1504,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// or a missed reserve.
         fn flat_write(self: *Self, forward: bool) OperationError!void {
             const trees = if (self.flat) |*trees| trees else return;
+            // Disk mode: `State` moved by writing the trees; nothing to shadow.
+            if (self.disk != null) return;
             const mode: FlatTrees.Mode = if (self.phase == .opening) .replay else .live;
             assert(mode == .replay or self.phase == .ready);
             assert(!self.state.trie_stale);
@@ -1367,6 +1529,88 @@ pub fn DatabaseType(comptime Storage: type) type {
                 return source.state.state_trie.storage_root(address_hash.*);
             }
         };
+
+        // Disk mode: `State.disk`, admission.
+
+        fn disk_backend(self: *Self) state_module.Disk {
+            assert(self.disk != null);
+            return .{
+                .context = self,
+                .account = disk_account,
+                .storage = disk_storage,
+                .root = disk_root,
+                .apply = disk_apply,
+            };
+        }
+
+        fn disk_of(context: *anyopaque) *DiskState {
+            const self: *Self = @ptrCast(@alignCast(context));
+            return &self.disk.?;
+        }
+
+        fn disk_account(context: *anyopaque, address_hash: *const Hash) ?state_module.DiskAccount {
+            return disk_of(context).account(address_hash);
+        }
+
+        fn disk_storage(
+            context: *anyopaque,
+            address_hash: *const Hash,
+            slot_hash: *const Hash,
+        ) u256 {
+            return disk_of(context).storage(address_hash, slot_hash);
+        }
+
+        fn disk_root(context: *anyopaque) Hash {
+            return disk_of(context).root();
+        }
+
+        /// One block through `DiskState`: live (admitted, and a refusal for memtable room
+        /// grants compaction once more, as `FlatTrees.reserve` does), or replay (into the
+        /// replay reserves). Counts the branch writes for admission.
+        fn disk_apply(
+            context: *anyopaque,
+            changeset: *const Changeset,
+            forward: bool,
+        ) state_module.Error!void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const disk = &self.disk.?;
+            const live = self.phase != .opening;
+            disk.mode = if (live) .live else .replay;
+            if (self.phase == .ready) try self.disk_admit(1);
+            disk.apply(changeset, forward) catch |err| switch (err) {
+                error.Busy => {
+                    if (self.phase == .ready) {
+                        const trees = &self.flat.?;
+                        trees.stats.busy += 1;
+                        trees.compact(self.config.checkpoint_blocks_per_commit());
+                    }
+                    return error.Busy;
+                },
+                error.Corrupt => return error.StateCorrupt,
+                error.Full => return error.StateFull,
+                error.Unsupported => return error.Unsupported,
+            };
+            self.disk_writes_current += disk.record_writes_len;
+            assert(disk.record_writes_len <= self.config.disk_state.?.record_writes_max);
+        }
+
+        /// Disk mode, live: refuses (`error.Busy`) a move of `blocks` blocks whose branch
+        /// writes could take the journal's past the replay reserve, and wants a checkpoint
+        /// (its completion retires the writes before the fallback checkpoint).
+        fn disk_admit(self: *Self, blocks: u64) error{Busy}!void {
+            const disk_config = self.config.disk_state orelse return;
+            assert(self.phase == .ready);
+            assert(blocks <= self.config.move_blocks_max());
+            const span = self.disk_writes_closed + self.disk_writes_pending +
+                self.disk_writes_current;
+            if (span + blocks * disk_config.record_writes_max <=
+                disk_config.replay_record_writes_max) return;
+            self.disk_admission_busy += 1;
+            self.checkpoint_wanted = true;
+            self.checkpoint_maybe_start();
+            self.checkpoint_flush();
+            return error.Busy;
+        }
 
         fn apply_block(self: *Self, hash: Hash) OperationError!void {
             const view = self.chain.block(hash).?;
@@ -1661,6 +1905,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         ) ProofError!?history_module.AccountState {
             assert(slots.len == storage_proofs.len and slots.len == values.len);
             if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            // Disk mode keeps no `StateTrie` and no history (proofs over records: later).
+            if (self.disk != null) return error.HistoryUnavailable;
             if (self.history_tracking()) |store| {
                 const proofs = storage_proofs;
                 return store.get_proof(number, address, slots, account_proof, proofs, values);
@@ -1683,6 +1929,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         ) ProofError!?history_module.AccountState {
             assert(slots.len <= set.capacity());
             if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            if (self.disk != null) return error.HistoryUnavailable;
             const store = self.history_tracking() orelse return error.HistoryUnavailable;
             assert(store.window() != null);
             return store.get_proofs(number, address, slots, account_proof, set);
@@ -1704,6 +1951,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             out: []history_module.StorageEntry,
         ) ProofError!history_module.StorageRange {
             if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            if (self.disk != null) return error.HistoryUnavailable;
             assert(!self.state.trie_stale);
             if (number == self.head_info.number) {
                 return self.state.state_trie.storage_range(address_hash, start, max, out);
@@ -1821,6 +2069,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(self.phase == .ready);
             if (engine.checkpoint_result) |_| {
                 self.checkpoints_completed += 1;
+                // The checkpoint before this one is the fallback now: only the interval it
+                // closed (and the writes since) can be replayed.
+                self.disk_writes_closed = self.disk_writes_pending;
+                self.disk_writes_pending = 0;
             } else |err| self.checkpoint_error = err;
             self.pump();
             self.checkpoint_maybe_start();
@@ -1844,6 +2096,18 @@ pub fn DatabaseType(comptime Storage: type) type {
                 }
                 position += trees.checkpoint_encode(self.staging[position..]);
             }
+            if (self.disk != null) {
+                // The snapshot point closes an interval: its writes stay pending until this
+                // checkpoint completes (and are what an open from it carries).
+                self.disk_writes_pending += self.disk_writes_current;
+                self.disk_writes_current = 0;
+                if (8 > self.staging.len - position) return error.CheckpointTooLarge;
+                const writes = self.disk_writes_pending;
+                std.mem.writeInt(u64, self.staging[position..][0..8], writes, .little);
+                position += 8;
+                assert(self.state.account_table.count() == 0);
+                assert(self.state.storage_table.count() == 0);
+            }
             var sink: snapshot_module.BufferSink = .{ .buffer = self.staging[position..] };
             try snapshot_module.write_filtered(&self.state, &sink, filter);
             const snapshot_len: u32 = @intCast(sink.position);
@@ -1865,7 +2129,9 @@ pub fn DatabaseType(comptime Storage: type) type {
         fn checkpoint_write_header(self: *Self, snapshot_len: u32, block_count: u32) void {
             var writer: Writer = .{ .buffer = self.staging[0..checkpoint_header_size] };
             writer.int(u32, checkpoint_magic);
-            const version = if (self.flat != null)
+            const version = if (self.disk != null)
+                checkpoint_version_disk
+            else if (self.flat != null)
                 checkpoint_version_flat
             else if (self.code_store != null)
                 checkpoint_version_tables
@@ -1934,11 +2200,16 @@ pub fn DatabaseType(comptime Storage: type) type {
                 const count = try reader.int(u32);
                 _ = try reader.bytes(@as(u64, count) * CodeStore.info_size);
             }
-            if (version == checkpoint_version_flat) {
+            if (version == checkpoint_version_flat or version == checkpoint_version_disk) {
                 // Every tree, decoded (and scanned) during the open pause.
                 for (0..flat_trees_module.tree_count) |_| {
                     _ = try reader.bytes(try reader.int(u32));
                 }
+            }
+            if (version == checkpoint_version_disk) {
+                const writes = try reader.int(u64);
+                const root = if (present == 1) state_root else trie_module.node.empty_root;
+                try self.disk_load(writes, root);
             }
             try self.snapshot_load(try reader.bytes(snapshot_len));
             for (0..block_count) |_| {
@@ -1962,6 +2233,22 @@ pub fn DatabaseType(comptime Storage: type) type {
             };
         }
 
+        /// Disk mode: the state is the trees' at `root` (the head's state root), which must
+        /// resolve; the admission counts restart from the interval this checkpoint closed (a
+        /// fallback open does not know the one before: assume the whole reserve, so the next
+        /// operation waits for a checkpoint).
+        fn disk_load(self: *Self, writes: u64, root: Hash) !void {
+            const disk = &self.disk.?;
+            assert(disk.trees == &self.flat.?);
+            disk.set_root(root);
+            disk.check_root() catch return error.CheckpointInvalid;
+            const reserve = self.config.disk_state.?.replay_record_writes_max;
+            self.disk_writes_closed = if (self.open_fallback) reserve else writes;
+            self.disk_writes_pending = 0;
+            self.disk_writes_current = 0;
+            assert(std.mem.eql(u8, &disk.root(), &root));
+        }
+
         /// Loads the checkpoint's snapshot (`load_mode`) and checks its root. The snapshot
         /// bytes are scratch for the bulk trie build afterwards (they lie in `staging`, which
         /// the engine no longer reads once the checkpoint is verified).
@@ -1975,8 +2262,15 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .incremental => try snapshot_module.load_incremental_tables(&self.state, &source),
             };
             if (source.position != bytes.len) return error.CheckpointInvalid;
+            if (self.disk != null) {
+                // Disk mode: codes and block hashes only (accounts and slots are the trees').
+                const count = self.state.account_table.count() + self.state.storage_table.count();
+                if (count > 0) return error.CheckpointInvalid;
+            }
             self.trace(.snapshot_tables);
-            if (self.load_mode == .bulk) try snapshot_module.build_trie(&self.state, scratch);
+            if (self.load_mode == .bulk and self.disk == null) {
+                try snapshot_module.build_trie(&self.state, scratch);
+            }
             self.trace(.snapshot_trie);
             try snapshot_module.verify(&self.state, &expected);
             self.trace(.snapshot_root);

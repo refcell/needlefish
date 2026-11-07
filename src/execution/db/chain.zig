@@ -342,12 +342,14 @@ pub const ChainStore = struct {
         var current = self.meta(new_head) orelse return error.UnknownBlock;
         // Walk the new branch down until it meets the canonical chain. Before the first head
         // exists, the walk ends at the block whose parent is unknown (genesis).
-        while (!self.is_canonical(current.hash)) {
+        // An evicted head (`restore_evicted_head`) is canonical too: a block can build on it.
+        while (!self.is_canonical(current.hash) and self.evicted_head(current.hash) == null) {
             if (self.head_meta == null and self.meta(current.parent_hash) == null) break;
             if (plan.apply_len == plan.apply.len) return error.ReorgTooDeep;
             plan.apply[plan.apply_len] = current.hash;
             plan.apply_len += 1;
-            current = self.meta(current.parent_hash) orelse return error.UnknownParent;
+            current = self.meta(current.parent_hash) orelse
+                self.evicted_head(current.parent_hash) orelse return error.UnknownParent;
         }
         std.mem.reverse(Hash, plan.apply[0..plan.apply_len]);
         plan.ancestor = current;
@@ -381,6 +383,15 @@ pub const ChainStore = struct {
         }
         self.head_meta = new_head;
         assert(self.is_canonical(new_head.hash));
+    }
+
+    /// The head's metadata when `hash` is the head and its block is not stored.
+    fn evicted_head(self: *const ChainStore, hash: Hash) ?BlockMeta {
+        const head_meta = self.head_meta orelse return null;
+        if (!std.mem.eql(u8, &head_meta.hash, &hash)) return null;
+        if (self.meta(hash) != null) return null;
+        assert(self.canonical_hash(head_meta.number) != null);
+        return head_meta;
     }
 
     /// First head whose block was evicted (a checkpoint keeps its metadata only): the head

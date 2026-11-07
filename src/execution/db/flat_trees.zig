@@ -31,7 +31,9 @@
 //! account record from an account entry or from a storage entry of its address), and an
 //! entry is at least `account_put_bytes_min` (or `storage_put_bytes_min`) encoded bytes, so
 //! (journal bytes + retained chain bytes) / entry bytes bounds it. The branch trees get no
-//! replay reserve (head moves do not write them yet).
+//! replay reserve unless in disk mode (`Database.Config.disk_state`, where `DiskState` writes
+//! them): then `branch_replay_entries`, which the database's admission keeps the journal
+//! within, and `branch_operation_entries` of room for one head move.
 //!
 //! Sizes: key limits are `u64` and independent of `State.Config` (which sizes RAM tables), and
 //! tables are cut at one index block's worth of records (`table_records_cap`), independent of
@@ -114,6 +116,11 @@ pub const Config = struct {
     /// many; entries are up to ~1.1 KiB of static memory each). Level sizes grow from it, so
     /// it bounds the keys a tree can hold: 8 x it x 8^6 (1024: ~2.1B keys, 4096: ~8.6B).
     branch_flush_entries_min: u32,
+    /// Disk mode: branch puts one live head move makes at most (normal puts always fit below
+    /// the flush trigger, so a refused move clears once the memtables swap), and branch puts
+    /// a journal replay may make (its reserve). Zero without disk mode.
+    branch_operation_entries: u32 = 0,
+    branch_replay_entries: u32 = 0,
     /// Blocks of the block cache every tree's reads share.
     cache_blocks: u32,
 };
@@ -175,10 +182,14 @@ pub fn tree_config(
     };
 }
 
-/// The tree config of a branch tree: no replay reserve (head moves do not write it).
+/// The tree config of a branch tree: twice the flush trigger, plus (disk mode) one head move's
+/// branch puts and the replay reserve. Normal puts stop at `2 x flush + operation`: below the
+/// flush trigger more than `operation` entries are always free, so a move refused for room
+/// fits once the memtables swap.
 pub fn branch_tree_config(config: Config, keys_max: u64, records_cap: u32) lsm.Config {
     assert(config.branch_flush_entries_min > 0 and records_cap > 0);
-    const memtable: u64 = 2 * @as(u64, config.branch_flush_entries_min);
+    const memtable: u64 = 2 * @as(u64, config.branch_flush_entries_min) +
+        config.branch_operation_entries + config.branch_replay_entries;
     assert(memtable < std.math.maxInt(u32) / 4);
     const level0_tables_max: u32 = 4;
     const growth_factor: u32 = 8;
@@ -187,7 +198,7 @@ pub fn branch_tree_config(config: Config, keys_max: u64, records_cap: u32) lsm.C
         .block_count = config.block_count,
         .memtable_entries_max = @intCast(memtable),
         .flush_entries_min = config.branch_flush_entries_min,
-        .replay_entries_max = 0,
+        .replay_entries_max = config.branch_replay_entries,
         .table_records_max = @intCast(@min(memtable, records_cap)),
         .level0_tables_max = level0_tables_max,
         .levels_count = levels_for(level0_tables_max * memtable, keys_max, growth_factor),

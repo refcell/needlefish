@@ -66,4 +66,5 @@ test {
     _ = @import("database_flat_test.zig");
     _ = @import("branch_record_test.zig");
     _ = @import("disk_state_test.zig");
+    _ = @import("database_disk_test.zig");
 }

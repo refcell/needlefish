@@ -431,6 +431,16 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             return limit -| self.mutable_memtable().count;
         }
 
+        /// Entries `put_replay` may still add: the rest of the mutable memtable, and a whole
+        /// memtable more when the immutable one is empty (the full one swaps into it).
+        pub fn replay_capacity_free(self: *Tree) u32 {
+            const max = self.config.memtable_entries_max;
+            assert(self.mutable_memtable().count <= max);
+            const free = max - self.mutable_memtable().count;
+            if (self.immutable_memtable().count > 0) return free;
+            return free + max;
+        }
+
         /// Whether a value of `length` bytes is valid for this tree (0, a tombstone, is not).
         pub fn value_length_valid(length: usize) bool {
             if (variable) return length >= 1 and length <= value_size;

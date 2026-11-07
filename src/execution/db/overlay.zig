@@ -6,7 +6,8 @@
 //!
 //! Wipes are O(1): each overlay account has an epoch that a wipe bumps, and a slot written
 //! under an older epoch reads as absent. Only `commit` of a wiped account scans the committed
-//! storage table for that account's slots, which happens at most once per wiped account.
+//! storage table for that account's slots, which happens at most once per wiped account (in
+//! disk mode a wiped account must have no committed storage: see `add_wiped_slots`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -189,7 +190,19 @@ pub const Overlay = struct {
     }
 
     /// Records every committed slot of a wiped account, with its final overlay value.
+    ///
+    /// Disk mode cannot list an account's slots (no in-memory table, and the trees are point
+    /// lookups only), so wiping an account whose storage root is not empty is
+    /// `error.Unsupported` and the block is rejected. After Cancun this never rejects a valid
+    /// block: SELFDESTRUCT destroys only an account created in the same transaction
+    /// (EIP-6780), and a CREATE onto an address with storage fails (EIP-7610), so a wiped
+    /// account never has committed storage; its slots written this block are in `slots`.
     fn add_wiped_slots(self: *const Overlay, changeset: *Changeset, address: Address) Error!void {
+        if (self.base.disk != null) {
+            if (self.base.has_storage(address)) return error.Unsupported;
+            assert(self.base.storage_table.count() == 0);
+            return;
+        }
         var iterator = self.base.storage_table.iterator();
         while (iterator.next()) |entry| {
             if (!std.mem.eql(u8, &entry.key_ptr.address, &address)) continue;
