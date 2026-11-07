@@ -96,6 +96,7 @@ test {
     _ = el_peers;
     _ = el_run;
     _ = @import("el_source.zig");
+    _ = @import("el_pool.zig");
     _ = @import("metrics_server.zig");
 }
 

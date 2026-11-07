@@ -7,7 +7,11 @@
 //!
 //!     base el-peers [--chain base-sepolia|base-mainnet] [--duration <s>]
 //!                   [--fork-hash <8 hex digits>] [--port <udp port>] [--seed <enode>]...
+//!                   [--peers <file>]
 //!
+//! `--peers` seeds the crawl with the file's enodes (walked as hard as the bootnodes: a
+//! chain's nodes know more of it) and appends every newly found node to the file, which
+//! `el-run --peers` re-reads every minute.
 //! The discv4 table is shared by every Ethereum-family network, so most nodes found are
 //! other chains; the fork hash filter keeps the chain's own. Without `--fork-hash` every
 //! node with an `eth` entry is printed with its fork hash. A printed node is only a
@@ -26,10 +30,13 @@ const assert = std.debug.assert;
 const usage =
     \\usage: base el-peers [--chain base-sepolia|base-mainnet] [--duration <s>]
     \\                     [--fork-hash <8 hex digits>] [--port <udp port>] [--seed <enode>]...
+    \\                     [--peers <file>]
     \\
 ;
 
-const nodes_max = 32768;
+const nodes_max = 1 << 17;
+/// Largest peer file read or written.
+const peers_file_bytes_max = 64 * 1024;
 /// Distinct fork hashes counted for the summary.
 const forks_max = 64;
 /// New pings per loop pass: keeps the send rate near 50 packets per 100 ms.
@@ -44,6 +51,8 @@ const Flags = struct {
     duration_s: u64 = 120,
     fork_hash: ?[4]u8 = null,
     port: u16 = 0,
+    /// Known peers to seed from; every newly found one is appended.
+    peers: ?[]const u8 = null,
     /// Extra starting nodes, ahead of the bootnodes (for example a known peer list).
     seeds: [seeds_max][]const u8 = undefined,
     seeds_count: usize = 0,
@@ -66,6 +75,8 @@ fn parse_flags(args: []const []const u8) !Flags {
             if (value.len != 8) return error.InvalidArguments;
             _ = try std.fmt.hexToBytes(&hash, value);
             flags.fork_hash = hash;
+        } else if (std.mem.eql(u8, name, "--peers")) {
+            flags.peers = value;
         } else if (std.mem.eql(u8, name, "--seed")) {
             if (flags.seeds_count == seeds_max) return error.InvalidArguments;
             flags.seeds[flags.seeds_count] = value;
@@ -274,6 +285,32 @@ fn handle_enr(crawler: *Crawler, packet: *const discv4.Packet) void {
     var text: [enode.text_length_max]u8 = undefined;
     const line = format_enode(&text, node) catch return;
     std.debug.print("el-peers: fork {x} next {d} {s}\n", .{ &fork.hash, fork.next, line });
+    if (crawler.flags.peers) |path| append_peer(crawler.io, path, line) catch |err| {
+        std.debug.print("el-peers: cannot update {s}: {t}\n", .{ path, err });
+    };
+}
+
+/// Adds `line` to the peer file at `path` unless a line with the same node id is there.
+fn append_peer(io: Io, path: []const u8, line: []const u8) !void {
+    var buffer: [peers_file_bytes_max]u8 = undefined;
+    const existing = Io.Dir.cwd().readFile(io, path, buffer[0 .. buffer.len - 512]) catch |err|
+        switch (err) {
+            error.FileNotFound => buffer[0..0],
+            else => return err,
+        };
+    const id_end = std.mem.indexOfScalar(u8, line, '@') orelse return error.InvalidEnode;
+    if (std.mem.indexOf(u8, existing, line[0..id_end]) != null) return;
+    if (line.len + 1 > buffer.len - existing.len) return error.FileTooLarge;
+    var length = existing.len;
+    if (length > 0 and buffer[length - 1] != '\n') {
+        buffer[length] = '\n';
+        length += 1;
+    }
+    @memcpy(buffer[length..][0..line.len], line);
+    length += line.len;
+    buffer[length] = '\n';
+    length += 1;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buffer[0..length] });
 }
 
 fn format_enode(output: []u8, node: *const Node) ![]u8 {
@@ -316,6 +353,13 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     try crawler.index.ensureTotalCapacity(init.gpa, nodes_max);
     defer crawler.index.deinit(init.gpa);
     for (flags.seeds[0..flags.seeds_count]) |text| add_enode(&crawler, text, lookups_per_node);
+    // Known peers of the chain: their tables hold more of it, so walk them hard.
+    var peers_buffer: [peers_file_bytes_max]u8 = undefined;
+    if (flags.peers) |path| {
+        const text = Io.Dir.cwd().readFile(io, path, &peers_buffer) catch "";
+        var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+        while (lines.next()) |line| add_enode(&crawler, line, lookups_per_bootnode);
+    }
     for (flags.chain.bootnodes.execution) |text| add_enode(&crawler, text, lookups_per_bootnode);
     if (crawler.count == 0) return error.NoBootnodes;
     try crawl(&crawler);

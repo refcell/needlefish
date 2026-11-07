@@ -5,19 +5,27 @@
 //! (docs/UNSAFE_TIP.md).
 //!
 //!     base el-fetch --enode <enode://...> --from <block|tip> [--count <n>] [--batch <n>]
-//!                   [--parent <hash>] [--follow] [--duration <s>] [--verbose]
+//!                   [--parent <hash>] [--follow] [--duration <s>] [--verbose] [--trace]
 //!                   [--chain base-sepolia|base-mainnet]
 //!
 //! `--from tip` starts at the peer's head. `--parent` binds the first block to a known hash
 //! (the snapshot block's). `--follow` keeps going past `--count`: it polls for the next
 //! block every 100 ms and prints each one with its tip lag (now minus the block's scheduled
 //! time), for `--duration` seconds. A dropped connection is reopened and the range resumes
-//! from the last linked block. `--verbose` prints every block's hash.
+//! from the last linked block. `--verbose` prints every block's hash; `--trace` every
+//! response's size and latency.
+//!
+//! `--peers <file>` (one enode per line) fetches through `el_feed.zig` instead: from every
+//! peer at once (`el_pool.zig`) up to a few hundred blocks below the tip, then one peer
+//! following the tip, from `--from <block>` for `--count` blocks or `--duration` seconds.
+//! It reports the download rate and, once at the tip, the lag: blocks are checked and
+//! linked, not executed.
 
 const std = @import("std");
 const base = @import("base");
 
 const el_source = @import("el_source.zig");
+const el_feed = @import("el_feed.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 const enode = base.consensus.p2p.peers.enode;
 const curve = base.common.crypto.secp256k1;
@@ -26,18 +34,22 @@ const assert = std.debug.assert;
 
 const usage =
     \\usage: base el-fetch --enode <enode://...> --from <block|tip> [--count <n>] [--batch <n>]
-    \\                     [--parent <hash>] [--follow] [--duration <s>] [--verbose]
+    \\                     [--parent <hash>] [--follow] [--duration <s>] [--verbose] [--trace]
     \\                     [--chain base-sepolia|base-mainnet]
+    \\       base el-fetch --peers <file> --from <block> [--count <n>] [--duration <s>]
+    \\                     [--parent <hash>] [--chain base-sepolia|base-mainnet]
     \\
 ;
 
 const Flags = struct {
     enode: ?[]const u8 = null,
+    peers: ?[]const u8 = null,
     from: ?u64 = null,
     from_tip: bool = false,
     parent: ?[32]u8 = null,
     follow: bool = false,
     verbose: bool = false,
+    trace: bool = false,
     duration_s: u64 = 0,
     count: u64 = 1000,
     batch: u32 = 128,
@@ -57,11 +69,17 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.verbose = true;
             continue;
         }
+        if (std.mem.eql(u8, name, "--trace")) {
+            flags.trace = true;
+            continue;
+        }
         index += 1;
         if (index == args.len) return error.InvalidArguments;
         const value = args[index];
         if (std.mem.eql(u8, name, "--enode")) {
             flags.enode = value;
+        } else if (std.mem.eql(u8, name, "--peers")) {
+            flags.peers = value;
         } else if (std.mem.eql(u8, name, "--duration")) {
             flags.duration_s = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--from")) {
@@ -87,9 +105,9 @@ fn parse_flags(args: []const []const u8) !Flags {
                 &base.common.chains.sepolia;
         } else return error.InvalidArguments;
     }
-    if (flags.enode == null or (flags.from == null) == !flags.from_tip) {
-        return error.InvalidArguments;
-    }
+    if ((flags.enode == null) == (flags.peers == null)) return error.InvalidArguments;
+    if ((flags.from == null) == !flags.from_tip) return error.InvalidArguments;
+    if (flags.peers != null and flags.from_tip) return error.InvalidArguments;
     if (flags.batch == 0 or flags.batch > el_source.batch_max) return error.InvalidArguments;
     if (flags.count == 0) return error.InvalidArguments;
     return flags;
@@ -100,6 +118,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     };
+    if (flags.peers) |path| return run_pool(init, &flags, path);
     const node = enode.parse(flags.enode.?) catch {
         std.debug.print("el-fetch: invalid enode\n", .{});
         return 2;
@@ -120,6 +139,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .from = flags.from,
         .parent = flags.parent,
         .batch = flags.batch,
+        .trace = flags.trace,
     });
     defer source.deinit(init.gpa);
     return run(source, init.io, &flags);
@@ -168,7 +188,7 @@ fn run(source: *el_source.Source, io: Io, flags: *const Flags) !u8 {
             reported = source.blocks;
             std.debug.print("el-fetch: blocks {d}..{d} txs {d} bytes {d} blocks_per_s {d}\n", .{
                 from,                              last.number,
-                source.transactions_count,         source.bytes,
+                source.transactions_count,         source.peer.bytes,
                 source.blocks * 1000 / elapsed_ms,
             });
         }
@@ -182,6 +202,73 @@ fn run(source: *el_source.Source, io: Io, flags: *const Flags) !u8 {
         lag.count, lag.sum_ms / lag.count, lag.max_ms,
     });
     return 0;
+}
+
+/// Download only, through the multi-peer feed: rates, per-peer counters, and tip lag.
+fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
+    const io = init.io;
+    const feed = el_feed.Feed.create(init.gpa, io, .{
+        .chain = flags.chain,
+        .from = flags.from.?,
+        .parent = flags.parent,
+        .peers_path = path,
+    }) catch |err| {
+        std.debug.print("el-fetch: no usable peers in {s}: {t}\n", .{ path, err });
+        return 2;
+    };
+    defer feed.destroy();
+    const rollup = unsafe_watch.rollup_for(flags.chain);
+    const start = Io.Clock.awake.now(io);
+    var last_report_ms: i64 = 0;
+    var block: el_source.Block = undefined;
+    var blocks: u64 = 0;
+    var lag: Lag = .{};
+    while (blocks < flags.count) {
+        const elapsed_ms = start.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+        const duration_ms: i64 = @intCast(flags.duration_s * 1000);
+        if (flags.duration_s > 0 and elapsed_ms >= duration_ms) break;
+        if (elapsed_ms - last_report_ms >= 5_000) {
+            last_report_ms = elapsed_ms;
+            report(feed, elapsed_ms, blocks, &lag);
+        }
+        if (!try feed.next(&block)) {
+            if (!flags.follow and feed.mode == .follow) break;
+            try io.sleep(.fromMilliseconds(100), .awake);
+            continue;
+        }
+        blocks += 1;
+        if (feed.at_tip) {
+            const now = Io.Clock.real.now(io);
+            const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+            const lag_ms = now_ms -| rollup.l2_block_timestamp_ms(block.number);
+            lag.count += 1;
+            lag.sum_ms += lag_ms;
+            lag.max_ms = @max(lag.max_ms, lag_ms);
+        }
+    }
+    const elapsed_ms = start.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    report(feed, elapsed_ms, blocks, &lag);
+    feed.pool.print_peers();
+    std.debug.print("el-fetch: ok, {d} linked blocks {d}..{d}, {d} duplicate segments\n", .{
+        blocks, flags.from.?, feed.next_number -| 1, feed.pool.duplicates,
+    });
+    return 0;
+}
+
+fn report(feed: *el_feed.Feed, elapsed_ms: i64, blocks: u64, lag: *const Lag) void {
+    const elapsed: u64 = @intCast(@max(elapsed_ms, 1));
+    const last = feed.next_number -| 1;
+    std.debug.print("el-fetch: at {d}, {d} blocks, {d} blocks/s, {t}, {d} behind the " ++
+        "schedule, tip blocks {d} lag_ms avg {d} max {d}\n", .{
+        last,
+        blocks,
+        blocks * 1000 / elapsed,
+        feed.mode,
+        feed.pool.tip_estimate() -| last,
+        lag.count,
+        if (lag.count == 0) 0 else lag.sum_ms / lag.count,
+        lag.max_ms,
+    });
 }
 
 test "el-fetch: flags take a number or the tip, and a valueless --follow anywhere" {

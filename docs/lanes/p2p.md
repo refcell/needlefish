@@ -60,8 +60,12 @@ behind a small interface and switch later.
   - [x] `base el-run`: devp2p blocks into `execution.import.run`'s runner, bound to the
     database head, with tip lag per block. Not yet run on real state (waiting for the
     Sepolia disk import).
-  - [ ] Parallel fetch from several peers, and cross-checks against signed gossip blocks
-    while running.
+  - [x] Multi-peer catch-up (`el_pool.zig`, `el_feed.zig`): 3,575 blocks/s average from
+    five peers over 90 s from the snapshot's next block, with hedging, peer cooldowns and
+    cross-segment link checks; then tip following on a lent connection. `el-run --peers`,
+    `el-fetch --peers` (download only), `el-peers --peers` (grows the peer file).
+  - [ ] Run on real state (waiting for the Sepolia disk import), and cross-checks against
+    signed gossip blocks while running.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.

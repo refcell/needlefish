@@ -1,35 +1,36 @@
 //! `base el-run`: executes blocks N+1, N+2, ... on a disk-mode database
-//! (`execution.import.run`) with blocks from one execution-layer peer over devp2p
-//! (`el_source.zig`), with no RPC. N is the database head; the first block fetched must name
-//! the head's hash as its parent, so the peer's chain is bound to the verified state.
+//! (`execution.import.run`) with blocks from execution-layer peers over devp2p, with no RPC.
+//! N is the database head; the first block must name the head's hash as its parent, so the
+//! peers' chain is bound to the verified state.
 //!
-//!     base el-run --db <path> --enode <enode://...> [--chain base-sepolia|base-mainnet]
-//!                 [--blocks <n>] [--duration <s>]
+//!     base el-run --db <path> (--peers <file> | --enode <enode://...>)
+//!                 [--chain base-sepolia|base-mainnet] [--blocks <n>] [--duration <s>]
+//!
+//! Blocks come from `el_feed.zig`: every peer at once (`el_pool.zig`) while the head is
+//! behind, then one peer following the tip. `--peers` is a file of enodes (one per line,
+//! re-read every minute, so `el-peers --out` can grow it); `--enode` adds one more.
 //!
 //! Every block is checked by the runner (transactions root, gas, bloom, receipts root, state
 //! root, withdrawals root, resealed hash) and committed only when all match, so the head
 //! only ever advances by one executed block. One line per block (number, transactions, gas,
-//! execution ms, tip lag), a summary every 10 s. Once the source reaches the peer's head the
-//! run is at the tip: lag (time the block was committed minus its scheduled time) is counted
-//! from then on. The first refused or mismatching block exits 1 with the head on its parent;
-//! nothing is skipped. Commits are made durable every `flush_every` blocks and at the tip.
-//!
-//! Catch-up over devp2p is bounded by the peer (3 to 9 blocks/s measured); a database far
-//! behind the tip is better caught up with `base import-run` first, then handed to this.
+//! execution ms, tip lag), a summary every 10 s with the download and execution rates. Once
+//! the follower reaches the peer's head the run is at the tip: lag (time the block was
+//! committed minus its scheduled time) is counted from then on. The first refused or
+//! mismatching block exits 1 with the head on its parent; nothing is skipped. Commits are
+//! made durable every `flush_every` blocks and whenever no block is waiting.
 
 const std = @import("std");
 const Io = std.Io;
 const base = @import("base");
 
 const el_source = @import("el_source.zig");
+const el_feed = @import("el_feed.zig");
 const import_run_cli = @import("import_run.zig");
 const snapshot_import_out = @import("snapshot_import_out.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 
 const to_disk = base.execution.import.to_disk;
 const import_run = base.execution.import.run;
-const enode = base.consensus.p2p.peers.enode;
-const curve = base.common.crypto.secp256k1;
 const ChainConfig = base.common.chains.ChainConfig;
 const assert = std.debug.assert;
 
@@ -38,20 +39,37 @@ const Storage = base.execution.db.storage.IoStorageType(IO);
 const Importer = to_disk.ImporterType(Storage);
 const Database = Importer.Database;
 const Runner = import_run.RunnerType(Storage);
+const Executor = base.execution.node.executor.Executor;
+
+/// The monotonic clock the runner times its phases with.
+const AwakeClock = struct {
+    io: Io,
+
+    fn clock(self: *AwakeClock) Executor.Clock {
+        return .{ .context = self, .now_ns = now_ns };
+    }
+
+    fn now_ns(context: *anyopaque) u64 {
+        const self: *AwakeClock = @ptrCast(@alignCast(context));
+        return @intCast(Io.Clock.awake.now(self.io).nanoseconds);
+    }
+};
 
 const usage =
-    \\usage: base el-run --db <path> --enode <enode://...> [--chain base-sepolia|base-mainnet]
-    \\                   [--blocks <n>] [--duration <s>]
+    \\usage: base el-run --db <path> (--peers <file> | --enode <enode://...>)
+    \\                   [--chain base-sepolia|base-mainnet] [--blocks <n>] [--duration <s>]
     \\
 ;
 
 const flush_every = 64;
 const summary_interval_ms = 10_000;
+const peers_interval_ms = 60_000;
 const tip_wait_ms = 100;
 
 const Flags = struct {
     db: []const u8 = "",
-    enode: []const u8 = "",
+    enode: ?[]const u8 = null,
+    peers: ?[]const u8 = null,
     chain: *const import_run_cli.Chain = &import_run_cli.chains[0],
     config: *const ChainConfig = &base.common.chains.sepolia,
     blocks: ?u64 = null,
@@ -70,6 +88,8 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.db = value;
         } else if (std.mem.eql(u8, name, "--enode")) {
             flags.enode = value;
+        } else if (std.mem.eql(u8, name, "--peers")) {
+            flags.peers = value;
         } else if (std.mem.eql(u8, name, "--chain")) {
             flags.chain = for (&import_run_cli.chains) |*chain| {
                 if (std.mem.eql(u8, chain.name, value)) break chain;
@@ -86,7 +106,9 @@ fn parse_flags(args: []const []const u8) !Flags {
             if (flags.duration_s.? == 0) return error.InvalidArguments;
         } else return error.InvalidArguments;
     }
-    if (flags.db.len == 0 or flags.enode.len == 0) return error.InvalidArguments;
+    if (flags.db.len == 0 or (flags.enode == null and flags.peers == null)) {
+        return error.InvalidArguments;
+    }
     assert(flags.config.chain_id == flags.chain.spec.chain_id);
     return flags;
 }
@@ -94,10 +116,6 @@ fn parse_flags(args: []const []const u8) !Flags {
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const flags = parse_flags(args) catch {
         std.debug.print("{s}", .{usage});
-        return 2;
-    };
-    const node = enode.parse(flags.enode) catch {
-        std.debug.print("el-run: invalid enode\n", .{});
         return 2;
     };
     const gpa = init.gpa;
@@ -129,17 +147,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 1;
     };
     if (!import_run_cli.usable(opened.db, flags.chain)) return 1;
-    const remote_compressed = node.public_key;
-    const target: el_source.Target = .{
-        .address = switch (node.address) {
-            .ip4 => |ip| .{ .ip4 = .{ .bytes = ip, .port = node.tcp_port } },
-            .ip6 => |ip| .{ .ip6 = .{ .bytes = ip, .port = node.tcp_port } },
-        },
-        .remote = curve.decompress_public_key(&remote_compressed) orelse return error.InvalidKey,
-        .secret = el_source.random_secret(init.io),
-        .chain = flags.config,
-    };
-    return execute(init, &flags, opened.db, ticker.driver(), target);
+    return execute(init, &flags, opened.db, ticker.driver());
 }
 
 const Run = struct {
@@ -147,11 +155,12 @@ const Run = struct {
     flags: *const Flags,
     db: *Database,
     runner: *Runner,
-    source: *el_source.Source,
+    feed: *el_feed.Feed,
     rollup: base.consensus.protocol.RollupConfig,
     first: u64,
     started_ms: i64,
     last_summary_ms: i64,
+    peers_printed_ms: i64 = 0,
     blocks: u64 = 0,
     transactions: u64 = 0,
     gas: u64 = 0,
@@ -187,28 +196,36 @@ fn execute(
     flags: *const Flags,
     db: *Database,
     driver: to_disk.Driver,
-    target: el_source.Target,
 ) !u8 {
     const gpa = init.gpa;
     var config: import_run.Config = .{ .executor = .{} };
     const cores: u32 = @intCast(@max(std.Thread.getCpuCount() catch 1, 1));
     config.executor.recovery_threads = @min(cores - 1, 7);
     config.executor.state_gas_basis = base.execution.node.executor.default_state_gas_basis;
+    var awake: AwakeClock = .{ .io = init.io };
+    config.clock = awake.clock();
     const runner = try Runner.create(gpa, db, flags.chain.spec, driver, config);
     defer runner.destroy(gpa);
     const head = db.head_info;
     assert(head.present);
-    const source = try gpa.create(el_source.Source);
-    defer gpa.destroy(source);
-    // The peer's first block must be the child of the verified database head.
-    try source.init(gpa, init.io, target, .{ .from = head.number + 1, .parent = head.hash });
-    defer source.deinit(gpa);
+    // The first block must be the child of the verified database head.
+    const feed = el_feed.Feed.create(gpa, init.io, .{
+        .chain = flags.config,
+        .from = head.number + 1,
+        .parent = head.hash,
+        .peers_path = flags.peers,
+        .enode = flags.enode,
+    }) catch |err| {
+        std.debug.print("el-run: no usable peers ({t})\n", .{err});
+        return 2;
+    };
+    defer feed.destroy();
     var run: Run = .{
         .io = init.io,
         .flags = flags,
         .db = db,
         .runner = runner,
-        .source = source,
+        .feed = feed,
         .rollup = unsafe_watch.rollup_for(flags.config),
         .first = head.number + 1,
         .started_ms = 0,
@@ -234,13 +251,13 @@ fn execute(
 fn run_blocks(run: *Run) !u8 {
     while (!run.done()) {
         var block: el_source.Block = undefined;
-        if (!try run.source.next(&block)) {
-            // At the peer's head: make what we have durable, then wait for the next block.
+        if (!try run.feed.next(&block)) {
+            // Nothing new yet: make what we have durable, then wait for the next block.
             try run.flush();
-            if (!run.at_tip) std.debug.print("el-run: at the tip, block {d}\n", .{
-                run.db.head_info.number,
-            });
-            run.at_tip = true;
+            if (!run.at_tip and run.feed.at_tip) {
+                std.debug.print("el-run: at the tip, block {d}\n", .{run.db.head_info.number});
+            }
+            run.at_tip = run.feed.at_tip;
             try run.io.sleep(.fromMilliseconds(tip_wait_ms), .awake);
             continue;
         }
@@ -280,7 +297,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
     const now = Io.Clock.real.now(run.io);
     const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
     const lag_ms = now_ms -| run.rollup.l2_block_timestamp_ms(block.number);
-    if (run.at_tip) {
+    if (run.feed.at_tip) {
         run.tip_blocks += 1;
         run.lag_sum_ms += lag_ms;
         run.lag_max_ms = @max(run.lag_max_ms, lag_ms);
@@ -321,26 +338,50 @@ fn summary(run: *Run) void {
     const gas: f64 = @floatFromInt(run.gas);
     const lag_avg_ms = if (run.tip_blocks == 0) 0 else run.lag_sum_ms / run.tip_blocks;
     std.debug.print("summary: {d} blocks ({d:.1}/s), {d} txs, {d:.1} Mgas/s executing, " ++
-        "head {d}, at tip {}, tip blocks {d} lag_ms avg {d} max {d}, reconnects {d}, " ++
-        "{d:.0} s\n", .{
+        "head {d} ({d} behind), {t}, tip blocks {d} lag_ms avg {d} max {d}, " ++
+        "{d} downloaded, {d} switches, {d:.0} s\n", .{
         run.blocks,
         @as(f64, @floatFromInt(run.blocks)) / elapsed_s,
         run.transactions,
         gas / 1e6 / executing_s,
         run.db.head_info.number,
-        run.at_tip,
+        run.feed.pool.tip_estimate() -| run.db.head_info.number,
+        run.feed.mode,
         run.tip_blocks,
         lag_avg_ms,
         run.lag_max_ms,
-        run.source.reconnects,
+        run.feed.pool.blocks,
+        run.feed.switches,
         elapsed_s,
     });
+    print_phases(run);
+    if (now - run.peers_printed_ms >= peers_interval_ms) {
+        run.peers_printed_ms = now;
+        run.feed.pool.print_peers();
+    }
+}
+
+/// Milliseconds per committed block in each runner phase (`Runner.Stats.time`).
+fn print_phases(run: *const Run) void {
+    const blocks = run.runner.stats.blocks;
+    if (blocks == 0) return;
+    const time = &run.runner.stats.time;
+    std.debug.print("phases ms/block:", .{});
+    inline for (@typeInfo(@TypeOf(time.*)).@"struct".field_names) |name| {
+        const ns: f64 = @floatFromInt(@field(time, name));
+        const per_block_ms = ns / 1e6 / @as(f64, @floatFromInt(blocks));
+        std.debug.print(" {s} {d:.2}", .{ name[0 .. name.len - 3], per_block_ms });
+    }
+    std.debug.print("\n", .{});
 }
 
 test "el-run: flags" {
     const enode_text = "enode://00@127.0.0.1:1";
     try std.testing.expectError(error.InvalidArguments, parse_flags(&.{ "--db", "x" }));
     try std.testing.expectError(error.InvalidArguments, parse_flags(&.{ "--enode", enode_text }));
+    const peers = try parse_flags(&.{ "--db", "x", "--peers", "peers.txt" });
+    try std.testing.expectEqualStrings("peers.txt", peers.peers.?);
+    try std.testing.expect(peers.enode == null);
     const set = try parse_flags(&.{
         "--db", "x", "--enode", enode_text, "--chain", "base-mainnet", "--duration", "1800",
     });

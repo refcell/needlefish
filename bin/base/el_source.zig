@@ -30,7 +30,7 @@ pub const batch_max = 1024;
 /// Raw headers and bodies of one batch.
 const headers_bytes_max = 2 << 20;
 const bodies_bytes_max = 64 << 20;
-const reconnects_max = 32;
+const reconnects_max_default = 32;
 /// Bodies per request when pipelining: small requests let the peer answer them in parallel.
 const bodies_per_request = 16;
 const requests_in_flight_max = batch_max / bodies_per_request;
@@ -54,6 +54,211 @@ pub const Target = struct {
 const Span = struct { offset: u32, length: u32 };
 const Entry = struct { header: Span, body: Span, hash: [32]u8, root: [32]u8 };
 
+/// Up to `spans.len` consecutive blocks: raw headers and bodies in two arenas.
+pub const Batch = struct {
+    headers: []u8,
+    bodies: []u8,
+    spans: []Entry,
+    first: u64 = 0,
+    count: u32 = 0,
+    /// The parent hash the first header names.
+    parent: [32]u8 = @splat(0),
+    headers_used: u32 = 0,
+    bodies_used: u32 = 0,
+
+    pub fn alloc(
+        allocator: std.mem.Allocator,
+        blocks_max: u32,
+        headers_bytes: usize,
+        bodies_bytes: usize,
+    ) !Batch {
+        assert(blocks_max > 0 and blocks_max <= batch_max);
+        const headers = try allocator.alloc(u8, headers_bytes);
+        errdefer allocator.free(headers);
+        const bodies = try allocator.alloc(u8, bodies_bytes);
+        errdefer allocator.free(bodies);
+        const spans = try allocator.alloc(Entry, blocks_max);
+        return .{ .headers = headers, .bodies = bodies, .spans = spans };
+    }
+
+    pub fn free(batch: *Batch, allocator: std.mem.Allocator) void {
+        allocator.free(batch.headers);
+        allocator.free(batch.bodies);
+        allocator.free(batch.spans);
+        batch.* = undefined;
+    }
+
+    fn reset(batch: *Batch, first: u64) void {
+        batch.first = first;
+        batch.count = 0;
+        batch.headers_used = 0;
+        batch.bodies_used = 0;
+    }
+
+    pub fn hash(batch: *const Batch, index: u32) [32]u8 {
+        assert(index < batch.count);
+        return batch.spans[index].hash;
+    }
+
+    /// Block `index`, its transactions decoded into `transactions`. Borrows the batch.
+    pub fn block(
+        batch: *const Batch,
+        index: u32,
+        transactions: [][]const u8,
+    ) !Block {
+        assert(index < batch.count);
+        const span = &batch.spans[index];
+        const body = batch.bodies[span.body.offset..][0..span.body.length];
+        const result = try eth.body_transactions(body, transactions);
+        return .{
+            .number = batch.first + index,
+            .hash = span.hash,
+            .header_rlp = batch.headers[span.header.offset..][0..span.header.length],
+            .transactions = transactions[0..result.count],
+        };
+    }
+};
+
+/// Fetches blocks `first`.. (at most `amount`, fewer past the peer's head) from `peer` into
+/// `batch` and checks them: each header's number and parent hash (the first one's against
+/// `parent` when given), and each body's transactions root and empty ommers. Headers come
+/// in one request; bodies in chunks of `bodies_per_request`, all in flight at once.
+/// Returns how many blocks came (zero past the peer's head).
+pub fn fetch(
+    peer: *Peer,
+    batch: *Batch,
+    first: u64,
+    amount: u32,
+    parent: ?[32]u8,
+    scratch: [][]const u8,
+) !u32 {
+    assert(amount > 0 and amount <= batch.spans.len);
+    batch.reset(first);
+    const count = try fetch_headers(peer, batch, amount, parent);
+    if (count == 0) return 0;
+    try fetch_bodies(peer, batch, count, scratch);
+    batch.count = count;
+    assert(batch.count <= amount);
+    return count;
+}
+
+fn fetch_headers(peer: *Peer, batch: *Batch, amount: u32, parent: ?[32]u8) !u32 {
+    var request: [64]u8 = undefined;
+    peer.request_id += 1;
+    const id = peer.request_id;
+    const origin: eth.Origin = .{ .number = batch.first };
+    try peer.send(.get_block_headers, try eth.encode_get_block_headers(
+        &request,
+        id,
+        origin,
+        amount,
+    ), true);
+    const sent = peer.now();
+    const data = try peer.expect(.block_headers);
+    peer.trace_response("headers", batch.first, data.len, sent);
+    var response = try eth.decode_response(data);
+    if (response.request_id != id) return error.UnexpectedResponse;
+    var count: u32 = 0;
+    while (!response.items.is_empty()) : (count += 1) {
+        if (count == amount) return error.TooManyHeaders;
+        const raw = try response.items.raw();
+        const header = try Header.decode(raw);
+        if (header.number != batch.first + count) return error.HeaderOutOfOrder;
+        if (count == 0) batch.parent = header.parent_hash.bytes;
+        const expected = if (count == 0) parent else batch.spans[count - 1].hash;
+        if (expected) |hash| {
+            if (!std.mem.eql(u8, &hash, &header.parent_hash.bytes)) return error.BrokenChain;
+        }
+        batch.spans[count] = .{
+            .header = try copy(batch.headers, &batch.headers_used, raw),
+            .body = .{ .offset = 0, .length = 0 },
+            .hash = keccak.keccak256(raw),
+            .root = header.transactions_root.bytes,
+        };
+    }
+    return count;
+}
+
+/// Requests bodies in chunks, all in flight at once, then checks each answer against
+/// its header's transactions root. A partial answer re-requests the rest of its chunk.
+fn fetch_bodies(peer: *Peer, batch: *Batch, count: u32, scratch: [][]const u8) !void {
+    assert(count > 0);
+    // The divisor is a nonzero constant, so divCeil cannot fail.
+    const chunks = std.math.divCeil(u32, count, bodies_per_request) catch unreachable;
+    assert(chunks <= requests_in_flight_max);
+    var done: [requests_in_flight_max]u32 = @splat(0);
+    const first_id = peer.request_id + 1;
+    const sent = peer.now();
+    for (0..chunks) |chunk| {
+        peer.request_id += 1;
+        try request_bodies(peer, batch, peer.request_id, chunk_range(count, @intCast(chunk)));
+    }
+    for (0..chunks) |_| {
+        const data = try peer.expect(.block_bodies);
+        peer.trace_response("bodies", batch.first, data.len, sent);
+        var response = try eth.decode_response(data);
+        if (response.request_id < first_id or response.request_id >= first_id + chunks) {
+            return error.UnexpectedResponse;
+        }
+        const chunk: u32 = @intCast(response.request_id - first_id);
+        const range = chunk_range(count, chunk);
+        done[chunk] = try store_bodies(batch, &response.items, range, scratch);
+    }
+    for (0..chunks) |chunk_index| {
+        const range = chunk_range(count, @intCast(chunk_index));
+        while (range[0] + done[chunk_index] < range[1]) {
+            peer.request_id += 1;
+            const id = peer.request_id;
+            const from = range[0] + done[chunk_index];
+            try request_bodies(peer, batch, id, .{ from, range[1] });
+            const data = try peer.expect(.block_bodies);
+            var response = try eth.decode_response(data);
+            if (response.request_id != id) return error.UnexpectedResponse;
+            const stored = try store_bodies(batch, &response.items, .{ from, range[1] }, scratch);
+            if (stored == 0) return error.NoBodies;
+            done[chunk_index] += stored;
+        }
+    }
+}
+
+/// Asks for the bodies of batch entries `range`, at most one chunk.
+fn request_bodies(peer: *Peer, batch: *const Batch, id: u64, range: [2]u32) !void {
+    assert(range[0] < range[1] and range[1] - range[0] <= bodies_per_request);
+    var hashes: [bodies_per_request][32]u8 = undefined;
+    const length = range[1] - range[0];
+    for (hashes[0..length], batch.spans[range[0]..range[1]]) |*hash, entry| {
+        hash.* = entry.hash;
+    }
+    var request: [bodies_per_request * 33 + 64]u8 = undefined;
+    const message = try eth.encode_get_block_bodies(&request, id, hashes[0..length]);
+    try peer.send(.get_block_bodies, message, true);
+}
+
+/// Checks the bodies in `items` against `spans[range]` in order and stores them;
+/// returns how many came.
+fn store_bodies(
+    batch: *Batch,
+    items: *base.common.rlp.Decoder,
+    range: [2]u32,
+    scratch: [][]const u8,
+) !u32 {
+    var index = range[0];
+    while (!items.is_empty()) : (index += 1) {
+        if (index == range[1]) return error.TooManyBodies;
+        const raw = try items.raw();
+        const body = try eth.body_transactions(raw, scratch);
+        const root = eth.transactions_root(scratch[0..body.count]);
+        if (!std.mem.eql(u8, &root, &batch.spans[index].root) or !body.ommers_empty) {
+            std.debug.print("el-source: body {d} does not match its header\n", .{
+                batch.first + index,
+            });
+            return error.BodyMismatch;
+        }
+        batch.spans[index].body = try copy(batch.bodies, &batch.bodies_used, raw);
+    }
+    return index - range[0];
+}
+
 pub const Source = struct {
     peer: Peer,
     target: Target,
@@ -61,19 +266,14 @@ pub const Source = struct {
     next_number: u64,
     parent: ?[32]u8,
     batch_amount: u32,
-    headers: []u8,
-    bodies: []u8,
-    spans: []Entry,
+    batch: Batch,
     transactions: [][]const u8,
-    batch_count: u32 = 0,
-    batch_index: u32 = 0,
-    headers_used: u32 = 0,
-    bodies_used: u32 = 0,
+    index: u32 = 0,
     // Counters.
     blocks: u64 = 0,
     transactions_count: u64 = 0,
-    bytes: u64 = 0,
     reconnects: u32 = 0,
+    reconnects_max: u32,
 
     pub const Options = struct {
         /// Null: start at the peer's head.
@@ -81,6 +281,10 @@ pub const Source = struct {
         /// The hash block `from` must name as its parent, when known.
         parent: ?[32]u8 = null,
         batch: u32 = 128,
+        /// Print each response's size and latency (diagnostics).
+        trace: bool = false,
+        /// Failed connects (with backoff) before giving up with `TooManyReconnects`.
+        reconnects_max: u32 = reconnects_max_default,
     };
 
     /// Connects, handshakes and allocates every buffer. `source` must not move afterwards.
@@ -91,15 +295,28 @@ pub const Source = struct {
         target: Target,
         options: Options,
     ) !void {
+        try source.init_unconnected(allocator, io, target, options);
+        errdefer source.deinit(allocator);
+        const status = try source.reopen();
+        source.next_number = options.from orelse try source.peer.head_number(status.head);
+        assert(source.peer.connected);
+    }
+
+    /// Allocates every buffer without connecting: the caller swaps a connected `peer` in
+    /// (and sets `target` to its peer), or calls `init` instead. `options.from` is required.
+    pub fn init_unconnected(
+        source: *Source,
+        allocator: std.mem.Allocator,
+        io: Io,
+        target: Target,
+        options: Options,
+    ) !void {
         assert(options.batch > 0 and options.batch <= batch_max);
         var peer = try Peer.alloc(allocator, io);
         errdefer peer.free(allocator);
-        const headers = try allocator.alloc(u8, headers_bytes_max);
-        errdefer allocator.free(headers);
-        const bodies = try allocator.alloc(u8, bodies_bytes_max);
-        errdefer allocator.free(bodies);
-        const spans = try allocator.alloc(Entry, batch_max);
-        errdefer allocator.free(spans);
+        peer.trace = options.trace;
+        var batch = try Batch.alloc(allocator, batch_max, headers_bytes_max, bodies_bytes_max);
+        errdefer batch.free(allocator);
         const transactions = try allocator.alloc([]const u8, transactions_max);
         errdefer allocator.free(transactions);
         source.* = .{
@@ -108,46 +325,34 @@ pub const Source = struct {
             .next_number = 0,
             .parent = options.parent,
             .batch_amount = options.batch,
-            .headers = headers,
-            .bodies = bodies,
-            .spans = spans,
+            .batch = batch,
             .transactions = transactions,
+            .reconnects_max = options.reconnects_max,
         };
-        const status = try source.reopen();
-        errdefer source.peer.close();
-        source.next_number = options.from orelse try source.peer.head_number(status.head);
-        assert(source.peer.connected);
+        source.next_number = options.from orelse 0;
     }
 
     pub fn deinit(source: *Source, allocator: std.mem.Allocator) void {
         source.peer.close();
         source.peer.free(allocator);
-        allocator.free(source.headers);
-        allocator.free(source.bodies);
-        allocator.free(source.spans);
+        source.batch.free(allocator);
         allocator.free(source.transactions);
     }
 
     /// The next block, or false when the peer has none past the last one yet.
     pub fn next(source: *Source, block: *Block) !bool {
-        if (source.batch_index == source.batch_count) {
+        if (!source.peer.connected) _ = try source.reopen();
+        if (source.index == source.batch.count) {
             if (!try source.refill_reconnecting()) return false;
         }
-        assert(source.batch_index < source.batch_count);
-        const span = &source.spans[source.batch_index];
-        const body = source.bodies[span.body.offset..][0..span.body.length];
-        const result = try eth.body_transactions(body, source.transactions);
-        block.* = .{
-            .number = source.next_number,
-            .hash = span.hash,
-            .header_rlp = source.headers[span.header.offset..][0..span.header.length],
-            .transactions = source.transactions[0..result.count],
-        };
-        source.batch_index += 1;
+        assert(source.index < source.batch.count);
+        block.* = try source.batch.block(source.index, source.transactions);
+        assert(block.number == source.next_number);
+        source.index += 1;
         source.next_number += 1;
-        source.parent = span.hash;
+        source.parent = block.hash;
         source.blocks += 1;
-        source.transactions_count += result.count;
+        source.transactions_count += block.transactions.len;
         return true;
     }
 
@@ -174,7 +379,7 @@ pub const Source = struct {
         while (true) {
             const status = source.peer.open(&source.target) catch |err| {
                 source.reconnects += 1;
-                if (source.reconnects > reconnects_max) return error.TooManyReconnects;
+                if (source.reconnects > source.reconnects_max) return error.TooManyReconnects;
                 std.debug.print("el-source: connect failed ({s}), retry in {d} s\n", .{
                     @errorName(err), backoff_s,
                 });
@@ -189,129 +394,17 @@ pub const Source = struct {
 
     /// Fetches and checks the next batch; false when the peer has nothing new.
     fn refill(source: *Source) !bool {
-        assert(source.batch_index == source.batch_count);
-        source.batch_count = 0;
-        source.batch_index = 0;
-        source.headers_used = 0;
-        source.bodies_used = 0;
-        const count = try source.fetch_headers();
-        if (count == 0) return false;
-        try source.fetch_bodies(count);
-        source.batch_count = count;
-        return true;
-    }
-
-    fn fetch_headers(source: *Source) !u32 {
-        const peer = &source.peer;
-        var request: [64]u8 = undefined;
-        peer.request_id += 1;
-        const id = peer.request_id;
-        const origin: eth.Origin = .{ .number = source.next_number };
-        const amount = source.batch_amount;
-        try peer.send(.get_block_headers, try eth.encode_get_block_headers(
-            &request,
-            id,
-            origin,
-            amount,
-        ), true);
-        const data = try peer.expect(.block_headers);
-        source.bytes += data.len;
-        var response = try eth.decode_response(data);
-        if (response.request_id != id) return error.UnexpectedResponse;
-        var count: u32 = 0;
-        while (!response.items.is_empty()) : (count += 1) {
-            if (count == amount) return error.TooManyHeaders;
-            const raw = try response.items.raw();
-            const header = try Header.decode(raw);
-            if (header.number != source.next_number + count) return error.HeaderOutOfOrder;
-            const parent = if (count == 0) source.parent else source.spans[count - 1].hash;
-            if (parent) |hash| {
-                if (!std.mem.eql(u8, &hash, &header.parent_hash.bytes)) return error.BrokenChain;
-            }
-            source.spans[count] = .{
-                .header = try copy(source.headers, &source.headers_used, raw),
-                .body = .{ .offset = 0, .length = 0 },
-                .hash = keccak.keccak256(raw),
-                .root = header.transactions_root.bytes,
-            };
-        }
-        return count;
-    }
-
-    /// Requests bodies in chunks, all in flight at once, then checks each answer against
-    /// its header's transactions root. A partial answer re-requests the rest of its chunk.
-    fn fetch_bodies(source: *Source, count: u32) !void {
-        const peer = &source.peer;
-        assert(count > 0);
-        // The divisor is a nonzero constant, so divCeil cannot fail.
-        const chunks = std.math.divCeil(u32, count, bodies_per_request) catch unreachable;
-        assert(chunks <= requests_in_flight_max);
-        var done: [requests_in_flight_max]u32 = @splat(0);
-        const first_id = peer.request_id + 1;
-        for (0..chunks) |chunk| {
-            peer.request_id += 1;
-            const range = chunk_range(count, @intCast(chunk));
-            try source.request_bodies(peer.request_id, range);
-        }
-        for (0..chunks) |_| {
-            const data = try peer.expect(.block_bodies);
-            source.bytes += data.len;
-            var response = try eth.decode_response(data);
-            if (response.request_id < first_id or response.request_id >= first_id + chunks) {
-                return error.UnexpectedResponse;
-            }
-            const chunk: u32 = @intCast(response.request_id - first_id);
-            done[chunk] = try source.store_bodies(&response.items, chunk_range(count, chunk));
-        }
-        for (0..chunks) |chunk_index| {
-            const range = chunk_range(count, @intCast(chunk_index));
-            while (range[0] + done[chunk_index] < range[1]) {
-                peer.request_id += 1;
-                const id = peer.request_id;
-                const from = range[0] + done[chunk_index];
-                try source.request_bodies(id, .{ from, range[1] });
-                const data = try peer.expect(.block_bodies);
-                source.bytes += data.len;
-                var response = try eth.decode_response(data);
-                if (response.request_id != id) return error.UnexpectedResponse;
-                const stored = try source.store_bodies(&response.items, .{ from, range[1] });
-                if (stored == 0) return error.NoBodies;
-                done[chunk_index] += stored;
-            }
-        }
-    }
-
-    /// Asks for the bodies of batch entries `range`, at most one chunk.
-    fn request_bodies(source: *Source, id: u64, range: [2]u32) !void {
-        assert(range[0] < range[1] and range[1] - range[0] <= bodies_per_request);
-        var hashes: [bodies_per_request][32]u8 = undefined;
-        const length = range[1] - range[0];
-        for (hashes[0..length], source.spans[range[0]..range[1]]) |*hash, entry| {
-            hash.* = entry.hash;
-        }
-        var request: [bodies_per_request * 33 + 64]u8 = undefined;
-        const message = try eth.encode_get_block_bodies(&request, id, hashes[0..length]);
-        try source.peer.send(.get_block_bodies, message, true);
-    }
-
-    /// Checks the bodies in `items` against `spans[range]` in order and stores them;
-    /// returns how many came.
-    fn store_bodies(source: *Source, items: *base.common.rlp.Decoder, range: [2]u32) !u32 {
-        var index = range[0];
-        while (!items.is_empty()) : (index += 1) {
-            if (index == range[1]) return error.TooManyBodies;
-            const raw = try items.raw();
-            const body = try eth.body_transactions(raw, source.transactions);
-            const root = eth.transactions_root(source.transactions[0..body.count]);
-            if (!std.mem.eql(u8, &root, &source.spans[index].root) or !body.ommers_empty) {
-                std.debug.print("el-source: body {d} does not match its header\n", .{
-                    source.next_number + index,
-                });
-                return error.BodyMismatch;
-            }
-            source.spans[index].body = try copy(source.bodies, &source.bodies_used, raw);
-        }
-        return index - range[0];
+        assert(source.index == source.batch.count);
+        source.index = 0;
+        const count = try fetch(
+            &source.peer,
+            &source.batch,
+            source.next_number,
+            source.batch_amount,
+            source.parent,
+            source.transactions,
+        );
+        return count > 0;
     }
 };
 
@@ -345,8 +438,14 @@ pub const Peer = struct {
     plain: []u8,
     message: []u8,
     request_id: u64 = 0,
+    /// Decompressed message bytes received.
+    bytes: u64 = 0,
+    /// Print each response's size and latency (diagnostics).
+    trace: bool = false,
+    /// Do not print the handshake lines.
+    quiet: bool = false,
 
-    fn alloc(allocator: std.mem.Allocator, io: Io) !Peer {
+    pub fn alloc(allocator: std.mem.Allocator, io: Io) !Peer {
         const read_buffer = try allocator.alloc(u8, 64 * 1024);
         errdefer allocator.free(read_buffer);
         const write_buffer = try allocator.alloc(u8, 64 * 1024);
@@ -366,7 +465,7 @@ pub const Peer = struct {
         };
     }
 
-    fn free(peer: *Peer, allocator: std.mem.Allocator) void {
+    pub fn free(peer: *Peer, allocator: std.mem.Allocator) void {
         assert(!peer.connected);
         allocator.free(peer.read_buffer);
         allocator.free(peer.write_buffer);
@@ -375,8 +474,9 @@ pub const Peer = struct {
         allocator.free(peer.message);
     }
 
-    fn open(peer: *Peer, target: *const Target) !eth.Status {
+    pub fn open(peer: *Peer, target: *const Target) !eth.Status {
         assert(!peer.connected);
+        // Zig 0.17's threaded Io has no connect timeout yet (it panics on one).
         peer.stream = try target.address.connect(peer.io, .{ .mode = .stream });
         peer.connected = true;
         errdefer peer.close();
@@ -387,10 +487,34 @@ pub const Peer = struct {
         return peer.greet(target.secret, target.chain);
     }
 
-    fn close(peer: *Peer) void {
+    pub fn close(peer: *Peer) void {
         if (!peer.connected) return;
         peer.stream.close(peer.io);
         peer.connected = false;
+    }
+
+    /// Unblocks a read in progress on another thread; `close` still follows.
+    pub fn shutdown(peer: *Peer) void {
+        if (!peer.connected) return;
+        peer.stream.shutdown(peer.io, .both) catch {};
+    }
+
+    fn now(peer: *const Peer) Io.Timestamp {
+        return Io.Clock.awake.now(peer.io);
+    }
+
+    fn trace_response(
+        peer: *const Peer,
+        kind: []const u8,
+        number: u64,
+        bytes: usize,
+        sent: Io.Timestamp,
+    ) void {
+        if (!peer.trace) return;
+        const elapsed_ms = sent.durationTo(peer.now()).toMilliseconds();
+        std.debug.print("el-source: trace {s} at {d} bytes {d} after_ms {d}\n", .{
+            kind, number, bytes, elapsed_ms,
+        });
     }
 
     fn send(peer: *Peer, id: eth.Id, data: []const u8, compress: bool) !void {
@@ -419,6 +543,7 @@ pub const Peer = struct {
                 try snappy.decompress(message.data, peer.message, message_size_max)
             else
                 message.data;
+            peer.bytes += data.len;
             switch (message.id) {
                 .ping => try peer.send(.pong, &.{0xc0}, compressed),
                 .disconnect => {
@@ -473,10 +598,10 @@ pub const Peer = struct {
         var buffer: [512]u8 = undefined;
         try peer.send(.hello, try eth.encode_hello(&buffer, "needlefish", &node_id), false);
         const hello = try eth.decode_hello(try peer.expect(.hello));
-        std.debug.print("el-source: hello from {s}\n", .{hello.client});
+        if (!peer.quiet) std.debug.print("el-source: hello from {s}\n", .{hello.client});
         if (!hello.eth_68) return error.NoSharedCapability;
         const status = try eth.decode_status(try peer.expect(.status));
-        std.debug.print("el-source: status network {d} fork 0x{x} next {d}\n", .{
+        if (!peer.quiet) std.debug.print("el-source: status network {d} fork 0x{x} next {d}\n", .{
             status.network_id, &status.fork_id.hash, status.fork_id.next,
         });
         if (status.network_id != chain.chain_id) return error.WrongNetwork;
@@ -490,7 +615,7 @@ pub const Peer = struct {
     }
 
     /// The block number of the peer's head, from its Status head hash.
-    fn head_number(peer: *Peer, head: [32]u8) !u64 {
+    pub fn head_number(peer: *Peer, head: [32]u8) !u64 {
         var request: [64]u8 = undefined;
         peer.request_id += 1;
         const id = peer.request_id;
