@@ -119,7 +119,11 @@ pub const Context = struct {
         const account = try context.state.load(address);
         if (account.info.has_code()) return;
         try context.charge(gas.create + keccak256_gas + gas.keccak256_word);
+        // Touched, like revm's code install: a new token account (the factory's) then
+        // persists at the end of the transaction; a revert unwinds both.
+        try context.state.touch(account);
         try context.state.set_code(account, &marker_code);
+        assert(account.touched);
     }
 
     pub fn is_cobalt(context: *const Context) bool {

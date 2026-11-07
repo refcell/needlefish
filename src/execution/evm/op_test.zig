@@ -1045,6 +1045,9 @@ test "op: B-20 factory creates activated asset tokens with init calls" {
     const salt = native.u256_word(7);
     const token = b20_factory.token_address(.asset, sender_address, &salt);
     try testing.expectEqualSlices(u8, &native.address_word(token), created.output);
+    // The new token account persists (mainnet block 54049777 created one).
+    const token_account = try h.state.load(token);
+    try testing.expect(token_account.in_database and token_account.dirty);
 
     var query: [4 + 32]u8 = undefined;
     query[0..4].* = b20_factory.selector_of(.is_b20_initialized);
