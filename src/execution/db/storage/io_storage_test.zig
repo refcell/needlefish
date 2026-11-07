@@ -214,6 +214,22 @@ fn HarnessType(comptime IO: type) type {
             while (index <= sequence) : (index += 1) apply(out, index, self.body(index));
         }
 
+        /// The simulator and FlakyIo are deterministic, so their loops are bounded by steps. A
+        /// real device is bounded by wall time: a step waits at least 20 us, so a step bound
+        /// is only ~20 s and one fsync stall on a loaded disk exhausted it.
+        const real_device = IO != SimIo and IO != FlakyIo;
+        const real_wait_ns_max: u64 = 300 * std.time.ns_per_s;
+
+        fn wait_start_ns(self: *const Harness) u64 {
+            return if (comptime real_device) self.io.now_monotonic_ns() else 0;
+        }
+
+        fn wait_exhausted(self: *const Harness, steps: u32, start_ns: u64) bool {
+            if (comptime !real_device) return steps > 1_000_000;
+            const elapsed_ns = self.io.now_monotonic_ns() -| start_ns;
+            return elapsed_ns > real_wait_ns_max or steps > 100_000_000;
+        }
+
         /// One step of the IO world, then one storage tick (which delivers callbacks).
         fn pump(self: *Harness) !void {
             if (IO == SimIo) {
@@ -228,28 +244,32 @@ fn HarnessType(comptime IO: type) type {
 
         /// Waits for every operation of a real backend to finish (bounded by wall time).
         fn drain(self: *Harness) void {
+            const start_ns = self.wait_start_ns();
             var waits: u32 = 0;
             while (!self.storage.idle()) : (waits += 1) {
-                // 1M waits of 20 us: 20 s for a handful of 64 KiB operations.
-                if (waits > 1_000_000) @panic("io_storage test: operations never finished");
+                if (self.wait_exhausted(waits, start_ns)) {
+                    @panic("io_storage test: operations never finished");
+                }
                 self.pump() catch |err| std.debug.panic("io_storage test: drain: {t}", .{err});
             }
             assert(self.storage.idle());
         }
 
         fn wait_phase(self: *Harness) !void {
+            const start_ns = self.wait_start_ns();
             var ticks: u32 = 0;
             while (!self.phase_done) : (ticks += 1) {
-                if (ticks > 1_000_000) return error.Timeout;
+                if (self.wait_exhausted(ticks, start_ns)) return error.Timeout;
                 try self.pump();
             }
             self.phase_done = false;
         }
 
         fn wait_idle(self: *Harness) !void {
+            const start_ns = self.wait_start_ns();
             var ticks: u32 = 0;
             while (!self.engine.idle() or !self.storage.idle()) : (ticks += 1) {
-                if (ticks > 1_000_000) return error.Timeout;
+                if (self.wait_exhausted(ticks, start_ns)) return error.Timeout;
                 try self.pump();
             }
             if (self.failure) |err| return err;
@@ -334,9 +354,10 @@ fn HarnessType(comptime IO: type) type {
         /// Runs the workload until `acknowledged_target` commits are durable.
         fn run(self: *Harness, acknowledged_target: u64) !void {
             assert(acknowledged_target <= entries_max);
+            const start_ns = self.wait_start_ns();
             var steps: u32 = 0;
             while (self.acknowledged < acknowledged_target) : (steps += 1) {
-                if (steps > 1_000_000) return error.Timeout;
+                if (self.wait_exhausted(steps, start_ns)) return error.Timeout;
                 try self.step();
             }
         }
