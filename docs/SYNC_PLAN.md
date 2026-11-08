@@ -191,6 +191,16 @@ Run `base consensus` (verifier mode) against real L1 with the mainnet rollup con
   and 0 engine divergences, after the L1 blob schedule fix (947c00a); the safe hash equals
   the reference's. Cadence against the reference's `optimism_syncStatus`, a reorg, and
   mainnet remain.
+  Cadence run (2026-11-08, attempt 9 on 07755d2, which includes the EIP-7702 authorization
+  list fix 645d48c): from a 9,567-block safe lag the verifier caught up in 57 minutes and then
+  held the tip. All 83 per-minute samples against two public nodes matched their safe block
+  hash, with 0 attributes mismatches and 0 engine divergences. No public endpoint serves
+  `optimism_syncStatus`, so the reference is the public node's `safe` and `finalized` block
+  tags. Once caught up, safe stays within one batch submission of the reference's (lag 0 to
+  1,000 blocks, while the reference's safe moves in steps of about 1,300 to 1,500).
+  Finalized equals the reference's exactly at every sample after the derivation cursor
+  passes L1 finality. Before that point, finalized = safe - 1 is expected: everything
+  derived so far comes from finalized L1 blocks. A reorg and mainnet remain.
 
 ### M6. Unsafe head from mainnet gossip
 
