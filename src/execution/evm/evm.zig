@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const primitives = @import("primitives.zig");
 const stack_module = @import("stack.zig");
 const memory_module = @import("memory.zig");
@@ -216,8 +217,8 @@ pub const Evm = struct {
         const frame_count = @as(usize, config.depth_max) + 1;
         const frames = try allocator.alloc(Frame, frame_count);
         errdefer allocator.free(frames);
-        const stacks = try allocator.alloc([stack_module.limit]u256, frame_count);
-        errdefer allocator.free(stacks);
+        const stacks = try lazy.alloc(allocator, [stack_module.limit]u256, frame_count);
+        errdefer lazy.free(allocator, stacks);
         var shared_memory = try memory_module.SharedMemory.init(allocator, config.memory_bytes_max);
         errdefer shared_memory.deinit(allocator);
         var arena = try bytecode.Arena.init(allocator, config.code_arena_bytes);
@@ -228,10 +229,10 @@ pub const Evm = struct {
             config.code_cache_entries,
         );
         errdefer code_cache.deinit(allocator);
-        const return_buffer = try allocator.alloc(u8, config.memory_bytes_max);
-        errdefer allocator.free(return_buffer);
+        const return_buffer = try lazy.alloc(allocator, u8, config.memory_bytes_max);
+        errdefer lazy.free(allocator, return_buffer);
         const scratch_limbs = crypto.modexp.scratch_limbs_needed(config.modexp_modulus_bytes_max);
-        const precompile_scratch = try allocator.alloc(u64, @intCast(scratch_limbs));
+        const precompile_scratch = try lazy.alloc(allocator, u64, @intCast(scratch_limbs));
         return .{
             .config = config,
             .state = state,
@@ -247,12 +248,12 @@ pub const Evm = struct {
 
     pub fn deinit(evm: *Evm, allocator: std.mem.Allocator) void {
         allocator.free(evm.frames);
-        allocator.free(evm.stacks);
+        lazy.free(allocator, evm.stacks);
         evm.shared_memory.deinit(allocator);
         evm.arena.deinit(allocator);
         evm.code_cache.deinit(allocator);
-        allocator.free(evm.return_buffer);
-        allocator.free(evm.precompile_scratch);
+        lazy.free(allocator, evm.return_buffer);
+        lazy.free(allocator, evm.precompile_scratch);
         evm.* = undefined;
     }
 

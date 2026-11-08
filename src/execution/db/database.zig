@@ -91,6 +91,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const engine_module = @import("storage/engine.zig");
 const journal_module = @import("storage/journal.zig");
@@ -785,17 +786,18 @@ pub fn DatabaseType(comptime Storage: type) type {
             fn init(allocator: std.mem.Allocator, config: Config) !Buffers {
                 const body_max = config.engine.entry_body_size_max;
                 const queue_max = config.queue_entries_max;
-                const changeset_buffer = try allocator.alloc(u8, body_max);
-                errdefer allocator.free(changeset_buffer);
-                const queue_bodies = try allocator.alloc(u8, @as(usize, body_max) * queue_max);
-                errdefer allocator.free(queue_bodies);
+                const changeset_buffer = try lazy.alloc(allocator, u8, body_max);
+                errdefer lazy.free(allocator, changeset_buffer);
+                const queue_bytes = @as(usize, body_max) * queue_max;
+                const queue_bodies = try lazy.alloc(allocator, u8, queue_bytes);
+                errdefer lazy.free(allocator, queue_bodies);
                 const queue_lengths = try allocator.alloc(u32, queue_max);
                 errdefer allocator.free(queue_lengths);
                 const queue_metadata = try allocator.alloc(Metadata, queue_max);
                 errdefer allocator.free(queue_metadata);
                 const queue_batch = try allocator.alloc([]const u8, queue_max);
                 errdefer allocator.free(queue_batch);
-                const staging = try allocator.alloc(u8, config.checkpoint_staging_bytes);
+                const staging = try lazy.alloc(allocator, u8, config.checkpoint_staging_bytes);
                 return .{
                     .changeset_buffer = changeset_buffer,
                     .queue_bodies = queue_bodies,
@@ -813,12 +815,12 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (self.flat) |*trees| trees.deinit(allocator);
             if (self.code_store) |*store| store.deinit(allocator);
             if (self.history) |*store| store.deinit(allocator);
-            allocator.free(self.staging);
+            lazy.free(allocator, self.staging);
             allocator.free(self.queue_batch);
             allocator.free(self.queue_metadata);
             allocator.free(self.queue_lengths);
-            allocator.free(self.queue_bodies);
-            allocator.free(self.changeset_buffer);
+            lazy.free(allocator, self.queue_bodies);
+            lazy.free(allocator, self.changeset_buffer);
             self.changeset_built.deinit(allocator);
             self.changeset.deinit(allocator);
             ChainStore.plan_deinit(allocator, &self.plan_restore);

@@ -10,8 +10,10 @@
 //! wrong header root, a broken header chain, a code under the wrong key, a missing code.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const testing = std.testing;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const to_disk = @import("to_disk.zig");
 const hashed_state = @import("hashed_state.zig");
@@ -623,6 +625,139 @@ test "to_disk: sizing at Base Sepolia scale" {
     too_many.codes = std.math.maxInt(u32);
     const refused = to_disk.sizing(SimStorage, too_many, to_disk.shape_node);
     try testing.expectError(error.CodesTooLarge, refused);
+}
+
+/// Tracks the live allocations of at least `bytes_min` for the residency guard below.
+const LargeAllocations = struct {
+    const bytes_min = 1 << 20;
+    const count_max = 1024;
+
+    backing: std.mem.Allocator,
+    addresses: [count_max]usize = undefined,
+    lengths: [count_max]usize = undefined,
+    count: u32 = 0,
+
+    fn allocator(self: *LargeAllocations) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *LargeAllocations = @ptrCast(@alignCast(context));
+        const memory = self.backing.rawAlloc(len, alignment, ret) orelse return null;
+        if (len >= bytes_min) {
+            assert(self.count < count_max);
+            self.addresses[self.count] = @intFromPtr(memory);
+            self.lengths[self.count] = len;
+            self.count += 1;
+        }
+        return memory;
+    }
+
+    /// Tracked allocations never change size (the startup buffers do not).
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        len: usize,
+        ret: usize,
+    ) bool {
+        const self: *LargeAllocations = @ptrCast(@alignCast(context));
+        if (memory.len >= bytes_min or len >= bytes_min) return false;
+        return self.backing.rawResize(memory, alignment, len, ret);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        len: usize,
+        ret: usize,
+    ) ?[*]u8 {
+        const self: *LargeAllocations = @ptrCast(@alignCast(context));
+        if (memory.len >= bytes_min or len >= bytes_min) return null;
+        return self.backing.rawRemap(memory, alignment, len, ret);
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *LargeAllocations = @ptrCast(@alignCast(context));
+        if (memory.len >= bytes_min) {
+            const index = std.mem.indexOfScalar(
+                usize,
+                self.addresses[0..self.count],
+                @intFromPtr(memory.ptr),
+            ).?;
+            assert(self.lengths[index] == memory.len);
+            self.count -= 1;
+            self.addresses[index] = self.addresses[self.count];
+            self.lengths[index] = self.lengths[self.count];
+        }
+        self.backing.rawFree(memory, alignment, ret);
+    }
+
+    fn virtual_bytes(self: *const LargeAllocations) u64 {
+        var total: u64 = 0;
+        for (self.lengths[0..self.count]) |len| total += len;
+        return total;
+    }
+
+    /// The resident bytes of the tracked allocations (`mincore`, page granularity).
+    fn resident_bytes(self: *const LargeAllocations) u64 {
+        const page_size = std.heap.pageSize();
+        var vector: [4096]u8 = undefined;
+        var total: u64 = 0;
+        for (self.addresses[0..self.count], self.lengths[0..self.count]) |address, len| {
+            // Large allocations come straight from the page allocator: page-aligned.
+            assert(address % page_size == 0);
+            const end = address + std.mem.alignForward(usize, len, page_size);
+            var at = address;
+            while (at < end) {
+                const pages = @min((end - at) / page_size, vector.len);
+                const result = std.os.linux.mincore(@ptrFromInt(at), pages * page_size, &vector);
+                assert(std.os.linux.errno(result) == .SUCCESS);
+                for (vector[0..pages]) |flags| total += @as(u64, flags & 1) * page_size;
+                at += pages * page_size;
+            }
+        }
+        assert(total <= self.virtual_bytes() + self.count * page_size);
+        return total;
+    }
+};
+
+// Regression guard: in Debug and ReleaseSafe, `Allocator.alloc` fills every allocation (0xAA),
+// which made every byte of the node's upper-bound buffers resident (the Base Sepolia node held
+// ~55 GB). The node shape at 1/100 of Base Sepolia's counts reserves ~12 GiB; a fresh
+// database must keep nearly all of it unresident (`lazy.alloc`). What stays resident is the
+// hash maps (`std` fills them) and the buffers init writes.
+test "to_disk: node sizing reserves its buffers without making them resident" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const counts: to_disk.Counts = .{
+        .accounts = 376_124,
+        .slots = 37_205_919,
+        .codes = 47_655,
+        .code_bytes = 231_711_118,
+    };
+    const sizing = try to_disk.sizing(SimStorage, counts, to_disk.shape_node);
+    // `Database.init` only checks the storage's size; nothing reads or writes it.
+    const disk = try lazy.alloc(testing.allocator, u8, sizing.config.engine.size_bytes());
+    defer lazy.free(testing.allocator, disk);
+    var sim: SimStorage = undefined;
+    sim.durable = disk;
+    sim.memory = disk;
+    var large: LargeAllocations = .{ .backing = testing.allocator };
+    const allocator = large.allocator();
+    const db = try testing.allocator.create(Database);
+    defer testing.allocator.destroy(db);
+    db.* = try Database.init(allocator, &sim, sizing.config);
+    defer db.deinit(allocator);
+    const virtual = large.virtual_bytes();
+    const resident = large.resident_bytes();
+    try testing.expect(virtual > 8 << 30);
+    try testing.expect(resident < 768 << 20);
 }
 
 test "to_disk: counts round-trip; damaged encodings are refused (seeded)" {

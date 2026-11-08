@@ -538,6 +538,22 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   GiB) is outside the database and runner (the devp2p feed and its peers). After: ~15 GiB. At 2.6x the counts (mainnet estimate), before: codes 56 GiB and
   LSM slot arrays 117 GiB (would not fit 125 GB); after: ~17-20 GiB resident (filters grow
   with the keys written since import, 1.25 B per key).
+- Safe-build fill (2026-11-08): in Debug and ReleaseSafe (the node ships ReleaseSafe)
+  `Allocator.alloc` fills every allocation with 0xAA, so every upper-bound buffer was
+  resident at init whatever init wrote: the Sepolia node stayed at ~55 GB after the two
+  changes above. Every large buffer the node's database and runner size from bounds (code
+  arena, LSM block lists, filters, slot infos and orphans, memtable keys, values and order,
+  both block caches, record cache, disk-state memo and record writes, chain bytes, code
+  store entries and pin buffer, checkpoint staging and queue bodies, the evm's memory,
+  stacks, return buffer, code arena and analysis cache) comes from `lazy.alloc` (raw
+  allocator, no fill; `alloc_aligned` for the sector-aligned block cache), and anything
+  read before it is written stays a zeroed normal allocation. ~1.2 GiB stays filled at the
+  node shape, mostly `std` hash maps (no raw path through the `Allocator` interface): disk
+  memo map 410 MiB, code table 392 MiB, evm state maps 147 MiB. The code arena stays sized to
+  `code_bytes_max`: it is append only and in pinned mode holds every code added since open,
+  so its resident size is those codes, not the snapshot's. Guard: `to_disk_test` inits a
+  node-shaped database at 1/100 Sepolia counts (12.2 GiB reserved) and requires < 768 MiB
+  of its large allocations resident (603 MiB; a filled code arena or block cache fails).
 - Disk-backed state (docs/design/disk-state.md): a TigerBeetle-style LSM forest on a block
   grid inside the engine file, hashed keys only (accounts, storage, trie branches by
   (owner, path), codes), leaves derived from records, sparse root over the branch tree,
@@ -1624,6 +1640,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-08: lsm: init no longer zeroes every table slot's filter and block list (14.8 GiB
   of the Sepolia node's 50.7 GiB). The lsm crash test starts from all-ones filters and block
   lists; dropping `slot_acquire`'s filter zeroing fails it.
+- 2026-11-08: the node's bounded startup buffers are allocated lazily (no safe-build fill,
+  see Decisions). ReleaseSafe, `Database.init` + `Runner.create`, VmRSS: Base Sepolia counts
+  49.2 GiB filled before (mincore; the live node measured 54.9 GB) -> 1.20 GiB after (0.96
+  GiB after `Database.init`); 2.6x the counts 187.5 GiB filled before -> 1.67 GiB after.
 - 2026-11-06: disk state phase 1d: contract codes leave the checkpoint image (still resident):
   sorted code tables on the grid flushed before each checkpoint on the checkpoint's block
   budget, the table list in database checkpoint v2, an engine open pause in which open scans

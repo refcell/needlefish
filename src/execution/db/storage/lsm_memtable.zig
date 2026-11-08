@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../../utilities/lazy_alloc/root.zig");
 
 const key_size_max = @import("table.zig").key_size_max;
 
@@ -46,16 +47,16 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime v
         pub fn init(allocator: std.mem.Allocator, entries_max: u32) !Memtable {
             assert(entries_max > 0);
             assert(entries_max < std.math.maxInt(u32) / 4);
-            const keys = try allocator.alloc(Key, entries_max);
-            errdefer allocator.free(keys);
-            const values = try allocator.alloc(Value, entries_max);
-            errdefer allocator.free(values);
+            const keys = try lazy.alloc(allocator, Key, entries_max);
+            errdefer lazy.free(allocator, keys);
+            const values = try lazy.alloc(allocator, Value, entries_max);
+            errdefer lazy.free(allocator, values);
             const tombstones = try allocator.alloc(bool, entries_max);
             errdefer allocator.free(tombstones);
             const lengths = try allocator.alloc(u16, if (variable) entries_max else 0);
             errdefer allocator.free(lengths);
-            const order = try allocator.alloc(u32, entries_max);
-            errdefer allocator.free(order);
+            const order = try lazy.alloc(allocator, u32, entries_max);
+            errdefer lazy.free(allocator, order);
             const slot_count = std.math.ceilPowerOfTwo(u32, 2 * entries_max) catch unreachable;
             const slots = try allocator.alloc(u32, slot_count);
             @memset(slots, 0);
@@ -72,11 +73,11 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime v
         }
 
         pub fn deinit(self: *Memtable, allocator: std.mem.Allocator) void {
-            allocator.free(self.keys);
-            allocator.free(self.values);
+            lazy.free(allocator, self.keys);
+            lazy.free(allocator, self.values);
             allocator.free(self.tombstones);
             allocator.free(self.lengths);
-            allocator.free(self.order);
+            lazy.free(allocator, self.order);
             allocator.free(self.slots);
             self.* = undefined;
         }

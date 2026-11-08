@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const gas = @import("gas.zig");
 
 pub const SharedMemory = struct {
@@ -16,11 +17,11 @@ pub const SharedMemory = struct {
     pub fn init(allocator: std.mem.Allocator, capacity_bytes: u32) !SharedMemory {
         assert(capacity_bytes % 32 == 0);
         assert(capacity_bytes > 0);
-        return .{ .buffer = try allocator.alloc(u8, capacity_bytes) };
+        return .{ .buffer = try lazy.alloc(allocator, u8, capacity_bytes) };
     }
 
     pub fn deinit(shared: *SharedMemory, allocator: std.mem.Allocator) void {
-        allocator.free(shared.buffer);
+        lazy.free(allocator, shared.buffer);
         shared.* = undefined;
     }
 

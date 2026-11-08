@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const branch_record = @import("branch_record.zig");
 
@@ -61,17 +62,17 @@ pub const RecordCache = struct {
         assert(entries_max >= ways);
         const set_count = entries_max / ways;
         const slots: usize = @as(usize, set_count) * ways;
-        const hashes = try allocator.alloc(Hash, slots);
-        errdefer allocator.free(hashes);
-        const hangs = try allocator.alloc(PathKey, slots);
-        errdefer allocator.free(hangs);
+        const hashes = try lazy.alloc(allocator, Hash, slots);
+        errdefer lazy.free(allocator, hashes);
+        const hangs = try lazy.alloc(allocator, PathKey, slots);
+        errdefer lazy.free(allocator, hangs);
         const lengths = try allocator.alloc(u16, slots);
         errdefer allocator.free(lengths);
         const referenced = try allocator.alloc(bool, slots);
         errdefer allocator.free(referenced);
         const hands = try allocator.alloc(u8, set_count);
         errdefer allocator.free(hands);
-        const values = try allocator.alloc(u8, slots * value_bytes_max);
+        const values = try lazy.alloc(allocator, u8, slots * value_bytes_max);
         @memset(lengths, 0);
         @memset(referenced, false);
         @memset(hands, 0);
@@ -87,12 +88,12 @@ pub const RecordCache = struct {
     }
 
     pub fn deinit(self: *RecordCache, allocator: std.mem.Allocator) void {
-        allocator.free(self.values);
+        lazy.free(allocator, self.values);
         allocator.free(self.hands);
         allocator.free(self.referenced);
         allocator.free(self.lengths);
-        allocator.free(self.hangs);
-        allocator.free(self.hashes);
+        lazy.free(allocator, self.hangs);
+        lazy.free(allocator, self.hashes);
         self.* = undefined;
     }
 

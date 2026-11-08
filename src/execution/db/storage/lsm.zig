@@ -56,6 +56,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../../utilities/lazy_alloc/root.zig");
 
 const storage = @import("storage.zig");
 const grid_module = @import("grid.zig");
@@ -350,18 +351,18 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             errdefer mutable.deinit(allocator);
             var immutable = try Memtable.init(allocator, config.memtable_entries_max);
             errdefer immutable.deinit(allocator);
-            const slot_infos = try allocator.alloc(Info, slots);
-            errdefer allocator.free(slot_infos);
+            const slot_infos = try lazy.alloc(allocator, Info, slots);
+            errdefer lazy.free(allocator, slot_infos);
             const slot_used = try allocator.alloc(bool, slots);
             errdefer allocator.free(slot_used);
-            const slot_blocks = try allocator.alloc(u64, slots * layout.blocks_per_table);
-            errdefer allocator.free(slot_blocks);
-            const filters = try allocator.alloc(u32, filter_slots * layout.filter_words);
-            errdefer allocator.free(filters);
-            const level_slots = try allocator.alloc(u32, slots);
-            errdefer allocator.free(level_slots);
-            const orphans = try allocator.alloc(u64, layout.orphans_max);
-            errdefer allocator.free(orphans);
+            const slot_blocks = try lazy.alloc(allocator, u64, slots * layout.blocks_per_table);
+            errdefer lazy.free(allocator, slot_blocks);
+            const filters = try lazy.alloc(allocator, u32, filter_slots * layout.filter_words);
+            errdefer lazy.free(allocator, filters);
+            const level_slots = try lazy.alloc(allocator, u32, slots);
+            errdefer lazy.free(allocator, level_slots);
+            const orphans = try lazy.alloc(allocator, u64, layout.orphans_max);
+            errdefer lazy.free(allocator, orphans);
             var compaction = try Compaction.init(allocator, grid, config, layout);
             errdefer compaction.deinit(allocator);
             var reader = try Table.Reader.init(allocator, grid, cache);
@@ -390,12 +391,12 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         /// Frees memory. Grid IO may be in flight only if the storage dropped it (crash).
         pub fn deinit(self: *Tree, allocator: std.mem.Allocator) void {
             for (&self.memtables) |*memtable| memtable.deinit(allocator);
-            allocator.free(self.slot_infos);
+            lazy.free(allocator, self.slot_infos);
             allocator.free(self.slot_used);
-            allocator.free(self.slot_blocks);
-            allocator.free(self.filters);
-            allocator.free(self.level_slots);
-            allocator.free(self.orphans);
+            lazy.free(allocator, self.slot_blocks);
+            lazy.free(allocator, self.filters);
+            lazy.free(allocator, self.level_slots);
+            lazy.free(allocator, self.orphans);
             self.compaction.deinit(allocator);
             self.reader.deinit(allocator);
             self.* = undefined;

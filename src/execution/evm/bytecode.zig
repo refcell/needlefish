@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 const op = @import("opcode.zig");
 
 /// Enough zero bytes for a PUSH32 on the last byte plus a trailing STOP.
@@ -66,11 +67,11 @@ pub const Arena = struct {
 
     pub fn init(allocator: std.mem.Allocator, capacity_bytes: usize) !Arena {
         assert(capacity_bytes > 0);
-        return .{ .buffer = try allocator.alloc(u8, capacity_bytes) };
+        return .{ .buffer = try lazy.alloc(allocator, u8, capacity_bytes) };
     }
 
     pub fn deinit(arena: *Arena, allocator: std.mem.Allocator) void {
-        allocator.free(arena.buffer);
+        lazy.free(allocator, arena.buffer);
         arena.* = undefined;
     }
 
@@ -114,15 +115,15 @@ pub const AnalysisCache = struct {
     pub fn init(allocator: std.mem.Allocator, bytes: usize, entries_count: u32) !AnalysisCache {
         assert(std.math.isPowerOfTwo(entries_count));
         assert(entries_count >= 4);
-        const buffer = try allocator.alloc(u8, bytes);
-        errdefer allocator.free(buffer);
+        const buffer = try lazy.alloc(allocator, u8, bytes);
+        errdefer lazy.free(allocator, buffer);
         const entries = try allocator.alloc(Entry, entries_count);
         for (entries) |*entry| entry.occupied = false;
         return .{ .buffer = buffer, .entries = entries };
     }
 
     pub fn deinit(cache: *AnalysisCache, allocator: std.mem.Allocator) void {
-        allocator.free(cache.buffer);
+        lazy.free(allocator, cache.buffer);
         allocator.free(cache.entries);
         cache.* = undefined;
     }

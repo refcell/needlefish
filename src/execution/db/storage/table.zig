@@ -19,12 +19,14 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../../utilities/lazy_alloc/root.zig");
 
 const storage = @import("storage.zig");
 const grid_module = @import("grid.zig");
 const free_set_module = @import("free_set.zig");
 
 const sector_size = storage.sector_size;
+const block_alignment = std.mem.Alignment.fromByteUnits(sector_size);
 const Reference = grid_module.Reference;
 const BlockKind = grid_module.BlockKind;
 const FreeSet = free_set_module.FreeSet;
@@ -79,8 +81,7 @@ pub const BlockCache = struct {
         errdefer allocator.free(referenced);
         const hands = try allocator.alloc(u8, set_count);
         errdefer allocator.free(hands);
-        const blocks = try allocator.alignedAlloc(u8, .fromByteUnits(sector_size), slots *
-            block_size);
+        const blocks = try lazy.alloc_aligned(allocator, u8, block_alignment, slots * block_size);
         @memset(addresses, 0);
         @memset(checksums, 0);
         @memset(referenced, false);
@@ -101,7 +102,7 @@ pub const BlockCache = struct {
         allocator.free(self.checksums);
         allocator.free(self.referenced);
         allocator.free(self.hands);
-        allocator.free(self.blocks);
+        lazy.free_aligned(allocator, block_alignment, self.blocks);
         self.* = undefined;
     }
 

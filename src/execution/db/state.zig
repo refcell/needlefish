@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const changeset_module = @import("changeset.zig");
 const address_map = @import("address_map.zig");
@@ -322,8 +323,8 @@ pub const State = struct {
         var code_table: std.AutoHashMapUnmanaged(Hash, CodeRef) = .empty;
         try code_table.ensureTotalCapacity(allocator, config.codes_max);
         errdefer code_table.deinit(allocator);
-        const code_arena = try allocator.alloc(u8, config.code_bytes_max);
-        errdefer allocator.free(code_arena);
+        const code_arena = try lazy.alloc(allocator, u8, config.code_bytes_max);
+        errdefer lazy.free(allocator, code_arena);
         const state_trie = try trie.StateTrie.init(allocator, .{
             .accounts_max = config.accounts_max,
             .account_nodes_max = config.account_nodes_max,
@@ -342,7 +343,7 @@ pub const State = struct {
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         self.state_trie.deinit(allocator);
-        allocator.free(self.code_arena);
+        lazy.free(allocator, self.code_arena);
         self.code_table.deinit(allocator);
         self.storage_table.deinit(allocator);
         self.account_table.deinit(allocator);

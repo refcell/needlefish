@@ -38,6 +38,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const trie = @import("../trie/root.zig");
 const witness = @import("witness.zig");
@@ -267,19 +268,20 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             var read_slots: @FieldType(Self, "read_slots") = .empty;
             try read_slots.ensureTotalCapacity(allocator, config.read_memo_slots_max);
             errdefer read_slots.deinit(allocator);
-            const memo_bytes = try allocator.alloc(u8, config.memo_bytes_max);
-            errdefer allocator.free(memo_bytes);
+            const memo_bytes = try lazy.alloc(allocator, u8, config.memo_bytes_max);
+            errdefer lazy.free(allocator, memo_bytes);
             const frames = try allocator.alloc(Frame, frames_max);
             errdefer allocator.free(frames);
-            const record_writes = try allocator.alloc(RecordWrite, config.record_writes_max);
-            errdefer allocator.free(record_writes);
-            const record_bytes = try allocator.alloc(u8, config.record_write_bytes_max);
-            errdefer allocator.free(record_bytes);
-            const account_writes = try allocator.alloc(
+            const record_writes = try lazy.alloc(allocator, RecordWrite, config.record_writes_max);
+            errdefer lazy.free(allocator, record_writes);
+            const record_bytes = try lazy.alloc(allocator, u8, config.record_write_bytes_max);
+            errdefer lazy.free(allocator, record_bytes);
+            const account_writes = try lazy.alloc(
+                allocator,
                 AccountWrite,
                 config.changeset.accounts_max + config.changeset.storage_max,
             );
-            errdefer allocator.free(account_writes);
+            errdefer lazy.free(allocator, account_writes);
             var swapped = try Changeset.init(allocator, config.changeset);
             errdefer swapped.deinit(allocator);
             const record_cache = try RecordCache.init(allocator, config.record_cache_entries);
@@ -304,11 +306,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.record_cache.deinit(allocator);
             self.swapped.deinit(allocator);
-            allocator.free(self.account_writes);
-            allocator.free(self.record_bytes);
-            allocator.free(self.record_writes);
+            lazy.free(allocator, self.account_writes);
+            lazy.free(allocator, self.record_bytes);
+            lazy.free(allocator, self.record_writes);
             allocator.free(self.frames);
-            allocator.free(self.memo_bytes);
+            lazy.free(allocator, self.memo_bytes);
             self.memo.deinit(allocator);
             self.read_slots.deinit(allocator);
             self.read_accounts.deinit(allocator);

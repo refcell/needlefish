@@ -47,6 +47,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 const state_module = @import("state.zig");
 const snapshot_module = @import("snapshot.zig");
@@ -202,8 +203,8 @@ pub fn CodeStoreType(comptime Storage: type) type {
             errdefer manifest_deinit(allocator, &tables);
             var pending = try manifest_init(allocator, config.tables_max, capacity + 1);
             errdefer manifest_deinit(allocator, &pending);
-            const entries = try allocator.alloc(Entry, config.codes_max);
-            errdefer allocator.free(entries);
+            const entries = try lazy.alloc(allocator, Entry, config.codes_max);
+            errdefer lazy.free(allocator, entries);
             var builder = try Table.Builder.init(allocator, grid);
             errdefer builder.deinit(allocator);
             const alignment = comptime std.mem.Alignment.fromByteUnits(sector_size);
@@ -244,8 +245,8 @@ pub fn CodeStoreType(comptime Storage: type) type {
             var pins: std.AutoHashMapUnmanaged(Hash, Pin) = .empty;
             try pins.ensureTotalCapacity(allocator, config.pins_max);
             errdefer pins.deinit(allocator);
-            const pin_buffer = try allocator.alloc(u8, config.pin_bytes);
-            errdefer allocator.free(pin_buffer);
+            const pin_buffer = try lazy.alloc(allocator, u8, config.pin_bytes);
+            errdefer lazy.free(allocator, pin_buffer);
             const rewrite_value = try allocator.alloc(u8, self.value_size_max);
             self.cache = cache;
             self.pins = pins;
@@ -294,14 +295,14 @@ pub fn CodeStoreType(comptime Storage: type) type {
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             manifest_deinit(allocator, &self.tables);
             manifest_deinit(allocator, &self.pending);
-            allocator.free(self.entries);
+            lazy.free(allocator, self.entries);
             self.builder.deinit(allocator);
             allocator.free(self.scan_index);
             allocator.free(self.scan_data);
             allocator.free(self.pending_ends);
             if (self.cache) |*cache| cache.deinit(allocator);
             self.pins.deinit(allocator);
-            allocator.free(self.pin_buffer);
+            lazy.free(allocator, self.pin_buffer);
             allocator.free(self.rewrite_value);
             self.* = undefined;
         }

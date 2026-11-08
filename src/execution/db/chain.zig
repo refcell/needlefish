@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const lazy = @import("../../utilities/lazy_alloc/root.zig");
 
 pub const Hash = [32]u8;
 
@@ -115,8 +116,8 @@ pub const ChainStore = struct {
         assert(config.canonical_max >= config.reorg_depth_max);
         const slots = try allocator.alloc(Slot, config.blocks_max);
         errdefer allocator.free(slots);
-        const bytes = try allocator.alloc(u8, config.bytes_max);
-        errdefer allocator.free(bytes);
+        const bytes = try lazy.alloc(allocator, u8, config.bytes_max);
+        errdefer lazy.free(allocator, bytes);
         var by_hash: std.AutoHashMapUnmanaged(Hash, u32) = .empty;
         try by_hash.ensureTotalCapacity(allocator, config.blocks_max);
         errdefer by_hash.deinit(allocator);
@@ -139,7 +140,7 @@ pub const ChainStore = struct {
         allocator.free(self.canonical);
         self.transactions.deinit(allocator);
         self.by_hash.deinit(allocator);
-        allocator.free(self.bytes);
+        lazy.free(allocator, self.bytes);
         allocator.free(self.slots);
         self.* = undefined;
     }
