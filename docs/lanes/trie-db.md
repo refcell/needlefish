@@ -538,6 +538,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   GiB) is outside the database and runner (the devp2p feed and its peers). After: ~15 GiB. At 2.6x the counts (mainnet estimate), before: codes 56 GiB and
   LSM slot arrays 117 GiB (would not fit 125 GB); after: ~17-20 GiB resident (filters grow
   with the keys written since import, 1.25 B per key).
+- Code growth (2026-11-08): `to_disk.sizing` froze the state's code limits at the snapshot's
+  counts plus 65,536 codes and 64 MiB, so the Base Sepolia node refused block 56149240
+  (`CodeFull`) ~1.14M blocks after its snapshot. The format headroom (`codes_headroom`,
+  `code_bytes_headroom`) still sizes everything a file encodes: the code grid blocks (part
+  of `grid_block_count`, in the superblock layout), `code_tables_max` (the manifest
+  decoder's bound) and so the checkpoint staging and zone. `Shape.codes_growth` and
+  `code_bytes_growth` then raise only `State`'s RAM limits (code table capacity, arena,
+  code store sort entries), halved until a rewrite of every code needs at most three
+  quarters of the table list (`CodeStore.tables_needed`; init now requires only that a
+  rewrite fits the list, the format still sizes it at twice). Node: +2^23 codes and +8
+  GiB: Base Sepolia's limits go from 4,831,109 codes / 23.24 GB to 13,219,717 / 31.83 GB
+  (971 of 1,408 tables), layout and staging byte for byte unchanged, so its file opens
+  with no migration. RAM: the code table (a `std` map, filled at init) 2^23 -> 2^24
+  entries, 392 -> 784 MiB; arena (lazy, 23.2 -> 31.8 GB virtual) and sort entries (lazy,
+  48 B per code) cost only what is touched. The arena stays append only: in pinned mode it
+  holds the codes added since open (hundreds of MiB a week, dropped at the next open).
+  Past the new limits a block is refused (`CodeFull`, nothing written); a grid with no
+  room for a flush skips it (`flushes_no_space`), the codes ride in the image, and a
+  checkpoint that outgrows staging fails `CheckpointTooLarge` (reported, the head safe).
 - Safe-build fill (2026-11-08): in Debug and ReleaseSafe (the node ships ReleaseSafe)
   `Allocator.alloc` fills every allocation with 0xAA, so every upper-bound buffer was
   resident at init whatever init wrote: the Sepolia node stayed at ~55 GB after the two
@@ -1640,6 +1659,12 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-08: lsm: init no longer zeroes every table slot's filter and block list (14.8 GiB
   of the Sepolia node's 50.7 GiB). The lsm crash test starts from all-ones filters and block
   lists; dropping `slot_acquire`'s filter zeroing fails it.
+- 2026-11-08: code growth (see Decisions): the state's code limits grow past the format's
+  headroom without changing the format. Tests: Base Sepolia's layout, table list and
+  staging pinned to their values; a seeded sizing sweep (layout equal, three quarters of
+  the list); a file imported with the old sizing reopens with growth and takes three
+  times the old headroom of new codes across a checkpoint and a reopen (the old limits
+  refuse within it). Mutations caught: no growth; growth in the format; no halving.
 - 2026-11-08: the node's bounded startup buffers are allocated lazily (no safe-build fill,
   see Decisions). ReleaseSafe, `Database.init` + `Runner.create`, VmRSS: Base Sepolia counts
   49.2 GiB filled before (mincore; the live node measured 54.9 GB) -> 1.20 GiB after (0.96

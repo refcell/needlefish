@@ -789,3 +789,227 @@ fn fuzz_counts(_: void, smith: *testing.Smith) anyerror!void {
     const counts = to_disk.Counts.decode(bytes[0..length]) catch return;
     try testing.expectEqualSlices(u8, bytes[0..length], &counts.encode());
 }
+
+// Code growth (`Shape.codes_growth`): RAM limits past the format's code headroom.
+
+test "to_disk: code growth leaves a Base Sepolia sized file's format unchanged" {
+    const counts: to_disk.Counts = .{
+        .accounts = 37_612_478,
+        .slots = 3_720_591_921,
+        .codes = 4_765_573,
+        .code_bytes = 23_171_111_820,
+    };
+    var shape_format = to_disk.shape_node;
+    shape_format.codes_growth = 0;
+    shape_format.code_bytes_growth = 0;
+    const format = (try to_disk.sizing(SimStorage, counts, shape_format)).config;
+    const grown = (try to_disk.sizing(SimStorage, counts, to_disk.shape_node)).config;
+    // The superblock layout of the Base Sepolia node's file (before code growth existed),
+    // checked byte for byte at open (`LayoutMismatch`), and what its checkpoints encode.
+    const layout = grown.engine.layout();
+    try testing.expectEqual(@as(u64, 2_543_648_768), layout.checkpoint_zone_size_bytes);
+    try testing.expectEqual(@as(u64, 64 << 20), layout.journal_size_bytes);
+    try testing.expectEqual(@as(u32, 64 * 1024), layout.checkpoint_block_size);
+    try testing.expectEqual(@as(u32, 2 << 20), layout.entry_body_size_max);
+    try testing.expectEqual(@as(u64, 19_802_124), layout.grid_block_count);
+    try testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&format.engine.layout()),
+        std.mem.asBytes(&layout),
+    );
+    try testing.expectEqual(@as(u32, 1408), grown.code_tables_max);
+    try testing.expectEqual(format.code_tables_max, grown.code_tables_max);
+    try testing.expectEqual(@as(u32, 2_533_551_498), grown.checkpoint_staging_bytes);
+    try testing.expectEqual(format.checkpoint_staging_bytes, grown.checkpoint_staging_bytes);
+    // The format's code limits, then the state's: the whole growth fits.
+    try testing.expectEqual(@as(u32, 4_831_109), format.state.codes_max);
+    try testing.expectEqual(@as(u64, 23_238_220_684), format.state.code_bytes_max);
+    try testing.expectEqual(format.state.codes_max + (1 << 23), grown.state.codes_max);
+    try testing.expectEqual(format.state.code_bytes_max + (8 << 30), grown.state.code_bytes_max);
+    const needed = Database.CodeStore.tables_needed(
+        grown.engine.checkpoint_block_size,
+        grown.state.codes_max,
+        grown.state.code_bytes_max,
+    );
+    try testing.expect(4 * needed <= 3 * grown.code_tables_max);
+}
+
+test "to_disk: code growth is halved until every code fits three quarters of the list" {
+    var prng = Prng.init(0x7464_0500);
+    for (0..200) |_| {
+        const codes = prng.range(1, 1 << 20);
+        const counts: to_disk.Counts = .{
+            .accounts = prng.range(1, 1 << 24),
+            .slots = prng.range(1, 1 << 28),
+            .codes = codes,
+            .code_bytes = codes * prng.range(1, 24_576),
+        };
+        var shape = to_disk.shape_node;
+        shape.codes_growth = @intCast(prng.range(0, 1 << 24));
+        shape.code_bytes_growth = prng.range(0, 64 << 30);
+        var shape_format = shape;
+        shape_format.codes_growth = 0;
+        shape_format.code_bytes_growth = 0;
+        const format = (try to_disk.sizing(SimStorage, counts, shape_format)).config;
+        const grown = (try to_disk.sizing(SimStorage, counts, shape)).config;
+        try testing.expectEqualSlices(
+            u8,
+            std.mem.asBytes(&format.engine.layout()),
+            std.mem.asBytes(&grown.engine.layout()),
+        );
+        try testing.expectEqual(format.code_tables_max, grown.code_tables_max);
+        try testing.expectEqual(format.checkpoint_staging_bytes, grown.checkpoint_staging_bytes);
+        try testing.expect(grown.state.codes_max >= format.state.codes_max);
+        try testing.expect(grown.state.code_bytes_max >= format.state.code_bytes_max);
+        try testing.expect(grown.state.codes_max - format.state.codes_max <= shape.codes_growth);
+        try testing.expect(grown.state.code_bytes_max - format.state.code_bytes_max <=
+            shape.code_bytes_growth);
+        const needed = Database.CodeStore.tables_needed(
+            grown.engine.checkpoint_block_size,
+            grown.state.codes_max,
+            grown.state.code_bytes_max,
+        );
+        try testing.expect(4 * needed <= 3 * grown.code_tables_max);
+    }
+}
+
+const growth_ticks_max = 1_000_000;
+
+fn growth_settled(db: *const Database) bool {
+    return !db.checkpoint_wanted and db.engine.checkpoint_phase == .idle and db.idle();
+}
+
+/// Commits one block per code (the shape's changesets hold one), each a fresh code of
+/// `length` bytes, onto the head; returns `error.CodeFull` from the state when refused.
+fn commit_codes(run: *Run, prng: *Prng, hashes: []Hash, length: u32) !void {
+    const db = run.db;
+    var overlay = try @import("../db/overlay.zig").Overlay.init(testing.allocator, &db.state, .{
+        .accounts_max = 4,
+        .slots_max = 4,
+        .codes_max = 1,
+    });
+    defer overlay.deinit(testing.allocator);
+    var code: [1024]u8 = undefined;
+    for (hashes) |*hash| {
+        prng.fill(code[0..length]);
+        hash.* = try overlay.insert_code(code[0..length]);
+        var block_hash: Hash = undefined;
+        prng.fill(&block_hash);
+        const input: @import("../db/database.zig").BlockInput = .{
+            .hash = block_hash,
+            .parent_hash = db.head_info.hash,
+            .number = db.head_info.number + 1,
+            .timestamp = (db.head_info.number + 1) * 2,
+            .header = &block_hash,
+            .body = "body",
+            .receipts = "",
+            .transaction_hashes = &.{},
+            .changeset = "",
+        };
+        var ticks: u32 = 0;
+        while (true) : (ticks += 1) {
+            if (ticks >= growth_ticks_max) return error.Timeout;
+            _ = db.execute_and_commit(&overlay, &input) catch |err| switch (err) {
+                error.Busy => {
+                    run.sim.tick();
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+    }
+    var ticks: u32 = 0;
+    while (!db.idle()) : (ticks += 1) {
+        if (ticks >= growth_ticks_max) return error.Timeout;
+        run.sim.tick();
+    }
+}
+
+fn checkpoint_settled(run: *Run) !void {
+    run.db.request_checkpoint();
+    var ticks: u32 = 0;
+    while (!growth_settled(run.db)) : (ticks += 1) {
+        if (ticks >= growth_ticks_max) return error.Timeout;
+        run.db.checkpoint_flush();
+        run.sim.tick();
+    }
+    if (run.db.checkpoint_error) |err| return err;
+}
+
+/// Imports `source` sized with the format's code headroom only (as files were before code
+/// growth), then reopens the file with `shape`.
+fn growth_run(source: *const Source, shape: to_disk.Shape) !Run {
+    var shape_format = shape;
+    shape_format.codes_growth = 0;
+    shape_format.code_bytes_growth = 0;
+    var run = try Run.init_shaped(source, 0x7464_0600, shape_format);
+    errdefer run.deinit();
+    var importer = run.importer();
+    var chain: to_disk.HeaderChain = .{};
+    try synthetic_chain(source.root, &chain);
+    _ = try import_into(&importer, source, &chain);
+    const grown = try to_disk.sizing(SimStorage, source.counts(), shape);
+    try testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&run.config.engine.layout()),
+        std.mem.asBytes(&grown.config.engine.layout()),
+    );
+    run.config = grown.config;
+    try run.reopen();
+    return run;
+}
+
+test "to_disk: a file sized before code growth reopens with it and takes more new codes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var prng = Prng.init(0x7464_0700);
+    const source = try random_source(arena_state.allocator(), &prng, 40);
+    const shape: to_disk.Shape = comptime blk: {
+        var shape = shape_test;
+        shape.codes_growth = 64;
+        shape.code_bytes_growth = 64 * 1024;
+        break :blk shape;
+    };
+    // Three times the format's headroom of codes, and of code bytes.
+    const codes_new = 3 * shape.codes_headroom;
+    const length = 3 * shape.code_bytes_headroom / codes_new;
+    var hashes: [codes_new]Hash = undefined;
+    var codes: [codes_new][]const u8 = undefined;
+    {
+        // Control: the format's limits alone refuse a new code within the headroom.
+        var shape_format = shape;
+        shape_format.codes_growth = 0;
+        shape_format.code_bytes_growth = 0;
+        var run = try growth_run(&source, shape_format);
+        defer run.deinit();
+        try testing.expectError(error.CodeFull, commit_codes(&run, &prng, &hashes, length));
+    }
+    var run = try growth_run(&source, shape);
+    defer run.deinit();
+    const half = codes_new / 2;
+    try commit_codes(&run, &prng, hashes[0..half], length);
+    try checkpoint_settled(&run);
+    try commit_codes(&run, &prng, hashes[half..], length);
+    const head = run.db.head_info;
+    for (&hashes, &codes) |*hash, *code| {
+        code.* = try arena_state.allocator().dupe(u8, run.db.state.code_by_hash(hash.*).?);
+    }
+    run.db.codes_release();
+    // The first half from their tables, the rest replayed from the journal.
+    try run.reopen();
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&head), std.mem.asBytes(&run.db.head_info));
+    try testing.expect(run.db.state.codes_in_tables > 0);
+    for (&hashes, &codes) |*hash, code| {
+        const read = run.db.state.code_by_hash(hash.*) orelse return error.NoCode;
+        try testing.expectEqualSlices(u8, code, read);
+        try testing.expectEqualSlices(u8, &hash.*, &node.keccak256(read));
+    }
+    run.db.codes_release();
+    try testing.expectEqual(head_number + codes_new, run.db.head_info.number);
+    for (source.codes) |code| {
+        const stored = run.db.state.code_by_hash(node.keccak256(code)) orelse return error.NoCode;
+        try testing.expectEqualSlices(u8, code, stored);
+        run.db.codes_release();
+    }
+}

@@ -108,9 +108,15 @@ pub const Shape = struct {
     flat_prefetch_keys_max: u32 = 0,
     flat_prefetch_reads_max: u32 = 0,
     code_flush_bytes_min: u32,
-    /// Codes and code bytes the state holds beyond the snapshot's (contracts created later).
+    /// Codes and code bytes the format is sized for beyond the snapshot's: the code grid
+    /// blocks, the code table list, and so the checkpoint zone. Part of the format.
     codes_headroom: u32,
     code_bytes_headroom: u32,
+    /// Codes and code bytes the state accepts beyond those (contracts created later): RAM
+    /// limits only, not part of the format. Halved until a rewrite of every code needs at
+    /// most three quarters of the table list the format sized (`grow_code_limits`).
+    codes_growth: u32 = 0,
+    code_bytes_growth: u64 = 0,
     /// Codes out of RAM (`Database.Config.code_pin_bytes`; 0: codes stay resident). Not part
     /// of the format: a file opens with any of these.
     code_pin_bytes: u64 = 0,
@@ -175,6 +181,10 @@ pub const shape_node: Shape = .{
     .code_flush_bytes_min = 64 * 1024,
     .codes_headroom = 1 << 16,
     .code_bytes_headroom = 64 << 20,
+    // Years of new contracts at Base's rate (~10^5 codes and hundreds of MiB a week); the
+    // code table (filled at init) holds 2^24 entries at Base Sepolia's counts (784 MiB).
+    .codes_growth = 1 << 23,
+    .code_bytes_growth = 8 << 30,
     // Codes stay in their tables: a block's codes are pinned (1.5 GiB reserved, touched only
     // as far as the largest block's codes reach) and their blocks cached (256 MiB).
     .code_pin_bytes = @as(u64, block_codes_max) * code_size_max,
@@ -253,6 +263,7 @@ pub fn sizing(comptime Storage: type, counts: Counts, shape: Shape) SizingError!
     );
     config.code_tables_max = @max(16, tables_min);
     size_checkpoint(Storage, &config);
+    grow_code_limits(Storage, &config, shape);
     return .{
         .counts = counts,
         .account_branches_max = account_branches,
@@ -313,6 +324,36 @@ fn tables_blocks(comptime Storage: type, config: database.Config) u64 {
         FlatTrees.StorageBranchTree.layout_of(configs.storage_branches).blocks_per_table;
     assert(blocks >= 4 * 2);
     return blocks;
+}
+
+/// Raises the state's code limits past the format's (`Shape.codes_growth`): the format
+/// (grid, table list, checkpoint zone) is already sized, so a file sized before opens the
+/// same. The growth is halved until a rewrite of every code fits three quarters of the list.
+fn grow_code_limits(comptime Storage: type, config: *database.Config, shape: Shape) void {
+    const CodeStore = code_store_module.CodeStoreType(Storage);
+    const block_size = config.engine.checkpoint_block_size;
+    const codes_format: u32 = config.state.codes_max;
+    const bytes_format = config.state.code_bytes_max;
+    const tables_max: u64 = config.code_tables_max;
+    const needed_format = CodeStore.tables_needed(block_size, codes_format, bytes_format);
+    assert(4 * @as(u64, needed_format) <= 3 * tables_max);
+    var codes_growth: u64 = shape.codes_growth;
+    var bytes_growth: u64 = shape.code_bytes_growth;
+    var halvings: u32 = 0;
+    while (halvings <= 64) : (halvings += 1) {
+        const codes = @min(codes_format + codes_growth, std.math.maxInt(u32));
+        const bytes = bytes_format + bytes_growth;
+        const needed = CodeStore.tables_needed(block_size, @intCast(codes), bytes);
+        if (4 * @as(u64, needed) <= 3 * tables_max) {
+            config.state.codes_max = @intCast(codes);
+            config.state.code_bytes_max = bytes;
+            break;
+        }
+        codes_growth /= 2;
+        bytes_growth /= 2;
+    } else unreachable; // No growth fits (asserted above); 64 halvings reach it.
+    assert(config.state.codes_max >= codes_format);
+    assert(config.state.code_bytes_max >= bytes_format);
 }
 
 /// Staging bytes: header, code table list, the trees' bytes, the branch-write count, a

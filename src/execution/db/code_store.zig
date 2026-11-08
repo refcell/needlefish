@@ -193,8 +193,8 @@ pub fn CodeStoreType(comptime Storage: type) type {
             const capacity = Table.index_capacity(config.block_size);
             const table_bytes_max = table_bytes_max_of(config.block_size);
             const value_size_max = Table.value_size_max(config.block_size);
-            // Every code fits half the table list, so a rewrite always leaves room.
-            assert(config.tables_max >= tables_max_min(
+            // A rewrite of every code always fits the table list.
+            assert(config.tables_max >= tables_needed(
                 config.block_size,
                 config.codes_max,
                 config.code_bytes_max,
@@ -266,15 +266,24 @@ pub fn CodeStoreType(comptime Storage: type) type {
             return @as(u64, room) * ((capacity - 1) / 2);
         }
 
-        /// The fewest `Config.tables_max` `init` accepts for these code limits: every code
-        /// fits half the table list, so a rewrite always leaves room.
+        /// The `Config.tables_max` sizing gives these code limits: every code fits half the
+        /// table list, so a rewrite leaves room for as many flushes again. Part of the format
+        /// (the checkpoint zone holds the list), so the format's limits size it.
         pub fn tables_max_min(block_size: u32, codes_max: u32, code_bytes_max: u64) u32 {
+            const tables = 2 * @as(u64, tables_needed(block_size, codes_max, code_bytes_max));
+            assert(tables >= 2);
+            return @intCast(tables);
+        }
+
+        /// The tables a rewrite of every code writes at most (`init` requires the list to
+        /// hold them): each table but the last is closed only by a record that does not fit.
+        pub fn tables_needed(block_size: u32, codes_max: u32, code_bytes_max: u64) u32 {
             const table_bytes_max = table_bytes_max_of(block_size);
             const all_bytes = code_bytes_max + @as(u64, codes_max) * 36;
             const record_max = 36 + @as(u64, Table.value_size_max(block_size));
             assert(table_bytes_max > 2 * record_max);
-            const tables = (all_bytes / (table_bytes_max - record_max) + 1) * 2;
-            assert(tables >= 2);
+            const tables = all_bytes / (table_bytes_max - record_max) + 1;
+            assert(tables >= 1);
             return @intCast(tables);
         }
 
