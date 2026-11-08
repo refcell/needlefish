@@ -235,6 +235,7 @@ fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!
         },
     }
     if (envelope != .legacy and envelope != .deposit) try access_list(w, envelope.access_list());
+    if (envelope == .eip7702) try authorization_list(w, envelope.eip7702.tx.authorization_list);
     if (envelope == .eip4844) {
         try field_quantity(w, "maxFeePerBlobGas", envelope.eip4844.tx.max_fee_per_blob_gas);
         try w.key("blobVersionedHashes");
@@ -243,6 +244,27 @@ fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!
         for (0..hashes.count()) |i| try w.data(&hashes.get(i).bytes);
         try w.end_array();
     }
+}
+
+/// EIP-7702 authorizations, named as op-reth writes them. Without them a reader that rebuilds
+/// the transaction (a consensus node checking the transactions root) gets different bytes.
+fn authorization_list(w: *Writer, list: consensus.AuthorizationList) WriteError!void {
+    try w.key("authorizationList");
+    try w.begin_array();
+    var it = list.iterator();
+    var count: u32 = 0;
+    while (it.next()) |item| : (count += 1) {
+        try w.begin_object();
+        try field_quantity(w, "chainId", item.chain_id);
+        try field_data(w, "address", &item.address.bytes);
+        try field_quantity(w, "nonce", item.nonce);
+        try field_quantity(w, "yParity", item.y_parity);
+        try field_quantity(w, "r", item.r);
+        try field_quantity(w, "s", item.s);
+        try w.end_object();
+    }
+    try w.end_array();
+    assert(count == list.count);
 }
 
 fn access_list(w: *Writer, list: consensus.AccessList) WriteError!void {

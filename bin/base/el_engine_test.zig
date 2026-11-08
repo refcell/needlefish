@@ -399,6 +399,56 @@ test "el engine: block reads by number, hash and tag" {
     try testing.expect(contains(try setup.call(buffer, unknown), "\"result\":null"));
 }
 
+test "el engine: an EIP-7702 transaction's JSON rebuilds to its own bytes" {
+    var authorization_buffer: [256]u8 = undefined;
+    const first: consensus.Authorization = .{
+        .chain_id = 84532,
+        .address = .{ .bytes = @splat(0x11) },
+        .nonce = 3,
+        .y_parity = 1,
+        .r = 5 << 200,
+        .s = 7,
+    };
+    var second = first;
+    second.chain_id = 0;
+    second.address = .{ .bytes = @splat(0x22) };
+    second.nonce = 0;
+    second.y_parity = 0;
+    second.r = 9;
+    second.s = 1 << 255;
+    const authorizations =
+        consensus.AuthorizationList.build(&authorization_buffer, &.{ first, second });
+    const envelope = try consensus.tx.sign(consensus.Eip7702{
+        .chain_id = 84532,
+        .nonce = 12,
+        .max_priority_fee_per_gas = 1_000,
+        .max_fee_per_gas = 2_000_000,
+        .gas_limit = 90_000,
+        .to = .{ .bytes = @splat(0x33) },
+        .value = 0,
+        .input = &.{ 0xde, 0xad },
+        .access_list = .empty,
+        .authorization_list = authorizations,
+    }, @splat(0x07));
+    var raw_buffer: [512]u8 = undefined;
+    const raw = envelope.encode_to(&raw_buffer);
+    var text_buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&text_buffer);
+    var w: base.utilities.json.Writer = .init(&out);
+    try base.execution.rpc.format.transaction(&w, raw, null, consensus.recover_address);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try sources.transaction_json.decode(
+        arena.allocator(),
+        arena.allocator(),
+        out.buffered(),
+        .{ .recover_senders = false },
+    );
+    var rebuilt_buffer: [512]u8 = undefined;
+    const rebuilt = decoded.envelope.?.encode_to(&rebuilt_buffer);
+    try testing.expectEqualSlices(u8, raw, rebuilt);
+}
+
 test "el engine: safe and finalized answer the anchor until a forkchoice update" {
     var setup: Setup = .{};
     try setup.init(30, 16, 10); // Ring: 14..29.
