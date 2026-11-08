@@ -307,9 +307,15 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     });
     while (true) {
         node.tick();
-        try os_io.run_for_ns(10 * std.time.ns_per_ms);
+        try os_io.run_for_ns(loop_period_ns);
     }
 }
+
+/// One node tick per period. Engine and L1 requests advance one step per tick (the polling
+/// client starts a request in one tick and takes its result in a later one), so the period
+/// bounds a verifier's request rate: at 10 ms, about 20 engine requests per second, under
+/// the five L2 blocks per second Base produces at five requests per consolidated block.
+const loop_period_ns: u64 = 2 * std.time.ns_per_ms;
 
 const ServerAddresses = struct { rpc: ?io.Address, ws: ?io.Address, metrics: ?io.Address };
 

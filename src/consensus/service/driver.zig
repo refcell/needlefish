@@ -172,8 +172,8 @@ pub const SafeCheck = struct {
     cap: ?BlockId = null,
     /// Entries exist but none of their L1 blocks is canonical.
     unsupported: bool = false,
-    /// Ticks spent waiting for L1 lookups.
-    ticks: u32 = 0,
+    /// When the check first ran (driver clock, ms); its L1 wait is bounded by time, not ticks.
+    started_ms: ?u64 = null,
     /// A newer entry's L1 block is orphaned: reset records below it are not trusted.
     orphan_seen: bool = false,
     /// The newest canonical reset record that an orphan shadowed (last resort cap).
@@ -208,9 +208,9 @@ pub const SafeCheck = struct {
 
 /// L1 lookups per tick for the safedb check.
 const safe_check_lookups_max = 16;
-/// Ticks the safedb check waits for L1 (a provider behind the recorded blocks) before it
-/// gives up without a cap.
-const safe_check_ticks_max = 3000;
+/// How long the safedb check waits for L1 (a provider behind the recorded blocks) before it
+/// gives up without a cap (3000 ticks of the 10 ms loop it was sized for).
+const safe_check_wait_ms_max = 30_000;
 
 fn optional(comptime T: type, result: ProviderError!T) ProviderError!?T {
     return result catch |err| switch (err) {
@@ -389,8 +389,9 @@ pub const Driver = struct {
             const L1 = @typeInfo(@TypeOf(providers.l1)).pointer.child;
             if (@hasDecl(L1, "forget_numbers")) providers.l1.forget_numbers();
         }
-        check.ticks += 1;
-        if (check.ticks > safe_check_ticks_max) {
+        const started_ms = check.started_ms orelse driver.now_ms;
+        check.started_ms = started_ms;
+        if (driver.now_ms -| started_ms >= safe_check_wait_ms_max) {
             check.done = true; // L1 never caught up: keep the labels (base/base).
             return true;
         }
