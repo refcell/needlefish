@@ -224,8 +224,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         orphan_count: u32 = 0,
         compaction: Compaction,
         reader: Table.Reader,
-        /// `get`'s block buffer (one block, read synchronously) and its copy of the value.
-        get_buffer: []align(storage.sector_size) u8,
+        /// `get`'s copy of the value.
         get_value: Value = undefined,
         lookup_active: bool = false,
         lookup_asynchronous: bool = false,
@@ -367,9 +366,6 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             errdefer compaction.deinit(allocator);
             var reader = try Table.Reader.init(allocator, grid, cache);
             errdefer reader.deinit(allocator);
-            const alignment = comptime std.mem.Alignment.fromByteUnits(storage.sector_size);
-            const get_buffer = try allocator.alignedAlloc(u8, alignment, config.block_size);
-            @memset(get_buffer, 0);
             @memset(slot_used, false);
             @memset(slot_blocks, 0);
             @memset(filters, 0);
@@ -386,7 +382,6 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
                 .orphans = orphans,
                 .compaction = compaction,
                 .reader = reader,
-                .get_buffer = get_buffer,
             };
         }
 
@@ -401,7 +396,6 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             allocator.free(self.orphans);
             self.compaction.deinit(allocator);
             self.reader.deinit(allocator);
-            allocator.free(self.get_buffer);
             self.* = undefined;
         }
 
@@ -712,7 +706,9 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
         ) Error![]const u8 {
             const cache = self.reader.cache;
             const block = cache.get(reference) orelse block: {
-                const payload = self.grid.read_sync(self.get_buffer, reference, kind) orelse
+                // Read straight into a cache slot: a miss copies no block.
+                const claimed = cache.claim(reference);
+                const payload = self.grid.read_sync(claimed.buffer, reference, kind) orelse
                     return self.get_fault();
                 const valid = switch (kind) {
                     .table_index => Table.index_valid(payload, self.grid.config.block_count),
@@ -721,7 +717,7 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
                 };
                 if (!valid) return self.get_fault();
                 const length = grid_module.block_header_size + payload.len;
-                break :block cache.put(reference, self.get_buffer[0..length]);
+                break :block cache.fill(claimed, reference, length);
             };
             const header: *const grid_module.BlockHeader = @ptrCast(@alignCast(
                 block[0..grid_module.block_header_size],

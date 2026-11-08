@@ -149,6 +149,36 @@ pub const BlockCache = struct {
         return target[0..block.len];
     }
 
+    /// A slot for a block about to be read straight into it (no copy): `buffer` is the slot's
+    /// whole block. The slot holds nothing until `fill` names it (a read that fails leaves
+    /// it empty). Replaces any entry at the same address, as `put` does.
+    pub const Claim = struct { slot: usize, buffer: []align(sector_size) u8 };
+
+    pub fn claim(self: *BlockCache, reference: Reference) Claim {
+        assert(reference.address > 0);
+        const set = self.set_of(reference.address);
+        const first = set * ways;
+        const slot = for (first..first + ways) |slot| {
+            if (self.addresses[slot] == reference.address) break slot;
+        } else self.evict(set);
+        self.addresses[slot] = 0;
+        self.referenced[slot] = false;
+        assert(slot >= first and slot < first + ways);
+        return .{ .slot = slot, .buffer = self.block_at(slot) };
+    }
+
+    /// Names the claimed slot `reference`'s verified block, of `length` bytes (header and
+    /// payload), and returns it (valid until the next `put` or `claim`).
+    pub fn fill(self: *BlockCache, claimed: Claim, reference: Reference, length: usize) []const u8 {
+        assert(reference.address > 0);
+        assert(length <= self.block_size);
+        assert(self.addresses[claimed.slot] == 0);
+        assert(claimed.buffer.ptr == self.block_at(claimed.slot).ptr);
+        self.addresses[claimed.slot] = reference.address;
+        self.checksums[claimed.slot] = reference.checksum;
+        return claimed.buffer[0..length];
+    }
+
     /// CLOCK: the first slot from the hand without a reference bit, clearing bits on the way.
     fn evict(self: *BlockCache, set: usize) usize {
         const first = set * ways;

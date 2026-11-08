@@ -426,3 +426,26 @@ test "table: a paced build pauses after each granted block and equals an unpaced
     try testing.expectEqual(expected.data_block_count, pauses);
     try testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&info));
 }
+
+test "table: a claimed cache slot is empty until filled, and drops the address's old entry" {
+    var cache = try BlockCache.init(testing.allocator, sector_size, BlockCache.ways);
+    defer cache.deinit(testing.allocator);
+    const old: grid_module.Reference = .{ .address = 7, .checksum = 1 };
+    const new: grid_module.Reference = .{ .address = 7, .checksum = 2 };
+    var block: [64]u8 = @splat(0xaa);
+    _ = cache.put(old, &block);
+    try testing.expect(cache.get(old) != null);
+    // Claiming the address (a reused block) drops the old entry before the read lands.
+    const claimed = cache.claim(new);
+    try testing.expectEqual(@as(usize, sector_size), claimed.buffer.len);
+    try testing.expect(cache.get(old) == null);
+    try testing.expect(cache.get(new) == null);
+    // A read that fails leaves the slot empty; a later claim reuses it.
+    const again = cache.claim(new);
+    @memset(again.buffer[0..64], 0xbb);
+    const filled = cache.fill(again, new, 64);
+    block = @splat(0xbb);
+    try testing.expectEqualSlices(u8, &block, filled);
+    try testing.expectEqualSlices(u8, &block, cache.get(new).?[0..64]);
+    try testing.expect(cache.get(old) == null);
+}

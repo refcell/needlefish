@@ -148,7 +148,9 @@ pub const shape_node: Shape = .{
     .queue_entries_max = 8,
     .flat_flush_entries_min = 16 * 1024,
     .flat_branch_flush_entries_min = 4096,
-    .flat_cache_blocks = 1024,
+    // 4 GiB of 64 KiB blocks, filled as blocks read (an import touches few): a block that
+    // misses reads 64 KiB and checks it, and 64 MiB churned every block.
+    .flat_cache_blocks = 1 << 16,
     .code_flush_bytes_min = 64 * 1024,
     .codes_headroom = 1 << 16,
     .code_bytes_headroom = 64 << 20,
