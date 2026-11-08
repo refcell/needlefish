@@ -848,7 +848,7 @@ fn RunType(comptime Storage: type) type {
                 if (attempts >= to_disk.busy_ticks_max) return error.Stalled;
                 _ = self.overlay.commit(&self.changeset) catch |err| switch (err) {
                     error.Busy => {
-                        self.tick();
+                        self.wait_compaction();
                         continue;
                     },
                     else => return err,
@@ -856,6 +856,22 @@ fn RunType(comptime Storage: type) type {
                 break;
             }
             assert(self.overlay.accounts.count() == 0);
+        }
+
+        /// After a busy apply (memtable room): lets the compactions finish, bounded, before
+        /// the next attempt, as `import/run.zig` waits for quiet.
+        fn wait_compaction(self: *Run) void {
+            const trees = &self.db.flat.?;
+            var ticks: u32 = 0;
+            while (ticks < to_disk.busy_ticks_max) : (ticks += 1) {
+                self.tick();
+                const idle = trees.accounts.compaction_idle() and
+                    trees.storage.compaction_idle() and
+                    trees.account_branches.compaction_idle() and
+                    trees.storage_branches.compaction_idle();
+                if (idle) break;
+            }
+            assert(ticks <= to_disk.busy_ticks_max);
         }
 
         /// `commit_applied` the applied block (made room for: never busy here).
