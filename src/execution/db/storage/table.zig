@@ -117,16 +117,23 @@ pub const BlockCache = struct {
 
     /// The cached block for `reference`, or null. Valid until the next `put`.
     pub fn get(self: *BlockCache, reference: Reference) ?[]const u8 {
+        const block = self.peek(reference);
+        if (block == null) self.stats.misses += 1 else self.stats.hits += 1;
+        return block;
+    }
+
+    /// `get` without counting a hit or a miss (a prefetch's probe). A hit is marked
+    /// referenced all the same: the block is about to be used.
+    pub fn peek(self: *BlockCache, reference: Reference) ?[]const u8 {
         assert(reference.address > 0);
         const first = self.set_of(reference.address) * ways;
         for (first..first + ways) |slot| {
             if (self.addresses[slot] != reference.address) continue;
             if (self.checksums[slot] != reference.checksum) break;
             self.referenced[slot] = true;
-            self.stats.hits += 1;
+            assert(slot < first + ways);
             return self.block_at(slot);
         }
-        self.stats.misses += 1;
         return null;
     }
 

@@ -17,6 +17,16 @@
 //! were (`StateDb.rollback` unwinds an applied block) and its `Outcome` names the first
 //! failed check, or the execution error.
 //!
+//! Prefetch: when the flat trees have a prefetcher (`db/prefetch.zig`), each attempt first
+//! reads the blocks of the state the block will likely touch into the block cache, many at
+//! once, while checkpoints are held: the beneficiary, the fee vaults and L1Block, each
+//! transaction's sender (recovered ahead on the executor's recovery pool), recipient,
+//! deposit `from`, and access list (accounts and slots). Execution's synchronous reads then
+//! hit the cache. The executor's commit (the runner is its backend, over the StateDb) does
+//! the same first for the branch records the root update will resolve: the trie paths of
+//! the block's dirty accounts and slots, and of the slots' owners. Best effort: results
+//! never depend on what was prefetched.
+//!
 //! Busy: a block is held (`hold_checkpoints`) from execution to its journal entry, so no
 //! checkpoint can start in between. Before each block the runner therefore makes room for
 //! the journal entry and for the branch writes of the block and of a rollback (the database's
@@ -43,6 +53,7 @@ const payload = @import("../payload/root.zig");
 const trie = @import("../trie/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
+const evm = @import("../evm/root.zig");
 
 const Hash = [32]u8;
 const Address = [20]u8;
@@ -140,6 +151,15 @@ pub const Config = struct {
     clock: ?Executor.Clock = null,
 };
 
+/// Accounts every Base block touches: the fee vaults and the L1Block predeploy.
+const system_accounts = [_]Address{
+    evm.op.sequencer_fee_vault,
+    evm.op.base_fee_vault,
+    evm.op.l1_fee_vault,
+    evm.op.operator_fee_vault,
+    evm.op.l1_block_address,
+};
+
 /// Summed wall time per phase of the committed blocks, under `Config.clock`.
 pub const Time = struct {
     /// Pre-block system calls and the state cache reset.
@@ -159,6 +179,8 @@ pub const Time = struct {
     journal_ns: u64 = 0,
     /// Waiting for storage room (checkpoints, compaction) before the block.
     room_ns: u64 = 0,
+    /// Naming the block's likely keys and reading their blocks ahead (every attempt).
+    prefetch_ns: u64 = 0,
 };
 
 pub const Stats = struct {
@@ -231,6 +253,14 @@ pub fn RunnerType(comptime Storage: type) type {
     return struct {
         const Runner = @This();
         pub const Database = database.DatabaseType(Storage);
+        pub const Prefetch = Database.FlatTrees.Prefetch;
+
+        /// Names a block's prefetch keys in place of the runner's own hints (tests): before
+        /// execution (`block`), and before the commit (`block` null).
+        pub const Hinter = struct {
+            context: *anyopaque,
+            hint: *const fn (context: *anyopaque, prefetch: *Prefetch, block: ?*const Block) void,
+        };
 
         db: *Database,
         spec: *const chainspec.ChainSpec,
@@ -239,6 +269,7 @@ pub fn RunnerType(comptime Storage: type) type {
         executor: Executor,
         stats: Stats = .{},
         clock: ?Executor.Clock = null,
+        hinter: ?Hinter = null,
 
         /// Executes on `db`, an open disk-mode database with a head (an import's head N or
         /// a block this runner committed). Heap-pinned: the executor points at the StateDb.
@@ -273,7 +304,8 @@ pub fn RunnerType(comptime Storage: type) type {
                 .undo_blocks_max = 2,
             }, &db.state);
             errdefer self.state_db.deinit(allocator);
-            self.executor = try Executor.init(allocator, spec, &self.state_db, config.executor);
+            self.executor =
+                try Executor.init_backend(allocator, spec, self.backend(), config.executor);
             self.executor.phase_clock = config.clock;
             self.clock = config.clock;
             return self;
@@ -338,6 +370,8 @@ pub fn RunnerType(comptime Storage: type) type {
             // The state holds the block before its entry is queued: no checkpoint between.
             db.hold_checkpoints(true);
             defer db.hold_checkpoints(false);
+            // Held: no block a prefetch read names can be rewritten before the read lands.
+            self.prefetch(block, header);
             // Base blocks carry an empty withdrawals list from Canyon on.
             const withdrawals: ?[]const payload.Withdrawal =
                 if (header.withdrawals_root != null) &.{} else null;
@@ -372,6 +406,130 @@ pub fn RunnerType(comptime Storage: type) type {
             self.add_time(check_ns, self.now_ns() -| journal_start_ns);
             assert(std.mem.eql(u8, &db.head_info.state_root, &executed.state_root));
             return true;
+        }
+
+        /// Reads the blocks of the state `block` will likely touch into the block cache, all
+        /// at once, ticking until done (bounded; an unfinished prefetch skips the next).
+        fn prefetch(self: *Runner, block: *const Block, header: *const Header) void {
+            const prefetch_state = self.db.flat.?.prefetch orelse return;
+            if (prefetch_state.running) return;
+            const start_ns = self.now_ns();
+            prefetch_state.clear();
+            if (self.hinter) |hinter| {
+                hinter.hint(hinter.context, prefetch_state, block);
+            } else {
+                self.hint(prefetch_state, block, header);
+            }
+            self.prefetch_run(prefetch_state);
+            self.stats.time.prefetch_ns += self.now_ns() -| start_ns;
+        }
+
+        fn prefetch_run(self: *Runner, prefetch_state: *Prefetch) void {
+            assert(!prefetch_state.running);
+            prefetch_state.start(&self.db.flat.?);
+            var ticks: u32 = 0;
+            while (prefetch_state.running and ticks < ticks_max) : (ticks += 1) self.tick();
+            assert(ticks <= ticks_max);
+        }
+
+        /// The executor's backend: the StateDb, whose commit first prefetches.
+        fn backend(self: *Runner) executor_module.Backend {
+            return .{
+                .context = self,
+                .database = self.state_db.database(),
+                .commit = backend_commit,
+                .root = backend_root,
+            };
+        }
+
+        fn backend_commit(
+            context: *anyopaque,
+            evm_state: *evm.State,
+        ) executor_module.BackendError!void {
+            const self: *Runner = @ptrCast(@alignCast(context));
+            assert(self.db.checkpoints_held);
+            self.prefetch_paths(evm_state);
+            return self.state_db.commit(evm_state);
+        }
+
+        fn backend_root(context: *anyopaque) executor_module.BackendError!Hash {
+            const self: *Runner = @ptrCast(@alignCast(context));
+            assert(self.db.checkpoints_held);
+            return self.state_db.root();
+        }
+
+        /// Reads ahead the branch records the commit's root update resolves: along the trie
+        /// paths of the block's dirty accounts and slots, and of the slots' owners.
+        fn prefetch_paths(self: *Runner, evm_state: *const evm.State) void {
+            const prefetch_state = self.db.flat.?.prefetch orelse return;
+            if (prefetch_state.running) return;
+            const start_ns = self.now_ns();
+            prefetch_state.clear();
+            if (self.hinter) |hinter| {
+                hinter.hint(hinter.context, prefetch_state, null);
+            } else {
+                var accounts = evm_state.accounts.iterator();
+                while (accounts.next()) |entry| {
+                    if (!entry.value_ptr.dirty) continue;
+                    prefetch_state.add_path(null, &keccak256(entry.key_ptr));
+                }
+                var slots = evm_state.slots.iterator();
+                while (slots.next()) |entry| {
+                    if (!entry.value_ptr.dirty) continue;
+                    const owner = keccak256(&entry.key_ptr.address);
+                    var slot_bytes: [32]u8 = undefined;
+                    std.mem.writeInt(u256, &slot_bytes, entry.key_ptr.slot, .big);
+                    prefetch_state.add_path(&owner, &keccak256(&slot_bytes));
+                    const account = evm_state.accounts.getPtr(entry.key_ptr.address);
+                    const dirty = account != null and account.?.dirty;
+                    if (!dirty) prefetch_state.add_path(null, &owner);
+                }
+            }
+            self.prefetch_run(prefetch_state);
+            self.stats.time.prefetch_ns += self.now_ns() -| start_ns;
+        }
+
+        /// The runner's hints (see the file comment). Senders come from the executor's
+        /// recovery pool, which the block then adopts; without a pool they are not hinted.
+        fn hint(
+            self: *Runner,
+            prefetch_state: *Prefetch,
+            block: *const Block,
+            header: *const Header,
+        ) void {
+            hint_account(prefetch_state, &header.beneficiary.bytes);
+            for (&system_accounts) |*address| hint_account(prefetch_state, address);
+            self.executor.prefetch(block.transactions);
+            const senders = self.executor.prefetched_senders();
+            if (senders) |list| assert(list.len == block.transactions.len);
+            for (block.transactions, 0..) |raw, index| {
+                if (senders) |list| {
+                    if (list[index]) |sender| hint_account(prefetch_state, &sender.bytes);
+                }
+                const envelope = consensus.Envelope.decode(raw) catch continue;
+                hint_transaction(prefetch_state, &envelope);
+            }
+        }
+
+        fn hint_transaction(prefetch_state: *Prefetch, envelope: *const consensus.Envelope) void {
+            if (envelope.* == .deposit) hint_account(prefetch_state, &envelope.deposit.from.bytes);
+            switch (envelope.kind()) {
+                .call => |to| hint_account(prefetch_state, &to.bytes),
+                .create => {},
+            }
+            var items = envelope.access_list().iterator();
+            while (items.next()) |item| {
+                const address_hash = keccak256(&item.address.bytes);
+                prefetch_state.add_account(&address_hash);
+                for (0..item.storage_keys.count()) |index| {
+                    const slot = item.storage_keys.get(index);
+                    prefetch_state.add_slot(&address_hash, &keccak256(&slot.bytes));
+                }
+            }
+        }
+
+        fn hint_account(prefetch_state: *Prefetch, address: *const Address) void {
+            prefetch_state.add_account(&keccak256(address));
         }
 
         fn now_ns(self: *const Runner) u64 {

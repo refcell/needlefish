@@ -342,6 +342,19 @@ pub const Executor = struct {
         assert(executor.prefetched != null);
     }
 
+    /// The senders `prefetch` recovers (null for a transaction that does not recover),
+    /// waiting for them; null without a running prefetch. Valid until a block executes or
+    /// the prefetch is cancelled.
+    pub fn prefetched_senders(executor: *Executor) ?[]const ?primitives.Address {
+        const raws = executor.prefetched orelse return null;
+        const slot: u1 = executor.slot +% 1;
+        const pipeline = &executor.pipelines[slot];
+        for (0..raws.len) |index| pipeline.wait_for(index);
+        const senders, _ = executor.slot_buffers(slot);
+        assert(raws.len <= senders.len);
+        return senders[0..raws.len];
+    }
+
     /// Finishes a prefetch no block adopted (its senders are dropped); afterwards the
     /// prefetched transactions may change.
     pub fn cancel_prefetch(executor: *Executor) void {

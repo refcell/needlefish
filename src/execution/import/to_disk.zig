@@ -103,6 +103,9 @@ pub const Shape = struct {
     flat_flush_entries_min: u32,
     flat_branch_flush_entries_min: u32,
     flat_cache_blocks: u32,
+    /// Keys a block's prefetch names and its reads in flight (`db/prefetch.zig`); 0: none.
+    flat_prefetch_keys_max: u32 = 0,
+    flat_prefetch_reads_max: u32 = 0,
     code_flush_bytes_min: u32,
     /// Codes and code bytes the state holds beyond the snapshot's (contracts created later).
     codes_headroom: u32,
@@ -151,6 +154,9 @@ pub const shape_node: Shape = .{
     // 4 GiB of 64 KiB blocks, filled as blocks read (an import touches few): a block that
     // misses reads 64 KiB and checks it, and 64 MiB churned every block.
     .flat_cache_blocks = 1 << 16,
+    // A block's hinted keys and written trie paths, read 64 blocks at a time.
+    .flat_prefetch_keys_max = 1 << 13,
+    .flat_prefetch_reads_max = 64,
     .code_flush_bytes_min = 64 * 1024,
     .codes_headroom = 1 << 16,
     .code_bytes_headroom = 64 << 20,
@@ -265,6 +271,8 @@ fn base_config(shape: Shape) database.Config {
         .flat_trees = true,
         .flat_flush_entries_min = shape.flat_flush_entries_min,
         .flat_cache_blocks = shape.flat_cache_blocks,
+        .flat_prefetch_keys_max = shape.flat_prefetch_keys_max,
+        .flat_prefetch_reads_max = shape.flat_prefetch_reads_max,
         .flat_branch_flush_entries_min = shape.flat_branch_flush_entries_min,
         .disk_state = shape.disk_state,
     };

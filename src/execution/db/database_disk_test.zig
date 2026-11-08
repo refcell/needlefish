@@ -11,6 +11,11 @@
 //! is dropped from both. A tiny branch flush trigger (below one block's branch writes) and the
 //! smallest replay reserve the config allows exercise the operation room and the admission.
 //!
+//! Prefetch (`prefetch.zig`): before many steps the disk database prefetches a random mix of
+//! keys (accounts and slots of the address universe, absent and random keys, branch records
+//! at random hangs, keys of the wrong tree), sometimes left running across the next blocks,
+//! checkpoints and crashes: every comparison with the oracle holds all the same.
+//!
 //! Imported start: a random state bulk-imported into the four trees, made head N with no
 //! stored block (`import_head`), checkpointed, reopened (clean or after a crash), and compared
 //! with the oracle given that state as its first block; then random blocks on top. A wrong
@@ -30,6 +35,7 @@ const changeset_module = @import("changeset.zig");
 const branch_record = @import("branch_record.zig");
 const disk_state_test = @import("disk_state_test.zig");
 const Prng = @import("../../testing/prng.zig").Prng;
+const node_keccak = @import("../trie/node.zig").keccak256;
 
 const Hash = database.Hash;
 const HeadInfo = database.HeadInfo;
@@ -95,6 +101,8 @@ const config_disk: database.Config = .{
     .flat_storage_branches_max = 4096,
     // Below one block's branch writes: a move fits only through the operation room.
     .flat_branch_flush_entries_min = 4,
+    .flat_prefetch_keys_max = 48,
+    .flat_prefetch_reads_max = 3,
     .disk_state = .{
         .trie_nodes_max = 1 << 13,
         .storage_tries_max = 64,
@@ -294,6 +302,9 @@ const Counts = struct {
     branch_flushes: u64 = 0,
     imports: u64 = 0,
     stored_alone: u64 = 0,
+    /// Prefetches started, and blocks they read into the cache.
+    prefetches: u64 = 0,
+    prefetch_reads: u64 = 0,
 };
 
 const Harness = struct {
@@ -364,6 +375,39 @@ const Harness = struct {
         self.counts.branch_flushes += trees.account_branches.stats.flushes +
             trees.storage_branches.stats.flushes;
         self.counts.admission_busy += self.disk.db.disk_admission_busy;
+        self.counts.prefetch_reads += trees.prefetch.?.stats.reads;
+    }
+
+    /// Starts a prefetch of random keys, right and wrong, and ticks it a random number of
+    /// times (it may outlive this step: later blocks, checkpoints and crashes meet it).
+    fn prefetch(self: *Harness) void {
+        const trees = &self.disk.db.flat.?;
+        const prefetch_state = trees.prefetch.?;
+        if (prefetch_state.running) return;
+        prefetch_state.clear();
+        for (0..self.prng.range(1, 48)) |_| {
+            const address_hash = node_keccak(&address_of(self.prng.below(addresses_max + 4)));
+            var slot_bytes: [32]u8 = @splat(0);
+            slot_bytes[31] = @intCast(self.prng.below(slots_per_address + 2));
+            const slot_hash = node_keccak(&slot_bytes);
+            var random: Hash = undefined;
+            self.prng.fill(&random);
+            var hang: [6]u8 = undefined;
+            for (&hang) |*nibble| nibble.* = @intCast(self.prng.below(16));
+            const depth: usize = @intCast(self.prng.below(hang.len + 1));
+            switch (self.prng.below(9)) {
+                0, 1 => prefetch_state.add_account(&address_hash),
+                7 => prefetch_state.add_path(&address_hash, &slot_hash),
+                8 => prefetch_state.add_path(null, &address_hash),
+                2, 3 => prefetch_state.add_slot(&address_hash, &slot_hash),
+                4 => prefetch_state.add_branch(&address_hash, hang[0..depth]),
+                5 => prefetch_state.add_branch(null, hang[0..depth]),
+                else => prefetch_state.add_slot(&random, &address_hash),
+            }
+        }
+        prefetch_state.start(trees);
+        self.counts.prefetches += 1;
+        for (0..self.prng.below(12)) |_| self.disk_sim.tick();
     }
 
     fn format(self: *Harness, seed: u64) !void {
@@ -614,6 +658,7 @@ const Harness = struct {
 
     fn step(self: *Harness) !void {
         if (self.disk.db.phase == .failed) return error.DatabaseFailed;
+        if (self.disk.db.phase == .ready and self.prng.chance(1, 4)) self.prefetch();
         const roll = self.prng.below(100);
         if (roll < 3) {
             self.disk.db.request_checkpoint();
@@ -735,6 +780,7 @@ test "database disk mode: seeded blocks, reorgs, checkpoints, crashes match in-m
     try testing.expect(counts.record_writes_max > config_disk.flat_branch_flush_entries_min);
     try testing.expect(counts.branch_flushes >= 20);
     try testing.expect(counts.admission_busy >= 1);
+    try testing.expect(counts.prefetches >= 100 and counts.prefetch_reads >= 100);
 }
 
 // Imported start.

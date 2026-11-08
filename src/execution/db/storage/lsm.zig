@@ -731,6 +731,96 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             return error.Corrupt;
         }
 
+        // Prefetch (`prefetch.zig`): `get`'s search over the cached blocks only, so a caller
+        // can read the blocks it lacks ahead of time, many at once, into the cache.
+
+        /// A table block a search needs that the block cache lacks.
+        pub const Need = struct {
+            reference: grid_module.Reference,
+            kind: grid_module.BlockKind,
+        };
+
+        /// Where `get(key)`'s search over the cached blocks ends: a value (`found`, valid
+        /// until the next cache put or memtable change), no value (`absent`: not present, a
+        /// tombstone, or the tree faulted), or a block the cache lacks (`missing`; reading it
+        /// into the cache moves the search on).
+        pub const PrefetchStep = union(enum) { absent, found: []const u8, missing: Need };
+
+        /// Follows `get(key)`'s search over the memtables and the cached blocks, without IO
+        /// and without counting (see `PrefetchStep`).
+        pub fn prefetch_step(self: *Tree, key: *const Key) PrefetchStep {
+            assert(self.scan_callback == null);
+            if (self.fault) return .absent;
+            if (self.memtable_find(key)) |found| {
+                const memtable, const entry = found;
+                if (memtable.tombstones[entry]) return .absent;
+                return .{ .found = memtable.value(entry) };
+            }
+            for (self.level_list(0)) |slot| {
+                if (!self.in_range(slot, key)) continue;
+                const step = self.prefetch_table(slot, key) orelse continue;
+                return step;
+            }
+            var level: u32 = 1;
+            while (level < self.config.levels_count) : (level += 1) {
+                const slot = self.level_find(level, key) orelse continue;
+                const step = self.prefetch_table(slot, key) orelse continue;
+                return step;
+            }
+            assert(level == self.config.levels_count);
+            return .absent;
+        }
+
+        /// The search's end in table `slot`, or null to go on to the next table.
+        fn prefetch_table(self: *Tree, slot: u32, key: *const Key) ?PrefetchStep {
+            assert(self.slot_used[slot]);
+            if (self.slot_filter(slot)) |words| {
+                if (!filter_module.may_contain(words, filter_module.hash(key))) return null;
+            }
+            const info = &self.slot_infos[slot];
+            const index = self.cached_payload(info.index) orelse
+                return .{ .missing = .{ .reference = info.index, .kind = .table_index } };
+            const ordinal = Table.index_find(index, key) orelse return null;
+            const reference = Table.index_reference(index, ordinal);
+            const data = self.cached_payload(reference) orelse
+                return .{ .missing = .{ .reference = reference, .kind = .table_data } };
+            const value = Table.data_search(data, key) orelse return null;
+            // A tombstone ends the search as `get`'s does, with no value.
+            return if (value.len == 0) .absent else .{ .found = value };
+        }
+
+        /// The payload of a cached (verified) block, or null.
+        fn cached_payload(self: *Tree, reference: grid_module.Reference) ?[]const u8 {
+            const block = self.reader.cache.peek(reference) orelse return null;
+            const header: *const grid_module.BlockHeader = @ptrCast(@alignCast(
+                block[0..grid_module.block_header_size],
+            ));
+            assert(header.address == reference.address);
+            return block[grid_module.block_header_size..][0..header.payload_size];
+        }
+
+        /// Caches `block` (header and payload), which the grid read for a prefetch and
+        /// verified (`read_block`: checksum, address, kind), once it also checks as a table
+        /// block of `kind`, as `get` checks what it reads. False (nothing cached) otherwise.
+        pub fn prefetch_store(
+            self: *Tree,
+            reference: grid_module.Reference,
+            kind: grid_module.BlockKind,
+            block: []const u8,
+        ) bool {
+            assert(block.len >= grid_module.block_header_size);
+            assert(block.len <= self.config.block_size);
+            const payload = block[grid_module.block_header_size..];
+            const valid = switch (kind) {
+                .table_index => Table.index_valid(payload, self.grid.config.block_count),
+                .table_data => Table.data_valid(payload),
+                _ => false,
+            };
+            if (!valid) return false;
+            _ = self.reader.cache.put(reference, block);
+            return true;
+        }
+
         // Levels and table slots.
 
         pub fn level_list(self: *const Tree, level: u32) []u32 {

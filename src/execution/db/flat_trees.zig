@@ -57,6 +57,7 @@ const table_module = @import("storage/table.zig");
 const free_set_module = @import("storage/free_set.zig");
 const changeset_module = @import("changeset.zig");
 const branch_record = @import("branch_record.zig");
+const prefetch_module = @import("prefetch.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
 const node = @import("../trie/node.zig");
 
@@ -123,6 +124,9 @@ pub const Config = struct {
     branch_replay_entries: u32 = 0,
     /// Blocks of the block cache every tree's reads share.
     cache_blocks: u32,
+    /// Keys one prefetch names and reads it keeps in flight (`prefetch.zig`); 0: none.
+    prefetch_keys_max: u32 = 0,
+    prefetch_reads_max: u32 = 0,
 };
 
 /// Records one table of `Tree` holds within one index block when values are their largest
@@ -282,6 +286,7 @@ pub fn FlatTreesType(comptime Storage: type) type {
         pub const Mode = enum { live, replay };
         pub const BulkError = lsm_bulk.Error;
         pub const Bulk = BulkType(Self);
+        pub const Prefetch = prefetch_module.PrefetchType(Self);
 
         cache: *BlockCache,
         accounts: AccountTree,
@@ -291,6 +296,9 @@ pub fn FlatTreesType(comptime Storage: type) type {
         /// The running bulk import's loaders (`bulk_begin`..`bulk_end`), boxed: they must not
         /// move while loading.
         bulk: ?*Bulk = null,
+        /// Reads a set of keys' blocks into the cache ahead of their point reads; null
+        /// unless configured. Boxed: its grid reads point into it.
+        prefetch: ?*Prefetch = null,
         /// The callback's context, set by the owner before a scan.
         owner: ?*anyopaque = null,
         scan_callback: ?Callback = null,
@@ -318,9 +326,17 @@ pub fn FlatTreesType(comptime Storage: type) type {
             var account_branches =
                 try AccountBranchTree.init(allocator, grid, cache, configs.account_branches);
             errdefer account_branches.deinit(allocator);
-            const storage_branches =
+            var storage_branches =
                 try StorageBranchTree.init(allocator, grid, cache, configs.storage_branches);
+            errdefer storage_branches.deinit(allocator);
+            assert((config.prefetch_keys_max == 0) == (config.prefetch_reads_max == 0));
+            const prefetch = if (config.prefetch_keys_max == 0) null else try Prefetch.create(
+                allocator,
+                .{ .keys_max = config.prefetch_keys_max, .reads_max = config.prefetch_reads_max },
+                block_size,
+            );
             return .{
+                .prefetch = prefetch,
                 .cache = cache,
                 .accounts = accounts,
                 .storage = storage,
@@ -384,6 +400,7 @@ pub fn FlatTreesType(comptime Storage: type) type {
         /// Frees memory. Grid IO may be in flight only if the storage dropped it (crash).
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (self.bulk) |bulk| bulk.destroy(allocator);
+            if (self.prefetch) |prefetch| prefetch.destroy(allocator);
             inline for (tree_names) |name| @field(self, name).deinit(allocator);
             self.cache.deinit(allocator);
             allocator.destroy(self.cache);
@@ -406,6 +423,7 @@ pub fn FlatTreesType(comptime Storage: type) type {
         /// No grid IO in flight and no lookup pending (the owner may be freed).
         pub fn idle(self: *const Self) bool {
             if (self.bulk) |bulk| if (!bulk.idle()) return false;
+            if (self.prefetch) |prefetch| if (!prefetch.idle()) return false;
             inline for (tree_names) |name| {
                 const tree = &@field(self, name);
                 if (tree.compaction.io_pending or tree.lookup_active) return false;

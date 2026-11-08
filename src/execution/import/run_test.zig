@@ -12,6 +12,10 @@
 //! In the middle the storage crashes with blocks not yet durable: the database reopens at a
 //! committed block at or after the durable one, and the runner continues from there.
 //!
+//! The runner prefetches every block (`db/prefetch.zig`) with its own hints (senders from
+//! its recovery pool), and a second run names deliberately wrong keys instead (random keys,
+//! keys of the wrong tree, the right keys in the wrong tree): every block still matches.
+//!
 //! Negative cases (on the imported head and on a committed one): a header whose state root
 //! (or withdrawals root) is tampered and rehashed fails that check with the computed root
 //! reported; a block with an invalid transaction fails execution; a wrong parent, a wrong
@@ -74,7 +78,17 @@ const shape_run: to_disk.Shape = blk: {
     shape.entry_body_size_max = 4 * sector_size;
     shape.chain.reorg_depth_max = 1;
     shape.disk_state.replay_record_writes_max = shape.disk_state.record_writes_max * 3;
+    // Prefetch with a block cache far smaller than its reads: blocks churn.
+    shape.flat_prefetch_keys_max = 256;
+    shape.flat_prefetch_reads_max = 4;
     break :blk shape;
+};
+
+/// The runner's executor: the oracle's, with recovery workers (senders are hinted).
+const runner_executor_config: executor_module.Config = blk: {
+    var config = executor_config;
+    config.recovery_threads = 2;
+    break :blk config;
 };
 
 const contract: Address = @as([18]u8, @splat(0)) ++ [2]u8{ 0xc0, 0xde };
@@ -389,7 +403,7 @@ const Harness = struct {
 
     fn runner_create(self: *Harness) !*Runner {
         return Runner.create(testing.allocator, self.disk.db, spec, self.disk.driver(), .{
-            .executor = executor_config,
+            .executor = runner_executor_config,
             .clock = .{ .context = &self.clock_ns, .now_ns = clock_read },
         });
     }
@@ -662,4 +676,80 @@ test "import run: failed checks and refusals leave head and state; the next bloc
     const last = &harness.blocks[blocks_count - 1];
     try testing.expectEqualSlices(u8, &last.hash, &harness.disk.db.head_info.hash);
     try harness.expect_oracle_state();
+}
+
+/// Names wrong keys for every block, before execution and before the commit: random
+/// accounts, slots, branch records and trie paths, the touched accounts' hashes as slots and
+/// storage-trie owners, and slot hashes as accounts.
+const WrongHints = struct {
+    prng: @import("../../testing/prng.zig").Prng,
+    addresses: []const Address,
+    hinted: u64 = 0,
+    attempts: u64 = 0,
+    commits: u64 = 0,
+
+    fn hint(context: *anyopaque, prefetch: *Runner.Prefetch, block: ?*const run.Block) void {
+        const self: *WrongHints = @ptrCast(@alignCast(context));
+        if (block) |named| assert(named.transactions.len > 0);
+        if (block == null) self.commits += 1 else self.attempts += 1;
+        for (0..64) |_| {
+            var random: Hash = undefined;
+            self.prng.fill(&random);
+            const known = keccak256(&self.addresses[@intCast(self.prng.below(self.addresses.len))]);
+            var hang: [8]u8 = undefined;
+            for (&hang) |*nibble| nibble.* = @intCast(self.prng.below(16));
+            const depth: usize = @intCast(self.prng.below(hang.len + 1));
+            switch (self.prng.below(8)) {
+                0 => prefetch.add_account(&random),
+                6 => prefetch.add_path(&known, &random),
+                7 => prefetch.add_path(null, &random),
+                1 => prefetch.add_slot(&known, &random),
+                2 => prefetch.add_slot(&random, &known),
+                3 => prefetch.add_branch(&known, hang[0..depth]),
+                4 => prefetch.add_branch(null, hang[0..depth]),
+                else => prefetch.add_account(&keccak256(&random)),
+            }
+            self.hinted += 1;
+        }
+    }
+};
+
+test "import run: a prefetch of deliberately wrong keys changes no result" {
+    const keys = derive_keys();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const harness = try Harness.create(arena_state.allocator(), &keys, 5);
+    defer harness.destroy();
+    var wrong: WrongHints = .{
+        .prng = .init(0xbad_4ee5),
+        .addresses = &harness.addresses,
+    };
+    harness.runner.hinter = .{ .context = &wrong, .hint = WrongHints.hint };
+    for (0..blocks_count) |index| _ = try harness.pass(@intCast(index));
+    try harness.runner.flush();
+    try harness.expect_oracle_state();
+    const stats = harness.disk.db.flat.?.prefetch.?.stats;
+    // Before each attempt's execution and before each commit.
+    try testing.expect(wrong.attempts >= blocks_count and wrong.commits >= blocks_count);
+    try testing.expect(wrong.hinted == 64 * (wrong.attempts + wrong.commits));
+    // The wrong keys were walked, and the blocks they lacked read and cached.
+    try testing.expect(stats.runs >= blocks_count and stats.keys == wrong.hinted);
+    try testing.expect(stats.reads > 0 and stats.depth_max <= 4);
+}
+
+test "import run: the runner's own prefetch hints read blocks ahead" {
+    const keys = derive_keys();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const harness = try Harness.create(arena_state.allocator(), &keys, 6);
+    defer harness.destroy();
+    for (0..blocks_count) |index| _ = try harness.pass(@intCast(index));
+    try harness.expect_oracle_state();
+    const stats = harness.disk.db.flat.?.prefetch.?.stats;
+    // Before each block's execution and before its commit.
+    try testing.expect(stats.runs >= 2 * blocks_count);
+    // Beneficiary, five system accounts, and per transaction its sender and recipient.
+    try testing.expect(stats.keys >= blocks_count * (1 + 5 + 2));
+    try testing.expect(stats.reads > 0 and stats.rounds > 0);
+    try testing.expect(harness.runner.stats.time.prefetch_ns > 0);
 }

@@ -355,6 +355,9 @@ pub const Config = struct {
     flat_flush_entries_min: u32 = 16 * 1024,
     /// Block cache blocks the flat trees' lookups share.
     flat_cache_blocks: u32 = 64,
+    /// Keys one flat-tree prefetch names and its reads in flight (`prefetch.zig`); 0: none.
+    flat_prefetch_keys_max: u32 = 0,
+    flat_prefetch_reads_max: u32 = 0,
     /// Live keys the flat trees size their levels for (independent of `state`, which sizes
     /// RAM tables); null: `state.accounts_max` / `state.storage_slots_max`.
     flat_accounts_max: ?u64 = null,
@@ -422,6 +425,8 @@ pub const Config = struct {
             else
                 0,
             .cache_blocks = config.flat_cache_blocks,
+            .prefetch_keys_max = config.flat_prefetch_keys_max,
+            .prefetch_reads_max = config.flat_prefetch_reads_max,
         };
     }
 
