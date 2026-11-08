@@ -65,6 +65,10 @@ pub const shape_test: to_disk.Shape = .{
     .code_flush_bytes_min = 1024,
     .codes_headroom = 4,
     .code_bytes_headroom = 4096,
+    // Codes out of RAM, as the node: read back from their tables after a reopen.
+    .code_pin_bytes = 64 * 1024,
+    .code_pins_max = 16,
+    .code_cache_blocks = 16,
 };
 
 pub const head_number: u64 = 5_000_000;

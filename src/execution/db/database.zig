@@ -37,8 +37,10 @@
 //! on the same per-commit block budget), and the checkpoint (version 2) carries the table
 //! list plus only the codes no table holds. `open` uses the engine's open pause: it decodes
 //! the table list, scans the tables into `State.code_arena`, loads the image, and resumes the
-//! journal. Codes stay resident, so `State.code_by_hash` is unchanged. Without a grid the
-//! checkpoint is version 1 with every code, as before.
+//! journal. Codes stay resident, so `State.code_by_hash` is unchanged, unless
+//! `Config.code_pin_bytes` is set: then the scan keeps only where each code is and a read
+//! copies it from its table, valid until `codes_release`. Without a grid the checkpoint is
+//! version 1 with every code, as before.
 //! Flat trees (`Config.flat_trees`, needs a grid; `flat_trees.zig`): every head move also
 //! writes its unwound changesets' old values and applied changesets' new values into an
 //! account tree and a storage tree (shadow writes: `State` stays the source of truth), with
@@ -349,6 +351,13 @@ pub const Config = struct {
     /// New code bytes since the last flush below which a checkpoint skips the flush and
     /// carries those codes in its image (fewer small tables, fewer rewrites).
     code_flush_bytes_min: u32 = 64 * 1024,
+    /// Codes out of RAM (`code_store.zig` pinned mode; needs a grid) when non-zero: open
+    /// keeps only where each table code is, and `State.code_by_hash` reads it from its
+    /// table, pinned until `codes_release`. Bytes and codes pinned at once (size them for
+    /// one block's codes), and the code tables' own block cache.
+    code_pin_bytes: u64 = 0,
+    code_pins_max: u32 = 0,
+    code_cache_blocks: u32 = 0,
     /// Shadow-write committed changesets into flat account and storage trees on the grid
     /// (`flat_trees.zig`); needs a grid. Off: nothing changes (checkpoint version 2).
     /// A database opens only with the setting it was written with (no backfill yet).
@@ -442,6 +451,9 @@ pub const Config = struct {
             .codes_max = config.state.codes_max,
             .code_bytes_max = config.state.code_bytes_max,
             .flush_bytes_min = config.code_flush_bytes_min,
+            .pin_bytes = config.code_pin_bytes,
+            .pins_max = config.code_pins_max,
+            .cache_blocks = config.code_cache_blocks,
         };
     }
 
@@ -849,6 +861,12 @@ pub fn DatabaseType(comptime Storage: type) type {
                 // Pinned from here on: bind the state to the trees and to this database.
                 disk.trees = &self.flat.?;
                 self.state.disk = self.disk_backend();
+            }
+            if (self.code_store) |*store| {
+                if (store.pinned()) self.state.code_reader = .{
+                    .context = self,
+                    .read = code_read,
+                };
             }
             self.phase = .opening;
             self.open_fallback = false;
@@ -1581,6 +1599,26 @@ pub fn DatabaseType(comptime Storage: type) type {
         };
 
         // Disk mode: `State.disk`, admission.
+
+        fn code_read(
+            context: *anyopaque,
+            hash: *const Hash,
+            code: state_module.CodeRef,
+        ) ?[]const u8 {
+            const self: *Self = @ptrCast(@alignCast(context));
+            assert(self.state.code_reader != null);
+            return self.code_store.?.read_pinned(hash, code);
+        }
+
+        /// Ends the lifetime of every code slice `State.code_by_hash` returned for a code
+        /// held in a table only (`Config.code_pin_bytes`); a no-op otherwise. Call it where
+        /// no caller holds one (the import runner: before each block).
+        pub fn codes_release(self: *Self) void {
+            const store = if (self.code_store) |*store| store else return;
+            if (!store.pinned()) return;
+            assert(self.state.code_reader != null);
+            store.release();
+        }
 
         fn disk_backend(self: *Self) state_module.Disk {
             assert(self.disk != null);

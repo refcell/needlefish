@@ -372,6 +372,9 @@ pub fn RunnerType(comptime Storage: type) type {
         ) Error!bool {
             const db = self.db;
             assert(!db.checkpoints_held);
+            // No code slice of an earlier block or attempt is in use: the executor's state
+            // cache starts empty each block.
+            db.codes_release();
             // The state holds the block before its entry is queued: no checkpoint between.
             db.hold_checkpoints(true);
             defer db.hold_checkpoints(false);

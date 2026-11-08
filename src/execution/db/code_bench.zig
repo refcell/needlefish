@@ -10,6 +10,14 @@
 //! `SimStorage` with no latency, so times are the CPU side (copies, checksums, decode,
 //! keccak of every code at insert), not device time.
 //!
+//! Then, after the reopen, the code reads of `read_blocks` blocks of `reads_per_block`
+//! reads each (half from 512 hot codes, half from all of them, as calls into popular
+//! contracts and a long tail): grid codes resident in the arena, and pinned (codes out of
+//! RAM, phase 1e): read from their tables through the code block cache (256 MiB, as the
+//! node's, so every block is cached after its first read) and pinned until each block's
+//! release. Cold: the first block after the open (every block read from storage, CPU side
+//! only); warm: the mean of the last half.
+//!
 //! Benchmark scaffolding: fixtures come from the page allocator.
 
 const std = @import("std");
@@ -33,6 +41,11 @@ const codes_total: u32 = 4096;
 const codes_per_block: u32 = 128;
 const codes_later: u32 = 16;
 const block_size: u32 = 64 * 1024;
+const read_blocks: u32 = 64;
+const reads_per_block: u32 = 256;
+const hot_codes: u32 = 512;
+
+const Variant = enum { plain, grid, pinned };
 
 fn code_length(prng: *Prng) u32 {
     const roll = prng.below(10);
@@ -41,7 +54,7 @@ fn code_length(prng: *Prng) u32 {
     return @intCast(prng.range(12_000, 24_576));
 }
 
-fn config_for(grid: bool) database.Config {
+fn config_for(variant: Variant) database.Config {
     var state = bench.state_config(shape);
     state.codes_max = 8192;
     state.code_bytes_max = 32 << 20;
@@ -72,7 +85,13 @@ fn config_for(grid: bool) database.Config {
         .queue_entries_max = 4,
         .checkpoint_staging_bytes = @intCast(staging),
     };
-    if (grid) config.engine.grid_block_count = database.code_grid_block_count(state, block_size);
+    if (variant == .plain) return config;
+    config.engine.grid_block_count = database.code_grid_block_count(state, block_size);
+    if (variant == .pinned) {
+        config.code_pin_bytes = @as(u64, reads_per_block) * 24_576;
+        config.code_pins_max = reads_per_block;
+        config.code_cache_blocks = 4096;
+    }
     return config;
 }
 
@@ -84,6 +103,9 @@ const Result = struct {
     open_ns: u64 = 0,
     open_tables_ns: u64 = 0,
     tables: u32 = 0,
+    read_cold_ns: u64 = 0,
+    read_warm_ns: u64 = 0,
+    read_bytes: u64 = 0,
 };
 
 const Run = struct {
@@ -170,9 +192,9 @@ const Run = struct {
     }
 };
 
-fn run_variant(io: std.Io, grid: bool) !Result {
+fn run_variant(io: std.Io, variant: Variant) !Result {
     const allocator = std.heap.page_allocator;
-    const config = config_for(grid);
+    const config = config_for(variant);
     var sim = try SimStorage.init(allocator, .{
         .size_bytes = config.engine.size_bytes(),
         .seed = 11,
@@ -215,7 +237,36 @@ fn run_variant(io: std.Io, grid: bool) !Result {
     result.checkpoint_next_ns = try fixture.checkpoint();
     result.image_next_bytes = fixture.db.engine.superblock.working.checkpoint.size_bytes;
     try reopen(fixture, allocator, config, &result);
+    try read_codes(fixture, allocator, &result);
     return result;
+}
+
+/// Times the reads of `read_blocks` blocks of codes, releasing the pins before each block.
+fn read_codes(fixture: *Run, allocator: std.mem.Allocator, result: *Result) !void {
+    const state = &fixture.db.state;
+    const hashes = try allocator.alloc(database.Hash, state.code_table.count());
+    defer allocator.free(hashes);
+    var keys = state.code_table.keyIterator();
+    for (hashes) |*hash| hash.* = keys.next().?.*;
+    var prng = Prng.init(99);
+    var checksum: u64 = 0;
+    var warm_ns: u64 = 0;
+    for (0..read_blocks) |block| {
+        const start = bench.now_ns(fixture.io);
+        fixture.db.codes_release();
+        for (0..reads_per_block) |read| {
+            const range: u64 = if (read % 2 == 0) hot_codes else hashes.len;
+            const code = state.code_by_hash(hashes[prng.below(range)]) orelse
+                return error.CodeUnreadable;
+            checksum +%= code[code.len / 2];
+            if (block == 0) result.read_bytes += code.len;
+        }
+        const elapsed = bench.now_ns(fixture.io) - start;
+        if (block == 0) result.read_cold_ns = elapsed;
+        if (block >= read_blocks / 2) warm_ns += elapsed;
+    }
+    result.read_warm_ns = warm_ns / (read_blocks / 2);
+    std.mem.doNotOptimizeAway(checksum);
 }
 
 fn reopen(
@@ -243,6 +294,21 @@ fn reopen(
     }
 }
 
+fn print_reads(label: []const u8, result: *const Result) void {
+    std.debug.print(
+        "  {s:<9} reads of a block ({d} codes, {d} KiB): cold {d:>7.3} ms, warm {d:>7.3} ms " ++
+            "({d:.0} ns/code)\n",
+        .{
+            label,
+            reads_per_block,
+            result.read_bytes / 1024,
+            @as(f64, @floatFromInt(result.read_cold_ns)) / 1e6,
+            @as(f64, @floatFromInt(result.read_warm_ns)) / 1e6,
+            @as(f64, @floatFromInt(result.read_warm_ns)) / reads_per_block,
+        },
+    );
+}
+
 fn print_result(label: []const u8, result: *const Result) void {
     const mib = 1024.0 * 1024.0;
     std.debug.print(
@@ -263,11 +329,15 @@ fn print_result(label: []const u8, result: *const Result) void {
 }
 
 fn run_case(io: std.Io) !void {
-    const plain = try run_variant(io, false);
-    const grid = try run_variant(io, true);
+    const plain = try run_variant(io, .plain);
+    const grid = try run_variant(io, .grid);
+    const pinned = try run_variant(io, .pinned);
     std.debug.print("{s}\n", .{name});
     print_result("grid-less", &plain);
     print_result("grid", &grid);
+    print_result("pinned", &pinned);
+    print_reads("grid", &grid);
+    print_reads("pinned", &pinned);
 }
 
 /// Runs the code table benchmark when it matches `filter`.

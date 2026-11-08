@@ -14,7 +14,8 @@
 //!
 //! Disk mode (`disk` set, `Database.Config.disk_state`): accounts, slots, the state root, and
 //! every apply and unwind go to `DiskState` (`disk_state.zig`) over the flat trees; the account
-//! and storage tables and the `StateTrie` stay empty. Codes and block hashes stay here. Reads
+//! and storage tables and the `StateTrie` stay empty. Codes and block hashes stay here (codes
+//! the code store's tables hold may be read on demand instead: `CodeReader`). Reads
 //! hash the address (and slot) per call; `has_storage` is the account's storage root, so
 //! `account().storage_slots` is only a flag (0 or 1) in disk mode.
 
@@ -76,9 +77,32 @@ pub const SlotKey = struct {
     slot: u256,
 };
 
-/// A code in the arena: arena offsets are u64 (snapshots hold tens of GiB of code), one
-/// code is at most 24 KiB before EIP-7907 and always below 4 GiB.
-pub const CodeRef = struct { offset: u64, len: u32 };
+/// A code in the arena (`table` 0) at `offset`, or in the code store's table `table - 1`
+/// (read through `State.code_reader`; `offset` unused). Arena offsets are u64 (snapshots
+/// hold tens of GiB of code), one code is at most 24 KiB before EIP-7907 and always below
+/// 4 GiB.
+pub const CodeRef = struct {
+    offset: u64,
+    len: u32,
+    table: u32 = 0,
+
+    comptime {
+        // The table ordinal rides in the padding: the code table's entries do not grow.
+        assert(@sizeOf(CodeRef) == 16);
+    }
+};
+
+/// A code's hash, and whether `insert_code` (`insert_code_table`) added it.
+pub const CodeInserted = struct { hash: Hash, new: bool };
+
+/// Reads the codes the arena does not hold (`CodeRef.table > 0`): the code store's pinned
+/// reads (`code_store.zig`). Bound by the database at open, before any such code exists.
+pub const CodeReader = struct {
+    context: *anyopaque,
+    /// The code; valid until the database's next `codes_release`. Null when it cannot be
+    /// read: a table block that does not verify, or every pin is taken.
+    read: *const fn (context: *anyopaque, hash: *const Hash, code: CodeRef) ?[]const u8,
+};
 
 const BlockHashEntry = struct { number: u64, hash: Hash, valid: bool };
 
@@ -270,6 +294,12 @@ pub const State = struct {
     code_table: std.AutoHashMapUnmanaged(Hash, CodeRef),
     code_arena: []u8,
     code_arena_len: u64 = 0,
+    /// Bytes of every code, in the arena or in a table (at most `config.code_bytes_max`).
+    code_bytes_total: u64 = 0,
+    /// Codes held in tables only (`CodeRef.table > 0`).
+    codes_in_tables: u32 = 0,
+    /// Set when codes may live in tables only (see `CodeReader`).
+    code_reader: ?CodeReader = null,
     block_hashes: [block_hashes_max]BlockHashEntry = @splat(.{
         .number = 0,
         .hash = @splat(0),
@@ -379,10 +409,24 @@ pub const State = struct {
         return self.state_trie.storage_root(address_hash);
     }
 
+    /// The code with this hash, null when unknown (or, for a code held in a table only, not
+    /// readable now: see `CodeReader`). An arena code's slice stays valid for the state's
+    /// lifetime; a table code's until the database's next `codes_release`.
     pub fn code_by_hash(self: *const State, hash: Hash) ?[]const u8 {
         if (std.mem.eql(u8, &hash, &node.empty_code_hash)) return &.{};
         const code = self.code_table.get(hash) orelse return null;
-        return self.code_arena[code.offset..][0..code.len];
+        if (code.table == 0) return self.code_arena[code.offset..][0..code.len];
+        assert(self.codes_in_tables > 0);
+        const reader = self.code_reader.?;
+        const bytes = reader.read(reader.context, &hash, code) orelse return null;
+        assert(bytes.len == code.len);
+        return bytes;
+    }
+
+    /// Whether a code with this hash is known (present without reading it).
+    pub fn code_known(self: *const State, hash: Hash) bool {
+        if (std.mem.eql(u8, &hash, &node.empty_code_hash)) return true;
+        return self.code_table.contains(hash);
     }
 
     pub fn block_hash(self: *const State, number: u64) ?Hash {
@@ -402,18 +446,45 @@ pub const State = struct {
 
     /// Stores `code` by hash. Returns whether it was new. Code is content-addressed and
     /// immutable, so unwinding a block keeps it.
-    pub fn insert_code(self: *State, code: []const u8) Error!struct { hash: Hash, new: bool } {
+    pub fn insert_code(self: *State, code: []const u8) Error!CodeInserted {
         const hash = node.keccak256(code);
         if (code.len == 0 or self.code_table.contains(hash)) return .{ .hash = hash, .new = false };
         if (self.code_table.count() == self.config.codes_max) return error.CodeFull;
+        if (self.code_bytes_total + code.len > self.config.code_bytes_max) return error.CodeFull;
         if (self.code_arena_len + code.len > self.code_arena.len) return error.CodeFull;
         const offset = self.code_arena_len;
         @memcpy(self.code_arena[offset..][0..code.len], code);
         self.code_arena_len += @intCast(code.len);
+        self.code_bytes_total += code.len;
         self.code_table.putAssumeCapacityNoClobber(hash, .{
             .offset = offset,
             .len = @intCast(code.len),
         });
+        assert(self.code_arena_len <= self.code_bytes_total);
+        return .{ .hash = hash, .new = true };
+    }
+
+    /// Records `code`, held in the code store's table `table - 1`, by hash without keeping
+    /// its bytes (the open scan, when codes are read from tables: `code_reader`).
+    pub fn insert_code_table(
+        self: *State,
+        code: []const u8,
+        table: u32,
+    ) Error!CodeInserted {
+        assert(table > 0);
+        assert(self.code_reader != null);
+        const hash = node.keccak256(code);
+        if (code.len == 0 or self.code_table.contains(hash)) return .{ .hash = hash, .new = false };
+        if (self.code_table.count() == self.config.codes_max) return error.CodeFull;
+        if (self.code_bytes_total + code.len > self.config.code_bytes_max) return error.CodeFull;
+        self.code_bytes_total += code.len;
+        self.codes_in_tables += 1;
+        self.code_table.putAssumeCapacityNoClobber(hash, .{
+            .offset = 0,
+            .len = @intCast(code.len),
+            .table = table,
+        });
+        assert(self.codes_in_tables <= self.code_table.count());
         return .{ .hash = hash, .new = true };
     }
 
@@ -423,6 +494,8 @@ pub const State = struct {
         assert(self.account_table.count() == 0);
         self.code_table.clearRetainingCapacity();
         self.code_arena_len = 0;
+        self.code_bytes_total = 0;
+        self.codes_in_tables = 0;
         assert(self.code_table.count() == 0);
     }
 

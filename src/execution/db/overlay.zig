@@ -101,6 +101,10 @@ pub const Overlay = struct {
         return self.base.code_by_hash(hash);
     }
 
+    pub fn code_known(self: *const Overlay, hash: Hash) bool {
+        return self.base.code_known(hash);
+    }
+
     pub fn block_hash(self: *const Overlay, number: u64) ?Hash {
         return self.base.block_hash(number);
     }

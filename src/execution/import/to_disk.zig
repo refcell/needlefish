@@ -40,6 +40,7 @@ const code_store_module = @import("../db/code_store.zig");
 const grid_module = @import("../db/storage/grid.zig");
 const checkpoint_module = @import("../db/storage/checkpoint.zig");
 const node = @import("../trie/node.zig");
+const evm = @import("../evm/root.zig");
 
 const Hash = node.Hash;
 const EntrySource = hashed_state.EntrySource;
@@ -110,7 +111,21 @@ pub const Shape = struct {
     /// Codes and code bytes the state holds beyond the snapshot's (contracts created later).
     codes_headroom: u32,
     code_bytes_headroom: u32,
+    /// Codes out of RAM (`Database.Config.code_pin_bytes`; 0: codes stay resident). Not part
+    /// of the format: a file opens with any of these.
+    code_pin_bytes: u64 = 0,
+    code_pins_max: u32 = 0,
+    code_cache_blocks: u32 = 0,
 };
+
+/// Accounts one block's evm state caches at most (`evm.state.Limits.accounts_max`'s
+/// ceiling), each with one code of at most the EIP-170 limit: what one block can pin.
+const block_codes_max: u32 = (evm.state.Limits{}).accounts_max;
+const code_size_max: u32 = (evm.env.Config{}).code_size_max;
+
+comptime {
+    assert(block_codes_max == 1 << 16);
+}
 
 const node_record_writes_max: u32 = 1 << 14;
 const node_reorg_depth_max: u32 = 4;
@@ -160,6 +175,11 @@ pub const shape_node: Shape = .{
     .code_flush_bytes_min = 64 * 1024,
     .codes_headroom = 1 << 16,
     .code_bytes_headroom = 64 << 20,
+    // Codes stay in their tables: a block's codes are pinned (1.5 GiB reserved, touched only
+    // as far as the largest block's codes reach) and their blocks cached (256 MiB).
+    .code_pin_bytes = @as(u64, block_codes_max) * code_size_max,
+    .code_pins_max = block_codes_max,
+    .code_cache_blocks = 4096,
 };
 
 pub const Sizing = struct {
@@ -268,6 +288,9 @@ fn base_config(shape: Shape) database.Config {
         .queue_entries_max = shape.queue_entries_max,
         .checkpoint_staging_bytes = database.checkpoint_header_size,
         .code_flush_bytes_min = shape.code_flush_bytes_min,
+        .code_pin_bytes = shape.code_pin_bytes,
+        .code_pins_max = shape.code_pins_max,
+        .code_cache_blocks = shape.code_cache_blocks,
         .flat_trees = true,
         .flat_flush_entries_min = shape.flat_flush_entries_min,
         .flat_cache_blocks = shape.flat_cache_blocks,
@@ -706,7 +729,7 @@ pub fn ImporterType(comptime Storage: type) type {
             const self: *Importer = @ptrCast(@alignCast(context));
             if (self.failure) |err| return err;
             // The evm fails a call into an account whose code is missing.
-            if (self.db.state.code_by_hash(account.code_hash) == null) return error.CodeMissing;
+            if (!self.db.state.code_known(account.code_hash)) return error.CodeMissing;
             const record: flat_trees_module.Account = .{
                 .info = .{
                     .nonce = account.nonce,
@@ -792,7 +815,9 @@ pub fn ImporterType(comptime Storage: type) type {
                 }
                 const record = disk.account(&sample.key) orelse return error.SampleMismatch;
                 if (!record.eql(expected)) return error.SampleMismatch;
-                // The code came back from the code tables at its arena offset.
+                // The code came back from the code tables (pinned mode: read from its table
+                // here, so nothing else is pinned).
+                db.codes_release();
                 const code = db.state.code_by_hash(account.code_hash) orelse
                     return error.CodeMissing;
                 const code_hash = node.keccak256(code);

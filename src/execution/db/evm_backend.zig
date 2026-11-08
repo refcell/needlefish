@@ -69,7 +69,8 @@ pub fn commit_evm(evm_state: *const evm.State, overlay: *Overlay) overlay_module
             continue;
         }
         if (account.info.has_code()) {
-            if (overlay.code_by_hash(account.info.code_hash) == null) {
+            // Known without reading: a code held in a table only needs no read here.
+            if (!overlay.code_known(account.info.code_hash)) {
                 const stored = try overlay.insert_code(account.info.code.?);
                 assert(std.mem.eql(u8, &stored, &account.info.code_hash));
             }

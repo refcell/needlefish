@@ -12,6 +12,14 @@
 //! - Compatibility: a grid-less file with version 2 superblocks opens unchanged without a
 //!   grid and is refused (`LayoutMismatch`) with one.
 //! - Rot in a table block only the newest checkpoint names falls back to the older one.
+//! - Pinned mode (`Config.code_pin_bytes`, codes out of RAM, phase 1e): the crash recovery
+//!   and the differential again, with codes read back from their tables through a block
+//!   cache of one set (16 blocks, so codes are evicted and read again) into a pin buffer of
+//!   a few codes (so pins run out). Between steps the harness reads random codes, keeps
+//!   every slice until it releases the pins, and checks each again right before: a pin
+//!   that does not last until the release shows (safe builds overwrite released pins). Its
+//!   checkpoints are byte for byte the resident mode's. A rotten table block fails the read
+//!   of its codes only, and a rewrite that meets it aborts without changing a table.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -75,6 +83,15 @@ const config_grid: database.Config = .{
     .code_flush_bytes_min = 0,
 };
 
+/// Codes out of RAM: a few codes pinned at once, one cache set.
+const config_pinned: database.Config = blk: {
+    var config = config_grid;
+    config.code_pin_bytes = 3 * table_value_max;
+    config.code_pins_max = 6;
+    config.code_cache_blocks = 16;
+    break :blk config;
+};
+
 const config_plain: database.Config = blk: {
     var config = config_grid;
     config.engine.grid_block_count = 0;
@@ -133,10 +150,26 @@ const Digest = struct {
 /// account references them; the database behaves the same with or without the grid.
 const Leaked = std.AutoHashMapUnmanaged(Hash, void);
 
+const held_max = 12;
+const Held = struct { hash: Hash, code: []const u8 };
+
+const PinnedCounts = struct {
+    /// Codes read from a table (not from the arena) and found intact.
+    reads_table: u64 = 0,
+    /// Reads refused for want of a pin (then released and read again).
+    pins_full: u64 = 0,
+    /// Table codes read after a rewrite re-pointed them, before any reopen.
+    reads_after_rewrite: u64 = 0,
+    /// Rewrites that read codes held in tables only.
+    rewrites_from_tables: u64 = 0,
+};
+
 const Harness = struct {
     db: Database,
     sim: *SimStorage,
     prng: Prng,
+    /// The pinned reads' own randomness: the blocks stay those of any other mode's harness.
+    read_prng: Prng,
     overlay: Overlay,
     config: database.Config,
     heads: []HeadInfo,
@@ -152,6 +185,13 @@ const Harness = struct {
     leaked: Leaked = .empty,
     fallback_intact: bool = true,
     checkpoints_seen: u64 = 0,
+    /// Pinned mode: codes read since the last release, each with the slice returned.
+    held: [held_max]Held = undefined,
+    held_len: u32 = 0,
+    pinned: PinnedCounts = .{},
+    rewrite_seen: bool = false,
+    /// Pinned mode: read random codes between steps.
+    random_reads: bool = true,
 
     fn create(sim: *SimStorage, seed: u64, config: database.Config) !*Harness {
         const self = try testing.allocator.create(Harness);
@@ -166,6 +206,7 @@ const Harness = struct {
             .db = try Database.init(testing.allocator, sim, config),
             .sim = sim,
             .prng = Prng.init(seed),
+            .read_prng = Prng.init(seed ^ 0x9e37_79b9),
             .overlay = undefined,
             .config = config,
             .heads = heads,
@@ -230,6 +271,9 @@ const Harness = struct {
     }
 
     fn reopen(self: *Harness) !void {
+        // The pinned slices die with the database (a crash, or a clean close).
+        self.held_len = 0;
+        self.rewrite_seen = false;
         self.db.deinit(testing.allocator);
         self.db = try Database.init(testing.allocator, self.sim, self.config);
         self.checkpoints_seen = 0;
@@ -297,7 +341,50 @@ const Harness = struct {
 
     fn room_for_code(self: *const Harness) bool {
         const state = &self.db.state;
-        return state.code_table.count() < codes_cap and state.code_arena_len < code_bytes_cap;
+        return state.code_table.count() < codes_cap and state.code_bytes_total < code_bytes_cap;
+    }
+
+    fn is_pinned(self: *const Harness) bool {
+        return self.config.code_pin_bytes > 0;
+    }
+
+    /// Pinned mode: reads a random code of the state and keeps its slice until the release.
+    fn read_random_code(self: *Harness) !void {
+        const state = &self.db.state;
+        const count = state.code_table.count();
+        if (count == 0) return;
+        var codes = state.code_table.iterator();
+        var entry = codes.next().?;
+        for (0..self.read_prng.below(count)) |_| entry = codes.next().?;
+        const hash = entry.key_ptr.*;
+        const table = entry.value_ptr.table;
+        if (self.held_len == held_max) try self.release_codes();
+        const store = &self.db.code_store.?;
+        const pins_full = store.stats.pins_full;
+        const code = state.code_by_hash(hash) orelse code: {
+            // Every pin taken: the only refusal a healthy table may give.
+            try testing.expectEqual(pins_full + 1, store.stats.pins_full);
+            self.pinned.pins_full += 1;
+            try self.release_codes();
+            break :code state.code_by_hash(hash) orelse return error.CodeUnreadable;
+        };
+        const expected = self.model.get(hash) orelse return error.UnknownCode;
+        try testing.expectEqualSlices(u8, expected, code);
+        self.held[self.held_len] = .{ .hash = hash, .code = code };
+        self.held_len += 1;
+        if (table == 0) return;
+        self.pinned.reads_table += 1;
+        if (self.rewrites() > 0) self.pinned.reads_after_rewrite += 1;
+    }
+
+    /// Every slice read since the last release still holds its code; then releases.
+    fn release_codes(self: *Harness) !void {
+        for (self.held[0..self.held_len]) |held| {
+            const expected = self.model.get(held.hash) orelse return error.UnknownCode;
+            try testing.expectEqualSlices(u8, expected, held.code);
+        }
+        self.held_len = 0;
+        self.db.codes_release();
     }
 
     fn random_writes(self: *Harness) !void {
@@ -341,7 +428,10 @@ const Harness = struct {
         try self.random_writes();
         var input = self.block_input(head.hash, head.number + 1);
         const commit = self.db.execute_and_commit(&self.overlay, &input) catch |err| switch (err) {
-            error.Busy, error.UnknownParent => return self.leak_overlay_codes(),
+            // A block whose codes outgrow one changeset is dropped like a refused one.
+            error.Busy, error.UnknownParent, error.ChangesetFull => {
+                return self.leak_overlay_codes();
+            },
             else => return err,
         };
         try self.record(commit.sequence);
@@ -356,6 +446,7 @@ const Harness = struct {
 
     fn step(self: *Harness) !void {
         if (self.db.phase == .failed) return error.DatabaseFailed;
+        if (self.is_pinned() and self.random_reads) try self.step_reads();
         const roll = self.prng.below(100);
         if (roll < 3) {
             self.db.request_checkpoint();
@@ -367,6 +458,16 @@ const Harness = struct {
         if (self.db.checkpoint_error) |err| return err;
         self.sim.tick();
         self.track();
+    }
+
+    fn step_reads(self: *Harness) !void {
+        const store = &self.db.code_store.?;
+        if (store.flushing() and store.flush_rewrite and self.db.state.codes_in_tables > 0) {
+            if (!self.rewrite_seen) self.pinned.rewrites_from_tables += 1;
+            self.rewrite_seen = true;
+        } else self.rewrite_seen = false;
+        for (0..self.read_prng.below(3)) |_| try self.read_random_code();
+        if (self.read_prng.chance(1, 8)) try self.release_codes();
     }
 
     fn track(self: *Harness) void {
@@ -407,9 +508,12 @@ const Harness = struct {
     /// Every code in the state equals the deployed bytes, and the tables cover the arena.
     fn check_code_bytes(self: *Harness) !void {
         const state = &self.db.state;
+        try self.release_codes();
         var codes = state.code_table.iterator();
         while (codes.next()) |entry| {
-            const code = state.code_by_hash(entry.key_ptr.*).?;
+            // Pinned mode: one code pinned at a time.
+            self.db.codes_release();
+            const code = state.code_by_hash(entry.key_ptr.*) orelse return error.CodeUnreadable;
             const expected = self.model.get(entry.key_ptr.*) orelse return error.UnknownCode;
             try testing.expectEqualSlices(u8, expected, code);
             try testing.expectEqualSlices(u8, entry.key_ptr, &keccak256(code));
@@ -442,6 +546,19 @@ const Counts = struct {
     opens_with_tables: u32 = 0,
     rewrites: u64 = 0,
     oversize_codes: u32 = 0,
+    pinned: PinnedCounts = .{},
+    cache_evictions: u64 = 0,
+
+    /// Takes the harness's pinned counts (they restart after this).
+    fn add_pinned(counts: *Counts, harness: *Harness) void {
+        counts.pinned.reads_table += harness.pinned.reads_table;
+        counts.pinned.pins_full += harness.pinned.pins_full;
+        counts.pinned.reads_after_rewrite += harness.pinned.reads_after_rewrite;
+        counts.pinned.rewrites_from_tables += harness.pinned.rewrites_from_tables;
+        harness.pinned = .{};
+        const store = &harness.db.code_store.?;
+        if (store.cache) |*cache| counts.cache_evictions += cache.stats.evictions;
+    }
 };
 
 fn at_crash_point(harness: *const Harness, point: CrashPoint) bool {
@@ -473,9 +590,9 @@ fn run_until(harness: *Harness, prng: *Prng, point: CrashPoint) !bool {
     return point == .tick;
 }
 
-fn run_crash_seed(seed: u64, counts: *Counts) !void {
+fn run_crash_seed(seed: u64, base: database.Config, counts: *Counts) !void {
     var prng = Prng.init(seed);
-    var config = config_grid;
+    var config = base;
     config.code_tables_max = @intCast(prng.range(4, 5));
     if (seed % 2 == 1) config.checkpoint_bytes_per_commit = @intCast(prng.range(1, 3) * block_size);
     var sim = try sim_create(config, seed, @intCast(prng.range(1, 6)));
@@ -501,6 +618,7 @@ fn run_crash_seed(seed: u64, counts: *Counts) !void {
         }
         if (harness.db.code_store.?.tables.count > 0) counts.opens_with_tables += 1;
         try harness.check_recovered(acknowledged);
+        counts.add_pinned(harness);
     }
     var codes = harness.db.state.code_table.valueIterator();
     while (codes.next()) |code| counts.oversize_codes += @intFromBool(code.len > table_value_max);
@@ -509,7 +627,7 @@ fn run_crash_seed(seed: u64, counts: *Counts) !void {
 test "database codes: seeded crashes mid flush, rewrite, and checkpoint keep every code" {
     var counts: Counts = .{};
     for (0..24) |seed| {
-        run_crash_seed(seed, &counts) catch |err| {
+        run_crash_seed(seed, config_grid, &counts) catch |err| {
             std.debug.print("database codes crash recovery: failing seed={d}\n", .{seed});
             return err;
         };
@@ -521,6 +639,28 @@ test "database codes: seeded crashes mid flush, rewrite, and checkpoint keep eve
     try testing.expect(counts.opens_with_tables >= 36);
     try testing.expect(counts.rewrites >= 6);
     try testing.expect(counts.oversize_codes > 0);
+}
+
+test "database codes: pinned mode, seeded crashes keep every code readable from its table" {
+    var counts: Counts = .{};
+    for (0..24) |seed| {
+        run_crash_seed(seed, config_pinned, &counts) catch |err| {
+            std.debug.print("database codes pinned crash recovery: failing seed={d}\n", .{seed});
+            return err;
+        };
+    }
+    try testing.expect(counts.hits[@backingInt(CrashPoint.mid_flush)] >= 4);
+    try testing.expect(counts.hits[@backingInt(CrashPoint.mid_rewrite)] >= 2);
+    try testing.expect(counts.hits[@backingInt(CrashPoint.mid_checkpoint)] >= 4);
+    try testing.expect(counts.fallbacks >= 4);
+    try testing.expect(counts.opens_with_tables >= 36);
+    try testing.expect(counts.rewrites >= 6);
+    try testing.expect(counts.oversize_codes > 0);
+    try testing.expect(counts.pinned.reads_table >= 1000);
+    try testing.expect(counts.pinned.pins_full > 0);
+    try testing.expect(counts.pinned.rewrites_from_tables >= 4);
+    try testing.expect(counts.pinned.reads_after_rewrite > 0);
+    try testing.expect(counts.cache_evictions > 0);
 }
 
 // Differential: grid vs grid-less, in lockstep.
@@ -541,11 +681,11 @@ fn run_lockstep(harnesses: []const *Harness, steps: u32) !void {
     }
 }
 
-test "database codes: grid, grid-less, and a too-small grid agree on every block" {
-    var configs = [_]database.Config{ config_grid, config_plain, config_grid };
+test "database codes: grid, grid-less, a too-small grid, and pinned agree on every block" {
+    var configs = [_]database.Config{ config_grid, config_plain, config_grid, config_pinned };
     configs[2].engine.grid_block_count = 6;
-    var sims: [3]SimStorage = undefined;
-    var harnesses: [3]*Harness = undefined;
+    var sims: [4]SimStorage = undefined;
+    var harnesses: [4]*Harness = undefined;
     for (&configs, &sims, &harnesses, 0..) |*config, *sim, *harness, index| {
         sim.* = try sim_create(config.*, 0xd1ff + index, 3);
         harness.* = try Harness.create(sim, 0x5eed, config.*);
@@ -567,12 +707,18 @@ test "database codes: grid, grid-less, and a too-small grid agree on every block
         totals.flushes += harnesses[0].db.code_store.?.stats.flushes;
         totals.rewrites += harnesses[0].db.code_store.?.stats.rewrites;
         no_space += harnesses[2].db.code_store.?.stats.flushes_no_space;
+        // Codes out of RAM change nothing on disk: the same checkpoint, byte for byte.
+        const checkpoint_grid = harnesses[0].db.engine.superblock.working.checkpoint;
+        const checkpoint_pinned = harnesses[3].db.engine.superblock.working.checkpoint;
+        try testing.expectEqual(checkpoint_grid.checksum, checkpoint_pinned.checksum);
+        try testing.expectEqual(checkpoint_grid.size_bytes, checkpoint_pinned.size_bytes);
         for (harnesses) |harness| {
             try harness.reopen();
             try harness.check_code_bytes();
         }
         try run_lockstep(&harnesses, 0);
     }
+    try testing.expect(harnesses[3].db.state.codes_in_tables > 0);
     try testing.expect(totals.flushes >= 8 and totals.rewrites > 0);
     try testing.expect(no_space > 0);
     const image_grid = harnesses[0].db.engine.superblock.working.checkpoint.size_bytes;
@@ -660,4 +806,119 @@ test "database codes: rot in a table only the newest checkpoint names falls back
     try testing.expect(live_head.eql(harness.db.head_info));
     try testing.expect(harness.digest().eql(live_digest));
     try harness.check_code_bytes();
+}
+
+test "database codes: pinned, a rotten table block fails its own codes only; a rewrite aborts" {
+    var sim = try sim_create(config_pinned, 0x7077, 2);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 0x7077, config_pinned);
+    defer harness.destroy();
+    harness.random_reads = false;
+    try harness.format(0x7077);
+    for (0..300) |_| try harness.step();
+    try harness.tick_until(Harness.idle);
+    harness.db.request_checkpoint();
+    try harness.tick_until(Harness.idle);
+    try harness.reopen();
+    const store = &harness.db.code_store.?;
+    try testing.expect(store.tables.count > 0);
+    // Rot the last payload byte of the first table's first data block (a byte of its last
+    // code; the block is not cached: just opened).
+    const address = store.tables.blocks[1];
+    const block: usize = @intCast(config_pinned.engine.grid_offset() + (address - 1) * block_size);
+    const payload_size = std.mem.readInt(u32, sim.memory[block + 48 ..][0..4], .little);
+    const offset = block + 128 + payload_size - 1;
+    sim.durable[offset] ^= 0x01;
+    sim.memory[offset] ^= 0x01;
+    const state = &harness.db.state;
+    var failed: u32 = 0;
+    var codes = state.code_table.iterator();
+    while (codes.next()) |entry| {
+        harness.db.codes_release();
+        const expected = harness.model.get(entry.key_ptr.*).?;
+        if (state.code_by_hash(entry.key_ptr.*)) |code| {
+            try testing.expectEqualSlices(u8, expected, code);
+        } else {
+            // Only codes of the rotten table fail (its first block's).
+            try testing.expectEqual(@as(u32, 1), entry.value_ptr.table);
+            failed += 1;
+        }
+    }
+    try testing.expect(failed > 0);
+    try testing.expectEqual(@as(u64, failed), store.stats.read_faults);
+    // Blocks and checkpoints go on until a rewrite meets the rotten codes and aborts.
+    const tables: u32 = store.tables.count;
+    const first = store.tables.infos[0];
+    var steps: u32 = 0;
+    while (store.stats.flush_faults == 0) : (steps += 1) {
+        if (steps == 20_000) return error.NoRewrite;
+        try harness.step();
+    }
+    try harness.tick_until(Harness.idle);
+    try testing.expect(store.fault);
+    try testing.expectEqual(@as(u64, 0), store.stats.rewrites);
+    try testing.expect(store.tables.count >= tables);
+    try testing.expectEqual(first, store.tables.infos[0]);
+    // Later checkpoints carry the new codes in their image; blocks go on.
+    for (0..200) |_| try harness.step();
+    harness.db.request_checkpoint();
+    try harness.tick_until(Harness.idle);
+    try testing.expect(harness.db.checkpoint_error == null);
+}
+
+/// Room for more code than one table holds, so a rewrite writes several tables.
+const config_pinned_wide: database.Config = blk: {
+    var config = config_pinned;
+    config.state.codes_max = 1024;
+    config.state.code_bytes_max = 2 * 1024 * 1024;
+    config.engine.grid_block_count = database.code_grid_block_count(config.state, block_size);
+    config.code_tables_max = Database.CodeStore.tables_max_min(
+        block_size,
+        config.state.codes_max,
+        config.state.code_bytes_max,
+    );
+    break :blk config;
+};
+
+test "database codes: pinned, a rewrite into several tables re-points every code" {
+    const config = config_pinned_wide;
+    var sim = try sim_create(config, 0x9e90, 2);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 0x9e90, config);
+    defer harness.destroy();
+    harness.random_reads = false;
+    try harness.format(0x9e90);
+    var deployed: u32 = 0;
+    var reopened = false;
+    while (harness.rewrites() == 0) : (deployed += 1) {
+        if (deployed == 2000) return error.NoRewrite;
+        // Four codes a block, a checkpoint (one flush, one table) every four blocks.
+        const head = harness.db.head_info;
+        harness.overlay.discard();
+        for (0..4) |index| {
+            const length: u32 = @intCast(harness.prng.range(2000, 3900));
+            const code_hash = try harness.deploy_code_sized(length);
+            try harness.overlay.set_account(address_of(index), .{ .code_hash = code_hash });
+        }
+        var input = harness.block_input(head.hash, head.number + 1);
+        const commit = try harness.db.execute_and_commit(&harness.overlay, &input);
+        try harness.record(commit.sequence);
+        try harness.tick_until(Harness.idle);
+        if (deployed % 4 != 3) continue;
+        harness.db.request_checkpoint();
+        try harness.tick_until(Harness.idle);
+        // Halfway, a reopen: from then on the older codes are held in tables only.
+        const store = &harness.db.code_store.?;
+        if (!reopened and store.tables.count * 2 >= config.code_tables_max) {
+            try harness.reopen();
+            reopened = true;
+        }
+    }
+    try testing.expect(reopened);
+    const store = &harness.db.code_store.?;
+    try testing.expect(store.tables.count >= 2);
+    try testing.expect(harness.db.state.codes_in_tables >= 64);
+    // Before any reopen: every code reads back through the table it now points at.
+    try harness.check_code_bytes();
+    try testing.expect(store.stats.reads >= harness.db.state.codes_in_tables);
 }

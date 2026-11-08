@@ -58,12 +58,14 @@ fn block_hash_count(state: *const State) u32 {
 
 /// Which codes a snapshot carries: a code is written when it lies at or past `offset_min`
 /// in the code arena or is longer than `length_max`. The others are stored elsewhere (the
-/// database's code tables) and must be in the state before the snapshot loads.
+/// database's code tables) and must be in the state before the snapshot loads. A code held
+/// in a table only (not in the arena) is never written.
 pub const CodeFilter = struct {
     offset_min: u64 = 0,
     length_max: u32 = std.math.maxInt(u32),
 
     pub fn includes(filter: CodeFilter, code: state_module.CodeRef) bool {
+        if (code.table != 0) return false;
         return code.offset >= filter.offset_min or code.len > filter.length_max;
     }
 };
@@ -74,7 +76,7 @@ pub fn write(state: *State, sink: anytype) !void {
 }
 
 fn code_count(state: *const State, filter: CodeFilter) u32 {
-    if (filter.offset_min == 0) return state.code_table.count();
+    if (filter.offset_min == 0 and state.codes_in_tables == 0) return state.code_table.count();
     var count: u32 = 0;
     var codes = state.code_table.valueIterator();
     while (codes.next()) |code| count += @intFromBool(filter.includes(code.*));
@@ -200,7 +202,7 @@ pub fn verify(state: *State, expected: *const Expected) !void {
     var accounts = state.account_table.iterator();
     while (accounts.next()) |entry| {
         const code_hash = entry.value_ptr.info.code_hash;
-        if (state.code_by_hash(code_hash) == null) return error.InvalidSnapshot;
+        if (!state.code_known(code_hash)) return error.InvalidSnapshot;
     }
 }
 

@@ -447,13 +447,19 @@ const Cursors = struct {
 
 /// Opens the written file again with the sizing from its counts record, and checks the
 /// head, its root, the block hashes, and the samples (read through the trie).
-/// Hashes every code the reopened state holds (loaded from the code tables at their arena
-/// offsets, which pass 4 GiB at snapshot scale) and returns how many there are.
-fn check_codes(state: *const base.execution.db.State) error{CodeHashMismatch}!u64 {
+/// Hashes the codes the reopened state holds and returns how many there are. Codes in the
+/// arena are all hashed; codes held in the tables only (codes out of RAM) one in
+/// `table_code_stride`, each read back from its table (in hash order, so every read is a
+/// random grid read; the open scan hashed every one of them already).
+fn check_codes(db: *Database) error{ CodeHashMismatch, CodeMissing }!u64 {
+    const table_code_stride = 1024;
+    const state = &db.state;
     var count: u64 = 0;
     var codes = state.code_table.iterator();
     while (codes.next()) |entry| : (count += 1) {
-        const code = state.code_by_hash(entry.key_ptr.*).?;
+        if (entry.value_ptr.table != 0 and count % table_code_stride != 0) continue;
+        db.codes_release();
+        const code = state.code_by_hash(entry.key_ptr.*) orelse return error.CodeMissing;
         assert(code.len == entry.value_ptr.len);
         var hash: Hash = undefined;
         std.crypto.hash.sha3.Keccak256.hash(code, &hash, .{});
@@ -500,7 +506,7 @@ fn reopen(
         const hash = opened.db.state.block_hash(link.number) orelse return error.NoBlockHash;
         if (!std.mem.eql(u8, &hash, &link.hash)) return error.BlockHashMismatch;
     }
-    const codes = check_codes(&opened.db.state) catch |err| {
+    const codes = check_codes(opened.db) catch |err| {
         std.debug.print("SELF-CHECK FAILED: codes: {t}\n", .{err});
         return 1;
     };

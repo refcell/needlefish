@@ -284,11 +284,25 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   grid-less vs too-small-grid differential, v2 grid-less file, table rot falls back.
   (`db/code_store.zig`, `database_code_test.zig`; `db/codes` bench: image 44.7 -> 17.7 MiB,
   steady checkpoint 34-35 -> 13-14 ms, open 161 -> 151 ms; see Decisions)
-- [ ] Disk state phase 1e (rest of the code store): codes out of RAM. Needs a read path that
-  does not hand out evictable slices (phase 4's batched prefetch or per-block code pinning;
-  see "code store read path"). Smaller follow-ups: parallel table reads at open (the scan
-  reads one block at a time), skip the redundant keccak per code at open (grid checksums
-  already cover the bytes), a code lookup hit/miss bench through the database.
+- [x] Disk state phase 1e: codes out of RAM (`Config.code_pin_bytes`, on in `to_disk.shape_node`,
+  so `base el-run`): open keeps only each table code's table, `State.code_by_hash` copies a
+  table code into a pin buffer through the code store's own block cache and blocking grid
+  reads, valid until `Database.codes_release` (the runner, before each block); rewrites read
+  table codes from the old tables and re-point them. No format change: checkpoints are byte
+  for byte the resident mode's. Tests: pinned crash recovery over the 24 code seeds with
+  random reads held to the release (1-set cache, pins running out), pinned in the 4-way
+  differential (equal checkpoint checksums), multi-table rewrite re-point, rotten block
+  (its codes only fail; a rewrite aborts), import run executing a table code after each
+  reopen; mutations (no key check, no block verify, early release, no or off-by-one
+  re-point) each fail a test. (`db/code_store.zig`; `db/codes` bench: a block of 256 code
+  reads warm 0.010 -> 0.161 ms, cold 5.7 ms CPU; see Decisions)
+- [ ] Code store follow-ups: the importer still loads every code into the arena (57 GiB at
+  2.6x Sepolia) before flushing: stream `Bytecodes` into tables. The arena is still
+  allocated at `code_bytes_max` (virtual, untouched in pinned mode): allocate the headroom
+  only outside imports. The code table index (48 B per code, 0.4 GiB Sepolia) could become
+  per-table filters. Prefetch the codes a block names (recipients) with the state. Parallel
+  table reads at open (the scan reads one block at a time), skip the redundant keccak per
+  code at open (grid checksums already cover the bytes).
 - [x] Disk state phase 2a: the LSM tree primitive for flat state (`storage/lsm.zig`,
   `lsm_memtable.zig`, `lsm_filter.zig`, `lsm_compaction.zig`): fixed-size keys and values, two
   static memtables (`error.Busy` when full), leveled tables (level 0 overlapping, growth 8),
@@ -474,6 +488,56 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   safe next step keeps codes resident in `code_arena` and only moves them out of the
   checkpoint image (tables durable on the grid, image carries only codes not yet in a table,
   open scans the tables, a full merge from RAM when the table list is full).
+- Code store read path, phase 1e (2026-11-08): per-block pinning with a blocking read, the
+  first option above; chosen over a batched prefetch before execution (the evm reaches codes
+  through calls it cannot know before running) and over an open-time engine pause (open
+  still scans every table, to learn each code's table and check its keccak). Pinned mode
+  (`code_pin_bytes > 0`, needs a grid): `CodeRef.table` (in the struct's padding: 16 B
+  stays) names the table of a code the arena does not hold; the open scan records it
+  (`State.insert_code_table`) instead of copying. A read (`CodeStore.read_pinned`): fences,
+  the index block, the data block (each from the store's own `BlockCache` or
+  `Grid.read_sync`: checksum, address, kind, then `index_valid`/`data_valid`), the record
+  by key, its length against the code table's; the bytes are copied into a bump pin buffer
+  with a hash index, so a second read returns the same slice. `release` (safe builds poison
+  the bytes) is the only point a slice dies; `Database.codes_release` is called by the
+  import runner before each attempt (the executor's state cache is emptied by every commit
+  and abort, so no slice outlives a block), by `to_disk.verify_samples` and the importer's
+  self-check per code. A read that cannot pin (pins full) or verify returns null: the evm
+  sees `DatabaseFailure`, the block fails, nothing is corrupted. Sizing (node): one block
+  pins at most the evm's accounts per block ceiling (2^16) codes of at most 24,576 B: 1.5
+  GiB reserved, resident only as far as the largest block reaches; a 256 MiB code block
+  cache (4096 blocks) kept apart from the flat trees' 4 GiB cache, whose blocks churn every
+  block. No keccak per read: the open scan hashed every table code and the grid checksum
+  covers the bytes since (safe builds assert it). New codes still go to the arena (append
+  only, carried by the image until flushed, resident until the next open); `code_bytes_max`
+  now bounds arena plus table codes (`State.code_bytes_total`), the same limit as before.
+  Rewrite: entries carry their table; `source_next` reads a table code into `rewrite_value`
+  (the builder copies it before the next pull); on finish the codes of pending table k
+  (`pending_ends`) point at k + 1. A code that cannot be read ends the table early and
+  aborts the flush: the partial and pending tables' blocks are released, the reservation
+  forfeited, and the store faults (no more flushes; new codes stay in the image). Callers
+  that only ask whether a code exists use `State.code_known` (no read): the evm commit, the
+  snapshot verify, the importer's account check. Off by default; memory-mode nodes keep
+  codes resident (their RPC and witness paths hold code slices without a release point).
+- LSM table-slot memory (2026-11-08): a tree allocates a filter for every table slot of every
+  level but the last and a block list (`blocks_per_table` addresses) for every slot, with
+  slots for 3x each level's capacity, and init zeroed both, so all of it was resident: on
+  the Sepolia node 14.8 GiB (storage filters 7.4 GiB, storage-branch filters 3.4 GiB and
+  block lists 3.1 GiB). `slot_acquire` already zeroes a slot's filter and every table's
+  block list is written (flush, merge, bulk) or zeroed (`open_decode`) before it is read, so
+  init no longer zeroes them: resident memory follows the tables that exist. Still virtual
+  at chain scale (125 GB at 2.6x Sepolia: the storage tree grows a seventh level), which
+  Linux's default overcommit allows; sizing filters to a budget (a pool, tables past it
+  probed without one) and block lists from index blocks would make the bound real.
+- Node memory (Base Sepolia `el-run`, 2026-11-08; counts: 37.6M accounts, 3.72G slots, 4.77M
+  codes, 21.6 GiB code): 50.7 GiB resident before the two changes above: code arena 21.6
+  GiB + code table 0.38 GiB; LSM filters 11.1 GiB and block lists 3.7 GiB (init memsets);
+  flat block cache 4 GiB; memtables up to 2.3 GiB (two per tree, the branch trees' ~0.9 GiB
+  each from the replay reserve); checkpoint staging 2.4 GiB; disk state memo, frames and
+  record cache 1.1 GiB; the runner 0.7 GiB; code store sort entries 0.2 GiB; the rest (~3.2
+  GiB) is outside the database and runner (the devp2p feed and its peers). After: ~15 GiB. At 2.6x the counts (mainnet estimate), before: codes 56 GiB and
+  LSM slot arrays 117 GiB (would not fit 125 GB); after: ~17-20 GiB resident (filters grow
+  with the keys written since import, 1.25 B per key).
 - Disk-backed state (docs/design/disk-state.md): a TigerBeetle-style LSM forest on a block
   grid inside the engine file, hashed keys only (accounts, storage, trie branches by
   (owner, path), codes), leaves derived from records, sparse root over the branch tree,
@@ -1551,6 +1615,15 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   engine grid crash test over 24 seeds x 6 crashes (mid write, mid and paused checkpoint,
   newest-zone rot forcing the fallback) reading back every referenced block. `db/table`:
   build 2.2-2.4 GiB/s, lookup hit 0.21-0.28 us, cold miss 25 us. Code store (1d) remains.
+- 2026-11-08: disk state phase 1e: codes out of RAM (pinned per block, see Decisions), on in
+  the node's shape; no format change (pinned and resident checkpoints are byte for byte
+  equal in the differential). `db/codes`: a block of 256 code reads (half from 512 hot
+  codes) warm 0.010 ms resident -> 0.161 ms pinned (629 ns per code, all cached), cold 5.7
+  ms CPU; checkpoint and open times and images unchanged. `db/disk-state:sim` counters
+  unchanged, times within run noise.
+- 2026-11-08: lsm: init no longer zeroes every table slot's filter and block list (14.8 GiB
+  of the Sepolia node's 50.7 GiB). The lsm crash test starts from all-ones filters and block
+  lists; dropping `slot_acquire`'s filter zeroing fails it.
 - 2026-11-06: disk state phase 1d: contract codes leave the checkpoint image (still resident):
   sorted code tables on the grid flushed before each checkpoint on the checkpoint's block
   budget, the table list in database checkpoint v2, an engine open pause in which open scans

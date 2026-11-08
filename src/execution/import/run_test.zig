@@ -81,6 +81,9 @@ const shape_run: to_disk.Shape = blk: {
     // Prefetch with a block cache far smaller than its reads: blocks churn.
     shape.flat_prefetch_keys_max = 256;
     shape.flat_prefetch_reads_max = 4;
+    // Every code goes into a table at the import's checkpoint: execution reads the
+    // contract's code from its table (pinned per block) after every reopen.
+    shape.code_flush_bytes_min = 0;
     break :blk shape;
 };
 
@@ -561,6 +564,9 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
         for (head.number - head_number..blocks_count) |index| _ = try harness.pass(@intCast(index));
         try harness.runner.flush();
         try harness.expect_oracle_state();
+        // The contract's code came from its table, through the pins.
+        try testing.expect(harness.state().codes_in_tables > 0);
+        try testing.expect(harness.disk.db.code_store.?.stats.reads > 0);
         // Every phase of the committed blocks was timed.
         const time = harness.runner.stats.time;
         try testing.expect(time.transactions_ns > 0 and time.commit_ns > 0);
