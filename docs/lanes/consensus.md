@@ -26,6 +26,17 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] batch stream, batch queue, batch validator, batch provider
   - [x] stateful attributes builder, network upgrade txs (Ecotone/Fjord/Isthmus/Jovian)
   - [x] attributes queue, pipeline core (step, reset, signals)
+- [ ] M5 derivation check on Base Sepolia (`base derive-check`, `src/consensus/derive_check`):
+  derive real safe blocks from Sepolia L1 (blobs from the beacon API) and compare every
+  payload attributes with the reference node through `AttributesMatch` (header plus derived
+  transactions root; the full body only on a root mismatch).
+  - [x] 2026-11-08 run: start l2 56077495 (L1 origin 12090294), reset walk-back to l2
+    56074375 (L1 origin 12090244); derived l2 56077496..56083495 (6000 blocks) from L1
+    12090244..12090414 (9 blob blocks, 55 blobs): 6000 matched, 0 mismatched, 0 resets.
+  - [x] fix found by the run: Amsterdam L1 headers (`blockAccessListHash`, `slotNumber`)
+    failed the header hash check in `sources/header_json.zig` (L1Provider too)
+  - [ ] engine API integration with the stateful node (consolidate against our own EL)
+  - [ ] L1 reorg evidence (live or replayed) and mainnet
 - [x] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [x] engine task queue: insert unsafe, consolidate (AttributesMatch), build/seal (Holocene
@@ -108,6 +119,13 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     (`sources/message_passer_roots.zig`)
 
 ## Decisions
+- derive-check takes each verified block's hash from the reference (the block the engine
+  already has in consolidation), since the hash needs execution; blocks below the start come
+  from the reference (the reset walk-back window, preloaded in batches). Public endpoints:
+  sepolia.base.org counts every batch element against 25 calls/s, so L2 calls are paced at
+  55 ms per element in batches of 20.
+- Amsterdam header fields follow alloy's order: `requests_hash`, `block_access_list_hash`,
+  `slot_number` (all optional, appended).
 - Safe head after L1 reorgs: base/base discovery trusts a safe label whose L1 origin is canonical even when the blocks that carried its batch data are gone. We also check the safedb (L1 block -> safe head) at every startup/reset and lower the safe label to what canonical L1 still supports, so the batcher re-posts. A safe head may therefore drop after a reorg (the sim allows it at resets).
 - execution forwarding: single requests over HTTP only; batches and WebSocket stay local (unknown methods -32601), because the servers cannot defer one batch entry or a WS frame. base/base forwards per batch entry.
 - safedb persistence: one rewritten image (like checkpoints) instead of redb; the in-memory safedb stays on without a path (base/base disables tracking), since the RPC is useful anyway.

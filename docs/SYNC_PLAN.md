@@ -181,6 +181,9 @@ Run `base consensus` (verifier mode) against real L1 with the mainnet rollup con
   block at that height. Safe and finalized heads advance at the same cadence as the
   reference's `optimism_syncStatus`, within one batch submission interval. Run through at
   least one L1 reorg (or replay a recorded one).
+- Status (2026-11-08): `base derive-check` derived 6000 consecutive Base Sepolia blocks from
+  real L1 data and matched every one against the reference node (docs/lanes/consensus.md).
+  Engine integration with the stateful node, reorg evidence, and mainnet remain.
 
 ### M6. Unsafe head from mainnet gossip
 
