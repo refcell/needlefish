@@ -350,9 +350,11 @@ fn run_blocks(run: *Run) !u8 {
 }
 
 /// Serves the Engine API and the JSON-RPC server for `duration_ms` while no block is
-/// waiting: in slices, alternating between their IOs, when both run.
+/// waiting: in slices, alternating between their IOs, when both run. A request's accept,
+/// read and write each wait out the other server's slice, so slices stay short: a verifier
+/// consensus node sends its engine requests one at a time.
 fn serve_idle(run: *Run, duration_ms: u64) !void {
-    const slice_ms = 10;
+    const slice_ms = 2;
     if (run.engine != null and run.rpc != null) {
         var waited_ms: u64 = 0;
         while (waited_ms < duration_ms) : (waited_ms += 2 * slice_ms) {
