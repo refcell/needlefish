@@ -639,6 +639,34 @@ test "pipeline: a reset walk longer than the L2 cache resumes where it stopped" 
     try testing.expect(driver.pipeline.reset_walk == null);
 }
 
+test "pipeline: a reset whose L1 origin is not yet available keeps its walked point" {
+    var scenario: Scenario = undefined;
+    scenario.init(16);
+    defer scenario.deinit();
+    var driver: Driver = undefined;
+    try driver.init(&scenario);
+    defer driver.deinit();
+    try driver.run_to_end();
+    const head = driver.cursor;
+    var forgetful: ForgetfulL2 = .{ .chain = driver.chain };
+    const reset: pipeline_module.Signal = .{ .reset = .{ .l2_safe_head = head } };
+    // L1 unavailable: the walk finishes over retries, then only the L1 half fails.
+    driver.chain.unavailable_from = 0;
+    for (0..64) |_| {
+        const result = driver.pipeline.signal(driver.chain, &forgetful, reset);
+        try testing.expectError(error.NotAvailable, result);
+    }
+    const walked = forgetful.fetches;
+    try testing.expect(walked > 1 and walked < head.block_info.number);
+    try testing.expect(driver.pipeline.reset_point != null);
+    // L1 back: the kept point is used, with no second walk over the forgetful provider.
+    driver.chain.unavailable_from = std.math.maxInt(u64);
+    try driver.pipeline.signal(driver.chain, &forgetful, reset);
+    try testing.expectEqual(walked, forgetful.fetches);
+    try testing.expect(driver.pipeline.reset_point == null);
+    try testing.expectEqual(@as(u64, 3), driver.pipeline.origin().?.number);
+}
+
 /// Runs the main scenario with random unavailable data and random resets for `seed`,
 /// then finishes without faults. Returns the executed blocks (caller frees).
 fn run_with_faults(seed: u64) ![]Record {

@@ -128,8 +128,11 @@ pub const Pipeline = struct {
     /// channel timeout spans thousands of L2 blocks, more than an L2 provider caches, so a
     /// walk restarted from the safe head on every retry would never finish.
     reset_walk: ?ResetWalk = null,
+    /// A finished walk-back's point, kept while the reset's L1 half is not yet available.
+    reset_point: ?KeptResetPoint = null,
 
     const ResetWalk = struct { safe_hash: Hash, current: L2BlockInfo };
+    const KeptResetPoint = struct { safe_hash: Hash, point: ResetPoint };
 
     /// Builds the stage stack starting at L1 `origin` with the genesis system config
     /// (base/base `PipelineBuilder`). Drivers usually send a reset before stepping.
@@ -274,15 +277,43 @@ pub const Pipeline = struct {
     /// untouched when the failure happens before the L1 origin is fetched.
     pub fn signal(pipeline: *Pipeline, chain: anytype, l2: anytype, sig: Signal) Error!void {
         switch (sig) {
-            .reset => |reset_signal| {
-                const point = try pipeline.initial_reset(l2, reset_signal.l2_safe_head);
-                try pipeline.reset(chain, point);
-            },
+            .reset => |reset_signal| try pipeline.signal_reset(chain, l2, reset_signal),
             .activation => try pipeline.activate(),
             .flush_channel => try pipeline.flush_channel(),
         }
         assert(pipeline.origin() != null);
         assert(pipeline.attributes_queue.batch == null);
+    }
+
+    /// The reset: the walk-back's point, then the stages from its L1 origin. A walked point
+    /// is kept while the L1 half is not yet available, so a retry for the same safe head
+    /// does not walk again (an L2 provider's cache cannot hold a whole walk).
+    fn signal_reset(
+        pipeline: *Pipeline,
+        chain: anytype,
+        l2: anytype,
+        reset_signal: ResetSignal,
+    ) Error!void {
+        const safe_head = reset_signal.l2_safe_head;
+        const point = if (pipeline.reset_point_for(safe_head.block_info.hash)) |kept|
+            kept
+        else
+            try pipeline.initial_reset(l2, safe_head);
+        pipeline.reset_point = null;
+        pipeline.reset(chain, point) catch |err| {
+            if (err == error.NotAvailable) {
+                pipeline.reset_point = .{ .safe_hash = safe_head.block_info.hash, .point = point };
+            }
+            return err;
+        };
+        assert(pipeline.reset_point == null);
+        assert(pipeline.reset_walk == null);
+    }
+
+    fn reset_point_for(pipeline: *const Pipeline, safe_hash: Hash) ?ResetPoint {
+        const kept = pipeline.reset_point orelse return null;
+        if (!kept.safe_hash.eql(safe_hash)) return null;
+        return kept.point;
     }
 
     /// Walks back from `l2_safe_head` until the walked-back block's L1 origin is at least
