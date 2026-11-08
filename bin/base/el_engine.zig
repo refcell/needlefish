@@ -340,6 +340,20 @@ pub const Engine = struct {
         return .syncing;
     }
 
+    /// A forkchoice label while the ring holds its block. A label whose block left the ring
+    /// is dropped, so `safe`/`finalized` answer the anchor again: a consensus node restarted
+    /// after its labeled blocks aged out would otherwise read a block el-run cannot serve.
+    fn held(engine: *Engine, label: *?Label) ?Label {
+        const found = label.* orelse return null;
+        const hash = engine.ring.hash_at(found.number);
+        if (hash != null and std.mem.eql(u8, &hash.?, &found.hash)) return found;
+        label.* = null;
+        report("el-run engine: forkchoice label block {d} left the ring; answering the " ++
+            "anchor until the next forkchoice update\n", .{found.number});
+        assert(label.* == null);
+        return null;
+    }
+
     /// What an unset `safe`/`finalized` answers: the pinned anchor while the ring still holds
     /// it, else a new one; null with an empty ring.
     fn anchor_label(engine: *Engine) ?Label {
@@ -548,8 +562,8 @@ fn get_block_by_number(engine: *Engine, call: *Call) HandlerError!void {
             return write_block(call.writer, &block, full);
         },
         .latest => engine.chain.head(),
-        .safe => engine.safe orelse try anchor_or_fail(engine, call),
-        .finalized => engine.finalized orelse try anchor_or_fail(engine, call),
+        .safe => engine.held(&engine.safe) orelse try anchor_or_fail(engine, call),
+        .finalized => engine.held(&engine.finalized) orelse try anchor_or_fail(engine, call),
     };
     // Proof: labels are executed blocks, and the head never moves back.
     const block = try read_number(engine, call, label.number) orelse unreachable;

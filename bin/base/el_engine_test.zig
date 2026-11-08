@@ -424,6 +424,33 @@ test "el engine: safe and finalized answer the anchor until a forkchoice update"
     ));
 }
 
+test "el engine: labels whose blocks left the ring fall back to the anchor" {
+    var setup: Setup = .{};
+    try setup.init(30, 16, 10); // Ring: 14..29.
+    defer setup.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const buffer = try arena.allocator().alloc(u8, 64 * 1024);
+    _ = try setup.engine.forkchoice(&setup.state(29, 16, 15));
+    const labeled = try decode_full(arena.allocator(), try get_block(&setup, buffer, "safe", true));
+    try testing.expect(labeled.info.block_info.hash.eql(setup.hash(16)));
+    for (30..33) |index| { // Ring: 17..32; finalized (15) left, safe (16) left.
+        setup.fake.head_index = index;
+        setup.engine.on_block(&setup.fixture.block(index));
+    }
+    for ([_][]const u8{ "safe", "finalized" }) |tag| {
+        const text = try get_block(&setup, buffer, tag, true);
+        const block = try decode_full(arena.allocator(), text);
+        try testing.expect(block.info.block_info.hash.eql(setup.hash(24))); // 32 - 16 / 2.
+    }
+    try testing.expect(setup.engine.safe == null and setup.engine.finalized == null);
+    try testing.expectEqual(@as(u64, 0), setup.engine.stats.ring_misses);
+    // A label still in the ring is kept.
+    _ = try setup.engine.forkchoice(&setup.state(32, 20, 18));
+    const kept = try decode_full(arena.allocator(), try get_block(&setup, buffer, "safe", true));
+    try testing.expect(kept.info.block_info.hash.eql(setup.hash(20)));
+}
+
 test "el engine: safe and finalized wait for a deep enough ring" {
     var setup: Setup = .{};
     try setup.init(30, 64, 10); // Ring 64 blocks, 30 held, nothing evicted yet.
