@@ -597,7 +597,7 @@ pub const Replayer = struct {
             if (!account.dirty or !account.in_database) continue;
             const code = account.info.code orelse continue;
             if (code.len == 0) continue;
-            try self.sparse.add_code(code);
+            try self.sparse.add_code_hashed(&account.info.code_hash, code);
         }
         state.accounts.clearRetainingCapacity();
         state.slots.clearRetainingCapacity();

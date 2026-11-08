@@ -49,7 +49,10 @@ with its 95% bootstrap interval.
   peak RSS against 351 MiB. needlefish's node cannot yet hold a large state, so this is a
   10,000-account chain, not mainnet.
 - **Profiles** found a needlefish inefficiency: about 21% of its replay time re-hashes
-  unchanged contract code after each block.
+  unchanged contract code after each block. It is fixed since: needlefish's execution +
+  roots is 1.23x faster on the 100-block window and 1.28x on the 1,000-block window
+  ([code re-hash fix](#code-re-hash-fix)).
+  The other tables in this document predate the fix.
 - **Build settings matter as much as the implementation on this machine**: native CPU
   tuning made both sides slower (base/base generic is 1.70x faster than native with roots,
   needlefish baseline 1.10x faster than native). The full matrix is below.
@@ -220,12 +223,37 @@ What the profiles say:
   single part. The next is a needlefish inefficiency the profile found: after every
   block, the replayer re-adds the bytecode of every changed contract to its code store,
   which hashes the code (up to 24 KB) only to find it is already there. That is about 21%
-  of the block and most of the 2.5 ms/block "state commit" phase above. Checking the
-  account's known code hash first would remove it. It is left in place so the numbers here
-  describe the code as it was measured.
+  of the block and most of the 2.5 ms/block "state commit" phase above. It is fixed since
+  (below); the numbers here describe the code as it was measured.
 - **Sender recovery** is 15% of needlefish's block; base/base's (C libsecp256k1) does not
   reach 1.5% of its much longer block. It is the one execution phase where base/base is
   faster in absolute time (0.80 against 1.00 ms/block).
+
+#### Code re-hash fix
+
+The replayer (and the follower) now look a changed contract's code up by the account's
+`code_hash`, which the evm already holds, and hash only code new to the store (in safe
+builds, to check the hash). Measured with `reproduce.sh`'s method (`base replay bench`,
+`ReleaseSafe` native, fresh process per run, cold and warm, `--recovery-threads 0`, one
+pinned CPU, before and after interleaved over 30 rounds, 10 on the 1,000-block window with
+no in-process repeat, `etc/bench/stats.zig`) but without cgroup isolation, on another 4-vCPU
+cloud VM: compare before with after, not with the tables above. Every block matched its
+header in every run.
+
+| Workload | Phase | before ms/block | after ms/block | speedup, warm (95% CI) |
+| --- | --- | ---: | ---: | ---: |
+| 10-block fixture | execution | 9.32 | 9.29 | 1.00x (0.98-1.02) |
+| 10-block fixture | execution + roots | 13.26 | 11.13 | 1.19x (1.16-1.22) |
+| 10-block fixture | state commit (phase mean) | 3.33 | 1.25 | |
+| 100-block window | execution | 4.71 | 4.72 | 1.00x (0.98-1.02) |
+| 100-block window | execution + roots | 7.35 | 5.98 | 1.23x (1.21-1.25) |
+| 100-block window | state commit (phase mean) | 2.19 | 0.84 | |
+| 1,000-block window | execution | 4.56 | 4.47 | 1.02x (1.00-1.05) |
+| 1,000-block window | execution + roots | 7.48 | 5.83 | 1.28x (1.26-1.31) |
+| 1,000-block window | state commit (phase mean) | 2.45 | 0.90 | |
+
+Times are median window time over blocks, warm; cold gives about the same ratios (1.20x,
+1.24x and 1.26x).
 
 
 ### EVM only (B3)

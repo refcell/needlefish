@@ -842,6 +842,24 @@ pub const SparseState = struct {
         _ = try self.codes.add(code);
     }
 
+    /// `add_code` for code whose keccak256 the caller already knows (an evm account's
+    /// `code_hash`): code the store holds is found by its hash and not hashed again. The
+    /// caller guarantees `hash == keccak256(code)`; safe builds check code new to the store.
+    pub fn add_code_hashed(
+        self: *SparseState,
+        hash: *const Hash,
+        code: []const u8,
+    ) error{WitnessFull}!void {
+        assert(code.len > 0);
+        if (self.codes.get(hash)) |stored| {
+            assert(stored.len == code.len);
+            return;
+        }
+        if (std.debug.runtime_safety) assert(std.mem.eql(u8, &node.keccak256(code), hash));
+        try self.codes.add_hashed(hash, code, false);
+        assert(self.codes.get(hash) != null);
+    }
+
     /// Appends the next ancestor header, oldest first: it must be the child of the previous
     /// one (number + 1, parent hash = keccak256 of the previous header). Nothing is served
     /// until `verify_headers` links the last one to the parent.

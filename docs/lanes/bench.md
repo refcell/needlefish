@@ -109,8 +109,9 @@ README.
   `time_total` per `newPayload`; disk is the allocated size (MDBX's map file is sparse).
 - **Profiles.** needlefish's replayer re-adds every changed contract's code to the code
   store after each block, hashing up to 24 KB just to find it present (about 21% of replay
-  time). Left in place so the published numbers describe the measured code; checking the
-  account's code hash first would remove it.
+  time). Fixed 2026-11-08 (`SparseState.add_code_hashed`: look the code up by the account's
+  `code_hash`, hash only new code); the published tables still describe the measured code,
+  and BENCHMARKS.md's "Code re-hash fix" has the before/after.
 - **README.** Removed Status, Performance, Releases, Testing, and Development. Added
   Benchmarks and a short Contributing pointer. `just release` now downloads Zig 0.17.1 into
   `.cache/zig` when it is not on `PATH`, so installation is clone plus `just release`.
@@ -124,3 +125,8 @@ README.
   configurations), phase attribution and flame graphs, and the first node-to-node result.
   The 1,000-block window found two B-20 precompile bugs (fixed). BENCHMARKS.md and the
   README rewritten.
+- 2026-11-08: fixed the code re-hash the profiles found. Before/after, ReleaseSafe native,
+  single-threaded, 30 interleaved rounds: 100-block window execution + roots 7.35 ->
+  5.98 ms/block (1.23x, 1.21-1.25), state commit 2.19 -> 0.84 ms/block; fixture 1.19x;
+  1,000-block window (10 rounds) 7.48 -> 5.83 ms/block (1.28x, 1.26-1.31), state commit
+  2.45 -> 0.90 ms/block; execution alone unchanged.
