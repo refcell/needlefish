@@ -141,6 +141,9 @@ pub const shape_node: Shape = .{
         .replay_record_writes_max = node_record_writes_max * 16,
         // ~300 MiB: the account trie's top four levels and the hot paths stay resolved.
         .record_cache_entries = 1 << 18,
+        // A block's reads, remembered until its write-back (~12 MiB).
+        .read_memo_accounts_max = 1 << 14,
+        .read_memo_slots_max = 1 << 16,
     },
     .queue_entries_max = 8,
     .flat_flush_entries_min = 16 * 1024,

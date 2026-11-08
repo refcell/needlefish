@@ -390,6 +390,8 @@ pub const Config = struct {
             .record_write_bytes_max = disk.record_write_bytes_max,
             .changeset = config.changeset,
             .record_cache_entries = disk.record_cache_entries,
+            .read_memo_accounts_max = disk.read_memo_accounts_max,
+            .read_memo_slots_max = disk.read_memo_slots_max,
         };
     }
 
@@ -471,6 +473,10 @@ pub const DiskStateConfig = struct {
     replay_record_writes_max: u32,
     /// Branch records `DiskState` keeps across blocks (`record_cache.zig`, ~1.1 KiB each).
     record_cache_entries: u32 = disk_state_module.record_cache_entries_default,
+    /// Account records and slots `DiskState` remembers between a block's reads and its
+    /// write-back (`DiskState.Config`).
+    read_memo_accounts_max: u32 = 4096,
+    read_memo_slots_max: u32 = 16 * 1024,
 };
 
 /// Grid blocks for the code tables of `state` (the node default): four times the blocks

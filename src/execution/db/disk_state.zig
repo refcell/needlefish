@@ -92,6 +92,10 @@ pub const Config = struct {
     /// Records kept across blocks by top-node hash and hang (`record_cache.zig`), ~1.1 KiB
     /// each: a block's walk takes the top of every trie it touches from here.
     record_cache_entries: u32 = record_cache_entries_default,
+    /// Account records and slots one block reads at most through the read memo (more read
+    /// the trees every time).
+    read_memo_accounts_max: u32 = 4096,
+    read_memo_slots_max: u32 = 16 * 1024,
 };
 
 /// How to rebuild a node's preimage. Content-addressed: equal hashes have equal preimages,
@@ -153,9 +157,11 @@ pub const Stats = struct {
     record_cache_hits: u64 = 0,
     /// Leaves resolved by hash (each reads the account or storage tree).
     leaves_resolved: u64 = 0,
-    /// Account and slot point reads of the trees (evm reads, leaves, pre-state roots).
+    /// Account and slot point reads of the trees (evm reads, leaves, pre-state roots), and
+    /// reads the read memo answered instead.
     account_reads: u64 = 0,
     slot_reads: u64 = 0,
+    read_memo_hits: u64 = 0,
     /// Branch-record puts and tombstones written.
     record_writes: u64 = 0,
     /// Sparse trie updates with node resolution, the root hash, the record diff and
@@ -203,6 +209,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// Verified records across blocks (content-addressed: never stale).
         record_cache: RecordCache,
         memo: std.AutoHashMapUnmanaged(Hash, Entry) = .empty,
+        /// The account records and slots read since the last write-back (or `set_root`),
+        /// as the trees hold them: every tree write goes through `apply`, which clears it.
+        read_accounts: std.AutoHashMapUnmanaged(Hash, ?Account) = .empty,
+        read_slots: std.AutoHashMapUnmanaged([flat_trees_module.storage_key_size]u8, u256) =
+            .empty,
         memo_bytes: []u8,
         memo_bytes_len: u32 = 0,
         frames: []Frame,
@@ -250,6 +261,12 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             var memo: std.AutoHashMapUnmanaged(Hash, Entry) = .empty;
             try memo.ensureTotalCapacity(allocator, config.memo_entries_max);
             errdefer memo.deinit(allocator);
+            var read_accounts: std.AutoHashMapUnmanaged(Hash, ?Account) = .empty;
+            try read_accounts.ensureTotalCapacity(allocator, config.read_memo_accounts_max);
+            errdefer read_accounts.deinit(allocator);
+            var read_slots: @FieldType(Self, "read_slots") = .empty;
+            try read_slots.ensureTotalCapacity(allocator, config.read_memo_slots_max);
+            errdefer read_slots.deinit(allocator);
             const memo_bytes = try allocator.alloc(u8, config.memo_bytes_max);
             errdefer allocator.free(memo_bytes);
             const frames = try allocator.alloc(Frame, frames_max);
@@ -268,6 +285,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             const record_cache = try RecordCache.init(allocator, config.record_cache_entries);
             return .{
                 .record_cache = record_cache,
+                .read_accounts = read_accounts,
+                .read_slots = read_slots,
                 .account_writes = account_writes,
                 .trees = trees,
                 .config = config,
@@ -291,6 +310,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             allocator.free(self.frames);
             allocator.free(self.memo_bytes);
             self.memo.deinit(allocator);
+            self.read_slots.deinit(allocator);
+            self.read_accounts.deinit(allocator);
             self.sparse_state.deinit(allocator);
             self.* = undefined;
         }
@@ -304,17 +325,35 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         pub fn set_root(self: *Self, state_root: Hash) void {
             self.state_root = state_root;
             self.fault = false;
+            // The trees may have moved (a reopen, a crash, an import): forget their reads.
+            self.forget_reads();
             assert(std.mem.eql(u8, &self.state_root, &state_root));
         }
 
-        // Reads (synchronous point lookups; a failure faults the state).
+        // Reads (synchronous point lookups through the read memo; a failure faults the
+        // state and is not remembered).
 
         pub fn account(self: *Self, address_hash: *const Hash) ?Account {
+            if (self.read_accounts.get(address_hash.*)) |record| {
+                self.stats.read_memo_hits += 1;
+                return record;
+            }
             self.stats.account_reads += 1;
-            return self.trees.get_account(address_hash) catch {
+            const record = self.trees.get_account(address_hash) catch {
                 self.fault = true;
                 return null;
             };
+            if (self.read_accounts.count() < self.config.read_memo_accounts_max) {
+                self.read_accounts.putAssumeCapacityNoClobber(address_hash.*, record);
+            }
+            return record;
+        }
+
+        /// Empties the read memo: the trees are about to change, or did.
+        fn forget_reads(self: *Self) void {
+            self.read_accounts.clearRetainingCapacity();
+            self.read_slots.clearRetainingCapacity();
+            assert(self.read_accounts.count() == 0 and self.read_slots.count() == 0);
         }
 
         pub fn basic(self: *Self, address_hash: *const Hash) ?AccountInfo {
@@ -324,11 +363,20 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         /// The slot word, 0 when absent.
         pub fn storage(self: *Self, address_hash: *const Hash, slot_hash: *const Hash) u256 {
+            const key = flat_trees_module.storage_key_hashed(address_hash, slot_hash);
+            if (self.read_slots.get(key)) |word| {
+                self.stats.read_memo_hits += 1;
+                return word;
+            }
             self.stats.slot_reads += 1;
-            return self.trees.get_slot(address_hash, slot_hash) catch {
+            const word = self.trees.get_slot(address_hash, slot_hash) catch {
                 self.fault = true;
                 return 0;
             };
+            if (self.read_slots.count() < self.config.read_memo_slots_max) {
+                self.read_slots.putAssumeCapacityNoClobber(key, word);
+            }
+            return word;
         }
 
         /// Checks that the state root resolves: the root record (and for a leaf root, its
@@ -415,6 +463,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             try self.collect_accounts(applied);
             try self.reserve(applied);
             const diffed_ns = self.now_ns();
+            // Every read of this block happened above: the memo now names the old values.
+            self.forget_reads();
             self.write_accounts();
             self.write_slots(applied);
             self.write_records();
@@ -702,19 +752,15 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             var value_buffer: [state_trie.account_rlp_bytes_max]u8 = undefined;
             var value: []const u8 = undefined;
             if (owner) |owner_hash| {
-                self.stats.slot_reads += 1;
-                const word = self.trees.get_slot(owner_hash, key) catch {
-                    self.fault = true;
-                    return null;
-                };
+                const word = self.storage(owner_hash, key);
+                if (self.fault) return null;
                 if (word == 0) return self.fail();
                 value = state_trie.encode_storage_value(word, value_buffer[0..33]);
             } else {
-                self.stats.account_reads += 1;
-                const record = self.trees.get_account(key) catch {
-                    self.fault = true;
-                    return null;
-                } orelse return self.fail();
+                const record = self.account(key) orelse {
+                    if (self.fault) return null;
+                    return self.fail();
+                };
                 const info: trie.Account = .{
                     .nonce = record.info.nonce,
                     .balance = record.info.balance,

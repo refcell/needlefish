@@ -347,6 +347,7 @@ const Counters = struct {
     leaves_resolved: u64 = 0,
     account_reads: u64 = 0,
     slot_reads: u64 = 0,
+    read_memo_hits: u64 = 0,
     record_writes: u64 = 0,
 
     fn minus(after: Counters, before: Counters) Counters {
@@ -419,7 +420,7 @@ const Totals = struct {
             "  apply {d:.3} ms/block [update {d:.3} root {d:.3} diff {d:.3} write {d:.3}] " ++
                 "journal {d:.3} room {d:.3}; grid reads {d:.1}, cache hits {d:.1} " ++
                 "misses {d:.1}, records resolved {d:.1} read {d:.1} cached {d:.1}, " ++
-                "leaves {d:.1}, account reads {d:.1}, slot reads {d:.1}, " ++
+                "leaves {d:.1}, account reads {d:.1}, slot reads {d:.1}, memo hits {d:.1}, " ++
                 "record writes {d:.1}\n",
             .{
                 ms(total.apply_ns, blocks),           ms(total.update_ns, blocks),
@@ -430,7 +431,7 @@ const Totals = struct {
                 per(apply.records_resolved, blocks),  per(apply.record_reads, blocks),
                 per(apply.record_cache_hits, blocks), per(apply.leaves_resolved, blocks),
                 per(apply.account_reads, blocks),     per(apply.slot_reads, blocks),
-                per(apply.record_writes, blocks),
+                per(apply.read_memo_hits, blocks),    per(apply.record_writes, blocks),
             },
         );
     }
@@ -560,6 +561,7 @@ fn RunType(comptime Storage: type) type {
                 .leaves_resolved = stats.leaves_resolved,
                 .account_reads = stats.account_reads,
                 .slot_reads = stats.slot_reads,
+                .read_memo_hits = stats.read_memo_hits,
                 .record_writes = stats.record_writes,
             };
         }
