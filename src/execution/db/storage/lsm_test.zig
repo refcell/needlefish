@@ -72,6 +72,8 @@ const Spec = struct {
     grid_blocks: u64 = grid_blocks,
     zone_blocks: u64 = engine_config.checkpoint_zone_size_bytes / block_size,
     cache_blocks: u32 = 16,
+    /// The tree's filters and block lists start as 0xff bytes, not zeros (`tree_init`).
+    poison: bool = false,
 
     fn engine(comptime spec: Spec) engine_module.Config {
         var config = engine_config;
@@ -177,6 +179,13 @@ fn HarnessType(comptime spec: Spec) type {
             var config = spec.tree;
             config.block_count = spec.grid_blocks;
             self.tree = try Tree.init(testing.allocator, &self.engine.grid.?, &self.cache, config);
+            if (spec.poison) {
+                // Init does not zero them: a tree must never read one it did not set. All
+                // ones is the worst case for both: a filter that rules out no key, and block
+                // addresses past the grid.
+                @memset(self.tree.filters, std.math.maxInt(u32));
+                @memset(self.tree.slot_blocks, std.math.maxInt(u64));
+            }
             assert(self.tree.checkpoint_size_max() + self.engine.free_set_image.len <=
                 engine_config_spec.checkpoint_zone_size_bytes);
             self.tree.install_callback = on_install;
@@ -642,7 +651,9 @@ fn choice_of(prng: *Prng) u64 {
     };
 }
 
-const CrashHarness = HarnessType(.{ .key_size = 32, .value_size = 8 });
+/// Poisoned: the crash test also proves the tree never reads a filter or block list it did
+/// not set (a slot's filter all ones would rule out nothing: no filter negatives).
+const CrashHarness = HarnessType(.{ .key_size = 32, .value_size = 8, .poison = true });
 
 fn run_crash_seed(seed: u64, counts: *Counts) !void {
     var prng = Prng.init(seed);

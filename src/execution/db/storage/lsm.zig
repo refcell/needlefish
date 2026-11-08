@@ -366,9 +366,11 @@ fn TreeShapeType(comptime Storage: type, comptime shape: Shape) type {
             errdefer compaction.deinit(allocator);
             var reader = try Table.Reader.init(allocator, grid, cache);
             errdefer reader.deinit(allocator);
+            // Filters and block lists are not zeroed here: `slot_acquire` zeroes a slot's
+            // filter and every table's block list is written (output, bulk) or zeroed (open)
+            // before use. Untouched slots then cost no RAM: sized for every table a level may
+            // hold (3x its capacity), they are GiBs at chain scale, mostly never used.
             @memset(slot_used, false);
-            @memset(slot_blocks, 0);
-            @memset(filters, 0);
             return .{
                 .config = config,
                 .layout = layout,
