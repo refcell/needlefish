@@ -140,7 +140,10 @@ Get verified mainnet state at a recent block into the needlefish database.
 - Reference: base/base `crates/infra/snapshotter` (`tip.rs`, `progress.rs`),
   `crates/execution/node/src/storage.rs`; the public reth database table definitions.
 - Check: imported state root equals the header at the snapshot block. Spot-check 10,000
-  random accounts and storage slots against the reference node at that block.
+  random accounts and storage slots against the reference node at that block
+  (`base state-check --db <path>`: accounts and slots read through the trie and from the flat
+  records against `eth_getProof`, codes against `eth_getCode`, inside the endpoint's proof
+  window).
 
 ### M4. Catch-up sync from the snapshot block to the tip
 
