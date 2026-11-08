@@ -64,8 +64,15 @@ behind a small interface and switch later.
     five peers over 90 s from the snapshot's next block, with hedging, peer cooldowns and
     cross-segment link checks; then tip following on a lent connection. `el-run --peers`,
     `el-fetch --peers` (download only), `el-peers --peers` (grows the peer file).
-  - [ ] Run on real state (waiting for the Sepolia disk import), and cross-checks against
-    signed gossip blocks while running.
+  - [x] Run on real state: 1,000,445 consecutive executed blocks from the snapshot, then
+    38.9 min at the tip (docs/UNSAFE_TIP.md, acceptance run).
+  - [x] Signed gossip anchor (`el_gossip.zig`, `el-run --gossip`, `el-fetch --gossip`):
+    the consensus gossip network on its own thread; every block the caller commits is
+    compared with the sequencer-signed gossip block at its height. The 159 signed blocks
+    from the 2026-11-06 watch all match the executed blocks at those heights (64-bit hash
+    prefixes, the watch log's width).
+  - [ ] Gossip as a second tip source (decode the payload into header and transactions),
+    with gaps filled from the pool.
 - [ ] `libp2p`: interop test against a real go/rust libp2p peer (needs a devnet peer).
   Skipped for now (coordinator, 2026-11-05): no external peer is available; the
   loopback, in-process, and devnet interop tests cover our own stack end to end.

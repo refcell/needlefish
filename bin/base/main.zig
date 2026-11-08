@@ -107,6 +107,7 @@ test {
     _ = @import("derive_check_net.zig");
     _ = @import("el_source.zig");
     _ = @import("el_pool.zig");
+    _ = @import("el_gossip.zig");
     _ = @import("metrics_server.zig");
 }
 

@@ -21,6 +21,11 @@
 //!
 //! With `--engine.addr <ip:port> --engine.jwt <file>` it also serves the Engine API to a
 //! verifier `base consensus` (`el_engine.zig`), between blocks and while idle at the tip.
+//!
+//! With `--gossip` (and any `--p2p.*` flags) it also joins the consensus gossip network
+//! (`el_gossip.zig`) and checks every committed block against the sequencer-signed gossip
+//! block at its height, when gossip delivers one: equal hashes anchor the devp2p chain to
+//! the sequencer, a different hash prints `GOSSIP CONFLICT`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,6 +33,7 @@ const base = @import("base");
 
 const el_source = @import("el_source.zig");
 const el_feed = @import("el_feed.zig");
+const el_gossip = @import("el_gossip.zig");
 const import_run_cli = @import("import_run.zig");
 const snapshot_import_out = @import("snapshot_import_out.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
@@ -64,7 +70,7 @@ const usage =
     \\                   [--chain base-sepolia|base-mainnet] [--blocks <n>] [--duration <s>]
     \\                   [--engine.addr <ip:port> --engine.jwt <file>
     \\                    [--engine.ring-blocks <n>] [--engine.ring-mb <n>]]
-    \\                   [--engine.rollup-out <rollup.json>]
+    \\                   [--engine.rollup-out <rollup.json>] [--gossip [--p2p.* ...]]
     \\
 ;
 
@@ -82,14 +88,27 @@ const Flags = struct {
     blocks: ?u64 = null,
     duration_s: ?u64 = null,
     engine: el_engine.Flags = .{},
+    gossip: bool = false,
+    /// Every argument, for the `--p2p.*` flags `el_gossip` reads.
+    args: []const []const u8 = &.{},
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
-    var flags: Flags = .{};
+    var flags: Flags = .{ .args = args };
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
-        if (index + 1 == args.len) return error.InvalidArguments;
         const name = args[index];
+        if (std.mem.eql(u8, name, "--gossip")) {
+            flags.gossip = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, name, "--p2p.")) {
+            const has_value = std.mem.indexOfScalar(u8, name, '=') != null or
+                base.consensus.p2p.options.is_bool(name["--p2p.".len..]);
+            if (!has_value) index += 1;
+            continue;
+        }
+        if (index + 1 == args.len) return error.InvalidArguments;
         index += 1;
         const value = args[index];
         if (std.mem.eql(u8, name, "--db")) {
@@ -167,6 +186,8 @@ const Run = struct {
     feed: *el_feed.Feed,
     /// The Engine API (`--engine.addr`), served only between blocks.
     engine: ?*el_engine.Service = null,
+    /// Sequencer-signed gossip (`--gossip`), checked against every committed block.
+    gossip: ?*el_gossip.Gossip = null,
     rollup: base.consensus.protocol.RollupConfig,
     first: u64,
     started_ms: i64,
@@ -239,6 +260,11 @@ fn execute(
         return 2;
     };
     defer if (engine) |service| service.destroy(gpa);
+    const gossip = if (flags.gossip)
+        try el_gossip.Gossip.start(gpa, init.io, flags.config, flags.args)
+    else
+        null;
+    defer if (gossip) |value| value.destroy();
     var run: Run = .{
         .io = init.io,
         .flags = flags,
@@ -246,6 +272,7 @@ fn execute(
         .runner = runner,
         .feed = feed,
         .engine = engine,
+        .gossip = gossip,
         .rollup = unsafe_watch.rollup_for(flags.config),
         .first = head.number + 1,
         .started_ms = 0,
@@ -333,7 +360,8 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
 }
 
 /// The per-committed-block hook: `block` was executed, checked, and committed as the
-/// database head. Dispatches to the optional consumers (the Engine API's block ring).
+/// database head. Dispatches to the optional consumers (the Engine API's block ring, the
+/// gossip anchor).
 fn block_committed(run: *Run, block: *const el_source.Block) void {
     assert(run.db.head_info.number == block.number);
     assert(std.mem.eql(u8, &run.db.head_info.hash, &block.hash));
@@ -343,6 +371,7 @@ fn block_committed(run: *Run, block: *const el_source.Block) void {
         .header_rlp = block.header_rlp,
         .transactions = block.transactions,
     });
+    if (run.gossip) |gossip| _ = gossip.on_chain(block.number, block.hash);
 }
 
 fn report_failure(run: *const Run, outcome: *const import_run.Outcome) void {
@@ -393,6 +422,7 @@ fn summary(run: *Run) void {
     });
     print_phases(run);
     if (run.engine) |service| service.engine.summary();
+    if (run.gossip) |value| value.summary();
     if (now - run.peers_printed_ms >= peers_interval_ms) {
         run.peers_printed_ms = now;
         run.feed.pool.print_peers();
@@ -440,6 +470,13 @@ test "el-run: flags" {
     try std.testing.expectEqualStrings("127.0.0.1:8551", engine.engine.addr.?);
     const half = parse_flags(&.{ "--db", "x", "--enode", enode_text, "--engine.jwt", "j" });
     try std.testing.expectError(error.InvalidArguments, half);
+    // `--gossip` takes no value; `--p2p.*` values are skipped, boolean ones take none.
+    const gossip = try parse_flags(&.{
+        "--gossip", "--p2p.peers.hi", "4", "--p2p.no-discovery", "--db", "x", "--enode", enode_text,
+    });
+    try std.testing.expect(gossip.gossip);
+    try std.testing.expectEqualStrings("x", gossip.db);
+    try std.testing.expect(!defaults.gossip);
 }
 
 test {

@@ -192,7 +192,20 @@ signed gossip block at the same height (whenever gossip delivers one, its hash m
 the followed chain) or the snapshot hash at the bottom of the range. Checked offline: the
 159 sequencer-signed gossip blocks one `unsafe-watch` run received (55318947 to
 55319105) match the blocks the execution peer serves at those heights (the run logged
-64-bit hash prefixes; compared with `el-fetch --verbose`).
+64-bit hash prefixes; compared with `el-fetch --verbose`). The acceptance run below later
+executed those heights: all 159 signed hashes equal the executed blocks' hashes (64-bit
+prefixes), so the executed chain is the sequencer's at least there.
+
+`el-run --gossip` (and `el-fetch --peers --gossip`) makes that check live
+(`bin/base/el_gossip.zig`). The consensus gossip network runs on its own thread, as in
+`unsafe-watch`. Every block el-run commits is compared with the sequencer-signed gossip
+block at its height, whichever arrives first, over a ring of the last 4,096 heights. An
+equal hash anchors the block; a different one prints `GOSSIP CONFLICT` with both hashes.
+A height with no gossip stays unanchored, not failed. The 10 s summary adds a `gossip:`
+line: peers, signed blocks, anchored, conflicts, and how often and by how much gossip
+arrived before the devp2p block. Behind NAT, gossip delivery is still the limit: a
+15-minute `el-fetch --gossip` run at the tip on 2026-11-08 held one or two gossip peers but
+received no blocks.
 
 ### Acceptance run (2026-11-08): met
 

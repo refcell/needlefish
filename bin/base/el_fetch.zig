@@ -21,12 +21,15 @@
 //! It reports the download rate and, once at the tip, the lag: blocks are checked and
 //! linked, not executed. `--consume-us <n>` makes the consumer spend `n` microseconds per
 //! block, standing in for execution, to see how the pool behaves behind a slower consumer.
+//! `--gossip` (with any `--p2p.*` flags) checks each block against the sequencer-signed
+//! gossip block at its height (`el_gossip.zig`).
 
 const std = @import("std");
 const base = @import("base");
 
 const el_source = @import("el_source.zig");
 const el_feed = @import("el_feed.zig");
+const el_gossip = @import("el_gossip.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 const enode = base.consensus.p2p.peers.enode;
 const curve = base.common.crypto.secp256k1;
@@ -38,7 +41,7 @@ const usage =
     \\                     [--parent <hash>] [--follow] [--duration <s>] [--verbose] [--trace]
     \\                     [--chain base-sepolia|base-mainnet]
     \\       base el-fetch --peers <file> --from <block> [--count <n>] [--duration <s>]
-    \\                     [--parent <hash>] [--consume-us <n>]
+    \\                     [--parent <hash>] [--consume-us <n>] [--gossip [--p2p.* ...]]
     \\                     [--chain base-sepolia|base-mainnet]
     \\
 ;
@@ -50,6 +53,8 @@ const Flags = struct {
     from_tip: bool = false,
     parent: ?[32]u8 = null,
     follow: bool = false,
+    gossip: bool = false,
+    args: []const []const u8 = &.{},
     verbose: bool = false,
     trace: bool = false,
     duration_s: u64 = 0,
@@ -60,7 +65,7 @@ const Flags = struct {
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
-    var flags: Flags = .{};
+    var flags: Flags = .{ .args = args };
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const name = args[index];
@@ -74,6 +79,16 @@ fn parse_flags(args: []const []const u8) !Flags {
         }
         if (std.mem.eql(u8, name, "--trace")) {
             flags.trace = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--gossip")) {
+            flags.gossip = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, name, "--p2p.")) {
+            const has_value = std.mem.indexOfScalar(u8, name, '=') != null or
+                base.consensus.p2p.options.is_bool(name["--p2p.".len..]);
+            if (!has_value) index += 1;
             continue;
         }
         index += 1;
@@ -222,6 +237,11 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
         return 2;
     };
     defer feed.destroy();
+    const gossip = if (flags.gossip)
+        try el_gossip.Gossip.start(init.gpa, io, flags.chain, flags.args)
+    else
+        null;
+    defer if (gossip) |value| value.destroy();
     const rollup = unsafe_watch.rollup_for(flags.chain);
     const start = Io.Clock.awake.now(io);
     var last_report_ms: i64 = 0;
@@ -235,6 +255,7 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
         if (elapsed_ms - last_report_ms >= 5_000) {
             last_report_ms = elapsed_ms;
             report(feed, elapsed_ms, blocks, &lag);
+            if (gossip) |value| value.summary();
         }
         if (!try feed.next(&block)) {
             if (!flags.follow and feed.mode == .follow) break;
@@ -242,6 +263,7 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
             continue;
         }
         blocks += 1;
+        if (gossip) |value| _ = value.on_chain(block.number, block.hash);
         if (flags.consume_us > 0) {
             try io.sleep(.fromMicroseconds(@intCast(flags.consume_us)), .awake);
         }
@@ -256,6 +278,7 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
     }
     const elapsed_ms = start.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
     report(feed, elapsed_ms, blocks, &lag);
+    if (gossip) |value| value.summary();
     feed.pool.print_peers();
     std.debug.print("el-fetch: ok, {d} linked blocks {d}..{d}, {d} duplicate segments\n", .{
         blocks, flags.from.?, feed.next_number -| 1, feed.pool.duplicates,
