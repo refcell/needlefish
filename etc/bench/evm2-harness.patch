@@ -1,0 +1,283 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8051e8ed..b0c65401 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2634,6 +2634,7 @@ dependencies = [
+  "alloy-hardforks",
+  "alloy-primitives",
+  "alloy-provider",
++ "alloy-rlp",
+  "alloy-rpc-client",
+  "alloy-rpc-types-eth",
+  "alloy-rpc-types-trace",
+diff --git a/crates/cli/Cargo.toml b/crates/cli/Cargo.toml
+index 023a5765..01842ad0 100644
+--- a/crates/cli/Cargo.toml
++++ b/crates/cli/Cargo.toml
+@@ -26,7 +26,7 @@ alloy-consensus = { workspace = true, features = ["k256", "secp256k1", "std"] }
+ alloy-chains.workspace = true
+ alloy-eips = { workspace = true, features = ["serde", "std"] }
+ alloy-hardforks.workspace = true
+-alloy-primitives = { workspace = true, features = ["keccak-cache-global", "map-indexmap", "secp256k1", "serde", "std"] }
++alloy-primitives = { workspace = true, features = ["map-indexmap", "secp256k1", "serde", "std"] }
+ alloy-provider = { workspace = true, features = ["debug-api", "reqwest", "reqwest-rustls-tls"] }
+ alloy-rpc-client = { workspace = true, features = ["reqwest"] }
+ alloy-rpc-types-eth = { workspace = true, features = ["serde", "std"] }
+@@ -63,7 +63,10 @@ tikv-jemallocator = { workspace = true, optional = true }
+ evm2-jit-build = { workspace = true, optional = true }
+ 
+ [features]
+-default = ["mimalloc"]
++default = ["mimalloc", "keccak-cache-global"]
++# Process-global keccak memo (alloy `fixed-cache`); `--no-default-features --features mimalloc`
++# builds without it.
++keccak-cache-global = ["alloy-primitives/keccak-cache-global"]
+ jit = [
+     "evm2-eest/jit",
+     "dep:evm2-jit-context",
+@@ -78,9 +81,14 @@ jemalloc = ["dep:tikv-jemallocator"]
+ mimalloc = ["dep:mimalloc"]
+ 
+ [dev-dependencies]
++alloy-rlp = { workspace = true, features = ["std"] }
+ criterion.workspace = true
+ revm = { workspace = true, features = ["test-types"] }
+ 
+ [[bench]]
+ name = "evm"
+ harness = false
++
++[[bench]]
++name = "nf"
++harness = false
+diff --git a/crates/cli/benches/nf.rs b/crates/cli/benches/nf.rs
+new file mode 100644
+index 00000000..eb1a4391
+--- /dev/null
++++ b/crates/cli/benches/nf.rs
+@@ -0,0 +1,225 @@
++//! needlefish comparison runner (`etc/bench/evm2.sh` in refcell/needlefish).
++//!
++//!     nf [--engine evm2|revm] [--target-ms <ms>] <fixture.json>...
++//!
++//! Times every state-test case of the given fixture files with the same loop as needlefish's
++//! `statetest --bench`: one EVM per case lives across iterations, as in a node; each
++//! iteration resets its state to the case's pre-state (untimed: evm2 `set_database`, revm a
++//! fresh `CacheDB`, needlefish `State.reset`, each keeping its allocations), then executes one
++//! transaction (timed: evm2 `transact` + `commit`, revm `transact`, needlefish `transact`).
++//! Results are dropped outside the timed region. A warm-up runs for `target-ms`, then
++//! iterations run until the timed total reaches `target-ms`; the line reports the mean. Code
++//! analysis is shared across iterations (the pre-state's bytecode is analyzed before timing).
++//! Before timing, one run on a fresh EVM must succeed and match the fixture's logs hash. One
++//! line per case:
++//!
++//!     BENCH case=<name> iterations=<n> gas=<gas used> exec_ns=<mean> total_ns=<mean> ok=1
++#![allow(missing_docs, unreachable_pub, dead_code, clippy::missing_const_for_fn)]
++
++#[path = "evm/fixture.rs"]
++mod fixture;
++
++use alloy_primitives::{B256, Log, keccak256};
++use evm2::{
++    BaseEvmTypes, Evm, ExecutedTx, Precompiles, SpecId, ethereum::ethereum_tx_registry,
++};
++use evm2_cli::reference;
++use evm2_eest::StateTestSuite;
++use revm::{
++    ExecuteEvm, MainBuilder, MainContext,
++    context::{BlockEnv as RevmBlockEnv, CfgEnv, Context},
++    database::{CacheDB, EmptyDB, InMemoryDB as RevmInMemoryDB},
++    statetest_types::{TestSuite as RevmSuite, TestUnit as RevmUnit},
++};
++use std::{
++    env, fs,
++    hint::black_box,
++    sync::Arc,
++    time::{Duration, Instant},
++};
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Engine {
++    Evm2,
++    Revm,
++}
++
++/// Gas used, success, and logs hash of one execution.
++struct Checked {
++    gas: u64,
++    success: bool,
++    logs: B256,
++}
++
++fn main() {
++    let mut engine = Engine::Evm2;
++    let mut target = Duration::from_millis(20);
++    let mut files = Vec::new();
++    let mut args = env::args().skip(1);
++    while let Some(arg) = args.next() {
++        match arg.as_str() {
++            "--engine" => {
++                engine = match args.next().as_deref() {
++                    Some("evm2") => Engine::Evm2,
++                    Some("revm") => Engine::Revm,
++                    other => panic!("unknown engine {other:?}"),
++                }
++            }
++            "--target-ms" => {
++                let ms = args.next().and_then(|v| v.parse().ok()).expect("--target-ms <ms>");
++                target = Duration::from_millis(ms);
++            }
++            // `cargo bench` passes `--bench`.
++            "--bench" => {}
++            _ => files.push(arg),
++        }
++    }
++    assert!(!files.is_empty(), "usage: nf [--engine evm2|revm] [--target-ms <ms>] <file>...");
++    for file in files {
++        // The fixture loader resolves paths against the workspace; absolute paths pass through.
++        let absolute = fs::canonicalize(&file).unwrap_or_else(|e| panic!("{file}: {e}"));
++        let path: &'static str = Box::leak(absolute.display().to_string().into_boxed_str());
++        let input = fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
++        let suite: StateTestSuite = serde_json::from_str(&input).expect("state test fixture");
++        let suites = fixture::Suites::load([path]);
++        for (name, unit) in &suite.0 {
++            let (fork, posts) = unit.post.iter().next().expect("fixture has a post state");
++            let spec = fork.to_state_spec_id().expect("supported fork");
++            let expected_logs = posts[0].logs;
++            let (checked, mean) = match engine {
++                Engine::Evm2 => bench_evm2(suites.get(path).case(name, spec), spec, target),
++                Engine::Revm => bench_revm(&input, name, spec, target),
++            };
++            let ok = checked.success && checked.logs == expected_logs;
++            println!(
++                "BENCH case={name} iterations={} gas={} exec_ns={} total_ns={} ok={}",
++                mean.iterations,
++                checked.gas,
++                mean.ns,
++                mean.ns,
++                u8::from(ok)
++            );
++        }
++    }
++}
++
++struct Mean {
++    iterations: u64,
++    ns: u64,
++}
++
++/// Warm up for `target`, then run until the timed total reaches `target`. `iteration` resets,
++/// runs one timed transaction, and returns its time.
++fn measure(target: Duration, mut iteration: impl FnMut() -> Duration) -> Mean {
++    let warm_up = Instant::now();
++    while warm_up.elapsed() < target {
++        iteration();
++    }
++    let mut timed = Duration::ZERO;
++    let mut iterations = 0u64;
++    while timed < target || iterations < 2 {
++        timed += iteration();
++        iterations += 1;
++    }
++    Mean { iterations, ns: (timed.as_nanos() / u128::from(iterations)) as u64 }
++}
++
++fn logs_hash(logs: &[Log]) -> B256 {
++    let mut out = Vec::with_capacity(alloy_rlp::list_length(logs));
++    alloy_rlp::encode_list(logs, &mut out);
++    keccak256(out)
++}
++
++type Evm2 = Evm<'static, BaseEvmTypes>;
++
++fn bench_evm2(case: fixture::Case<'_>, spec: SpecId, target: Duration) -> (Checked, Mean) {
++    let block = case.block();
++    let db = case.state();
++    let tx = case.tx();
++    let new_evm = || {
++        Evm2::new(spec, block, ethereum_tx_registry(spec), db.clone(), Precompiles::base(spec))
++    };
++    let result = new_evm().transact(&tx).map(ExecutedTx::commit).expect("evm2 executes");
++    let checked = Checked {
++        gas: result.tx_gas_used(),
++        success: result.is_success(),
++        logs: logs_hash(&result.logs),
++    };
++    let mut evm = new_evm();
++    let mean = measure(target, || {
++        evm.set_database(db.clone());
++        let start = Instant::now();
++        let result = black_box(evm.transact(&tx).map(ExecutedTx::commit));
++        let elapsed = start.elapsed();
++        drop(result);
++        elapsed
++    });
++    (checked, mean)
++}
++
++type RevmDb = CacheDB<Arc<RevmInMemoryDB>>;
++
++fn bench_revm(input: &str, name: &str, spec: SpecId, target: Duration) -> (Checked, Mean) {
++    let mut suite: RevmSuite = serde_json::from_str(input).expect("revm state test fixture");
++    let mut unit = suite.0.remove(name).expect("case in fixture");
++    let reference_spec = reference::spec_id(spec);
++    let test = unit
++        .post
++        .iter_mut()
++        .find(|(spec_name, _)| spec_name.to_spec_id() == reference_spec)
++        .map(|(_, tests)| tests.remove(0))
++        .expect("revm post test");
++    let tx = test.tx_env(&unit).expect("revm transaction");
++    let mut cfg = CfgEnv::new();
++    cfg.set_spec_and_mainnet_gas_params(reference_spec);
++    cfg = cfg.disable_tx_chain_id_check();
++    cfg.chain_id = unit.env.current_chain_id.map(|id| id.to()).unwrap_or_default();
++    let block: RevmBlockEnv = unit.block_env(&mut cfg);
++    let db = Arc::new(revm_database(&unit));
++    let new_evm = || {
++        Context::mainnet()
++            .with_cfg(cfg.clone())
++            .with_block(block.clone())
++            .with_db(RevmDb::new(Arc::clone(&db)))
++            .build_mainnet()
++    };
++    let result = new_evm().transact(tx.clone()).expect("revm executes").result;
++    let checked = Checked {
++        gas: result.tx_gas_used(),
++        success: result.is_success(),
++        logs: logs_hash(result.logs()),
++    };
++    let mut evm = new_evm();
++    let mean = measure(target, || {
++        evm.ctx.journaled_state.database = RevmDb::new(Arc::clone(&db));
++        let tx = tx.clone();
++        let start = Instant::now();
++        let result = black_box(evm.transact(tx));
++        let elapsed = start.elapsed();
++        drop(result);
++        elapsed
++    });
++    (checked, mean)
++}
++
++fn revm_database(unit: &RevmUnit) -> RevmInMemoryDB {
++    let mut db = RevmInMemoryDB::new(EmptyDB::new());
++    for (address, account) in &unit.pre {
++        let code = revm::state::Bytecode::new_raw_checked(account.code.clone())
++            .unwrap_or_else(|_| revm::state::Bytecode::new_legacy(account.code.clone()));
++        // Analyze once, outside the timed region, as the evm2 side does.
++        let _ = code.legacy_jump_table();
++        let mut info = revm::state::AccountInfo {
++            balance: account.balance,
++            nonce: account.nonce,
++            code: Some(code),
++            ..Default::default()
++        };
++        db.insert_contract(&mut info);
++        db.insert_account_info(*address, info);
++        for (key, value) in &account.storage {
++            db.insert_account_storage(*address, *key, *value).expect("revm storage");
++        }
++    }
++    db
++}

@@ -1,15 +1,26 @@
-//! `zig build statetest -- <file-or-dir> [--fork Cancun] [--filter name] [--quiet]`
+//! `zig build statetest -- <file-or-dir>... [--fork Cancun] [--filter name] [--quiet]
+//!     [--bench [--target-ms <ms>]]`
 //!
 //! Runs ethereum/tests GeneralStateTests fixtures (fetch with `just vectors`) and prints
-//! failures plus a pass-rate summary. Exits non-zero if any case fails.
+//! failures plus a pass-rate summary. Exits non-zero if any case fails. `--bench` times every
+//! case instead and prints `BENCH` lines (`state_test_bench.zig`, `etc/bench/evm2.sh`).
 
 const std = @import("std");
 const base = @import("base");
 const evm = base.execution.evm;
 const state_test = evm.state_test;
 const Io = std.Io;
+const assert = std.debug.assert;
+const bench = @import("state_test_bench.zig");
 
-const Context = struct { quiet: bool, verbose: bool = false, path: []const u8 = "" };
+const Context = struct {
+    quiet: bool,
+    verbose: bool = false,
+    path: []const u8 = "",
+    /// `--bench`: target time per case and phase, and where `BENCH` lines go.
+    bench_target_ns: ?u64 = null,
+    out: ?*Io.Writer = null,
+};
 
 fn report(context_opaque: *anyopaque, failure: state_test.Failure) void {
     const context: *Context = @ptrCast(@alignCast(context_opaque));
@@ -30,26 +41,16 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        std.debug.print("usage: statetest <file-or-dir> [--fork F] [--filter S] [--quiet]\n", .{});
+        std.debug.print("usage: statetest <file-or-dir>... [--fork F] [--filter S] [--quiet]" ++
+            " [--bench [--target-ms <ms>]]\n", .{});
         return 2;
     }
-    var options = state_test.Options{};
     var context = Context{ .quiet = false };
-    var index: usize = 2;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--quiet")) {
-            context.quiet = true;
-        } else if (std.mem.eql(u8, arg, "--verbose")) {
-            context.verbose = true;
-        } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--fork")) {
-            index += 1;
-            options.fork = evm.Fork.from_test_name(args[index]) orelse return 2;
-        } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--filter")) {
-            index += 1;
-            options.name_filter = args[index];
-        }
-    }
+    const arguments = try parse_arguments(init.arena.allocator(), args[1..], &context) orelse
+        return 2;
+    var out_buffer: [4096]u8 = undefined;
+    var out_writer = Io.File.stdout().writer(io, &out_buffer);
+    context.out = &out_writer.interface;
     var database = evm.MemoryDatabase.init(gpa);
     defer database.deinit();
     // Pre-Osaka fixtures run up to 120M gas in one transaction: ~1.2M TSTOREs at 100 gas.
@@ -71,12 +72,60 @@ pub fn main(init: std.process.Init) !u8 {
         .on_failure = report,
         .context = &context,
     };
-    const summary = try run_path(io, gpa, &runner, &context, args[1], options);
+    var summary = state_test.Summary{};
+    for (arguments.paths) |path| {
+        summary.add(try run_path(io, gpa, &runner, &context, path, arguments.options));
+    }
+    if (context.bench_target_ns != null) return if (summary.failed == 0) 0 else 1;
     const total = summary.passed + summary.failed;
     std.debug.print("statetest: passed={d} total={d} failed={d} skipped_forks={d}\n", .{
         summary.passed, total, summary.failed, summary.skipped,
     });
     return if (summary.failed == 0) 0 else 1;
+}
+
+const Arguments = struct { paths: []const []const u8, options: state_test.Options };
+
+/// Flags go to `context` and the returned options; null on a usage error.
+fn parse_arguments(
+    arena: std.mem.Allocator,
+    args: []const []const u8,
+    context: *Context,
+) !?Arguments {
+    const paths = try arena.alloc([]const u8, args.len);
+    var paths_len: usize = 0;
+    var options = state_test.Options{};
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--quiet")) {
+            context.quiet = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            context.verbose = true;
+        } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--fork")) {
+            index += 1;
+            options.fork = evm.Fork.from_test_name(args[index]) orelse return null;
+        } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--filter")) {
+            index += 1;
+            options.name_filter = args[index];
+        } else if (std.mem.eql(u8, arg, "--bench")) {
+            context.bench_target_ns = context.bench_target_ns orelse 20 * std.time.ns_per_ms;
+        } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--target-ms")) {
+            index += 1;
+            const target_ms = try std.fmt.parseInt(u64, args[index], 10);
+            if (target_ms == 0) return null;
+            context.bench_target_ns = target_ms * std.time.ns_per_ms;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("unknown option: {s}\n", .{arg});
+            return null;
+        } else {
+            paths[paths_len] = arg;
+            paths_len += 1;
+        }
+    }
+    if (paths_len == 0) return null;
+    assert(paths_len <= args.len);
+    return .{ .paths = paths[0..paths_len], .options = options };
 }
 
 fn run_path(
@@ -116,6 +165,13 @@ fn run_one(
     defer gpa.free(bytes);
     context.path = path;
     if (context.verbose) std.debug.print("RUN {s}\n", .{path});
+    if (context.bench_target_ns) |target_ns| {
+        bench.bench_file(io, context.out.?, gpa, runner, bytes, target_ns) catch |err| {
+            std.debug.print("ERROR {s}: {t}\n", .{ path, err });
+            return .{ .failed = 1 };
+        };
+        return .{};
+    }
     return state_test.run_file(runner, gpa, bytes, options) catch |err| {
         std.debug.print("ERROR {s}: {t}\n", .{ path, err });
         return .{ .failed = 1 };

@@ -75,6 +75,9 @@ pub fn build(b: *std.Build) void {
     });
 
     const statetest = add_vector_tools(b, base, target, optimize);
+    // `etc/bench/evm2.sh` installs the state-test runner (`statetest --bench`) per build mode.
+    const bench_tools = b.step("bench-tools", "Install the benchmark tools (statetest)");
+    bench_tools.dependOn(&b.addInstallArtifact(statetest, .{}).step);
     // Compile (not run) the state-test runner on every `zig build test`: it is the EVM's
     // conformance oracle, and cross-lane API changes once broke it unnoticed.
     test_step.dependOn(&statetest.step);

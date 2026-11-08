@@ -85,7 +85,7 @@ pub fn run_file(
     return summary;
 }
 
-const Case = struct { name: []const u8, fixture: Value };
+pub const Case = struct { name: []const u8, fixture: Value };
 
 fn run_test(runner: *Runner, arena: std.mem.Allocator, case: Case, options: Options) Error!Summary {
     var summary = Summary{};
@@ -122,7 +122,7 @@ pub fn field(value: Value, name: []const u8) ?Value {
     return value.object.get(name);
 }
 
-fn parse_index(expected: Value) Error!Index {
+pub fn parse_index(expected: Value) Error!Index {
     const indexes = field(expected, "indexes") orelse return error.InvalidFixture;
     return .{
         .data = try parse_usize(field(indexes, "data")),
@@ -199,7 +199,7 @@ fn array_item(value: ?Value, index: usize) Error!Value {
 
 // ------------------------------------------------------------------ case setup
 
-fn load_pre(database: *MemoryDatabase, arena: std.mem.Allocator, pre: Value) Error!void {
+pub fn load_pre(database: *MemoryDatabase, arena: std.mem.Allocator, pre: Value) Error!void {
     if (pre != .object) return error.InvalidFixture;
     var accounts = pre.object.iterator();
     while (accounts.next()) |entry| {
@@ -219,7 +219,7 @@ fn load_pre(database: *MemoryDatabase, arena: std.mem.Allocator, pre: Value) Err
     }
 }
 
-fn block_env(fork: Fork, fixture: Value) Error!env.BlockEnv {
+pub fn block_env(fork: Fork, fixture: Value) Error!env.BlockEnv {
     const block = field(fixture, "env") orelse return error.InvalidFixture;
     const random = field(block, "currentRandom");
     const excess_blob_gas: u64 = @intCast(try u256_field_or(block, "currentExcessBlobGas", 0));
@@ -298,7 +298,7 @@ pub fn authorization_list(
     return items;
 }
 
-fn tx_env(arena: std.mem.Allocator, fixture: Value, index: Index) Error!transaction.TxEnv {
+pub fn tx_env(arena: std.mem.Allocator, fixture: Value, index: Index) Error!transaction.TxEnv {
     const tx = field(fixture, "transaction") orelse return error.InvalidFixture;
     const to_text = try string_of(field(tx, "to"));
     var result = transaction.TxEnv{
@@ -341,7 +341,8 @@ fn tx_env(arena: std.mem.Allocator, fixture: Value, index: Index) Error!transact
 
 // ------------------------------------------------------------------ execution
 
-fn run_case(
+/// Runs one (fork, post index) of a case; null when the post state and logs match.
+pub fn run_case(
     runner: *Runner,
     arena: std.mem.Allocator,
     case: Case,
@@ -356,7 +357,9 @@ fn run_case(
     evm.block = try block_env(fork, case.fixture);
     const tx = try tx_env(arena, case.fixture, try parse_index(expected));
     const result = try transaction.transact(evm, fork, &tx);
-    const expects_exception = field(expected, "expectException") != null;
+    // evm2's fixtures write `"expectException": null` for a valid transaction.
+    const exception = field(expected, "expectException");
+    const expects_exception = exception != null and exception.? != .null;
     var logs: []const state_module.Log = &.{};
     switch (result) {
         .invalid => |invalid| if (!expects_exception) {
@@ -538,4 +541,16 @@ test "state_test: an EEST EIP-7702 fixture (delegation to a precompile) passes e
     const summary = try run_file(&runner, std.testing.allocator, fixture, .{});
     try std.testing.expectEqual(@as(u32, 1), summary.passed);
     try std.testing.expectEqual(@as(u32, 0), summary.failed);
+    // evm2's fixtures (`data/*.json`) mark a valid transaction `"expectException": null`.
+    const with_null = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        fixture,
+        "\"indexes\"",
+        "\"expectException\": null, \"indexes\"",
+    );
+    defer std.testing.allocator.free(with_null);
+    const null_summary = try run_file(&runner, std.testing.allocator, with_null, .{});
+    try std.testing.expectEqual(@as(u32, 1), null_summary.passed);
+    try std.testing.expectEqual(@as(u32, 0), null_summary.failed);
 }

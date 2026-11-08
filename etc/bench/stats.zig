@@ -16,11 +16,18 @@
 //! every (block, pass) sample, nearest rank. Confidence intervals resample whole passes with
 //! replacement (10,000 resamples, fixed seed, so the output is deterministic).
 //! `--pair a/b` adds the speedup of `a` over `b`: b's median window time over a's.
+//!
+//! `--cases` reads per-case lines instead (`etc/bench/evm2.sh`: one transaction per state-test
+//! case, `case=<name>`, `exec_ns` the mean time of one transaction in one process) and prints
+//! one row per case: every configuration's median over processes and, per `--pair`, the
+//! speedup with a 95% bootstrap interval over processes, plus the geometric mean of the
+//! speedups. Every configuration must report the same gas for a case (the same work).
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-const configs_max = 64;
+/// Configurations, and separately cases (`--cases`).
+const configs_max = 1024;
 const passes_max = 4096;
 const samples_max = 1 << 23;
 const pairs_max = 32;
@@ -38,6 +45,8 @@ const Phase = enum(u8) { pre, recover, post, receipts, commit, root };
 
 const Sample = struct {
     config: u16,
+    /// Index into the case names (`--cases` input), or `no_case`.
+    case: u16 = no_case,
     mode: Mode,
     iteration: u32,
     run: u32,
@@ -48,6 +57,8 @@ const Sample = struct {
     phases: [phase_names.len]?u64,
 };
 
+const no_case = std.math.maxInt(u16);
+
 const Pass = struct { gas: u64 = 0, exec_ns: u64 = 0, total_ns: u64 = 0 };
 
 pub fn main(init: std.process.Init) !void {
@@ -55,8 +66,14 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(gpa);
     var pairs: [pairs_max][2][]const u8 = undefined;
     var pairs_len: u32 = 0;
+    var by_case = false;
     var index: usize = 1;
     while (index < args.len) : (index += 2) {
+        if (std.mem.eql(u8, args[index], "--cases")) {
+            by_case = true;
+            index -= 1;
+            continue;
+        }
         if (!std.mem.eql(u8, args[index], "--pair") or index + 1 == args.len) {
             return error.InvalidArguments;
         }
@@ -71,11 +88,18 @@ pub fn main(init: std.process.Init) !void {
     const input = try reader.interface.allocRemaining(gpa, .limited(input_bytes_max));
     var names: std.ArrayList([]const u8) = .empty;
     var samples: std.ArrayList(Sample) = .empty;
-    try parse(gpa, input, &names, &samples);
+    var cases: std.ArrayList([]const u8) = .empty;
+    try parse(gpa, input, &names, &cases, &samples);
     if (samples.items.len == 0) return error.NoSamples;
     var out_buffer: [1 << 14]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &out_buffer);
     const out = &writer.interface;
+    if (by_case) {
+        const data: CaseData = .{ .names = names.items, .cases = cases.items };
+        try print_cases(gpa, out, data, samples.items, pairs[0..pairs_len]);
+        try out.flush();
+        return;
+    }
     try print_timings(gpa, out, names.items, samples.items);
     try print_phases(out, names.items, samples.items);
     try print_pairs(gpa, out, names.items, samples.items, pairs[0..pairs_len]);
@@ -86,6 +110,7 @@ fn parse(
     gpa: std.mem.Allocator,
     input: []const u8,
     names: *std.ArrayList([]const u8),
+    cases: *std.ArrayList([]const u8),
     samples: *std.ArrayList(Sample),
 ) !void {
     var lines = std.mem.tokenizeScalar(u8, input, '\n');
@@ -113,6 +138,8 @@ fn parse(
                 config = value;
             } else if (std.mem.eql(u8, key, "mode")) {
                 sample.mode = std.meta.stringToEnum(Mode, value) orelse return error.BadMode;
+            } else if (std.mem.eql(u8, key, "case")) {
+                sample.case = try intern(gpa, cases, value);
             } else if (std.mem.eql(u8, key, "ok")) {
                 ok = std.mem.eql(u8, value, "1");
             } else {
@@ -153,7 +180,7 @@ fn intern(gpa: std.mem.Allocator, names: *std.ArrayList([]const u8), name: []con
     for (names.items, 0..) |known, index| {
         if (std.mem.eql(u8, known, name)) return @intCast(index);
     }
-    if (names.items.len == configs_max) return error.TooManyConfigs;
+    if (names.items.len == configs_max) return error.TooManyNames;
     try names.append(gpa, name);
     assert(names.items.len <= configs_max);
     return @intCast(names.items.len - 1);
@@ -440,4 +467,103 @@ fn window_times(gpa: std.mem.Allocator, passes: []const Pass, total: bool) ![]u6
     for (passes, values) |pass, *value| value.* = if (total) pass.total_ns else pass.exec_ns;
     assert(values.len == passes.len);
     return values;
+}
+
+const CaseData = struct { names: []const []const u8, cases: []const []const u8 };
+
+/// `--cases`: one row per case, columns per configuration (median µs per transaction) and
+/// per pair (speedup of a over b), then the geometric mean of each pair's speedups.
+fn print_cases(
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    data: CaseData,
+    samples: []const Sample,
+    pairs: []const [2][]const u8,
+) !void {
+    var pair_configs: [pairs_max][2]u16 = undefined;
+    for (pairs, 0..) |pair, index| {
+        pair_configs[index] = .{
+            index_of(data.names, pair[0]) orelse return error.UnknownConfig,
+            index_of(data.names, pair[1]) orelse return error.UnknownConfig,
+        };
+    }
+    try out.print("| case | gas |", .{});
+    for (data.names) |name| try out.print(" {s} µs |", .{name});
+    for (pairs) |pair| try out.print(" {s} vs {s} |", .{ pair[0], pair[1] });
+    try out.print("\n| --- | ---: |", .{});
+    for (0..data.names.len + pairs.len) |_| try out.print(" ---: |", .{});
+    try out.print("\n", .{});
+    var log_sums: [pairs_max]f64 = @splat(0);
+    var log_counts: [pairs_max]u32 = @splat(0);
+    for (data.cases, 0..) |case_name, case| {
+        const gas = try case_gas(samples, @intCast(case), case_name, data.names);
+        try out.print("| {s} | {d} |", .{ case_name, gas });
+        for (data.names, 0..) |_, config| {
+            const values = try case_times(gpa, samples, @intCast(case), @intCast(config));
+            if (values.len == 0) {
+                try out.print(" |", .{});
+            } else {
+                try out.print(" {d:.3} |", .{median_of(values) / 1e3});
+            }
+        }
+        for (pair_configs[0..pairs.len], 0..) |pair, index| {
+            const a = try case_times(gpa, samples, @intCast(case), pair[0]);
+            const b = try case_times(gpa, samples, @intCast(case), pair[1]);
+            if (a.len == 0 or b.len == 0) {
+                try out.print(" |", .{});
+                continue;
+            }
+            const ci = try bootstrap_median(gpa, a, b);
+            try out.print(" {d:.2}x ({d:.2}-{d:.2}) |", .{ ci.median, ci.low, ci.high });
+            log_sums[index] += @log(ci.median);
+            log_counts[index] += 1;
+        }
+        try out.print("\n", .{});
+    }
+    try out.print("| geometric mean | |", .{});
+    for (data.names) |_| try out.print(" |", .{});
+    for (log_sums[0..pairs.len], log_counts[0..pairs.len]) |sum, count| {
+        if (count == 0) {
+            try out.print(" |", .{});
+        } else {
+            try out.print(" {d:.2}x |", .{@exp(sum / @as(f64, @floatFromInt(count)))});
+        }
+    }
+    try out.print("\n\n", .{});
+}
+
+/// The gas every configuration reports for `case`; different gas means different work.
+fn case_gas(
+    samples: []const Sample,
+    case: u16,
+    case_name: []const u8,
+    names: []const []const u8,
+) !u64 {
+    var gas: ?u64 = null;
+    var first: u16 = 0;
+    for (samples) |sample| {
+        if (sample.case != case) continue;
+        if (gas) |known| {
+            if (known != sample.gas) {
+                std.debug.print("gas mismatch on {s}: {s} {d}, {s} {d}\n", .{
+                    case_name, names[first], known, names[sample.config], sample.gas,
+                });
+                return error.GasMismatch;
+            }
+        } else {
+            gas = sample.gas;
+            first = sample.config;
+        }
+    }
+    return gas orelse error.NoSamples;
+}
+
+fn case_times(gpa: std.mem.Allocator, samples: []const Sample, case: u16, config: u16) ![]u64 {
+    var values: std.ArrayList(u64) = .empty;
+    for (samples) |sample| {
+        if (sample.case == case and sample.config == config) {
+            try values.append(gpa, sample.exec_ns);
+        }
+    }
+    return values.items;
 }
