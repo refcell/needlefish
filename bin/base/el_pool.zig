@@ -42,6 +42,8 @@ const failure_cooldown_ms_max = 60_000;
 /// The consumer gives up after this long without a segment while peers exist.
 const stall_ms_max = 300_000;
 const wait_ms = 100;
+/// An idle connection makes a request at least this often, so that its pings get answered.
+const keepalive_ms = 10_000;
 /// Per segment: headers are ~700 bytes each. Bodies vary widely: some Base Sepolia ranges
 /// hold over 20 MiB per 128 blocks. Only the touched part of each buffer becomes resident.
 const segment_headers_bytes = 1 << 20;
@@ -81,6 +83,9 @@ pub const Worker = struct {
     rejected: u32 = 0,
     hedges: u32 = 0,
     cooldown_until_ms: i64 = 0,
+    /// When the worker last finished a request on its connection.
+    last_request_ms: i64 = 0,
+    keepalives: u32 = 0,
 
     /// Blocks per second while fetching (0 before the first segment).
     pub fn rate(worker: *const Worker) u64 {
@@ -89,7 +94,7 @@ pub const Worker = struct {
     }
 };
 
-const Job = struct { segment: u64, generation: u64, first: u64 };
+const Job = struct { segment: u64, generation: u64, first: u64, keepalive: bool = false };
 
 pub const Options = struct {
     from: u64,
@@ -379,6 +384,12 @@ pub const Pool = struct {
                     return job;
                 }
             }
+            if (worker.peer.connected and now - worker.last_request_ms >= keepalive_ms) {
+                worker.busy = true;
+                var job = pool.make_job(pool.base_segment);
+                job.keepalive = true;
+                return job;
+            }
             pool.condition.waitTimeout(pool.io, &pool.mutex, .{ .duration = .{
                 .raw = .fromMilliseconds(wait_ms * 2),
                 .clock = .awake,
@@ -432,7 +443,9 @@ pub const Pool = struct {
         defer pool.mutex.unlock(pool.io);
         defer pool.condition.broadcast(pool.io);
         assert(worker.busy);
+        assert(!job.keepalive);
         worker.busy = false;
+        worker.last_request_ms = pool.now_ms();
         const slot = &pool.slots[job.segment % pool.window];
         const current = job.generation == pool.generation and slot.segment == job.segment;
         if (current) slot.fetchers -|= 1;
@@ -466,6 +479,16 @@ pub const Pool = struct {
         slot.fetched_by = worker.index;
         worker.segments += 1;
         worker.blocks += count;
+    }
+
+    fn finish_keepalive(pool: *Pool, worker: *Worker) void {
+        pool.mutex.lockUncancelable(pool.io);
+        defer pool.mutex.unlock(pool.io);
+        defer pool.condition.broadcast(pool.io);
+        assert(worker.busy);
+        worker.busy = false;
+        worker.last_request_ms = pool.now_ms();
+        worker.keepalives += 1;
     }
 
     /// Lends the open connection of the fastest idle peer: swaps it with `peer` (an
@@ -506,10 +529,10 @@ pub const Pool = struct {
         defer pool.mutex.unlock(pool.io);
         for (pool.workers[0..pool.worker_count]) |worker| {
             std.debug.print("  peer {s}: {d} blocks, {d} blocks/s fetching, {d} failures, " ++
-                "{d} behind, {d} rejected, {d} hedges, connected {}\n", .{
-                worker.label,    worker.blocks,         worker.rate(),
-                worker.failures, worker.behind,         worker.rejected,
-                worker.hedges,   worker.peer.connected,
+                "{d} behind, {d} rejected, {d} hedges, {d} keepalives, connected {}\n", .{
+                worker.label,    worker.blocks,     worker.rate(),
+                worker.failures, worker.behind,     worker.rejected,
+                worker.hedges,   worker.keepalives, worker.peer.connected,
             });
         }
     }
@@ -544,6 +567,11 @@ fn alloc_batch(allocator: std.mem.Allocator) !el_source.Batch {
 fn work(worker: *Worker) void {
     const pool = worker.pool;
     while (pool.take(worker)) |job| {
+        if (job.keepalive) {
+            worker.peer.keepalive(job.first) catch worker.peer.close();
+            pool.finish_keepalive(worker);
+            continue;
+        }
         const started = pool.now_ms();
         const result = fetch_segment(worker, job.first);
         const elapsed: u64 = @intCast(@max(pool.now_ms() - started, 1));

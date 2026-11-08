@@ -147,7 +147,11 @@ the same fetch path. The demo counts it as a failure; it does not skip or re-anc
   consumer hands blocks out in order and checks the parent link across segments: a
   segment that does not link is refetched and its peer cooled down. Failing peers cool
   down 1 to 60 s, peers that answer short (behind) 15 s. The pool stops 256 blocks short
-  of the tip, estimated from the block schedule.
+  of the tip, estimated from the block schedule. When execution is the limit, the window
+  is full and workers idle without reading their sockets; peers then dropped them for
+  unanswered pings (disconnect reason 11, 8 drops in 180 s behind a 110 blocks/s
+  consumer). An idle connection now makes a one-header request every 10 s, which answers
+  pending pings: the same run had no reason-11 drops.
 - `bin/base/el_feed.zig`, `Feed`: the pool until it stops short of the tip, then a
   `Source` on the fastest peer's open connection (lent from its worker: peers refuse
   quick reconnects); back to the pool if the follower fails or falls 512 blocks behind.

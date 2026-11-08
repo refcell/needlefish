@@ -614,6 +614,20 @@ pub const Peer = struct {
         return status;
     }
 
+    /// Keeps an idle connection alive: one header request, during which `receive` answers
+    /// any ping the peer sent meanwhile (a peer drops a connection whose pings go
+    /// unanswered, disconnect reason 11).
+    pub fn keepalive(peer: *Peer, number: u64) !void {
+        assert(peer.connected);
+        var request: [64]u8 = undefined;
+        peer.request_id += 1;
+        const id = peer.request_id;
+        const message = try eth.encode_get_block_headers(&request, id, .{ .number = number }, 1);
+        try peer.send(.get_block_headers, message, true);
+        const response = try eth.decode_response(try peer.expect(.block_headers));
+        if (response.request_id != id) return error.UnexpectedResponse;
+    }
+
     /// The block number of the peer's head, from its Status head hash.
     pub fn head_number(peer: *Peer, head: [32]u8) !u64 {
         var request: [64]u8 = undefined;

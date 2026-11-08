@@ -19,7 +19,8 @@
 //! peer at once (`el_pool.zig`) up to a few hundred blocks below the tip, then one peer
 //! following the tip, from `--from <block>` for `--count` blocks or `--duration` seconds.
 //! It reports the download rate and, once at the tip, the lag: blocks are checked and
-//! linked, not executed.
+//! linked, not executed. `--consume-us <n>` makes the consumer spend `n` microseconds per
+//! block, standing in for execution, to see how the pool behaves behind a slower consumer.
 
 const std = @import("std");
 const base = @import("base");
@@ -37,7 +38,8 @@ const usage =
     \\                     [--parent <hash>] [--follow] [--duration <s>] [--verbose] [--trace]
     \\                     [--chain base-sepolia|base-mainnet]
     \\       base el-fetch --peers <file> --from <block> [--count <n>] [--duration <s>]
-    \\                     [--parent <hash>] [--chain base-sepolia|base-mainnet]
+    \\                     [--parent <hash>] [--consume-us <n>]
+    \\                     [--chain base-sepolia|base-mainnet]
     \\
 ;
 
@@ -51,6 +53,7 @@ const Flags = struct {
     verbose: bool = false,
     trace: bool = false,
     duration_s: u64 = 0,
+    consume_us: u64 = 0,
     count: u64 = 1000,
     batch: u32 = 128,
     chain: *const base.common.chains.ChainConfig = &base.common.chains.sepolia,
@@ -80,6 +83,8 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.enode = value;
         } else if (std.mem.eql(u8, name, "--peers")) {
             flags.peers = value;
+        } else if (std.mem.eql(u8, name, "--consume-us")) {
+            flags.consume_us = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--duration")) {
             flags.duration_s = try std.fmt.parseInt(u64, value, 10);
         } else if (std.mem.eql(u8, name, "--from")) {
@@ -237,6 +242,9 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
             continue;
         }
         blocks += 1;
+        if (flags.consume_us > 0) {
+            try io.sleep(.fromMicroseconds(@intCast(flags.consume_us)), .awake);
+        }
         if (feed.at_tip) {
             const now = Io.Clock.real.now(io);
             const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
