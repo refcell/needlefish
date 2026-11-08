@@ -542,7 +542,7 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
         }
         try testing.expect(acknowledged >= head_number + 4);
         checkpoints += harness.disk.db.checkpoints_completed;
-        requested += harness.runner.stats.checkpoints_requested;
+        requested += harness.runner.stats.room.checkpoints_requested;
         harness.runner.destroy(testing.allocator);
         harness.disk.sim.crash();
         try harness.disk.reopen();
@@ -567,7 +567,7 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
         try testing.expect(time.state_root_ns > 0 and time.receipts_root_ns > 0);
         try testing.expect(time.check_ns > 0 and time.journal_ns > 0 and time.room_ns > 0);
         checkpoints += harness.disk.db.checkpoints_completed;
-        requested += harness.runner.stats.checkpoints_requested;
+        requested += harness.runner.stats.room.checkpoints_requested;
     }
     // Beyond the imports' own: the runner made room by checkpoints, before and after a crash.
     try testing.expect(requested >= 6);

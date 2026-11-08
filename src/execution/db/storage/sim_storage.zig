@@ -30,6 +30,8 @@ pub const Options = struct {
     seed: u64,
     latency_ticks_min: u32 = 1,
     latency_ticks_max: u32 = 4,
+    /// Ticks a sync takes beyond the latency (a flush of the device's write cache).
+    sync_latency_ticks_extra: u32 = 0,
     /// Probability that a completed read returns one flipped bit (transient fault).
     read_fault_numerator: u32 = 0,
     read_fault_denominator: u32 = 1000,
@@ -259,8 +261,10 @@ pub const SimStorage = struct {
             self.options.latency_ticks_min,
             self.options.latency_ticks_max,
         );
+        const extra = if (operation == .sync) self.options.sync_latency_ticks_extra else 0;
         completion.operation = operation;
-        completion.tick_ready = self.tick_count + latency;
+        completion.tick_ready = self.tick_count + latency + extra;
+        assert(completion.tick_ready > self.tick_count);
         completion.next = self.pending_head;
         self.pending_head = completion;
         self.pending_count += 1;

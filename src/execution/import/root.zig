@@ -7,6 +7,7 @@
 //! - `hashed_state`: the state root of reth's `HashedAccounts` + `HashedStorages` tables.
 //! - `to_disk`: one pass of that state into a needlefish disk-mode database (bulk loaders).
 //! - `run`: executes blocks N+1.. on that database, checking every header field.
+//! - `room`: waits for journal and admission room before each such block.
 
 const std = @import("std");
 
@@ -17,6 +18,7 @@ pub const reth = @import("reth.zig");
 pub const hashed_state = @import("hashed_state.zig");
 pub const to_disk = @import("to_disk.zig");
 pub const run = @import("run.zig");
+pub const room = @import("room.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -35,6 +35,15 @@
 //! (synchronous, block-cache misses), block-cache hits and misses, DiskState's record and
 //! leaf resolutions and the tree reads they took.
 //!
+//! The filter `db/disk-state:room` runs only the runner's mode (`tx+paths`), with more warm
+//! blocks (`shape_room`), and reports what the room before each block is made of
+//! (`import/room.zig`'s counters: waits, what was short, checkpoints, and the waiting time by
+//! the checkpoint's phase); it keeps the scratch file as `:keep` does.
+//!
+//! The filter `db/disk-state:sim` runs the room mode over SimStorage instead (a small state,
+//! a fixed IO latency per operation and execution time per block, all in storage ticks):
+//! deterministic, and it writes nothing to disk.
+//!
 //! The filter `db/disk-state:keep` keeps the scratch file afterwards and reuses one a previous
 //! run kept (no import), so repeated runs write only their blocks. The driver waits on the
 //! IO backend 50 us before each storage tick (`run_for_ns`), as el-run's does.
@@ -51,6 +60,7 @@ const changeset_module = @import("changeset.zig");
 const overlay_module = @import("overlay.zig");
 const branch_record = @import("branch_record.zig");
 const to_disk = @import("../import/to_disk.zig");
+const room_module = @import("../import/room.zig");
 const hashed_state = @import("../import/hashed_state.zig");
 const SimStorage = @import("storage/sim_storage.zig").SimStorage;
 const IoStorageType = @import("storage/io_storage.zig").IoStorageType;
@@ -122,6 +132,27 @@ pub const shape_bench: Shape = .{
     // 64 MiB over ~4 GB of trees: about the node's cache over the real state, in ratio.
     .cache_blocks = 1024,
 };
+
+/// `shape_bench` with fewer cold and more warm blocks: several checkpoint intervals.
+pub const shape_room: Shape = shape: {
+    var shape = shape_bench;
+    shape.blocks_cold = 10;
+    shape.blocks_warm = 1200;
+    break :shape shape;
+};
+
+/// `shape_test` with several checkpoint intervals of blocks (the `:sim` filter).
+pub const shape_sim: Shape = shape: {
+    var shape = shape_test;
+    shape.blocks_warm = 600;
+    break :shape shape;
+};
+/// The `:sim` filter's IO latency per operation (uniform) and execution per block, in ticks.
+const sim_latency_ticks_min: u32 = 8;
+const sim_latency_ticks_max: u32 = 24;
+/// A sync costs about two blocks (as an fsync under load on the node's disk).
+const sim_sync_ticks_extra: u32 = 200;
+const sim_exec_ticks: u32 = 16;
 
 pub const shape_test: Shape = .{
     .accounts = 3000,
@@ -496,6 +527,82 @@ const Totals = struct {
     }
 };
 
+/// Journal commits: queued (after `commit_applied`) to durable.
+const Commits = struct {
+    count: u64 = 0,
+    latency_ns: u64 = 0,
+    latency_max_ns: u64 = 0,
+    /// Entries queued behind each new one, summed.
+    queue_depth_sum: u64 = 0,
+};
+
+/// How the room and commit times read: wall ms, or SimStorage ticks.
+const Unit = struct { name: []const u8, divisor: f64 };
+const unit_ms: Unit = .{ .name = "ms", .divisor = 1e6 };
+const unit_ticks: Unit = .{ .name = "ticks", .divisor = 1 };
+
+fn in_unit(value: u64, count: f64, unit: Unit) f64 {
+    assert(count > 0 and unit.divisor > 0);
+    return @as(f64, @floatFromInt(value)) / unit.divisor / count;
+}
+
+/// Room over every block of a mode (`room.zig`'s counters, `after` minus `before`).
+fn report_room(
+    after: *const room_module.Stats,
+    before: *const room_module.Stats,
+    blocks_count: u64,
+    checkpoints: u64,
+    unit: Unit,
+) void {
+    assert(blocks_count > 0);
+    assert(after.calls >= before.calls + blocks_count);
+    const blocks: f64 = @floatFromInt(blocks_count);
+    var room_ns: u64 = 0;
+    for (after.phase_ns, before.phase_ns) |a, b| room_ns += a - b;
+    std.debug.print(
+        "  room (all {d} blocks) {d:.3} {s}/block [drain {d:.3} prepare {d:.3} " ++
+            "write {d:.3} superblock {d:.3} other {d:.3}]; waits {d} (queue {d}, journal {d}, " ++
+            "admission {d}, start {d}), ticks {d:.1}/block, checkpoints requested {d} " ++
+            "(ahead {d}) started {d} completed {d}\n",
+        .{
+            blocks_count,
+            in_unit(room_ns, blocks, unit),
+            unit.name,
+            in_unit(after.ns(.drain) - before.ns(.drain), blocks, unit),
+            in_unit(after.ns(.prepare) - before.ns(.prepare), blocks, unit),
+            in_unit(after.ns(.write) - before.ns(.write), blocks, unit),
+            in_unit(after.ns(.superblock) - before.ns(.superblock), blocks, unit),
+            in_unit(after.ns(.other) - before.ns(.other), blocks, unit),
+            after.waits - before.waits,
+            after.short_queue - before.short_queue,
+            after.short_journal - before.short_journal,
+            after.short_admission - before.short_admission,
+            after.start_waits - before.start_waits,
+            per(after.ticks - before.ticks, blocks),
+            after.checkpoints_requested - before.checkpoints_requested,
+            after.checkpoints_ahead - before.checkpoints_ahead,
+            after.checkpoints_started - before.checkpoints_started,
+            checkpoints,
+        },
+    );
+}
+
+/// Journal commits of a mode: queued to durable, and the syncs they and the rest took.
+fn report_commits(commits: *const Commits, blocks_count: u64, syncs: u64, unit: Unit) void {
+    assert(blocks_count > 0);
+    assert(commits.latency_max_ns <= commits.latency_ns);
+    std.debug.print("  journal commits {d}: latency mean {d:.3} {s} max {d:.1}, " ++
+        "queued {d:.2} on average; syncs {d} ({d:.2}/block)\n", .{
+        commits.count,
+        in_unit(commits.latency_ns, @floatFromInt(@max(1, commits.count)), unit),
+        unit.name,
+        in_unit(commits.latency_max_ns, 1, unit),
+        per(commits.queue_depth_sum, @floatFromInt(blocks_count)),
+        syncs,
+        per(syncs, @floatFromInt(blocks_count)),
+    });
+}
+
 fn ms(ns: u64, count: f64) f64 {
     assert(count > 0);
     return @as(f64, @floatFromInt(ns)) / 1e6 / count;
@@ -513,6 +620,7 @@ const Touch = struct { index: u64, slot: ?u256 = null, value: u256 = 0, write: b
 /// What a block's prefetch names (see the file comment).
 const Hint = enum { none, tx, all };
 const Mode = struct { hint: Hint, paths: bool };
+const modes_room = [_]Mode{.{ .hint = .tx, .paths = true }};
 const modes = [_]Mode{
     .{ .hint = .none, .paths = false },
     .{ .hint = .tx, .paths = false },
@@ -526,6 +634,7 @@ fn RunType(comptime Storage: type) type {
         const Run = @This();
         const Importer = to_disk.ImporterType(Storage);
         const Database = Importer.Database;
+        const Room = room_module.RoomType(Database);
 
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -534,6 +643,14 @@ fn RunType(comptime Storage: type) type {
         /// Drops the scratch file from the OS page cache; null on `SimStorage`.
         drop: ?Drop,
         mode: Mode = modes[0],
+        /// The modes `measure` runs.
+        modes_run: []const Mode = &modes,
+        /// Storage ticks one block's execution takes (SimStorage: IO progresses meanwhile).
+        exec_ticks: u32 = 0,
+        room: room_module.Stats = .{},
+        /// Journal commits: submit time per queued sequence (a ring), and latency totals.
+        submitted_ns: [64]u64 = @splat(0),
+        commits: Commits = .{},
         /// Drop the page cache before every block (the cold blocks).
         drop_each: bool = false,
         shape: Shape,
@@ -604,8 +721,10 @@ fn RunType(comptime Storage: type) type {
             self.driver.tick(self.driver.context);
         }
 
+        /// Wall time; on SimStorage, storage ticks (deterministic).
         fn now_ns(context: *anyopaque) u64 {
             const self: *Run = @ptrCast(@alignCast(context));
+            if (Storage == SimStorage) return self.storage.tick_count;
             return bench.now_ns(self.io);
         }
 
@@ -764,6 +883,7 @@ fn RunType(comptime Storage: type) type {
             sample.reads.prefetch_failed = prefetched.prefetch_failed;
             sample.reads.prefetch_depth_sum = prefetched.prefetch_depth_sum;
             try self.write_block();
+            for (0..self.exec_ticks) |_| self.tick();
             const paths_start_ns = bench.now_ns(self.io);
             self.prefetch_paths();
             sample.paths_ns = bench.now_ns(self.io) - paths_start_ns;
@@ -862,6 +982,8 @@ fn RunType(comptime Storage: type) type {
         /// the next attempt, as `import/run.zig` waits for quiet.
         fn wait_compaction(self: *Run) void {
             const trees = &self.db.flat.?;
+            // No commit grants paced compaction while the driver waits.
+            trees.compact(std.math.maxInt(u64));
             var ticks: u32 = 0;
             while (ticks < to_disk.busy_ticks_max) : (ticks += 1) {
                 self.tick();
@@ -895,26 +1017,19 @@ fn RunType(comptime Storage: type) type {
             });
             assert(committed.sequence > 0);
             assert(std.mem.eql(u8, &self.db.head_info.hash, &hash));
+            self.submitted_ns[committed.sequence % self.submitted_ns.len] = now_ns(self);
+            self.commits.queue_depth_sum += self.db.queue_count;
         }
 
-        fn journal_used(db: *const Database) u64 {
-            const journal_state = &db.engine.journal;
-            assert(journal_state.head >= journal_state.tail);
-            return journal_state.head - journal_state.tail + db.journal_bytes_pending;
-        }
-
-        /// Room for this block's entry and branch writes (`import/run.zig` `make_room`).
-        fn roomy(db: *const Database) bool {
-            const journal_config = db.engine.journal.config;
-            const entry_max = Database.Engine.JournalType.entry_size_max(journal_config);
-            const journal_roomy =
-                journal_used(db) + 2 * entry_max <= journal_config.zone_size_bytes;
-            const disk_config = db.config.disk_state.?;
-            const span = db.disk_writes_closed + db.disk_writes_pending + db.disk_writes_current;
-            const admission_roomy = span + 2 * disk_config.record_writes_max <=
-                disk_config.replay_record_writes_max;
-            const queue_roomy = db.queue_count + 1 <= db.config.queue_entries_max;
-            return queue_roomy and journal_roomy and admission_roomy;
+        fn on_durable(context: ?*anyopaque, sequence: u64) void {
+            const self: *Run = @ptrCast(@alignCast(context.?));
+            const start_ns = self.submitted_ns[sequence % self.submitted_ns.len];
+            if (start_ns == 0) return;
+            const latency_ns = now_ns(self) -| start_ns;
+            self.commits.count += 1;
+            self.commits.latency_ns += latency_ns;
+            self.commits.latency_max_ns = @max(self.commits.latency_max_ns, latency_ns);
+            assert(self.commits.latency_ns >= latency_ns);
         }
 
         /// No checkpoint or IO in flight: the database may close.
@@ -922,27 +1037,20 @@ fn RunType(comptime Storage: type) type {
             return !db.checkpoint_wanted and db.engine.checkpoint_phase == .idle and db.idle();
         }
 
+        /// Room for this block's entry and branch writes, as `import/run.zig` makes it.
         fn make_room(self: *Run) !void {
-            const db = &self.db;
-            var ticks: u32 = 0;
-            while (true) : (ticks += 1) {
-                if (db.phase != .ready) return error.NotReady;
-                if (db.checkpoint_error) |err| return err;
-                const journal_config = db.engine.journal.config;
-                const half = journal_used(db) * 2 > journal_config.zone_size_bytes;
-                const running = db.checkpoint_wanted or db.engine.checkpoint_phase != .idle;
-                if ((half or !roomy(db)) and !running) db.request_checkpoint();
-                if (roomy(db)) break;
-                if (ticks >= to_disk.busy_ticks_max) return error.Stalled;
-                self.tick();
-            }
-            assert(roomy(db));
+            const clock: room_module.Clock = .{ .context = self, .now_ns = now_ns };
+            try Room.make_room(&self.db, self.driver, clock, &self.room);
+            assert(Room.roomy(&self.db));
         }
 
         /// Every hint mode: a reopen, cold blocks, then warm blocks; reports both.
         fn measure(self: *Run, report: bool) !void {
-            for (modes, 0..) |mode, mode_index| {
+            for (self.modes_run, 0..) |mode, mode_index| {
                 try self.reopen();
+                const room_before = self.room;
+                const checkpoints_before = self.db.checkpoints_completed;
+                const syncs_before = self.storage.stats.syncs;
                 self.mode = mode;
                 // Fresh keys per mode and per run on a kept file (its head moved on).
                 self.prng = Prng.init(mix(0xd15c_be9c + mode_index, self.number));
@@ -965,6 +1073,12 @@ fn RunType(comptime Storage: type) type {
                 const depth_max = self.db.flat.?.prefetch.?.stats.depth_max;
                 cold.report(mode, "cold", self.shape, depth_max);
                 warm.report(mode, "warm", self.shape, depth_max);
+                const checkpoints = self.db.checkpoints_completed - checkpoints_before;
+                const unit = if (Storage == SimStorage) unit_ticks else unit_ms;
+                report_room(&self.room, &room_before, total_blocks, checkpoints, unit);
+                const syncs = self.storage.stats.syncs - syncs_before;
+                report_commits(&self.commits, total_blocks, syncs, unit);
+                self.commits = .{};
             }
         }
 
@@ -974,6 +1088,8 @@ fn RunType(comptime Storage: type) type {
             var ticks: u32 = 0;
             while (!quiet(&self.db)) : (ticks += 1) {
                 if (ticks >= to_disk.busy_ticks_max) return error.Stalled;
+                // No commit grants a paced checkpoint while the driver waits.
+                self.db.checkpoint_flush();
                 self.tick();
             }
             assert(quiet(&self.db));
@@ -988,6 +1104,8 @@ fn RunType(comptime Storage: type) type {
                 .codes_max = 1,
             });
             self.db.disk.?.clock = .{ .context = self, .now_ns = now_ns };
+            self.db.on_durable = on_durable;
+            self.db.durable_context = self;
             assert(self.db.head_info.present);
             assert(self.db.head_info.number >= head_number);
             // A kept file's head is past the import's: continue its chain and new accounts.
@@ -1003,7 +1121,13 @@ fn RunType(comptime Storage: type) type {
 
 /// The storage, its driver, and how to drop its file's pages (null on `SimStorage`).
 fn Setup(comptime Storage: type) type {
-    return struct { storage: *Storage, driver: to_disk.Driver, drop: ?Drop };
+    return struct {
+        storage: *Storage,
+        driver: to_disk.Driver,
+        drop: ?Drop,
+        modes_run: []const Mode = &modes,
+        exec_ticks: u32 = 0,
+    };
 }
 
 /// Imports `shape`'s state into a database on `storage` (or, `reuse`, opens the one a kept
@@ -1023,6 +1147,8 @@ fn run_on(
     defer allocator.destroy(bench_run);
     try bench_run.init(allocator, io, setup.storage, setup.driver, setup.drop, source, config);
     defer bench_run.deinit();
+    bench_run.modes_run = setup.modes_run;
+    bench_run.exec_ticks = setup.exec_ticks;
     const import_start_ns = bench.now_ns(io);
     const reused = reuse and reused: {
         Run.Importer.open(&bench_run.db, setup.driver) catch break :reused false;
@@ -1079,11 +1205,21 @@ const scratch_path = scratch_directory ++ "/data.db";
 /// comment).
 pub fn run(io: std.Io, filter: ?[]const u8) void {
     var keep = false;
+    var room = false;
     if (filter) |pattern| {
-        keep = std.mem.eql(u8, pattern, name ++ ":keep");
+        if (std.mem.eql(u8, pattern, name ++ ":sim")) {
+            run_sim(std.heap.page_allocator, io, true) catch |err| {
+                std.debug.print("{s}: failed: {s}\n", .{ name, @errorName(err) });
+            };
+            return;
+        }
+        room = std.mem.eql(u8, pattern, name ++ ":room");
+        keep = room or std.mem.eql(u8, pattern, name ++ ":keep");
         if (!keep and std.mem.indexOf(u8, name, pattern) == null) return;
     }
-    run_os(io, std.heap.page_allocator, shape_bench, keep) catch |err| {
+    const shape = if (room) shape_room else shape_bench;
+    const modes_run: []const Mode = if (room) &modes_room else &modes;
+    run_os(io, std.heap.page_allocator, shape, modes_run, keep) catch |err| {
         std.debug.print("{s}: failed: {s}\n", .{ name, @errorName(err) });
     };
 }
@@ -1111,7 +1247,13 @@ fn TickerType(comptime IO: type, comptime Storage: type) type {
     };
 }
 
-fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape, keep: bool) !void {
+fn run_os(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    shape: Shape,
+    modes_run: []const Mode,
+    keep: bool,
+) !void {
     const IO = io_root.IO;
     if (builtin.os.tag != .linux) return;
     var backend = IO.init(.{}) catch |err| {
@@ -1144,6 +1286,7 @@ fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape, keep: bool) !v
         .storage = &storage,
         .driver = ticker.driver(),
         .drop = .{ .context = &file, .drop = File.drop },
+        .modes_run = modes_run,
     };
     try run_on(Storage, allocator, io, setup, source, config, keep, true);
 }
@@ -1175,11 +1318,14 @@ fn delete_scratch(io: std.Io) void {
     };
 }
 
-test "disk state bench: a small state imports and blocks apply over SimStorage" {
-    const allocator = std.testing.allocator;
-    var source = try Source.init(allocator, shape_test);
+/// The SimStorage run: the import tests' small shape with room for this benchmark's blocks.
+/// `sim` (the `:sim` filter) gives the admission the node's ratio (16 largest blocks), a
+/// fixed IO latency, and `sim_exec_ticks` ticks of execution per block, and reports room in
+/// ticks: deterministic, and no disk writes.
+fn run_sim(allocator: std.mem.Allocator, io: std.Io, sim: bool) !void {
+    const bench_shape = if (sim) shape_sim else shape_test;
+    var source = try Source.init(allocator, bench_shape);
     defer source.deinit(allocator);
-    // The import tests' small shape, with room for this benchmark's blocks.
     var shape = @import("../import/to_disk_test.zig").shape_test;
     const record_writes_max: u32 = 512;
     shape.changeset.accounts_max = 64;
@@ -1189,20 +1335,31 @@ test "disk state bench: a small state imports and blocks apply over SimStorage" 
     shape.disk_state.memo_bytes_max = 8 << 20;
     shape.disk_state.record_writes_max = record_writes_max;
     shape.disk_state.record_write_bytes_max = record_writes_max * branch_record.value_bytes_max;
-    shape.disk_state.replay_record_writes_max =
-        record_writes_max * (2 * shape.chain.reorg_depth_max + 1);
+    const replay_blocks: u32 = if (sim) 16 else 2 * shape.chain.reorg_depth_max + 1;
+    // The node's journal outlasts many admission intervals: admission paces checkpoints.
+    if (sim) shape.journal_size_bytes = 16 << 20;
+    shape.disk_state.replay_record_writes_max = record_writes_max * replay_blocks;
     shape.flat_prefetch_keys_max = 512;
     shape.flat_prefetch_reads_max = 8;
     const config = try database_config(SimStorage, &source, shape);
     var storage = try SimStorage.init(allocator, .{
         .size_bytes = config.engine.size_bytes(),
         .seed = 5,
+        .latency_ticks_min = if (sim) sim_latency_ticks_min else 1,
+        .latency_ticks_max = if (sim) sim_latency_ticks_max else 4,
+        .sync_latency_ticks_extra = if (sim) sim_sync_ticks_extra else 0,
     });
     defer storage.deinit(allocator);
     const setup: Setup(SimStorage) = .{
         .storage = &storage,
         .driver = .{ .context = &storage, .tick = sim_tick },
         .drop = null,
+        .modes_run = if (sim) &modes_room else &modes,
+        .exec_ticks = if (sim) sim_exec_ticks else 0,
     };
-    try run_on(SimStorage, allocator, std.testing.io, setup, source, config, false, false);
+    try run_on(SimStorage, allocator, io, setup, source, config, false, sim);
+}
+
+test "disk state bench: a small state imports and blocks apply over SimStorage" {
+    try run_sim(std.testing.allocator, std.testing.io, false);
 }

@@ -43,6 +43,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const to_disk = @import("to_disk.zig");
+const room_module = @import("room.zig");
 const database = @import("../db/database.zig");
 const state_module = @import("../db/state.zig");
 const executor_module = @import("../node/executor.zig");
@@ -187,8 +188,8 @@ pub const Stats = struct {
     blocks: u64 = 0,
     /// Attempts that met `Busy` and were retried.
     busy_retries: u64 = 0,
-    /// Checkpoints asked for to make room before a block.
-    checkpoints_requested: u64 = 0,
+    /// Making room before each attempt (`room.zig`): waits, causes, checkpoints asked for.
+    room: room_module.Stats = .{},
     /// Storage ticks spent making room, quieting, or rolling back.
     ticks: u64 = 0,
     time: Time = .{},
@@ -198,6 +199,9 @@ pub const Stats = struct {
 pub const attempts_max: u32 = 64;
 /// Ticks one wait (room, rollback, flush) may take.
 pub const ticks_max: u32 = to_disk.busy_ticks_max;
+comptime {
+    assert(room_module.ticks_max == ticks_max);
+}
 /// Ticks a wait for quiet storage takes at most before the next attempt.
 const quiet_ticks_max: u32 = 1 << 20;
 
@@ -253,6 +257,7 @@ pub fn RunnerType(comptime Storage: type) type {
     return struct {
         const Runner = @This();
         pub const Database = database.DatabaseType(Storage);
+        const Room = room_module.RoomType(Database);
         pub const Prefetch = Database.FlatTrees.Prefetch;
 
         /// Names a block's prefetch keys in place of the runner's own hints (tests): before
@@ -606,54 +611,23 @@ pub fn RunnerType(comptime Storage: type) type {
             self.driver.tick(self.driver.context);
         }
 
-        fn journal_used(db: *const Database) u64 {
-            const journal = &db.engine.journal;
-            assert(journal.head >= journal.tail);
-            return journal.head - journal.tail + db.journal_bytes_pending;
-        }
-
-        /// The journal fits this block's entry with a largest entry to spare.
-        fn journal_roomy(db: *const Database) bool {
-            const journal = &db.engine.journal;
-            const entry_max = Database.Engine.JournalType.entry_size_max(journal.config);
-            return journal_used(db) + 2 * entry_max <= journal.config.zone_size_bytes;
-        }
-
-        /// The replay admission takes this block's branch writes and a rollback's.
-        fn admission_roomy(db: *const Database) bool {
-            const disk_config = db.config.disk_state.?;
-            const span = db.disk_writes_closed + db.disk_writes_pending + db.disk_writes_current;
-            return span + 2 * disk_config.record_writes_max <=
-                disk_config.replay_record_writes_max;
-        }
-
-        fn roomy(db: *const Database) bool {
-            const queue_roomy = db.queue_count + 1 <= db.config.queue_entries_max;
-            return queue_roomy and journal_roomy(db) and admission_roomy(db);
-        }
-
-        /// Ticks until the next block can be journaled and rolled back without a checkpoint
-        /// (none can start while a block is held), asking for checkpoints as needed. Like the
-        /// durable node, also asks for one once the journal is half full.
+        /// Ticks until the next block has room (`room.zig`), counting the ticks.
         fn make_room(self: *Runner) Error!void {
-            const db = self.db;
-            var ticks: u32 = 0;
-            while (true) : (ticks += 1) {
-                if (db.phase != .ready) return error.NotReady;
-                if (db.checkpoint_error != null) return error.CheckpointFailed;
-                const half = journal_used(db) * 2 > db.engine.journal.config.zone_size_bytes;
-                const wanted = half or !journal_roomy(db) or !admission_roomy(db);
-                const running = db.checkpoint_wanted or db.engine.checkpoint_phase != .idle;
-                if (wanted and !running) {
-                    db.request_checkpoint();
-                    self.stats.checkpoints_requested += 1;
-                }
-                if (roomy(db)) break;
-                if (ticks >= ticks_max) return error.Stalled;
-                self.tick();
-            }
-            assert(roomy(db));
-            assert(!db.checkpoints_held);
+            const driver: to_disk.Driver = .{ .context = self, .tick = tick_counted };
+            Room.make_room(self.db, driver, self.clock, &self.stats.room) catch |err| {
+                return switch (err) {
+                    error.NotReady => error.NotReady,
+                    error.CheckpointFailed => error.CheckpointFailed,
+                    error.Stalled => error.Stalled,
+                };
+            };
+            assert(Room.roomy(self.db));
+            assert(!self.db.checkpoints_held);
+        }
+
+        fn tick_counted(context: *anyopaque) void {
+            const self: *Runner = @ptrCast(@alignCast(context));
+            self.tick();
         }
 
         /// No checkpoint wanted or running, nothing queued, no compaction pending.

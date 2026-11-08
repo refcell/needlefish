@@ -467,7 +467,7 @@ fn summary(session: *Session) void {
         db.durable_sequence,
         db.submitted_sequence,
         db.checkpoints_completed,
-        stats.checkpoints_requested,
+        stats.room.checkpoints_requested,
         stats.busy_retries,
         session.fetcher.requests,
         session.fetcher.failures,
