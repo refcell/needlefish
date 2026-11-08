@@ -43,6 +43,10 @@ pub const Header = struct {
     parent_beacon_block_root: ?B256 = null,
     /// Prague (EIP-7685) / Isthmus.
     requests_hash: ?B256 = null,
+    /// Amsterdam (EIP-7928): hash of the block-level access list.
+    block_access_list_hash: ?B256 = null,
+    /// Amsterdam (EIP-7843): the beacon slot of the block.
+    slot_number: ?u64 = null,
 
     const field_names = @typeInfo(Header).@"struct".field_names;
     const field_types = @typeInfo(Header).@"struct".field_types;

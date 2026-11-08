@@ -223,3 +223,25 @@ fn fuzz_decoders(context: void, smith: *std.testing.Smith) anyerror!void {
 test "l1 json: fuzz decoders" {
     try std.testing.fuzz({}, fuzz_decoders, .{});
 }
+
+// Ethereum Sepolia block 12090253 (public), an Amsterdam header: `blockAccessListHash`
+// (EIP-7928) and `slotNumber` (EIP-7843) follow `requestsHash` and are part of the hash.
+// The transaction list is truncated and withdrawals dropped: neither is hashed here.
+const amsterdam_header = @embedFile("testdata/sepolia_l1_12090253_header.json");
+
+test "l1 json: amsterdam header fields are hashed" {
+    var extra: [header_json.extra_data_size_max]u8 = undefined;
+    const decoded = try header_json.decode(amsterdam_header, &extra);
+    try testing.expectEqual(@as(u64, 12_090_253), decoded.header.number);
+    try testing.expectEqual(@as(?u64, 0xaffd0a), decoded.header.slot_number);
+    try testing.expect(decoded.header.block_access_list_hash != null);
+    const expected = primitives.B256.comptime_hex(
+        "bb528dde0066f2187e97eddaba129037d4421843720843ab3ddb961729c13b0b",
+    );
+    try testing.expect(decoded.hash.eql(expected));
+    // Without the Amsterdam fields the header no longer hashes to the block hash.
+    var header = decoded.header;
+    header.slot_number = null;
+    header.block_access_list_hash = null;
+    try testing.expect(!header.hash().eql(expected));
+}

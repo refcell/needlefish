@@ -47,6 +47,8 @@ const Key = enum(u5) {
     excess_blob_gas,
     parent_beacon_block_root,
     requests_hash,
+    block_access_list_hash,
+    slot_number,
     hash,
 };
 
@@ -72,6 +74,8 @@ const keys = std.StaticStringMap(Key).initComptime(.{
     .{ "excessBlobGas", .excess_blob_gas },
     .{ "parentBeaconBlockRoot", .parent_beacon_block_root },
     .{ "requestsHash", .requests_hash },
+    .{ "blockAccessListHash", .block_access_list_hash },
+    .{ "slotNumber", .slot_number },
     .{ "hash", .hash },
 });
 
@@ -179,6 +183,8 @@ fn apply(
             header.parent_beacon_block_root = try object.hash(value);
         },
         .requests_hash => header.requests_hash = try object.hash(value),
+        .block_access_list_hash => header.block_access_list_hash = try object.hash(value),
+        .slot_number => header.slot_number = try object.quantity(u64, value),
         .hash => unreachable,
     }
 }
