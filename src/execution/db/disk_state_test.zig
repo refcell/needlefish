@@ -109,6 +109,8 @@ const disk_config: disk_state.Config = .{
     .record_writes_max = 1024,
     .record_write_bytes_max = 1024 * branch_record.value_bytes_max,
     .changeset = changeset_config,
+    // Smaller than one state's records: entries are evicted and come back.
+    .record_cache_entries = 64,
 };
 
 const reference_config: trie.state_trie.Config = .{
@@ -260,6 +262,9 @@ const Counts = struct {
     record_tombstones: u64 = 0,
     extension_puts: u64 = 0,
     leaf_root_puts: u64 = 0,
+    /// Records the record cache answered, and cache entries checked against the build.
+    cache_hits: u64 = 0,
+    cache_matched: u64 = 0,
 };
 
 fn nibble_at(hash: *const Hash, index: usize) u8 {
@@ -756,6 +761,7 @@ fn check(
     built: *const Built,
     reference: *StateTrie,
     universe: *const Universe,
+    counts: *Counts,
 ) !void {
     try testing.expect(!disk.fault);
     try testing.expectEqualSlices(u8, &built.root, &disk.root());
@@ -797,7 +803,61 @@ fn check(
         try testing.expectEqual(want == null, got == null);
         if (want) |value| try testing.expectEqualSlices(u8, value, got.?);
     }
+    try check_cache(arena, disk, built, counts);
     try testing.expect(!disk.fault);
+}
+
+/// The hash of a (non leaf-root) record's top node: its extension, else its branch.
+fn top_hash(record: *const branch_record.Record) Hash {
+    assert(!branch_record.is_leaf_root(record));
+    var branch_buffer: [branch_record.branch_bytes_max]u8 = undefined;
+    const branch_bytes = branch_record.branch_encoding(record, &branch_buffer);
+    if (record.extension_len == 0) return node.keccak256(branch_bytes);
+    var extension_buffer: [branch_record.extension_encoding_bytes_max]u8 = undefined;
+    const branch_ref = trie.node.RlpNode.from_rlp(branch_bytes);
+    return node.keccak256(branch_record.extension_encoding(record, &branch_ref, &extension_buffer));
+}
+
+const TopKey = struct { hash: Hash, hang: [branch_record.path_key_bytes]u8 };
+
+/// Every record cache entry is a record whose path fits its hang and (unless a leaf root,
+/// whose leaf `DiskState` checks on use) whose top node hashes to its key; where the fresh
+/// build holds a record with that top hash at that hang, the entry is exactly that record.
+/// A stale or misfiled entry fails here, before any block could resolve through it.
+fn check_cache(
+    arena: std.mem.Allocator,
+    disk: *const DiskState,
+    built: *const Built,
+    counts: *Counts,
+) !void {
+    var tops: std.AutoHashMapUnmanaged(TopKey, []const u8) = .empty;
+    const lists = [_][]const Derived{
+        built.records.accounts.items,
+        built.records.storage.items,
+    };
+    for (lists, 0..) |list, owned| {
+        for (list) |entry| {
+            var record: branch_record.Record = undefined;
+            try branch_record.decode(entry.value, &record);
+            if (branch_record.is_leaf_root(&record)) continue;
+            const path_key = if (owned == 1) entry.key[32..65] else entry.key[0..33];
+            const key: TopKey = .{ .hash = top_hash(&record), .hang = path_key[0..33].* };
+            try tops.put(arena, key, entry.value);
+        }
+    }
+    const cache = &disk.record_cache;
+    for (0..cache.slot_count()) |slot| {
+        const entry = cache.entry(slot) orelse continue;
+        var record: branch_record.Record = undefined;
+        try branch_record.decode(entry.value, &record);
+        const hang = try branch_record.decode_path_key(entry.hang);
+        try branch_record.validate_path(hang.slice(), &record);
+        if (branch_record.is_leaf_root(&record)) continue;
+        try testing.expectEqualSlices(u8, entry.hash, &top_hash(&record));
+        const want = tops.get(.{ .hash = entry.hash.*, .hang = entry.hang.* }) orelse continue;
+        try testing.expectEqualSlices(u8, want, entry.value);
+        counts.cache_matched += 1;
+    }
 }
 
 /// `disk.apply`, compacting and ticking while the memtables lack room.
@@ -902,7 +962,14 @@ const Run = struct {
         for (0..self.prng.below(8)) |_| self.harness.sim.tick();
         const built = try build_state(self.arena, &self.model);
         try self.universe.add_built(self.arena, &built);
-        try check(self.harness, &self.disk, &built, &self.reference, &self.universe);
+        try check(
+            self.harness,
+            &self.disk,
+            &built,
+            &self.reference,
+            &self.universe,
+            self.counts,
+        );
     }
 };
 
@@ -957,7 +1024,7 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
     run.disk = try DiskState.init(testing.allocator, harness.trees(), built.root, disk_config);
     defer run.disk.deinit(testing.allocator);
     try run.universe.add_built(arena, &built);
-    try check(harness, &run.disk, &built, &run.reference, &run.universe);
+    try check(harness, &run.disk, &built, &run.reference, &run.universe, counts);
     for (0..blocks) |index| {
         // At least one checkpoint with a reopen and one crash per seed.
         if (index == blocks / 4) {
@@ -970,6 +1037,7 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
         }
         try run.step();
     }
+    counts.cache_hits += run.disk.stats.record_cache_hits;
 }
 
 test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bulk build" {
@@ -989,6 +1057,9 @@ test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bul
     try testing.expect(counts.record_tombstones >= 20);
     try testing.expect(counts.extension_puts >= 10);
     try testing.expect(counts.leaf_root_puts >= 10);
+    // The record cache answers and is checked against the build.
+    try testing.expect(counts.cache_hits >= 500);
+    try testing.expect(counts.cache_matched >= 1000);
 }
 
 test "disk state: a record off its reference is Corrupt; an unlisted wipe is Unsupported" {
@@ -1045,4 +1116,17 @@ test "disk state: a record off its reference is Corrupt; an unlisted wipe is Uns
     try disk.apply(&changeset, true);
     try testing.expect(!std.mem.eql(u8, &built.root, &disk.root()));
     try testing.expect(disk.basic(&node.keccak256(&account.address)).?.eql(info));
+    // The root is the post-state's: nothing the refused blocks read (the corrupted record
+    // above all) was kept for later blocks.
+    var reference = try StateTrie.init(testing.allocator, reference_config);
+    defer reference.deinit(testing.allocator);
+    for (model.accounts.items) |*entry| {
+        const hash = node.keccak256(&entry.address);
+        try reference.set_account(hash, trie_account(entry.info));
+        for (entry.slots.items) |slot| {
+            try reference.set_storage(hash, slot_hash(slot.slot), slot.value);
+        }
+    }
+    try reference.set_account(node.keccak256(&account.address), trie_account(info));
+    try testing.expectEqualSlices(u8, &try reference.root(), &disk.root());
 }

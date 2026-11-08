@@ -139,6 +139,8 @@ pub const shape_node: Shape = .{
         .record_writes_max = node_record_writes_max,
         .record_write_bytes_max = node_record_writes_max * branch_record.value_bytes_max,
         .replay_record_writes_max = node_record_writes_max * 16,
+        // ~300 MiB: the account trie's top four levels and the hot paths stay resolved.
+        .record_cache_entries = 1 << 18,
     },
     .queue_entries_max = 8,
     .flat_flush_entries_min = 16 * 1024,

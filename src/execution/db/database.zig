@@ -389,6 +389,7 @@ pub const Config = struct {
             .record_writes_max = disk.record_writes_max,
             .record_write_bytes_max = disk.record_write_bytes_max,
             .changeset = config.changeset,
+            .record_cache_entries = disk.record_cache_entries,
         };
     }
 
@@ -468,6 +469,8 @@ pub const DiskStateConfig = struct {
     /// Branch-record writes the journal since the fallback checkpoint may replay (each
     /// branch tree's replay reserve); at least one largest move's bound.
     replay_record_writes_max: u32,
+    /// Branch records `DiskState` keeps across blocks (`record_cache.zig`, ~1.1 KiB each).
+    record_cache_entries: u32 = disk_state_module.record_cache_entries_default,
 };
 
 /// Grid blocks for the code tables of `state` (the node default): four times the blocks

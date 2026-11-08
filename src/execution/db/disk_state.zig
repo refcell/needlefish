@@ -44,6 +44,7 @@ const witness = @import("witness.zig");
 const changeset_module = @import("changeset.zig");
 const flat_trees_module = @import("flat_trees.zig");
 const branch_record = @import("branch_record.zig");
+const record_cache_module = @import("record_cache.zig");
 
 const node = trie.node;
 const sparse = trie.sparse;
@@ -57,6 +58,10 @@ const AccountInfo = changeset_module.AccountInfo;
 const Address = changeset_module.Address;
 const SparseState = witness.SparseState;
 const AccountState = @import("history.zig").AccountState;
+const RecordCache = record_cache_module.RecordCache;
+
+/// Record cache entries when a config names none (~4.6 MiB).
+pub const record_cache_entries_default: u32 = 4096;
 
 pub const Account = flat_trees_module.Account;
 
@@ -84,6 +89,9 @@ pub const Config = struct {
     record_write_bytes_max: u32,
     /// Capacity of the scratch changeset an unwind applies (the stored changeset reversed).
     changeset: changeset_module.Config,
+    /// Records kept across blocks by top-node hash and hang (`record_cache.zig`), ~1.1 KiB
+    /// each: a block's walk takes the top of every trie it touches from here.
+    record_cache_entries: u32 = record_cache_entries_default,
 };
 
 /// How to rebuild a node's preimage. Content-addressed: equal hashes have equal preimages,
@@ -138,9 +146,11 @@ pub const Clock = struct {
 pub const Stats = struct {
     /// Successful `apply` calls.
     blocks: u64 = 0,
-    /// Branch records resolved by hash, and how many of them read the branch trees.
+    /// Branch records resolved by hash, how many of them read the branch trees, and how
+    /// many the record cache answered.
     records_resolved: u64 = 0,
     record_reads: u64 = 0,
+    record_cache_hits: u64 = 0,
     /// Leaves resolved by hash (each reads the account or storage tree).
     leaves_resolved: u64 = 0,
     /// Account and slot point reads of the trees (evm reads, leaves, pre-state roots).
@@ -190,6 +200,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         config: Config,
         state_root: Hash,
         sparse_state: SparseState,
+        /// Verified records across blocks (content-addressed: never stale).
+        record_cache: RecordCache,
         memo: std.AutoHashMapUnmanaged(Hash, Entry) = .empty,
         memo_bytes: []u8,
         memo_bytes_len: u32 = 0,
@@ -223,6 +235,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         ) !Self {
             assert(config.memo_entries_max > 0 and config.memo_bytes_max > 0);
             assert(config.record_writes_max > 0);
+            assert(config.record_cache_entries >= record_cache_module.ways);
             var sparse_state = try SparseState.init(allocator, .{
                 .nodes_max = 1,
                 .node_bytes_max = 1,
@@ -250,8 +263,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 config.changeset.accounts_max + config.changeset.storage_max,
             );
             errdefer allocator.free(account_writes);
-            const swapped = try Changeset.init(allocator, config.changeset);
+            var swapped = try Changeset.init(allocator, config.changeset);
+            errdefer swapped.deinit(allocator);
+            const record_cache = try RecordCache.init(allocator, config.record_cache_entries);
             return .{
+                .record_cache = record_cache,
                 .account_writes = account_writes,
                 .trees = trees,
                 .config = config,
@@ -267,6 +283,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.record_cache.deinit(allocator);
             self.swapped.deinit(allocator);
             allocator.free(self.account_writes);
             allocator.free(self.record_bytes);
@@ -572,14 +589,13 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             want: *const Hash,
         ) ?[]const u8 {
             self.stats.records_resolved += 1;
-            self.stats.record_reads += 1;
-            const value = self.trees.get_branch(owner, hang) catch {
-                self.fault = true;
-                return null;
-            } orelse {
-                self.corrupt = true;
-                return null;
-            };
+            var value_buffer: [branch_record.value_bytes_max]u8 = undefined;
+            const cached = self.record_cache.get(want, hang);
+            const value = if (cached) |bytes| value: {
+                self.stats.record_cache_hits += 1;
+                @memcpy(value_buffer[0..bytes.len], bytes);
+                break :value value_buffer[0..bytes.len];
+            } else self.read_record(owner, hang) orelse return null;
             var record: Record = undefined;
             branch_record.decode(value, &record) catch return self.fail();
             branch_record.validate_path(hang, &record) catch return self.fail();
@@ -595,13 +611,34 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 branch_bytes
             else
                 branch_record.extension_encoding(&record, &branch_ref, &extension_buffer);
-            if (!std.mem.eql(u8, &node.keccak256(top), want)) return self.fail();
+            if (cached == null) {
+                if (!std.mem.eql(u8, &node.keccak256(top), want)) return self.fail();
+                self.record_cache.put(want, hang, value);
+            } else if (std.debug.runtime_safety) {
+                // Cached records were verified (or built from hashed nodes) when cached.
+                assert(std.mem.eql(u8, &node.keccak256(top), want));
+            }
             const stored = self.store_bytes(want, top) orelse return null;
             if (record.extension_len > 0 and branch_ref.is_hash()) {
                 _ = self.store_bytes(&branch_ref.root_hash(), branch_bytes) orelse return null;
             }
             self.register_children(owner, hang, &record);
             return stored;
+        }
+
+        /// The record bytes at (`owner`, `hang`) from the branch trees (null: faulted or
+        /// missing, flagged).
+        fn read_record(self: *Self, owner: ?*const Hash, hang: []const u8) ?[]const u8 {
+            self.stats.record_reads += 1;
+            const value = self.trees.get_branch(owner, hang) catch {
+                self.fault = true;
+                return null;
+            } orelse {
+                self.corrupt = true;
+                return null;
+            };
+            assert(value.len >= 1 and value.len <= branch_record.value_bytes_max);
+            return value;
         }
 
         fn fail(self: *Self) ?[]const u8 {
@@ -851,7 +888,13 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 try self.build_record(position, post.?, &record);
                 branch_record.validate_path(position, &record) catch return error.Corrupt;
                 var buffer: [branch_record.value_bytes_max]u8 = undefined;
-                return self.add_write(owner, position, branch_record.encode(&record, &buffer));
+                const value = branch_record.encode(&record, &buffer);
+                // The post-state's top node, hashed by the root computation: the next block
+                // resolves it from the cache (embedded nodes are never resolved by hash).
+                if (frame.post.ref.is_hash()) {
+                    self.record_cache.put(&frame.post.ref.root_hash(), position, value);
+                }
+                return self.add_write(owner, position, value);
             }
             if (pre_record) return self.add_write(owner, position, null);
         }
