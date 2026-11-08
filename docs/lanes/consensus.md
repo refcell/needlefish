@@ -261,6 +261,14 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   Withdrawals are decoded but not checked against `withdrawalsRoot` (post-Isthmus that root
   is the message passer storage root).
 
+- L1 blob schedule (L1 info deposits' blob base fee): the node takes its built-in L1's
+  Prague, Osaka and BPO forks by `l1_chain_id` (`L1BlobSchedule.of_l1`, shared with the proof
+  client and derive-check). An unknown L1 keeps Cancun's fraction and logs a warning; base/base
+  needs an L1 chain config for such chains, which this node does not read yet.
+- Post-Canyon EIP-1559 parameters for all-zero Holocene `eip1559Params` in consolidation: the
+  built-in chain's by `l2_chain_id`, else Base mainnet's (the rollup JSON's `chain_op_config`
+  is not read).
+
 ## el-run engine (M5 integration)
 
 `base el-run --engine.addr IP:PORT --engine.jwt FILE` serves the Engine API to a verifier
@@ -296,7 +304,9 @@ from devp2p. Semantics (`bin/base/el_engine.zig`):
   the consensus node's startup walk and reset walk-back stay inside the ring. Until the ring
   holds 16,384 blocks (or has evicted by bytes) they answer a "warming up" error; the
   consensus node retries. So start `base consensus` once el-run's summary shows a full ring
-  (about 55 min at the tip at 200 ms blocks).
+  (about 55 min at the tip at 200 ms blocks). A forkchoice label whose block has left the ring
+  is dropped and the tag answers the anchor again, so a consensus node restarted after a long
+  stall starts without an el-run restart.
 - Single-threaded: the HTTP server runs on its own completion IO, driven by el-run only
   between blocks (non-blocking `poll`) and during the idle wait at the tip (`wait` replaces
   the 100 ms sleep). Requests never run while the runner executes or commits, and the engine
@@ -351,6 +361,10 @@ read methods from what el-run itself executed, never proxied (`bin/base/el_rpc.z
   historical state.
 
 ## Log
+- 2026-11-08: verifier on el-run (Base Sepolia): consolidation now warns with the first
+  attributes mismatch per block. It showed `transaction_content` at index 0, the L1 info
+  deposit: the node priced blob fees with Cancun's fraction (block 56166090: 11 instead of 2).
+  Fixed with the L1's own blob schedule; chain fee params fixed alongside.
 - 2026-11-08: el-run read-only JSON-RPC (`bin/base/el_rpc.zig`, `--rpc`): head state, head
   proofs over the disk records, and blocks/transactions/receipts from an RPC ring; compared
   against the public Base Sepolia RPC.
