@@ -18,10 +18,26 @@
 //! block), random existing accounts, random slots of random contracts (half of them large
 //! ones), a few new accounts and new slots, and deletes some slots.
 //!
-//! Reported per block, cold (the first `blocks_cold`) and warm (the last half of the
-//! `blocks_warm` that follow): ms of reads, apply (and DiskState's phases), journal, room;
-//! grid reads (synchronous, block-cache misses), block-cache hits and misses, DiskState's
-//! record and leaf resolutions and the tree reads they took.
+//! A block also reads (without writing) the account of each contract whose slots it touches,
+//! as a call does. Prefetch (`prefetch.zig`, as `import/run.zig` does before execution) runs
+//! in three hint modes, each after its own reopen and on its own random blocks: `none`;
+//! `tx`, the accounts a block's transactions name (senders and recipients: every account it
+//! touches, the called contracts included, but no slot); and `all`, every key it touches (as
+//! if access lists named every slot: the upper bound). `none` runs again last (drift). Modes
+//! marked `+paths` also prefetch, before the apply, the branch records along the trie paths
+//! of every key the block writes (`Prefetch.add_path`), as `import/run.zig` does.
+//!
+//! Reported per mode and block, cold (the first `blocks_cold` after the reopen, with the
+//! file dropped from the OS page cache before every block, as for a state far larger than
+//! RAM) and warm (the last half of the `blocks_warm` that follow, no more drops): ms of
+//! prefetch, reads, apply (and DiskState's phases), journal, room; the prefetch's keys,
+//! rounds, blocks read and its read depth (mean and peak reads in flight); grid reads
+//! (synchronous, block-cache misses), block-cache hits and misses, DiskState's record and
+//! leaf resolutions and the tree reads they took.
+//!
+//! The filter `db/disk-state:keep` keeps the scratch file afterwards and reuses one a previous
+//! run kept (no import), so repeated runs write only their blocks. The driver waits on the
+//! IO backend 50 us before each storage tick (`run_for_ns`), as el-run's does.
 //!
 //! Benchmark scaffolding: fixtures come from the page allocator, and the scratch file is opened
 //! and its page cache dropped here (Linux `fadvise`), not in library code.
@@ -349,6 +365,11 @@ const Counters = struct {
     slot_reads: u64 = 0,
     read_memo_hits: u64 = 0,
     record_writes: u64 = 0,
+    prefetch_keys: u64 = 0,
+    prefetch_rounds: u64 = 0,
+    prefetch_reads: u64 = 0,
+    prefetch_failed: u64 = 0,
+    prefetch_depth_sum: u64 = 0,
 
     fn minus(after: Counters, before: Counters) Counters {
         var out: Counters = .{};
@@ -368,6 +389,7 @@ const Counters = struct {
 
 const Totals = struct {
     blocks: u64 = 0,
+    prefetch_ns: u64 = 0,
     reads_ns: u64 = 0,
     apply_ns: u64 = 0,
     update_ns: u64 = 0,
@@ -376,7 +398,11 @@ const Totals = struct {
     write_ns: u64 = 0,
     journal_ns: u64 = 0,
     room_ns: u64 = 0,
+    paths_ns: u64 = 0,
+    /// Apply attempts that met `Busy` (each reruns the apply: its counters add up).
+    apply_busy: u64 = 0,
     reads: Counters = .{},
+    paths: Counters = .{},
     apply: Counters = .{},
 
     fn add(total: *Totals, sample: *const Totals) void {
@@ -389,30 +415,61 @@ const Totals = struct {
         }
     }
 
-    fn report(total: *const Totals, label: []const u8, shape: Shape, slots: u64) void {
+    fn report(
+        total: *const Totals,
+        mode: Mode,
+        label: []const u8,
+        shape: Shape,
+        depth_max: u32,
+    ) void {
         assert(total.blocks > 0);
         const blocks: f64 = @floatFromInt(total.blocks);
-        const ms = struct {
-            fn of(ns: u64, count: f64) f64 {
-                return @as(f64, @floatFromInt(ns)) / 1e6 / count;
-            }
-        }.of;
-        const per = struct {
-            fn of(value: u64, count: f64) f64 {
-                return @as(f64, @floatFromInt(value)) / count;
-            }
-        }.of;
+        const reads = &total.reads;
+        const issued: f64 = @floatFromInt(@max(1, reads.prefetch_reads + reads.prefetch_failed));
         std.debug.print(
-            "{s} {s} ({d} blocks, {d} accounts, {d} slots, cache {d} blocks): " ++
-                "reads {d:.3} ms/block (grid reads {d:.1}, cache hits {d:.1} misses {d:.1}, " ++
-                "account reads {d:.1}, slot reads {d:.1})\n",
+            "{s} hint={t}{s} {s} ({d} blocks, cache {d} blocks): prefetch {d:.3} ms/block " ++
+                "(keys {d:.1}, rounds {d:.1}, blocks read {d:.1}, failed {d:.1}, " ++
+                "depth mean {d:.1} max {d}); reads {d:.3} ms/block (grid reads {d:.1}, " ++
+                "cache hits {d:.1} misses {d:.1}, account reads {d:.1}, slot reads {d:.1})\n",
             .{
-                name,                                   label,
-                total.blocks,                           shape.accounts,
-                slots,                                  shape.cache_blocks,
-                ms(total.reads_ns, blocks),             per(total.reads.grid_reads, blocks),
-                per(total.reads.cache_hits, blocks),    per(total.reads.cache_misses, blocks),
-                per(total.reads.account_reads, blocks), per(total.reads.slot_reads, blocks),
+                name,
+                mode.hint,
+                if (mode.paths) "+paths" else "",
+                label,
+                total.blocks,
+                shape.cache_blocks,
+                ms(total.prefetch_ns, blocks),
+                per(reads.prefetch_keys, blocks),
+                per(reads.prefetch_rounds, blocks),
+                per(reads.prefetch_reads, blocks),
+                per(reads.prefetch_failed, blocks),
+                per(reads.prefetch_depth_sum, issued),
+                depth_max,
+                ms(total.reads_ns, blocks),
+                per(reads.grid_reads, blocks),
+                per(reads.cache_hits, blocks),
+                per(reads.cache_misses, blocks),
+                per(reads.account_reads, blocks),
+                per(reads.slot_reads, blocks),
+            },
+        );
+        total.report_apply();
+    }
+
+    /// The path prefetch and the apply.
+    fn report_apply(total: *const Totals) void {
+        assert(total.blocks > 0);
+        const blocks: f64 = @floatFromInt(total.blocks);
+        const paths = &total.paths;
+        std.debug.print(
+            "  paths {d:.3} ms/block (keys {d:.1}, rounds {d:.1}, blocks read {d:.1}, " ++
+                "depth mean {d:.1})\n",
+            .{
+                ms(total.paths_ns, blocks),
+                per(paths.prefetch_keys, blocks),
+                per(paths.prefetch_rounds, blocks),
+                per(paths.prefetch_reads, blocks),
+                per(paths.prefetch_depth_sum, @max(1, per(paths.prefetch_reads, 1))),
             },
         );
         const apply = &total.apply;
@@ -421,7 +478,7 @@ const Totals = struct {
                 "journal {d:.3} room {d:.3}; grid reads {d:.1}, cache hits {d:.1} " ++
                 "misses {d:.1}, records resolved {d:.1} read {d:.1} cached {d:.1}, " ++
                 "leaves {d:.1}, account reads {d:.1}, slot reads {d:.1}, memo hits {d:.1}, " ++
-                "record writes {d:.1}\n",
+                "record writes {d:.1}, busy retries {d:.2}\n",
             .{
                 ms(total.apply_ns, blocks),           ms(total.update_ns, blocks),
                 ms(total.root_ns, blocks),            ms(total.diff_ns, blocks),
@@ -432,13 +489,37 @@ const Totals = struct {
                 per(apply.record_cache_hits, blocks), per(apply.leaves_resolved, blocks),
                 per(apply.account_reads, blocks),     per(apply.slot_reads, blocks),
                 per(apply.read_memo_hits, blocks),    per(apply.record_writes, blocks),
+                per(total.apply_busy, blocks),
             },
         );
+        assert(paths.prefetch_reads <= paths.grid_reads);
     }
 };
 
-/// One key a block touches: an account (`slot` null) or a slot of it.
-const Touch = struct { index: u64, slot: ?u256 = null, value: u256 = 0 };
+fn ms(ns: u64, count: f64) f64 {
+    assert(count > 0);
+    return @as(f64, @floatFromInt(ns)) / 1e6 / count;
+}
+
+fn per(value: u64, count: f64) f64 {
+    assert(count > 0);
+    return @as(f64, @floatFromInt(value)) / count;
+}
+
+/// One key a block touches: an account (`slot` null) or a slot of it; read, and written
+/// unless `write` is false (a called contract's account).
+const Touch = struct { index: u64, slot: ?u256 = null, value: u256 = 0, write: bool = true };
+
+/// What a block's prefetch names (see the file comment).
+const Hint = enum { none, tx, all };
+const Mode = struct { hint: Hint, paths: bool };
+const modes = [_]Mode{
+    .{ .hint = .none, .paths = false },
+    .{ .hint = .tx, .paths = false },
+    .{ .hint = .tx, .paths = true },
+    .{ .hint = .all, .paths = true },
+    .{ .hint = .none, .paths = false },
+};
 
 fn RunType(comptime Storage: type) type {
     return struct {
@@ -449,6 +530,12 @@ fn RunType(comptime Storage: type) type {
         allocator: std.mem.Allocator,
         io: std.Io,
         storage: *Storage,
+        driver: to_disk.Driver,
+        /// Drops the scratch file from the OS page cache; null on `SimStorage`.
+        drop: ?Drop,
+        mode: Mode = modes[0],
+        /// Drop the page cache before every block (the cold blocks).
+        drop_each: bool = false,
         shape: Shape,
         config: @import("database.zig").Config,
         db: Database,
@@ -472,6 +559,8 @@ fn RunType(comptime Storage: type) type {
             allocator: std.mem.Allocator,
             io: std.Io,
             storage: *Storage,
+            driver: to_disk.Driver,
+            drop: ?Drop,
             source: Source,
             config: @import("database.zig").Config,
         ) !void {
@@ -481,6 +570,8 @@ fn RunType(comptime Storage: type) type {
                 .allocator = allocator,
                 .io = io,
                 .storage = storage,
+                .driver = driver,
+                .drop = drop,
                 .shape = shape,
                 .config = config,
                 .db = try Database.init(allocator, storage, config),
@@ -489,7 +580,7 @@ fn RunType(comptime Storage: type) type {
                 .source = source,
                 .prng = Prng.init(0xd15c_be9c),
                 .touches = try allocator.alloc(Touch, shape.block_slots() +
-                    shape.block_account_count()),
+                    shape.block_account_count() + shape.block_contracts),
                 .encoded = try allocator.alloc(u8, config.engine.entry_body_size_max),
             };
             self.overlay = try Overlay.init(allocator, &self.db.state, .{
@@ -509,13 +600,8 @@ fn RunType(comptime Storage: type) type {
             self.* = undefined;
         }
 
-        fn driver(self: *Run) to_disk.Driver {
-            return .{ .context = self.storage, .tick = tick };
-        }
-
-        fn tick(context: *anyopaque) void {
-            const storage: *Storage = @ptrCast(@alignCast(context));
-            storage.tick();
+        fn tick(self: *Run) void {
+            self.driver.tick(self.driver.context);
         }
 
         fn now_ns(context: *anyopaque) u64 {
@@ -528,7 +614,7 @@ fn RunType(comptime Storage: type) type {
             var importer: Importer = .{
                 .allocator = self.allocator,
                 .db = &self.db,
-                .driver = self.driver(),
+                .driver = self.driver,
             };
             var codes: Codes = .{};
             try importer.format(0xd15c_be9c);
@@ -551,7 +637,13 @@ fn RunType(comptime Storage: type) type {
         fn counters(self: *Run) Counters {
             const trees = &self.db.flat.?;
             const stats = &self.db.disk.?.stats;
+            const prefetched = &trees.prefetch.?.stats;
             return .{
+                .prefetch_keys = prefetched.keys,
+                .prefetch_rounds = prefetched.rounds,
+                .prefetch_reads = prefetched.reads,
+                .prefetch_failed = prefetched.failed,
+                .prefetch_depth_sum = prefetched.depth_sum,
                 .grid_reads = trees.accounts.grid.stats.reads,
                 .cache_hits = trees.cache.stats.hits,
                 .cache_misses = trees.cache.stats.misses,
@@ -584,6 +676,7 @@ fn RunType(comptime Storage: type) type {
                     large[@intCast(prng.below(large.len))]
                 else
                     prng.below(shape.contracts()) * shape.contract_every;
+                self.touch(.{ .index = index, .write = false });
                 for (0..shape.block_slots_per_contract) |_| {
                     self.touch_slot(index, prng.below(slots_of(index, shape)));
                 }
@@ -625,6 +718,7 @@ fn RunType(comptime Storage: type) type {
 
         fn write_block(self: *Run) !void {
             for (self.touches[0..self.touches_len]) |*item| {
+                if (!item.write) continue;
                 const address = address_of(item.index);
                 if (item.slot) |slot| {
                     try self.overlay.set_storage(address, slot, item.value);
@@ -650,18 +744,35 @@ fn RunType(comptime Storage: type) type {
             self.plan_block();
             self.db.hold_checkpoints(true);
             defer self.db.hold_checkpoints(false);
+            if (self.drop_each) {
+                if (self.drop) |callback| callback.drop(callback.context);
+            }
+            const before_prefetch = self.counters();
+            const prefetch_start_ns = bench.now_ns(self.io);
+            self.prefetch();
+            sample.prefetch_ns = bench.now_ns(self.io) - prefetch_start_ns;
             const before_reads = self.counters();
             const reads_start_ns = bench.now_ns(self.io);
             std.mem.doNotOptimizeAway(self.read_block());
             sample.reads_ns = bench.now_ns(self.io) - reads_start_ns;
             const before_apply = self.counters();
             sample.reads = before_apply.minus(before_reads);
+            const prefetched = before_reads.minus(before_prefetch);
+            sample.reads.prefetch_keys = prefetched.prefetch_keys;
+            sample.reads.prefetch_rounds = prefetched.prefetch_rounds;
+            sample.reads.prefetch_reads = prefetched.prefetch_reads;
+            sample.reads.prefetch_failed = prefetched.prefetch_failed;
+            sample.reads.prefetch_depth_sum = prefetched.prefetch_depth_sum;
             try self.write_block();
+            const paths_start_ns = bench.now_ns(self.io);
+            self.prefetch_paths();
+            sample.paths_ns = bench.now_ns(self.io) - paths_start_ns;
+            sample.paths = self.counters().minus(before_apply);
             const disk_before = self.db.disk.?.stats;
             const apply_start_ns = bench.now_ns(self.io);
-            try self.apply_overlay();
+            try self.apply_overlay(sample);
             sample.apply_ns = bench.now_ns(self.io) - apply_start_ns;
-            sample.apply = self.counters().minus(before_apply);
+            sample.apply = self.counters().minus(before_apply).minus(sample.paths);
             const disk_after = &self.db.disk.?.stats;
             sample.update_ns = disk_after.update_ns - disk_before.update_ns;
             sample.root_ns = disk_after.root_ns - disk_before.root_ns;
@@ -671,17 +782,73 @@ fn RunType(comptime Storage: type) type {
             try self.journal();
             sample.journal_ns = bench.now_ns(self.io) - journal_start_ns;
             sample.blocks = 1;
-            self.storage.tick();
+            self.tick();
+        }
+
+        /// The hint mode's keys, read ahead into the block cache (ticking until done).
+        fn prefetch(self: *Run) void {
+            if (self.mode.hint == .none) return;
+            const trees = &self.db.flat.?;
+            const prefetch_state = trees.prefetch.?;
+            assert(!prefetch_state.running);
+            prefetch_state.clear();
+            for (self.touches[0..self.touches_len]) |*item| {
+                const address_hash = node.keccak256(&address_of(item.index));
+                const slot = item.slot orelse {
+                    prefetch_state.add_account(&address_hash);
+                    continue;
+                };
+                if (self.mode.hint != .all) continue;
+                var slot_bytes: [32]u8 = undefined;
+                std.mem.writeInt(u256, &slot_bytes, slot, .big);
+                prefetch_state.add_slot(&address_hash, &node.keccak256(&slot_bytes));
+            }
+            self.prefetch_run();
+        }
+
+        /// The branch records along the trie paths of the keys the block writes.
+        fn prefetch_paths(self: *Run) void {
+            if (!self.mode.paths) return;
+            const prefetch_state = self.db.flat.?.prefetch.?;
+            prefetch_state.clear();
+            for (self.touches[0..self.touches_len]) |*item| {
+                if (!item.write) continue;
+                const address_hash = node.keccak256(&address_of(item.index));
+                const slot = item.slot orelse {
+                    prefetch_state.add_path(null, &address_hash);
+                    continue;
+                };
+                var slot_bytes: [32]u8 = undefined;
+                std.mem.writeInt(u256, &slot_bytes, slot, .big);
+                const slot_hash = node.keccak256(&slot_bytes);
+                prefetch_state.add_path(&address_hash, &slot_hash);
+                prefetch_state.add_path(null, &address_hash);
+            }
+            self.prefetch_run();
+        }
+
+        /// Starts the named prefetch and ticks until it is done.
+        fn prefetch_run(self: *Run) void {
+            const trees = &self.db.flat.?;
+            const prefetch_state = trees.prefetch.?;
+            prefetch_state.start(trees);
+            var ticks: u32 = 0;
+            while (prefetch_state.running) : (ticks += 1) {
+                assert(ticks < to_disk.busy_ticks_max);
+                self.tick();
+            }
+            assert(prefetch_state.idle());
         }
 
         /// `Overlay.commit` (State.apply -> DiskState.apply), retried while busy.
-        fn apply_overlay(self: *Run) !void {
+        fn apply_overlay(self: *Run, sample: *Totals) !void {
             var attempts: u32 = 0;
+            defer sample.apply_busy += attempts;
             while (true) : (attempts += 1) {
                 if (attempts >= to_disk.busy_ticks_max) return error.Stalled;
                 _ = self.overlay.commit(&self.changeset) catch |err| switch (err) {
                     error.Busy => {
-                        self.storage.tick();
+                        self.tick();
                         continue;
                     },
                     else => return err,
@@ -734,6 +901,11 @@ fn RunType(comptime Storage: type) type {
             return queue_roomy and journal_roomy and admission_roomy;
         }
 
+        /// No checkpoint or IO in flight: the database may close.
+        fn quiet(db: *const Database) bool {
+            return !db.checkpoint_wanted and db.engine.checkpoint_phase == .idle and db.idle();
+        }
+
         fn make_room(self: *Run) !void {
             const db = &self.db;
             var ticks: u32 = 0;
@@ -746,38 +918,54 @@ fn RunType(comptime Storage: type) type {
                 if ((half or !roomy(db)) and !running) db.request_checkpoint();
                 if (roomy(db)) break;
                 if (ticks >= to_disk.busy_ticks_max) return error.Stalled;
-                self.storage.tick();
+                self.tick();
             }
             assert(roomy(db));
         }
 
-        /// Cold blocks after the reopen, then warm blocks; reports both.
+        /// Every hint mode: a reopen, cold blocks, then warm blocks; reports both.
         fn measure(self: *Run, report: bool) !void {
-            var cold: Totals = .{};
-            var warm: Totals = .{};
-            const total_blocks = self.shape.blocks_cold + self.shape.blocks_warm;
-            for (0..total_blocks) |index| {
-                var sample: Totals = .{};
-                try self.block(&sample);
-                if (index < self.shape.blocks_cold) {
-                    cold.add(&sample);
-                } else if (index >= self.shape.blocks_cold + self.shape.blocks_warm / 2) {
-                    warm.add(&sample);
+            for (modes, 0..) |mode, mode_index| {
+                try self.reopen();
+                self.mode = mode;
+                // Fresh keys per mode and per run on a kept file (its head moved on).
+                self.prng = Prng.init(mix(0xd15c_be9c + mode_index, self.number));
+                var cold: Totals = .{};
+                var warm: Totals = .{};
+                const total_blocks = self.shape.blocks_cold + self.shape.blocks_warm;
+                for (0..total_blocks) |index| {
+                    self.drop_each = index < self.shape.blocks_cold;
+                    var sample: Totals = .{};
+                    try self.block(&sample);
+                    if (index < self.shape.blocks_cold) {
+                        cold.add(&sample);
+                    } else if (index >= self.shape.blocks_cold + self.shape.blocks_warm / 2) {
+                        warm.add(&sample);
+                    }
                 }
+                assert(cold.blocks == self.shape.blocks_cold);
+                assert(warm.blocks > 0);
+                if (!report) continue;
+                const depth_max = self.db.flat.?.prefetch.?.stats.depth_max;
+                cold.report(mode, "cold", self.shape, depth_max);
+                warm.report(mode, "warm", self.shape, depth_max);
             }
-            assert(cold.blocks == self.shape.blocks_cold);
-            assert(warm.blocks > 0);
-            if (!report) return;
-            cold.report("cold", self.shape, self.source.slots_total);
-            warm.report("warm", self.shape, self.source.slots_total);
         }
 
-        /// Closes and reopens the database: an empty block cache.
+        /// Closes and reopens the database (an empty block cache), and drops the file from
+        /// the OS page cache.
         fn reopen(self: *Run) !void {
+            var ticks: u32 = 0;
+            while (!quiet(&self.db)) : (ticks += 1) {
+                if (ticks >= to_disk.busy_ticks_max) return error.Stalled;
+                self.tick();
+            }
+            assert(quiet(&self.db));
             self.overlay.deinit(self.allocator);
             self.db.deinit(self.allocator);
             self.db = try Database.init(self.allocator, self.storage, self.config);
-            try Importer.open(&self.db, self.driver());
+            try Importer.open(&self.db, self.driver);
+            if (self.drop) |callback| callback.drop(callback.context);
             self.overlay = try Overlay.init(self.allocator, &self.db.state, .{
                 .accounts_max = self.shape.block_account_count() + self.shape.block_slots(),
                 .slots_max = self.shape.block_slots(),
@@ -785,35 +973,57 @@ fn RunType(comptime Storage: type) type {
             });
             self.db.disk.?.clock = .{ .context = self, .now_ns = now_ns };
             assert(self.db.head_info.present);
+            assert(self.db.head_info.number >= head_number);
+            // A kept file's head is past the import's: continue its chain and new accounts.
+            if (self.number == head_number) {
+                self.number = self.db.head_info.number;
+                self.accounts_created =
+                    (self.number - head_number) * self.shape.block_new_accounts;
+            }
+            assert(self.number == self.db.head_info.number);
         }
     };
 }
 
-/// Imports `shape`'s state into a database on `storage`, reopens it (`drop` then empties the
-/// OS page cache of its file, if any), and measures the blocks.
+/// The storage, its driver, and how to drop its file's pages (null on `SimStorage`).
+fn Setup(comptime Storage: type) type {
+    return struct { storage: *Storage, driver: to_disk.Driver, drop: ?Drop };
+}
+
+/// Imports `shape`'s state into a database on `storage` (or, `reuse`, opens the one a kept
+/// file holds, importing only if that fails), and measures the blocks in every hint mode.
 fn run_on(
     comptime Storage: type,
     allocator: std.mem.Allocator,
     io: std.Io,
-    storage: *Storage,
+    setup: Setup(Storage),
     source: Source,
     config: @import("database.zig").Config,
-    drop: ?Drop,
+    reuse: bool,
     report: bool,
 ) !void {
     const Run = RunType(Storage);
     const bench_run = try allocator.create(Run);
     defer allocator.destroy(bench_run);
-    try bench_run.init(allocator, io, storage, source, config);
+    try bench_run.init(allocator, io, setup.storage, setup.driver, setup.drop, source, config);
     defer bench_run.deinit();
     const import_start_ns = bench.now_ns(io);
-    try bench_run.import();
-    try bench_run.reopen();
-    if (drop) |callback| callback.drop(callback.context);
+    const reused = reuse and reused: {
+        Run.Importer.open(&bench_run.db, setup.driver) catch break :reused false;
+        break :reused bench_run.db.head_info.present;
+    };
+    if (!reused) {
+        if (reuse) {
+            bench_run.db.deinit(allocator);
+            bench_run.db = try Run.Database.init(allocator, setup.storage, config);
+        }
+        try bench_run.import();
+    }
     if (report) {
         const import_ns = bench.now_ns(io) - import_start_ns;
-        std.debug.print("{s}: imported in {d:.1} s, grid {d} blocks of {d} KiB\n", .{
+        std.debug.print("{s}: {s} in {d:.1} s, grid {d} blocks of {d} KiB\n", .{
             name,
+            if (reused) "reopened a kept file" else "imported",
             @as(f64, @floatFromInt(import_ns)) / 1e9,
             config.engine.grid_block_count,
             config.engine.checkpoint_block_size / 1024,
@@ -849,17 +1059,43 @@ fn database_config(
 const scratch_directory = ".zig-cache/tmp/needlefish-disk-state-bench";
 const scratch_path = scratch_directory ++ "/data.db";
 
-/// Runs the benchmark when `filter` matches its name.
+/// Runs the benchmark when `filter` matches its name (`db/disk-state:keep`: see the file
+/// comment).
 pub fn run(io: std.Io, filter: ?[]const u8) void {
+    var keep = false;
     if (filter) |pattern| {
-        if (std.mem.indexOf(u8, name, pattern) == null) return;
+        keep = std.mem.eql(u8, pattern, name ++ ":keep");
+        if (!keep and std.mem.indexOf(u8, name, pattern) == null) return;
     }
-    run_os(io, std.heap.page_allocator, shape_bench) catch |err| {
+    run_os(io, std.heap.page_allocator, shape_bench, keep) catch |err| {
         std.debug.print("{s}: failed: {s}\n", .{ name, @errorName(err) });
     };
 }
 
-fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape) !void {
+/// Waits on the IO backend, then ticks the storage (el-run's driver).
+fn TickerType(comptime IO: type, comptime Storage: type) type {
+    return struct {
+        const Ticker = @This();
+        const tick_ns: u64 = 50 * std.time.ns_per_us;
+
+        backend: *IO,
+        storage: *Storage,
+
+        fn driver(ticker: *Ticker) to_disk.Driver {
+            return .{ .context = ticker, .tick = tick };
+        }
+
+        fn tick(context: *anyopaque) void {
+            const ticker: *Ticker = @ptrCast(@alignCast(context));
+            ticker.backend.run_for_ns(tick_ns) catch |err| {
+                std.debug.panic("{s}: io: {t}", .{ name, err });
+            };
+            ticker.storage.tick();
+        }
+    };
+}
+
+fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape, keep: bool) !void {
     const IO = io_root.IO;
     if (builtin.os.tag != .linux) return;
     var backend = IO.init(.{}) catch |err| {
@@ -869,13 +1105,13 @@ fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape) !void {
     defer backend.deinit();
     const directory = std.Io.Dir.cwd();
     try directory.createDirPath(io, scratch_directory);
-    defer directory.deleteDir(io, scratch_directory) catch |err| {
+    defer if (!keep) directory.deleteDir(io, scratch_directory) catch |err| {
         std.debug.print("{s}: cannot remove {s}: {s}\n", .{
             name, scratch_directory, @errorName(err),
         });
     };
-    delete_scratch(io);
-    defer delete_scratch(io);
+    if (!keep) delete_scratch(io);
+    defer if (!keep) delete_scratch(io);
     const fd = try backend.open_file(scratch_path, .create);
     defer backend.close_now(fd);
     const Storage = IoStorageType(IO);
@@ -887,8 +1123,18 @@ fn run_os(io: std.Io, allocator: std.mem.Allocator, shape: Shape) !void {
     });
     defer storage.deinit(allocator);
     var file: File = .{ .fd = fd };
-    const drop: Drop = .{ .context = &file, .drop = File.drop };
-    try run_on(Storage, allocator, io, &storage, source, config, drop, true);
+    var ticker: TickerType(IO, Storage) = .{ .backend = &backend, .storage = &storage };
+    const setup: Setup(Storage) = .{
+        .storage = &storage,
+        .driver = ticker.driver(),
+        .drop = .{ .context = &file, .drop = File.drop },
+    };
+    try run_on(Storage, allocator, io, setup, source, config, keep, true);
+}
+
+fn sim_tick(context: *anyopaque) void {
+    const storage: *SimStorage = @ptrCast(@alignCast(context));
+    storage.tick();
 }
 
 const File = struct {
@@ -929,11 +1175,18 @@ test "disk state bench: a small state imports and blocks apply over SimStorage" 
     shape.disk_state.record_write_bytes_max = record_writes_max * branch_record.value_bytes_max;
     shape.disk_state.replay_record_writes_max =
         record_writes_max * (2 * shape.chain.reorg_depth_max + 1);
+    shape.flat_prefetch_keys_max = 512;
+    shape.flat_prefetch_reads_max = 8;
     const config = try database_config(SimStorage, &source, shape);
     var storage = try SimStorage.init(allocator, .{
         .size_bytes = config.engine.size_bytes(),
         .seed = 5,
     });
     defer storage.deinit(allocator);
-    try run_on(SimStorage, allocator, std.testing.io, &storage, source, config, null, false);
+    const setup: Setup(SimStorage) = .{
+        .storage = &storage,
+        .driver = .{ .context = &storage, .tick = sim_tick },
+        .drop = null,
+    };
+    try run_on(SimStorage, allocator, std.testing.io, setup, source, config, false, false);
 }
