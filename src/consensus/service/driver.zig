@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 
 const protocol = @import("../protocol/root.zig");
 const task = @import("../engine/task.zig");
+const attributes_match = @import("../engine/attributes_match.zig");
+const chains = @import("../../common/chains/root.zig");
 const conf_depth = @import("conf_depth.zig");
 const derive_errors = @import("../derive/errors.zig");
 const pipeline_module = @import("../derive/pipeline.zig");
@@ -217,6 +219,19 @@ fn optional(comptime T: type, result: ProviderError!T) ProviderError!?T {
     };
 }
 
+/// Post-Canyon EIP-1559 parameters that consolidation substitutes for all-zero Holocene
+/// `eip1559Params` (base/base `chain_op_config.post_canyon_params()`): the built-in chain's,
+/// else Base mainnet's (the rollup JSON's `chain_op_config` is not read).
+fn fee_params_canyon(l2_chain_id: u64) attributes_match.FeeParams {
+    const chain = chains.by_chain_id(l2_chain_id) orelse
+        return attributes_match.fee_params_canyon_default;
+    assert(chain.eip1559_elasticity > 0 and chain.eip1559_denominator_canyon > 0);
+    return .{
+        .elasticity = chain.eip1559_elasticity,
+        .denominator = chain.eip1559_denominator_canyon,
+    };
+}
+
 pub const Driver = struct {
     allocator: Allocator,
     rollup: *const RollupConfig,
@@ -265,7 +280,10 @@ pub const Driver = struct {
         assert(rollup.block_time > 0 or rollup.denim_timestamp_schedule() != null);
         const genesis = rollup.genesis;
         const start_origin: BlockInfo = .{ .hash = genesis.l1.hash, .number = genesis.l1.number };
-        const context: @import("../engine/task.zig").Context = .{ .rollup = rollup };
+        const context: task.Context = .{
+            .rollup = rollup,
+            .fee_params_canyon = fee_params_canyon(rollup.l2_chain_id),
+        };
         var queue = try EngineTaskQueue.init(allocator, context, .{}, options.queue);
         errdefer queue.deinit(allocator);
         var finalizer = try Finalizer.init(allocator, options.finalizer_capacity);
@@ -966,6 +984,21 @@ fn run_startup(scenario: *Scenario) void {
         scenario.driver.tick(scenario.providers(), ms(Scenario.genesis_time + 20));
     }
     assert(scenario.driver.phase != .starting);
+}
+
+test "driver: consolidation compares with the chain's post-Canyon EIP-1559 parameters" {
+    var scenario: Scenario = undefined;
+    try scenario.init(.{});
+    defer scenario.deinit();
+    const default = attributes_match.fee_params_canyon_default;
+    try testing.expect(scenario.driver.queue.context.fee_params_canyon.eql(default));
+    // Base Sepolia: elasticity 10, not Base mainnet's 6.
+    scenario.driver.deinit();
+    scenario.rollup.l2_chain_id = chains.sepolia.chain_id;
+    const rollup = &scenario.rollup;
+    try scenario.driver.init(testing.allocator, rollup, &scenario.schedule, &scenario.safe_db, .{});
+    const sepolia = scenario.driver.queue.context.fee_params_canyon;
+    try testing.expect(sepolia.eql(.{ .elasticity = 10, .denominator = 250 }));
 }
 
 test "driver: startup unwinds a safe head whose L1 data a reorg orphaned" {
