@@ -8,8 +8,9 @@
 //! `--test-head` (test-only, needs `--state-root`) skips headers: the head and its 255
 //! ancestors get synthetic hashes, so the file opens but must not execute real blocks.
 //!
-//! Sizing comes from the MDBX counts (`to_disk.sizing`); the counts are written next to the
-//! database as `<path>.counts` (`to_disk.Counts.encode`), and every open must size from them.
+//! Sizing comes from the MDBX counts and the newest node shape (`to_disk.node_shape`); both
+//! are written next to the database as `<path>.counts` (`to_disk.Counts.encode`), and every
+//! open must size from them.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -68,7 +69,7 @@ pub fn run(init: std.process.Init, options: Options, reader: *mdbx.Reader, numbe
     }
     std.debug.print("expected state root {x}\n", .{expected});
     const counts = try counts_of(init.gpa, reader);
-    const sizing = to_disk.sizing(Storage, counts, to_disk.shape_node) catch |err| {
+    const sizing = to_disk.sizing(Storage, counts, to_disk.node_shape(counts)) catch |err| {
         std.debug.print("cannot size the database: {t} (codes need u64 limits: plan step 9)\n", .{
             err,
         });
@@ -242,8 +243,9 @@ fn counts_of(gpa: std.mem.Allocator, reader: *mdbx.Reader) !to_disk.Counts {
 fn print_sizing(sizing: *const to_disk.Sizing) void {
     const config = &sizing.config;
     const block_size = config.engine.checkpoint_block_size;
-    std.debug.print("sizing: {d} accounts, {d} slots, {d} codes ({d} MiB); branch records " ++
-        "sized for {d} account-trie, {d} storage-trie\n", .{
+    std.debug.print("sizing: node shape {t}, {d} accounts, {d} slots, {d} codes ({d} MiB); " ++
+        "branch records sized for {d} account-trie, {d} storage-trie\n", .{
+        sizing.counts.shape,
         sizing.counts.accounts,
         sizing.counts.slots,
         sizing.counts.codes,
@@ -482,7 +484,7 @@ fn reopen(
     var buffer: [to_disk.Counts.encoded_size]u8 = undefined;
     const bytes = try Io.Dir.cwd().readFile(init.io, counts_path, &buffer);
     const counts = try to_disk.Counts.decode(bytes);
-    const sizing = try to_disk.sizing(Storage, counts, to_disk.shape_node);
+    const sizing = try to_disk.sizing(Storage, counts, to_disk.node_shape(counts));
     var opened = try Opened.init(gpa, backend, path, sizing.config, false);
     defer opened.deinit(gpa, backend);
     var ticker: Ticker = .{ .backend = backend, .storage = opened.storage };

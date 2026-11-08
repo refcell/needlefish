@@ -334,7 +334,7 @@ pub const Config = struct {
     /// Entries waiting for the engine.
     queue_entries_max: u32,
     /// Largest serialized checkpoint (snapshot plus retained blocks).
-    checkpoint_staging_bytes: u32,
+    checkpoint_staging_bytes: u64,
     /// Checkpoint bytes written per durable commit (rounded up to whole checkpoint blocks);
     /// 0 writes a checkpoint as fast as the storage allows. Choose it so a whole checkpoint
     /// (`checkpoint_staging_bytes`) finishes within the commits that fit in half the journal;
@@ -630,8 +630,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         queue_head: u32 = 0,
         queue_count: u32 = 0,
         staging: []u8,
-        staging_len: u32 = 0,
-        staging_position: u32 = 0,
+        staging_len: u64 = 0,
+        staging_position: u64 = 0,
         phase: Phase = .closed,
         head_info: HeadInfo = .{},
         /// Sequence of the newest journaled operation (queued, in flight, or durable).
@@ -894,7 +894,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 return;
             }
             @memcpy(self.staging[self.staging_len..][0..chunk.len], chunk);
-            self.staging_len += @intCast(chunk.len);
+            self.staging_len += chunk.len;
         }
 
         /// The newest checkpoint failed to verify; the engine streams the fallback next.
@@ -2194,7 +2194,7 @@ pub fn DatabaseType(comptime Storage: type) type {
         }
 
         /// Serializes header, state snapshot, and retained blocks into the staging buffer.
-        fn checkpoint_write(self: *Self) !u32 {
+        fn checkpoint_write(self: *Self) !u64 {
             assert(self.queue_count == 0);
             var position: usize = checkpoint_header_size;
             var filter: snapshot_module.CodeFilter = .{};

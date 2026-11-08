@@ -5,7 +5,7 @@
 //! `Shape.accounts` accounts, every `contract_every`-th a contract whose slot count comes from
 //! a skewed tier (most hold a few slots, a few hold hundreds of thousands), is streamed as
 //! reth `HashedAccounts` / `HashedStorages` entries through `to_disk.ImporterType` (the same
-//! bulk import the node's database comes from, sized by `to_disk.sizing` with `shape_node`),
+//! bulk import the node's database comes from, sized by `to_disk.sizing` with `shape_node_v2`),
 //! onto `IoStorage` over the OS backend (a scratch file under `.zig-cache/tmp`, deleted
 //! afterwards). The database is then reopened (an empty block cache) and the file's pages
 //! dropped from the OS page cache (`fadvise`), so the first blocks read cold.
@@ -1275,7 +1275,7 @@ fn run_os(
     const Storage = IoStorageType(IO);
     var source = try Source.init(allocator, shape);
     defer source.deinit(allocator);
-    const config = try database_config(Storage, &source, to_disk.shape_node);
+    const config = try database_config(Storage, &source, to_disk.shape_node_v2);
     var storage = try Storage.init(allocator, &backend, fd, .{
         .size_bytes = config.engine.size_bytes(),
     });

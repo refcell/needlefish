@@ -235,7 +235,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s} is not a counts record\n", .{counts_path});
         return 1;
     };
-    const sizing = try to_disk.sizing(Storage, counts, to_disk.shape_node);
+    const sizing = try to_disk.sizing(Storage, counts, to_disk.node_shape(counts));
     var backend = try snapshot_import_out.backend_init();
     defer backend.deinit();
     var opened = Opened.init(gpa, &backend, flags.db, sizing.config, false) catch |err| {

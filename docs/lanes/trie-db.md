@@ -557,6 +557,29 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   Past the new limits a block is refused (`CodeFull`, nothing written); a grid with no
   room for a flush skips it (`flushes_no_space`), the codes ride in the image, and a
   checkpoint that outgrows staging fails `CheckpointTooLarge` (reported, the head safe).
+- Node shape v2 (2026-11-08, for Base mainnet): v1's per-block bounds that the format
+  fixes fit a 40M gas block (Base mainnet's limit after Denim; sampled blocks use 1.7M at
+  the median, 12.6M at most) only when it is benign: one 40M gas block can change ~10k
+  scattered slots (>= 4,000 gas each) and write ~35k branch records (v1: 16,384), and a
+  70M gas block can encode a changeset past v1's 2 MiB entry; either refuses that block on
+  every retry, a node stuck for good. v2 (new imports; the counts record's magic
+  "nfsize02" names it, `to_disk.node_shape`; "nfsize01" files keep v1 byte for byte): 8
+  MiB entries (a 160M gas block's densest changeset is ~4.6 MB), 65,536 branch-record
+  writes per block with the smallest replay reserve the database accepts (9x, one largest
+  head move), 8,192 codes per block. The branch memtables grow 418k -> 1.19M entries (1.3
+  GiB each, four of them, lazy) and the checkpoint image's maximum with them: staging 3.3
+  -> 6.1 GiB at 2.6x Sepolia's counts, past u32, so `checkpoint_staging_bytes` and the
+  staging cursors are u64 (the engine already records u64 image sizes; v1's values do
+  not change). The grid, the trees' levels for the counts, and every other format field
+  are v1's. Not part of the format, so any later binary may raise them: changeset accounts
+  (16,384) and slots (65,536), sparse nodes and memo per block.
+- Mainnet ceilings (2026-11-08; 2.6x and 4x Base Sepolia's counts, v2): the trees' last
+  levels hold 8.9x (accounts) and 36x (slots) the keys at 2.6x before compaction runs out
+  of slots; the grid holds 1.7x the trees' estimate (Sepolia's trees fill 88% of theirs),
+  ~1.2 TB of growth at 2.6x, beyond the ~0.9 TB of free disk after the import; code limits
+  grow +2^23 codes / +8 GiB with no halving (2,093 of 3,652 tables at 2.6x). At ~10M slots
+  and ~1M accounts a day (Base's reported ~435 GB a year of state), the grid lasts over a
+  year and the disk ~15 months; nothing else in the shape depends on state size.
 - Import codes out of RAM (2026-11-08): the importer kept every snapshot code in the arena
   until its checkpoint flushed them (21.6 GiB on Base Sepolia; mainnet 2-4x). In pinned mode
   it now evicts every `code_batch_bytes` (1 GiB) of arena: `CodeStore.evict_start` flushes
@@ -1669,6 +1692,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-08: lsm: init no longer zeroes every table slot's filter and block list (14.8 GiB
   of the Sepolia node's 50.7 GiB). The lsm crash test starts from all-ones filters and block
   lists; dropping `slot_acquire`'s filter zeroing fails it.
+- 2026-11-08: node shape v2 for new imports (see Decisions); checkpoint staging is u64.
+  Tests: Base Sepolia's "nfsize01" record sizes its pinned layout and staging; v2 holds a
+  160M gas block's densest changeset and a scattered 40M gas block's branch writes (v1
+  does not); both shapes initialize; v2 at 2.6x imports, checkpoints and reopens on a real
+  file (ReleaseSafe VmHWM 3.46 GB, 2.40 GB reopened). Mutations caught: v1 record sized as
+  v2, "nfsize01" decoded as v2, v2 encoded as "nfsize01", v2 with v1's record writes, v2
+  with v1's entry size.
 - 2026-11-08: import codes out of RAM (see Decisions). ReleaseSafe import on a scratch file
   at Base Sepolia sizing with 3 GiB of synthetic codes: VmHWM 4.60 GB -> 2.52 GB (init 1.41
   GB + one 1 GiB batch); at 2.6x and 4x the counts with 1.2 GiB of codes: 3.42 and 5.08 GB.

@@ -23,7 +23,8 @@
 //!
 //! Sizing (`sizing`) derives the whole database config from the snapshot's counts and a
 //! `Shape`; the result is part of the on-disk format (tree layouts, grid size), so every open
-//! of the file must use the same counts (`Counts.encode` is the importer's sidecar record).
+//! of the file must use the same counts and shape (`Counts.encode` is the importer's sidecar
+//! record; its magic names the node shape, `node_shape`).
 //! Library code: storage ticks go through the caller's `Driver`, no clock or file access here.
 
 const std = @import("std");
@@ -50,23 +51,38 @@ const BranchNode = @import("../trie/root.zig").BranchNode;
 
 pub const block_hashes_max = state_module.block_hashes_max;
 
-/// The snapshot's counts: everything sizing needs.
+/// The node shape a database was sized with (its counts record's magic). A file keeps its
+/// shape for life; new imports take the newest (`node_shape`).
+pub const ShapeVersion = enum(u8) {
+    /// Base Sepolia's file (before 2026-11-08): per-block bounds for ~40M gas blocks.
+    v1 = 1,
+    /// Per-block bounds for blocks of 4x Base mainnet's 40M gas limit (`shape_node_v2`).
+    v2 = 2,
+};
+
+/// The snapshot's counts, and the shape they size: everything sizing needs.
 pub const Counts = struct {
     accounts: u64,
     slots: u64,
     codes: u64,
     code_bytes: u64,
+    shape: ShapeVersion = .v2,
 
-    /// magic u64, then the four counts, little-endian.
+    /// magic u64 (names the shape), then the four counts, little-endian.
     pub const encoded_size: u32 = 8 + 4 * 8;
-    /// "nfsize01" read as a little-endian u64.
-    const magic: u64 = 0x3130_657a_6973_666e;
+    /// "nfsize01" and "nfsize02" read as little-endian u64s.
+    const magic_v1: u64 = 0x3130_657a_6973_666e;
+    const magic_v2: u64 = 0x3230_657a_6973_666e;
     /// Larger counts are refused (a damaged sidecar, not a chain).
     pub const count_max: u64 = 1 << 40;
 
     pub fn encode(counts: Counts) [encoded_size]u8 {
         assert(counts.valid());
         var out: [encoded_size]u8 = undefined;
+        const magic = switch (counts.shape) {
+            .v1 => magic_v1,
+            .v2 => magic_v2,
+        };
         std.mem.writeInt(u64, out[0..8], magic, .little);
         std.mem.writeInt(u64, out[8..16], counts.accounts, .little);
         std.mem.writeInt(u64, out[16..24], counts.slots, .little);
@@ -77,8 +93,13 @@ pub const Counts = struct {
 
     pub fn decode(bytes: []const u8) error{InvalidCounts}!Counts {
         if (bytes.len != encoded_size) return error.InvalidCounts;
-        if (std.mem.readInt(u64, bytes[0..8], .little) != magic) return error.InvalidCounts;
+        const shape: ShapeVersion = switch (std.mem.readInt(u64, bytes[0..8], .little)) {
+            magic_v1 => .v1,
+            magic_v2 => .v2,
+            else => return error.InvalidCounts,
+        };
         const counts: Counts = .{
+            .shape = shape,
             .accounts = std.mem.readInt(u64, bytes[8..16], .little),
             .slots = std.mem.readInt(u64, bytes[16..24], .little),
             .codes = std.mem.readInt(u64, bytes[24..32], .little),
@@ -138,9 +159,19 @@ comptime {
 const node_record_writes_max: u32 = 1 << 14;
 const node_reorg_depth_max: u32 = 4;
 
-/// The node's shape: the node's durable journal, chain and per-block limits, with a shallow
-/// reorg depth (each branch tree's memtable holds `record_writes_max` per movable block).
-pub const shape_node: Shape = .{
+/// The node's shape for a database's counts record (`Counts.shape`): every open of a file
+/// must size it with the shape it was imported with.
+pub fn node_shape(counts: Counts) Shape {
+    return switch (counts.shape) {
+        .v1 => shape_node_v1,
+        .v2 => shape_node_v2,
+    };
+}
+
+/// The node's first shape (frozen: Base Sepolia's file is laid out by it): the node's durable
+/// journal, chain and per-block limits, with a shallow reorg depth (each branch tree's
+/// memtable holds `record_writes_max` per movable block).
+pub const shape_node_v1: Shape = .{
     .block_size = 64 * 1024,
     .journal_size_bytes = 64 << 20,
     .entry_body_size_max = 2 << 20,
@@ -192,6 +223,31 @@ pub const shape_node: Shape = .{
     .code_pin_bytes = @as(u64, block_codes_max) * code_size_max,
     .code_pins_max = block_codes_max,
     .code_cache_blocks = 4096,
+};
+
+const node_v2_record_writes_max: u32 = 1 << 16;
+
+/// The node's shape for new imports. v1's per-block bounds that are part of the format (the
+/// journal entry body, the branch trees' per-block reserve in their memtables, which the
+/// checkpoint zone is sized for) fit a 40M gas block only when it is benign: one block of
+/// 40M gas (Base mainnet's limit after Denim) can change ~10k scattered slots, 4,000 gas
+/// each at least, and so write ~35k branch records (v1: 16,384); a 70M gas block can
+/// encode a changeset past v1's 2 MiB entry. Either refuses the block, and every retry of
+/// it, for good. v2: entries of 8 MiB (a 160M gas block's densest changeset, ~4.6 MB) and
+/// 65,536 branch-record writes per block, with the smallest replay reserve the database
+/// accepts (one largest head move). Bounds that are not part of the format (the
+/// changeset's accounts and slots, sparse nodes, memo) can grow in any later binary.
+pub const shape_node_v2: Shape = blk: {
+    var shape = shape_node_v1;
+    shape.entry_body_size_max = 8 << 20;
+    // 160M gas creates at most 5,000 codes (32,000 gas each).
+    shape.changeset.codes_max = 1 << 13;
+    const move_blocks_max = 2 * @as(u32, shape.chain.reorg_depth_max) + 1;
+    shape.disk_state.record_writes_max = node_v2_record_writes_max;
+    shape.disk_state.record_write_bytes_max =
+        node_v2_record_writes_max * branch_record.value_bytes_max;
+    shape.disk_state.replay_record_writes_max = node_v2_record_writes_max * move_blocks_max;
+    break :blk shape;
 };
 
 pub const Sizing = struct {
@@ -373,8 +429,8 @@ fn size_checkpoint(comptime Storage: type, config: *database.Config) void {
         @as(u64, CodeStore.manifest_size_max(config.code_store_config().?)) +
         FlatTrees.checkpoint_size_max_of(config.flat_trees_config().?) + 8 +
         snapshot_max + chain_max;
-    assert(staging < std.math.maxInt(u32));
-    config.checkpoint_staging_bytes = @intCast(staging);
+    assert(staging > database.checkpoint_header_size);
+    config.checkpoint_staging_bytes = staging;
     const block_size = config.engine.checkpoint_block_size;
     const free_image = 2 * (std.math.divCeil(u64, config.engine.grid_block_count, 8) catch
         unreachable); // Non-zero divisor.

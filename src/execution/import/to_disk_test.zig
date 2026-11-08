@@ -631,7 +631,7 @@ test "to_disk: sizing at Base Sepolia scale" {
         .codes = 3_000_000,
         .code_bytes = 3 << 30,
     };
-    const sizing = try to_disk.sizing(SimStorage, counts, to_disk.shape_node);
+    const sizing = try to_disk.sizing(SimStorage, counts, to_disk.shape_node_v2);
     const config = sizing.config;
     try testing.expect(config.engine.grid_block_count > sizing.tree_blocks + sizing.code_blocks);
     // Each tree's layout holds its keys (`layout_of` asserts inside `sizing`).
@@ -651,14 +651,14 @@ test "to_disk: sizing at Base Sepolia scale" {
     var large = counts;
     large.codes = 4_765_573;
     large.code_bytes = 23_171_111_820;
-    const sized = try to_disk.sizing(SimStorage, large, to_disk.shape_node);
+    const sized = try to_disk.sizing(SimStorage, large, to_disk.shape_node_v2);
     try testing.expect(sized.config.state.code_bytes_max >= large.code_bytes);
     try testing.expect(sized.config.state.codes_max >= large.codes);
     try testing.expect(sized.code_blocks * config.engine.checkpoint_block_size >
         4 * large.code_bytes);
     var too_many = counts;
     too_many.codes = std.math.maxInt(u32);
-    const refused = to_disk.sizing(SimStorage, too_many, to_disk.shape_node);
+    const refused = to_disk.sizing(SimStorage, too_many, to_disk.shape_node_v2);
     try testing.expectError(error.CodesTooLarge, refused);
 }
 
@@ -780,7 +780,7 @@ test "to_disk: node sizing reserves its buffers without making them resident" {
         .codes = 4_766,
         .code_bytes = 23_171_112,
     };
-    var shape = to_disk.shape_node;
+    var shape = to_disk.shape_node_v2;
     shape.code_bytes_growth = 256 << 20;
     shape.codes_growth = 1 << 16;
     const sizing = try to_disk.sizing(SimStorage, counts, shape);
@@ -812,6 +812,7 @@ test "to_disk: counts round-trip; damaged encodings are refused (seeded)" {
             .slots = prng.below(to_disk.Counts.count_max + 1),
             .codes = prng.below(to_disk.Counts.count_max + 1),
             .code_bytes = prng.below(to_disk.Counts.count_max + 1),
+            .shape = if (prng.chance(1, 2)) .v1 else .v2,
         };
         var bytes = counts.encode();
         try testing.expectEqual(counts, try to_disk.Counts.decode(&bytes));
@@ -843,11 +844,11 @@ test "to_disk: code growth leaves a Base Sepolia sized file's format unchanged" 
         .codes = 4_765_573,
         .code_bytes = 23_171_111_820,
     };
-    var shape_format = to_disk.shape_node;
+    var shape_format = to_disk.shape_node_v1;
     shape_format.codes_growth = 0;
     shape_format.code_bytes_growth = 0;
     const format = (try to_disk.sizing(SimStorage, counts, shape_format)).config;
-    const grown = (try to_disk.sizing(SimStorage, counts, to_disk.shape_node)).config;
+    const grown = (try to_disk.sizing(SimStorage, counts, to_disk.shape_node_v1)).config;
     // The superblock layout of the Base Sepolia node's file (before code growth existed),
     // checked byte for byte at open (`LayoutMismatch`), and what its checkpoints encode.
     const layout = grown.engine.layout();
@@ -861,6 +862,18 @@ test "to_disk: code growth leaves a Base Sepolia sized file's format unchanged" 
         std.mem.asBytes(&format.engine.layout()),
         std.mem.asBytes(&layout),
     );
+    // Base Sepolia's counts record ("nfsize01") names v1, which sizes that same layout.
+    var record = counts.encode();
+    @memcpy(record[0..8], "nfsize01");
+    const sidecar = try to_disk.Counts.decode(&record);
+    try testing.expectEqual(to_disk.ShapeVersion.v1, sidecar.shape);
+    const opened = (try to_disk.sizing(SimStorage, sidecar, to_disk.node_shape(sidecar))).config;
+    try testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&opened.engine.layout()),
+        std.mem.asBytes(&layout),
+    );
+    try testing.expectEqual(grown.checkpoint_staging_bytes, opened.checkpoint_staging_bytes);
     try testing.expectEqual(@as(u32, 1408), grown.code_tables_max);
     try testing.expectEqual(format.code_tables_max, grown.code_tables_max);
     try testing.expectEqual(@as(u32, 2_533_551_498), grown.checkpoint_staging_bytes);
@@ -888,7 +901,7 @@ test "to_disk: code growth is halved until every code fits three quarters of the
             .codes = codes,
             .code_bytes = codes * prng.range(1, 24_576),
         };
-        var shape = to_disk.shape_node;
+        var shape = to_disk.shape_node_v2;
         shape.codes_growth = @intCast(prng.range(0, 1 << 24));
         shape.code_bytes_growth = prng.range(0, 64 << 30);
         var shape_format = shape;
@@ -1142,4 +1155,60 @@ test "to_disk: a batch the arena cannot drain is refused" {
     var chain: to_disk.HeaderChain = .{};
     try synthetic_chain(source.root, &chain);
     try testing.expectError(error.CodesNotEvicted, import_into(&importer, &source, &chain));
+}
+
+// The node's shapes (`to_disk.node_shape`).
+
+test "to_disk: new imports take shape v2; its per-block bounds hold a 160M gas block" {
+    // Base mainnet's estimate: 2.6x Base Sepolia's counts.
+    const counts: to_disk.Counts = .{
+        .accounts = 37_612_478 * 26 / 10,
+        .slots = 3_720_591_921 * 26 / 10,
+        .codes = 4_765_573 * 26 / 10,
+        .code_bytes = 23_171_111_820 * 26 / 10,
+    };
+    try testing.expectEqual(to_disk.ShapeVersion.v2, counts.shape);
+    const bytes = counts.encode();
+    try testing.expectEqualSlices(u8, "nfsize02", bytes[0..8]);
+    const shape = to_disk.node_shape(counts);
+    try testing.expectEqual(to_disk.shape_node_v2.entry_body_size_max, shape.entry_body_size_max);
+    const config = (try to_disk.sizing(SimStorage, counts, shape)).config;
+    const v1 = (try to_disk.sizing(SimStorage, counts, to_disk.shape_node_v1)).config;
+    // The trees and the grid are sized by the counts alone.
+    try testing.expectEqual(v1.engine.grid_block_count, config.engine.grid_block_count);
+    try testing.expect(config.engine.checkpoint_zone_size_bytes >=
+        v1.engine.checkpoint_zone_size_bytes);
+    // A 160M gas block: at least 4,000 gas per changed slot and 7,600 per changed account,
+    // 116 and 165 changeset bytes each: its changeset (slots are the densest) fits an entry.
+    const gas: u64 = 160_000_000;
+    const changeset_bytes = gas / 4_000 * 116;
+    try testing.expect(changeset_bytes + 64 * 1024 < config.engine.entry_body_size_max);
+    try testing.expect(v1.engine.entry_body_size_max < changeset_bytes);
+    // A scattered 40M gas block: ~10k slots, ~4 branch records each.
+    const writes: u64 = 40_000_000 / 4_000 * 4;
+    try testing.expect(writes <= config.disk_state.?.record_writes_max);
+    try testing.expect(writes > v1.disk_state.?.record_writes_max);
+    // The journal holds several of the largest entries; the chain ring a reorg's blocks.
+    try testing.expect(config.engine.journal_size_bytes >= 4 * config.engine.entry_body_size_max);
+    try testing.expect(config.chain_bytes_capacity() >=
+        (config.chain.reorg_depth_max + 1) * config.engine.entry_body_size_max);
+    // Both shapes size a database that initializes (every layout assert holds).
+    for ([_]to_disk.Shape{ to_disk.shape_node_v1, to_disk.shape_node_v2 }) |node_shape| {
+        const small: to_disk.Counts = .{
+            .accounts = 1 << 16,
+            .slots = 1 << 20,
+            .codes = 1 << 10,
+            .code_bytes = 1 << 24,
+        };
+        const sized = (try to_disk.sizing(SimStorage, small, node_shape)).config;
+        const disk = try lazy.alloc(testing.allocator, u8, sized.engine.size_bytes());
+        defer lazy.free(testing.allocator, disk);
+        var sim: SimStorage = undefined;
+        sim.durable = disk;
+        sim.memory = disk;
+        const db = try testing.allocator.create(Database);
+        defer testing.allocator.destroy(db);
+        db.* = try Database.init(testing.allocator, &sim, sized);
+        db.deinit(testing.allocator);
+    }
 }
