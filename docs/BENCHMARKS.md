@@ -292,23 +292,23 @@ reset, for 20 ms of warm-up and 20 ms timed per case and process
 the same gas used. Speedup is the ratio of median µs per transaction over fresh processes,
 above 1 meaning the first engine is faster; the summary is the geometric mean over cases.
 
-| pair | P0 (before) | P1 (register locals) |
-| --- | ---: | ---: |
-| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x |
-| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x |
-| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x |
-| needlefish ReleaseFast vs evm2 tail-call + keccak memo | 0.70x | 0.81x |
-| evm2 tail-call vs revm | 1.25x | 1.25x |
+| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) |
+| --- | ---: | ---: | ---: |
+| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x |
+| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x |
+| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x |
+| needlefish ReleaseFast vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x |
+| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x |
 
-| case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | evm2 µs | P1 speedup |
-| --- | ---: | ---: | ---: | ---: |
-| fibonacci-calldata | 63.8 | 42.0 | 27.3 | 0.65x |
-| snailtracer | 80,352 | 63,842 | 49,770 | 0.78x |
-| burntpix | 71,941 | 45,507 | 35,442 | 0.78x |
-| uniswap_v3_pool | 25.1 | 21.6 | 16.3 | 0.76x |
-| erc20_transfer | 13,230 | 12,822 | 6,208 | 0.48x |
-| hash_10k | 8,383 | 8,206 | 3,413 | 0.42x |
-| counter | 1.00 | 0.99 | 1.51 | 1.52x |
+| case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | P2 µs | evm2 µs | P2 speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fibonacci-calldata | 63.8 | 42.0 | 23.7 | 26.7 | 1.13x |
+| snailtracer | 80,352 | 63,842 | 51,852 | 47,711 | 0.92x |
+| burntpix | 71,941 | 45,507 | 30,609 | 34,035 | 1.11x |
+| uniswap_v3_pool | 25.1 | 21.6 | 17.8 | 16.3 | 0.91x |
+| erc20_transfer | 13,230 | 12,822 | 11,979 | 6,119 | 0.51x |
+| hash_10k | 8,383 | 8,206 | 7,372 | 3,404 | 0.46x |
+| counter | 1.00 | 0.99 | 0.83 | 1.41 | 1.70x |
 
 - *evm2 tail-call* is evm2's default on nightly Rust (`become` handlers with the
   `preserve_none` calling convention); *packed* is its stable-Rust dispatch. The *memo*
@@ -316,12 +316,20 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   enable; needlefish has no memo, and the keccak-bound cases (erc20_transfer, hash_10k) are
   where it trails most.
 - needlefish wins every tiny transaction (counter, airdrop, eip2935, eip4788, fiat_token,
-  push0_proxy, uniswap_v2_pair, usdc_proxy: 1.3-1.5x), where per-transaction setup
+  push0_proxy, uniswap_v2_pair, usdc_proxy: 1.5-1.7x at P2), where per-transaction setup
   dominates.
-- P1 keeps pc, gas and the stack in locals between opcodes that need nothing else; see the
-  evm lane. P2 (tail-call handlers) and P3 (keccak) follow.
+- P1 keeps pc, gas and the stack in locals between opcodes that need nothing else. P2 writes
+  every stack result with one 32-byte store, keeps pc and stack length 64-bit, charges gas
+  with one subtract and a borrow branch, and checks only the stack bound an opcode can cross
+  (see the evm lane). A tail-call dispatch backend like evm2's was built and measured for P2
+  and ran 5-14% slower than the labeled `switch`, which already compiles to threaded
+  dispatch in Zig; it was not kept. P3 (keccak) follows.
+- P2 also skips clearing an empty transient-storage table in the untimed state reset (as each
+  transaction start already did); measured alone, it moves the timed transaction 0-4%
+  (warmer caches), mostly on the small cases.
 - Measured 2026-11-08 on the 4-vCPU cloud VM, pinned to one CPU but not isolated; P0 is 3
-  rounds and P1 5 rounds, so per-case intervals are wide (printed by `stats.zig --cases`).
+  rounds, P1 and P2 5 rounds, so per-case intervals are wide (printed by
+  `stats.zig --cases`).
 
 ### Memory and size
 

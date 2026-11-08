@@ -325,7 +325,8 @@ pub const State = struct {
         state.database = database;
         state.accounts.clearRetainingCapacity();
         state.slots.clearRetainingCapacity();
-        state.transient.clearRetainingCapacity();
+        // As in `begin_transaction`: an empty map has no tombstones, so skip the memset.
+        if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;

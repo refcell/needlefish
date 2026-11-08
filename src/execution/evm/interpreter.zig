@@ -32,11 +32,13 @@ const Exit = evm_module.Exit;
 const CallKind = evm_module.CallKind;
 
 const Stack = stack_module.Stack;
+const write = stack_module.write;
 
 /// Interpreter state kept in machine registers between opcodes; `Frame` holds the
 /// authoritative copy only at sync points and when `run` returns.
 const Registers = struct {
-    pc: u32,
+    /// 64 bits like `Stack.len`: no zero extension when indexing the code (`Frame.pc` is u32).
+    pc: u64,
     gas: u64,
     stack: Stack,
 };
@@ -62,7 +64,7 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
             },
         }
     }
-    f.pc = r.pc;
+    f.pc = @intCast(r.pc);
     f.gas = r.gas;
     f.stack.len = r.stack.len;
     assert(f.stack.items == r.stack.items);
@@ -87,9 +89,16 @@ inline fn step(
     const inputs: u32 = comptime op.table[opcode].inputs;
     const outputs: u32 = comptime op.table[opcode].outputs;
     if (comptime inputs > 0 or outputs > 0) {
-        // One compare for both bounds: `len < inputs` wraps to a huge value, and otherwise
-        // `len - inputs + outputs > 1024` overflows the stack.
-        if (r.stack.len -% inputs > stack_module.limit - outputs) {
+        // One compare. An opcode that does not grow the stack can only underflow; one without
+        // inputs can only overflow; otherwise `len < inputs` wraps to a huge value and
+        // `len - inputs + outputs > 1024` overflows.
+        const out_of_bounds = if (comptime outputs <= inputs)
+            r.stack.len < inputs
+        else if (comptime inputs == 0)
+            r.stack.len > stack_module.limit - outputs
+        else
+            r.stack.len -% inputs > stack_module.limit - outputs;
+        if (out_of_bounds) {
             @branchHint(.cold);
             exit.* = if (r.stack.len < inputs) .stack_underflow else .stack_overflow;
             return false;
@@ -97,19 +106,23 @@ inline fn step(
     }
     const cost = comptime gas.static_cost(fork, opcode);
     if (comptime cost > 0) {
-        if (r.gas < cost) {
+        // Subtract, then branch on the borrow: one `sub` and one `jb`, as evm2 compiles it.
+        // On out-of-gas the register keeps the wrapped value; a halted frame's remaining gas
+        // is 0 whatever the register holds (`Evm.finish_frame`).
+        const remaining = @subWithOverflow(r.gas, cost);
+        r.gas = remaining[0];
+        if (remaining[1] != 0) {
             @branchHint(.cold);
             exit.* = .out_of_gas;
             return false;
         }
-        r.gas -= cost;
     }
     r.pc += 1;
     if (comptime in_registers(opcode)) {
         return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
     }
     // Sync point: the opcode reads or writes frame state beyond the registers.
-    f.pc = r.pc;
+    f.pc = @intCast(r.pc);
     f.gas = r.gas;
     f.stack.len = r.stack.len;
     const result = execute(fork, opcode, f, evm);
@@ -171,16 +184,16 @@ inline fn execute_registers(
         op.SLT => binary(s, slt),
         op.SGT => binary(s, sgt),
         op.EQ => binary(s, eq),
-        op.ISZERO => s.peek(0).* = @intFromBool(s.peek(0).* == 0),
+        op.ISZERO => write(s.peek(0), @intFromBool(s.peek(0).* == 0)),
         op.AND => binary(s, bit_and),
         op.OR => binary(s, bit_or),
         op.XOR => binary(s, bit_xor),
-        op.NOT => s.peek(0).* = ~s.peek(0).*,
+        op.NOT => write(s.peek(0), ~s.peek(0).*),
         op.BYTE => binary(s, byte),
         op.SHL => binary(s, shl),
         op.SHR => binary(s, shr),
         op.SAR => binary(s, sar),
-        op.CLZ => s.peek(0).* = @clz(s.peek(0).*),
+        op.CLZ => write(s.peek(0), @clz(s.peek(0).*)),
         op.PUSH0 => s.push(0),
         op.PUSH1...op.PUSH32 => push(opcode - op.PUSH1 + 1, r, analyzed),
         op.DUP1...op.DUP16 => s.dup(opcode - op.DUP1 + 1),
@@ -215,7 +228,7 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
         op.ADDRESS...op.BLOBBASEFEE => return environment(fork, opcode, f, evm),
         op.SLOAD => return sload(fork, f, evm),
         op.SSTORE => return sstore(fork, f, evm),
-        op.TLOAD => s.peek(0).* = evm.state.transient_load(f.address, s.peek(0).*),
+        op.TLOAD => write(s.peek(0), evm.state.transient_load(f.address, s.peek(0).*)),
         op.TSTORE => return tstore(f, evm),
         op.LOG0...op.LOG4 => return log(opcode - op.LOG0, f, evm),
         op.CREATE => return create(fork, false, f, evm),
@@ -237,14 +250,14 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
 inline fn binary(s: *Stack, comptime function: anytype) void {
     const a = s.pop();
     const b = s.peek(0);
-    b.* = function(a, b.*);
+    write(b, function(a, b.*));
 }
 
 inline fn ternary(s: *Stack, comptime function: anytype) void {
     const a = s.pop();
     const b = s.pop();
     const c = s.peek(0);
-    c.* = function(a, b, c.*);
+    write(c, function(a, b, c.*));
 }
 
 pub fn add(a: u256, b: u256) u256 {
@@ -319,7 +332,7 @@ fn exp(comptime fork: Fork, f: *Frame) ?Exit {
     const cost = gas.exp_cost(fork, power.*) - gas.high;
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
-    power.* = exponent(base, power.*);
+    write(power, exponent(base, power.*));
     return null;
 }
 
@@ -413,7 +426,7 @@ inline fn memory_op(comptime opcode: u8, s: *Stack, memory: *Memory, gas_left: *
         op.MLOAD => {
             const offset = s.peek(0);
             const range = memory_range(memory, gas_left, offset.*, 32) orelse return false;
-            offset.* = primitives.word_from_be(memory.word(range.offset));
+            write(offset, primitives.word_from_be(memory.word(range.offset)));
         },
         op.MSTORE => {
             const offset = s.pop();
@@ -458,7 +471,7 @@ fn keccak(f: *Frame) ?Exit {
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
     const data = f.memory.slice(range.offset, range.size);
-    size.* = primitives.b256_to_u256(primitives.keccak256(data));
+    write(size, primitives.b256_to_u256(primitives.keccak256(data)));
     return null;
 }
 
@@ -539,7 +552,7 @@ inline fn environment_value(
         op.CALLDATALOAD => {
             var word: [32]u8 = undefined;
             memory_module.copy_padded(&word, f.input, s.peek(0).*);
-            s.peek(0).* = primitives.word_from_be(&word);
+            write(s.peek(0), primitives.word_from_be(&word));
         },
         op.CALLDATASIZE => s.push(f.input.len),
         op.CODESIZE => s.push(f.analyzed.len),
@@ -595,10 +608,10 @@ inline fn block_value(comptime fork: Fork, comptime opcode: u8, s: *Stack, evm: 
         op.BLOBHASH => {
             const index = s.peek(0);
             const hashes = evm.tx.blob_hashes;
-            index.* = if (index.* < hashes.len)
+            write(index, if (index.* < hashes.len)
                 primitives.b256_to_u256(hashes[@intCast(index.*)])
             else
-                0;
+                0);
         },
         op.BLOBBASEFEE => s.push(evm.block.blob_base_fee),
         else => comptime unreachable,
@@ -660,11 +673,11 @@ fn block_hash(f: *Frame, evm: *Evm) ?Exit {
     const number = f.stack.peek(0);
     const current = evm.block.number;
     if (number.* >= current or current - number.* > 256) {
-        number.* = 0;
+        write(number, 0);
         return null;
     }
     const hash = evm.state.block_hash(@intCast(number.*)) catch |err| return evm.fail(err);
-    number.* = primitives.b256_to_u256(hash);
+    write(number, primitives.b256_to_u256(hash));
     return null;
 }
 
@@ -677,7 +690,7 @@ fn sload(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
         if (f.gas < gas.cold_sload_extra) return .out_of_gas;
         f.gas -= gas.cold_sload_extra;
     }
-    key.* = access.slot.present;
+    write(key, access.slot.present);
     return null;
 }
 

@@ -341,6 +341,18 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   one compare (`len -% inputs > 1024 - outputs`). Steps return a `bool` continue flag with the
   exit in a local: a `?Exit` result compiled to a load from a constant global plus a branch on
   every opcode (~8% of snailtracer).
+- P2: tail-call handlers measured and rejected. A full `preserve_none` +
+  `@call(.always_tail)` backend (one handler per fork and opcode, registers as arguments)
+  passed every evm2 fixture but ran 5-14% slower than the P1 switch on every one: Zig's
+  labeled `switch` already compiles to threaded dispatch (an indirect jump per arm), which is
+  what evm2's tail calls buy over its central loop. The gap to evm2 was inside the handlers,
+  found by comparing disassembly: (1) results written as four 8-byte stores (an ADD was four
+  `adc`s to memory) that the next DUP/SWAP's 32-byte load cannot forward from, so
+  `stack.write` stores a word with one `vmovdqu` (inline asm on x86-64 + AVX; LLVM splits a
+  plain vector store again); (2) a 32-bit pc and stack length zero-extended on every opcode
+  (now u64); (3) gas as compare + subtract (now `@subWithOverflow` and a borrow branch);
+  (4) stack checks narrowed per opcode (underflow only when the stack cannot grow). Together
+  fibonacci 42 -> 24 us (evm2 tail-call 27) on B1.
 - Static allocation: frames, 1025 stacks, shared memory, analysis arena, return buffer, journal,
   logs, code store and state maps are sized at init. Exceeding a state/journal limit is
   `error.StateFull` (fatal block error, never silent divergence). Memory growth past
@@ -373,6 +385,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   vs evm2's tail-call build on its 31 fixtures, ReleaseFast geometric mean 0.77x -> 0.89x
   (1.04x vs evm2's stable build); docs/BENCHMARKS.md "EVM vs evm2". EEST stable and develop
   state tests still pass. Next: P2 tail-call handlers.
+- 2026-11-08: P2: tail calls rejected (slower than the switch in Zig); single-store stack
+  writes, 64-bit registers, borrow-checked gas, narrower stack checks instead. Next: P3 keccak.
 - 2026-11-06: paused (project paused by owner). Last pushed work: 23575ed5 (EIP-7702
   delegation fuzz). Next on resume: lookup-count profiling (first unchecked backlog item).
 - 2026-11-05: 64-bit-limb big-endian word loads (MLOAD/MSTORE/PUSH/CALLDATALOAD):
