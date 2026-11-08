@@ -16,22 +16,46 @@ const assert = std.debug.assert;
 pub const lazy_bytes_min = 64 * 1024;
 
 pub fn alloc(allocator: std.mem.Allocator, comptime T: type, count: usize) error{OutOfMemory}![]T {
-    const size_bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
-    if (size_bytes < lazy_bytes_min) return allocator.alloc(T, count);
-    const alignment: std.mem.Alignment = .of(T);
-    const bytes = allocator.rawAlloc(size_bytes, alignment, @returnAddress()) orelse
-        return error.OutOfMemory;
-    const items: [*]T = @ptrCast(@alignCast(bytes));
-    assert(@intFromPtr(items) % @alignOf(T) == 0);
-    return items[0..count];
+    return alloc_aligned(allocator, T, .of(T), count);
 }
 
 pub fn free(allocator: std.mem.Allocator, items: anytype) void {
     const T = @typeInfo(@TypeOf(items)).pointer.child;
+    free_aligned(allocator, .of(T), items);
+}
+
+/// `alloc` with an alignment of at least `T`'s (sector-aligned IO buffers).
+pub fn alloc_aligned(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    comptime alignment: std.mem.Alignment,
+    count: usize,
+) error{OutOfMemory}![]align(alignment.toByteUnits()) T {
+    comptime assert(alignment.compare(.gte, .of(T)));
+    const size_bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.OutOfMemory;
+    if (size_bytes < lazy_bytes_min) return allocator.alignedAlloc(T, alignment, count);
+    const bytes = allocator.rawAlloc(size_bytes, alignment, @returnAddress()) orelse
+        return error.OutOfMemory;
+    const items: [*]align(alignment.toByteUnits()) T = @ptrCast(@alignCast(bytes));
+    assert(@intFromPtr(items) % alignment.toByteUnits() == 0);
+    return items[0..count];
+}
+
+/// Frees what `alloc_aligned` returned with the same `alignment`.
+pub fn free_aligned(
+    allocator: std.mem.Allocator,
+    comptime alignment: std.mem.Alignment,
+    items: anytype,
+) void {
+    const T = @typeInfo(@TypeOf(items)).pointer.child;
     const size_bytes = @sizeOf(T) * items.len;
-    if (size_bytes < lazy_bytes_min) return allocator.free(items);
+    if (size_bytes < lazy_bytes_min) {
+        const aligned: []align(alignment.toByteUnits()) const T = @alignCast(items);
+        return allocator.free(aligned);
+    }
+    assert(@intFromPtr(items.ptr) % alignment.toByteUnits() == 0);
     const bytes: [*]u8 = @ptrCast(@constCast(items.ptr));
-    allocator.rawFree(bytes[0..size_bytes], .of(T), @returnAddress());
+    allocator.rawFree(bytes[0..size_bytes], alignment, @returnAddress());
 }
 
 pub fn create(allocator: std.mem.Allocator, comptime T: type) error{OutOfMemory}!*T {
@@ -59,6 +83,19 @@ test "lazy: small and large allocations round-trip through the testing allocator
     defer destroy(allocator, big);
     big.bytes[0] = 4;
     try std.testing.expectEqual(@as(u8, 4), big.bytes[0]);
+}
+
+test "lazy: aligned allocations, small and large, round-trip" {
+    const allocator = std.testing.allocator;
+    const alignment = comptime std.mem.Alignment.fromByteUnits(4096);
+    const small = try alloc_aligned(allocator, u8, alignment, 512);
+    defer free_aligned(allocator, alignment, small);
+    const large = try alloc_aligned(allocator, u8, alignment, 1 << 20);
+    defer free_aligned(allocator, alignment, large);
+    try std.testing.expect(@intFromPtr(small.ptr) % 4096 == 0);
+    try std.testing.expect(@intFromPtr(large.ptr) % 4096 == 0);
+    large[large.len - 1] = 1;
+    small[0] = 2;
 }
 
 test "lazy: zero-length and overflowing requests" {
