@@ -367,6 +367,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   disables it. Same idea as alloy's `keccak-cache-global` that reth and evm2's bench enable,
   but owned and sized at init instead of process-global. B1 now pairs memo-off with evm2
   memo-off and memo-on with evm2 memo-on (`statetest --no-keccak-memo`).
+- P4 (state lookups): the account map and `MemoryDatabase`'s account and storage maps hash
+  the address folded into one word (`AddressContext`, as `StorageKeyContext` already did for
+  slots) instead of wyhash over the bytes. A/B vs P3 on the eight state-heavy fixtures, 7
+  rounds: geometric mean 1.02x (erc20_transfer 1.12x, curve_3pool 1.09x). State lookups are
+  ~6% of a contract-heavy profile, so the rest of the gap to evm2 there is elsewhere: 256-bit
+  division (`uint.div_rem` + `knuth_step`) is 6-20% on curve and uniswap_v3_pool.
 - Static allocation: frames, 1025 stacks, shared memory, analysis arena, return buffer, journal,
   logs, code store and state maps are sized at init. Exceeding a state/journal limit is
   `error.StateFull` (fatal block error, never silent divergence). Memory growth past
@@ -395,6 +401,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-08: P4: folded-address hashing for the account and in-memory database maps,
+  1.02x geometric mean on state-heavy fixtures; 256-bit division is the next gap to evm2.
 - 2026-11-08: P3 (AVX-512 Keccak-f, per-`Evm` keccak memo): vs evm2 tail-call on 15 rounds,
   ReleaseFast geometric mean 1.05x -> 1.13x memo-off (hash_10k 0.46x -> 0.97x,
   erc20_transfer 0.51x -> 0.92x), 1.07x with both memos on; ReleaseSafe 0.85x.

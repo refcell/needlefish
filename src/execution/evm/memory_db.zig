@@ -14,8 +14,8 @@ const StorageKey = state_module.StorageKey;
 
 pub const MemoryDatabase = struct {
     allocator: std.mem.Allocator,
-    accounts: std.AutoHashMapUnmanaged(Address, AccountInfo) = .empty,
-    storage: std.AutoHashMapUnmanaged(StorageKey, u256) = .empty,
+    accounts: state_module.AddressMap(AccountInfo) = .empty,
+    storage: state_module.StorageKeyMap(u256) = .empty,
     codes: std.AutoHashMapUnmanaged(B256, []const u8) = .empty,
     block_hashes: std.AutoHashMapUnmanaged(u64, B256) = .empty,
 

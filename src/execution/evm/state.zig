@@ -128,6 +128,32 @@ pub const StorageKeyContext = struct {
     }
 };
 
+/// Account map context: the 20-byte address folded into one 64-bit word and avalanched,
+/// compared as one integer. `AutoContext` hashes the bytes through wyhash and compares them
+/// element-wise.
+pub const AddressContext = struct {
+    pub fn hash(_: AddressContext, address: Address) u64 {
+        const word: u160 = @bitCast(address);
+        var folded: u64 = @truncate(word);
+        folded = (folded ^ @as(u64, @truncate(word >> 64))) *% StorageKeyContext.multiplier;
+        folded = (folded ^ @as(u64, @truncate(word >> 128))) *% StorageKeyContext.multiplier;
+        return StorageKeyContext.fmix64(folded);
+    }
+
+    pub fn eql(_: AddressContext, a: Address, b: Address) bool {
+        return @as(u160, @bitCast(a)) == @as(u160, @bitCast(b));
+    }
+};
+
+pub fn AddressMap(comptime V: type) type {
+    return std.HashMapUnmanaged(
+        Address,
+        V,
+        AddressContext,
+        std.hash_map.default_max_load_percentage,
+    );
+}
+
 pub fn StorageKeyMap(comptime V: type) type {
     return std.HashMapUnmanaged(
         StorageKey,
@@ -275,7 +301,7 @@ pub const StaticWarm = struct {
 pub const State = struct {
     database: Database,
     limits: Limits,
-    accounts: std.AutoHashMapUnmanaged(Address, Account) = .empty,
+    accounts: AddressMap(Account) = .empty,
     slots: StorageKeyMap(Slot) = .empty,
     transient: StorageKeyMap(u256) = .empty,
     journal: []Entry,
