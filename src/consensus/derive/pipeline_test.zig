@@ -593,6 +593,52 @@ test "pipeline: reset walks back one channel timeout" {
     try testing.expectError(error.NotAvailable, driver.pipeline.initial_reset(driver.chain, head));
 }
 
+/// An L2 provider that remembers only the block it fetched last and answers any other block
+/// with `NotAvailable` while it fetches it (one request in flight, a one-entry cache).
+const ForgetfulL2 = struct {
+    chain: *TestChain,
+    cached: ?Hash = null,
+    fetches: u32 = 0,
+
+    pub fn l2_block_info_by_hash(l2: *ForgetfulL2, hash: Hash) !L2BlockInfo {
+        if (l2.cached) |cached| {
+            if (cached.eql(hash)) return l2.chain.l2_block_info_by_hash(hash);
+        }
+        l2.cached = hash;
+        l2.fetches += 1;
+        return error.NotAvailable;
+    }
+
+    pub fn system_config_by_l2_hash(l2: *ForgetfulL2, hash: Hash) !SystemConfig {
+        return l2.chain.system_config_by_l2_hash(hash);
+    }
+};
+
+test "pipeline: a reset walk longer than the L2 cache resumes where it stopped" {
+    var scenario: Scenario = undefined;
+    scenario.init(16);
+    defer scenario.deinit();
+    var driver: Driver = undefined;
+    try driver.init(&scenario);
+    defer driver.deinit();
+    try driver.run_to_end();
+    const head = driver.cursor;
+    var forgetful: ForgetfulL2 = .{ .chain = driver.chain };
+    // Restarting from the safe head on every retry would evict and refetch forever.
+    const point = for (0..64) |_| {
+        break driver.pipeline.initial_reset(&forgetful, head) catch |err| {
+            try testing.expectEqual(error.NotAvailable, err);
+            continue;
+        };
+    } else return error.TestUnexpectedResult;
+    // Safe head origin 11, channel timeout 8: the first block with origin <= 3, as in the
+    // walk over an L2 provider that has every block.
+    try testing.expectEqual(@as(u64, 3), point.l1_origin.number);
+    // Each block of the walk was fetched once.
+    try testing.expect(forgetful.fetches > 1 and forgetful.fetches < head.block_info.number);
+    try testing.expect(driver.pipeline.reset_walk == null);
+}
+
 /// Runs the main scenario with random unavailable data and random resets for `seed`,
 /// then finishes without faults. Returns the executed blocks (caller frees).
 fn run_with_faults(seed: u64) ![]Record {

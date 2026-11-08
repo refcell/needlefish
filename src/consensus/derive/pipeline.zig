@@ -123,6 +123,13 @@ pub const Pipeline = struct {
     prepared: [prepared_max]AttributesWithParent = undefined,
     prepared_head: u32 = 0,
     prepared_count: u32 = 0,
+    /// The reset walk-back in progress (`initial_reset`), kept when an L2 block is not yet
+    /// available and resumed by the next retry for the same safe head. On 200 ms blocks a
+    /// channel timeout spans thousands of L2 blocks, more than an L2 provider caches, so a
+    /// walk restarted from the safe head on every retry would never finish.
+    reset_walk: ?ResetWalk = null,
+
+    const ResetWalk = struct { safe_hash: Hash, current: L2BlockInfo };
 
     /// Builds the stage stack starting at L1 `origin` with the genesis system config
     /// (base/base `PipelineBuilder`). Drivers usually send a reset before stepping.
@@ -284,7 +291,7 @@ pub const Pipeline = struct {
     /// open in the window are seen (base/base `initial_reset`). The Granite timeout switch
     /// uses the safe lower bound `l2 time - max sequencer drift` for the L1 origin time.
     pub fn initial_reset(
-        pipeline: *const Pipeline,
+        pipeline: *Pipeline,
         l2: anytype,
         l2_safe_head: L2BlockInfo,
     ) Error!ResetPoint {
@@ -297,10 +304,19 @@ pub const Pipeline = struct {
         // Each step moves to the parent block, so the walk ends at genesis at the latest.
         const steps_max = (l2_safe_head.block_info.number -| genesis_number) + 1;
         var current = l2_safe_head;
+        if (pipeline.reset_walk) |walk| {
+            if (walk.safe_hash.eql(l2_safe_head.block_info.hash)) current = walk.current;
+        }
+        pipeline.reset_walk = null;
+        assert(current.block_info.number <= l2_safe_head.block_info.number);
         for (0..steps_max) |_| {
             if (current.block_info.number <= genesis_number) break;
             if (current.l1_origin.number +| channel_timeout <= origin_number) break;
-            const parent = try l2.l2_block_info_by_hash(current.block_info.parent_hash);
+            const parent_hash = current.block_info.parent_hash;
+            const parent = l2.l2_block_info_by_hash(parent_hash) catch |err| {
+                pipeline.reset_walk_keep(err, l2_safe_head, current);
+                return err;
+            };
             // An inconsistent L2 provider (not a parent) is treated as a reorg.
             if (parent.block_info.number +| 1 != current.block_info.number) {
                 return error.ReorgDetected;
@@ -308,8 +324,25 @@ pub const Pipeline = struct {
             current = parent;
         } else unreachable; // Proof: the block number decreases by one per step.
         assert(current.block_info.number <= l2_safe_head.block_info.number);
-        const config = try l2.system_config_by_l2_hash(current.block_info.hash);
+        const config = l2.system_config_by_l2_hash(current.block_info.hash) catch |err| {
+            pipeline.reset_walk_keep(err, l2_safe_head, current);
+            return err;
+        };
+        assert(pipeline.reset_walk == null);
         return .{ .l1_origin = current.l1_origin, .system_config = config };
+    }
+
+    /// Keeps the walk at `current` for the next retry when `err` only means "not yet".
+    fn reset_walk_keep(
+        pipeline: *Pipeline,
+        err: Error,
+        l2_safe_head: L2BlockInfo,
+        current: L2BlockInfo,
+    ) void {
+        assert(pipeline.reset_walk == null);
+        assert(current.block_info.number <= l2_safe_head.block_info.number);
+        if (err != error.NotAvailable) return;
+        pipeline.reset_walk = .{ .safe_hash = l2_safe_head.block_info.hash, .current = current };
     }
 
     fn reset(pipeline: *Pipeline, chain: anytype, point: ResetPoint) Error!void {
