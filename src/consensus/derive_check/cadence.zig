@@ -58,6 +58,14 @@ pub const Cadence = struct {
         return cadence.jumps + @intFromBool(cadence.current_l1 != null);
     }
 
+    /// The largest jump in L2 blocks, counting the current one.
+    pub fn jump_blocks_max_total(cadence: *const Cadence) u64 {
+        if (cadence.current_l1 == null) return cadence.jump_blocks_max;
+        assert(cadence.current_last_l2 >= cadence.current_first_l2);
+        const current = cadence.current_last_l2 - cadence.current_first_l2 + 1;
+        return @max(cadence.jump_blocks_max, current);
+    }
+
     /// Mean L1 blocks between jumps, times 10 (one decimal), or 0 without a gap.
     pub fn gap_l1_mean_tenths(cadence: *const Cadence) u64 {
         if (cadence.gaps == 0) return 0;
@@ -84,6 +92,11 @@ test "derive check cadence: jumps and gaps" {
     cadence.record(131, 61);
     try testing.expectEqual(@as(u64, 3), cadence.jumps_total());
     try testing.expectEqual(@as(u64, 20), cadence.jump_blocks_max);
+    try testing.expectEqual(@as(u64, 20), cadence.jump_blocks_max_total());
+    var single: Cadence = .{};
+    for (1..8) |n| single.record(n, 3);
+    try testing.expectEqual(@as(u64, 0), single.jump_blocks_max);
+    try testing.expectEqual(@as(u64, 7), single.jump_blocks_max_total());
     try testing.expectEqual(@as(u64, 31), cadence.blocks);
     try testing.expectEqual(@as(u64, 6), cadence.gap_l1_max);
     try testing.expectEqual(@as(u64, 55), cadence.gap_l1_mean_tenths());
@@ -108,6 +121,7 @@ test "derive check cadence: seeded fuzz keeps the counters consistent" {
         try testing.expectEqual(jumps, cadence.jumps_total());
         try testing.expectEqual(count, cadence.blocks);
         try testing.expectEqual(jumps - 1, cadence.gaps);
-        try testing.expect(cadence.jump_blocks_max <= count);
+        try testing.expect(cadence.jump_blocks_max <= cadence.jump_blocks_max_total());
+        try testing.expect(cadence.jump_blocks_max_total() <= count);
     }
 }

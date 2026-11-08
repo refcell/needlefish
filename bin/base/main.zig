@@ -31,6 +31,7 @@ const el_fetch = @import("el_fetch.zig");
 const el_peers = @import("el_peers.zig");
 const el_run = @import("el_run.zig");
 const state_check = @import("state_check.zig");
+const derive_check = @import("derive_check.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -66,6 +67,7 @@ const usage =
     \\  el-peers   find a Base chain's execution peers over discv4
     \\  el-run     execute blocks from an execution peer (devp2p) on an imported database
     \\  state-check  spot-check a database's accounts and slots against a reference node
+    \\  derive-check  derive a Base chain's safe blocks from L1, compare with a reference node
     \\
 ;
 
@@ -98,6 +100,8 @@ test {
     _ = el_peers;
     _ = el_run;
     _ = state_check;
+    _ = derive_check;
+    _ = @import("derive_check_net.zig");
     _ = @import("el_source.zig");
     _ = @import("el_pool.zig");
     _ = @import("metrics_server.zig");
@@ -212,6 +216,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "state-check")) {
         return try state_check.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "derive-check")) {
+        return try derive_check.main(init, args);
     }
     return null;
 }
