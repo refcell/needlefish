@@ -185,7 +185,12 @@ Run `base consensus` (verifier mode) against real L1 with the mainnet rollup con
   real L1 data and matched every one against the reference node (docs/lanes/consensus.md).
   Engine integration with the stateful node, reorg evidence, and mainnet remain.
   `base el-run --engine.addr` now serves the Engine API a verifier `base consensus` needs
-  (docs/lanes/consensus.md, "el-run engine"); the live run is next.
+  (docs/lanes/consensus.md, "el-run engine").
+  Live run (2026-11-08): a verifier `base consensus` on el-run consolidated Base Sepolia safe
+  blocks 56216041..56216565 against el-run's devp2p-executed chain with 0 attributes mismatches
+  and 0 engine divergences, after the L1 blob schedule fix (947c00a); the safe hash equals
+  the reference's. Cadence against the reference's `optimism_syncStatus`, a reorg, and
+  mainnet remain.
 
 ### M6. Unsafe head from mainnet gossip
 
