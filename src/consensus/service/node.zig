@@ -124,6 +124,12 @@ pub const Options = struct {
     head_poll_interval_ns: u64 = std.time.ns_per_s,
     safedb_entries: u32 = 4096,
     http_client: http_client.Options = .{},
+    /// L1 blocks with transactions, L1 receipts and L2 blocks with transactions: Base mainnet
+    /// L1 receipts reach ~2 MiB per block, past the default 1 MiB body.
+    provider_http_client: http_client.Options = .{
+        .recv_buffer_size = 16 * 1024 * 1024 + 8 * 1024,
+        .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 16 * 1024 * 1024 },
+    },
     /// Engine API: an 8 MiB `newPayload` request, up to 16 MiB `getPayload` responses.
     engine_http_client: http_client.Options = .{
         .send_buffer_size = 8 * 1024 * 1024 + 64 * 1024,
@@ -806,11 +812,12 @@ pub fn Node(comptime IO: type) type {
             const io = node.io;
             try node.watcher.init(allocator, io, options.l1, options.http_client, .{});
             errdefer node.watcher.deinit();
-            try node.l1.init(allocator, io, options.l1, options.http_client, .{
+            try node.l1.init(allocator, io, options.l1, options.provider_http_client, .{
                 .batch_inbox = node.rollup.batch_inbox_address,
             });
             errdefer node.l1.deinit();
-            try node.l2.init(allocator, io, options.l2, options.http_client, node.rollup, .{
+            const provider_http = options.provider_http_client;
+            try node.l2.init(allocator, io, options.l2, provider_http, node.rollup, .{
                 .jwt_secret = options.jwt_secret,
                 .block_by_number_ttl_ns = options.head_poll_interval_ns,
             });
