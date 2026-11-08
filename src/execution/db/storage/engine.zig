@@ -225,6 +225,8 @@ pub fn EngineType(comptime Storage: type) type {
         commit_metadata: Metadata = @splat(0),
         commit_metadata_pending: Metadata = @splat(0),
         commit_callback: ?Callback = null,
+        /// Entries of the commit in flight (or that just completed, in its callback).
+        commit_count: u32 = 0,
         checkpoint_phase: CheckpointPhase = .idle,
         checkpoint_callback: ?Callback = null,
         checkpoint_result: CheckpointError!Checkpoint = .{},
@@ -357,15 +359,32 @@ pub fn EngineType(comptime Storage: type) type {
             metadata: *const Metadata,
             callback: Callback,
         ) error{ NotReady, Busy, JournalFull }!u64 {
+            const metadatas: *const [1]Metadata = metadata;
+            const count = try self.commit_batch(&.{body}, metadatas, callback);
+            assert(count == 1);
+            return self.journal.sequence_next;
+        }
+
+        /// Group commit: journals the first entries of `bodies` that fit one write
+        /// (`JournalType.append_batch`), at least one, and returns how many; `callback`
+        /// fires once they are all durable (`commit_count` of them).
+        pub fn commit_batch(
+            self: *Self,
+            bodies: []const []const u8,
+            metadatas: []const Metadata,
+            callback: Callback,
+        ) error{ NotReady, Busy, JournalFull }!u32 {
             if (self.phase != .ready) return error.NotReady;
             if (self.commit_callback != null) return error.Busy;
             assert(self.journal.idle());
-            assert(body.len <= self.config.entry_body_size_max);
-            const sequence = try self.journal.append(body, metadata, on_journal);
-            self.commit_metadata_pending = metadata.*;
+            assert(bodies.len > 0 and bodies.len == metadatas.len);
+            for (bodies) |body| assert(body.len <= self.config.entry_body_size_max);
+            const count = try self.journal.append_batch(bodies, metadatas, on_journal);
+            assert(count >= 1 and count <= bodies.len);
+            self.commit_metadata_pending = metadatas[count - 1];
             self.commit_callback = callback;
-            assert(sequence == self.journal.sequence_next);
-            return sequence;
+            self.commit_count = count;
+            return count;
         }
 
         /// Writes a snapshot of the state after every entry committed so far, then frees the

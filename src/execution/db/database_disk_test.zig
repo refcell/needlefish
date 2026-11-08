@@ -305,6 +305,8 @@ const Counts = struct {
     /// Prefetches started, and blocks they read into the cache.
     prefetches: u64 = 0,
     prefetch_reads: u64 = 0,
+    /// Group commits of more than one entry (crashes meet them in flight).
+    commits_grouped: u64 = 0,
 };
 
 const Harness = struct {
@@ -376,6 +378,7 @@ const Harness = struct {
             trees.storage_branches.stats.flushes;
         self.counts.admission_busy += self.disk.db.disk_admission_busy;
         self.counts.prefetch_reads += trees.prefetch.?.stats.reads;
+        self.counts.commits_grouped += self.disk.db.commits_grouped;
     }
 
     /// Starts a prefetch of random keys, right and wrong, and ticks it a random number of
@@ -781,6 +784,7 @@ test "database disk mode: seeded blocks, reorgs, checkpoints, crashes match in-m
     try testing.expect(counts.branch_flushes >= 20);
     try testing.expect(counts.admission_busy >= 1);
     try testing.expect(counts.prefetches >= 100 and counts.prefetch_reads >= 100);
+    try testing.expect(counts.commits_grouped >= 20);
 }
 
 // Imported start.

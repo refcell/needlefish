@@ -7,7 +7,8 @@ const testing = std.testing;
 
 const storage = @import("storage.zig");
 const journal_module = @import("journal.zig");
-const SimStorage = @import("sim_storage.zig").SimStorage;
+const sim_storage = @import("sim_storage.zig");
+const SimStorage = sim_storage.SimStorage;
 const Prng = @import("../../../testing/prng.zig").Prng;
 const fuzz = @import("../../../testing/fuzz.zig");
 
@@ -286,6 +287,72 @@ test "journal: crash at a random tick keeps every committed entry and a valid pr
         try testing.expect(harness.recovered_count <= submitted);
         try expect_recovered(harness, &bodies, 0);
     }
+}
+
+/// Appends up to `wanted` of the next bodies as one group commit; returns how many it took,
+/// or null if the ring is full.
+fn append_group(harness: *Harness, bodies: *Bodies, prng: *Prng, first: u32, wanted: u32) ?u32 {
+    assert(wanted >= 1 and first + wanted <= entries_max);
+    var slices: [8][]const u8 = undefined;
+    var metadatas: [8][metadata_size]u8 = undefined;
+    for (slices[0..wanted], metadatas[0..wanted], 0..) |*slice, *metadata, index| {
+        slice.* = bodies.make(prng, first + @as(u32, @intCast(index)));
+        metadata.* = @splat(0);
+        metadata[0] = @truncate(harness.journal.sequence_next + index);
+    }
+    const count = harness.journal.append_batch(
+        slices[0..wanted],
+        metadatas[0..wanted],
+        Harness.on_done,
+    ) catch return null;
+    assert(count >= 1 and count <= wanted);
+    return count;
+}
+
+test "journal: group commits fill, wrap, crash, and recover like single appends" {
+    var prng = Prng.init(6);
+    var batched: u32 = 0;
+    for (0..48) |seed| {
+        const sim_options: sim_storage.Options = .{ .size_bytes = 256 * 1024, .seed = seed };
+        var sim = try SimStorage.init(testing.allocator, sim_options);
+        defer sim.deinit(testing.allocator);
+        const harness = try setup(&sim, 32 * sector_size);
+        defer teardown(harness);
+        var bodies: Bodies = .{};
+        var committed: u32 = 0;
+        var submitted: u32 = 0;
+        var start = harness.journal.start_point();
+        var start_index: u32 = 0;
+        const crash_tick = prng.range(1, 400);
+        var tick: u64 = 0;
+        while (tick < crash_tick and submitted + 8 <= entries_max) : (tick += 1) {
+            if (harness.journal.idle()) {
+                if (harness.done) committed = submitted;
+                harness.done = false;
+                const wanted: u32 = @intCast(prng.range(1, 8));
+                if (append_group(harness, &bodies, &prng, submitted, wanted)) |count| {
+                    submitted += count;
+                    batched += @intFromBool(count > 1);
+                } else {
+                    // Full: a "checkpoint" at the head releases every entry before it.
+                    start = harness.journal.start_point();
+                    start_index = submitted;
+                    harness.journal.release(harness.journal.head);
+                }
+            }
+            sim.tick();
+        }
+        if (harness.done) committed = submitted;
+        sim.crash();
+        harness.journal.state = .idle;
+        harness.journal.callback = null;
+        harness.done = false;
+        try harness.recover(&sim, start);
+        try testing.expect(start_index + harness.recovered_count >= committed);
+        try testing.expect(start_index + harness.recovered_count <= submitted);
+        try expect_recovered(harness, &bodies, start_index);
+    }
+    try testing.expect(batched > 48);
 }
 
 fn fuzz_header(_: void, input: []const u8) anyerror!void {

@@ -11,8 +11,10 @@
 //!   entry as a block insert followed by a head move, through the same code paths.
 //!
 //! Operations return at once with their entry sequence. Entries wait in a bounded queue and
-//! the engine writes one at a time; `durable_sequence` (and the optional `on_durable`
-//! callback) reports how far the journal is durable. A full queue, or a journal without room
+//! the engine writes them in group commits: every entry queued while a commit was in flight
+//! goes into the next one write and one sync (`Engine.commit_batch`), so the sync rate does
+//! not bound the block rate; `durable_sequence` (and the optional `on_durable` callback)
+//! reports how far the journal is durable. A full queue, or a journal without room
 //! for the entry, returns `error.Busy`: tick the storage and retry.
 //!
 //! Checkpoints serialize the state snapshot, every stored block (oldest first, as block
@@ -610,6 +612,8 @@ pub fn DatabaseType(comptime Storage: type) type {
         queue_bodies: []u8,
         queue_lengths: []u32,
         queue_metadata: []Metadata,
+        /// The bodies of one group commit (`pump`).
+        queue_batch: [][]const u8,
         queue_head: u32 = 0,
         queue_count: u32 = 0,
         staging: []u8,
@@ -626,6 +630,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// Journal bytes of the queued and in-flight entries.
         journal_bytes_pending: u64 = 0,
         in_flight_bytes: u64 = 0,
+        /// Entries of the group commit in flight.
+        in_flight_count: u32 = 0,
+        /// Group commits that journaled more than one entry.
+        commits_grouped: u64 = 0,
         checkpoint_wanted: bool = false,
         /// Set while the caller's State holds changes not yet journaled (an executed block
         /// awaiting adoption): a checkpoint snapshot then would capture them. Wanted
@@ -740,6 +748,7 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .queue_bodies = buffers.queue_bodies,
                 .queue_lengths = buffers.queue_lengths,
                 .queue_metadata = buffers.queue_metadata,
+                .queue_batch = buffers.queue_batch,
                 .staging = buffers.staging,
                 .history = history_store,
             };
@@ -758,6 +767,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             queue_bodies: []u8,
             queue_lengths: []u32,
             queue_metadata: []Metadata,
+            queue_batch: [][]const u8,
             staging: []u8,
 
             fn init(allocator: std.mem.Allocator, config: Config) !Buffers {
@@ -771,12 +781,15 @@ pub fn DatabaseType(comptime Storage: type) type {
                 errdefer allocator.free(queue_lengths);
                 const queue_metadata = try allocator.alloc(Metadata, queue_max);
                 errdefer allocator.free(queue_metadata);
+                const queue_batch = try allocator.alloc([]const u8, queue_max);
+                errdefer allocator.free(queue_batch);
                 const staging = try allocator.alloc(u8, config.checkpoint_staging_bytes);
                 return .{
                     .changeset_buffer = changeset_buffer,
                     .queue_bodies = queue_bodies,
                     .queue_lengths = queue_lengths,
                     .queue_metadata = queue_metadata,
+                    .queue_batch = queue_batch,
                     .staging = staging,
                 };
             }
@@ -789,6 +802,7 @@ pub fn DatabaseType(comptime Storage: type) type {
             if (self.code_store) |*store| store.deinit(allocator);
             if (self.history) |*store| store.deinit(allocator);
             allocator.free(self.staging);
+            allocator.free(self.queue_batch);
             allocator.free(self.queue_metadata);
             allocator.free(self.queue_lengths);
             allocator.free(self.queue_bodies);
@@ -1298,15 +1312,22 @@ pub fn DatabaseType(comptime Storage: type) type {
             return self.submitted_sequence;
         }
 
+        /// Journals the queued entries from the head, as many as one group commit takes
+        /// (`Engine.commit_batch`; up to the ring's end), if no commit is in flight.
         fn pump(self: *Self) void {
             if (self.phase != .ready or self.queue_count == 0) return;
             if (self.engine.commit_callback != null) return;
-            const index = self.queue_head;
+            const first = self.queue_head;
+            const queue_max = self.config.queue_entries_max;
+            const run = @min(self.queue_count, queue_max - first);
             const body_max = self.config.engine.entry_body_size_max;
-            const length = self.queue_lengths[index];
-            const body = self.queue_bodies[@as(usize, index) * body_max ..][0..length];
-            const metadata = &self.queue_metadata[index];
-            const sequence = self.engine.commit(body, metadata, on_commit) catch |err|
+            for (self.queue_batch[0..run], first..) |*body, index| {
+                const offset = @as(usize, index) * body_max;
+                body.* = self.queue_bodies[offset..][0..self.queue_lengths[index]];
+            }
+            const bodies = self.queue_batch[0..run];
+            const metadatas = self.queue_metadata[first..][0..run];
+            const count = self.engine.commit_batch(bodies, metadatas, on_commit) catch |err|
                 switch (err) {
                     // Admission keeps room for every queued entry; a checkpoint frees more.
                     error.JournalFull => {
@@ -1317,31 +1338,46 @@ pub fn DatabaseType(comptime Storage: type) type {
                     // Ready and no commit in flight, both checked above.
                     error.NotReady, error.Busy => unreachable,
                 };
-            assert(sequence == self.durable_sequence + 1);
-            // The journal copied the body: the slot is free.
-            self.in_flight_bytes = journal_module.entry_size_bytes(length);
-            self.queue_head = (self.queue_head + 1) % self.config.queue_entries_max;
-            self.queue_count -= 1;
+            assert(count >= 1 and count <= run);
+            // The journal copied the bodies: the slots are free.
+            var bytes: u64 = 0;
+            for (bodies[0..count]) |body| bytes += journal_module.entry_size_bytes(body.len);
+            self.in_flight_bytes = bytes;
+            self.in_flight_count = count;
+            self.commits_grouped += @intFromBool(count > 1);
+            self.queue_head = (first + count) % queue_max;
+            self.queue_count -= count;
+            assert(self.durable_sequence + self.in_flight_count + self.queue_count ==
+                self.submitted_sequence);
         }
 
         fn on_commit(engine: *Engine) void {
             const self: *Self = @alignCast(@fieldParentPtr("engine", engine));
             assert(self.phase == .ready);
-            self.durable_sequence += 1;
-            assert(self.durable_sequence == engine.sequence_last());
-            assert(self.durable_sequence <= self.submitted_sequence);
+            const count = self.in_flight_count;
+            assert(count >= 1 and count == engine.commit_count);
+            self.in_flight_count = 0;
             self.journal_bytes_pending -= self.in_flight_bytes;
             self.in_flight_bytes = 0;
-            if (self.on_durable) |callback| callback(self.durable_context, self.durable_sequence);
-            // A paced checkpoint writes its next chunk after each durable commit.
-            // The code flush before a checkpoint spends the same per-commit block budget.
+            for (0..count) |_| {
+                self.durable_sequence += 1;
+                if (self.on_durable) |callback| {
+                    callback(self.durable_context, self.durable_sequence);
+                }
+            }
+            assert(self.durable_sequence == engine.sequence_last());
+            assert(self.durable_sequence <= self.submitted_sequence);
+            // A paced checkpoint writes its next chunk after each durable commit (each entry
+            // of a group commit grants its share). The code flush before a checkpoint spends
+            // the same per-commit block budget.
+            const blocks = self.config.checkpoint_blocks_per_commit() *| count;
+            assert(blocks > 0);
             if (self.config.checkpoint_bytes_per_commit > 0) {
-                const blocks = self.config.checkpoint_blocks_per_commit();
                 if (self.code_store) |*store| store.grant(blocks);
                 self.engine.checkpoint_grant(blocks);
             }
             // Flat tree compaction is paced per durable commit on the same budget.
-            if (self.flat) |*trees| trees.compact(self.config.checkpoint_blocks_per_commit());
+            if (self.flat) |*trees| trees.compact(blocks);
             self.checkpoint_maybe_start();
             self.pump();
         }

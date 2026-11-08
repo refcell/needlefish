@@ -13,6 +13,14 @@
 //! offset and wrapping jumps to the next multiple of `zone_size`. The ring is full when an
 //! entry would end past `tail + zone_size`.
 //!
+//! Group commit (`append_batch`): several entries, contiguous in one write and covered by one
+//! sync, so one sync makes a whole queue durable. They are ordinary entries (each its own
+//! header, sequence and chain link), so the format and recovery are those of single appends:
+//! a crash before the sync leaves any subset of the batch's sectors written, and the scan
+//! stops at the first entry that does not verify, as it does at a torn single entry; no
+//! entry of the batch was acknowledged. A batch stays within the buffer (one largest entry
+//! and a trailer), before the zone end, and within the live span.
+//!
 //! Recovery scans from the replay start and accepts an entry only if the header checksum, sequence,
 //! chain link, and body checksum all match. At the first position that fails it also tries
 //! the zone start once (the writer may have wrapped there), then stops. A stop on a zeroed
@@ -162,8 +170,10 @@ pub fn JournalType(comptime Storage: type) type {
         write: storage.Write = .{},
         sync: storage.Sync = .{},
         append_position: u64 = 0,
-        /// Bytes of the entry being appended (the write may add a zeroed trailer sector).
+        /// Bytes of the entries being appended (the write may add a zeroed trailer sector),
+        /// their count, and the last one's header checksum.
         append_size: u64 = 0,
+        append_count: u32 = 0,
         append_checksum: u128 = 0,
         recover_position: u64 = 0,
         recover_consumer: ?Consumer = null,
@@ -281,40 +291,92 @@ pub fn JournalType(comptime Storage: type) type {
             metadata: *const [metadata_size]u8,
             callback: Callback,
         ) error{JournalFull}!u64 {
+            const sequence = self.sequence_next;
+            const metadatas: *const [1][metadata_size]u8 = metadata;
+            const count = try self.append_batch(&.{body}, metadatas, callback);
+            assert(count == 1);
+            return sequence;
+        }
+
+        /// Appends the first entries of `bodies` (with `metadatas`, one each) that fit one
+        /// write (see the file comment), at least one; returns how many. `callback` fires
+        /// once they are all durable; their sequences follow `sequence_next`.
+        pub fn append_batch(
+            self: *Self,
+            bodies: []const []const u8,
+            metadatas: []const [metadata_size]u8,
+            callback: Callback,
+        ) error{JournalFull}!u32 {
             assert(self.state == .idle);
             assert(self.callback == null);
-            assert(body.len <= self.config.body_size_max);
-            const size = entry_size_bytes(body.len);
-            const position = self.placement(size) orelse return error.JournalFull;
-
-            const header: *Header = @ptrCast(self.buffer[0..sector_size]);
-            header.* = std.mem.zeroes(Header);
-            header.checksum_body = checksum(body);
-            header.previous_checksum = self.previous_checksum;
-            header.format_id = self.format_id;
-            header.magic = magic;
-            header.sequence = self.sequence_next;
-            header.body_size = @intCast(body.len);
-            header.metadata = metadata.*;
-            header.checksum = header.compute_checksum();
-            @memcpy(self.buffer[sector_size..][0..body.len], body);
-            // Pads the body and, when written, zeroes the trailer sector.
+            assert(bodies.len > 0 and bodies.len == metadatas.len);
+            const zone_size = self.config.zone_size_bytes;
+            const position = self.placement(entry_size_bytes(bodies[0].len)) orelse
+                return error.JournalFull;
+            var size: u64 = 0;
+            var count: u32 = 0;
+            var previous = self.previous_checksum;
+            for (bodies, metadatas) |body, *metadata| {
+                assert(body.len <= self.config.body_size_max);
+                const entry_size = entry_size_bytes(body.len);
+                const end = size + entry_size;
+                // The first entry always fits (placement, and the buffer's size).
+                const fits = end + sector_size <= self.buffer.len and
+                    position % zone_size + end <= zone_size and
+                    position + end <= self.tail + zone_size;
+                if (!fits) break;
+                previous = self.encode_entry(size, count, previous, body, metadata);
+                size = end;
+                count += 1;
+            }
+            assert(count >= 1 and count <= bodies.len);
+            // Zeroes the trailer sector, when written.
             const write_size = size + if (self.trailer_free(position, size)) sector_size else 0;
-            @memset(self.buffer[sector_size + body.len .. @intCast(write_size)], 0);
+            @memset(self.buffer[@intCast(size)..@intCast(write_size)], 0);
             assert(write_size <= self.buffer.len);
 
             self.append_position = position;
             self.append_size = size;
-            self.append_checksum = header.checksum;
+            self.append_count = count;
+            self.append_checksum = previous;
             self.state = .append_write;
             self.callback = callback;
             self.storage.write_sectors(
                 on_append_write,
                 &self.write,
                 self.buffer[0..@intCast(write_size)],
-                self.config.zone_offset + position % self.config.zone_size_bytes,
+                self.config.zone_offset + position % zone_size,
             );
-            return self.sequence_next;
+            return count;
+        }
+
+        /// Writes entry `index` of a batch (header, body, zeroed padding) at `offset` in the
+        /// buffer, chained to `previous`; returns its header checksum.
+        fn encode_entry(
+            self: *Self,
+            offset: u64,
+            index: u32,
+            previous: u128,
+            body: []const u8,
+            metadata: *const [metadata_size]u8,
+        ) u128 {
+            const size = entry_size_bytes(body.len);
+            assert(offset % sector_size == 0);
+            assert(offset + size <= self.buffer.len);
+            const entry = self.buffer[@intCast(offset)..][0..@intCast(size)];
+            const header: *Header = @ptrCast(@alignCast(entry[0..sector_size]));
+            header.* = std.mem.zeroes(Header);
+            header.checksum_body = checksum(body);
+            header.previous_checksum = previous;
+            header.format_id = self.format_id;
+            header.magic = magic;
+            header.sequence = self.sequence_next + index;
+            header.body_size = @intCast(body.len);
+            header.metadata = metadata.*;
+            header.checksum = header.compute_checksum();
+            @memcpy(entry[sector_size..][0..body.len], body);
+            @memset(entry[sector_size + body.len ..], 0);
+            return header.checksum;
         }
 
         /// Whether the sector after an entry at `position` of `size` bytes may be zeroed: it
@@ -339,8 +401,9 @@ pub fn JournalType(comptime Storage: type) type {
             assert(self.state == .append_sync);
             assert(self.append_position >= self.head);
             assert(self.write.buffer.len >= self.append_size);
+            assert(self.append_count >= 1);
             self.head = self.append_position + self.append_size;
-            self.sequence_next += 1;
+            self.sequence_next += self.append_count;
             self.previous_checksum = self.append_checksum;
             assert(self.head <= self.tail + self.config.zone_size_bytes);
             self.finish();
