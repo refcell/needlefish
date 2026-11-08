@@ -10,6 +10,7 @@ const json = @import("../../utilities/json/root.zig");
 const node = @import("../node/root.zig");
 const evm = @import("../evm/root.zig");
 const op_receipt = @import("op_receipt.zig");
+const chainspec = @import("../chainspec/root.zig");
 
 const Hash = [32]u8;
 const Writer = json.Writer;
@@ -333,6 +334,84 @@ pub fn field_data(w: *Writer, name: []const u8, bytes: []const u8) WriteError!vo
 pub fn field_quantity(w: *Writer, name: []const u8, value: anytype) WriteError!void {
     try w.key(name);
     try w.quantity(value);
+}
+
+/// Where a receipt sits in its block: the cumulative gas before it and its first log index.
+pub const ReceiptPosition = struct { previous_gas: u64, log_index: u64 };
+
+/// The context of receipt `value` of transaction `raw` at `index` of block `hash`.
+pub fn receipt_context(
+    spec: *const chainspec.ChainSpec,
+    recoverer: consensus.Recoverer,
+    header: *const Header,
+    hash: Hash,
+    raw: []const u8,
+    index: u32,
+    value: consensus.Receipt,
+    position: ReceiptPosition,
+) ReceiptContext {
+    const envelope = Envelope.decode(raw) catch unreachable; // Stored by the chain.
+    const sender = envelope.recover_sender(recoverer) orelse primitives.Address.zero;
+    const to = envelope.kind().to();
+    const base_fee = header.base_fee_per_gas orelse 0;
+    const blob_count = envelope.blob_versioned_hashes().count();
+    var blob_price: ?u128 = null;
+    if (blob_count > 0) if (spec.blob_params_at(header.timestamp)) |params| {
+        blob_price = params.base_fee(header.excess_blob_gas orelse 0);
+    };
+    assert(value.cumulative_gas_used >= position.previous_gas);
+    return .{
+        .inclusion = .{
+            .block_hash = hash,
+            .block_number = header.number,
+            .index = index,
+            .base_fee = base_fee,
+        },
+        .tx_hash = primitives.keccak256(raw).bytes,
+        .from = sender,
+        .to = to,
+        .contract_address = if (to == null) contract_address(sender, envelope.nonce().?) else null,
+        .gas_used = value.cumulative_gas_used - position.previous_gas,
+        .effective_gas_price = envelope.effective_gas_price(base_fee) orelse 0,
+        .first_log_index = position.log_index,
+        .blob_gas_used = @as(u64, blob_count) * (1 << 17),
+        .blob_gas_price = blob_price,
+    };
+}
+
+/// Writes the receipt at `only` (or every receipt, without the enclosing array) of the
+/// stored block `record` whose hash is `hash`.
+pub fn block_receipts(
+    w: *Writer,
+    spec: *const chainspec.ChainSpec,
+    recoverer: consensus.Recoverer,
+    record: node.chain.Record,
+    hash: Hash,
+    only: ?u32,
+) WriteError!void {
+    const block_ms = timestamp_ms(record);
+    var transactions = record.transactions;
+    var receipts = record.receipts;
+    var index: u32 = 0;
+    var previous_gas: u64 = 0;
+    var log_index: u64 = 0;
+    var first: []const u8 = &.{};
+    while (!transactions.is_empty()) : (index += 1) {
+        const raw = transactions.bytes() catch unreachable; // Stored by the chain.
+        if (index == 0) first = raw;
+        const encoded = receipts.bytes() catch unreachable; // Stored by the chain.
+        const value = consensus.Receipt.decode(encoded) catch unreachable;
+        defer previous_gas = value.cumulative_gas_used;
+        defer log_index += value.logs.count;
+        if (only) |wanted| if (wanted != index) continue;
+        var context = receipt_context(spec, recoverer, &record.header, hash, raw, index, value, .{
+            .previous_gas = previous_gas,
+            .log_index = log_index,
+        });
+        context.inclusion.timestamp_ms = block_ms;
+        context.op = op_receipt.fields(spec, record.header.timestamp, first, raw);
+        try receipt(w, value, context);
+    }
 }
 
 /// The address a creation by `sender` at `nonce` deploys to.
