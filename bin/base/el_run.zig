@@ -18,6 +18,9 @@
 //! committed minus its scheduled time) is counted from then on. The first refused or
 //! mismatching block exits 1 with the head on its parent; nothing is skipped. Commits are
 //! made durable every `flush_every` blocks and whenever no block is waiting.
+//!
+//! With `--engine.addr <ip:port> --engine.jwt <file>` it also serves the Engine API to a
+//! verifier `base consensus` (`el_engine.zig`), between blocks and while idle at the tip.
 
 const std = @import("std");
 const Io = std.Io;
@@ -28,6 +31,7 @@ const el_feed = @import("el_feed.zig");
 const import_run_cli = @import("import_run.zig");
 const snapshot_import_out = @import("snapshot_import_out.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
+const el_engine = @import("el_engine.zig");
 
 const to_disk = base.execution.import.to_disk;
 const import_run = base.execution.import.run;
@@ -58,6 +62,9 @@ const AwakeClock = struct {
 const usage =
     \\usage: base el-run --db <path> (--peers <file> | --enode <enode://...>)
     \\                   [--chain base-sepolia|base-mainnet] [--blocks <n>] [--duration <s>]
+    \\                   [--engine.addr <ip:port> --engine.jwt <file>
+    \\                    [--engine.ring-blocks <n>] [--engine.ring-mb <n>]]
+    \\                   [--engine.rollup-out <rollup.json>]
     \\
 ;
 
@@ -74,6 +81,7 @@ const Flags = struct {
     config: *const ChainConfig = &base.common.chains.sepolia,
     blocks: ?u64 = null,
     duration_s: ?u64 = null,
+    engine: el_engine.Flags = .{},
 };
 
 fn parse_flags(args: []const []const u8) !Flags {
@@ -104,11 +112,12 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, name, "--duration")) {
             flags.duration_s = try std.fmt.parseInt(u64, value, 10);
             if (flags.duration_s.? == 0) return error.InvalidArguments;
-        } else return error.InvalidArguments;
+        } else if (!try flags.engine.parse(name, value)) return error.InvalidArguments;
     }
     if (flags.db.len == 0 or (flags.enode == null and flags.peers == null)) {
         return error.InvalidArguments;
     }
+    if (!flags.engine.valid()) return error.InvalidArguments;
     assert(flags.config.chain_id == flags.chain.spec.chain_id);
     return flags;
 }
@@ -156,6 +165,8 @@ const Run = struct {
     db: *Database,
     runner: *Runner,
     feed: *el_feed.Feed,
+    /// The Engine API (`--engine.addr`), served only between blocks.
+    engine: ?*el_engine.Service = null,
     rollup: base.consensus.protocol.RollupConfig,
     first: u64,
     started_ms: i64,
@@ -220,12 +231,21 @@ fn execute(
         return 2;
     };
     defer feed.destroy();
+    const chain = el_engine.database_chain(Database, db);
+    const spec = flags.chain.spec;
+    const start = el_engine.Service.start;
+    const engine = start(gpa, init.io, &flags.engine, spec, flags.config, chain) catch |err| {
+        std.debug.print("el-run: cannot start the engine API: {t}\n", .{err});
+        return 2;
+    };
+    defer if (engine) |service| service.destroy(gpa);
     var run: Run = .{
         .io = init.io,
         .flags = flags,
         .db = db,
         .runner = runner,
         .feed = feed,
+        .engine = engine,
         .rollup = unsafe_watch.rollup_for(flags.config),
         .first = head.number + 1,
         .started_ms = 0,
@@ -258,10 +278,13 @@ fn run_blocks(run: *Run) !u8 {
                 std.debug.print("el-run: at the tip, block {d}\n", .{run.db.head_info.number});
             }
             run.at_tip = run.feed.at_tip;
-            try run.io.sleep(.fromMilliseconds(tip_wait_ms), .awake);
+            if (run.engine) |service| {
+                try service.wait(tip_wait_ms);
+            } else try run.io.sleep(.fromMilliseconds(tip_wait_ms), .awake);
             continue;
         }
         if (!try run_one(run, &block)) return 1;
+        if (run.engine) |service| service.poll();
         run.unflushed += 1;
         if (run.unflushed >= flush_every) try run.flush();
         if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
@@ -290,6 +313,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         return false;
     }
     assert(run.db.head_info.number == block.number);
+    block_committed(run, block);
     run.blocks += 1;
     run.transactions += outcome.transactions;
     run.gas += outcome.gas_used;
@@ -306,6 +330,19 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         block.number, block.hash, outcome.transactions, outcome.gas_used, elapsed, lag_ms,
     });
     return true;
+}
+
+/// The per-committed-block hook: `block` was executed, checked, and committed as the
+/// database head. Dispatches to the optional consumers (the Engine API's block ring).
+fn block_committed(run: *Run, block: *const el_source.Block) void {
+    assert(run.db.head_info.number == block.number);
+    assert(std.mem.eql(u8, &run.db.head_info.hash, &block.hash));
+    if (run.engine) |service| service.engine.on_block(&.{
+        .number = block.number,
+        .hash = block.hash,
+        .header_rlp = block.header_rlp,
+        .transactions = block.transactions,
+    });
 }
 
 fn report_failure(run: *const Run, outcome: *const import_run.Outcome) void {
@@ -355,6 +392,7 @@ fn summary(run: *Run) void {
         elapsed_s,
     });
     print_phases(run);
+    if (run.engine) |service| service.engine.summary();
     if (now - run.peers_printed_ms >= peers_interval_ms) {
         run.peers_printed_ms = now;
         run.feed.pool.print_peers();
@@ -396,4 +434,14 @@ test "el-run: flags" {
         &.{ "--db", "x", "--enode", enode_text, "--duration" },
     };
     for (rejected) |args| try std.testing.expectError(error.InvalidArguments, parse_flags(args));
+    const engine = try parse_flags(&.{
+        "--db", "x", "--enode", enode_text, "--engine.addr", "127.0.0.1:8551", "--engine.jwt", "j",
+    });
+    try std.testing.expectEqualStrings("127.0.0.1:8551", engine.engine.addr.?);
+    const half = parse_flags(&.{ "--db", "x", "--enode", enode_text, "--engine.jwt", "j" });
+    try std.testing.expectError(error.InvalidArguments, half);
+}
+
+test {
+    _ = el_engine;
 }
