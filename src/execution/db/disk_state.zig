@@ -432,6 +432,79 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             return .{ .account = leaf_account, .word = word };
         }
 
+        /// `eth_getProof` at the current root: `verify_leaf`'s walk (every node rebuilt and
+        /// checked against its parent's hash), then the hashed nodes on the account's path into
+        /// `account_proof` and, with `slot_hash`, on the slot's path into `storage_proof`
+        /// (`trie.Proof` layout: root first; untouched without `slot_hash`). An absent key gets
+        /// its exclusion proof; an absent account an empty storage proof. Writes nothing;
+        /// only between blocks.
+        pub fn prove(
+            self: *Self,
+            address_hash: *const Hash,
+            slot_hash: ?*const Hash,
+            account_proof: anytype,
+            storage_proof: anytype,
+        ) Error!Leaf {
+            const leaf = try self.verify_leaf(address_hash, slot_hash);
+            try self.collect_proof(&self.state_root, address_hash, account_proof);
+            if (slot_hash) |slot| {
+                const owner = leaf.account orelse AccountState{
+                    .nonce = 0,
+                    .balance = 0,
+                    .storage_root = node.empty_root,
+                    .code_hash = node.empty_code_hash,
+                };
+                try self.collect_proof(&owner.storage_root, slot, storage_proof);
+            }
+            assert(account_proof.count > 0 or std.mem.eql(u8, &self.state_root, &node.empty_root));
+            return leaf;
+        }
+
+        /// The hashed nodes from `root` along `key`, from the memo the walk just filled.
+        fn collect_proof(
+            self: *const Self,
+            trie_root: *const Hash,
+            key: *const Hash,
+            proof: anytype,
+        ) Error!void {
+            proof.count = 0;
+            if (std.mem.eql(u8, trie_root, &node.empty_root)) return;
+            const path = Nibbles.from_bytes(key);
+            var rest: []const u8 = path.slice();
+            var ref = RlpNode.from_hash(trie_root.*);
+            var depth: u32 = 0;
+            while (depth < proof.ends.len) : (depth += 1) {
+                var bytes = ref.slice();
+                if (ref.is_hash()) {
+                    const entry = self.memo.get(ref.root_hash()) orelse return error.Corrupt;
+                    if (entry.bytes_len == 0) return error.Corrupt;
+                    bytes = self.entry_bytes(&entry);
+                    const start = if (proof.count == 0) 0 else proof.ends[proof.count - 1];
+                    if (start + bytes.len > proof.buffer.len) return error.Full;
+                    @memcpy(proof.buffer[start..][0..bytes.len], bytes);
+                    proof.ends[proof.count] = @intCast(start + bytes.len);
+                    proof.count += 1;
+                }
+                const decoded = sparse.decode_node(bytes) catch return error.Corrupt;
+                switch (decoded.kind) {
+                    .leaf => return,
+                    .extension => {
+                        const extension = decoded.path.slice();
+                        if (!std.mem.startsWith(u8, rest, extension)) return;
+                        rest = rest[extension.len..];
+                        ref = decoded.children[0];
+                    },
+                    .branch => {
+                        if (rest.len == 0) return;
+                        ref = decoded.children[rest[0]];
+                        if (ref.len == 0) return;
+                        rest = rest[1..];
+                    },
+                }
+            }
+            return error.Corrupt; // Deeper than any key: a cycle of forged references.
+        }
+
         /// The records `apply` wrote for the last block (puts and tombstones), for tests.
         pub fn last_record_writes(self: *const Self) []const RecordWrite {
             return self.record_writes[0..self.record_writes_len];

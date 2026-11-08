@@ -2020,8 +2020,11 @@ pub fn DatabaseType(comptime Storage: type) type {
         ) ProofError!?history_module.AccountState {
             assert(slots.len == storage_proofs.len and slots.len == values.len);
             if (self.phase != .ready or !self.head_info.present) return error.NotReady;
-            // Disk mode keeps no `StateTrie` and no history (proofs over records: later).
-            if (self.disk != null) return error.HistoryUnavailable;
+            // Disk mode keeps no history: the head only, walked over the records.
+            if (self.disk != null) {
+                if (number != self.head_info.number) return error.HistoryUnavailable;
+                return self.proof_disk(address, slots, account_proof, storage_proofs, values);
+            }
             if (self.history_tracking()) |store| {
                 const proofs = storage_proofs;
                 return store.get_proof(number, address, slots, account_proof, proofs, values);
@@ -2074,6 +2077,39 @@ pub fn DatabaseType(comptime Storage: type) type {
             const store = self.history_tracking() orelse return error.HistoryUnavailable;
             assert(store.window().?.head == self.head_info.number);
             return store.storage_range(number, &address_hash, &start, max, out);
+        }
+
+        /// `proof_at` at the head of a disk-mode database (`DiskState.prove`), one walk per
+        /// slot. Between blocks only: a walk reuses the per-block memo.
+        fn proof_disk(
+            self: *Self,
+            address: history_module.Address,
+            slots: []const u256,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) ProofError!?history_module.AccountState {
+            const disk = &self.disk.?;
+            assert(!self.checkpoints_held);
+            const address_hash = keccak256(&address);
+            // Without slots the storage proof is never written: the account proof stands in.
+            const leaf = disk.prove(&address_hash, null, account_proof, account_proof) catch |err|
+                return disk_proof_error(err);
+            for (slots, storage_proofs, values) |slot, *proof, *value| {
+                var slot_bytes: [32]u8 = undefined;
+                std.mem.writeInt(u256, &slot_bytes, slot, .big);
+                const slot_hash = keccak256(&slot_bytes);
+                const found = disk.prove(&address_hash, &slot_hash, account_proof, proof);
+                value.* = (found catch |err| return disk_proof_error(err)).word;
+            }
+            return leaf.account;
+        }
+
+        fn disk_proof_error(err: disk_state_module.Error) ProofError {
+            return switch (err) {
+                error.Full, error.Busy => error.HistoryFull,
+                error.Corrupt, error.Unsupported => error.HistoryCorrupt,
+            };
         }
 
         fn proof_live(

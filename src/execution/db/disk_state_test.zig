@@ -804,7 +804,50 @@ fn check(
         if (want) |value| try testing.expectEqualSlices(u8, value, got.?);
     }
     try check_cache(arena, disk, built, counts);
+    try check_proofs(disk, reference, universe);
     try testing.expect(!disk.fault);
+}
+
+/// Proofs over the records (`DiskState.prove`) equal the in-memory trie's byte for byte, for
+/// a sample of accounts and slots (present and absent).
+fn check_proofs(disk: *DiskState, reference: *StateTrie, universe: *const Universe) !void {
+    const Proofs = struct {
+        disk_account: StateTrie.AccountProof,
+        disk_storage: StateTrie.StorageProof,
+        want_account: StateTrie.AccountProof,
+        want_storage: StateTrie.StorageProof,
+    };
+    const proofs = try testing.allocator.create(Proofs);
+    defer testing.allocator.destroy(proofs);
+    const sample_max = 16;
+    var it_accounts = universe.accounts.keyIterator();
+    var sampled: u32 = 0;
+    while (it_accounts.next()) |key| : (sampled += 1) {
+        if (sampled == sample_max) break;
+        _ = try disk.prove(key, null, &proofs.disk_account, &proofs.disk_storage);
+        try reference.prove_account(key.*, &proofs.want_account);
+        try expect_proof_eql(&proofs.want_account, &proofs.disk_account);
+    }
+    var it_slots = universe.slots.keyIterator();
+    sampled = 0;
+    while (it_slots.next()) |key| : (sampled += 1) {
+        if (sampled == sample_max) break;
+        const owner = key[0..32];
+        const leaf = try disk.prove(owner, key[32..64], &proofs.disk_account, &proofs.disk_storage);
+        try testing.expectEqual(disk.storage(owner, key[32..64]), leaf.word);
+        try reference.prove_account(owner.*, &proofs.want_account);
+        reference.prove_storage(owner.*, key[32..64].*, &proofs.want_storage);
+        try expect_proof_eql(&proofs.want_account, &proofs.disk_account);
+        try expect_proof_eql(&proofs.want_storage, &proofs.disk_storage);
+    }
+}
+
+fn expect_proof_eql(want: anytype, got: anytype) !void {
+    try testing.expectEqual(want.count, got.count);
+    for (0..want.count) |index| {
+        const at: u32 = @intCast(index);
+        try testing.expectEqualSlices(u8, want.node_at(at), got.node_at(at));
+    }
 }
 
 /// The hash of a (non leaf-root) record's top node: its extension, else its branch.
