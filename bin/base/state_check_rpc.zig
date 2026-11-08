@@ -124,10 +124,12 @@ pub const Pacer = struct {
 /// What one item of an answer says.
 pub const ItemState = enum { ok, limited, out_of_window, failed };
 
-/// Error messages nodes give for state they no longer (or do not yet) serve.
+/// Error messages nodes give for state they no longer (or do not yet) serve. Only the proof
+/// range counts: "eth_getLogs is limited to a 200 range" is a request too large, not state
+/// out of the window.
 const window_signs = [_][]const u8{
-    "missing trie node",   "limited to a",           "historical state", "pruned",
-    "state not available", "state is not available", "header not found", "proof window",
+    "missing trie node",   "eth_getproof is limited", "historical state", "pruned",
+    "state not available", "state is not available",  "header not found", "proof window",
 };
 
 /// Error messages of rate limits.
@@ -472,6 +474,9 @@ test "state-check: answer items are ok, limited, out of the window, or failed" {
         , .state = .out_of_window },
         .{ .text =
         \\{"error":{"code":-32602,"message":"invalid argument"}}
+        , .state = .failed },
+        .{ .text =
+        \\{"error":{"code":-32614,"message":"eth_getLogs is limited to a 200 range"}}
         , .state = .failed },
         .{ .text = "{\"id\":0}", .state = .failed },
         .{ .text = "7", .state = .failed },

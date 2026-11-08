@@ -152,9 +152,10 @@ const window_margin_blocks = 150;
 /// The window is re-read (`eth_blockNumber`) this often while proofs are fetched.
 const window_refresh_ms = 5 * 60_000;
 /// Logs are read in chunks of blocks back from N until the pool holds two addresses per
-/// sampled account, or `logs_blocks_max` blocks were read.
-const logs_chunk_blocks = 500;
-const logs_blocks_max = 5_000;
+/// sampled account, or `logs_blocks_max` blocks were read. sepolia.base.org refuses
+/// `eth_getLogs` ranges over 200 blocks ("eth_getLogs is limited to a 200 range").
+const logs_chunk_blocks = 100;
+const logs_blocks_max = 2_000;
 /// Blocks back from N whose transactions' senders and recipients join the pool.
 const transaction_blocks = 1;
 /// Codes fetched with `eth_getCode` as a cross-check of the reference itself (every code is
