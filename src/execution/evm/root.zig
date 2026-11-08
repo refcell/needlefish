@@ -37,6 +37,7 @@ test {
     _ = @import("op_test.zig");
     _ = @import("evm_fuzz.zig");
     _ = @import("arith_fuzz.zig");
+    _ = @import("keccak_memo.zig");
     _ = @import("memory_fuzz.zig");
     _ = @import("call_fuzz.zig");
     _ = @import("sstore_fuzz.zig");

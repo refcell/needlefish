@@ -42,6 +42,9 @@ pub const Config = struct {
     /// Analysis cache by code hash: byte buffer and table slots (a power of two).
     code_cache_bytes: u32 = 64 << 20,
     code_cache_entries: u32 = 1 << 14,
+    /// KECCAK256 memo entries for inputs of up to 64 bytes (`keccak_memo.zig`): 0 disables it,
+    /// otherwise a power of two of at least 64. 2^16 entries reserve ~6 MiB, resident as used.
+    keccak_memo_entries: u32 = 1 << 16,
     /// EIP-170 runtime code size limit.
     code_size_max: u32 = 24_576,
     /// EIP-3860 init code size limit.

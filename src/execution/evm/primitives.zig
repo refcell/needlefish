@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const crypto_keccak = @import("../../common/crypto/keccak.zig");
 
 pub const Address = [20]u8;
 pub const B256 = [32]u8;
@@ -23,10 +24,9 @@ comptime {
     assert(@sizeOf(B256) == 32);
 }
 
+/// The crypto lane's Keccak (lanes in vector registers on x86-64 with AVX-512), not std's.
 pub fn keccak256(bytes: []const u8) B256 {
-    var out: B256 = undefined;
-    std.crypto.hash.sha3.Keccak256.hash(bytes, &out, .{});
-    return out;
+    return crypto_keccak.keccak256(bytes);
 }
 
 pub fn b256_to_u256(word: B256) u256 {

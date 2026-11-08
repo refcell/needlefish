@@ -224,7 +224,7 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
     const s = &f.stack;
     switch (opcode) {
         op.EXP => return exp(fork, f),
-        op.KECCAK256 => return keccak(f),
+        op.KECCAK256 => return keccak(f, evm),
         op.ADDRESS...op.BLOBBASEFEE => return environment(fork, opcode, f, evm),
         op.SLOAD => return sload(fork, f, evm),
         op.SSTORE => return sstore(fork, f, evm),
@@ -463,7 +463,7 @@ inline fn memory_op(comptime opcode: u8, s: *Stack, memory: *Memory, gas_left: *
     return true;
 }
 
-fn keccak(f: *Frame) ?Exit {
+fn keccak(f: *Frame, evm: *Evm) ?Exit {
     const offset = f.stack.pop();
     const size = f.stack.peek(0);
     const range = memory_range(&f.memory, &f.gas, offset, size.*) orelse return .out_of_gas;
@@ -471,7 +471,7 @@ fn keccak(f: *Frame) ?Exit {
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
     const data = f.memory.slice(range.offset, range.size);
-    write(size, primitives.b256_to_u256(primitives.keccak256(data)));
+    write(size, primitives.b256_to_u256(evm.keccak_memo.hash(data)));
     return null;
 }
 

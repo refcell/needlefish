@@ -8,6 +8,10 @@ fallback but hot paths should be our own, optimized implementations.
 - [x] keccak256 single-message: closed. Lazy rotation measured slower; published AArch64 work
   (Becker-Kannwischer 2022) finds scalar fastest for one message on Apple cores, NEON-SHA3 only
   wins multi-lane, which `keccak256_batch` covers.
+- [x] keccak256 single-message on x86-64 with AVX-512 (evm lane, 2026-11-08): each lane in its
+  own 128-bit register and the textbook theta / rho-pi / chi round (`permute_one`), as evm2's
+  keccak compiles: 264-272 ns per 64-byte hash against 555 (`permute(u64)`) and 636-675 (std)
+  on a 2.6 GHz Xeon. Other targets keep `permute(u64)`.
 - [x] sha256 (use/beat std), ripemd160, blake2f (EIP-152 compression), identity.
 - [x] secp256k1: field/scalar arithmetic (5x52 limbs or similar), GLV endomorphism, wNAF, ecrecover (precompile 0x01 semantics), signing (RFC 6979, constant time), public key → address. Vectors + differential fuzz vs `std.crypto.ecc.Secp256k1`.
 - [x] Generic Montgomery prime field `montgomery.Field(limbs, p)` shared by bn254/BLS/P256.
@@ -365,6 +369,8 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
   modes run every vector plus seeded round trips, a batch test, and a batch test.
 
 ## Log
+- 2026-11-08 (evm lane): x86-64 AVX-512 single-message Keccak-f (`permute_one`), 2.1x the
+  scalar path on a 64-byte hash; the EVM's KECCAK256 now uses this module instead of std.
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).
 - 2026-11-05: montgomery.Field generic over limbs; tested vs big ints for bn254, P-256, BLS12-381 (bench: 18.9ns bn254 mul, 31.0ns bls mul).
 - 2026-11-05: kzg: embedded public trusted setup, versioned hash, 0x0A input framing + output; pairing check plugs in once BLS12-381 lands.

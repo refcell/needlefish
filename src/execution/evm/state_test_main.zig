@@ -1,5 +1,5 @@
 //! `zig build statetest -- <file-or-dir>... [--fork Cancun] [--filter name] [--quiet]
-//!     [--bench [--target-ms <ms>]]`
+//!     [--bench [--target-ms <ms>]] [--no-keccak-memo]`
 //!
 //! Runs ethereum/tests GeneralStateTests fixtures (fetch with `just vectors`) and prints
 //! failures plus a pass-rate summary. Exits non-zero if any case fails. `--bench` times every
@@ -13,12 +13,16 @@ const Io = std.Io;
 const assert = std.debug.assert;
 const bench = @import("state_test_bench.zig");
 
+const memo_entries_default = (evm.env.Config{}).keccak_memo_entries;
+
 const Context = struct {
     quiet: bool,
     verbose: bool = false,
     path: []const u8 = "",
     /// `--bench`: target time per case and phase, and where `BENCH` lines go.
     bench_target_ns: ?u64 = null,
+    /// `--no-keccak-memo`: hash every KECCAK256 input (`evm.Config.keccak_memo_entries = 0`).
+    keccak_memo: bool = true,
     out: ?*Io.Writer = null,
 };
 
@@ -42,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         std.debug.print("usage: statetest <file-or-dir>... [--fork F] [--filter S] [--quiet]" ++
-            " [--bench [--target-ms <ms>]]\n", .{});
+            " [--bench [--target-ms <ms>]] [--no-keccak-memo]\n", .{});
         return 2;
     }
     var context = Context{ .quiet = false };
@@ -64,6 +68,7 @@ pub fn main(init: std.process.Init) !u8 {
     var machine = try evm.Evm.init(gpa, .{
         .memory_bytes_max = 1536 << 20,
         .code_arena_bytes = 1536 << 20,
+        .keccak_memo_entries = if (context.keccak_memo) memo_entries_default else 0,
     }, &state);
     defer machine.deinit(gpa);
     var runner = state_test.Runner{
@@ -108,6 +113,8 @@ fn parse_arguments(
         } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--filter")) {
             index += 1;
             options.name_filter = args[index];
+        } else if (std.mem.eql(u8, arg, "--no-keccak-memo")) {
+            context.keccak_memo = false;
         } else if (std.mem.eql(u8, arg, "--bench")) {
             context.bench_target_ns = context.bench_target_ns orelse 20 * std.time.ns_per_ms;
         } else if (index + 1 < args.len and std.mem.eql(u8, arg, "--target-ms")) {

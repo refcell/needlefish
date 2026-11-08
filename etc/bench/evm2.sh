@@ -11,11 +11,13 @@
 #
 # Every run is a fresh process; each round runs every configuration once, in a rotated order.
 # Configurations (all -C target-cpu=native / -Dcpu=native):
-#   nf-safe-native, nf-fast-native   needlefish ReleaseSafe and ReleaseFast
+#   nf-safe-native, nf-fast-native   needlefish ReleaseSafe and ReleaseFast, keccak memo off
+#   nf-fast-native-memo  needlefish ReleaseFast with its KECCAK256 memo (on by default in the
+#                     node; `statetest --no-keccak-memo` turns it off for the configs above)
 #   evm2-tco          evm2's tail-call dispatch (nightly Rust), keccak memo off
 #   evm2-packed       evm2's stable-Rust dispatch (what evm2's CI benches), keccak memo off
 #   evm2-tco-memo     evm2-tco with alloy's process-global keccak memo (`keccak-cache-global`,
-#                     on in evm2's own bench and in reth); needlefish has no memo yet
+#                     on in evm2's own bench and in reth); compare with nf-fast-native-memo
 #   revm              revm 43 through the same runner (stable build, memo off)
 #
 # Environment:
@@ -87,8 +89,9 @@ launch() { # launch <command...>: pinned, and in bench.slice when isolating
 
 # Configurations, one per line: `<label> <binary> [<arguments>]`.
 configs() {
-    echo "nf-safe-native $out/bin/nf-ReleaseSafe-native/bin/statetest --bench"
-    echo "nf-fast-native $out/bin/nf-ReleaseFast-native/bin/statetest --bench"
+    echo "nf-safe-native $out/bin/nf-ReleaseSafe-native/bin/statetest --bench --no-keccak-memo"
+    echo "nf-fast-native $out/bin/nf-ReleaseFast-native/bin/statetest --bench --no-keccak-memo"
+    echo "nf-fast-native-memo $out/bin/nf-ReleaseFast-native/bin/statetest --bench"
     echo "evm2-tco $out/bin/evm2-tco --engine evm2"
     echo "evm2-packed $out/bin/evm2-packed --engine evm2"
     echo "evm2-tco-memo $out/bin/evm2-tco-memo --engine evm2"
@@ -136,6 +139,6 @@ zig run -OReleaseSafe etc/bench/stats.zig -- --cases \
     --pair nf-safe-native/evm2-tco \
     --pair nf-fast-native/evm2-tco \
     --pair nf-fast-native/evm2-packed \
-    --pair nf-fast-native/evm2-tco-memo \
+    --pair nf-fast-native-memo/evm2-tco-memo \
     --pair evm2-tco/revm \
     <"$results/results.txt"

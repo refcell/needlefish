@@ -6,6 +6,7 @@
 //! `std.crypto.hash.sha3.Keccak256` is used only as a test oracle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Prng = @import("../../testing/prng.zig").Prng;
 
@@ -116,11 +117,70 @@ pub fn permute(comptime Lane: type, state: *[25]Lane) void {
     state.* = local;
 }
 
+/// Rho rotation of each lane by index x + 5y, from the rho-pi cycle above.
+const rho_by_lane: [25]u6 = blk: {
+    var table: [25]u6 = @splat(0);
+    var lane: usize = 1;
+    for (0..24) |step| {
+        table[lane] = rho_cycle[step];
+        lane = pi_cycle[step];
+    }
+    break :blk table;
+};
+
+comptime {
+    assert(rho_by_lane[0] == 0 and rho_by_lane[1] == 1 and rho_by_lane[2] == 62);
+    assert(rho_by_lane[5] == 36 and rho_by_lane[24] == 14);
+}
+
+/// One message on x86-64 with AVX-512 (F and VL): every lane in its own 128-bit register.
+/// The 32 vector registers hold the state without spills, `vprolq` rotates, and LLVM fuses
+/// three-input logic (theta's xors, chi) into `vpternlogq`; this is how evm2's keccak
+/// compiles. 264-272 ns per 64-byte hash on a 2.6 GHz Xeon, against 555 for `permute(u64)`
+/// and 636-675 for std. Other targets keep `permute(u64)` (aarch64 measured it best).
+const spread_lanes = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and
+    builtin.cpu.hasAll(.x86, &.{ .avx512f, .avx512vl });
+
+fn permute_one(state: *[25]u64) void {
+    if (comptime !spread_lanes) return permute(u64, state);
+    const Lane = @Vector(2, u64);
+    var lanes: [25]Lane = undefined;
+    inline for (0..25) |lane| lanes[lane] = .{ state[lane], 0 };
+    for (round_constants) |round_constant| round_spread(Lane, &lanes, round_constant);
+    inline for (0..25) |lane| state[lane] = lanes[lane][0];
+}
+
+/// The textbook round: theta, then rho and pi into a second array, then chi. With a lane
+/// per register it beats the in-place `round` (264 against 330 ns): no lane waits on the
+/// rho-pi cycle's chain of moves.
+inline fn round_spread(comptime Lane: type, state: *[25]Lane, round_constant: u64) void {
+    @setEvalBranchQuota(10_000);
+    var parity: [5]Lane = undefined;
+    inline for (0..5) |x| {
+        parity[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+    }
+    var moved: [25]Lane = undefined;
+    inline for (0..5) |x| {
+        const theta = parity[(x + 4) % 5] ^ rotl(Lane, parity[(x + 1) % 5], 1);
+        inline for (0..5) |y| {
+            const destination = y + 5 * ((2 * x + 3 * y) % 5);
+            moved[destination] = rotl(Lane, state[x + 5 * y] ^ theta, rho_by_lane[x + 5 * y]);
+        }
+    }
+    inline for (0..5) |y| {
+        inline for (0..5) |x| {
+            const next = moved[(x + 1) % 5 + 5 * y];
+            state[x + 5 * y] = moved[x + 5 * y] ^ (~next & moved[(x + 2) % 5 + 5 * y]);
+        }
+    }
+    state[0] ^= splat(Lane, round_constant);
+}
+
 inline fn absorb_block(state: *[25]u64, block: *const [rate_bytes]u8) void {
     inline for (0..rate_lanes) |lane| {
         state[lane] ^= std.mem.readInt(u64, block[lane * 8 ..][0..8], .little);
     }
-    permute(u64, state);
+    permute_one(state);
 }
 
 fn squeeze(state: *const [25]u64) Digest {
@@ -198,7 +258,6 @@ pub const batch_width: comptime_int = batch_width_for_target();
 /// (where LLVM emits the ARMv8.2 SHA3 instructions EOR3/BCAX/XAR/RAX1), 4 on
 /// AVX2, 8 on AVX-512.
 fn batch_width_for_target() comptime_int {
-    const builtin = @import("builtin");
     const cpu = builtin.cpu;
     if (cpu.arch.isX86()) {
         if (std.Target.x86.featureSetHas(cpu.features, .avx512f)) return 8;

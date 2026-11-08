@@ -353,6 +353,20 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   (now u64); (3) gas as compare + subtract (now `@subWithOverflow` and a borrow branch);
   (4) stack checks narrowed per opcode (underflow only when the stack cannot grow). Together
   fibonacci 42 -> 24 us (evm2 tail-call 27) on B1.
+  Follow-up from the preserve_none thread (2026-11-08): stock Zig 0.17.1 already emits real
+  `preserve_nonecc` + `musttail`, so fucory's fork adds nothing. The P2 tail calls lost to a
+  `push rbp`/`pop rbp` and a `vzeroupper` per handler; with both removed they only reach
+  parity (1.00x) with the switch. Of Guillotine's tricks, a stack-top pointer is a net loss
+  in ReleaseSafe, and per-basic-block gas checks are worth at most 1.01x.
+- P3: KECCAK256 through `common.crypto.keccak` instead of std, with an x86-64 AVX-512
+  single-message permutation (`permute_one`: a lane per 128-bit register, `vprolq` and
+  `vpternlogq`, as evm2's keccak compiles; 264-272 ns per 64-byte hash against std's
+  636-675), and a per-`Evm` memo of digests for inputs of up to 64 bytes
+  (`keccak_memo.zig`): direct-mapped, 2^16 entries (~6 MiB reserved lazily), a hit compares
+  the whole input, lives across transactions and blocks; `Config.keccak_memo_entries = 0`
+  disables it. Same idea as alloy's `keccak-cache-global` that reth and evm2's bench enable,
+  but owned and sized at init instead of process-global. B1 now pairs memo-off with evm2
+  memo-off and memo-on with evm2 memo-on (`statetest --no-keccak-memo`).
 - Static allocation: frames, 1025 stacks, shared memory, analysis arena, return buffer, journal,
   logs, code store and state maps are sized at init. Exceeding a state/journal limit is
   `error.StateFull` (fatal block error, never silent divergence). Memory growth past
@@ -381,6 +395,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-08: P3 (AVX-512 Keccak-f, per-`Evm` keccak memo): vs evm2 tail-call on 15 rounds,
+  ReleaseFast geometric mean 1.05x -> 1.13x memo-off (hash_10k 0.46x -> 0.97x,
+  erc20_transfer 0.51x -> 0.92x), 1.07x with both memos on; ReleaseSafe 0.85x.
 - 2026-11-08: P0 (evm2 fixture benchmark, `statetest --bench`) and P1 (register locals):
   vs evm2's tail-call build on its 31 fixtures, ReleaseFast geometric mean 0.77x -> 0.89x
   (1.04x vs evm2's stable build); docs/BENCHMARKS.md "EVM vs evm2". EEST stable and develop

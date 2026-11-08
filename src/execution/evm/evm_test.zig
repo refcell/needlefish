@@ -15,6 +15,8 @@ pub const test_config = env.Config{
     .code_arena_bytes = 1 << 22,
     .code_cache_bytes = 1 << 20,
     .code_cache_entries = 1 << 8,
+    // Small, so the fuzz and end-to-end tests also run through evictions.
+    .keccak_memo_entries = 1 << 6,
     .modexp_modulus_bytes_max = 4096,
 };
 

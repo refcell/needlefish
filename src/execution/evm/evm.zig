@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const lazy = @import("../../utilities/lazy_alloc/root.zig");
+const KeccakMemo = @import("keccak_memo.zig").KeccakMemo;
 const primitives = @import("primitives.zig");
 const stack_module = @import("stack.zig");
 const memory_module = @import("memory.zig");
@@ -203,6 +204,7 @@ pub const Evm = struct {
     shared_memory: memory_module.SharedMemory,
     arena: bytecode.Arena,
     code_cache: bytecode.AnalysisCache,
+    keccak_memo: KeccakMemo,
     return_buffer: []u8,
     precompile_scratch: []u64,
     return_len: u32 = 0,
@@ -229,6 +231,8 @@ pub const Evm = struct {
             config.code_cache_entries,
         );
         errdefer code_cache.deinit(allocator);
+        var keccak_memo = try KeccakMemo.init(allocator, config.keccak_memo_entries);
+        errdefer keccak_memo.deinit(allocator);
         const return_buffer = try lazy.alloc(allocator, u8, config.memory_bytes_max);
         errdefer lazy.free(allocator, return_buffer);
         const scratch_limbs = crypto.modexp.scratch_limbs_needed(config.modexp_modulus_bytes_max);
@@ -241,6 +245,7 @@ pub const Evm = struct {
             .shared_memory = shared_memory,
             .arena = arena,
             .code_cache = code_cache,
+            .keccak_memo = keccak_memo,
             .return_buffer = return_buffer,
             .precompile_scratch = precompile_scratch,
         };
@@ -252,6 +257,7 @@ pub const Evm = struct {
         evm.shared_memory.deinit(allocator);
         evm.arena.deinit(allocator);
         evm.code_cache.deinit(allocator);
+        evm.keccak_memo.deinit(allocator);
         lazy.free(allocator, evm.return_buffer);
         lazy.free(allocator, evm.precompile_scratch);
         evm.* = undefined;

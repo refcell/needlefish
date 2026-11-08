@@ -79,7 +79,9 @@ fn bench_case(
     const limits = evm.state.Limits.for_block_gas(tx.gas_limit);
     var state = try evm.State.init(gpa, database.interface(), limits);
     defer state.deinit(gpa);
-    var machine = try evm.Evm.init(gpa, .{}, &state);
+    // Same memo setting as the conformance run (`statetest --no-keccak-memo`).
+    const memo_entries = runner.evm.config.keccak_memo_entries;
+    var machine = try evm.Evm.init(gpa, .{ .keccak_memo_entries = memo_entries }, &state);
     defer machine.deinit(gpa);
     machine.block = try state_test.block_env(fork, case.fixture);
     const timing = Timing{ .state = &state, .machine = &machine, .database = &database };
