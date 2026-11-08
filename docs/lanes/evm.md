@@ -326,6 +326,21 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `State` (no vtable on the hot path).
 - Interpreter is instantiated per fork (`comptime fork`) with labeled-switch threaded dispatch
   (`continue :dispatch`); stack bounds and static gas are comptime per opcode.
+- evm2-style redesign (2026-11-08, approved by the owner; design in the thread's "EVM
+  redesign: evm2 research and design" doc). evm2 (alloy-rs/evm2, reth's EVM since v2.9.0) is
+  fast mainly from instruction plumbing: pc, stack length and gas stay in machine registers
+  between opcodes and reach memory only at opcodes that need the host or dynamic gas. Phases:
+  P0 benchmark against evm2 (`etc/bench/evm2.sh`), P1 register locals in the switch, P2
+  tail-call handlers (`@call(.always_tail)` with `preserve_none`), P3 keccak memo and a faster
+  x86 Keccak-f, P4 state lookups and analysis. CALL keeps the explicit frame stack (evm2
+  recurses natively; needlefish's driver is already allocation-free).
+- P1: `interpreter.run` keeps `Registers` (pc, gas, stack pointer + length) in locals. Opcodes
+  that touch only them, memory, and read-only frame/block fields (arithmetic, stack, PUSH,
+  jumps, MLOAD/MSTORE/MSTORE8/MCOPY, CALLDATALOAD and the env/block pushes) run on the
+  registers; all others are sync points (write to the frame, run, reload). The stack check is
+  one compare (`len -% inputs > 1024 - outputs`). Steps return a `bool` continue flag with the
+  exit in a local: a `?Exit` result compiled to a load from a constant global plus a branch on
+  every opcode (~8% of snailtracer).
 - Static allocation: frames, 1025 stacks, shared memory, analysis arena, return buffer, journal,
   logs, code store and state maps are sized at init. Exceeding a state/journal limit is
   `error.StateFull` (fatal block error, never silent divergence). Memory growth past
@@ -354,6 +369,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-08: P0 (evm2 fixture benchmark, `statetest --bench`) and P1 (register locals):
+  vs evm2's tail-call build on its 31 fixtures, ReleaseFast geometric mean 0.77x -> 0.89x
+  (1.04x vs evm2's stable build); docs/BENCHMARKS.md "EVM vs evm2". EEST stable and develop
+  state tests still pass. Next: P2 tail-call handlers.
 - 2026-11-06: paused (project paused by owner). Last pushed work: 23575ed5 (EIP-7702
   delegation fuzz). Next on resume: lookup-count profiling (first unchecked backlog item).
 - 2026-11-05: 64-bit-limb big-endian word loads (MLOAD/MSTORE/PUSH/CALLDATALOAD):

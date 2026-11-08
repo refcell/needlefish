@@ -281,6 +281,48 @@ windows are short (about 0.35 s) and noisier than the full replays, so the inter
 wider. One difference favours base/base: revm analyzes bytecode (jump tables) while the
 `CacheDB` is filled, outside the timed region; needlefish analyzes during execution.
 
+### EVM vs evm2
+
+needlefish's interpreter against [evm2](https://github.com/alloy-rs/evm2) (`37fb326b`) and
+revm 43 on evm2's own fixture suite (`data/*.json` minus the precompile cases: 31 single-
+transaction state tests, from 21k-gas transfers to snailtracer and burntpix). Both sides
+run the same loop: one `transact` per iteration on a reused EVM, after an untimed state
+reset, for 20 ms of warm-up and 20 ms timed per case and process
+([etc/bench/evm2.sh](../etc/bench/evm2.sh)). A case counts only when every engine reports
+the same gas used. Speedup is the ratio of median µs per transaction over fresh processes,
+above 1 meaning the first engine is faster; the summary is the geometric mean over cases.
+
+| pair | P0 (before) | P1 (register locals) |
+| --- | ---: | ---: |
+| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x |
+| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x |
+| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x |
+| needlefish ReleaseFast vs evm2 tail-call + keccak memo | 0.70x | 0.81x |
+| evm2 tail-call vs revm | 1.25x | 1.25x |
+
+| case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | evm2 µs | P1 speedup |
+| --- | ---: | ---: | ---: | ---: |
+| fibonacci-calldata | 63.8 | 42.0 | 27.3 | 0.65x |
+| snailtracer | 80,352 | 63,842 | 49,770 | 0.78x |
+| burntpix | 71,941 | 45,507 | 35,442 | 0.78x |
+| uniswap_v3_pool | 25.1 | 21.6 | 16.3 | 0.76x |
+| erc20_transfer | 13,230 | 12,822 | 6,208 | 0.48x |
+| hash_10k | 8,383 | 8,206 | 3,413 | 0.42x |
+| counter | 1.00 | 0.99 | 1.51 | 1.52x |
+
+- *evm2 tail-call* is evm2's default on nightly Rust (`become` handlers with the
+  `preserve_none` calling convention); *packed* is its stable-Rust dispatch. The *memo*
+  build turns on alloy's process-global keccak cache, which evm2's own benchmark and reth
+  enable; needlefish has no memo, and the keccak-bound cases (erc20_transfer, hash_10k) are
+  where it trails most.
+- needlefish wins every tiny transaction (counter, airdrop, eip2935, eip4788, fiat_token,
+  push0_proxy, uniswap_v2_pair, usdc_proxy: 1.3-1.5x), where per-transaction setup
+  dominates.
+- P1 keeps pc, gas and the stack in locals between opcodes that need nothing else; see the
+  evm lane. P2 (tail-call handlers) and P3 (keccak) follow.
+- Measured 2026-11-08 on the 4-vCPU cloud VM, pinned to one CPU but not isolated; P0 is 3
+  rounds and P1 5 rounds, so per-case intervals are wide (printed by `stats.zig --cases`).
+
 ### Memory and size
 
 | | needlefish ReleaseSafe | needlefish ReleaseFast | base/base |

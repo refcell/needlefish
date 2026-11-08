@@ -30,6 +30,11 @@ README.
 - [x] Plan B4: node to node through the Engine API (`etc/bench/node-bench.sh`), on a
       10,000-account synthetic devnet chain. Mainnet-state import waits for SYNC_PLAN M2/M3.
 - [x] Plan B5: BENCHMARKS.md and the README Benchmarks section rewritten from B1-B4.
+- [x] B1 vs evm2 (2026-11-08): `etc/bench/evm2.sh` times needlefish (`statetest --bench`),
+      evm2 (tail-call and stable dispatch, keccak memo on and off) and revm on evm2's own
+      fixture suite with one loop on both sides (`etc/bench/evm2-harness.patch` adds the `nf`
+      runner to evm2's CLI crate); `stats.zig --cases` prints per-case medians and speedups and
+      refuses cases whose gas differs between engines.
 - [ ] Rerun on a dedicated server (frequency control, PMU, `perf stat` instructions and
       cycles per block); this round ran on a 4-vCPU cloud VM.
 
@@ -117,6 +122,7 @@ README.
   `.cache/zig` when it is not on `PATH`, so installation is clone plus `just release`.
 
 ## Log
+- 2026-11-08: evm2 comparison (B1 above), baseline and the evm lane's P1 in BENCHMARKS.md.
 
 - 2026-11-06: base/base harness verifies all 110 blocks (100-block window + fixture) in
   11 runs each. Results, methodology, reproduce script, and README pushed.

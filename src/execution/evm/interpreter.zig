@@ -5,6 +5,12 @@
 //! Every arm is instantiated with a comptime opcode *and* comptime fork, so stack
 //! bounds, static gas, and fork rules are constants in the generated code.
 //!
+//! The program counter, the remaining gas, and the stack (pointer and length) live in
+//! `Registers`, a local the compiler keeps in machine registers, as evm2 does. Opcodes that
+//! touch only those (arithmetic, stack, PUSH, jumps) run on them directly; every other opcode
+//! is a sync point: the registers are written to the frame, the opcode runs on the frame, and
+//! the registers are reloaded (evm2's `DYNAMIC_GAS`/`HOOKED` instructions).
+//!
 //! The loop is bounded by gas: every instruction that does not exit costs >= 1 gas.
 
 const std = @import("std");
@@ -14,6 +20,7 @@ const op = @import("opcode.zig");
 const gas = @import("gas.zig");
 const uint = @import("uint.zig");
 const memory_module = @import("memory.zig");
+const stack_module = @import("stack.zig");
 const bytecode = @import("bytecode.zig");
 const opcode_profile = @import("opcode_profile.zig");
 const state_module = @import("state.zig");
@@ -24,49 +31,131 @@ const Frame = evm_module.Frame;
 const Exit = evm_module.Exit;
 const CallKind = evm_module.CallKind;
 
+const Stack = stack_module.Stack;
+
+/// Interpreter state kept in machine registers between opcodes; `Frame` holds the
+/// authoritative copy only at sync points and when `run` returns.
+const Registers = struct {
+    pc: u32,
+    gas: u64,
+    stack: Stack,
+};
+
 /// Run `frame` in place until it exits.
 pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     @setEvalBranchQuota(100_000);
-    // Runs on the frame in place: a local copy (for register promotion) measured ~13% slower
-    // on the call loop and no faster on straight-line code (snailtracer, arithmetic).
     const f = frame;
-    const exit: Exit = loop: {
-        dispatch: switch (f.analyzed.code[f.pc]) {
+    // Immutable for the frame's lifetime: loaded once, not through `f` after every store.
+    const analyzed = f.analyzed;
+    var registers = Registers{ .pc = f.pc, .gas = f.gas, .stack = f.stack };
+    const r = &registers;
+    // Set when a step halts. A plain `bool` continue flag instead of a `?Exit` result: Zig
+    // lowered the optional to a load from a constant global, and a branch, on every opcode.
+    var exit: Exit = undefined;
+    loop: {
+        dispatch: switch (analyzed.code[r.pc]) {
             inline else => |opcode| {
                 const start = opcode_profile.now();
                 defer opcode_profile.record(opcode, start);
-                if (step(fork, opcode, f, evm)) |exit| break :loop exit;
-                continue :dispatch f.analyzed.code[f.pc];
+                if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                continue :dispatch analyzed.code[r.pc];
             },
         }
-    };
+    }
+    f.pc = r.pc;
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    assert(f.stack.items == r.stack.items);
     assert(frame.stack.len <= 1024);
     return exit;
 }
 
-inline fn step(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
+inline fn step(
+    comptime fork: Fork,
+    comptime opcode: u8,
+    r: *Registers,
+    analyzed: *const bytecode.Analyzed,
+    f: *Frame,
+    evm: *Evm,
+    exit: *Exit,
+) bool {
     @setEvalBranchQuota(100_000);
-    if (comptime !op.is_defined(fork, opcode) or opcode == op.INVALID) return .invalid_opcode;
-    const info = comptime op.table[opcode];
-    if (comptime info.inputs > 0) {
-        if (f.stack.len < info.inputs) return .stack_underflow;
+    if (comptime !op.is_defined(fork, opcode) or opcode == op.INVALID) {
+        exit.* = .invalid_opcode;
+        return false;
     }
-    if (comptime info.outputs > info.inputs) {
-        if (f.stack.len + (info.outputs - info.inputs) > 1024) return .stack_overflow;
+    const inputs: u32 = comptime op.table[opcode].inputs;
+    const outputs: u32 = comptime op.table[opcode].outputs;
+    if (comptime inputs > 0 or outputs > 0) {
+        // One compare for both bounds: `len < inputs` wraps to a huge value, and otherwise
+        // `len - inputs + outputs > 1024` overflows the stack.
+        if (r.stack.len -% inputs > stack_module.limit - outputs) {
+            @branchHint(.cold);
+            exit.* = if (r.stack.len < inputs) .stack_underflow else .stack_overflow;
+            return false;
+        }
     }
     const cost = comptime gas.static_cost(fork, opcode);
     if (comptime cost > 0) {
-        if (f.gas < cost) return .out_of_gas;
-        f.gas -= cost;
+        if (r.gas < cost) {
+            @branchHint(.cold);
+            exit.* = .out_of_gas;
+            return false;
+        }
+        r.gas -= cost;
     }
-    f.pc += 1;
-    return execute(fork, opcode, f, evm);
+    r.pc += 1;
+    if (comptime in_registers(opcode)) {
+        return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
+    }
+    // Sync point: the opcode reads or writes frame state beyond the registers.
+    f.pc = r.pc;
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    const result = execute(fork, opcode, f, evm);
+    r.pc = f.pc;
+    r.gas = f.gas;
+    r.stack.len = f.stack.len;
+    if (result) |halt| {
+        exit.* = halt;
+        return false;
+    }
+    return true;
 }
 
-fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
-    const s = &f.stack;
+/// Opcodes that run on the registers: they read frame and block fields and may charge memory
+/// expansion from the gas register, but never call into state, return, or start a frame.
+fn in_registers(comptime opcode: u8) bool {
+    return switch (opcode) {
+        op.STOP, op.ADD, op.MUL, op.SUB, op.DIV, op.SDIV, op.MOD, op.SMOD => true,
+        op.ADDMOD, op.MULMOD, op.SIGNEXTEND, op.LT, op.GT, op.SLT, op.SGT, op.EQ => true,
+        op.ISZERO, op.AND, op.OR, op.XOR, op.NOT, op.BYTE, op.SHL, op.SHR, op.SAR => true,
+        op.CLZ, op.PUSH0, op.POP, op.JUMP, op.JUMPI, op.JUMPDEST, op.PC, op.MSIZE => true,
+        op.GAS, op.PUSH1...op.PUSH32, op.DUP1...op.DUP16, op.SWAP1...op.SWAP16 => true,
+        op.MLOAD, op.MSTORE, op.MSTORE8, op.MCOPY => true,
+        op.ADDRESS, op.ORIGIN, op.CALLER, op.CALLVALUE, op.CALLDATALOAD => true,
+        op.CALLDATASIZE, op.CODESIZE, op.GASPRICE, op.RETURNDATASIZE, op.CHAINID => true,
+        op.COINBASE, op.TIMESTAMP, op.NUMBER, op.PREVRANDAO, op.GASLIMIT, op.BASEFEE => true,
+        op.BLOBHASH, op.BLOBBASEFEE => true,
+        else => false,
+    };
+}
+
+inline fn execute_registers(
+    comptime fork: Fork,
+    comptime opcode: u8,
+    r: *Registers,
+    analyzed: *const bytecode.Analyzed,
+    f: *Frame,
+    evm: *const Evm,
+    exit: *Exit,
+) bool {
+    const s = &r.stack;
     switch (opcode) {
-        op.STOP => return .stop,
+        op.STOP => {
+            exit.* = .stop;
+            return false;
+        },
         op.ADD => binary(s, add),
         op.MUL => binary(s, mul),
         op.SUB => binary(s, sub),
@@ -76,7 +165,6 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
         op.SMOD => binary(s, smod),
         op.ADDMOD => ternary(s, addmod),
         op.MULMOD => ternary(s, mulmod),
-        op.EXP => return exp(fork, f),
         op.SIGNEXTEND => binary(s, signextend),
         op.LT => binary(s, lt),
         op.GT => binary(s, gt),
@@ -93,19 +181,37 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
         op.SHR => binary(s, shr),
         op.SAR => binary(s, sar),
         op.CLZ => s.peek(0).* = @clz(s.peek(0).*),
-        op.KECCAK256 => return keccak(f),
         op.PUSH0 => s.push(0),
-        op.PUSH1...op.PUSH32 => push(opcode - op.PUSH1 + 1, f),
+        op.PUSH1...op.PUSH32 => push(opcode - op.PUSH1 + 1, r, analyzed),
         op.DUP1...op.DUP16 => s.dup(opcode - op.DUP1 + 1),
         op.SWAP1...op.SWAP16 => s.swap(opcode - op.SWAP1 + 1),
         op.POP => _ = s.pop(),
-        op.JUMP => return jump(f),
-        op.JUMPI => return jumpi(f),
+        op.JUMP, op.JUMPI => if (!jump(opcode == op.JUMPI, r, analyzed)) {
+            exit.* = .invalid_jump;
+            return false;
+        },
         op.JUMPDEST => {},
-        op.PC => s.push(f.pc - 1),
+        op.PC => s.push(r.pc - 1),
         op.MSIZE => s.push(f.memory.len),
-        op.GAS => s.push(f.gas),
-        op.MLOAD, op.MSTORE, op.MSTORE8, op.MCOPY => return memory_op(opcode, f),
+        op.GAS => s.push(r.gas),
+        op.MLOAD, op.MSTORE, op.MSTORE8, op.MCOPY => {
+            if (!memory_op(opcode, s, &f.memory, &r.gas)) {
+                exit.* = .out_of_gas;
+                return false;
+            }
+        },
+        else => environment_value(fork, opcode, s, f, evm),
+    }
+    return true;
+}
+
+/// Sync-point opcodes: run on the frame (`f.pc`, `f.gas`, `f.stack` are current).
+fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
+    comptime assert(!in_registers(opcode));
+    const s = &f.stack;
+    switch (opcode) {
+        op.EXP => return exp(fork, f),
+        op.KECCAK256 => return keccak(f),
         op.ADDRESS...op.BLOBBASEFEE => return environment(fork, opcode, f, evm),
         op.SLOAD => return sload(fork, f, evm),
         op.SSTORE => return sstore(fork, f, evm),
@@ -128,13 +234,13 @@ fn execute(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit
 
 // ------------------------------------------------------------------ arithmetic
 
-inline fn binary(s: *@TypeOf(@as(Frame, undefined).stack), comptime function: anytype) void {
+inline fn binary(s: *Stack, comptime function: anytype) void {
     const a = s.pop();
     const b = s.peek(0);
     b.* = function(a, b.*);
 }
 
-inline fn ternary(s: *@TypeOf(@as(Frame, undefined).stack), comptime function: anytype) void {
+inline fn ternary(s: *Stack, comptime function: anytype) void {
     const a = s.pop();
     const b = s.pop();
     const c = s.peek(0);
@@ -275,54 +381,61 @@ pub fn sar(shift: u256, value: u256) u256 {
 
 pub const Range = struct { offset: u64, size: u64 };
 
-/// Charge for and grow memory to cover `[offset, offset + size)`.
-fn memory_range(f: *Frame, offset: u256, size: u256) ?Range {
+/// Charge `gas_left` for and grow `memory` to cover `[offset, offset + size)`.
+inline fn memory_range(memory: *Memory, gas_left: *u64, offset: u256, size: u256) ?Range {
     if (size == 0) return .{ .offset = 0, .size = 0 };
     if (offset > std.math.maxInt(u32) or size > std.math.maxInt(u32)) return null;
     const range = Range{ .offset = @intCast(offset), .size = @intCast(size) };
-    const cost = f.memory.expansion_cost(range.offset, range.size) orelse return null;
-    if (f.gas < cost) return null;
-    f.gas -= cost;
-    f.memory.grow(range.offset + range.size);
+    const end = range.offset + range.size;
+    // Within the active size (the common case) nothing is charged or grown.
+    if (end <= memory.len) return range;
+    const cost = memory.expansion_cost(range.offset, range.size) orelse return null;
+    if (gas_left.* < cost) return null;
+    gas_left.* -= cost;
+    memory.grow(end);
+    assert(memory.len >= end);
     return range;
 }
 
-fn charge_copy(f: *Frame, size: u64) bool {
+const Memory = memory_module.Memory;
+
+fn charge_copy(gas_left: *u64, size: u64) bool {
     const cost = gas.copy_cost(size);
-    if (f.gas < cost) return false;
-    f.gas -= cost;
+    if (gas_left.* < cost) return false;
+    gas_left.* -= cost;
     return true;
 }
 
-fn memory_op(comptime opcode: u8, f: *Frame) ?Exit {
-    const s = &f.stack;
+/// MLOAD, MSTORE, MSTORE8, MCOPY: run on the registers (`gas_left` is the gas register).
+/// False when the gas cannot pay for the expansion or copy (out of gas).
+inline fn memory_op(comptime opcode: u8, s: *Stack, memory: *Memory, gas_left: *u64) bool {
     switch (opcode) {
         op.MLOAD => {
             const offset = s.peek(0);
-            const range = memory_range(f, offset.*, 32) orelse return .out_of_gas;
-            offset.* = primitives.word_from_be(f.memory.word(range.offset));
+            const range = memory_range(memory, gas_left, offset.*, 32) orelse return false;
+            offset.* = primitives.word_from_be(memory.word(range.offset));
         },
         op.MSTORE => {
             const offset = s.pop();
             const value = s.pop();
-            const range = memory_range(f, offset, 32) orelse return .out_of_gas;
-            primitives.word_to_be(f.memory.word(range.offset), value);
+            const range = memory_range(memory, gas_left, offset, 32) orelse return false;
+            primitives.word_to_be(memory.word(range.offset), value);
         },
         op.MSTORE8 => {
             const offset = s.pop();
             const value = s.pop();
-            const range = memory_range(f, offset, 1) orelse return .out_of_gas;
-            f.memory.slice(range.offset, 1)[0] = @truncate(value);
+            const range = memory_range(memory, gas_left, offset, 1) orelse return false;
+            memory.slice(range.offset, 1)[0] = @truncate(value);
         },
         op.MCOPY => {
             const destination = s.pop();
             const source = s.pop();
             const size = s.pop();
-            if (size == 0) return null;
+            if (size == 0) return true;
             const end = @max(destination, source);
-            const range = memory_range(f, end, size) orelse return .out_of_gas;
-            if (!charge_copy(f, range.size)) return .out_of_gas;
-            const bytes = f.memory.bytes;
+            const range = memory_range(memory, gas_left, end, size) orelse return false;
+            if (!charge_copy(gas_left, range.size)) return false;
+            const bytes = memory.bytes;
             const src: usize = @intCast(source);
             const dst: usize = @intCast(destination);
             const count: usize = @intCast(size);
@@ -334,13 +447,13 @@ fn memory_op(comptime opcode: u8, f: *Frame) ?Exit {
         },
         else => comptime unreachable,
     }
-    return null;
+    return true;
 }
 
 fn keccak(f: *Frame) ?Exit {
     const offset = f.stack.pop();
     const size = f.stack.peek(0);
-    const range = memory_range(f, offset, size.*) orelse return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, offset, size.*) orelse return .out_of_gas;
     const cost = gas.keccak256_word * gas.words_for(range.size);
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
@@ -357,8 +470,8 @@ fn copy_to_memory(
     offset: u256,
     size: u256,
 ) ?Exit {
-    const range = memory_range(f, memory_offset, size) orelse return .out_of_gas;
-    if (!charge_copy(f, range.size)) return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, memory_offset, size) orelse return .out_of_gas;
+    if (!charge_copy(&f.gas, range.size)) return .out_of_gas;
     if (range.size == 0) return null;
     memory_module.copy_padded(f.memory.slice(range.offset, range.size), source, offset);
     return null;
@@ -366,9 +479,10 @@ fn copy_to_memory(
 
 // ------------------------------------------------------------------ control flow
 
-fn push(comptime size: u8, f: *Frame) void {
+inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analyzed) void {
     comptime assert(size >= 1 and size <= 32);
-    const immediate = f.analyzed.code[f.pc..][0..size];
+    // The code is padded, so an immediate running past the end reads zeros.
+    const immediate = analyzed.code[r.pc..][0..size];
     const value: u256 = if (size <= 8) blk: {
         var buffer: [8]u8 = @splat(0);
         buffer[8 - size ..].* = immediate.*;
@@ -378,30 +492,30 @@ fn push(comptime size: u8, f: *Frame) void {
         buffer[32 - size ..].* = immediate.*;
         break :blk primitives.word_from_be(&buffer);
     };
-    f.stack.push(value);
-    f.pc += size;
+    r.stack.push(value);
+    r.pc += size;
 }
 
-fn jump(f: *Frame) ?Exit {
-    const destination = f.stack.pop();
-    if (!f.analyzed.is_jumpdest(destination)) return .invalid_jump;
-    f.pc = @intCast(destination);
-    return null;
-}
-
-fn jumpi(f: *Frame) ?Exit {
-    const destination = f.stack.pop();
-    const condition = f.stack.pop();
-    if (condition == 0) return null;
-    if (!f.analyzed.is_jumpdest(destination)) return .invalid_jump;
-    f.pc = @intCast(destination);
-    return null;
+/// JUMP, or JUMPI when `conditional`. False on a jump to a non-JUMPDEST (invalid jump).
+inline fn jump(
+    comptime conditional: bool,
+    r: *Registers,
+    analyzed: *const bytecode.Analyzed,
+) bool {
+    const destination = r.stack.pop();
+    if (conditional) {
+        const condition = r.stack.pop();
+        if (condition == 0) return true;
+    }
+    if (!analyzed.is_jumpdest(destination)) return false;
+    r.pc = @intCast(destination);
+    return true;
 }
 
 fn output(f: *Frame, comptime exit: Exit) ?Exit {
     const offset = f.stack.pop();
     const size = f.stack.pop();
-    const range = memory_range(f, offset, size) orelse return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, offset, size) orelse return .out_of_gas;
     f.output_offset = range.offset;
     f.output_size = range.size;
     return exit;
@@ -409,8 +523,14 @@ fn output(f: *Frame, comptime exit: Exit) ?Exit {
 
 // ------------------------------------------------------------------ environment
 
-fn environment(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
-    const s = &f.stack;
+/// Environment reads that only push a frame, transaction, or block value (register opcodes).
+inline fn environment_value(
+    comptime fork: Fork,
+    comptime opcode: u8,
+    s: *Stack,
+    f: *const Frame,
+    evm: *const Evm,
+) void {
     switch (opcode) {
         op.ADDRESS => s.push(primitives.address_to_u256(f.address)),
         op.ORIGIN => s.push(primitives.address_to_u256(evm.tx.origin)),
@@ -422,21 +542,30 @@ fn environment(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?
             s.peek(0).* = primitives.word_from_be(&word);
         },
         op.CALLDATASIZE => s.push(f.input.len),
+        op.CODESIZE => s.push(f.analyzed.len),
+        op.GASPRICE => s.push(evm.tx.gas_price),
+        op.RETURNDATASIZE => s.push(evm.return_data().len),
+        op.CHAINID => s.push(evm.config.chain_id),
+        else => block_value(fork, opcode, s, evm),
+    }
+}
+
+/// Environment opcodes that copy into memory or read state (sync points).
+fn environment(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
+    const s = &f.stack;
+    switch (opcode) {
         op.CALLDATACOPY => {
             const memory_offset = s.pop();
             const offset = s.pop();
             const size = s.pop();
             return copy_to_memory(f, memory_offset, f.input, offset, size);
         },
-        op.CODESIZE => s.push(f.analyzed.len),
         op.CODECOPY => {
             const memory_offset = s.pop();
             const offset = s.pop();
             const size = s.pop();
             return copy_to_memory(f, memory_offset, f.analyzed.original(), offset, size);
         },
-        op.GASPRICE => s.push(evm.tx.gas_price),
-        op.RETURNDATASIZE => s.push(evm.return_data().len),
         op.RETURNDATACOPY => return return_data_copy(f, evm),
         op.BALANCE, op.EXTCODESIZE, op.EXTCODECOPY, op.EXTCODEHASH => {
             return external_account(fork, opcode, f, evm);
@@ -446,14 +575,12 @@ fn environment(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?
             const account = evm.state.load(f.address) catch |err| return evm.fail(err);
             s.push(account.info.balance);
         },
-        op.CHAINID => s.push(evm.config.chain_id),
-        else => block_value(fork, opcode, f, evm),
+        else => comptime unreachable,
     }
     return null;
 }
 
-fn block_value(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) void {
-    const s = &f.stack;
+inline fn block_value(comptime fork: Fork, comptime opcode: u8, s: *Stack, evm: *const Evm) void {
     switch (opcode) {
         op.COINBASE => s.push(primitives.address_to_u256(evm.block.coinbase)),
         op.TIMESTAMP => s.push(evm.block.timestamp),
@@ -485,8 +612,8 @@ fn return_data_copy(f: *Frame, evm: *Evm) ?Exit {
     const data = evm.return_data();
     const end = @as(u257, offset) + size;
     if (end > data.len) return .return_data_out_of_bounds;
-    const range = memory_range(f, memory_offset, size) orelse return .out_of_gas;
-    if (!charge_copy(f, range.size)) return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, memory_offset, size) orelse return .out_of_gas;
+    if (!charge_copy(&f.gas, range.size)) return .out_of_gas;
     if (range.size == 0) return null;
     const start: usize = @intCast(offset);
     @memcpy(f.memory.slice(range.offset, range.size), data[start..][0..range.size]);
@@ -583,7 +710,7 @@ fn log(comptime topic_count: u8, f: *Frame, evm: *Evm) ?Exit {
     const size = f.stack.pop();
     var topics: [4]primitives.B256 = undefined;
     inline for (0..topic_count) |i| topics[i] = primitives.u256_to_b256(f.stack.pop());
-    const range = memory_range(f, offset, size) orelse return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, offset, size) orelse return .out_of_gas;
     const cost = gas.log_data_byte * range.size;
     if (f.gas < cost) return .out_of_gas;
     f.gas -= cost;
@@ -601,7 +728,7 @@ fn create(comptime fork: Fork, comptime is_create2: bool, f: *Frame, evm: *Evm) 
     const offset = f.stack.pop();
     const size = f.stack.pop();
     const salt: u256 = if (is_create2) f.stack.pop() else 0;
-    const range = memory_range(f, offset, size) orelse return .out_of_gas;
+    const range = memory_range(&f.memory, &f.gas, offset, size) orelse return .out_of_gas;
     if (fork.at_least(.shanghai)) {
         if (range.size > evm.config.initcode_size_max) return .out_of_gas;
         const cost = gas.initcode_cost(range.size);
@@ -637,8 +764,10 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
     const out_offset = s.pop();
     const out_size = s.pop();
     if (kind == .call and value != 0 and f.is_static) return .static_violation;
-    const in_range = memory_range(f, in_offset, in_size) orelse return .out_of_gas;
-    const out_range = memory_range(f, out_offset, out_size) orelse return .out_of_gas;
+    const in_range = memory_range(&f.memory, &f.gas, in_offset, in_size) orelse
+        return .out_of_gas;
+    const out_range = memory_range(&f.memory, &f.gas, out_offset, out_size) orelse
+        return .out_of_gas;
     const access = evm.state.access(target) catch |err| return evm.fail(err);
     var cost: u64 = 0;
     if (fork.at_least(.berlin) and access.is_cold) cost += gas.cold_account_access_extra;
