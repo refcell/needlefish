@@ -557,6 +557,16 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   Past the new limits a block is refused (`CodeFull`, nothing written); a grid with no
   room for a flush skips it (`flushes_no_space`), the codes ride in the image, and a
   checkpoint that outgrows staging fails `CheckpointTooLarge` (reported, the head safe).
+- Import codes out of RAM (2026-11-08): the importer kept every snapshot code in the arena
+  until its checkpoint flushed them (21.6 GiB on Base Sepolia; mainnet 2-4x). In pinned mode
+  it now evicts every `code_batch_bytes` (1 GiB) of arena: `CodeStore.evict_start` flushes
+  the batch unpaced, points each written code at its table (`codes_in_tables`), and moves
+  the codes too long for a table to the arena's start, so the next batch reuses the same
+  pages (resident <= one batch). Same tables, manifest and checkpoint encodings as before:
+  a node opens the result like any file (each batch may end one partly filled table: ~1
+  more table per GiB, far below `code_tables_max`). A batch the grid cannot take (no
+  room, or too many long codes) fails the import (`CodesNotEvicted`), never a silent
+  in-RAM fallback.
 - Safe-build fill (2026-11-08): in Debug and ReleaseSafe (the node ships ReleaseSafe)
   `Allocator.alloc` fills every allocation with 0xAA, so every upper-bound buffer was
   resident at init whatever init wrote: the Sepolia node stayed at ~55 GB after the two
@@ -1659,6 +1669,13 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
 - 2026-11-08: lsm: init no longer zeroes every table slot's filter and block list (14.8 GiB
   of the Sepolia node's 50.7 GiB). The lsm crash test starts from all-ones filters and block
   lists; dropping `slot_acquire`'s filter zeroing fails it.
+- 2026-11-08: import codes out of RAM (see Decisions). ReleaseSafe import on a scratch file
+  at Base Sepolia sizing with 3 GiB of synthetic codes: VmHWM 4.60 GB -> 2.52 GB (init 1.41
+  GB + one 1 GiB batch); at 2.6x and 4x the counts with 1.2 GiB of codes: 3.42 and 5.08 GB.
+  Tests: three seeds of 300-500 codes (two too long for a table) in 64 KiB batches, every
+  code read back before and after a reopen with the state; a batch that cannot drain is
+  refused. Mutations caught: no re-point, re-point to the wrong table, no compaction,
+  compaction without moving offsets.
 - 2026-11-08: code growth (see Decisions): the state's code limits grow past the format's
   headroom without changing the format. Tests: Base Sepolia's layout, table list and
   staging pinned to their values; a seeded sizing sweep (layout equal, three quarters of

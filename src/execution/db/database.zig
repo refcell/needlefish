@@ -1612,6 +1612,31 @@ pub fn DatabaseType(comptime Storage: type) type {
             return self.code_store.?.read_pinned(hash, code);
         }
 
+        /// Writes the codes added since the last flush into tables now and drops them from the
+        /// arena (`CodeStore.evict_start`; pinned mode), so an import streams codes through a
+        /// bounded arena. Only while nothing else runs: no checkpoint, no commit. `.pending`:
+        /// tick until `codes_evicting()` is false.
+        pub fn codes_evict_start(self: *Self) code_store_module.Status {
+            assert(self.phase == .ready);
+            assert(!self.checkpoint_wanted and self.engine.checkpoint_phase == .idle);
+            assert(self.idle());
+            const store = &self.code_store.?;
+            assert(store.pinned() and !store.flushing());
+            const grid = &self.engine.grid.?;
+            const free_set = &self.engine.free_set.?;
+            return store.evict_start(grid, free_set, &self.state, on_code_evict);
+        }
+
+        pub fn codes_evicting(self: *const Self) bool {
+            const store = if (self.code_store) |*store| store else return false;
+            return store.flushing();
+        }
+
+        fn on_code_evict(store: *CodeStore) void {
+            assert(!store.flushing());
+            assert(store.pinned());
+        }
+
         /// Ends the lifetime of every code slice `State.code_by_hash` returned for a code
         /// held in a table only (`Config.code_pin_bytes`); a no-op otherwise. Call it where
         /// no caller holds one (the import runner: before each block).

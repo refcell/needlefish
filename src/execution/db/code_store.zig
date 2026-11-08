@@ -36,6 +36,9 @@
 //!   block cache, into `rewrite_value`), and point at their new tables once it finishes. A
 //!   code that cannot be read aborts the rewrite (its blocks released, nothing changed) and
 //!   stops all later flushes (`fault`): the codes then stay in the arena and the image.
+//! - Evict (`evict_start`, pinned mode: the importer): a flush whose arena codes then point
+//!   at their new tables only; the arena keeps just the codes too long for a table, moved to
+//!   its start (`evict_compact`), and new codes append after them.
 //! - Open (`manifest_load` + `scan_start`, during the engine's open pause): each table's
 //!   index block, then its data blocks, are read and verified, and every code is inserted
 //!   into the arena (its hash checked) before the checkpoint image's own codes.
@@ -153,6 +156,8 @@ pub fn CodeStoreType(comptime Storage: type) type {
         reservation: Reservation = undefined,
         flush_state: FlushState = .idle,
         flush_rewrite: bool = false,
+        /// The flush evicts what it writes from the arena (`evict_start`).
+        flush_evict: bool = false,
         flush_cut: u64 = 0,
         flush_arena: []const u8 = &.{},
         /// The state a rewrite re-points at the new tables when it finishes.
@@ -655,6 +660,26 @@ pub fn CodeStoreType(comptime Storage: type) type {
             return .pending;
         }
 
+        /// A flush (unpaced) whose codes then leave the arena: each is held in its table only,
+        /// and the arena keeps just the codes too long for a table (`evict_compact`), so
+        /// codes stream through a bounded arena (the importer). Pinned mode only; nothing may
+        /// insert codes until the callback. Same statuses as `flush_start`.
+        pub fn evict_start(
+            self: *Self,
+            grid: *Grid,
+            free_set: *FreeSet,
+            state: *State,
+            callback: Callback,
+        ) Status {
+            assert(self.pinned());
+            assert(self.flush_state == .idle and !self.flush_evict);
+            self.flush_evict = true;
+            const status = self.flush_start(grid, free_set, state, std.math.maxInt(u64), callback);
+            if (status == .done) self.flush_evict = false;
+            assert(self.flush_evict == (status == .pending));
+            return status;
+        }
+
         /// Lets a paced flush write `blocks` more blocks; a no-op when none runs.
         pub fn grant(self: *Self, blocks: u64) void {
             assert(blocks > 0);
@@ -822,6 +847,7 @@ pub fn CodeStoreType(comptime Storage: type) type {
                 self.stats.rewrites += 1;
             }
             assert(self.tables.count + self.pending.count <= self.config.tables_max);
+            const tables_base = self.tables.count;
             for (0..self.pending.count) |table| {
                 const target = self.tables.count;
                 self.tables.infos[target] = self.pending.infos[table];
@@ -831,8 +857,10 @@ pub fn CodeStoreType(comptime Storage: type) type {
                 self.tables.count += 1;
             }
             if (self.flush_rewrite) self.rewrite_repoint();
+            if (self.flush_evict) self.evict_repoint(tables_base);
             self.pending.count = 0;
             self.arena_flushed = self.flush_cut;
+            if (self.flush_evict) self.evict_compact();
             self.stats.flushes += 1;
             self.flush_end();
         }
@@ -840,6 +868,7 @@ pub fn CodeStoreType(comptime Storage: type) type {
         fn flush_end(self: *Self) void {
             assert(self.flush_state != .idle);
             self.flush_state = .idle;
+            self.flush_evict = false;
             self.flush_target = null;
             const callback = self.flush_callback.?;
             self.flush_callback = null;
@@ -864,6 +893,77 @@ pub fn CodeStoreType(comptime Storage: type) type {
                 start = end;
             }
             assert(start == self.entries_len);
+        }
+
+        /// After an evicting flush's tables join the list: the arena codes it wrote (pending
+        /// table k holds the entries before its end) are held in table `tables_base + k` only.
+        fn evict_repoint(self: *Self, tables_base: u32) void {
+            assert(self.flush_evict and self.pinned());
+            const state = self.flush_target.?;
+            assert(tables_base + self.pending.count == self.tables.count);
+            var start: u32 = 0;
+            var evicted: u32 = 0;
+            for (self.pending_ends[0..self.pending.count], 0..) |end, table| {
+                assert(end > start);
+                for (self.entries[start..end]) |*entry| {
+                    if (entry.table != 0) continue;
+                    const code = state.code_table.getPtr(entry.hash).?;
+                    assert(code.table == 0 and code.len == entry.len);
+                    code.* = .{
+                        .offset = 0,
+                        .len = entry.len,
+                        .table = tables_base + @as(u32, @intCast(table)) + 1,
+                    };
+                    evicted += 1;
+                }
+                start = end;
+            }
+            assert(start == self.entries_len);
+            state.codes_in_tables += evicted;
+            assert(state.codes_in_tables <= state.code_table.count());
+        }
+
+        /// After `evict_repoint`: the codes still in the arena (too long for a table, carried
+        /// by every checkpoint image) move to its start, in offset order, and the arena ends
+        /// after them. Nothing may be inserted while an evicting flush runs.
+        fn evict_compact(self: *Self) void {
+            assert(self.flush_evict);
+            const state = self.flush_target.?;
+            assert(state.code_arena_len == self.flush_cut);
+            self.entries_len = 0;
+            var codes = state.code_table.iterator();
+            while (codes.next()) |code| {
+                const ref = code.value_ptr.*;
+                if (ref.table != 0) continue;
+                // Every table-sized arena code went to a table.
+                assert(ref.len > self.value_size_max and ref.offset < self.flush_cut);
+                assert(self.entries_len < self.entries.len);
+                self.entries[self.entries_len] = .{
+                    .hash = code.key_ptr.*,
+                    .offset = ref.offset,
+                    .len = ref.len,
+                    .table = 0,
+                };
+                self.entries_len += 1;
+            }
+            const kept = self.entries[0..self.entries_len];
+            std.mem.sortUnstable(Entry, kept, {}, entry_offset_less);
+            var position: u64 = 0;
+            for (kept) |entry| {
+                assert(position <= entry.offset);
+                const from = state.code_arena[entry.offset..][0..entry.len];
+                std.mem.copyForwards(u8, state.code_arena[position..][0..entry.len], from);
+                state.code_table.getPtr(entry.hash).?.offset = position;
+                position += entry.len;
+            }
+            assert(position <= self.flush_cut);
+            state.code_arena_len = position;
+            self.arena_flushed = position;
+            self.entries_len = 0;
+        }
+
+        fn entry_offset_less(_: void, a: Entry, b: Entry) bool {
+            return a.offset < b.offset;
         }
 
         /// A rewrite could not read a code: releases the blocks it wrote (the table being

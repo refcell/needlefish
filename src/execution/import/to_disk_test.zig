@@ -32,6 +32,8 @@ const Database = Importer.Database;
 const sector_size = storage.sector_size;
 
 const record_writes_max = 64;
+/// Longest code a table holds at `shape_test`'s block size; longer ones ride in the image.
+const table_value_max: u64 = 4 * sector_size - 128 - 8 - 4 - 32;
 const reorg_depth_max = 4;
 
 pub const shape_test: to_disk.Shape = .{
@@ -209,13 +211,36 @@ fn random_slots(arena: std.mem.Allocator, prng: *Prng) ![]Slot {
     return slots;
 }
 
+/// Codes per source, their longest length, and how many of them (after the empty one) are
+/// too long for a code table.
+const CodeShape = struct { count_min: u64, count_max: u64, length_max: u64, long: u32 = 0 };
+
 fn random_codes(arena: std.mem.Allocator, prng: *Prng, source: *Source) !void {
-    const count = prng.range(2, 6);
+    return random_codes_shaped(arena, prng, source, .{
+        .count_min = 2,
+        .count_max = 6,
+        .length_max = 300,
+    });
+}
+
+fn random_codes_shaped(
+    arena: std.mem.Allocator,
+    prng: *Prng,
+    source: *Source,
+    shape: CodeShape,
+) !void {
+    const count = prng.range(shape.count_min, shape.count_max);
+    assert(count > shape.long);
     source.codes = try arena.alloc([]const u8, count);
     source.code_entries = try arena.alloc(Entry, count);
     for (source.codes, source.code_entries, 0..) |*code, *entry, index| {
         // The first is the empty code, which reth's Bytecodes holds (Base Sepolia does).
-        const length = if (index == 0) 0 else prng.range(1, 300);
+        const length = if (index == 0)
+            0
+        else if (index <= shape.long)
+            prng.range(table_value_max + 1, table_value_max + 200)
+        else
+            prng.range(1, shape.length_max);
         const bytes = try arena.alloc(u8, length);
         prng.fill(bytes);
         code.* = bytes;
@@ -228,6 +253,16 @@ fn random_codes(arena: std.mem.Allocator, prng: *Prng, source: *Source) !void {
 fn random_source(arena: std.mem.Allocator, prng: *Prng, accounts_count: u64) !Source {
     var source: Source = undefined;
     try random_codes(arena, prng, &source);
+    return random_accounts(arena, prng, accounts_count, &source);
+}
+
+fn random_accounts(
+    arena: std.mem.Allocator,
+    prng: *Prng,
+    accounts_count: u64,
+    source_codes: *const Source,
+) !Source {
+    var source = source_codes.*;
     const accounts = try arena.alloc(Account, accounts_count);
     for (accounts, 0..) |*account, index| {
         const previous = if (index > 0) &accounts[index - 1].key else null;
@@ -1021,4 +1056,90 @@ test "to_disk: a file sized before code growth reopens with it and takes more ne
         try testing.expectEqualSlices(u8, code, stored);
         run.db.codes_release();
     }
+}
+
+// Codes out of RAM during the import (`ImporterType.code_batch_bytes`).
+
+/// Imports a source of many codes (two too long for a table) in batches of `batch_bytes`.
+fn import_batched(source: *const Source, batch_bytes: u64) !Run {
+    var run = try Run.init(source, 0x7464_0800);
+    errdefer run.deinit();
+    var importer = run.importer();
+    importer.code_batch_bytes = batch_bytes;
+    var chain: to_disk.HeaderChain = .{};
+    try synthetic_chain(source.root, &chain);
+    const root = try import_into(&importer, source, &chain);
+    try testing.expectEqualSlices(u8, &source.root, &root);
+    try testing.expectEqual(source.codes.len - 1, importer.stats.codes);
+    const state = &run.db.state;
+    // Every code but the long ones (and a last remainder below the flush minimum) left the
+    // arena for a table, batch by batch.
+    var long_bytes: u64 = 0;
+    for (source.codes) |code| {
+        if (code.len > table_value_max) long_bytes += code.len;
+    }
+    try testing.expect(importer.stats.code_evictions >= 3);
+    try testing.expect(state.code_arena_len >= long_bytes);
+    try testing.expect(state.code_arena_len < long_bytes + shape_test.code_flush_bytes_min);
+    try testing.expect(state.codes_in_tables + 2 <= importer.stats.codes);
+    try testing.expect(state.codes_in_tables + 2 + 64 >= importer.stats.codes);
+    try check_codes(run.db, source);
+    return run;
+}
+
+/// Every code reads back, byte for byte, one pin at a time.
+fn check_codes(db: *Database, source: *const Source) !void {
+    for (source.codes[1..]) |code| {
+        db.codes_release();
+        const stored = db.state.code_by_hash(node.keccak256(code)) orelse return error.NoCode;
+        try testing.expectEqualSlices(u8, code, stored);
+    }
+    db.codes_release();
+}
+
+test "to_disk: codes stream through the arena into tables in batches, and reopen" {
+    for (0..3) |seed| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var prng = Prng.init(0x7464_0900 + seed);
+        var codes: Source = undefined;
+        try random_codes_shaped(arena, &prng, &codes, .{
+            .count_min = 300,
+            .count_max = 500,
+            .length_max = 1500,
+            .long = 2,
+        });
+        const source = try random_accounts(arena, &prng, 60, &codes);
+        var run = try import_batched(&source, 64 * 1024);
+        defer run.deinit();
+        try run.reopen();
+        try testing.expectEqual(source.codes.len - 1, run.db.state.code_table.count());
+        try check_codes(run.db, &source);
+        try testing.expectEqualSlices(u8, &source.root, &run.db.head_info.state_root);
+        try check_state(run.db, &source, &prng);
+    }
+}
+
+test "to_disk: a batch the arena cannot drain is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = Prng.init(0x7464_0a00);
+    var codes: Source = undefined;
+    try random_codes_shaped(arena, &prng, &codes, .{
+        .count_min = 40,
+        .count_max = 41,
+        .length_max = 1000,
+        .long = 2,
+    });
+    const source = try random_accounts(arena, &prng, 20, &codes);
+    // Two long codes stay in the arena: more than half of a 16 KiB batch.
+    var run = try Run.init(&source, 0x7464_0a01);
+    defer run.deinit();
+    var importer = run.importer();
+    importer.code_batch_bytes = 16 * 1024;
+    var chain: to_disk.HeaderChain = .{};
+    try synthetic_chain(source.root, &chain);
+    try testing.expectError(error.CodesNotEvicted, import_into(&importer, &source, &chain));
 }

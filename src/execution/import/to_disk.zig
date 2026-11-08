@@ -8,7 +8,9 @@
 //! is the same emission `db/disk_state_test.zig` imports (`branch_record.encode` at
 //! `path_key` / `storage_key`), so `DiskState` resolves the root from what is written.
 //! `Bytecodes` go into the state's code arena first (each checked against its key), and every
-//! account's code hash must name a loaded code.
+//! account's code hash must name a loaded code. With codes out of RAM (pinned mode, the
+//! node's shape) every `code_batch_bytes` of arena is written into code tables and dropped
+//! from the arena, so the import's memory does not grow with the snapshot's code bytes.
 //!
 //! The head: `fetch_chain` walks a `HeaderSource` from block N down 255 parents, requiring
 //! each link's hash to be the parent hash of the block above (the source binds every link's
@@ -482,7 +484,14 @@ pub const Stats = struct {
     blocks_written: u64 = 0,
     /// Storage ticks while a loader was busy.
     busy_ticks: u64 = 0,
+    /// Times the loaded codes went into code tables and left the arena.
+    code_evictions: u64 = 0,
 };
+
+/// Arena bytes per code batch (`ImporterType.code_batch_bytes`): RAM the import's codes take
+/// at most, and few enough batches (each ends one partly filled table) to leave the table
+/// list room.
+pub const code_batch_bytes_default: u64 = 1 << 30;
 
 pub const Progress = struct {
     context: *anyopaque,
@@ -542,6 +551,10 @@ pub fn ImporterType(comptime Storage: type) type {
         driver: Driver,
         progress: ?Progress = null,
         mutation: ?Mutation = null,
+        /// Pinned mode (`Shape.code_pin_bytes`): arena bytes at which the codes loaded so far
+        /// are written into code tables and leave RAM (`Database.codes_evict_start`), so the
+        /// import's memory does not grow with the snapshot's code bytes.
+        code_batch_bytes: u64 = code_batch_bytes_default,
         stats: Stats = .{},
         samples: Samples = .{},
         /// The first failure inside the record sink (it cannot return errors).
@@ -600,11 +613,17 @@ pub fn ImporterType(comptime Storage: type) type {
         }
 
         /// Loads every `Bytecodes` entry into the state's code arena, each checked against its
-        /// key (keccak256 of the code).
+        /// key (keccak256 of the code). Pinned mode: every `code_batch_bytes` of arena, and at
+        /// the end, the codes go into code tables and leave the arena (`evict_codes`).
         pub fn load_codes(self: *Importer, codes: EntrySource) !void {
             const state = &self.db.state;
             const codes_max = state.config.codes_max;
+            const evicting = self.codes_out_of_ram();
+            assert(self.code_batch_bytes >= self.db.config.code_flush_bytes_min);
             while (try codes.next(codes.context)) |entry| {
+                if (evicting and state.code_arena_len >= self.code_batch_bytes) {
+                    try self.evict_codes();
+                }
                 if (self.stats.codes >= codes_max) return error.CodeFull;
                 if (entry.key.len != 32) return error.Corrupt;
                 const code = try reth.decode_bytecode(entry.value);
@@ -618,7 +637,36 @@ pub fn ImporterType(comptime Storage: type) type {
                 self.stats.codes += 1;
                 self.stats.code_bytes += code.len;
             }
+            if (evicting) try self.evict_codes();
             assert(self.stats.codes <= codes_max);
+            assert(state.code_table.count() == self.stats.codes);
+        }
+
+        fn codes_out_of_ram(self: *const Importer) bool {
+            const store = if (self.db.code_store) |*store| store else return false;
+            return store.pinned();
+        }
+
+        /// Writes the arena's codes into code tables and drops them from RAM; the arena
+        /// keeps only codes too long for a table (and, at the end, less than the flush
+        /// minimum, which the checkpoint image carries).
+        fn evict_codes(self: *Importer) !void {
+            assert(self.codes_out_of_ram());
+            const db = self.db;
+            if (db.codes_evict_start() == .pending) {
+                var ticks: u32 = 0;
+                while (db.codes_evicting()) : (ticks += 1) {
+                    if (ticks >= busy_ticks_max) return error.Timeout;
+                    self.tick();
+                }
+            }
+            assert(!db.codes_evicting());
+            const store = &db.code_store.?;
+            if (store.fault) return error.CodeFlushFailed;
+            // No room on the grid, or too many codes too long for a table: they would all
+            // stay in RAM and in every checkpoint image.
+            if (db.state.code_arena_len >= self.code_batch_bytes / 2) return error.CodesNotEvicted;
+            self.stats.code_evictions += 1;
         }
 
         /// Streams the hashed state into the four trees by bulk load; returns its root.
