@@ -38,6 +38,7 @@ const import_run_cli = @import("import_run.zig");
 const snapshot_import_out = @import("snapshot_import_out.zig");
 const unsafe_watch = @import("unsafe_watch.zig");
 const el_engine = @import("el_engine.zig");
+const el_rpc = @import("el_rpc.zig");
 
 const to_disk = base.execution.import.to_disk;
 const import_run = base.execution.import.run;
@@ -71,6 +72,8 @@ const usage =
     \\                   [--engine.addr <ip:port> --engine.jwt <file>
     \\                    [--engine.ring-blocks <n>] [--engine.ring-mb <n>]]
     \\                   [--engine.rollup-out <rollup.json>] [--gossip [--p2p.* ...]]
+    \\                   [--rpc] [--rpc.addr <ip:port>] [--rpc.ring-blocks <n>]
+    \\                   [--rpc.ring-mb <n>] [--rpc.tx-index <entries>]
     \\
 ;
 
@@ -88,6 +91,8 @@ const Flags = struct {
     blocks: ?u64 = null,
     duration_s: ?u64 = null,
     engine: el_engine.Flags = .{},
+    /// The read-only JSON-RPC server (`--rpc`, `--rpc.*`).
+    rpc: el_rpc.Flags = .{},
     gossip: bool = false,
     /// Every argument, for the `--p2p.*` flags `el_gossip` reads.
     args: []const []const u8 = &.{},
@@ -100,6 +105,10 @@ fn parse_flags(args: []const []const u8) !Flags {
         const name = args[index];
         if (std.mem.eql(u8, name, "--gossip")) {
             flags.gossip = true;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "--rpc")) {
+            flags.rpc.enable();
             continue;
         }
         if (std.mem.startsWith(u8, name, "--p2p.")) {
@@ -131,7 +140,9 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, name, "--duration")) {
             flags.duration_s = try std.fmt.parseInt(u64, value, 10);
             if (flags.duration_s.? == 0) return error.InvalidArguments;
-        } else if (!try flags.engine.parse(name, value)) return error.InvalidArguments;
+        } else if (!try flags.engine.parse(name, value) and !try flags.rpc.parse(name, value)) {
+            return error.InvalidArguments;
+        }
     }
     if (flags.db.len == 0 or (flags.enode == null and flags.peers == null)) {
         return error.InvalidArguments;
@@ -186,6 +197,8 @@ const Run = struct {
     feed: *el_feed.Feed,
     /// The Engine API (`--engine.addr`), served only between blocks.
     engine: ?*el_engine.Service = null,
+    /// The read-only JSON-RPC server (`--rpc`), served only between blocks.
+    rpc: ?*el_rpc.Service = null,
     /// Sequencer-signed gossip (`--gossip`), checked against every committed block.
     gossip: ?*el_gossip.Gossip = null,
     rollup: base.consensus.protocol.RollupConfig,
@@ -240,6 +253,13 @@ fn execute(
     defer runner.destroy(gpa);
     const head = db.head_info;
     assert(head.present);
+    // Before the peers: a bad address fails before any connection is made.
+    const node = el_rpc.runner_node(Runner, runner);
+    const rpc = el_rpc.Service.start(gpa, &flags.rpc, flags.chain.spec, node) catch |err| {
+        std.debug.print("el-run: cannot start the JSON-RPC server: {t}\n", .{err});
+        return 2;
+    };
+    defer if (rpc) |service| service.destroy(gpa);
     // The first block must be the child of the verified database head.
     const feed = el_feed.Feed.create(gpa, init.io, .{
         .chain = flags.config,
@@ -260,6 +280,9 @@ fn execute(
         return 2;
     };
     defer if (engine) |service| service.destroy(gpa);
+    if (rpc) |service| if (engine) |engine_service| {
+        service.api.engine = &engine_service.engine;
+    };
     const gossip = if (flags.gossip)
         try el_gossip.Gossip.start(gpa, init.io, flags.config, flags.args)
     else
@@ -272,23 +295,31 @@ fn execute(
         .runner = runner,
         .feed = feed,
         .engine = engine,
+        .rpc = rpc,
         .gossip = gossip,
         .rollup = unsafe_watch.rollup_for(flags.config),
         .first = head.number + 1,
         .started_ms = 0,
         .last_summary_ms = 0,
     };
+    return run_reported(&run, head.hash);
+}
+
+/// Runs the blocks (`run_blocks`) between the start line and the final summary.
+fn run_reported(run: *Run, parent: [32]u8) !u8 {
+    assert(run.blocks == 0);
     run.started_ms = run.now_ms();
     run.last_summary_ms = run.started_ms;
     std.debug.print("el-run: executing {s} from block {d} (parent {x}), blocks over devp2p\n", .{
-        flags.chain.name, run.first, head.hash,
+        run.flags.chain.name, run.first, parent,
     });
-    const status = try run_blocks(&run);
+    const status = try run_blocks(run);
     try run.flush();
-    summary(&run);
+    summary(run);
     if (status == 0 and run.blocks > 0) {
+        const head = run.db.head_info;
         std.debug.print("el-run: ok, {d} consecutive executed blocks {d}..{d}, head {x}\n", .{
-            run.blocks, run.first, db.head_info.number, db.head_info.hash,
+            run.blocks, run.first, head.number, head.hash,
         });
     }
     return status;
@@ -305,18 +336,34 @@ fn run_blocks(run: *Run) !u8 {
                 std.debug.print("el-run: at the tip, block {d}\n", .{run.db.head_info.number});
             }
             run.at_tip = run.feed.at_tip;
-            if (run.engine) |service| {
-                try service.wait(tip_wait_ms);
-            } else try run.io.sleep(.fromMilliseconds(tip_wait_ms), .awake);
+            try serve_idle(run, tip_wait_ms);
             continue;
         }
         if (!try run_one(run, &block)) return 1;
         if (run.engine) |service| service.poll();
+        if (run.rpc) |service| service.poll();
         run.unflushed += 1;
         if (run.unflushed >= flush_every) try run.flush();
         if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
     }
     return 0;
+}
+
+/// Serves the Engine API and the JSON-RPC server for `duration_ms` while no block is
+/// waiting: in slices, alternating between their IOs, when both run.
+fn serve_idle(run: *Run, duration_ms: u64) !void {
+    const slice_ms = 10;
+    if (run.engine != null and run.rpc != null) {
+        var waited_ms: u64 = 0;
+        while (waited_ms < duration_ms) : (waited_ms += 2 * slice_ms) {
+            try run.rpc.?.wait(slice_ms);
+            try run.engine.?.wait(slice_ms);
+        }
+    } else if (run.engine) |service| {
+        try service.wait(duration_ms);
+    } else if (run.rpc) |service| {
+        try service.wait(duration_ms);
+    } else try run.io.sleep(.fromMilliseconds(@intCast(duration_ms)), .awake);
 }
 
 /// Executes one block; false (reported) when the runner refuses it or a check fails.
@@ -340,7 +387,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         return false;
     }
     assert(run.db.head_info.number == block.number);
-    block_committed(run, block);
+    block_committed(run, block, outcome.receipts);
     run.blocks += 1;
     run.transactions += outcome.transactions;
     run.gas += outcome.gas_used;
@@ -359,10 +406,14 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
     return true;
 }
 
-/// The per-committed-block hook: `block` was executed, checked, and committed as the
-/// database head. Dispatches to the optional consumers (the Engine API's block ring, the
-/// gossip anchor).
-fn block_committed(run: *Run, block: *const el_source.Block) void {
+/// The per-committed-block hook: `block` was executed (`receipts`, valid until the runner's
+/// next block), checked, and committed as the database head. Dispatches to the optional
+/// consumers (the Engine API's block ring, the JSON-RPC ring, the gossip anchor).
+fn block_committed(
+    run: *Run,
+    block: *const el_source.Block,
+    receipts: []const base.common.consensus.Receipt,
+) void {
     assert(run.db.head_info.number == block.number);
     assert(std.mem.eql(u8, &run.db.head_info.hash, &block.hash));
     if (run.engine) |service| service.engine.on_block(&.{
@@ -371,6 +422,12 @@ fn block_committed(run: *Run, block: *const el_source.Block) void {
         .header_rlp = block.header_rlp,
         .transactions = block.transactions,
     });
+    if (run.rpc) |service| service.api.store.on_block(&.{
+        .number = block.number,
+        .hash = block.hash,
+        .header_rlp = block.header_rlp,
+        .transactions = block.transactions,
+    }, receipts);
     if (run.gossip) |gossip| _ = gossip.on_chain(block.number, block.hash);
 }
 
@@ -422,6 +479,7 @@ fn summary(run: *Run) void {
     });
     print_phases(run);
     if (run.engine) |service| service.engine.summary();
+    if (run.rpc) |service| service.api.summary();
     if (run.gossip) |value| value.summary();
     if (now - run.peers_printed_ms >= peers_interval_ms) {
         run.peers_printed_ms = now;
@@ -481,4 +539,5 @@ test "el-run: flags" {
 
 test {
     _ = el_engine;
+    _ = el_rpc;
 }

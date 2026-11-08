@@ -155,7 +155,7 @@ pub fn fail_history(call: *Call, err: db_database.ProofError) HandlerError {
 }
 
 /// The account fields; leaves the `storageProof` key open for the slot array.
-fn write_account(
+pub fn write_account(
     w: *json.Writer,
     address: *const [20]u8,
     proof: *const AccountProof,
@@ -177,7 +177,7 @@ fn write_account(
     try w.key("storageProof");
 }
 
-fn write_slot(
+pub fn write_slot(
     w: *json.Writer,
     slot: *const Hash,
     value: u256,
@@ -211,7 +211,7 @@ pub fn scratch_of(api: *eth.Api) ?*Scratch {
 }
 
 /// Storage keys: a JSON array of hex strings of up to 32 bytes (left-padded), as geth.
-fn parse_keys(raw: []const u8, out: *[storage_keys_max]Hash) HandlerError!u32 {
+pub fn parse_keys(raw: []const u8, out: *[storage_keys_max]Hash) HandlerError!u32 {
     var scanner = json.Scanner.init(raw);
     const first = scanner.next() catch return error.InvalidParams;
     if (first.tag != .array_begin) return error.InvalidParams;

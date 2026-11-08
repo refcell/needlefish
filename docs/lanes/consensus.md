@@ -320,7 +320,40 @@ derives with) as rollup.json. `--p2p.disabled` keeps the first run to derivation
 on, gossiped blocks above el-run's head answer SYNCING and the consensus unsafe head then
 moves only by consolidation (the adopt-existing-block path), which also works.
 
+## el-run JSON-RPC (read-only)
+
+`base el-run --rpc` (127.0.0.1:8545; `--rpc.addr IP:PORT` for another) serves the common
+read methods from what el-run itself executed, never proxied (`bin/base/el_rpc.zig`):
+`web3_clientVersion`, `net_version`, `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
+`eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_getProof`,
+`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`,
+`eth_getBlockReceipts`. Decisions:
+- State is the database head only: the disk database keeps no state history, so a block
+  parameter naming another block is -32000 "historical state unavailable", never an answer
+  from the wrong state. `eth_getProof` at the head walks the branch records
+  (`DiskState.prove`, every node checked against its parent's hash; byte-identical to the
+  in-memory trie's proofs in `disk_state_test`). `eth_call` gas is capped at 50M.
+- Blocks, transactions and receipts come from an RPC ring filled by `block_committed` with
+  the executed receipts (`import.run.Outcome.receipts`): one `node.chain.Record` per block
+  (header, transactions, receipts), `--rpc.ring-blocks` 16,384 / `--rpc.ring-mb` 1024,
+  committed as written, plus a lossy 4-way transaction hash index (`--rpc.tx-index`, 2^21
+  entries, 48 MiB) whose hits are checked against the stored bytes. Older executed blocks are
+  -32000 naming the ring range; above the head or unknown: `null`. The ring starts empty at
+  every start.
+- `safe`/`finalized` are the Engine API's last valid forkchoice labels (needs
+  `--engine.addr`); otherwise an error.
+- Same model as the Engine API: own completion IO, polled between blocks and in the idle
+  wait at the tip (10 ms slices alternating with the engine's IO when both run). No request
+  runs while a block executes or commits, and the database stays single-threaded.
+  Limitation: while a catch-up download waits for peers (`Pool.next`, up to 5 min) requests
+  wait too; at the tip the feed does not block.
+- Not yet: `optimism_syncStatus` (needs the consensus node's labels), logs/filters,
+  historical state.
+
 ## Log
+- 2026-11-08: el-run read-only JSON-RPC (`bin/base/el_rpc.zig`, `--rpc`): head state, head
+  proofs over the disk records, and blocks/transactions/receipts from an RPC ring; compared
+  against the public Base Sepolia RPC.
 - 2026-11-08: el-run Engine API (`bin/base/el_engine.zig`, `el_ring.zig`): newPayload
   judged against executed blocks, forkchoice labels in the summary, full blocks from a
   16,384-block / 512 MiB ring, anchor for unset safe/finalized; a consensus `EngineClient`

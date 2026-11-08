@@ -113,6 +113,9 @@ pub const Outcome = struct {
     failed_transaction: ?u32 = null,
     /// The journal sequence of the commit; 0 when the block was not committed.
     sequence: u64 = 0,
+    /// The block's receipts when it executed (one per transaction), valid until the runner's
+    /// next block or the next use of its executor (`Runner.executor`).
+    receipts: []const consensus.Receipt = &.{},
 
     pub fn ok(outcome: *const Outcome) bool {
         return outcome.failure == null and outcome.passed == all_checks;
@@ -394,6 +397,8 @@ pub fn RunnerType(comptime Storage: type) type {
             };
             outcome.gas_used = executed.gas_used;
             outcome.computed_state_root = executed.state_root;
+            outcome.receipts = executed.receipts;
+            assert(executed.receipts.len == transactions.len);
             const check_start_ns = self.now_ns();
             outcome.passed = check_header(
                 self.spec,
