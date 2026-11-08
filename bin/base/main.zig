@@ -32,6 +32,7 @@ const el_peers = @import("el_peers.zig");
 const el_run = @import("el_run.zig");
 const state_check = @import("state_check.zig");
 const derive_check = @import("derive_check.zig");
+const https_bridge = @import("https_bridge.zig");
 
 const usage =
     \\usage: base <command> [args]
@@ -68,6 +69,7 @@ const usage =
     \\  el-run     execute blocks from an execution peer (devp2p) on an imported database
     \\  state-check  spot-check a database's accounts and slots against a reference node
     \\  derive-check  derive a Base chain's safe blocks from L1, compare with a reference node
+    \\  https-bridge  forward plain HTTP on loopback to HTTPS upstreams (public L1 for consensus)
     \\
 ;
 
@@ -101,6 +103,7 @@ test {
     _ = el_run;
     _ = state_check;
     _ = derive_check;
+    _ = https_bridge;
     _ = @import("derive_check_net.zig");
     _ = @import("el_source.zig");
     _ = @import("el_pool.zig");
@@ -219,6 +222,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "derive-check")) {
         return try derive_check.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "https-bridge")) {
+        return try https_bridge.main(init, args);
     }
     return null;
 }
