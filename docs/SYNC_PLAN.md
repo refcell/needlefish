@@ -184,6 +184,8 @@ Run `base consensus` (verifier mode) against real L1 with the mainnet rollup con
 - Status (2026-11-08): `base derive-check` derived 6000 consecutive Base Sepolia blocks from
   real L1 data and matched every one against the reference node (docs/lanes/consensus.md).
   Engine integration with the stateful node, reorg evidence, and mainnet remain.
+  `base el-run --engine.addr` now serves the Engine API a verifier `base consensus` needs
+  (docs/lanes/consensus.md, "el-run engine"); the live run is next.
 
 ### M6. Unsafe head from mainnet gossip
 

@@ -36,6 +36,12 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   - [x] fix found by the run: Amsterdam L1 headers (`blockAccessListHash`, `slotNumber`)
     failed the header hash check in `sources/header_json.zig` (L1Provider too)
   - [ ] engine API integration with the stateful node (consolidate against our own EL)
+    - [x] el-run serves the Engine API (`bin/base/el_engine.zig`, `--engine.addr`,
+      `--engine.jwt`): newPayload judged against executed blocks, forkchoice labels,
+      full blocks from an in-memory ring (`bin/base/el_ring.zig`); see "el-run engine" below
+    - [ ] live run: `base consensus` (verifier) against el-run on Base Sepolia
+    - [ ] execute head+1 payloads through the Runner (el-run then needs no devp2p at the tip)
+    - [ ] reorgs: el-run follows one devp2p chain; a reorged-out block is a divergence today
   - [ ] L1 reorg evidence (live or replayed) and mainnet
 - [x] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
@@ -255,7 +261,70 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
   Withdrawals are decoded but not checked against `withdrawalsRoot` (post-Isthmus that root
   is the message passer storage root).
 
+## el-run engine (M5 integration)
+
+`base el-run --engine.addr IP:PORT --engine.jwt FILE` serves the Engine API to a verifier
+`base consensus`, so derived safe attributes are consolidated against blocks el-run executed
+from devp2p. Semantics (`bin/base/el_engine.zig`):
+- `engine_newPayloadV1..V4`: version and shape checks as op-reth (`validate_new_payload`),
+  then the payload must hash to its `blockHash` (else INVALID). At or below el-run's head:
+  VALID when el-run's block at that number has that hash, else INVALID and a loud
+  `ENGINE DIVERGENCE` line (derivation or gossip disagrees with the devp2p chain). Above the
+  head: SYNCING (no execution). Older than the ring and the database's canonical index:
+  SYNCING (cannot judge, counted as `unjudged`).
+- `engine_forkchoiceUpdatedV1..V3`: VALID when the head is an executed block and safe and
+  finalized (zero = unset) are executed blocks at or below it; the labels are recorded and
+  printed in el-run's 10 s summary (`engine: head .. safe .. finalized ..`). SYNCING when one
+  is unknown; -38002 when out of order; attributes on a VALID update: -38003 (verifier only).
+- `eth_getBlockByNumber` (number, latest/pending, safe, finalized, earliest) and
+  `eth_getBlockByHash`, hashes or full transactions, from the ring; `eth_chainId`,
+  `eth_blockNumber`, `engine_exchangeCapabilities`, `engine_getClientVersionV1`. An executed
+  block that left the ring is -32000 naming the ring range, never a wrong block; above the
+  head or an unknown hash is `null`. Not served (-32601): `engine_getPayload*`,
+  `engine_getPayloadBodies*`, `eth_getProof`, state reads. The verifier does not call them on
+  Isthmus+ chains (output roots come from the header's `withdrawalsRoot`; `eth_getProof` is
+  only for pre-Isthmus `optimism_outputAtBlock`). Do not run the consensus node with
+  `--sequencer`.
+- Ring: the database keeps 1024 headers and no bodies, while the Sepolia safe head trails
+  the tip by 2,000-5,000 blocks and a pipeline reset walks back about 3,100 more. The ring
+  keeps the last `--engine.ring-blocks` (default 16,384) executed blocks, header RLP and
+  EIP-2718 transactions, in `--engine.ring-mb` (default 512) MiB, filled by the per-block hook
+  `block_committed(run, *const el_source.Block)` in `el_run.zig`. Both bounds evict oldest
+  first; a non-consecutive block restarts the ring. Memory is committed as it is written.
+- Unset safe/finalized: until a forkchoice update names them, `safe` and `finalized` answer
+  an anchor `min(8192, count / 2)` blocks below the newest ring block, pinned at first use, so
+  the consensus node's startup walk and reset walk-back stay inside the ring. Until the ring
+  holds 16,384 blocks (or has evicted by bytes) they answer a "warming up" error; the
+  consensus node retries. So start `base consensus` once el-run's summary shows a full ring
+  (about 55 min at the tip at 200 ms blocks).
+- Single-threaded: the HTTP server runs on its own completion IO, driven by el-run only
+  between blocks (non-blocking `poll`) and during the idle wait at the tip (`wait` replaces
+  the 100 ms sleep). Requests never run while the runner executes or commits, and the engine
+  is a plain state machine tested over SimIo.
+- JWT: HS256 bearer token with `iat` within the window (`utilities.jwt`), 401 otherwise.
+
+Run (paths are examples; the JWT secret is a runtime file, never committed):
+
+    openssl rand -hex 32 > /tmp/el-engine.jwt
+    base el-run --db DB --peers PEERS --chain base-sepolia \
+        --engine.addr 127.0.0.1:8551 --engine.jwt /tmp/el-engine.jwt \
+        --engine.rollup-out /tmp/base-sepolia-rollup.json
+    # once the summary's engine line shows ring 16384 blocks:
+    base consensus --rollup-config /tmp/base-sepolia-rollup.json \
+        --l1 http://127.0.0.1:PORT --l1-beacon http://127.0.0.1:PORT \
+        --l2 http://127.0.0.1:8551 --l2-jwt /tmp/el-engine.jwt \
+        --p2p.disabled --rpc.port 7545
+
+`--engine.rollup-out` writes the chain's built-in rollup config (the one `derive-check`
+derives with) as rollup.json. `--p2p.disabled` keeps the first run to derivation: with gossip
+on, gossiped blocks above el-run's head answer SYNCING and the consensus unsafe head then
+moves only by consolidation (the adopt-existing-block path), which also works.
+
 ## Log
+- 2026-11-08: el-run Engine API (`bin/base/el_engine.zig`, `el_ring.zig`): newPayload
+  judged against executed blocks, forkchoice labels in the summary, full blocks from a
+  16,384-block / 512 MiB ring, anchor for unset safe/finalized; a consensus `EngineClient`
+  drives it over SimIo and the production IO in tests.
 - 2026-11-05: paused for replay focus (owner decision). Next on resume: ungated swarm seeds 992, 2258, 2622.
 - 2026-11-05: reorg: safedb reset records are flagged (in memory) and trusted only without a newer orphaned entry; a shadowed one is the cap before finalized. Gated 3000/3000; ungated 2997/3000 (992, 2258, 2622).
 - 2026-11-05: reorg: `driver.SafeCheck` checks the safedb against canonical L1 before discovery and caps the safe label at the newest supported safe head (finalized when none; unknown blocks wait, 3000-tick budget). The sim real verifier keeps its safedb across restarts (`--safedb.path`); the cluster's safe-decrease check re-latches on driver resets. Seed 850 and 15/16/2562/2856/329 pass with the batcher gate removed; gated 3000-seed sweep clean, ungated 2997/3000.
