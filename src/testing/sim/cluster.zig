@@ -1463,7 +1463,9 @@ test "cluster: real execution behind the real sequencer and verifier reaches liv
 
 test "cluster: real execution recovers from crashes and power loss on its db" {
     var blocks_lost: u64 = 0;
-    for ([_]u64{ 61, 62, 63 }) |seed| {
+    // Seed 92 (the defaults) meets a power loss with a block written but not yet synced:
+    // group commits leave that window narrow, and 61..63 miss it.
+    for ([_]u64{ 61, 62, 63, 92 }) |seed| {
         var cluster = try Cluster.init(std.testing.allocator, seed, .{
             .verifier_count = 1,
             .crashes_per_minute = 6,
