@@ -51,6 +51,8 @@ pub const table = @import("table_bench.zig");
 pub const codes = @import("code_bench.zig");
 /// LSM tree for flat state: puts, compaction, write amplification, lookups (`lsm_bench.zig`).
 pub const lsm = @import("lsm_bench.zig");
+/// Disk-mode blocks over an imported state on a file, cold and warm (`disk_state_bench.zig`).
+pub const disk_state = @import("disk_state_bench.zig");
 
 const State = state_module.State;
 const Overlay = overlay_module.Overlay;
@@ -721,6 +723,7 @@ pub fn run_commit(io: std.Io, filter: ?[]const u8) void {
     table.run(io, filter);
     codes.run(io, filter);
     lsm.run(io, filter);
+    disk_state.run(io, filter);
 }
 
 fn run_commit_sim(
@@ -799,6 +802,7 @@ test {
     _ = steady;
     _ = witness_rpc;
     _ = restart;
+    _ = disk_state;
 }
 
 test "bench: cases are well formed" {

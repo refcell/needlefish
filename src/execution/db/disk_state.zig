@@ -128,6 +128,34 @@ const Cursor = struct {
     }
 };
 
+/// Reads a monotonic clock for `Stats` phase times (the caller's, through its IO).
+pub const Clock = struct {
+    context: *anyopaque,
+    now_ns: *const fn (context: *anyopaque) u64,
+};
+
+/// Counters since init (and, under a `Clock`, summed phase times of successful applies).
+pub const Stats = struct {
+    /// Successful `apply` calls.
+    blocks: u64 = 0,
+    /// Branch records resolved by hash, and how many of them read the branch trees.
+    records_resolved: u64 = 0,
+    record_reads: u64 = 0,
+    /// Leaves resolved by hash (each reads the account or storage tree).
+    leaves_resolved: u64 = 0,
+    /// Account and slot point reads of the trees (evm reads, leaves, pre-state roots).
+    account_reads: u64 = 0,
+    slot_reads: u64 = 0,
+    /// Branch-record puts and tombstones written.
+    record_writes: u64 = 0,
+    /// Sparse trie updates with node resolution, the root hash, the record diff and
+    /// account collection, and the puts.
+    update_ns: u64 = 0,
+    root_ns: u64 = 0,
+    diff_ns: u64 = 0,
+    write_ns: u64 = 0,
+};
+
 const Frame = struct { depth: u8, nibble: u8, pre: Cursor, post: Cursor };
 /// The walk is depth-first: at most sixteen pending siblings per level.
 const frames_max = 64 * 16 + 1;
@@ -183,6 +211,9 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         corrupt: bool = false,
         /// This block: the memo ran out of entries or bytes.
         memo_full: bool = false,
+        stats: Stats = .{},
+        /// Times `apply`'s phases into `stats` when set.
+        clock: ?Clock = null,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -262,6 +293,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         // Reads (synchronous point lookups; a failure faults the state).
 
         pub fn account(self: *Self, address_hash: *const Hash) ?Account {
+            self.stats.account_reads += 1;
             return self.trees.get_account(address_hash) catch {
                 self.fault = true;
                 return null;
@@ -275,6 +307,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         /// The slot word, 0 when absent.
         pub fn storage(self: *Self, address_hash: *const Hash, slot_hash: *const Hash) u256 {
+            self.stats.slot_reads += 1;
             return self.trees.get_slot(address_hash, slot_hash) catch {
                 self.fault = true;
                 return 0;
@@ -350,22 +383,38 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             if (self.fault) return error.Corrupt;
             const applied = if (forward) changeset else try self.reverse(changeset);
             try self.check_wipes(applied);
+            const start_ns = self.now_ns();
             self.begin_block();
             self.sparse_state.apply(applied) catch |err| return self.sparse_error(err);
+            const updated_ns = self.now_ns();
             const new_root = self.sparse_state.state_root();
             if (self.memo_full) return error.Full;
             if (self.fault or self.corrupt) return error.Corrupt;
+            const rooted_ns = self.now_ns();
             self.record_writes_len = 0;
             self.record_bytes_len = 0;
             try self.diff(null, &self.state_root, &new_root);
             try self.diff_storage(applied);
             try self.collect_accounts(applied);
             try self.reserve(applied);
+            const diffed_ns = self.now_ns();
             self.write_accounts();
             self.write_slots(applied);
             self.write_records();
             self.state_root = new_root;
             assert(!self.fault and !self.corrupt);
+            const stats = &self.stats;
+            stats.blocks += 1;
+            stats.record_writes += self.record_writes_len;
+            stats.update_ns += updated_ns -| start_ns;
+            stats.root_ns += rooted_ns -| updated_ns;
+            stats.diff_ns += diffed_ns -| rooted_ns;
+            stats.write_ns += self.now_ns() -| diffed_ns;
+        }
+
+        fn now_ns(self: *const Self) u64 {
+            const clock = self.clock orelse return 0;
+            return clock.now_ns(clock.context);
         }
 
         fn sparse_error(self: *Self, err: witness.Error) Error {
@@ -522,6 +571,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             hang: []const u8,
             want: *const Hash,
         ) ?[]const u8 {
+            self.stats.records_resolved += 1;
+            self.stats.record_reads += 1;
             const value = self.trees.get_branch(owner, hang) catch {
                 self.fault = true;
                 return null;
@@ -610,9 +661,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             want: *const Hash,
         ) ?[]const u8 {
             assert(depth < 64);
+            self.stats.leaves_resolved += 1;
             var value_buffer: [state_trie.account_rlp_bytes_max]u8 = undefined;
             var value: []const u8 = undefined;
             if (owner) |owner_hash| {
+                self.stats.slot_reads += 1;
                 const word = self.trees.get_slot(owner_hash, key) catch {
                     self.fault = true;
                     return null;
@@ -620,6 +673,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 if (word == 0) return self.fail();
                 value = state_trie.encode_storage_value(word, value_buffer[0..33]);
             } else {
+                self.stats.account_reads += 1;
                 const record = self.trees.get_account(key) catch {
                     self.fault = true;
                     return null;
