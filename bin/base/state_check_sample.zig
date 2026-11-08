@@ -9,14 +9,18 @@
 //!   contracts (`system_contracts`).
 //! - Accounts (`select_accounts`): the system contracts, then up to a quarter from the log
 //!   emitters, then the rest of the pool, each group sorted and shuffled by the seed.
-//! - Slots (`Planner`), in three phases, each within a key budget:
-//!   1. `plan_accounts`: for every sampled log emitter and system contract, its own slots
-//!      0..7, and probes of its holder maps: `keccak(pad(holder) ++ index)` for its first
-//!      two holders (addresses in its logs' topics) at every `holder_indices` index.
-//!   2. `plan_contracts` (after the probes are answered): for every sampled contract, the
-//!      holder-map indices that came back nonzero for its remaining holders (`learn`), slots
-//!      0..7 of contracts not probed, and `keccak(pad(address) ++ pad(i))` for i in 0..3 and
-//!      sampled addresses (mostly zero: absence through a storage trie).
+//! - Slots (`Planner`), in three phases, each within a key budget. A rate-limited reference
+//!   charges calls, not keys, so the phases pack keys into few calls:
+//!   1. `plan_accounts`: one call per account; every sampled log emitter and system
+//!      contract gets an equal share of half the slot budget (at most `keys_per_call_max`):
+//!      its own slots 0..15, probes of its holder maps (`keccak(pad(holder) ++ index)` for
+//!      its first four holders, addresses in its logs' topics, at every `holder_indices`
+//!      index), then generic mapping keys `keccak(pad(a) ++ pad(i))` for pool addresses a
+//!      and i in 0..3 to fill the share (mostly zero: absence through a storage trie).
+//!   2. `plan_contracts` (after the probes are answered), one call each for at most one
+//!      account in `second_phase_share`: the holder-map indices that came back nonzero for a
+//!      contract's other holders (`learn`), then own slots and generic keys of contracts the
+//!      first phase did not probe.
 //!   3. `plan_ring`: slots of the EIP-2935 block-hash ring and the EIP-4788 beacon-root ring,
 //!      which are nonzero, to fill the rest of the budget.
 
@@ -81,19 +85,26 @@ pub const holder_indices = blk: {
     break :blk indices;
 };
 
-pub const own_slots = 8;
+pub const own_slots = 16;
 pub const generic_indices = 4;
 pub const generic_addresses = 4;
-pub const probe_holders = 2;
+pub const probe_holders = 4;
 pub const holders_max = 64;
 pub const addresses_max = 1 << 16;
 pub const emitters_max = 1 << 12;
-/// Keys per `eth_getProof` call (endpoints cap them; 1024 is common).
-pub const keys_per_call_max = 128;
+/// Keys per `eth_getProof` call. A rate-limited endpoint charges calls, not keys
+/// (sepolia.base.org answered 2048 keys in one call, ~7 MB, in about a second), so calls
+/// carry many keys.
+pub const keys_per_call_max = 1024;
+/// At most one contract in this many sampled accounts gets a second-phase call.
+pub const second_phase_share = 8;
+/// Generic keys a contract gets in the second phase.
+pub const generic_keys = generic_addresses * generic_indices;
 
 comptime {
     assert(holder_indices.len <= 16); // `Contract.learned` is a u16 mask.
-    assert(probe_holders * holder_indices.len + own_slots <= keys_per_call_max);
+    assert(own_slots + probe_holders * holder_indices.len + generic_keys <= keys_per_call_max);
+    assert(holders_max * holder_indices.len + own_slots <= keys_per_call_max);
 }
 
 /// The storage key of `mapping(address => ...)` at slot `index`: keccak(pad(key) ++ index).
@@ -311,6 +322,32 @@ pub const Planner = struct {
             }
         }
     }
+
+    /// Up to `count` keys `keccak(pad(a) ++ pad(i))` for random addresses a of `others` and i
+    /// below `generic_indices`: mostly absent words (absence through a storage trie).
+    fn generic(
+        planner: *Planner,
+        list: *std.ArrayList(Key),
+        address: *const Address,
+        others: []const Address,
+        count: u64,
+        budget: u64,
+    ) !void {
+        assert(others.len > 0);
+        const end = list.items.len + count;
+        var draws: u64 = 0;
+        while (list.items.len < end and draws < 4 * count) : (draws += 1) {
+            const other = &others[@intCast(planner.random.uintLessThan(u64, others.len))];
+            const index = draws % generic_indices;
+            const key: Key = .{
+                .slot = mapping_slot(other, &word(index)),
+                .kind = .generic,
+                .index = @intCast(index),
+            };
+            if (!try planner.take(list, address, key, budget)) return;
+        }
+        assert(list.items.len <= end);
+    }
 };
 
 /// Splits `keys` into calls of at most `keys_per_call_max`; with `always`, an account
@@ -334,69 +371,76 @@ fn append_requests(
     assert(start >= keys.len);
 }
 
-/// Phase 1: one call per account, with own slots and holder probes for known contracts.
+/// Phase 1: one call per account; known contracts share `budget` keys equally: own slots,
+/// holder probes, then generic mapping keys.
 pub fn plan_accounts(
     planner: *Planner,
     accounts: []const Address,
     pool: *const Pool,
     budget: u64,
 ) ![]Request {
+    assert(accounts.len > 0);
+    const planned_before = planner.planned;
+    var known: u64 = 0;
+    for (accounts) |*address| known += @intFromBool(pool.known_contract(address));
+    const share = if (known == 0) 0 else (budget -| planner.planned) / known;
+    const cap = @min(share, keys_per_call_max);
     var requests: std.ArrayList(Request) = .empty;
     const all: u16 = (1 << holder_indices.len) - 1;
     for (accounts) |*address| {
         var keys: std.ArrayList(Key) = .empty;
         if (pool.known_contract(address)) {
-            try planner.own(&keys, address, budget);
+            const limit = @min(budget, planner.planned + cap);
+            try planner.own(&keys, address, limit);
             const holders = pool.holders_of(address);
             const probed = holders[0..@min(holders.len, probe_holders)];
-            try planner.holder_keys(&keys, address, probed, all, budget);
+            try planner.holder_keys(&keys, address, probed, all, limit);
+            // Generic keys fill the contract's share: slots ride free on its call.
+            const room = cap -| keys.items.len;
+            try planner.generic(&keys, address, pool.addresses.keys(), room, limit);
         }
-        assert(keys.items.len <= keys_per_call_max);
+        assert(keys.items.len <= cap);
         try append_requests(planner.arena, &requests, address, keys.items, true);
     }
     assert(requests.items.len == accounts.len);
-    assert(planner.planned <= @max(budget, 0));
+    assert(planner.planned <= @max(budget, planned_before));
     return requests.items;
 }
 
-/// Phase 2: learned holder maps first (likely nonzero), then own slots of contracts the
-/// first phase did not probe, then generic mapping keys, each pass over every contract.
+/// Phase 2, at most `calls_max` calls of one contract each: contracts whose holder probes
+/// came back nonzero get those maps for their other holders (likely nonzero), then contracts
+/// the first phase did not probe get own slots and generic mapping keys.
 pub fn plan_contracts(
     planner: *Planner,
     contracts: []const Contract,
     accounts: []const Address,
     pool: *const Pool,
     budget: u64,
+    calls_max: u64,
 ) ![]Request {
     assert(accounts.len > 0);
-    const lists = try planner.arena.alloc(std.ArrayList(Key), contracts.len);
-    for (lists) |*list| list.* = .empty;
-    for (contracts, lists) |*contract, *list| {
-        const holders = pool.holders_of(&contract.address);
-        if (contract.learned == 0 or holders.len <= probe_holders) continue;
-        const rest = holders[probe_holders..];
-        try planner.holder_keys(list, &contract.address, rest, contract.learned, budget);
-    }
-    for (contracts, lists) |*contract, *list| {
-        if (!contract.probed) try planner.own(list, &contract.address, budget);
-    }
-    for (contracts, lists) |*contract, *list| {
-        for (0..generic_addresses) |_| {
-            const other = &accounts[@intCast(planner.random.uintLessThan(u64, accounts.len))];
-            for (0..generic_indices) |index| {
-                const key: Key = .{
-                    .slot = mapping_slot(other, &word(index)),
-                    .kind = .generic,
-                    .index = @intCast(index),
-                };
-                _ = try planner.take(list, &contract.address, key, budget);
+    var requests: std.ArrayList(Request) = .empty;
+    for ([_]bool{ true, false }) |learned_pass| {
+        for (contracts) |*contract| {
+            if (requests.items.len >= calls_max) break;
+            var keys: std.ArrayList(Key) = .empty;
+            const holders = pool.holders_of(&contract.address);
+            if (learned_pass) {
+                if (contract.learned == 0 or holders.len <= probe_holders) continue;
+                const rest = holders[probe_holders..];
+                const mask = contract.learned;
+                try planner.holder_keys(&keys, &contract.address, rest, mask, budget);
+            } else {
+                if (contract.probed) continue;
+                try planner.own(&keys, &contract.address, budget);
+                const others = pool.addresses.keys();
+                try planner.generic(&keys, &contract.address, others, generic_keys, budget);
             }
+            assert(keys.items.len <= keys_per_call_max);
+            try append_requests(planner.arena, &requests, &contract.address, keys.items, false);
         }
     }
-    var requests: std.ArrayList(Request) = .empty;
-    for (contracts, lists) |*contract, list| {
-        try append_requests(planner.arena, &requests, &contract.address, list.items, false);
-    }
+    assert(requests.items.len <= calls_max);
     assert(planner.planned <= budget or contracts.len == 0);
     return requests.items;
 }
@@ -541,8 +585,11 @@ fn plan_all(arena: std.mem.Allocator, seed: u64, slots: u64) ![3][]const Request
         try contracts.append(arena, contract);
     }
     const budget = slots - slots / 10;
-    const second = try plan_contracts(&planner, contracts.items, accounts, &pool, budget);
+    const calls_max = accounts.len / second_phase_share + 1;
+    const second =
+        try plan_contracts(&planner, contracts.items, accounts, &pool, budget, calls_max);
     try testing.expect(planner.planned <= budget);
+    try testing.expect(second.len <= calls_max);
     const rings = [_]Address{ history_contract, beacon_roots_contract };
     const third = try plan_ring(&planner, &rings, slots - planner.planned);
     try testing.expectEqual(slots, planner.planned);

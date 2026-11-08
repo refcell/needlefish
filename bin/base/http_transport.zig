@@ -23,6 +23,9 @@ pub const HttpTransport = struct {
     /// 0 disables the timeout.
     timeout_ms: u64 = 0,
     timeouts: u64 = 0,
+    /// The status of the last answered request (`.too_many_requests` tells a rate limit
+    /// from a network failure); null when the last request got no answer.
+    status: ?std.http.Status = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, url: []const u8) HttpTransport {
         assert(std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://"));
@@ -89,6 +92,7 @@ pub const HttpTransport = struct {
 
     fn fetch(http: *HttpTransport, body: []const u8, response: []u8) rpc.TransportError!usize {
         var writer: std.Io.Writer = .fixed(response);
+        http.status = null;
         const result = http.client.fetch(.{
             .location = .{ .url = http.url },
             .method = .POST,
@@ -99,6 +103,7 @@ pub const HttpTransport = struct {
             error.WriteFailed => return error.ResponseTooLarge,
             else => return error.TransportFailed,
         };
+        http.status = result.status;
         if (result.status != .ok) return error.TransportFailed;
         return writer.buffered().len;
     }

@@ -142,8 +142,8 @@ Get verified mainnet state at a recent block into the needlefish database.
 - Check: imported state root equals the header at the snapshot block. Spot-check 10,000
   random accounts and storage slots against the reference node at that block
   (`base state-check --db <path>`: accounts and slots read through the trie and from the flat
-  records against `eth_getProof`, codes against `eth_getCode`, inside the endpoint's proof
-  window).
+  records against `eth_getProof`, codes against the code hash and `eth_getCode`, paced to the
+  endpoint's rate limit inside its proof window).
 
 ### M4. Catch-up sync from the snapshot block to the tip
 

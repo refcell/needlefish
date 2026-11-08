@@ -321,32 +321,35 @@ pub fn compare_slot(
     return added;
 }
 
-/// Compares one code: the reference's `eth_getCode` must hash to `code_hash`, and needlefish's
-/// code tables must hold the same bytes under it. Returns the mismatches added.
+/// Compares one code. needlefish's code tables must hold bytes hashing to `code_hash` (the
+/// reference's `codeHash`); with `reference_code` (its `eth_getCode`), that must hash to
+/// `code_hash` too. Returns the mismatches added.
 pub fn compare_code(
     report: *Report,
     address: *const Address,
     code_hash: *const Hash,
-    reference_code: []const u8,
+    reference_code: ?[]const u8,
     local_code: ?[]const u8,
 ) u32 {
     assert(!std.mem.eql(u8, code_hash, &node.empty_code_hash));
     const before = report.total;
-    const reference_hash = node.keccak256(reference_code);
-    if (!std.mem.eql(u8, &reference_hash, code_hash)) report.add(.{
-        .address = address.*,
-        .field = .code,
-        .side = .reference,
-        .expected = code_hash.*,
-        .actual = reference_hash,
-    });
+    if (reference_code) |code| {
+        const reference_hash = node.keccak256(code);
+        if (!std.mem.eql(u8, &reference_hash, code_hash)) report.add(.{
+            .address = address.*,
+            .field = .code,
+            .side = .reference,
+            .expected = code_hash.*,
+            .actual = reference_hash,
+        });
+    }
     const zero: Hash = @splat(0);
     const local_hash = if (local_code) |code| node.keccak256(code) else zero;
-    if (!std.mem.eql(u8, &local_hash, &reference_hash)) report.add(.{
+    if (!std.mem.eql(u8, &local_hash, code_hash)) report.add(.{
         .address = address.*,
         .field = .code,
         .side = .code_table,
-        .expected = reference_hash,
+        .expected = code_hash.*,
         .actual = local_hash,
     });
     const added: u32 = @intCast(report.total - before);
@@ -573,8 +576,12 @@ test "state-check: presence, absence, slots, and codes" {
     try expect_added(0, compare_code(&report, &address, &hash, code, code));
     try expect_added(1, compare_code(&report, &address, &hash, code, null));
     try expect_added(1, compare_code(&report, &address, &hash, code, "\x60\x80"));
-    try expect_added(2, compare_code(&report, &address, &hash, "\x00", code));
+    try expect_added(1, compare_code(&report, &address, &hash, "\x00", code));
     try testing.expectEqual(Side.reference, report.list()[2].side);
+    try expect_added(2, compare_code(&report, &address, &hash, "\x00", null));
+    try expect_added(0, compare_code(&report, &address, &hash, null, code));
+    try expect_added(1, compare_code(&report, &address, &hash, null, "\x60"));
+    try testing.expectEqual(Side.code_table, report.list()[report.list().len - 1].side);
 }
 
 test "state-check: the report keeps the first mismatches and counts all" {

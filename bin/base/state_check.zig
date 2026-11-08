@@ -3,7 +3,7 @@
 //! storage slots against a reference node").
 //!
 //!     base state-check --db <path> [--chain base-sepolia|base-mainnet] [--rpc <url>]
-//!                      [--samples <n>] [--seed <n>]
+//!                      [--samples <n>] [--accounts <n>] [--seed <n>] [--interval-ms <n>]
 //!
 //! The database opens read-write with the sizing of `<path>.counts` (as `import-run` and
 //! `el-run` open it; a file another process holds fails with `FileLocked`) and nothing is
@@ -12,21 +12,26 @@
 //! (`eth_getBlockByNumber`), or the check stops: the reference is on another block.
 //!
 //! Samples (`state_check_sample.zig`) are chosen from `--seed` and the reference's answers:
-//! a fifth of `--samples` are accounts drawn from recent blocks' logs and transactions and
-//! the system contracts, the rest are slots of those accounts (own slots 0..7, holder-map
-//! keys, generic mapping keys, and the EIP-2935/EIP-4788 rings, which keep at least 30% of
-//! the samples nonzero slots). Every account is compared with `eth_getProof` at N (nonce,
-//! balance, code hash, storage root), through the trie and from the flat record; every slot
-//! with its `storageProof` value (zeros included), both ways; every distinct code with
-//! `eth_getCode` at N (`state_check_compare.zig`).
+//! `--accounts` of `--samples` (default one in 200) are accounts drawn from recent blocks' logs
+//! and transactions and the system contracts, the rest are slots of those accounts (own
+//! slots, holder-map keys, generic mapping keys, and the EIP-2935/EIP-4788 rings, which keep
+//! at least 30% of the samples nonzero slots). Every account is compared with `eth_getProof`
+//! at N (nonce, balance, code hash, storage root), through the trie and from the flat record;
+//! every slot with its `storageProof` value (zeros included), both ways; every distinct code
+//! from the code tables against the code hash, the first few also against `eth_getCode` at N
+//! (`state_check_compare.zig`).
 //!
-//! Requests go in batches of `batch_max`, paced per item and retried with backoff. Public
-//! endpoints serve `eth_getProof` for the most recent ~10,000 blocks only (sepolia.base.org:
-//! about 33 minutes), so the check refuses a head older than the window allows for its
-//! estimated run time, and stops at the first answer that says the state is out of range.
+//! The reference is rate limited per call, not per key (`state_check_rpc.zig`), so each
+//! account costs a call and slots ride along, up to 1024 keys a call. Public endpoints serve
+//! `eth_getProof` for the most recent ~10,000 blocks only (sepolia.base.org: about 33
+//! minutes), so the check refuses a head the planned calls cannot finish before it leaves the
+//! window, re-reads the window every five minutes, and stops at the deadline or at the first
+//! answer that says the state is out of range, printing what it checked and why it stopped.
+//! Other keyless Base Sepolia endpoints (publicnode, drpc) refuse proofs even ten blocks
+//! back, so there is no second endpoint.
 //!
 //! Exit status: 0 every sample matches, 1 a mismatch (or the reference is on another block),
-//! 2 bad arguments, 3 the check could not run (database, window, or endpoint).
+//! 2 bad arguments, 3 the check could not run or finish (database, window, or endpoint).
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,6 +42,8 @@ const import_run_cli = @import("import_run.zig");
 const snapshot_import_out = @import("snapshot_import_out.zig");
 const compare = @import("state_check_compare.zig");
 const sample = @import("state_check_sample.zig");
+const rpc = @import("state_check_rpc.zig");
+const Endpoint = rpc.Endpoint;
 
 const to_disk = base.execution.import.to_disk;
 const node = base.execution.trie.node;
@@ -53,11 +60,13 @@ const Address = [20]u8;
 
 const usage =
     \\usage: base state-check --db <path> [--chain base-sepolia|base-mainnet] [--rpc <url>]
-    \\                        [--samples <n>] [--seed <n>]
-    \\  --db       a disk-mode database (and <path>.counts); opened, never written
-    \\  --rpc      reference JSON-RPC endpoint (eth_getProof, eth_getCode, eth_getLogs)
-    \\  --samples  accounts plus slots to check (default 10000)
-    \\  --seed     sample selection seed (default 1)
+    \\                        [--samples <n>] [--accounts <n>] [--seed <n>] [--interval-ms <n>]
+    \\  --db           a disk-mode database (and <path>.counts); opened, never written
+    \\  --rpc          reference JSON-RPC endpoint (eth_getProof, eth_getCode, eth_getLogs)
+    \\  --samples      accounts plus slots to check (default 10000)
+    \\  --accounts     of the samples, accounts: one eth_getProof call each (default 1 in 200)
+    \\  --seed         sample selection seed (default 1)
+    \\  --interval-ms  starting spacing of calls; it adapts to rate limits (default 6000)
     \\exit status: 0 all match, 1 mismatch, 2 usage, 3 could not check
     \\
 ;
@@ -69,13 +78,20 @@ const exit_unchecked = 3;
 const samples_default = 10_000;
 const samples_min = 10;
 const samples_max = 100_000;
+/// One sample in this many is an account by default: each costs a rate-limited call, while
+/// a call carries up to `sample.keys_per_call_max` slots.
+const accounts_divisor = 200;
+const interval_min_ms = 500;
+const interval_max_ms = 60_000;
 
 const Flags = struct {
     db: []const u8,
     chain: *const import_run_cli.Chain = &import_run_cli.chains[0],
     rpc: ?[]const u8 = null,
     samples: u32 = samples_default,
+    accounts: u32 = 0,
     seed: u64 = 1,
+    interval_ms: u32 = rpc.Pacer.Config.interval_initial_default_ms,
 };
 
 fn parse(args: []const []const u8) !Flags {
@@ -103,209 +119,89 @@ fn parse(args: []const []const u8) !Flags {
             if (flags.samples < samples_min or flags.samples > samples_max) {
                 return error.InvalidArguments;
             }
+        } else if (std.mem.eql(u8, name, "--accounts")) {
+            flags.accounts = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+            if (flags.accounts == 0) return error.InvalidArguments;
         } else if (std.mem.eql(u8, name, "--seed")) {
             flags.seed = std.fmt.parseInt(u64, value, 10) catch return error.InvalidArguments;
+        } else if (std.mem.eql(u8, name, "--interval-ms")) {
+            const interval = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+            if (interval < interval_min_ms or interval > interval_max_ms) {
+                return error.InvalidArguments;
+            }
+            flags.interval_ms = interval;
         } else return error.InvalidArguments;
     }
     flags.db = db orelse return error.InvalidArguments;
     if (flags.db.len == 0) return error.InvalidArguments;
+    if (flags.accounts == 0) flags.accounts = @max(flags.samples / accounts_divisor, 1);
+    if (flags.accounts > flags.samples / 2) return error.InvalidArguments;
     assert(flags.samples >= samples_min and flags.samples <= samples_max);
+    assert(flags.accounts > 0 and flags.accounts < flags.samples);
     return flags;
 }
 
-// The reference endpoint.
+// The reference endpoint (`state_check_rpc.zig`).
 
-/// Calls per JSON-RPC batch, and the spacing per item (sepolia.base.org's public limit, as
-/// `base follow` paces its proof endpoint).
-const batch_max = 5;
-const item_interval_ms = 150;
-const retries_max = 10;
 const response_bytes_max = 64 << 20;
 /// Blocks back from its head for which the public endpoint serves `eth_getProof`.
 const proof_window_blocks = 10_000;
 const block_time_ms = 200;
-/// Storage keys that cost one more pacing unit in an `eth_getProof` call.
-const keys_per_unit = 32;
-const logs_units = 4;
-/// Logs are read in chunks of blocks back from N until the pool holds three addresses per
+/// Blocks of the window kept unused: the check stops this far before N leaves it.
+const window_margin_blocks = 150;
+/// The window is re-read (`eth_blockNumber`) this often while proofs are fetched.
+const window_refresh_ms = 5 * 60_000;
+/// Logs are read in chunks of blocks back from N until the pool holds two addresses per
 /// sampled account, or `logs_blocks_max` blocks were read.
-const logs_chunk_blocks = 100;
+const logs_chunk_blocks = 500;
 const logs_blocks_max = 5_000;
 /// Blocks back from N whose transactions' senders and recipients join the pool.
-const transaction_blocks = 20;
-
-/// What a batch response says.
-const Verdict = union(enum) {
-    ok,
-    /// Rate limited, incomplete, or failed: try again.
-    retry: []const u8,
-    /// The endpoint cannot serve state at the block (pruned, or past its proof window).
-    out_of_window: []const u8,
-};
-
-/// Error messages nodes give for state they no longer (or do not yet) serve.
-const window_signs = [_][]const u8{
-    "missing trie node",   "limited to a",           "historical state", "pruned",
-    "state not available", "state is not available", "header not found",
-};
-
-fn out_of_window(message: []const u8) bool {
-    assert(window_signs.len > 0);
-    var start: usize = 0;
-    while (start < message.len) : (start += 1) {
-        for (window_signs) |sign| {
-            if (std.ascii.startsWithIgnoreCase(message[start..], sign)) return true;
-        }
-    }
-    assert(start == message.len);
-    return false;
-}
-
-fn error_message(item: json.Value) ?[]const u8 {
-    if (item != .object) return null;
-    const failure = item.object.get("error") orelse return null;
-    if (failure == .object) {
-        if (failure.object.get("message")) |message| {
-            if (message == .string) return message.string;
-        }
-    }
-    return "error without a message";
-}
-
-/// Classifies a batch response for `results.len` calls; on `.ok` every result is filled,
-/// in id order. An out-of-window error anywhere wins over everything else.
-fn classify(value: json.Value, results: []json.Value) Verdict {
-    assert(results.len > 0 and results.len <= 64);
-    const items: []const json.Value = switch (value) {
-        .array => |array| array.items,
-        .object => (&value)[0..1],
-        else => return .{ .retry = "not a JSON-RPC response" },
-    };
-    for (items) |item| {
-        const message = error_message(item) orelse continue;
-        if (out_of_window(message)) return .{ .out_of_window = message };
-    }
-    for (items) |item| {
-        if (error_message(item)) |message| return .{ .retry = message };
-    }
-    if (value != .array or items.len != results.len) return .{ .retry = "incomplete batch" };
-    var seen: u64 = 0;
-    for (items) |item| {
-        if (item != .object) return .{ .retry = "not an object" };
-        const id = item.object.get("id") orelse return .{ .retry = "no id" };
-        if (id != .integer or id.integer < 0 or id.integer >= results.len) {
-            return .{ .retry = "bad id" };
-        }
-        const bit = @as(u64, 1) << @intCast(id.integer);
-        if (seen & bit != 0) return .{ .retry = "repeated id" };
-        seen |= bit;
-        results[@intCast(id.integer)] = item.object.get("result") orelse
-            return .{ .retry = "no result" };
-    }
-    assert(@popCount(seen) == results.len);
-    return .ok;
-}
-
-/// One JSON-RPC endpoint: per-item pacing, retries with backoff.
-const Endpoint = struct {
-    io: Io,
-    http: HttpTransport,
-    response: []u8,
-    /// Awake-clock time (ms) before which the next request waits.
-    next_ms: i64 = 0,
-    requests: u64 = 0,
-    retries: u64 = 0,
-
-    fn pace(endpoint: *Endpoint, units: u32) !void {
-        assert(units > 0);
-        const now = Io.Clock.awake.now(endpoint.io).toMilliseconds();
-        if (endpoint.next_ms > now) {
-            try endpoint.io.sleep(.fromMilliseconds(endpoint.next_ms - now), .awake);
-        }
-        endpoint.next_ms = @max(now, endpoint.next_ms) + @as(i64, units) * item_interval_ms;
-        assert(endpoint.next_ms > now);
-    }
-
-    /// Calls `method` once per entry of `params`; returns each result in order.
-    fn batch(
-        endpoint: *Endpoint,
-        arena: std.mem.Allocator,
-        method: []const u8,
-        params: []const []const u8,
-        units: u32,
-    ) ![]json.Value {
-        assert(params.len > 0 and params.len <= batch_max);
-        var body: Io.Writer.Allocating = .init(arena);
-        try body.writer.writeAll("[");
-        for (params, 0..) |param, id| {
-            try body.writer.print("{s}{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\"," ++
-                "\"params\":{s}}}", .{ if (id == 0) "" else ",", id, method, param });
-        }
-        try body.writer.writeAll("]");
-        const results = try arena.alloc(json.Value, params.len);
-        var attempt: u32 = 0;
-        while (attempt < retries_max) : (attempt += 1) {
-            if (attempt > 0) {
-                endpoint.retries += 1;
-                const wait_ms: i64 = @min(@as(i64, 250) << @intCast(attempt), 15_000);
-                try endpoint.io.sleep(.fromMilliseconds(wait_ms), .awake);
-            }
-            try endpoint.pace(units);
-            endpoint.requests += 1;
-            const transport = endpoint.http.transport();
-            const text = transport.send(body.written(), endpoint.response) catch |err| {
-                std.debug.print("  {s}: {t}\n", .{ endpoint.http.url, err });
-                continue;
-            };
-            const value = json.parseFromSliceLeaky(json.Value, arena, text, .{}) catch continue;
-            switch (classify(value, results)) {
-                .ok => return results,
-                .out_of_window => |message| {
-                    std.debug.print("  {s} {s}: {s}\n", .{ endpoint.http.url, method, message });
-                    return error.OutOfWindow;
-                },
-                .retry => |message| if (attempt >= 2) {
-                    std.debug.print("  {s} {s}: {s}\n", .{ endpoint.http.url, method, message });
-                },
-            }
-        }
-        return error.EndpointFailed;
-    }
-
-    fn call(
-        endpoint: *Endpoint,
-        arena: std.mem.Allocator,
-        method: []const u8,
-        params: []const u8,
-    ) !json.Value {
-        const results = try endpoint.batch(arena, method, &.{params}, 1);
-        assert(results.len == 1);
-        return results[0];
-    }
-};
+const transaction_blocks = 1;
+/// Codes fetched with `eth_getCode` as a cross-check of the reference itself (every code is
+/// checked against the reference's code hash without a call).
+const reference_codes_max = 3;
+/// Calls per request. sepolia.base.org charges every call of a batch and refuses bursts of
+/// more than a few, so a batch is a burst: five-call batches got 8 of 29 calls refused and
+/// ~6 calls a minute through, evenly spaced single calls 10 a minute with none refused. A
+/// proof's cost also grows with its keys and with N's distance from the tip (1024 keys:
+/// ~1 s 600 blocks back, ~15 s 5,900 back; 5 x 1024 keys: no answer in 60 s).
+const calls_per_request = 1;
+/// The spacing the window guard plans with: twice sepolia.base.org's best sustained rate
+/// (one call every 6 s held for 20 calls one hour, and half were refused the next).
+const guard_interval_ms = 12_000;
+const http_timeout_ms = 90_000;
 
 // The window.
 
-/// Estimated run time for `accounts` accounts and `slots` slots: one proof call per account,
-/// about one more per four accounts for contracts' second phase and one per four for codes,
-/// a pacing unit per `keys_per_unit` keys, and the log and block fetches.
-fn estimate_ms(accounts: u64, slots: u64) u64 {
+/// Calls the check makes for `accounts` accounts and `slots` slots: the setup (tip, probe,
+/// block, transactions, logs), one proof per account, a second-phase proof for up to
+/// `sample.second_phase_share` of them, ring proofs, the window re-reads, and codes.
+fn calls_estimate(accounts: u64, slots: u64) u64 {
     assert(accounts > 0);
-    const units = accounts + accounts / 2 + slots / keys_per_unit +
-        logs_blocks_max / logs_chunk_blocks * logs_units + transaction_blocks;
-    const estimate = units * item_interval_ms;
-    assert(estimate >= accounts * item_interval_ms);
-    return estimate;
+    const setup = 3 + transaction_blocks + logs_blocks_max / logs_chunk_blocks / 2;
+    const ring = slots / sample.keys_per_call_max + 2;
+    const calls = setup + accounts + accounts / sample.second_phase_share + ring + 4 +
+        reference_codes_max;
+    assert(calls > accounts);
+    return calls;
 }
 
-/// Whether the reference still serves proofs at N when the run ends: N is `behind` blocks
-/// behind its head now, and the head moves a block per `block_time_ms` while the check runs
-/// (with half the estimate again as margin).
-fn window_holds(behind: u64, run_ms: u64) bool {
-    const run_blocks = (run_ms + run_ms / 2) / block_time_ms;
-    const holds = behind + run_blocks < proof_window_blocks;
+/// Whether `calls` calls at `interval_ms` apart end before block N, `behind` blocks behind
+/// the tip now, leaves the window (with `window_margin_blocks` to spare).
+fn window_holds(behind: u64, calls: u64, interval_ms: u64) bool {
+    const run_blocks = calls * interval_ms / block_time_ms;
+    const holds = behind + run_blocks + window_margin_blocks < proof_window_blocks;
     assert(!holds or behind < proof_window_blocks);
     return holds;
+}
+
+/// The awake-clock time at which block N, `behind` blocks behind the tip at `now_ms`, comes
+/// within `window_margin_blocks` of leaving the window.
+fn deadline_of(now_ms: i64, behind: u64) i64 {
+    const left = proof_window_blocks -| (behind + window_margin_blocks);
+    const deadline = now_ms + @as(i64, @intCast(left * block_time_ms));
+    assert(deadline >= now_ms);
+    return deadline;
 }
 
 // The check.
@@ -331,6 +227,11 @@ const Check = struct {
     code_accounts: u64 = 0,
     started_ms: i64,
     behind_start: u64 = 0,
+    /// What the check is doing (printed when it stops).
+    phase: []const u8 = "opening",
+    /// When the window was last re-read.
+    window_read_ms: i64 = 0,
+    codes_fetched: u64 = 0,
 
     fn now_ms(check: *const Check) i64 {
         return Io.Clock.awake.now(check.io).toMilliseconds();
@@ -350,10 +251,6 @@ const Check = struct {
         var total: u64 = 0;
         for (check.slots) |counts| total += counts.zero;
         return total;
-    }
-
-    fn block_param(check: *const Check, arena: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(arena, "0x{x}", .{check.head});
     }
 };
 
@@ -415,9 +312,14 @@ fn check_state(init: std.process.Init, flags: *const Flags, db: *Database, disk:
         .io = init.io,
         .http = .init(gpa, init.io, url),
         .response = response,
+        .pacer = .init(.{
+            .interval_initial_ms = flags.interval_ms,
+            .interval_min_ms = @min(flags.interval_ms, rpc.Pacer.Config.interval_floor_ms),
+            .interval_max_ms = @max(flags.interval_ms, rpc.Pacer.Config.interval_ceiling_ms),
+        }),
     };
     defer endpoint.http.deinit();
-    endpoint.http.timeout_ms = 30_000;
+    endpoint.http.timeout_ms = http_timeout_ms;
     const report = try gpa.create(compare.Report);
     defer gpa.destroy(report);
     report.* = .{ .print = true };
@@ -436,46 +338,84 @@ fn check_state(init: std.process.Init, flags: *const Flags, db: *Database, disk:
     defer check.scratch.deinit();
     defer check.keep.deinit();
     check.started_ms = check.now_ms();
-    const status = run(&check) catch |err| {
-        switch (err) {
-            error.OutOfWindow => std.debug.print("state-check: the reference does not serve " ++
-                "state at block {d} (outside its eth_getProof window); use a fresher database " ++
-                "copy\n", .{check.head}),
-            error.EndpointFailed => std.debug.print("state-check: {s} keeps failing; " ++
-                "stopped\n", .{url}),
-            error.MalformedResponse => std.debug.print("state-check: {s} sent an answer that " ++
-                "does not decode; stopped\n", .{url}),
-            error.DatabaseFault => std.debug.print("state-check: FAILED: the database faulted " ++
-                "on a read (a missing or corrupt record); stopped\n", .{}),
-            else => return err,
-        }
-        summary(&check);
-        return if (err == error.DatabaseFault) exit_mismatch else exit_unchecked;
-    };
+    const status = run(&check) catch |err| return stopped(&check, err);
     assert(status <= exit_unchecked);
     return status;
 }
 
-fn run(check: *Check) !u8 {
-    std.debug.print("state-check: {s} block {d}, {d} samples, seed {d}, reference {s}\n", .{
-        check.flags.chain.name, check.head,              check.flags.samples,
-        check.flags.seed,       check.endpoint.http.url,
+/// Reports why the check stopped early, with what it had checked; the exit status.
+fn stopped(check: *Check, err: anyerror) !u8 {
+    const url = check.endpoint.http.url;
+    std.debug.print("state-check: STOPPED during {s} after {d:.0} s: ", .{
+        check.phase,
+        check.elapsed_s(),
     });
+    switch (err) {
+        error.OutOfWindow => std.debug.print("the reference does not serve state at block " ++
+            "{d} (outside its eth_getProof window: \"{s}\"); use a fresher database copy\n", .{
+            check.head, check.endpoint.problem(),
+        }),
+        error.WindowClosing => std.debug.print("block {d} is about to leave {s}'s " ++
+            "eth_getProof window (deadline reached, last problem: \"{s}\"); use a fresher " ++
+            "copy or fewer --samples/--accounts\n", .{ check.head, url, check.endpoint.problem() }),
+        error.EndpointFailed => std.debug.print("{s} failed {d} times in a row without a rate " ++
+            "limit (last: \"{s}\")\n", .{ url, rpc.failures_max, check.endpoint.problem() }),
+        error.MalformedResponse => std.debug.print("{s} sent an answer that does not decode " ++
+            "(last problem: \"{s}\")\n", .{ url, check.endpoint.problem() }),
+        error.DatabaseFault => std.debug.print("FAILED: the database faulted on a read (a " ++
+            "missing or corrupt record)\n", .{}),
+        else => {
+            std.debug.print("{t}\n", .{err});
+            return err;
+        },
+    }
+    summary(check);
+    assert(check.report.total <= std.math.maxInt(u64));
+    if (err == error.DatabaseFault or check.report.total > 0) return exit_mismatch;
+    return exit_unchecked;
+}
+
+fn run(check: *Check) !u8 {
+    std.debug.print("state-check: {s} block {d}, {d} samples ({d} accounts), seed {d}, " ++
+        "reference {s}\n", .{
+        check.flags.chain.name, check.head,       check.flags.samples,
+        check.flags.accounts,   check.flags.seed, check.endpoint.http.url,
+    });
+    check.phase = "the window guard";
     if (!try check_window(check)) return exit_unchecked;
+    check.phase = "the block check";
     if (!try check_block(check)) return exit_mismatch;
     var prng: std.Random.DefaultPrng = .init(check.flags.seed);
     const arena = check.keep.allocator();
-    const accounts_target: u32 = check.flags.samples / 5;
     var pool: sample.Pool = .{};
-    try collect_pool(check, &pool, accounts_target);
-    const accounts = try sample.select_accounts(arena, prng.random(), &pool, accounts_target);
+    check.phase = "collecting addresses";
+    try collect_pool(check, &pool, check.flags.accounts);
+    const accounts = try sample.select_accounts(arena, prng.random(), &pool, check.flags.accounts);
     const slots_target = check.flags.samples - accounts.len;
     std.debug.print("samples: {d} accounts from {d} addresses ({d} log emitters), " ++
         "{d} slots\n", .{
         accounts.len, pool.addresses.count(), pool.holders.count(), slots_target,
     });
     var planner: sample.Planner = .{ .arena = arena, .random = prng.random() };
-    const first = try sample.plan_accounts(&planner, accounts, &pool, slots_target / 2);
+    try prove_slots(check, &planner, &pool, accounts, slots_target);
+    check.phase = "codes";
+    try check_codes(check);
+    final_window(check);
+    summary(check);
+    return verdict(check);
+}
+
+/// The three proof phases (`state_check_sample.zig`).
+fn prove_slots(
+    check: *Check,
+    planner: *sample.Planner,
+    pool: *const sample.Pool,
+    accounts: []const Address,
+    slots_target: u64,
+) !void {
+    assert(accounts.len > 0);
+    check.phase = "accounts and probes";
+    const first = try sample.plan_accounts(planner, accounts, pool, slots_target / 2);
     try prove(check, first, true);
     progress(check, "accounts and probes");
     const contracts = try contracts_of(check, accounts);
@@ -484,20 +424,25 @@ fn run(check: *Check) !u8 {
     const remaining = slots_target - planner.planned;
     const reserve = @min(remaining, nonzero_min -| check.nonzero());
     const budget = planner.planned + remaining - reserve;
-    const second = try sample.plan_contracts(&planner, contracts, accounts, &pool, budget);
+    const calls_max = accounts.len / sample.second_phase_share + 1;
+    check.phase = "contract slots";
+    const second = try sample.plan_contracts(planner, contracts, accounts, pool, budget, calls_max);
     try prove(check, second, false);
     progress(check, "contract slots");
     var rings: std.ArrayList(Address) = .empty;
     for ([_]Address{ sample.history_contract, sample.beacon_roots_contract }) |ring| {
         const fields = check.accounts.get(ring) orelse continue;
-        if (fields.has_code()) try rings.append(arena, ring);
+        if (fields.has_code()) try rings.append(check.keep.allocator(), ring);
     }
-    const third = try sample.plan_ring(&planner, rings.items, slots_target - planner.planned);
+    check.phase = "ring slots";
+    const third = try sample.plan_ring(planner, rings.items, slots_target - planner.planned);
     try prove(check, third, false);
     progress(check, "ring slots");
-    try check_codes(check);
-    final_window(check);
-    summary(check);
+    assert(planner.planned <= slots_target);
+}
+
+fn verdict(check: *const Check) u8 {
+    const nonzero_min = (@as(u64, check.flags.samples) * 3 + 9) / 10;
     if (check.nonzero() < nonzero_min) {
         std.debug.print("note: {d} nonzero slots, under 30% of the samples\n", .{check.nonzero()});
     }
@@ -510,42 +455,63 @@ fn run(check: *Check) !u8 {
     std.debug.print("state-check: ok: every sample matches the reference at block {d}\n", .{
         check.head,
     });
+    assert(check.report.total == 0);
     return 0;
 }
 
-/// The window guard: the reference's tip, how far N is behind it, and a probe of
-/// `eth_getProof` at N. False (reported) when N would leave the window during the run.
-fn check_window(check: *Check) !bool {
+/// The reference's tip, and block N's distance behind it.
+fn read_tip(check: *Check) !u64 {
     _ = check.scratch.reset(.retain_capacity);
     const arena = check.scratch.allocator();
     const tip_value = try check.endpoint.call(arena, "eth_blockNumber", "[]");
     if (tip_value != .string) return error.MalformedResponse;
     const tip = try compare.parse_u64(tip_value.string);
+    check.window_read_ms = check.now_ms();
+    if (tip >= check.head) {
+        check.endpoint.deadline_ms = deadline_of(check.window_read_ms, tip - check.head);
+    }
+    assert(check.window_read_ms > 0 or tip >= 0);
+    return tip;
+}
+
+/// The window guard: the reference's tip, how far N is behind it, and a probe of
+/// `eth_getProof` at N. False (reported) when the planned calls at `guard_interval_ms` would
+/// not end before N leaves the window.
+fn check_window(check: *Check) !bool {
+    const tip = try read_tip(check);
     if (tip < check.head) {
         std.debug.print("window: the reference's tip {d} is behind block {d}; it cannot serve " ++
             "that block yet\n", .{ tip, check.head });
         return false;
     }
-    const accounts = check.flags.samples / 5;
-    const run_ms = estimate_ms(accounts, check.flags.samples - accounts);
+    const slots = check.flags.samples - check.flags.accounts;
+    const calls = calls_estimate(check.flags.accounts, slots);
+    const interval_ms = @max(guard_interval_ms, check.flags.interval_ms);
     const behind = tip - check.head;
-    const holds = window_holds(behind, run_ms);
+    const holds = window_holds(behind, calls, interval_ms);
     std.debug.print("window: reference tip {d}; block {d} is {d} blocks (~{d} s) behind; " ++
-        "eth_getProof is served {d} blocks back; estimated run {d} s (+50% margin): {s}\n", .{
+        "eth_getProof is served {d} blocks back; ~{d} calls at {d} ms each take ~{d} s, " ++
+        "~{d} s are left: {s}\n", .{
         tip,
         check.head,
         behind,
         behind * block_time_ms / 1000,
         proof_window_blocks,
-        run_ms / 1000,
+        calls,
+        interval_ms,
+        calls * interval_ms / 1000,
+        (proof_window_blocks -| (behind + window_margin_blocks)) * block_time_ms / 1000,
         if (holds) "ok" else "REFUSED",
     });
     if (!holds) {
         std.debug.print("window: block {d} would leave the reference's window before the " ++
-            "check ends; use a fresher database copy or fewer --samples\n", .{check.head});
+            "check ends; use a fresher database copy or fewer --samples/--accounts\n", .{
+            check.head,
+        });
         return false;
     }
     // The first eth_getProof at N: an out-of-window answer stops the check here.
+    const arena = check.scratch.allocator();
     const params = try std.fmt.allocPrint(arena, "[\"0x{x}\",[],\"0x{x}\"]", .{
         sample.system_contracts[0],
         check.head,
@@ -557,15 +523,28 @@ fn check_window(check: *Check) !bool {
     return true;
 }
 
+/// Re-reads the tip every `window_refresh_ms` (the deadline moves with the chain's real pace).
+fn refresh_window(check: *Check) !void {
+    if (check.now_ms() - check.window_read_ms < window_refresh_ms) return;
+    const tip = try read_tip(check);
+    const behind = tip -| check.head;
+    std.debug.print("window: block {d} is {d} blocks behind the tip; ~{d} s left " ++
+        "(interval {d} ms)\n", .{
+        check.head,
+        behind,
+        @divTrunc(@max(check.endpoint.deadline_ms - check.now_ms(), 0), 1000),
+        check.endpoint.pacer.interval_ms,
+    });
+    if (behind + window_margin_blocks >= proof_window_blocks) return error.WindowClosing;
+    assert(check.endpoint.deadline_ms > check.now_ms());
+}
+
 /// Where N stands in the window once the check is done (informational).
 fn final_window(check: *Check) void {
-    _ = check.scratch.reset(.retain_capacity);
-    const arena = check.scratch.allocator();
-    const tip_value = check.endpoint.call(arena, "eth_blockNumber", "[]") catch |err| {
+    const tip = read_tip(check) catch |err| {
         std.debug.print("window: tip unavailable at the end ({t})\n", .{err});
         return;
     };
-    const tip = if (tip_value == .string) compare.parse_u64(tip_value.string) catch 0 else 0;
     assert(check.head > 0 or tip >= 0);
     std.debug.print("window: done; block {d} was {d} blocks behind the tip at the start and " ++
         "{d} at the end (limit {d})\n", .{
@@ -613,7 +592,7 @@ fn collect_pool(check: *Check, pool: *sample.Pool, accounts_target: u32) !void {
     try collect_transactions(check, pool);
     var scanned: u64 = 0;
     while (scanned < logs_blocks_max and scanned <= check.head) : (scanned += logs_chunk_blocks) {
-        if (pool.addresses.count() >= 3 * @as(u64, accounts_target)) break;
+        if (pool.addresses.count() >= 2 * @as(u64, accounts_target)) break;
         const to = check.head - scanned;
         const from = to -| (logs_chunk_blocks - 1);
         try collect_logs(check, pool, from, to);
@@ -631,12 +610,12 @@ fn collect_pool(check: *Check, pool: *sample.Pool, accounts_target: u32) !void {
 
 fn collect_transactions(check: *Check, pool: *sample.Pool) !void {
     var offset: u64 = 0;
-    while (offset < transaction_blocks and offset <= check.head) : (offset += batch_max) {
+    while (offset < transaction_blocks and offset <= check.head) : (offset += calls_per_request) {
         _ = check.scratch.reset(.retain_capacity);
         const arena = check.scratch.allocator();
-        var params: [batch_max][]const u8 = undefined;
+        var params: [calls_per_request][]const u8 = undefined;
         var count: usize = 0;
-        while (count < batch_max and offset + count < transaction_blocks and
+        while (count < calls_per_request and offset + count < transaction_blocks and
             offset + count <= check.head) : (count += 1)
         {
             params[count] = try std.fmt.allocPrint(arena, "[\"0x{x}\",true]", .{
@@ -645,7 +624,7 @@ fn collect_transactions(check: *Check, pool: *sample.Pool) !void {
         }
         assert(count > 0);
         const method = "eth_getBlockByNumber";
-        const blocks = try check.endpoint.batch(arena, method, params[0..count], @intCast(count));
+        const blocks = try check.endpoint.batch(arena, method, params[0..count]);
         for (blocks) |block| try add_transactions(check, pool, block);
     }
 }
@@ -700,26 +679,28 @@ fn proof_param(arena: std.mem.Allocator, request: *const sample.Request, block: 
     return text.written();
 }
 
-/// Proves `requests` at N in batches and checks every account and slot they answer.
+/// Proves `requests` at N, `calls_per_request` at a time, and checks every account and slot
+/// they answer.
 fn prove(check: *Check, requests: []const sample.Request, first_phase: bool) !void {
     var start: usize = 0;
-    while (start < requests.len) : (start += batch_max) {
+    while (start < requests.len) {
+        try refresh_window(check);
         _ = check.scratch.reset(.retain_capacity);
         const arena = check.scratch.allocator();
-        const chunk = requests[start..@min(start + batch_max, requests.len)];
-        var params: [batch_max][]const u8 = undefined;
-        var units: u32 = 0;
+        const end = @min(start + calls_per_request, requests.len);
+        const chunk = requests[start..end];
+        var params: [calls_per_request][]const u8 = undefined;
         for (chunk, params[0..chunk.len]) |*request, *param| {
             param.* = try proof_param(arena, request, check.head);
-            units += 1 + @as(u32, @intCast(request.keys.len / keys_per_unit));
         }
-        const params_used = params[0..chunk.len];
-        const results = try check.endpoint.batch(arena, "eth_getProof", params_used, units);
+        const results = try check.endpoint.batch(arena, "eth_getProof", params[0..chunk.len]);
         assert(results.len == chunk.len);
         for (chunk, results) |*request, result| {
             try absorb(check, arena, request, result, first_phase);
         }
+        start = end;
     }
+    assert(start == requests.len);
 }
 
 /// Checks one `eth_getProof` answer: the account (the first time it is seen) and its slots.
@@ -804,52 +785,62 @@ fn contracts_of(check: *Check, accounts: []const Address) ![]sample.Contract {
     return list.items;
 }
 
-/// One `eth_getCode` at N per distinct code hash among the sampled accounts.
+/// Every distinct code of the sampled accounts is read from needlefish's code tables and must
+/// hash to the reference's code hash; the first `reference_codes_max` are also fetched with
+/// `eth_getCode` at N and compared byte for byte (through their hashes).
 fn check_codes(check: *Check) !void {
     const keep = check.keep.allocator();
     var seen: std.AutoHashMapUnmanaged(Hash, void) = .empty;
-    var pending: std.ArrayList(Address) = .empty;
+    var fetched: std.ArrayList(Address) = .empty;
     for (check.accounts.keys(), check.accounts.values()) |address, fields| {
         if (!fields.has_code()) continue;
         if ((try seen.getOrPut(keep, fields.code_hash)).found_existing) continue;
-        try pending.append(keep, address);
+        const local = check.db.state.code_by_hash(fields.code_hash);
+        _ = compare.compare_code(check.report, &address, &fields.code_hash, null, local);
+        check.codes += 1;
+        if (fetched.items.len < reference_codes_max) try fetched.append(keep, address);
     }
     var start: usize = 0;
-    while (start < pending.items.len) : (start += batch_max) {
+    while (start < fetched.items.len) : (start += calls_per_request) {
+        try refresh_window(check);
         _ = check.scratch.reset(.retain_capacity);
         const arena = check.scratch.allocator();
-        const chunk = pending.items[start..@min(start + batch_max, pending.items.len)];
-        var params: [batch_max][]const u8 = undefined;
+        const end = @min(start + calls_per_request, fetched.items.len);
+        const chunk = fetched.items[start..end];
+        var params: [calls_per_request][]const u8 = undefined;
         for (chunk, params[0..chunk.len]) |address, *param| {
             param.* = try std.fmt.allocPrint(arena, "[\"0x{x}\",\"0x{x}\"]", .{
                 address, check.head,
             });
         }
-        const units: u32 = @intCast(chunk.len);
-        const results = try check.endpoint.batch(arena, "eth_getCode", params[0..chunk.len], units);
+        const results = try check.endpoint.batch(arena, "eth_getCode", params[0..chunk.len]);
         for (chunk, results) |address, result| {
             if (result != .string) return error.MalformedResponse;
             const code = try compare.parse_data(arena, result.string);
             const code_hash = check.accounts.get(address).?.code_hash;
             const local = check.db.state.code_by_hash(code_hash);
             _ = compare.compare_code(check.report, &address, &code_hash, code, local);
-            check.codes += 1;
+            check.codes_fetched += 1;
         }
     }
-    assert(check.codes == pending.items.len);
+    assert(check.codes_fetched == fetched.items.len);
+    assert(check.codes == seen.count());
 }
 
 fn progress(check: *const Check, phase: []const u8) void {
     assert(phase.len > 0);
+    const endpoint = check.endpoint;
     std.debug.print("  {s}: {d} accounts, {d} nonzero and {d} zero slots, {d} mismatches, " ++
-        "{d} requests ({d} retried), {d:.0} s\n", .{
+        "{d} calls in {d} requests ({d} rate-limited), interval {d} ms, {d:.0} s\n", .{
         phase,
         check.accounts.count(),
         check.nonzero(),
         check.zero(),
         check.report.total,
-        check.endpoint.requests,
-        check.endpoint.retries,
+        endpoint.calls,
+        endpoint.requests,
+        endpoint.limited,
+        endpoint.pacer.interval_ms,
         check.elapsed_s(),
     });
 }
@@ -865,12 +856,23 @@ fn summary(check: *const Check) void {
     assert(present <= accounts);
     std.debug.print("summary: block {d}: {d} samples = {d} accounts ({d} present, {d} absent " ++
         "or empty) + {d} slots ({d} nonzero, {d}% of the samples; {d} zero); {d} codes " ++
-        "checked ({d} accounts with code); {d} mismatches; {d} requests ({d} retried), " ++
+        "checked ({d} also against eth_getCode; {d} accounts with code); {d} mismatches; " ++
         "{d:.0} s\n", .{
-        check.head,              samples,                accounts,            present,
-        accounts - present,      nonzero + zero,         nonzero,             share,
-        zero,                    check.codes,            check.code_accounts, check.report.total,
-        check.endpoint.requests, check.endpoint.retries, check.elapsed_s(),
+        check.head,         samples,           accounts,            present,
+        accounts - present, nonzero + zero,    nonzero,             share,
+        zero,               check.codes,       check.codes_fetched, check.code_accounts,
+        check.report.total, check.elapsed_s(),
+    });
+    const endpoint = check.endpoint;
+    std.debug.print("summary: {s}: {d} calls in {d} requests, {d} rate-limited, {d} failed, " ++
+        "{d} s waiting, final interval {d} ms\n", .{
+        endpoint.http.url,
+        endpoint.calls,
+        endpoint.requests,
+        endpoint.limited,
+        endpoint.failures,
+        endpoint.waited_ms / 1000,
+        endpoint.pacer.interval_ms,
     });
     std.debug.print("summary: slots by source:", .{});
     for (sample.kinds, check.slots) |kind, counts| {
@@ -882,6 +884,7 @@ fn summary(check: *const Check) void {
 test {
     _ = compare;
     _ = sample;
+    _ = rpc;
 }
 
 test "state-check: flags" {
@@ -891,14 +894,19 @@ test "state-check: flags" {
     try std.testing.expectEqualStrings("base-sepolia", defaults.chain.name);
     try std.testing.expectEqual(@as(u32, 10_000), defaults.samples);
     try std.testing.expectEqual(@as(u64, 1), defaults.seed);
+    try std.testing.expectEqual(@as(u32, 50), defaults.accounts);
+    try std.testing.expectEqual(@as(u32, 6_000), defaults.interval_ms);
     try std.testing.expect(defaults.rpc == null);
     const set = try parse(&.{
-        "--chain",   "base-mainnet", "--db",   "y",  "--rpc", "http://127.0.0.1:8545",
-        "--samples", "500",          "--seed", "42",
+        "--chain",       "base-mainnet", "--db",   "y",  "--rpc",      "http://127.0.0.1:8545",
+        "--samples",     "500",          "--seed", "42", "--accounts", "50",
+        "--interval-ms", "800",
     });
     try std.testing.expectEqualStrings("base-mainnet", set.chain.name);
     try std.testing.expectEqual(@as(u32, 500), set.samples);
     try std.testing.expectEqual(@as(u64, 42), set.seed);
+    try std.testing.expectEqual(@as(u32, 50), set.accounts);
+    try std.testing.expectEqual(@as(u32, 800), set.interval_ms);
     const rejected = [_][]const []const u8{
         &.{"--db"},
         &.{ "--db", "" },
@@ -909,59 +917,26 @@ test "state-check: flags" {
         &.{ "--db", "x", "--samples", "many" },
         &.{ "--db", "x", "--seed", "-1" },
         &.{ "--db", "x", "--blocks", "1" },
+        &.{ "--db", "x", "--accounts", "0" },
+        &.{ "--db", "x", "--samples", "100", "--accounts", "51" },
+        &.{ "--db", "x", "--interval-ms", "100" },
+        &.{ "--db", "x", "--interval-ms", "60001" },
     };
     for (rejected) |args| try std.testing.expectError(error.InvalidArguments, parse(args));
 }
 
-test "state-check: answers are ok, retried, or out of the window" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var results: [2]json.Value = undefined;
-    const ok = try json.parseFromSliceLeaky(json.Value, arena,
-        \\[{"id":1,"result":"0x2"},{"id":0,"result":null}]
-    , .{});
-    try std.testing.expect(classify(ok, &results) == .ok);
-    try std.testing.expectEqualStrings("0x2", results[1].string);
-    try std.testing.expect(results[0] == .null);
-    const retried = [_][]const u8{
-        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32011,"message":"request limit reached"}}
-        ,
-        \\[{"id":0,"result":1},{"id":1,"error":{"code":429}}]
-        ,
-        \\[{"id":0,"result":1},{"id":0,"result":1}]
-        ,
-        \\[{"id":0,"result":1}]
-        ,
-        \\7
-        ,
-    };
-    for (retried) |text| {
-        const value = try json.parseFromSliceLeaky(json.Value, arena, text, .{});
-        try std.testing.expect(classify(value, &results) == .retry);
-    }
-    const out = [_][]const u8{
-        \\{"id":1,"error":{"code":-32614,"message":"eth_getProof is limited to a 10,000 range"}}
-        ,
-        \\[{"id":0,"result":1},{"id":1,"error":{"code":-32000,"message":"missing trie node 4f2a"}}]
-        ,
-        \\[{"id":0,"error":{"message":"request limit reached"}},{"id":1,"error":{"message":"Pruned"}}]
-        ,
-    };
-    for (out) |text| {
-        const value = try json.parseFromSliceLeaky(json.Value, arena, text, .{});
-        try std.testing.expect(classify(value, &results) == .out_of_window);
-    }
-}
-
 test "state-check: the window guard" {
-    // 10,000 samples: about 9 minutes of paced requests, well inside the 33-minute window.
-    const run_ms = estimate_ms(2_000, 8_000);
-    try std.testing.expect(run_ms > 5 * 60_000 and run_ms < 12 * 60_000);
-    try std.testing.expect(window_holds(0, run_ms));
-    try std.testing.expect(window_holds(5_000, run_ms));
-    try std.testing.expect(!window_holds(7_000, run_ms));
-    try std.testing.expect(!window_holds(proof_window_blocks, 0));
-    try std.testing.expect(window_holds(proof_window_blocks - 1, 0));
-    try std.testing.expect(!window_holds(0, 5 * 60 * 60_000));
+    // 10,000 samples, 50 accounts: ~85 calls, ~17 minutes at the guard's 12 s a call.
+    const calls = calls_estimate(50, 9_950);
+    try std.testing.expect(calls > 50 and calls < 100);
+    try std.testing.expect(window_holds(649, calls, guard_interval_ms));
+    try std.testing.expect(window_holds(4_000, calls, guard_interval_ms));
+    try std.testing.expect(!window_holds(6_000, calls, guard_interval_ms));
+    try std.testing.expect(!window_holds(proof_window_blocks, 1, 0));
+    try std.testing.expect(window_holds(proof_window_blocks - window_margin_blocks - 1, 1, 0));
+    try std.testing.expect(!window_holds(0, 2_000, guard_interval_ms));
+    // The deadline: the blocks left, at 200 ms a block, before the margin.
+    const left_ms = (proof_window_blocks - 649 - window_margin_blocks) * block_time_ms;
+    try std.testing.expectEqual(@as(i64, 1_000 + left_ms), deadline_of(1_000, 649));
+    try std.testing.expectEqual(@as(i64, 7), deadline_of(7, proof_window_blocks));
 }
