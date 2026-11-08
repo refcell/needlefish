@@ -15,6 +15,7 @@ const http = @import("../../utilities/http/root.zig");
 const http_client = @import("../../utilities/http/client.zig");
 const jwt = @import("../../utilities/jwt/root.zig");
 const log = @import("../../utilities/log/root.zig");
+const chains = @import("../../common/chains/root.zig");
 const protocol = @import("../protocol/root.zig");
 const rollup_rpc = @import("../rpc/rollup.zig");
 const admin_rpc = @import("../rpc/admin.zig");
@@ -316,7 +317,9 @@ pub fn Node(comptime IO: type) type {
         kzg_workspace: ?*kzg.blob.Workspace = null,
         engine: Engine,
         polling: Polling,
+        /// The L1's blob base fee schedule (L1 info deposits); Cancun's for an unknown L1.
         blob_schedule: L1BlobSchedule = .{},
+        blob_bpo: [2]L1BlobSchedule.Entry = undefined,
         driver: driver_module.Driver,
         rpc_server: RpcServer,
         backend: rollup_rpc.Backend,
@@ -420,17 +423,13 @@ pub fn Node(comptime IO: type) type {
                 .gossip_arena = .init(allocator),
             };
             errdefer node.safe_db.deinit(allocator);
+            node.init_blob_schedule();
             try node.init_sources();
             errdefer node.deinit_sources();
             var driver_options = options.driver;
             driver_options.follow = options.follow_source != null;
-            try node.driver.init(
-                allocator,
-                rollup,
-                &node.blob_schedule,
-                &node.safe_db,
-                driver_options,
-            );
+            const blob_schedule = &node.blob_schedule;
+            try node.driver.init(allocator, rollup, blob_schedule, &node.safe_db, driver_options);
             errdefer node.driver.deinit();
             try node.rpc_server.init(allocator, io, node, options.rpc_server);
             errdefer node.rpc_server.deinit();
@@ -451,6 +450,19 @@ pub fn Node(comptime IO: type) type {
             if (options.ws_address != null) try node.init_ws_rpc();
             errdefer node.deinit_ws_rpc();
             if (options.p2p) |p2p| try node.init_p2p(&p2p);
+        }
+
+        /// The L1's blob schedule prices L1 info deposits; an unknown L1 keeps Cancun's.
+        fn init_blob_schedule(node: *Self) void {
+            const l1_chain_id = node.rollup.l1_chain_id;
+            const l1 = chains.l1_by_chain_id(l1_chain_id) orelse {
+                node.logger.log(.warn, "consensus", "unknown L1: Cancun blob schedule", .{
+                    .l1_chain_id = l1_chain_id,
+                });
+                return;
+            };
+            node.blob_schedule = .of_l1(l1, &node.blob_bpo);
+            assert(node.blob_schedule.bpo.len <= node.blob_bpo.len);
         }
 
         fn init_ws_rpc(node: *Self) !void {
@@ -1350,7 +1362,7 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     var harness: Harness = undefined;
     try harness.init_connections(&fake, 0x4e, 6);
     defer harness.deinit();
-    var rollup: RollupConfig = .{ .block_time = 2 };
+    var rollup: RollupConfig = .{ .block_time = 2, .l1_chain_id = chains.l1_sepolia.chain_id };
     rollup.upgrades.set(.holocene, 0);
     var log_buffer: [4096]u8 = undefined;
     var memory: log.MemorySink = .{ .buffer = &log_buffer };
@@ -1370,6 +1382,12 @@ test "node: runs the driver, tracks L1 heads, and serves optimism_syncStatus" {
     defer node.deinit();
     node.checkpoints.?.start(); // `start` would also bind the RPC port.
     node.safedb_store.?.start();
+    // L1 info deposits price blobs with the L1's own schedule (Sepolia: through BPO2).
+    const after_bpo2 = chains.l1_sepolia.bpo2.? + 1;
+    try testing.expectEqual(
+        protocol.l1_info.L1BlobSchedule.bpo2_update_fraction,
+        node.blob_schedule.update_fraction(&rollup, after_bpo2),
+    );
     for (0..40) |_| {
         node.tick();
         harness.world.run_for_ns(std.time.ns_per_s / 10);

@@ -15,6 +15,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const primitives = @import("../../common/primitives/root.zig");
+const chains = @import("../../common/chains/root.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
 const rollup_config = @import("rollup_config.zig");
@@ -206,6 +207,24 @@ pub const L1BlobSchedule = struct {
     pub const Entry = struct { timestamp: u64, update_fraction: u64 };
     pub const cancun_update_fraction: u64 = 3_338_477;
     pub const prague_update_fraction: u64 = 5_007_716;
+    pub const bpo1_update_fraction: u64 = 8_346_193;
+    pub const bpo2_update_fraction: u64 = 11_684_671;
+
+    /// The schedule of a built-in L1 (its Prague, Osaka and BPO forks); the result borrows
+    /// `bpo` for its blob-parameter-only entries.
+    pub fn of_l1(config: *const chains.L1Config, bpo: *[2]Entry) L1BlobSchedule {
+        var count: usize = 0;
+        if (config.bpo1) |timestamp| {
+            bpo[count] = .{ .timestamp = timestamp, .update_fraction = bpo1_update_fraction };
+            count += 1;
+        }
+        if (config.bpo2) |timestamp| {
+            bpo[count] = .{ .timestamp = timestamp, .update_fraction = bpo2_update_fraction };
+            count += 1;
+        }
+        assert(count < 2 or bpo[0].timestamp <= bpo[1].timestamp);
+        return .{ .prague_time = config.prague, .osaka_time = config.osaka, .bpo = bpo[0..count] };
+    }
 
     pub fn update_fraction(
         schedule: *const L1BlobSchedule,
@@ -342,6 +361,27 @@ fn expect_roundtrip(raw: []const u8) !L1BlockInfo {
     var buffer: [calldata_length_max]u8 = undefined;
     try testing.expectEqualSlices(u8, raw, info.encode_calldata(&buffer));
     return info;
+}
+
+test "l1 info: built-in L1 blob schedules" {
+    var bpo: [2]L1BlobSchedule.Entry = undefined;
+    const sepolia = &chains.l1_sepolia;
+    const schedule = L1BlobSchedule.of_l1(sepolia, &bpo);
+    const rollup: RollupConfig = .{};
+    const S = L1BlobSchedule;
+    const cases = [_]struct { time: u64, fraction: u64 }{
+        .{ .time = sepolia.prague.? - 1, .fraction = S.cancun_update_fraction },
+        .{ .time = sepolia.osaka.?, .fraction = S.prague_update_fraction },
+        .{ .time = sepolia.bpo1.?, .fraction = S.bpo1_update_fraction },
+        .{ .time = sepolia.bpo2.? - 1, .fraction = S.bpo1_update_fraction },
+        .{ .time = sepolia.bpo2.?, .fraction = S.bpo2_update_fraction },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.fraction, schedule.update_fraction(&rollup, case.time));
+    }
+    // The default (an unknown L1) stays on Cancun's.
+    const empty: L1BlobSchedule = .{};
+    try std.testing.expectEqual(S.cancun_update_fraction, empty.update_fraction(&rollup, 1 << 40));
 }
 
 test "l1 info: bedrock roundtrip (base/base vector)" {

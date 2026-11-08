@@ -158,16 +158,7 @@ pub fn blob_schedule_of(
     config: *const chains.L1Config,
     bpo: *[2]L1BlobSchedule.Entry,
 ) L1BlobSchedule {
-    var count: usize = 0;
-    if (config.bpo1) |timestamp| {
-        bpo[count] = .{ .timestamp = timestamp, .update_fraction = 8_346_193 };
-        count += 1;
-    }
-    if (config.bpo2) |timestamp| {
-        bpo[count] = .{ .timestamp = timestamp, .update_fraction = 11_684_671 };
-        count += 1;
-    }
-    return .{ .prague_time = config.prague, .osaka_time = config.osaka, .bpo = bpo[0..count] };
+    return .of_l1(config, bpo);
 }
 
 pub const Client = struct {
