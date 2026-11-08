@@ -735,15 +735,24 @@ const LargeAllocations = struct {
 // hash maps (`std` fills them) and the buffers init writes.
 test "to_disk: node sizing reserves its buffers without making them resident" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // 1/1000 of Base Sepolia's counts: the storage this test reserves is the whole file, one
+    // mapping, and heuristic overcommit refuses one larger than a small host's RAM. The node's
+    // code growth (8 GiB of arena) is reduced for the same reason; laziness does not depend on
+    // either size, and the buffers sized from the shape alone (the 4 GiB block cache) stay.
     const counts: to_disk.Counts = .{
-        .accounts = 376_124,
-        .slots = 37_205_919,
-        .codes = 47_655,
-        .code_bytes = 231_711_118,
+        .accounts = 37_612,
+        .slots = 3_720_592,
+        .codes = 4_766,
+        .code_bytes = 23_171_112,
     };
-    const sizing = try to_disk.sizing(SimStorage, counts, to_disk.shape_node);
+    var shape = to_disk.shape_node;
+    shape.code_bytes_growth = 256 << 20;
+    shape.codes_growth = 1 << 16;
+    const sizing = try to_disk.sizing(SimStorage, counts, shape);
     // `Database.init` only checks the storage's size; nothing reads or writes it.
-    const disk = try lazy.alloc(testing.allocator, u8, sizing.config.engine.size_bytes());
+    // A host that refuses the reservation outright (overcommit) cannot run this check.
+    const disk = lazy.alloc(testing.allocator, u8, sizing.config.engine.size_bytes()) catch
+        return error.SkipZigTest;
     defer lazy.free(testing.allocator, disk);
     var sim: SimStorage = undefined;
     sim.durable = disk;
