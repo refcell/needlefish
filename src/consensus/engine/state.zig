@@ -6,6 +6,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const protocol = @import("../protocol/root.zig");
+const attributes_match = @import("attributes_match.zig");
 
 const L2BlockInfo = protocol.block.L2BlockInfo;
 const Hash = protocol.block.Hash;
@@ -66,6 +67,11 @@ pub const EngineState = struct {
     sync_state: SyncState = .{},
     /// Whether execution-layer sync has finished (the engine accepted a valid head).
     el_sync_finished: bool = false,
+    /// Consolidations whose derived attributes did not match the engine's block, and the
+    /// latest one (for logs: base/base warns with the mismatch before building).
+    mismatches: u64 = 0,
+    mismatch_last: ?attributes_match.Mismatch = null,
+    mismatch_last_number: u64 = 0,
 };
 
 const testing = std.testing;

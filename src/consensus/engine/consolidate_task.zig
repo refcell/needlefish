@@ -104,6 +104,9 @@ pub const ConsolidateTask = struct {
             &block,
         );
         if (mismatch != null) {
+            engine_state.mismatches += 1;
+            engine_state.mismatch_last = mismatch;
+            engine_state.mismatch_last_number = number;
             consolidate.phase = .build;
             return false;
         }

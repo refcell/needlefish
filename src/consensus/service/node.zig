@@ -325,6 +325,8 @@ pub fn Node(comptime IO: type) type {
         logged_safe_number: u64 = 0,
         logged_unsafe_number: u64 = 0,
         logged_error: ?anyerror = null,
+        /// The block number of the last logged attributes mismatch (0: none yet).
+        logged_mismatch_number: u64 = 0,
         status_logged_ns: u64 = 0,
         network: ?*Network = null,
         p2p_random: std.Random.DefaultPrng = .init(0),
@@ -1069,8 +1071,28 @@ pub fn Node(comptime IO: type) type {
             });
         }
 
+        /// Warns with the first mismatch at each block whose derived attributes differ from
+        /// the engine's block (consolidation then builds; retries are not logged again).
+        fn log_mismatch(node: *Self) void {
+            const engine_state = &node.driver.queue.state;
+            const mismatch = engine_state.mismatch_last orelse return;
+            const number = engine_state.mismatch_last_number;
+            if (number == node.logged_mismatch_number) return;
+            node.logged_mismatch_number = number;
+            var buffer: [2048]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buffer, "{any}", .{mismatch}) catch "(truncated)";
+            node.logger.log(.warn, "consensus", "attributes mismatch", .{
+                .number = number,
+                .kind = @tagName(mismatch),
+                .count = engine_state.mismatches,
+                .detail = detail,
+            });
+            assert(node.logged_mismatch_number == number);
+        }
+
         fn log_progress(node: *Self) void {
             node.log_waiting();
+            node.log_mismatch();
             const state = node.driver.sync_state();
             // Unwraps before comparing: the debug backend miscompiles `!=` between two
             // `?anyerror` (docs/TIGER_STYLE.md): two nulls compared unequal (a "cleared" error).

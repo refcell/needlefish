@@ -597,6 +597,7 @@ test "consolidate: matching block advances the safe head" {
     try testing.expect(step_until_done(&queue, &mock) == .completed);
     try testing.expect(queue.state.sync_state.safe_head.eql(info(6)));
     try testing.expectEqual(@as(u32, 0), mock.forkchoice_calls);
+    try testing.expectEqual(@as(u64, 0), queue.state.mismatches);
 
     const last = chain.fixtures[7].attributes(info(6));
     try queue.enqueue(.{ .consolidate = &last });
@@ -626,6 +627,9 @@ test "consolidate: mismatch builds and seals the derived block as safe" {
     try testing.expectEqual(@as(u32, 1), mock.build_calls);
     try testing.expect(queue.state.sync_state.unsafe_head.eql(replaced_info));
     try testing.expect(queue.state.sync_state.safe_head.eql(replaced_info));
+    try testing.expectEqual(@as(u64, 1), queue.state.mismatches);
+    try testing.expectEqual(@as(u64, 6), queue.state.mismatch_last_number);
+    try testing.expect(queue.state.mismatch_last != null);
 }
 
 test "consolidate: trailing bytes in an attribute transaction force a rebuild" {
