@@ -433,6 +433,8 @@ fn get_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
             .index = location.index,
             .base_fee = record.header.base_fee_per_gas,
             .timestamp_ms = format.timestamp_ms(record),
+            .timestamp = record.header.timestamp,
+            .deposit = format.deposit_receipt(record, location.index),
         }, recoverer);
     }
     const pool = api.pool orelse return call.writer.null_value();
@@ -948,6 +950,7 @@ pub fn block_logs(
             .index = index,
             .base_fee = null,
             .timestamp_ms = block_ms,
+            .timestamp = record.header.timestamp,
         };
         const tx_hash = primitives.keccak256(raw).bytes;
         var it = value.logs.iterator();

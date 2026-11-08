@@ -26,7 +26,28 @@ pub const Inclusion = struct {
     base_fee: ?u64,
     /// Denim: the block's millisecond timestamp (`blockTimestampMs`), when known.
     timestamp_ms: ?u64 = null,
+    /// The block's timestamp (`blockTimestamp` of transactions and logs), when known.
+    timestamp: ?u64 = null,
+    /// A deposit's receipt fields its transaction object repeats (`nonce`,
+    /// `depositReceiptVersion`), when known.
+    deposit: ?DepositReceipt = null,
 };
+
+pub const DepositReceipt = struct { nonce: ?u64, version: ?u64 };
+
+/// The deposit fields of the receipt at `index` of a stored block; null for other types.
+pub fn deposit_receipt(record: node.chain.Record, index: u32) ?DepositReceipt {
+    var receipts = record.receipts;
+    var position: u32 = 0;
+    while (!receipts.is_empty()) : (position += 1) {
+        const encoded = receipts.bytes() catch unreachable; // Stored by the chain.
+        if (position < index) continue;
+        const value = consensus.Receipt.decode(encoded) catch unreachable;
+        if (value.tx_type != .deposit) return null;
+        return .{ .nonce = value.deposit_nonce, .version = value.deposit_receipt_version };
+    }
+    return null;
+}
 
 /// Denim: a block's timestamp in milliseconds from its BaseTime deposit (index 1), as
 /// base/base's RPC reports it; null for pre-Denim blocks (no valid deposit there).
@@ -97,20 +118,30 @@ pub fn block(
     try w.key("transactions");
     try w.begin_array();
     var transactions = record.transactions;
+    var receipts = record.receipts;
     var index: u32 = 0;
     while (!transactions.is_empty()) : (index += 1) {
         const raw = transactions.bytes() catch unreachable; // Stored by the chain.
+        const encoded = if (receipts.is_empty()) null else receipts.bytes() catch unreachable;
         if (!full) {
             try w.data(&primitives.keccak256(raw).bytes);
             continue;
         }
-        const inclusion: Inclusion = .{
+        var inclusion: Inclusion = .{
             .block_hash = hash,
             .block_number = record.header.number,
             .index = index,
             .base_fee = record.header.base_fee_per_gas,
             .timestamp_ms = block_ms,
+            .timestamp = record.header.timestamp,
         };
+        if (encoded) |bytes| {
+            const value = consensus.Receipt.decode(bytes) catch unreachable; // Stored.
+            if (value.tx_type == .deposit) inclusion.deposit = .{
+                .nonce = value.deposit_nonce,
+                .version = value.deposit_receipt_version,
+            };
+        }
         try transaction(w, raw, inclusion, recoverer);
     }
     try w.end_array();
@@ -151,28 +182,41 @@ pub fn transaction(
         try w.key("to");
         try w.null_value();
     }
-    // Deposits have no nonce field; their receipt carries the deposit nonce.
-    if (envelope.nonce()) |nonce| try field_quantity(w, "nonce", nonce);
+    // Deposits have no nonce field: like op-reth, the object shows their receipt's.
+    const deposit_receipt_fields = if (inclusion) |at| at.deposit else null;
+    if (envelope.nonce()) |nonce| {
+        try field_quantity(w, "nonce", nonce);
+    } else if (deposit_receipt_fields) |fields| if (fields.nonce) |nonce| {
+        try field_quantity(w, "nonce", nonce);
+    };
     try field_quantity(w, "gas", envelope.gas_limit());
     try field_quantity(w, "value", envelope.value());
     try field_data(w, "input", envelope.input());
     if (envelope.chain_id()) |id| try field_quantity(w, "chainId", id);
     try fee_fields(w, envelope, inclusion);
     try inclusion_fields(w, inclusion);
+    if (inclusion) |at| if (at.timestamp) |time| try field_quantity(w, "blockTimestamp", time);
     if (inclusion) |at| if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
     try signature_fields(w, envelope);
-    if (envelope == .deposit) try deposit_fields(w, envelope.deposit);
+    if (envelope == .deposit) {
+        try deposit_fields(w, envelope.deposit);
+        if (deposit_receipt_fields) |fields| if (fields.version) |version| {
+            try field_quantity(w, "depositReceiptVersion", version);
+        };
+    }
     try w.end_object();
 }
 
-/// OP deposit fields (op-geth `RPCTransaction`): source hash, mint, system flag, and
-/// the zero signature values tooling expects on every transaction.
+/// OP deposit fields as op-reth (base/base) writes them: source hash, mint, the system flag
+/// only when set, and the zero signature values tooling expects on every transaction.
 fn deposit_fields(w: *Writer, deposit: consensus.Deposit) WriteError!void {
     try field_data(w, "sourceHash", &deposit.source_hash.bytes);
     try field_quantity(w, "mint", deposit.mint);
-    try w.key("isSystemTx");
-    try w.boolean(deposit.is_system_transaction);
-    inline for (.{ "v", "r", "s" }) |name| try field_quantity(w, name, @as(u8, 0));
+    if (deposit.is_system_transaction) {
+        try w.key("isSystemTx");
+        try w.boolean(true);
+    }
+    inline for (.{ "v", "r", "s", "yParity" }) |name| try field_quantity(w, name, @as(u8, 0));
 }
 
 fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!void {
@@ -320,6 +364,7 @@ pub fn log(
     try field_data(w, "transactionHash", &tx_hash);
     try field_quantity(w, "transactionIndex", at.index);
     try field_quantity(w, "logIndex", log_index);
+    if (at.timestamp) |time| try field_quantity(w, "blockTimestamp", time);
     if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
     try w.key("removed");
     try w.boolean(false);
@@ -366,6 +411,7 @@ pub fn receipt_context(
             .block_number = header.number,
             .index = index,
             .base_fee = base_fee,
+            .timestamp = header.timestamp,
         },
         .tx_hash = primitives.keccak256(raw).bytes,
         .from = sender,
@@ -464,7 +510,8 @@ test "format: deposit transaction and receipt carry the OP fields" {
     try json.validate(text);
     try testing.expect(std.mem.indexOf(u8, text, "\"type\":\"0x7e\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"mint\":\"0x7\"") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"isSystemTx\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "isSystemTx") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"yParity\":\"0x0\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"from\":\"0xdede") != null);
     try testing.expect(std.mem.indexOf(u8, text, "sourceHash") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"nonce\"") == null);
