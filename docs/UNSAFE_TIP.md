@@ -194,6 +194,27 @@ the followed chain) or the snapshot hash at the bottom of the range. Checked off
 55319105) match the blocks the execution peer serves at those heights (the run logged
 64-bit hash prefixes; compared with `el-fetch --verbose`).
 
+### Acceptance run (2026-11-08): met
+
+One `base el-run --peers` process, devp2p only (no RPC), on the disk database imported
+from the 55006660 snapshot, started at head 55006985:
+
+- Catch-up: the pool (13 usable peers) delivered 988,416 blocks; execution averaged about
+  95 blocks/s early and 78 blocks/s overall, against the chain's 5 blocks/s. The feed
+  switched to following the tip once (at 55995402, on a lent pool connection) and reached
+  the tip at 55995774, about 2.9 h after the start.
+- At the tip: 11,657 consecutive executed blocks (55995774 to 56007430) over 38.9 min,
+  every one committed with all header checks equal (state root, receipts root, bloom, gas,
+  transactions root, withdrawals root, resealed hash). Tip lag (commit time minus the
+  block's scheduled time): average 59 ms, median 54 ms, p90 105 ms, p99 295 ms, max
+  680 ms; no block over 1 s. Execution per block: average 6.1 ms, median 4 ms, p99 22 ms.
+- Whole run: 1,000,445 consecutive executed blocks (55006986 to 56007430), 0 gaps, 0
+  mismatches, 0 refusals, no restart or re-anchor. Execution headers are unsigned, so the
+  trust anchor is the snapshot block: every block is parent-linked back to it and every
+  state root was recomputed locally.
+- Per-block phases (ms) over the run: transactions 1.75, commit 3.06, prefetch 1.09,
+  room (checkpoint and compaction waits) 4.31, everything else under 0.1.
+
 ## Integration contract (to the executor)
 
 The p2p side hands the executor, in block-number order, payloads that are signed,
