@@ -566,7 +566,10 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   "nfsize02" names it, `to_disk.node_shape`; "nfsize01" files keep v1 byte for byte): 8
   MiB entries (a 160M gas block's densest changeset is ~4.6 MB), 65,536 branch-record
   writes per block with the smallest replay reserve the database accepts (9x, one largest
-  head move), 8,192 codes per block. The branch memtables grow 418k -> 1.19M entries (1.3
+  head move), 8,192 codes per block, and code flushes of 4 MiB at least (v1's 64 KiB
+  flushed about every checkpoint on mainnet, filling the table list and rewriting every
+  code every few days; 4 MiB leaves GiBs of new code between rewrites, the rest riding in
+  the image). The branch memtables grow 418k -> 1.19M entries (1.3
   GiB each, four of them, lazy) and the checkpoint image's maximum with them: staging 3.3
   -> 6.1 GiB at 2.6x Sepolia's counts, past u32, so `checkpoint_staging_bytes` and the
   staging cursors are u64 (the engine already records u64 image sizes; v1's values do
@@ -1698,7 +1701,7 @@ Owns `src/execution/{trie,db}`. Reference: reth trie/db, base/base `crates/execu
   does not); both shapes initialize; v2 at 2.6x imports, checkpoints and reopens on a real
   file (ReleaseSafe VmHWM 3.46 GB, 2.40 GB reopened). Mutations caught: v1 record sized as
   v2, "nfsize01" decoded as v2, v2 encoded as "nfsize01", v2 with v1's record writes, v2
-  with v1's entry size.
+  with v1's entry size, v2 with v1's 64 KiB code flushes.
 - 2026-11-08: import codes out of RAM (see Decisions). ReleaseSafe import on a scratch file
   at Base Sepolia sizing with 3 GiB of synthetic codes: VmHWM 4.60 GB -> 2.52 GB (init 1.41
   GB + one 1 GiB batch); at 2.6x and 4x the counts with 1.2 GiB of codes: 3.42 and 5.08 GB.

@@ -237,9 +237,13 @@ const node_v2_record_writes_max: u32 = 1 << 16;
 /// 65,536 branch-record writes per block, with the smallest replay reserve the database
 /// accepts (one largest head move). Bounds that are not part of the format (the
 /// changeset's accounts and slots, sparse nodes, memo) can grow in any later binary.
+/// New codes are flushed into tables 4 MiB at a time (v1: 64 KiB, about every checkpoint
+/// on mainnet, so the table list filled and every code was rewritten every few days); the
+/// rest ride in the checkpoint image (its staging reserves five flushes' worth).
 pub const shape_node_v2: Shape = blk: {
     var shape = shape_node_v1;
     shape.entry_body_size_max = 8 << 20;
+    shape.code_flush_bytes_min = 4 << 20;
     // 160M gas creates at most 5,000 codes (32,000 gas each).
     shape.changeset.codes_max = 1 << 13;
     const move_blocks_max = 2 * @as(u32, shape.chain.reorg_depth_max) + 1;

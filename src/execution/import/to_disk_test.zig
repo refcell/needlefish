@@ -1188,6 +1188,15 @@ test "to_disk: new imports take shape v2; its per-block bounds hold a 160M gas b
     const writes: u64 = 40_000_000 / 4_000 * 4;
     try testing.expect(writes <= config.disk_state.?.record_writes_max);
     try testing.expect(writes > v1.disk_state.?.record_writes_max);
+    // Flushes write at least 4 MiB of new code, so the tables a rewrite leaves free hold
+    // GiBs of new code before the next rewrite (v1: 64 KiB per flush, ~100 MiB).
+    const tables_free = config.code_tables_max - Database.CodeStore.tables_needed(
+        config.engine.checkpoint_block_size,
+        config.state.codes_max,
+        config.state.code_bytes_max,
+    );
+    try testing.expect(@as(u64, tables_free) * config.code_flush_bytes_min >= 4 << 30);
+    try testing.expect(@as(u64, tables_free) * v1.code_flush_bytes_min < 1 << 30);
     // The journal holds several of the largest entries; the chain ring a reorg's blocks.
     try testing.expect(config.engine.journal_size_bytes >= 4 * config.engine.entry_body_size_max);
     try testing.expect(config.chain_bytes_capacity() >=
