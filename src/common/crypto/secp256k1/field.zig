@@ -7,6 +7,7 @@
 //! All operations are branch-free so they also serve the constant-time signing path.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const ct = @import("../ct.zig");
 
@@ -19,6 +20,8 @@ const fold: u64 = 0x1000003D1;
 comptime {
     assert(@as(u257, p_int) + fold == @as(u257, 1) << 256);
     assert(p_int % 4 == 3); // sqrt is a single exponentiation.
+    // Limbs are bit-cast to and from whole u256 words.
+    assert(builtin.cpu.arch.endian() == .little);
 }
 
 pub const Fe = struct {
@@ -104,48 +107,30 @@ pub const Fe = struct {
         return fe.normalize().limbs[0] & 1 == 1;
     }
 
+    inline fn word(fe: Fe) u256 {
+        return @bitCast(fe.limbs);
+    }
+
+    inline fn from_word(value: u256) Fe {
+        return .{ .limbs = @bitCast(value) };
+    }
+
     /// Adds `top * 2^256` (top < 2^35) into a 256-bit value via 2^256 = fold (mod p).
-    inline fn fold_top(limbs: [4]u64, top: u64) Fe {
+    inline fn fold_top(value: u256, top: u64) Fe {
         assert(top < (1 << 35));
-        var result: Fe = undefined;
-        var accumulator: u128 = @as(u128, limbs[0]) + @as(u128, top) * fold;
-        result.limbs[0] = @truncate(accumulator);
-        inline for (1..4) |index| {
-            accumulator = (accumulator >> 64) + limbs[index];
-            result.limbs[index] = @truncate(accumulator);
-        }
-        // On a second overflow the wrapped value is below 2^70, so the extra fold
-        // reaches at most limb 1 and cannot carry further.
-        const overflow: u64 = @truncate(accumulator >> 64);
-        accumulator = @as(u128, result.limbs[0]) + overflow * fold;
-        result.limbs[0] = @truncate(accumulator);
-        result.limbs[1] +%= @truncate(accumulator >> 64);
-        return result;
+        // top * fold < 2^69; a carry out of 2^256 leaves a value below 2^69, so the
+        // second fold cannot carry again.
+        const folded = @addWithOverflow(value, @as(u256, top) * fold);
+        return from_word(folded[0] +% @as(u256, folded[1]) * fold);
     }
 
     pub fn add(a: Fe, b: Fe) Fe {
-        var limbs: [4]u64 = undefined;
-        var carry: u1 = 0;
-        inline for (0..4) |index| {
-            const step = @addWithOverflow(a.limbs[index], b.limbs[index]);
-            const step_carry = @addWithOverflow(step[0], carry);
-            limbs[index] = step_carry[0];
-            carry = step[1] | step_carry[1];
-        }
         // A carry is worth 2^256 = fold (mod p).
-        var second: u1 = 0;
-        const correction = fold & (0 -% @as(u64, carry));
-        inline for (0..4) |index| {
-            const addend = if (index == 0) correction else 0;
-            const step = @addWithOverflow(limbs[index], addend);
-            const step_carry = @addWithOverflow(step[0], second);
-            limbs[index] = step_carry[0];
-            second = step[1] | step_carry[1];
-        }
-        // A second carry leaves a value below fold, so limb 0 absorbs it.
-        assert(second == 0 or carry == 1);
-        limbs[0] +%= fold & (0 -% @as(u64, second));
-        return .{ .limbs = limbs };
+        const sum = @addWithOverflow(a.word(), b.word());
+        const folded = @addWithOverflow(sum[0], @as(u256, sum[1]) * fold);
+        // A second carry leaves a value below fold, so adding fold cannot carry again.
+        assert(folded[1] == 0 or sum[1] == 1);
+        return from_word(folded[0] +% @as(u256, folded[1]) * fold);
     }
 
     pub fn dbl(a: Fe) Fe {
@@ -153,50 +138,20 @@ pub const Fe = struct {
     }
 
     pub fn sub(a: Fe, b: Fe) Fe {
-        var limbs: [4]u64 = undefined;
-        var borrow: u1 = 0;
-        inline for (0..4) |index| {
-            const step = @subWithOverflow(a.limbs[index], b.limbs[index]);
-            const step_borrow = @subWithOverflow(step[0], borrow);
-            limbs[index] = step_borrow[0];
-            borrow = step[1] | step_borrow[1];
-        }
         // A borrow wrapped by +2^256; adding p instead means subtracting fold.
-        var second: u1 = 0;
-        const correction = fold & (0 -% @as(u64, borrow));
-        inline for (0..4) |index| {
-            const subtrahend = if (index == 0) correction else 0;
-            const step = @subWithOverflow(limbs[index], subtrahend);
-            const step_borrow = @subWithOverflow(step[0], second);
-            limbs[index] = step_borrow[0];
-            second = step[1] | step_borrow[1];
-        }
-        // A second borrow leaves limb 0 near 2^64, so this subtraction cannot borrow.
-        limbs[0] -%= fold & (0 -% @as(u64, second));
-        assert(second == 0 or borrow == 1);
-        return .{ .limbs = limbs };
+        const difference = @subWithOverflow(a.word(), b.word());
+        const folded = @subWithOverflow(difference[0], @as(u256, difference[1]) * fold);
+        // A second borrow leaves a value near 2^256, so this subtraction cannot borrow.
+        assert(folded[1] == 0 or difference[1] == 1);
+        return from_word(folded[0] -% @as(u256, folded[1]) * fold);
     }
 
     /// a / 2: adds p when a is odd (a 257-bit sum), then shifts right. Branch-free.
     pub fn half(a: Fe) Fe {
-        const mask = 0 -% (a.limbs[0] & 1);
-        const p_limbs = comptime from_int(p_int - 1).limbs;
-        var sum: [4]u64 = undefined;
-        var accumulator: u128 = 0;
-        inline for (0..4) |index| {
-            // p = (p - 1) + 1: limb 0 of p is odd, so p - 1 differs only in bit 0.
-            const p_limb = if (index == 0) p_limbs[0] | 1 else p_limbs[index];
-            accumulator = (accumulator >> 64) + a.limbs[index] + (p_limb & mask);
-            sum[index] = @truncate(accumulator);
-        }
-        const top: u64 = @truncate(accumulator >> 64);
-        assert(top <= 1);
-        var result: Fe = undefined;
-        inline for (0..3) |index| {
-            result.limbs[index] = (sum[index] >> 1) | (sum[index + 1] << 63);
-        }
-        result.limbs[3] = (sum[3] >> 1) | (top << 63);
-        return result;
+        const mask = 0 -% @as(u256, a.limbs[0] & 1);
+        const sum = @as(u257, a.word()) + (p_int & mask);
+        assert(sum & 1 == 0);
+        return from_word(@intCast(sum >> 1));
     }
 
     pub fn neg(a: Fe) Fe {
@@ -205,27 +160,19 @@ pub const Fe = struct {
 
     pub fn mul_small(a: Fe, comptime factor: u32) Fe {
         comptime assert(factor > 0);
-        var limbs: [4]u64 = undefined;
-        var accumulator: u128 = 0;
-        inline for (0..4) |index| {
-            accumulator = (accumulator >> 64) + @as(u128, a.limbs[index]) * factor;
-            limbs[index] = @truncate(accumulator);
-        }
-        return fold_top(limbs, @truncate(accumulator >> 64));
+        const product = @as(u320, a.word()) * factor;
+        return fold_top(@truncate(product), @intCast(product >> 256));
     }
 
-    /// Reduces a 512-bit product: low + high * fold, then folds the small top.
+    /// Reduces a 512-bit product: low + high * fold, then folds the small top. Written on
+    /// whole 256/320-bit integers so LLVM emits straight add-with-carry chains.
     inline fn reduce_wide(wide: [8]u64) Fe {
-        var limbs: [4]u64 = undefined;
-        var accumulator: u128 = 0;
-        inline for (0..4) |index| {
-            accumulator = (accumulator >> 64) + wide[index] +
-                @as(u128, wide[index + 4]) * fold;
-            limbs[index] = @truncate(accumulator);
-        }
-        const top: u64 = @truncate(accumulator >> 64);
+        const low_word: u256 = @bitCast(wide[0..4].*);
+        const high_word: u256 = @bitCast(wide[4..8].*);
+        const sum = @as(u320, low_word) + @as(u320, high_word) * fold;
+        const top: u64 = @intCast(sum >> 256);
         assert(top <= fold);
-        return fold_top(limbs, top);
+        return fold_top(@truncate(sum), top);
     }
 
     pub inline fn mul(a: Fe, b: Fe) Fe {

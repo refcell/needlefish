@@ -369,6 +369,13 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
   modes run every vector plus seeded round trips, a batch test, and a batch test.
 
 ## Log
+- 2026-11-09 (evm lane): secp256k1 field add, sub, half, small multiples and the product
+  reduction are written on whole u256/u320 words, so LLVM emits straight add-with-carry
+  chains instead of u128 accumulator steps: ecrecover 42.2 -> 40.9 us (scratch bench,
+  ReleaseFast, alternating binaries). A libsecp256k1-style 5x52 field with lazy reduction
+  (magnitudes tracked and asserted in Debug) passed every secp256k1 test but measured
+  about 6% slower (44.6 us): Zig/LLVM's mulx chains for 4x64 already beat the extra
+  partial products of 5x52 on x86-64, so it was not kept.
 - 2026-11-09 (evm lane): secp256k1 ecrecover 50.0 -> 42.0 us (scratch bench, ReleaseFast).
   Field mul/sqr inline into the point formulas; R's odd multiples are built affine on an
   isomorphic curve (libsecp256k1's global-z table), so R digits take mixed additions and G
