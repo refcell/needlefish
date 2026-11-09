@@ -373,6 +373,18 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   rounds: geometric mean 1.02x (erc20_transfer 1.12x, curve_3pool 1.09x). State lookups are
   ~6% of a contract-heavy profile, so the rest of the gap to evm2 there is elsewhere: 256-bit
   division (`uint.div_rem` + `knuth_step`) is 6-20% on curve and uniswap_v3_pool.
+- Division: on x86-64 each quotient digit is one `divq` (128 by 64 bits) instead of a
+  Möller-Granlund step with a reciprocal computed per call; for the one to four digits of an
+  EVM word, the reciprocal setup cost more than it saved. Knuth's loop is unrolled per divisor
+  length, a wide ADDMOD/MULMOD dividend that fits a word takes the 256-bit path, and the
+  reciprocal path stays for other targets (both are fuzzed against the builtins). An
+  intx-style 3-by-2 estimate was tried and gained nothing. A/B vs P4, two sets of 3 rounds:
+  geometric mean 1.04-1.07x (uniswap_v3_pool 1.12-1.21x, curve_tricrypto2 1.09-1.11x);
+  division falls from ~20% to ~14% of the curve_3pool + uniswap_v3_pool profile.
+- Base 10-block replay (`base replay bench ... --evm-only`, ReleaseSafe), P2 and P4 binaries
+  run alternately in one session: every block matches its header on both, 10.82 -> 10.16 ms
+  per block (1.07x), every block faster. Absolute times are ~1.6x those of 2026-11-08 because
+  the VM ran slower that session.
 - Static allocation: frames, 1025 stacks, shared memory, analysis arena, return buffer, journal,
   logs, code store and state maps are sized at init. Exceeding a state/journal limit is
   `error.StateFull` (fatal block error, never silent divergence). Memory growth past
@@ -401,6 +413,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: `divq` quotient digits on x86-64, 1.04-1.07x on division-heavy fixtures; Base
+  replay at P4 still matches every header, 1.07x faster per block than P2.
 - 2026-11-08: P4: folded-address hashing for the account and in-memory database maps,
   1.02x geometric mean on state-heavy fixtures; 256-bit division is the next gap to evm2.
 - 2026-11-08: P3 (AVX-512 Keccak-f, per-`Evm` keccak memo): vs evm2 tail-call on 15 rounds,

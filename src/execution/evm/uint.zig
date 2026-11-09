@@ -3,9 +3,9 @@
 //! LLVM lowers `u256 / u256` (and `%`, and the u512 MULMOD reduction) to a generic
 //! bit-serial expansion that costs ~500 ns per operation on aarch64, which made DIV/MOD
 //! the hottest path in arithmetic-heavy contracts. This is Knuth's algorithm D
-//! (TAOCP 4.3.1) over 64-bit limbs; each quotient digit comes from a Möller-Granlund
-//! 2-by-1 step with a precomputed reciprocal, so the inner loops are only 64x64->128
-//! multiplies. Differentially fuzzed against the builtin
+//! (TAOCP 4.3.1) over 64-bit limbs, unrolled per divisor length. Each quotient digit
+//! comes from x86-64's `divq`, or elsewhere from a Möller-Granlund 2-by-1 step with a
+//! precomputed reciprocal. Both paths are differentially fuzzed against the builtin
 //! operators below.
 
 const std = @import("std");
@@ -24,6 +24,15 @@ pub fn DivRem(comptime T: type) type {
 /// `a / b` and `a % b` for `b != 0`. `T` is `u256` or a wider dividend (u320 for
 /// ADDMOD, u512 for MULMOD); the divisor is always a word.
 pub fn div_rem(comptime T: type, a: T, b: u256) DivRem(T) {
+    return div_rem_with(hardware_divide, T, a, b);
+}
+
+/// x86-64 divides 128 by 64 bits in one instruction, which on current cores (Ice Lake and
+/// later, Zen 3 and later) costs less than computing a reciprocal for the few digits an
+/// EVM word has. Elsewhere each digit is a Möller-Granlund 2-by-1 step.
+const hardware_divide = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm;
+
+fn div_rem_with(comptime hardware: bool, comptime T: type, a: T, b: u256) DivRem(T) {
     comptime assert(@bitSizeOf(T) % limb_bits == 0);
     comptime assert(@bitSizeOf(T) >= 256);
     assert(b != 0);
@@ -34,11 +43,19 @@ pub fn div_rem(comptime T: type, a: T, b: u256) DivRem(T) {
         const y: u64 = @intCast(b);
         return .{ .quotient = x / y, .remainder = x % y };
     }
+    if (T != u256 and a <= std.math.maxInt(u256)) {
+        // Most ADDMOD and MULMOD dividends fit a word: skip the wide limb loops.
+        const narrow = div_rem_with(hardware, u256, @intCast(a), b);
+        return .{ .quotient = narrow.quotient, .remainder = narrow.remainder };
+    }
     const dividend_limbs = limbs_of(T, a);
     const divisor_limbs = limbs_of(u256, b);
     assert(dividend_limbs >= divisor_limbs);
-    if (divisor_limbs == 1) return div_rem_single(T, a, dividend_limbs, @intCast(b));
-    return div_rem_knuth(T, a, dividend_limbs, b, divisor_limbs);
+    return switch (divisor_limbs) {
+        1 => div_rem_single(hardware, T, a, dividend_limbs, @intCast(b)),
+        inline 2, 3, 4 => |n| div_rem_knuth(hardware, T, n, a, dividend_limbs, b),
+        else => unreachable,
+    };
 }
 
 pub fn div(a: u256, b: u256) u256 {
@@ -151,37 +168,70 @@ inline fn to_limbs(comptime T: type, x: T) Limbs(T) {
     return @bitCast(x);
 }
 
-/// `x[0..count] << shift` into `count + 1` limbs (the top limb takes the carried-out bits).
-fn shift_left(out: []u64, x: []const u64, shift: u6) void {
-    assert(out.len == x.len + 1);
-    if (shift == 0) {
-        @memcpy(out[0..x.len], x);
-        out[x.len] = 0;
-        return;
+/// The low `count` limbs of `a` shifted left by `shift`, in `count + 1` limbs so the
+/// shifted-out bits are kept; the limbs above are undefined.
+fn normalized(comptime T: type, a: T, count: u32, shift: u6) Limbs(Wide(T)) {
+    assert(count >= 1 and count <= @bitSizeOf(T) / limb_bits);
+    const limbs = to_limbs(T, a);
+    var out: Limbs(Wide(T)) = undefined;
+    out[count] = @truncate((@as(u128, limbs[count - 1]) << shift) >> limb_bits);
+    var index = count - 1;
+    while (index > 0) : (index -= 1) {
+        const pair = (@as(u128, limbs[index]) << limb_bits) | limbs[index - 1];
+        out[index] = @truncate((pair << shift) >> limb_bits);
     }
-    const back: u6 = @intCast(64 - @as(u7, shift));
-    out[x.len] = x[x.len - 1] >> back;
-    var index = x.len - 1;
-    while (index > 0) : (index -= 1) out[index] = (x[index] << shift) | (x[index - 1] >> back);
-    out[0] = x[0] << shift;
+    out[0] = limbs[0] << shift;
+    return out;
 }
 
-/// Short division by a single-limb divisor: one reciprocal step per dividend limb.
-fn div_rem_single(comptime T: type, a: T, dividend_limbs: u32, divisor: u64) DivRem(T) {
+fn Wide(comptime T: type) type {
+    return @Int(.unsigned, @bitSizeOf(T) + limb_bits);
+}
+
+/// Divide `high:low` by `d` (high < d): the `divq` instruction, or a Möller-Granlund step
+/// with the reciprocal `v` of the normalized `d`.
+inline fn divide_2by1(
+    comptime hardware: bool,
+    high: u64,
+    low: u64,
+    d: u64,
+    v: u64,
+) QuotientRemainder {
+    assert(high < d);
+    if (!hardware) return div_2by1(high, low, d, v);
+    var remainder: u64 = undefined;
+    const quotient = asm (
+        \\divq %[d]
+        : [_] "={rax}" (-> u64),
+          [_] "={rdx}" (remainder),
+        : [d] "r" (d),
+          [_] "{rax}" (low),
+          [_] "{rdx}" (high),
+    );
+    return .{ .quotient = quotient, .remainder = remainder };
+}
+
+/// Short division by a single-limb divisor, one digit per dividend limb. `divq` needs no
+/// normalization; the reciprocal step does.
+fn div_rem_single(
+    comptime hardware: bool,
+    comptime T: type,
+    a: T,
+    dividend_limbs: u32,
+    divisor: u64,
+) DivRem(T) {
     assert(divisor != 0);
     assert(dividend_limbs <= @bitSizeOf(T) / limb_bits);
-    const shift: u6 = @intCast(@clz(divisor));
+    const shift: u6 = if (hardware) 0 else @intCast(@clz(divisor));
     const d = divisor << shift;
-    const v = reciprocal(d);
-    const a_limbs = to_limbs(T, a);
-    var u: [@bitSizeOf(T) / limb_bits + 1]u64 = undefined;
-    shift_left(u[0 .. dividend_limbs + 1], a_limbs[0..dividend_limbs], shift);
+    const v = if (hardware) 0 else reciprocal(d);
+    const u = normalized(T, a, dividend_limbs, shift);
     var quotient: Limbs(T) = @splat(0);
     var carry: u64 = u[dividend_limbs];
     var index = dividend_limbs;
     while (index > 0) {
         index -= 1;
-        const step = div_2by1(carry, u[index], d, v);
+        const step = divide_2by1(hardware, carry, u[index], d, v);
         carry = step.remainder;
         quotient[index] = step.quotient;
     }
@@ -189,54 +239,45 @@ fn div_rem_single(comptime T: type, a: T, dividend_limbs: u32, divisor: u64) Div
     return .{ .quotient = @bitCast(quotient), .remainder = carry >> shift };
 }
 
+/// Knuth's algorithm D for an `n`-limb divisor (n >= 2), unrolled per `n`.
 fn div_rem_knuth(
+    comptime hardware: bool,
     comptime T: type,
+    comptime n: u32,
     a: T,
     dividend_limbs: u32,
     b: u256,
-    divisor_limbs: u32,
 ) DivRem(T) {
-    const n = divisor_limbs;
-    const m = dividend_limbs;
-    assert(n >= 2 and n <= divisor_limbs_max);
-    assert(m >= n);
+    comptime assert(n >= 2 and n <= divisor_limbs_max);
+    assert(dividend_limbs >= n and dividend_limbs <= @bitSizeOf(T) / limb_bits);
     // Normalize so the divisor's top limb has its high bit set (D1).
-    const b_limbs = to_limbs(u256, b);
-    const shift: u6 = @intCast(@clz(b_limbs[n - 1]));
-    var v_wide: [divisor_limbs_max + 1]u64 = undefined;
-    shift_left(v_wide[0 .. n + 1], b_limbs[0..n], shift);
-    assert(v_wide[n] == 0);
-    const v = v_wide[0..n];
+    const shift: u6 = @intCast(@clz(b) - (divisor_limbs_max - n) * limb_bits);
+    const v: [n]u64 = to_limbs(u256, b << shift)[0..n].*;
     assert(v[n - 1] >> 63 == 1);
-    const a_limbs = to_limbs(T, a);
-    var u: [@bitSizeOf(T) / limb_bits + 1]u64 = undefined;
-    shift_left(u[0 .. m + 1], a_limbs[0..m], shift);
-    const top_reciprocal = reciprocal(v[n - 1]);
-
+    const top_reciprocal = if (hardware) 0 else reciprocal(v[n - 1]);
+    var u = normalized(T, a, dividend_limbs, shift);
     var quotient: Limbs(T) = @splat(0);
-    var j: u32 = m - n + 1;
+    var j: u32 = dividend_limbs + 1 - n;
     while (j > 0) {
         j -= 1;
-        quotient[j] = knuth_step(u[j .. j + n + 1], v, top_reciprocal);
+        quotient[j] = knuth_step(hardware, n, u[j..][0 .. n + 1], &v, top_reciprocal);
     }
     // Denormalize the remainder u[0..n] (D8).
     var remainder: [divisor_limbs_max]u64 = @splat(0);
-    if (shift == 0) {
-        @memcpy(remainder[0..n], u[0..n]);
-    } else {
-        const back: u6 = @intCast(64 - @as(u7, shift));
-        for (0..n) |i| remainder[i] = (u[i] >> shift) | (u[i + 1] << back);
-    }
-    const result: u256 = @bitCast(remainder);
+    remainder[0..n].* = u[0..n].*;
+    const result = @as(u256, @bitCast(remainder)) >> shift;
     assert(result < b);
     return .{ .quotient = @bitCast(quotient), .remainder = result };
 }
 
 /// One quotient digit (D3-D6): `window` is u[j..j+n], updated in place to the remainder.
-fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
-    const n = v.len;
-    assert(window.len == n + 1);
-    assert(n >= 2);
+inline fn knuth_step(
+    comptime hardware: bool,
+    comptime n: u32,
+    window: *[n + 1]u64,
+    v: *const [n]u64,
+    top_reciprocal: u64,
+) u64 {
     assert(window[n] <= v[n - 1]);
     var estimate: u64 = std.math.maxInt(u64);
     var estimate_rem: u64 = undefined;
@@ -246,7 +287,7 @@ fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
         estimate_rem = sum[0];
         rem_overflow = sum[1] == 1;
     } else {
-        const step = div_2by1(window[n], window[n - 1], v[n - 1], top_reciprocal);
+        const step = divide_2by1(hardware, window[n], window[n - 1], v[n - 1], top_reciprocal);
         estimate = step.quotient;
         estimate_rem = step.remainder;
     }
@@ -263,7 +304,7 @@ fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
     // Multiply and subtract (D4).
     var carry: u64 = 0;
     var borrow: u1 = 0;
-    for (0..n) |i| {
+    inline for (0..n) |i| {
         const product = @as(u128, estimate) * v[i] + carry;
         carry = @truncate(product >> 64);
         const first = @subWithOverflow(window[i], @as(u64, @truncate(product)));
@@ -277,7 +318,7 @@ fn knuth_step(window: []u64, v: []const u64, top_reciprocal: u64) u64 {
     if (first[1] | second[1] == 0) return estimate;
     // Add back (D6): the estimate was one too large.
     var add_carry: u1 = 0;
-    for (0..n) |i| {
+    inline for (0..n) |i| {
         const sum = @addWithOverflow(window[i], v[i]);
         const sum_carry = @addWithOverflow(sum[0], add_carry);
         window[i] = sum_carry[0];
@@ -322,9 +363,11 @@ const testing = std.testing;
 
 fn expect_matches(comptime T: type, a: T, b: u256) !void {
     if (b == 0) return;
-    const result = div_rem(T, a, b);
-    try testing.expectEqual(a / b, result.quotient);
-    try testing.expectEqual(@as(u256, @intCast(a % b)), result.remainder);
+    inline for (.{ false, hardware_divide }) |hardware| {
+        const result = div_rem_with(hardware, T, a, b);
+        try testing.expectEqual(a / b, result.quotient);
+        try testing.expectEqual(@as(u256, @intCast(a % b)), result.remainder);
+    }
 }
 
 test "uint: edge cases match the builtin operators" {
@@ -380,6 +423,7 @@ test "uint: seeded differential against the builtin operators" {
     iteration = 0;
     while (iteration < 2_000) : (iteration += 1) {
         try expect_matches(u512, shaped(u512, &prng), shaped(u256, &prng));
+        try expect_matches(u320, shaped(u320, &prng), shaped(u256, &prng));
     }
 }
 
