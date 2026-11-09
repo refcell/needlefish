@@ -39,10 +39,11 @@ Owns `src/consensus/*` and `bin/consensus`. Reference: base/base `crates/consens
     - [x] el-run serves the Engine API (`bin/base/el_engine.zig`, `--engine.addr`,
       `--engine.jwt`): newPayload judged against executed blocks, forkchoice labels,
       full blocks from an in-memory ring (`bin/base/el_ring.zig`); see "el-run engine" below
-    - [ ] live run: `base consensus` (verifier) against el-run on Base Sepolia
+    - [x] live run: `base consensus` (verifier) against el-run on Base Sepolia (SYNC_PLAN M5)
     - [ ] execute head+1 payloads through the Runner (el-run then needs no devp2p at the tip)
     - [ ] reorgs: el-run follows one devp2p chain; a reorged-out block is a divergence today
-  - [ ] L1 reorg evidence (live or replayed) and mainnet
+  - [x] L1 reorg evidence: live Sepolia reorg at L1 12094705 survived (SYNC_PLAN M5)
+  - [ ] mainnet
 - [x] `engine`: (split below) engine task queue (insert unsafe, consolidate, build, finalize), forkchoice state tracking, safe/finalized promotion.
   - [x] sync state (heads, forkchoice state, ordering invariant), L2 finalizer
   - [x] engine task queue: insert unsafe, consolidate (AttributesMatch), build/seal (Holocene

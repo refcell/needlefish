@@ -200,7 +200,15 @@ Run `base consensus` (verifier mode) against real L1 with the mainnet rollup con
   1,000 blocks, while the reference's safe moves in steps of about 1,300 to 1,500).
   Finalized equals the reference's exactly at every sample after the derivation cursor
   passes L1 finality. Before that point, finalized = safe - 1 is expected: everything
-  derived so far comes from finalized L1 blocks. A reorg and mainnet remain.
+  derived so far comes from finalized L1 blocks.
+  L1 reorg (2026-11-08, same run): a passive head watcher saw Sepolia block 12094705 replaced
+  at 22:01 ET (depth 1; the orphan is no longer served, the canonical block carries no Base
+  batch). 15 s later the verifier, which derives at the L1 head (`verifier_l1_confs`
+  0), hit `ReorgDetected`. It restarted its forkchoice finder and walked
+  the derivation cursor back to L1 12094620. It was running again 53 s later and caught up
+  with the reference's safe head in about 15 minutes. The safe head never decreased (its
+  batches were in earlier L1 blocks). The safe hash matched at every sample before, during
+  and after, with 0 engine divergences. Mainnet remains.
 
 ### M6. Unsafe head from mainnet gossip
 
