@@ -433,6 +433,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: B1 after the ReleaseSafe change (10 rounds, idle, tight intervals) vs evm2
+  tail-call: ReleaseSafe 1.10x, ReleaseFast 1.37x, both memos 1.41x. Still behind in
+  ReleaseFast: entry_point 0.85x, hash_10k 0.93x, curve_tricrypto2 0.96x.
 - 2026-11-09: ReleaseSafe drops checks that cannot fire (pc overflow, stack indexes behind
   a two-sided stack check): 1.12x on compute and contract fixtures. Base replay at 0c892cb
   matches every header, 1.11x per block vs P2 in one session.

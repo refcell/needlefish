@@ -292,14 +292,14 @@ reset, for 20 ms of warm-up and 20 ms timed per case and process
 the same gas used. Speedup is the ratio of median µs per transaction over fresh processes,
 above 1 meaning the first engine is faster; the summary is the geometric mean over cases.
 
-| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x |
-| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x |
-| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x |
-| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x |
-| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - |
-| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x |
+| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) | P5 (ReleaseSafe checks) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x | 1.10x |
+| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x | 1.37x |
+| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x | 1.62x |
+| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x | 1.41x |
+| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - | - |
+| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x | 1.24x |
 
 | case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | P2 µs | evm2 µs (P2 run) | P2 speedup | P3 speedup | P3 both memo | P4 speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -339,6 +339,17 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   digit on x86-64. Every compute and contract case is now at or above evm2 tail-call:
   curve 1.02-1.11x, uniswap_v3_pool 1.07x, snailtracer 1.06x, entry_point 1.01x; only
   hash_10k stays below (0.93x, 0.68-0.99). ReleaseSafe reaches parity (1.04x).
+- P5 drops ReleaseSafe checks that cannot fire in the dispatch loop: the overflow check on
+  `pc += 1` (pc stays inside the padded code; the `code[pc]` bounds check remains) and the
+  stack index checks after each opcode's stack check, which is now two-sided with runtime
+  safety so it proves `len <= 1024`. ReleaseSafe 1.04x -> 1.10x; ReleaseFast compiles to the
+  same code. This 10-round run has tight per-case intervals and corrects the P4 picture:
+  ReleaseFast still trails on entry_point_v0_7 (0.85x, 0.81-0.87), hash_10k (0.93x),
+  curve_tricrypto2 (0.96x) and curve-stableswap-2pool (0.98x); ReleaseSafe trails on the
+  contract-heavy cases (curve_tricrypto2 0.74x, entry_point 0.79x, aggregation_router 0.83x)
+  and wins the compute ones (fibonacci 1.20x, factorial 1.06x, burntpix 1.00x).
+- hash_10k chains KECCAK256 over 32 fresh bytes, so no memo helps; evm2's keccak-asm runs
+  the same AVX-512 lane-per-register permutation as needlefish's, within ~4%.
 - P2 also skips clearing an empty transient-storage table in the untimed state reset (as each
   transaction start already did); measured alone, it moves the timed transaction 0-4%
   (warmer caches), mostly on the small cases.
@@ -348,7 +359,8 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   (evm2 snailtracer 48 -> 73 ms), so only same-run ratios are comparable across columns,
   which is why the case table gives P3 as speedups only. P4 is 10 rounds measured
   2026-11-09 with nothing else running; a P4 run under load from a parallel test suite read
-  the curve pools at 0.68-0.76x, so compare only unloaded runs.
+  the curve pools at 0.68-0.76x, so compare only unloaded runs. P5 is 10 rounds measured
+  2026-11-09 on an idle VM.
 
 ### Memory and size
 
