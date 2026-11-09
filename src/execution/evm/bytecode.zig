@@ -109,6 +109,8 @@ pub const AnalysisCache = struct {
     const Entry = struct {
         hash: [32]u8,
         analyzed: Analyzed,
+        /// The last code buffer checked equal to `analyzed` (safe builds' hit check).
+        source: [*]const u8,
         occupied: bool,
     };
 
@@ -136,15 +138,31 @@ pub const AnalysisCache = struct {
 
     /// The analysis of the code with `hash`, or null when it is not cached.
     pub fn get(cache: *const AnalysisCache, hash: *const [32]u8) ?Analyzed {
+        const entry = cache.find(hash) orelse return null;
+        return entry.analyzed;
+    }
+
+    fn find(cache: *const AnalysisCache, hash: *const [32]u8) ?*Entry {
         var index = cache.slot(hash);
         var probes: usize = 0;
         while (probes < cache.entries.len) : (probes += 1) {
             const entry = &cache.entries[index];
             if (!entry.occupied) return null;
-            if (std.mem.eql(u8, &entry.hash, hash)) return entry.analyzed;
+            if (std.mem.eql(u8, &entry.hash, hash)) return entry;
             index = (index + 1) & (cache.entries.len - 1);
         }
         unreachable; // The table is never more than 3/4 full, so a probe meets an empty slot.
+    }
+
+    /// Asserts that `code` is the code cached under `hash`. Stored code is never written
+    /// in place, so the full compare is skipped for the buffer that last matched (the
+    /// same CALL target again) and still runs for every other buffer under this hash.
+    pub fn assert_source(cache: *AnalysisCache, hash: *const [32]u8, code: []const u8) void {
+        const entry = cache.find(hash).?;
+        assert(entry.analyzed.len == code.len);
+        if (entry.source == code.ptr) return;
+        assert(std.mem.eql(u8, entry.analyzed.original(), code));
+        entry.source = code.ptr;
     }
 
     /// Analyze `code` (whose keccak is `hash`) into the cache; null when the cache is full.
@@ -160,7 +178,12 @@ pub const AnalysisCache = struct {
         cache.used += size;
         var index = cache.slot(hash);
         while (cache.entries[index].occupied) index = (index + 1) & (cache.entries.len - 1);
-        cache.entries[index] = .{ .hash = hash.*, .analyzed = analyzed, .occupied = true };
+        cache.entries[index] = .{
+            .hash = hash.*,
+            .analyzed = analyzed,
+            .source = code.ptr,
+            .occupied = true,
+        };
         cache.count += 1;
         assert(cache.used <= cache.buffer.len);
         return analyzed;

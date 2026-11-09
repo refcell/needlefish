@@ -433,6 +433,13 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: safe builds check a cached code analysis against the caller's code once per
+  code buffer, not on every CALL (the entry remembers the buffer that matched; stored code
+  is never written in place). The per-hit compare was 8-11% of ReleaseSafe time on
+  call-heavy fixtures: aggregation_router 1.15x, curve_tricrypto2 1.15x, universal_router
+  1.13x. With the secp256k1 work (crypto lane log), entry_point_v0_7 is 1.12x in
+  ReleaseFast. ReleaseSafe profiles of the remaining gaps show memset and page faults only
+  in the harness's untimed State.init/reset/deinit, not inside the timed transaction.
 - 2026-11-09: B1 after the ReleaseSafe change (10 rounds, idle, tight intervals) vs evm2
   tail-call: ReleaseSafe 1.10x, ReleaseFast 1.37x, both memos 1.41x. Still behind in
   ReleaseFast: entry_point 0.85x, hash_10k 0.93x, curve_tricrypto2 0.96x.
