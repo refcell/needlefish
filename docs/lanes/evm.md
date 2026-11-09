@@ -387,6 +387,20 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   so map layout and order are unchanged. A/B vs the division commit: 1.09x geometric mean on
   eight state-heavy fixtures (weth 1.21x, erc20_transfer 1.12x, entry_point 1.11x),
   snailtracer 1.04x.
+- ReleaseSafe (the build the node ships): the interpreter loop had 383 branches to panic
+  handlers. The most common were checks that cannot fire: `pc += 1` overflow on every
+  opcode (pc stays inside the padded code, under 2^33 bytes) and bounds checks on stack pops
+  and swaps after the opcode's own stack check. `pc` now advances with a wrapping add (the
+  `code[pc]` bounds check at dispatch stays), and with runtime safety the per-opcode stack
+  check is two-sided (`len -% inputs > 1024 - max(inputs, outputs)`), which proves
+  `len <= 1024` so the optimizer drops the index checks. Code, memory and stack checks that
+  can fire all remain; 383 -> 321 panic branches, loop 6% smaller. A/B, 4 rounds: ReleaseSafe
+  1.12x geometric mean (factorial 1.47x, weth 1.26x, fibonacci 1.15x, curve 1.11-1.14x).
+- hash_10k chains KECCAK256 over 32 fresh bytes, so no memo helps. evm2's keccak-asm uses the
+  same AVX-512 lane-per-register permutation as `permute_one`, and ours runs within ~4% of
+  it; needlefish's interpreter share of the case is smaller than evm2's. A 32/64-byte fast
+  path that builds the sponge state from the input words, without the padded block, measured
+  0.96-1.05x in two A/Bs (noise) and was not kept.
 - Base 10-block replay (`base replay bench ... --evm-only`, ReleaseSafe), P2 and P4 binaries
   run alternately in one session: every block matches its header on both, 10.82 -> 10.16 ms
   per block (1.07x), every block faster. Absolute times are ~1.6x those of 2026-11-08 because
@@ -419,6 +433,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: ReleaseSafe drops checks that cannot fire (pc overflow, stack indexes behind
+  a two-sided stack check): 1.12x on compute and contract fixtures. Base replay at 0c892cb
+  matches every header, 1.11x per block vs P2 in one session.
 - 2026-11-09: B1 at P4 (10 rounds, unloaded) vs evm2 tail-call: ReleaseFast 1.36x geometric
   mean, ReleaseSafe 1.04x, both memos on 1.37x; every compute and contract case at or above
   parity except hash_10k (0.93x).

@@ -89,15 +89,20 @@ inline fn step(
     const inputs: u32 = comptime op.table[opcode].inputs;
     const outputs: u32 = comptime op.table[opcode].outputs;
     if (comptime inputs > 0 or outputs > 0) {
-        // One compare. An opcode that does not grow the stack can only underflow; one without
-        // inputs can only overflow; otherwise `len < inputs` wraps to a huge value and
-        // `len - inputs + outputs > 1024` overflows.
-        const out_of_bounds = if (comptime outputs <= inputs)
-            r.stack.len < inputs
-        else if (comptime inputs == 0)
+        // One compare. An opcode without inputs can only overflow; otherwise `len < inputs`
+        // wraps `len -% inputs` to a huge value, so one unsigned compare catches underflow
+        // and `len - inputs + outputs > 1024`. In ReleaseFast an opcode that does not grow
+        // the stack checks only `len < inputs`. With runtime safety the two-sided form also
+        // tells the optimizer `len <= 1024`, which removes the bounds checks of the pops,
+        // peeks and swaps that follow (`stack.items` has 1024 entries).
+        const widest: u32 = @max(inputs, outputs);
+        const bound = stack_module.limit - widest;
+        const out_of_bounds = if (comptime inputs == 0)
             r.stack.len > stack_module.limit - outputs
+        else if (comptime outputs <= inputs and !std.debug.runtime_safety)
+            r.stack.len < inputs
         else
-            r.stack.len -% inputs > stack_module.limit - outputs;
+            r.stack.len -% inputs > bound;
         if (out_of_bounds) {
             @branchHint(.cold);
             exit.* = if (r.stack.len < inputs) .stack_underflow else .stack_overflow;
@@ -117,7 +122,9 @@ inline fn step(
             return false;
         }
     }
-    r.pc += 1;
+    // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes, `Analyzed.len` is a
+    // u32), and the next `analyzed.code[r.pc]` is still bounds-checked.
+    r.pc +%= 1;
     if (comptime in_registers(opcode)) {
         return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
     }
@@ -506,7 +513,8 @@ inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analy
         break :blk primitives.word_from_be(&buffer);
     };
     r.stack.push(value);
-    r.pc += size;
+    // Cannot wrap: the immediate's slice above is bounds-checked against the padded code.
+    r.pc +%= size;
 }
 
 /// JUMP, or JUMPI when `conditional`. False on a jump to a non-JUMPDEST (invalid jump).
