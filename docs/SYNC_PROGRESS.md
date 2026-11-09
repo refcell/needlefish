@@ -429,3 +429,5 @@
 - 17:29 ET cursor passed L1 finality at ~17:22. Our finalized 56269802 derived from L1 12093325 <= L1 finalized 12093334, equals sepolia.base.org finalized exactly; publicnode finalized tag lags (56267261). No public optimism_syncStatus (sepolia.base.org filtered, publicnode/drpc method not found). Second sampler vs sepolia.base.org -> cadence_official.tsv (120 min).
 - 17:46 ET verifier caught up: safe 56279627 and finalized 56275525 equal sepolia.base.org exactly, hash ok, 0 divergences, 1 benign NotEnoughData.
 - 17:53 ET cadence result: 83/83 samples hash ok (60 publicnode + 23 sepolia.base.org), safe at tip within one batch interval of reference, finalized exact after cursor passed L1 finality. NotFound warning at tip = end of L1 chain (benign). SYNC_PLAN M5 updated.
+- 18:31 ET progress text sent (message 2733). Verifier at tip, hash ok every sample, 0 divergences; tip WARNs are NotEnoughData/NotFound waiting on L1 (benign). Mainnet download 462.3/761 GB, 3320 GB free.
+- 20:31 ET progress text sent. Verifier safe 56328840 / finalized 56323987 vs sepolia.base.org 56329088 / 56323987, 0 divergences. Mainnet download 545.7/761 GB, 3243 GB free.
