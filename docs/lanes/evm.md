@@ -419,6 +419,9 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: B1 at P4 (10 rounds, unloaded) vs evm2 tail-call: ReleaseFast 1.36x geometric
+  mean, ReleaseSafe 1.04x, both memos on 1.37x; every compute and contract case at or above
+  parity except hash_10k (0.93x).
 - 2026-11-09: map keys read addresses as words, not byte by byte: 1.09x on state-heavy
   fixtures.
 - 2026-11-09: `divq` quotient digits on x86-64, 1.04-1.07x on division-heavy fixtures; Base
