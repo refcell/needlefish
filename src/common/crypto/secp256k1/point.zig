@@ -86,13 +86,31 @@ pub const Jacobian = struct {
 
     /// Variable-time mixed addition (madd-2004-hmv) with all special cases.
     pub fn add_affine(a: Jacobian, b: Affine) Jacobian {
-        if (a.infinity) return from_affine(b);
-        const z1z1 = a.z.sqr();
+        return a.add_affine_scaled(b, null, null);
+    }
+
+    /// Mixed addition of `b` taken with Jacobian z = 1 / `b_z_inverse` (null means 1),
+    /// so a point affine in one frame adds into an accumulator kept in a frame whose
+    /// coordinates are scaled by `b_z_inverse`. `ratio`, when given, receives z3 / a.z
+    /// (only for operands that hit no special case).
+    fn add_affine_scaled(a: Jacobian, b: Affine, b_z_inverse: ?Fe, ratio: ?*Fe) Jacobian {
+        if (a.infinity) {
+            assert(ratio == null);
+            const scale = b_z_inverse orelse return from_affine(b);
+            const scale_squared = scale.sqr();
+            return from_affine(.{
+                .x = b.x.mul(scale_squared),
+                .y = b.y.mul(scale_squared.mul(scale)),
+            });
+        }
+        const az = if (b_z_inverse) |scale| a.z.mul(scale) else a.z;
+        const z1z1 = az.sqr();
         const x2_scaled = b.x.mul(z1z1);
-        const s2 = b.y.mul(a.z).mul(z1z1);
+        const s2 = b.y.mul(az).mul(z1z1);
         const h = x2_scaled.sub(a.x);
         const r = s2.sub(a.y);
         if (h.is_zero()) {
+            assert(ratio == null);
             if (r.is_zero()) return a.dbl();
             return identity;
         }
@@ -103,32 +121,7 @@ pub const Jacobian = struct {
         const y3 = r.mul(v.sub(x3)).sub(a.y.mul(hhh));
         const z3 = a.z.mul(h);
         assert(!z3.is_zero());
-        return .{ .x = x3, .y = y3, .z = z3, .infinity = false };
-    }
-
-    /// Variable-time general addition (add-1998-cmo-2) with all special cases.
-    pub fn add(a: Jacobian, b: Jacobian) Jacobian {
-        if (a.infinity) return b;
-        if (b.infinity) return a;
-        const z1z1 = a.z.sqr();
-        const z2z2 = b.z.sqr();
-        const x1_scaled = a.x.mul(z2z2);
-        const x2_scaled = b.x.mul(z1z1);
-        const s1 = a.y.mul(b.z).mul(z2z2);
-        const s2 = b.y.mul(a.z).mul(z1z1);
-        const h = x2_scaled.sub(x1_scaled);
-        const r = s2.sub(s1);
-        if (h.is_zero()) {
-            if (r.is_zero()) return a.dbl();
-            return identity;
-        }
-        const hh = h.sqr();
-        const hhh = h.mul(hh);
-        const v = x1_scaled.mul(hh);
-        const x3 = r.sqr().sub(hhh).sub(v.dbl());
-        const y3 = r.mul(v.sub(x3)).sub(s1.mul(hhh));
-        const z3 = a.z.mul(b.z).mul(h);
-        assert(!z3.is_zero());
+        if (ratio) |out| out.* = h;
         return .{ .x = x3, .y = y3, .z = z3, .infinity = false };
     }
 };
@@ -152,34 +145,77 @@ fn recode(half: scalar_module.SignedHalf, comptime window: u4) Recoded {
     return recoded;
 }
 
-fn odd_multiples(point: Affine) [r_table_size]Jacobian {
-    var multiples: [r_table_size]Jacobian = undefined;
-    multiples[0] = Jacobian.from_affine(point);
-    const twice = multiples[0].dbl();
-    for (1..r_table_size) |index| multiples[index] = multiples[index - 1].add(twice);
-    assert(!multiples[0].infinity);
-    return multiples;
+/// Odd multiples R, 3R, ..., 15R as affine points of an isomorphic frame in which a
+/// Jacobian (X, Y, Z) stands for the real point (X, Y, Z * global_z). Every R digit
+/// then costs a mixed addition instead of a general one (libsecp256k1's global-z
+/// table). The a = 0 formulas do not involve b, so they hold in the frame unchanged.
+const RTable = struct {
+    entries: [r_table_size]Affine,
+    global_z: Fe,
+};
+
+fn odd_multiples(point: Affine) RTable {
+    // Frame scaled by twice.z, where 2R is affine and R is (x z^2, y z^3).
+    const twice = Jacobian.from_affine(point).dbl();
+    const twice_frame: Affine = .{ .x = twice.x, .y = twice.y };
+    const z_squared = twice.z.sqr();
+    var jacobian: [r_table_size]Jacobian = undefined;
+    var ratios: [r_table_size]Fe = undefined;
+    jacobian[0] = Jacobian.from_affine(.{
+        .x = point.x.mul(z_squared),
+        .y = point.y.mul(z_squared.mul(twice.z)),
+    });
+    // (2i + 1)R + 2R hits no special case: the order is prime and above 2i + 3.
+    for (1..r_table_size) |index| {
+        jacobian[index] = jacobian[index - 1].add_affine_scaled(twice_frame, null, &ratios[index]);
+    }
+    // Rescale entry i by z_last / z_i, the product of the later ratios.
+    const last = r_table_size - 1;
+    var table_out: RTable = undefined;
+    table_out.entries[last] = .{ .x = jacobian[last].x, .y = jacobian[last].y };
+    var scale = ratios[last];
+    var index: usize = last;
+    while (index > 0) {
+        index -= 1;
+        const scale_squared = scale.sqr();
+        table_out.entries[index] = .{
+            .x = jacobian[index].x.mul(scale_squared),
+            .y = jacobian[index].y.mul(scale_squared.mul(scale)),
+        };
+        if (index > 0) scale = scale.mul(ratios[index]);
+    }
+    table_out.global_z = jacobian[last].z.mul(twice.z);
+    assert(!table_out.global_z.is_zero());
+    assert(!jacobian[last].infinity);
+    return table_out;
 }
 
-inline fn add_jacobian_digit(
+inline fn add_r_digit(
     acc: Jacobian,
-    multiples: *const [r_table_size]Jacobian,
-    digit: i16,
-) Jacobian {
-    if (digit > 0) return acc.add(multiples[@intCast((digit - 1) >> 1)]);
-    if (digit < 0) return acc.add(multiples[@intCast((-digit - 1) >> 1)].negate());
-    return acc;
-}
-
-inline fn add_affine_digit(
-    acc: Jacobian,
-    multiples: *const [table.g_table_size]Affine,
+    multiples: *const [r_table_size]Affine,
     digit: i16,
 ) Jacobian {
     if (digit > 0) return acc.add_affine(multiples[@intCast((digit - 1) >> 1)]);
     if (digit < 0) {
         const entry = multiples[@intCast((-digit - 1) >> 1)];
         return acc.add_affine(.{ .x = entry.x, .y = entry.y.neg() });
+    }
+    return acc;
+}
+
+/// Adds a real affine G multiple into an accumulator kept in the R table's frame.
+inline fn add_g_digit(
+    acc: Jacobian,
+    multiples: *const [table.g_table_size]Affine,
+    digit: i16,
+    global_z: Fe,
+) Jacobian {
+    if (digit > 0) {
+        return acc.add_affine_scaled(multiples[@intCast((digit - 1) >> 1)], global_z, null);
+    }
+    if (digit < 0) {
+        const entry = multiples[@intCast((-digit - 1) >> 1)];
+        return acc.add_affine_scaled(.{ .x = entry.x, .y = entry.y.neg() }, global_z, null);
     }
     return acc;
 }
@@ -194,8 +230,8 @@ pub fn mul_double_var(g_factor: Scalar, r_factor: Scalar, r_point: Affine) Jacob
     const r1 = recode(r_halves[0], r_window);
     const r2 = recode(r_halves[1], r_window);
 
-    const r_multiples = odd_multiples(r_point);
-    var r_lambda_multiples: [r_table_size]Jacobian = r_multiples;
+    const r_table = odd_multiples(r_point);
+    var r_lambda_multiples: [r_table_size]Affine = r_table.entries;
     for (&r_lambda_multiples) |*entry| entry.x = entry.x.mul(beta);
 
     const length = @max(@max(g1.length, g2.length), @max(r1.length, r2.length));
@@ -204,12 +240,14 @@ pub fn mul_double_var(g_factor: Scalar, r_factor: Scalar, r_point: Affine) Jacob
     while (index > 0) {
         index -= 1;
         acc = acc.dbl();
-        acc = add_jacobian_digit(acc, &r_multiples, r1.digits[index]);
-        acc = add_jacobian_digit(acc, &r_lambda_multiples, r2.digits[index]);
-        acc = add_affine_digit(acc, &table.g_odd, g1.digits[index]);
-        acc = add_affine_digit(acc, &table.g_lambda_odd, g2.digits[index]);
+        acc = add_r_digit(acc, &r_table.entries, r1.digits[index]);
+        acc = add_r_digit(acc, &r_lambda_multiples, r2.digits[index]);
+        acc = add_g_digit(acc, &table.g_odd, g1.digits[index], r_table.global_z);
+        acc = add_g_digit(acc, &table.g_lambda_odd, g2.digits[index], r_table.global_z);
     }
     assert(index == 0);
+    // Back from the frame to real Jacobian coordinates.
+    if (!acc.infinity) acc.z = acc.z.mul(r_table.global_z);
     return acc;
 }
 

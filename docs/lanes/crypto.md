@@ -369,6 +369,11 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
   modes run every vector plus seeded round trips, a batch test, and a batch test.
 
 ## Log
+- 2026-11-09 (evm lane): secp256k1 ecrecover 50.0 -> 42.0 us (scratch bench, ReleaseFast).
+  Field mul/sqr inline into the point formulas; R's odd multiples are built affine on an
+  isomorphic curve (libsecp256k1's global-z table), so R digits take mixed additions and G
+  digits a scaled mixed addition; the general Jacobian addition is gone. statetest A/B:
+  precompile-ecrecover 1.20-1.27x, entry_point_v0_7 1.12x.
 - 2026-11-08 (evm lane): x86-64 AVX-512 single-message Keccak-f (`permute_one`), 2.1x the
   scalar path on a 64-byte hash; the EVM's KECCAK256 now uses this module instead of std.
 - 2026-11-05: keccak256 one-shot, streaming, SIMD batch; vectors, seeded + coverage fuzz vs std; bench (32B: 147ns single, 71ns/msg batch, std 141ns).

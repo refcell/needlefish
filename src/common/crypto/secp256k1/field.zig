@@ -228,7 +228,7 @@ pub const Fe = struct {
         return fold_top(limbs, top);
     }
 
-    pub fn mul(a: Fe, b: Fe) Fe {
+    pub inline fn mul(a: Fe, b: Fe) Fe {
         var wide: [8]u64 = @splat(0);
         inline for (0..4) |i| {
             var carry: u64 = 0;
@@ -242,7 +242,7 @@ pub const Fe = struct {
         return reduce_wide(wide);
     }
 
-    pub fn sqr(a: Fe) Fe {
+    pub inline fn sqr(a: Fe) Fe {
         const x = a.limbs;
         var wide: [8]u64 = @splat(0);
         // Off-diagonal products a_i * a_j (i < j), accumulated once.
