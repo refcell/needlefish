@@ -327,7 +327,9 @@ Run (paths are examples; the JWT secret is a runtime file, never committed):
         --p2p.disabled --rpc.port 7545
 
 `--engine.rollup-out` writes the chain's built-in rollup config (the one `derive-check`
-derives with) as rollup.json. `--p2p.disabled` keeps the first run to derivation: with gossip
+derives with) as rollup.json. `base rollup-config --chain base-sepolia|base-mainnet --out
+FILE` writes the same file without a database, to prepare a consensus node before el-run's
+first start. `--p2p.disabled` keeps the first run to derivation: with gossip
 on, gossiped blocks above el-run's head answer SYNCING and the consensus unsafe head then
 moves only by consolidation (the adopt-existing-block path), which also works.
 

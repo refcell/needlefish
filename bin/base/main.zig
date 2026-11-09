@@ -67,6 +67,7 @@ const usage =
     \\  el-fetch   fetch and check a block range from an execution peer (devp2p eth/68)
     \\  el-peers   find a Base chain's execution peers over discv4
     \\  el-run     execute blocks from an execution peer (devp2p) on an imported database
+    \\  rollup-config  write a Base chain's built-in rollup.json (for base consensus)
     \\  state-check  spot-check a database's accounts and slots against a reference node
     \\  derive-check  derive a Base chain's safe blocks from L1, compare with a reference node
     \\  https-bridge  forward plain HTTP on loopback to HTTPS upstreams (public L1 for consensus)
@@ -217,6 +218,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "el-run")) {
         return try el_run.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "rollup-config")) {
+        return try @import("el_engine.zig").rollup_config_main(init, args);
     }
     if (std.mem.eql(u8, command, "state-check")) {
         return try state_check.main(init, args);

@@ -695,6 +695,37 @@ fn write_block(w: *json.Writer, block: *const el_ring.Block, full: bool) Handler
     try w.end_object();
 }
 
+/// `base rollup-config --chain base-sepolia|base-mainnet --out <rollup.json>`: writes the
+/// chain's built-in rollup config (the one `--engine.rollup-out` writes) without a database,
+/// so a consensus node's config can be prepared and checked before el-run first starts.
+pub fn rollup_config_main(init: std.process.Init, args: []const []const u8) !u8 {
+    const usage = "usage: base rollup-config --chain base-sepolia|base-mainnet --out <file>\n";
+    var config: ?*const ChainConfig = null;
+    var out: ?[]const u8 = null;
+    var index: usize = 0;
+    while (index + 1 < args.len) : (index += 2) {
+        const name = args[index];
+        const value = args[index + 1];
+        if (std.mem.eql(u8, name, "--chain")) {
+            config = if (std.mem.eql(u8, value, "base-mainnet"))
+                &base.common.chains.mainnet
+            else if (std.mem.eql(u8, value, "base-sepolia"))
+                &base.common.chains.sepolia
+            else
+                null;
+        } else if (std.mem.eql(u8, name, "--out")) {
+            out = value;
+        } else break;
+    }
+    if (index != args.len or config == null or out == null) {
+        std.debug.print("{s}", .{usage});
+        return 2;
+    }
+    assert(config.?.chain_id != 0);
+    try write_rollup_config(init.io, out.?, config.?);
+    return 0;
+}
+
 /// Writes the built-in rollup config of `config` (the one `base derive-check` derives with)
 /// as rollup.json, so `base consensus` runs against el-run with the same chain.
 pub fn write_rollup_config(std_io: Io, path: []const u8, config: *const ChainConfig) !void {
