@@ -433,6 +433,11 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: B1 at P6 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.24x (was 1.10x;
+  the per-frame code compare had also run on every top-level call, so small transactions on
+  large contracts gain most), ReleaseFast 1.38x, both memos 1.42x. Behind: ReleaseFast
+  hash_10k 0.90x, entry_point 0.96x, curve_tricrypto2 0.97x; ReleaseSafe the curve pools
+  0.85-0.87x and entry_point 0.85x.
 - 2026-11-09: safe builds check a cached code analysis against the caller's code once per
   code buffer, not on every CALL (the entry remembers the buffer that matched; stored code
   is never written in place). The per-hit compare was 8-11% of ReleaseSafe time on

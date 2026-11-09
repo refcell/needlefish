@@ -292,14 +292,14 @@ reset, for 20 ms of warm-up and 20 ms timed per case and process
 the same gas used. Speedup is the ratio of median µs per transaction over fresh processes,
 above 1 meaning the first engine is faster; the summary is the geometric mean over cases.
 
-| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) | P5 (ReleaseSafe checks) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x | 1.10x |
-| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x | 1.37x |
-| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x | 1.62x |
-| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x | 1.41x |
-| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - | - |
-| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x | 1.24x |
+| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) | P5 (ReleaseSafe checks) | P6 (secp256k1, code check) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x | 1.10x | 1.24x |
+| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x | 1.37x | 1.38x |
+| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x | 1.62x | 1.63x |
+| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x | 1.41x | 1.42x |
+| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - | - | - |
+| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x | 1.24x | 1.23x |
 
 | case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | P2 µs | evm2 µs (P2 run) | P2 speedup | P3 speedup | P3 both memo | P4 speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -348,6 +348,19 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   curve_tricrypto2 (0.96x) and curve-stableswap-2pool (0.98x); ReleaseSafe trails on the
   contract-heavy cases (curve_tricrypto2 0.74x, entry_point 0.79x, aggregation_router 0.83x)
   and wins the compute ones (fibonacci 1.20x, factorial 1.06x, burntpix 1.00x).
+- P6 speeds up secp256k1 and the safe-build code check. ecrecover builds R's odd multiples
+  affine on an isomorphic curve (libsecp256k1's global-z table), so every R digit is a
+  mixed addition, and inlines the field multiply (50 -> 42 µs per recovery). Safe builds
+  had byte-compared a cached code analysis with the caller's code on every frame,
+  including each transaction's top-level call; they now compare once per code buffer.
+  ReleaseSafe 1.10x -> 1.24x: the small transactions on large contracts gain most
+  (fiat_token 0.93x -> 1.91x, seaport 0.88x -> 1.54x, univ2_router 0.84x -> 1.41x),
+  curve_tricrypto2 0.74x -> 0.85x. ReleaseFast entry_point_v0_7 0.85x -> 0.96x. Still
+  behind in ReleaseSafe: the curve pools (0.85-0.87x), entry_point (0.85x), hash_10k,
+  universal_router, aggregation_router (0.92-0.93x); in ReleaseFast: hash_10k (0.90x),
+  entry_point (0.96x), curve_tricrypto2 (0.97x). Profiles of the remaining ReleaseSafe gap
+  show it spread over the dispatch loop and 256-bit division (1.14x and 1.20x their
+  ReleaseFast cost on curve-stableswap) with no single dominant check.
 - hash_10k chains KECCAK256 over 32 fresh bytes, so no memo helps; evm2's keccak-asm runs
   the same AVX-512 lane-per-register permutation as needlefish's, within ~4%.
 - P2 also skips clearing an empty transient-storage table in the untimed state reset (as each
@@ -360,7 +373,7 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   which is why the case table gives P3 as speedups only. P4 is 10 rounds measured
   2026-11-09 with nothing else running; a P4 run under load from a parallel test suite read
   the curve pools at 0.68-0.76x, so compare only unloaded runs. P5 is 10 rounds measured
-  2026-11-09 on an idle VM.
+  2026-11-09 on an idle VM, as is P6.
 
 ### Memory and size
 
