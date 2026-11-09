@@ -92,29 +92,51 @@ pub const Account = struct {
 
 pub const StorageKey = struct { address: Address, slot: u256 };
 
+/// An address as three little-endian words (bytes 0..8, 8..16 and 16..20), each read with one
+/// load. Bit-casting `[20]u8` to `u160` compiled to twenty byte loads per hash and compare.
+const AddressWords = struct {
+    low: u64,
+    middle: u64,
+    high: u32,
+
+    inline fn of(address: *const Address) AddressWords {
+        return .{
+            .low = std.mem.readInt(u64, address[0..8], .little),
+            .middle = std.mem.readInt(u64, address[8..16], .little),
+            .high = std.mem.readInt(u32, address[16..20], .little),
+        };
+    }
+
+    inline fn fold(words: AddressWords) u64 {
+        const multiplier = StorageKeyContext.multiplier;
+        const folded = (words.low ^ words.middle) *% multiplier;
+        return (folded ^ words.high) *% multiplier;
+    }
+
+    inline fn eql(a: AddressWords, b: AddressWords) bool {
+        return a.low == b.low and a.middle == b.middle and a.high == b.high;
+    }
+};
+
 /// Storage-slot map context. `AutoContext` streams the key's fields through wyhash and
 /// compares bytes element-wise; together that was ~40% of an SSTORE/SLOAD loop. This
 /// folds the key's 64-bit limbs and finishes with the murmur3 `fmix64` avalanche, and
-/// compares the key as two wide integers. Like the unseeded wyhash it replaces, it is not
+/// compares the key as words. Like the unseeded wyhash it replaces, it is not
 /// keyed: probe lengths stay bounded by the gas needed to create each slot.
 pub const StorageKeyContext = struct {
     const multiplier: u64 = 0x9e37_79b9_7f4a_7c15;
 
-    pub fn hash(_: StorageKeyContext, key: StorageKey) u64 {
-        const address: u160 = @bitCast(key.address);
-        var folded: u64 = @truncate(address);
-        folded = (folded ^ @as(u64, @truncate(address >> 64))) *% multiplier;
-        folded = (folded ^ @as(u64, @truncate(address >> 128))) *% multiplier;
-        var limb: u32 = 0;
-        while (limb < 4) : (limb += 1) {
-            folded = (folded ^ @as(u64, @truncate(key.slot >> @intCast(limb * 64)))) *% multiplier;
+    pub inline fn hash(_: StorageKeyContext, key: StorageKey) u64 {
+        var folded = AddressWords.of(&key.address).fold();
+        inline for (0..4) |limb| {
+            folded = (folded ^ @as(u64, @truncate(key.slot >> (limb * 64)))) *% multiplier;
         }
         return fmix64(folded);
     }
 
-    pub fn eql(_: StorageKeyContext, a: StorageKey, b: StorageKey) bool {
-        const same_address = @as(u160, @bitCast(a.address)) == @as(u160, @bitCast(b.address));
-        return same_address and a.slot == b.slot;
+    pub inline fn eql(_: StorageKeyContext, a: StorageKey, b: StorageKey) bool {
+        if (a.slot != b.slot) return false;
+        return AddressWords.of(&a.address).eql(AddressWords.of(&b.address));
     }
 
     fn fmix64(value: u64) u64 {
@@ -129,19 +151,15 @@ pub const StorageKeyContext = struct {
 };
 
 /// Account map context: the 20-byte address folded into one 64-bit word and avalanched,
-/// compared as one integer. `AutoContext` hashes the bytes through wyhash and compares them
+/// compared as words. `AutoContext` hashes the bytes through wyhash and compares them
 /// element-wise.
 pub const AddressContext = struct {
-    pub fn hash(_: AddressContext, address: Address) u64 {
-        const word: u160 = @bitCast(address);
-        var folded: u64 = @truncate(word);
-        folded = (folded ^ @as(u64, @truncate(word >> 64))) *% StorageKeyContext.multiplier;
-        folded = (folded ^ @as(u64, @truncate(word >> 128))) *% StorageKeyContext.multiplier;
-        return StorageKeyContext.fmix64(folded);
+    pub inline fn hash(_: AddressContext, address: Address) u64 {
+        return StorageKeyContext.fmix64(AddressWords.of(&address).fold());
     }
 
-    pub fn eql(_: AddressContext, a: Address, b: Address) bool {
-        return @as(u160, @bitCast(a)) == @as(u160, @bitCast(b));
+    pub inline fn eql(_: AddressContext, a: Address, b: Address) bool {
+        return AddressWords.of(&a).eql(AddressWords.of(&b));
     }
 };
 

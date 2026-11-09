@@ -381,6 +381,12 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   intx-style 3-by-2 estimate was tried and gained nothing. A/B vs P4, two sets of 3 rounds:
   geometric mean 1.04-1.07x (uniswap_v3_pool 1.12-1.21x, curve_tricrypto2 1.09-1.11x);
   division falls from ~20% to ~14% of the curve_3pool + uniswap_v3_pool profile.
+- Map keys: the account and slot map contexts read an address as three little-endian words
+  (`AddressWords`) instead of bit-casting `[20]u8` to `u160`, which compiled to twenty byte
+  loads per hash and compare in an out-of-line `eql` (8% of snailtracer). Same hash values,
+  so map layout and order are unchanged. A/B vs the division commit: 1.09x geometric mean on
+  eight state-heavy fixtures (weth 1.21x, erc20_transfer 1.12x, entry_point 1.11x),
+  snailtracer 1.04x.
 - Base 10-block replay (`base replay bench ... --evm-only`, ReleaseSafe), P2 and P4 binaries
   run alternately in one session: every block matches its header on both, 10.82 -> 10.16 ms
   per block (1.07x), every block faster. Absolute times are ~1.6x those of 2026-11-08 because
@@ -413,6 +419,8 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-09: map keys read addresses as words, not byte by byte: 1.09x on state-heavy
+  fixtures.
 - 2026-11-09: `divq` quotient digits on x86-64, 1.04-1.07x on division-heavy fixtures; Base
   replay at P4 still matches every header, 1.07x faster per block than P2.
 - 2026-11-08: P4: folded-address hashing for the account and in-memory database maps,
