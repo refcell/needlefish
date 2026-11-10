@@ -348,6 +348,11 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   curve_tricrypto2 (0.96x) and curve-stableswap-2pool (0.98x); ReleaseSafe trails on the
   contract-heavy cases (curve_tricrypto2 0.74x, entry_point 0.79x, aggregation_router 0.83x)
   and wins the compute ones (fibonacci 1.20x, factorial 1.06x, burntpix 1.00x).
+- Base 10-block replay at ee94b4f against P2 (f819f64), both ReleaseSafe -Dcpu=native, run
+  alternately in one session (3 rounds of 10 warm passes, 330/330 header matches each):
+  5.16 ms to 4.28 ms per block (1.21x, 95% CI 1.12-1.26), every block faster (1.11-1.34x).
+  EVM time is exec_ns - pre_ns. This session's absolute times are lower than the 2026-11-09
+  measurement of the same pair (6.34 to 5.19 ms), so compare the ratio, not the milliseconds.
 - P6 speeds up secp256k1 and the safe-build code check. ecrecover builds R's odd multiples
   affine on an isomorphic curve (libsecp256k1's global-z table), so every R digit is a
   mixed addition, and inlines the field multiply (50 -> 42 µs per recovery). Safe builds

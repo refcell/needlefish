@@ -433,6 +433,14 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-10: Base 10-block replay at ee94b4f (`base replay bench
+  src/infra/replay/testdata/base-mainnet-53715983-10.nfrp 10 --evm-only`, ReleaseSafe
+  -Dcpu=native, taskset -c 3). Both binaries built the same way and run alternately, 3 rounds
+  of 10 warm passes, 330/330 header matches each (gas used, logs bloom, receipts root). EVM
+  time is exec_ns - pre_ns. Mean of per-block medians: 5.16 ms at P2 (f819f64) to 4.28 ms
+  (1.21x, bootstrap 95% CI 1.12-1.26 over the rounds). Every block faster, 1.11-1.34x
+  (largest 53715987, 6.15 to 4.60 ms). Absolute times are below the 2026-11-09 session
+  (6.34 to 5.19 ms, 1.22x), so only this session's ratio is comparable.
 - 2026-11-09: B1 at P6 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.24x (was 1.10x;
   the per-frame code compare had also run on every top-level call, so small transactions on
   large contracts gain most), ReleaseFast 1.38x, both memos 1.42x. Behind: ReleaseFast
