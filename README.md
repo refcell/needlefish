@@ -14,6 +14,11 @@ else. It is a ground-up port of [base/base](https://github.com/base/base) and ke
 layout, so every crate there has an obvious home here. L2 blocks are full blocks at Base's
 native 200 ms cadence; there are no flashblocks.
 
+<p align="center">
+  <img src="docs/assets/base-up-demo.gif" width="800"
+    alt="base up showing a live needlefish Base mainnet node: every block executed and checked">
+</p>
+
 ## Highlights
 
 - **Syncs Base mainnet.** A needlefish node has executed more than 1.6 million consecutive
@@ -43,8 +48,9 @@ What is not there yet:
   network has not been tested on mainnet yet.
 - **History.** The node keeps only the head state. There are no archive queries and no
   transaction pool, and its RPC is read-only.
-- **Operations.** Setup is a sequence of manual steps. Nothing restarts the processes for
-  you.
+- **Operations.** `base up` is new. The node in the recording above was set up step by step
+  before `base up` existed; `base up` shows it read-only. A full `base up` run from an empty
+  machine has not been done on mainnet yet.
 - **Sequencing.** The sequencer, batcher, proposer, and challenger have only run on the
   [local devnet](#local-devnet), never on a public network. Do not run them with real funds.
 
@@ -67,17 +73,23 @@ and more. Run `base` with no arguments to list them.
 
 ### Run a Base mainnet node
 
-A mainnet node takes four steps:
+```sh
+base up
+```
 
-1. Download the state from Base's public snapshot.
-2. Import it. The import verifies every account and slot against the snapshot block's
+`base up` takes a machine from nothing to a node at the tip of Base mainnet:
+
+1. It checks the setup first: disk space, ports, and the L1 endpoints.
+2. It downloads Base's latest public snapshot and imports it. The import recomputes the state
+   root from every account and storage slot and requires it to match the snapshot block's
    header.
-3. Follow the chain with `base el-run`, which executes and checks every block it receives
-   from peers.
-4. Run `base consensus` to derive the safe and finalized heads from Ethereum L1.
+3. It runs the execution node, which executes and checks every block it gets from peers.
+4. It runs the consensus node, which derives the safe and finalized heads from Ethereum L1.
 
-The [mainnet guide](docs/MAINNET.md) covers each step, the hardware it needs (about 3.5 TB of
-NVMe), and the node's current limits.
+Run it again to resume after an interruption; it never re-imports over a verified database.
+On a datadir where a node is already running, it shows that node's live view instead. The
+[mainnet guide](docs/MAINNET.md) covers the hardware it needs (about 3.5 TB of NVMe), each
+step in detail, and the node's current limits.
 
 ### Replay mainnet blocks
 

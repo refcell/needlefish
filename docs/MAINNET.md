@@ -1,9 +1,11 @@
 # Running a Base mainnet node
 
-These are the steps the first needlefish Base mainnet node ran, from November 7, 2026. They
-take verified state from Base's public reth snapshot, execute every block after it from
-execution-layer peers over devp2p, and derive the safe and finalized heads from Ethereum L1.
-Every step is a `base` subcommand. Setup is manual for now: there is no single command yet.
+`base up` runs all of this in one command; `base up --help` lists its options. This guide is
+what happens underneath, step by step. These are the steps the first needlefish Base mainnet
+node ran, from November 7, 2026, before `base up` existed. They take verified state from
+Base's public reth snapshot, execute every block after it from execution-layer peers over
+devp2p, and derive the safe and finalized heads from Ethereum L1. Every step is a `base`
+subcommand.
 
 ## Requirements
 
@@ -121,6 +123,7 @@ starts. `optimism_syncStatus` on port 7546 reports the safe and finalized heads.
 - **Restarts.**
   - Restarting el-run empties its engine ring, so consensus has to wait for it to warm up
     again.
-  - Run each process under a supervisor such as systemd. Nothing restarts them on its own.
+  - Run by hand, nothing restarts the processes on their own. `base up` supervises them
+    and restarts them with backoff.
 - **Snapshots.** Base rotates its snapshots. The import has been verified on reth
   2.5.2-dev snapshots (block 54528124).
