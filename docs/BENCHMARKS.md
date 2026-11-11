@@ -292,14 +292,14 @@ reset, for 20 ms of warm-up and 20 ms timed per case and process
 the same gas used. Speedup is the ratio of median µs per transaction over fresh processes,
 above 1 meaning the first engine is faster; the summary is the geometric mean over cases.
 
-| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) | P5 (ReleaseSafe checks) | P6 (secp256k1, code check) | P7 (code reads, CALLDATALOAD, inverse check) | P8 (division stalls, keccak theta) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x | 1.10x | 1.24x | 1.27x | 1.29x |
-| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x | 1.37x | 1.38x | 1.37x | 1.38x |
-| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x | 1.62x | 1.63x | 1.65x | 1.64x |
-| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x | 1.41x | 1.42x | 1.38x | 1.39x |
-| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - | - | - | - | - |
-| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x | 1.24x | 1.23x | 1.28x | 1.29x |
+| pair | P0 (before) | P1 (register locals) | P2 (handler stores and checks) | P3 (keccak) | P4 (lookups, division) | P5 (ReleaseSafe checks) | P6 (secp256k1, code check) | P7 (code reads, CALLDATALOAD, inverse check) | P8 (division stalls, keccak theta) | P9 (division in registers) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| needlefish ReleaseSafe vs evm2 tail-call | 0.64x | 0.76x | 0.84x | 0.85x | 1.04x | 1.10x | 1.24x | 1.27x | 1.29x | 1.30x |
+| needlefish ReleaseFast vs evm2 tail-call | 0.77x | 0.89x | 1.05x | 1.13x | 1.36x | 1.37x | 1.38x | 1.37x | 1.38x | 1.39x |
+| needlefish ReleaseFast vs evm2 stable (packed) | 0.91x | 1.04x | 1.24x | 1.49x | 1.69x | 1.62x | 1.63x | 1.65x | 1.64x | 1.65x |
+| needlefish ReleaseFast vs evm2 tail-call, both with keccak memo | - | - | - | 1.07x | 1.37x | 1.41x | 1.42x | 1.38x | 1.39x | 1.39x |
+| needlefish ReleaseFast (no memo) vs evm2 tail-call + keccak memo | 0.70x | 0.81x | 0.96x | - | - | - | - | - | - | - |
+| evm2 tail-call vs revm | 1.25x | 1.25x | 1.25x | 1.30x | 1.20x | 1.24x | 1.23x | 1.28x | 1.29x | 1.29x |
 
 | case (ReleaseFast vs evm2 tail-call) | P0 µs | P1 µs | P2 µs | evm2 µs (P2 run) | P2 speedup | P3 speedup | P3 both memo | P4 speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -403,6 +403,20 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   its ReleaseFast cost), not in the dispatch loop. Base 10-block replay against P7 in one
   session: every header and state root matches; EVM time 1.013x (95% CI 1.009-1.021) for the
   division change and 1.004x (1.002-1.006) more for keccak, block total with roots 1.03x.
+- P9 keeps division results in registers until the stack slot: `div`, `rem`, `div_rem` and
+  single-limb division inline into the out-of-line DIV/MOD/ADDMOD/MULMOD bodies, which end in
+  one 32-byte store (P8 still passed results through stack temporaries copied with
+  unforwardable wide loads). Against P8, two interleaved runs: curve_tricrypto2 1.055-1.075x
+  ReleaseSafe and 1.045x ReleaseFast, curve-stableswap 1.03-1.06x, uniswap_v3_pool
+  1.02-1.04x. In this run ReleaseSafe reaches 1.01x on curve-stableswap and 1.00x on
+  curve_tricrypto2 (P8 0.95x, 0.96x). Behind in ReleaseSafe: entry_point 0.94x (secp256k1
+  field asserts), onchain_lm_v2 and burntpix 0.96x, curve_3pool, factorial and
+  fibonacci-calldata 0.97x; factorial varies 5% between processes of one binary, and 12
+  processes each put its ReleaseSafe-only cost at 4%. Measured and not kept: a one-sided
+  stack check in safe builds with unchecked stack indexing (one `lea` fewer per opcode, the
+  ReleaseFast form) ran 0.985x (CI 0.982-0.989), onchain_lm_v2 0.957x; P5's two-sided check
+  stays. Base replay: every header and state root matches, EVM time 1.001x. The orb paused
+  several times during this run.
 - hash_10k chains KECCAK256 over 32 fresh bytes, so no memo helps; evm2's keccak-asm runs
   the same AVX-512 lane-per-register permutation as needlefish's, within ~4%.
 - P2 also skips clearing an empty transient-storage table in the untimed state reset (as each
@@ -415,7 +429,7 @@ above 1 meaning the first engine is faster; the summary is the geometric mean ov
   which is why the case table gives P3 as speedups only. P4 is 10 rounds measured
   2026-11-09 with nothing else running; a P4 run under load from a parallel test suite read
   the curve pools at 0.68-0.76x, so compare only unloaded runs. P5 is 10 rounds measured
-  2026-11-09 on an idle VM, as is P6. P7 and P8 are 10 rounds each, measured 2026-11-11 on
+  2026-11-09 on an idle VM, as is P6. P7, P8 and P9 are 10 rounds each, measured 2026-11-11 on
   an idle VM (two physical cores with two hyperthreads each; runs pinned to one hyperthread
   while its sibling stayed idle).
 

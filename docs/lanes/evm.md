@@ -452,6 +452,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: B1 at P9 (10 rounds; the orb paused several times): ReleaseSafe 1.30x,
+  ReleaseFast 1.39x vs evm2 tail-call. ReleaseSafe curve-stableswap 1.01x, curve_tricrypto2
+  1.00x, uniswap_v3_pool 0.98x; behind: entry_point 0.94x, onchain_lm_v2 and burntpix 0.96x,
+  curve_3pool, factorial, fibonacci-calldata 0.97x. Rejected after measuring: one-sided
+  stack check in safe builds plus indexing the stack through a many-pointer (drops the
+  `lea` of the two-sided check on 78 of 94 sites, no new panic branches, ReleaseFast
+  byte-identical) ran 0.985x ReleaseSafe (CI 0.982-0.989; onchain_lm_v2 0.957x, burntpix
+  0.948x), so the two-sided check stays. The remaining safe-only branches in the loop are
+  the `f.pc` u32 cast at the 29 sync points (rare, expensive opcodes) and asserts.
 - 2026-11-11: division results stay in registers. After the slot-write change, `uint.div`
   and the single-limb path still returned 32- and 64-byte results through stack
   temporaries written in 8- and 16-byte pieces and copied with 32-byte loads. `div_rem`,
