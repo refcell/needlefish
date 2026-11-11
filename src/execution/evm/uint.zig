@@ -23,8 +23,11 @@ pub fn DivRem(comptime T: type) type {
 
 /// `a / b` and `a % b` for `b != 0`. `T` is `u256` or a wider dividend (u320 for
 /// ADDMOD, u512 for MULMOD); the divisor is always a word.
-pub fn div_rem(comptime T: type, a: T, b: u256) DivRem(T) {
-    return div_rem_with(hardware_divide, T, a, b);
+pub inline fn div_rem(comptime T: type, a: T, b: u256) DivRem(T) {
+    // Inlined so the paths' results stay in registers: called out of line, the 64-byte
+    // result was assembled in a stack temporary from 8- and 16-byte stores and copied out with
+    // 32-byte loads, which cannot be forwarded from them and stalled every division.
+    return @call(.always_inline, div_rem_with, .{ hardware_divide, T, a, b });
 }
 
 /// x86-64 divides 128 by 64 bits in one instruction, which on current cores (Ice Lake and
@@ -45,7 +48,8 @@ fn div_rem_with(comptime hardware: bool, comptime T: type, a: T, b: u256) DivRem
     }
     if (T != u256 and a <= std.math.maxInt(u256)) {
         // Most ADDMOD and MULMOD dividends fit a word: skip the wide limb loops.
-        const narrow = div_rem_with(hardware, u256, @intCast(a), b);
+        const word: u256 = @intCast(a);
+        const narrow = @call(.always_inline, div_rem_with, .{ hardware, u256, word, b });
         return .{ .quotient = narrow.quotient, .remainder = narrow.remainder };
     }
     const dividend_limbs = limbs_of(T, a);
@@ -58,12 +62,12 @@ fn div_rem_with(comptime hardware: bool, comptime T: type, a: T, b: u256) DivRem
     };
 }
 
-pub fn div(a: u256, b: u256) u256 {
+pub inline fn div(a: u256, b: u256) u256 {
     if (b == 0) return 0;
     return div_rem(u256, a, b).quotient;
 }
 
-pub fn rem(a: u256, b: u256) u256 {
+pub inline fn rem(a: u256, b: u256) u256 {
     if (b == 0) return 0;
     return div_rem(u256, a, b).remainder;
 }
@@ -213,7 +217,7 @@ inline fn divide_2by1(
 
 /// Short division by a single-limb divisor, one digit per dividend limb. `divq` needs no
 /// normalization; the reciprocal step does.
-fn div_rem_single(
+inline fn div_rem_single(
     comptime hardware: bool,
     comptime T: type,
     a: T,

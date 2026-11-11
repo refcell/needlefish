@@ -298,7 +298,7 @@ noinline fn binary_into(
     a: u256,
     b: u256,
 ) void {
-    write(slot, function(a, b));
+    write(slot, @call(.always_inline, function, .{ a, b }));
 }
 
 /// ADDMOD, MULMOD.
@@ -316,7 +316,7 @@ noinline fn ternary_into(
     b: u256,
     c: u256,
 ) void {
-    write(slot, function(a, b, c));
+    write(slot, @call(.always_inline, function, .{ a, b, c }));
 }
 
 pub fn add(a: u256, b: u256) u256 {

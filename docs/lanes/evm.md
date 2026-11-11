@@ -452,6 +452,19 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: division results stay in registers. After the slot-write change, `uint.div`
+  and the single-limb path still returned 32- and 64-byte results through stack
+  temporaries written in 8- and 16-byte pieces and copied with 32-byte loads. `div_rem`,
+  `div`, `rem` and the single-limb path are now inline, and `binary_into`/`ternary_into`
+  inline the opcode function, so the out-of-line body ends in one store from registers
+  (Knuth stays a call, read back with 8-byte loads). Two runs of 10 and 12 interleaved
+  rounds vs b51a8a9: curve_tricrypto2 1.055-1.075x ReleaseSafe, 1.045-1.048x ReleaseFast;
+  curve-stableswap 1.03-1.06x / 1.02x; uniswap_v3_pool 1.02x / 1.035x; snailtracer
+  1.01-1.02x; geomean 1.004x (CI 1.001-1.009) ReleaseSafe, 1.002x ReleaseFast.
+  balancer_vault read 0.97-0.98x in ReleaseSafe only (the dispatch loop moved within its
+  cache line; its code is unchanged). The remaining ReleaseSafe-only panic branches in
+  division are TigerStyle asserts (`high < d` per digit, Knuth's pre/postconditions) plus
+  cold cast and decrement checks.
 - 2026-11-11: B1 at P8 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.29x, ReleaseFast
   1.38x, both memos 1.39x. hash_10k 0.90x -> 0.99x and erc20_transfer 0.93x -> 1.06x in
   both builds (keccak theta, crypto lane log); snailtracer at parity. Left in ReleaseSafe:
