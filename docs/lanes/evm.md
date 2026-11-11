@@ -452,6 +452,17 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: division without store-forwarding stalls. `uint.div_rem` returned its 64-byte
+  `DivRem` through memory and the handler reloaded it with wide loads straddling the callee's
+  narrower stores (a misaligned 32-byte reload in curve_3pool), and the single-limb path
+  built its quotient in a stack array indexed at runtime. Now DIV/SDIV/MOD/SMOD on operands
+  that fit a u64 divide in registers, wider ones (and ADDMOD/MULMOD) run out of line and
+  write the stack slot with one 32-byte store, and single-limb division is unrolled per
+  dividend length. 16 interleaved rounds vs 4c03795: snailtracer 1.043x ReleaseFast (CI
+  1.026-1.076), 1.030x ReleaseSafe, the rest within noise; unrolling alone (without the slot
+  write) cost curve and uniswap_v3 3-5%. Base replay: 660/660 headers, EVM 1.013x (CI
+  1.009-1.021). The cheaper MLOAD/MSTORE bounds path (one compare, out-of-line growth) was
+  noise (ReleaseSafe 1.003x, CI 0.996-1.011): the old path already did a single compare.
 - 2026-11-11: B1 at P7 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.27x (P6 1.24x on
   another VM; interleaved A/Bs against P6: 1.043x for once-per-frame code bounds, then
   1.014x for CALLDATALOAD), ReleaseFast 1.37x, both memos 1.38x. ReleaseSafe gaps: curve

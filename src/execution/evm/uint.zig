@@ -221,16 +221,41 @@ fn div_rem_single(
     divisor: u64,
 ) DivRem(T) {
     assert(divisor != 0);
-    assert(dividend_limbs <= @bitSizeOf(T) / limb_bits);
+    assert(dividend_limbs >= 1 and dividend_limbs <= @bitSizeOf(T) / limb_bits);
+    // Unrolled per dividend length so the digits stay in registers: a loop indexing a
+    // stack array stored the quotient one limb at a time and read it back as wider vectors,
+    // which cannot be forwarded from the narrower stores and stalled every division.
+    return switch (dividend_limbs) {
+        inline 1...@bitSizeOf(T) / limb_bits => |count| div_rem_single_unrolled(
+            hardware,
+            T,
+            count,
+            a,
+            divisor,
+        ),
+        else => unreachable,
+    };
+}
+
+inline fn div_rem_single_unrolled(
+    comptime hardware: bool,
+    comptime T: type,
+    comptime count: u32,
+    a: T,
+    divisor: u64,
+) DivRem(T) {
+    comptime assert(count >= 1 and count <= @bitSizeOf(T) / limb_bits);
+    assert(divisor != 0);
     const shift: u6 = if (hardware) 0 else @intCast(@clz(divisor));
     const d = divisor << shift;
     const v = if (hardware) 0 else reciprocal(d);
-    const u = normalized(T, a, dividend_limbs, shift);
+    // `a` has `count` significant limbs, so limb `count` of the shifted dividend holds the
+    // bits shifted out of the top one.
+    const u = to_limbs(Wide(T), @as(Wide(T), a) << shift);
     var quotient: Limbs(T) = @splat(0);
-    var carry: u64 = u[dividend_limbs];
-    var index = dividend_limbs;
-    while (index > 0) {
-        index -= 1;
+    var carry: u64 = u[count];
+    inline for (0..count) |step_index| {
+        const index = count - 1 - step_index;
         const step = divide_2by1(hardware, carry, u[index], d, v);
         carry = step.remainder;
         quotient[index] = step.quotient;

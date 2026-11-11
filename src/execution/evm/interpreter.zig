@@ -189,12 +189,12 @@ inline fn execute_registers(
         op.ADD => binary(s, add),
         op.MUL => binary(s, mul),
         op.SUB => binary(s, sub),
-        op.DIV => binary(s, div),
-        op.SDIV => binary(s, sdiv),
-        op.MOD => binary(s, mod),
-        op.SMOD => binary(s, smod),
-        op.ADDMOD => ternary(s, addmod),
-        op.MULMOD => ternary(s, mulmod),
+        op.DIV => divide(s, div, false),
+        op.SDIV => divide(s, sdiv, false),
+        op.MOD => divide(s, mod, true),
+        op.SMOD => divide(s, smod, true),
+        op.ADDMOD => modular(s, addmod),
+        op.MULMOD => modular(s, mulmod),
         op.SIGNEXTEND => binary(s, signextend),
         op.LT => binary(s, lt),
         op.GT => binary(s, gt),
@@ -270,11 +270,53 @@ inline fn binary(s: *Stack, comptime function: anytype) void {
     write(b, function(a, b.*));
 }
 
-inline fn ternary(s: *Stack, comptime function: anytype) void {
+// Division writes its result into the stack slot from out of line, with one 32-byte store.
+// Returned through memory (`uint.DivRem`), it was reloaded by the handler with wide loads
+// that straddled the callee's stores, could not be forwarded, and stalled every division.
+
+/// DIV, SDIV, MOD, SMOD. Operands that both fit a machine word are non-negative, so all four
+/// are the 64-bit operation, done here in registers; wider ones go out of line.
+inline fn divide(
+    s: *Stack,
+    comptime function: fn (u256, u256) u256,
+    comptime remainder: bool,
+) void {
+    const a = s.pop();
+    const b = s.peek(0);
+    if (a | b.* <= std.math.maxInt(u64)) {
+        const x: u64 = @intCast(a);
+        const y: u64 = @intCast(b.*);
+        write(b, if (y == 0) 0 else if (remainder) x % y else x / y);
+        return;
+    }
+    binary_into(function, b, a, b.*);
+}
+
+noinline fn binary_into(
+    comptime function: fn (u256, u256) u256,
+    slot: *u256,
+    a: u256,
+    b: u256,
+) void {
+    write(slot, function(a, b));
+}
+
+/// ADDMOD, MULMOD.
+inline fn modular(s: *Stack, comptime function: fn (u256, u256, u256) u256) void {
     const a = s.pop();
     const b = s.pop();
     const c = s.peek(0);
-    write(c, function(a, b, c.*));
+    ternary_into(function, c, a, b, c.*);
+}
+
+noinline fn ternary_into(
+    comptime function: fn (u256, u256, u256) u256,
+    slot: *u256,
+    a: u256,
+    b: u256,
+    c: u256,
+) void {
+    write(slot, function(a, b, c));
 }
 
 pub fn add(a: u256, b: u256) u256 {
