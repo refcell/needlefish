@@ -99,8 +99,13 @@ const tip_wait_ms = 100;
 /// of their 200 ms slot, so 30 ms leaves room to catch up; behind the tip, `poll` only.
 const tip_serve_ms = 30;
 
+/// At the tip, a block whose lag rose by more than this over the previous block's gets a
+/// `slow block` line saying where the time before it went.
+const slow_rise_ms = 400;
+
 comptime {
     assert(tip_serve_ms < tip_wait_ms);
+    assert(tip_wait_ms < slow_rise_ms);
 }
 
 const Flags = struct {
@@ -249,6 +254,12 @@ const Run = struct {
     tip_blocks: u64 = 0,
     lag_sum_ms: u64 = 0,
     lag_max_ms: u64 = 0,
+    lag_last_ms: u64 = 0,
+    /// Where the time between the previous block's commit and this block's execution went.
+    gap: Gap = .{},
+    /// `gap` summed over the tip blocks since the last summary (the `tip ms/block:` line).
+    gap_sum: Gap = .{},
+    gap_blocks: u64 = 0,
 
     fn now_ms(run: *const Run) i64 {
         return Io.Clock.awake.now(run.io).toMilliseconds();
@@ -373,32 +384,82 @@ fn cache_blocks_of(cache_mb: u32, config: *const base.execution.db.database.Conf
     return @intCast(blocks);
 }
 
+/// The time between two blocks' execution, by what el-run was doing (milliseconds).
+const Gap = struct {
+    /// Inside `feed.next`: devp2p requests, including those that found no new block.
+    fetch_ms: u64 = 0,
+    /// Making committed blocks durable (`Runner.flush`).
+    flush_ms: u64 = 0,
+    /// The idle wait after a fetch found no new block.
+    idle_ms: u64 = 0,
+    /// Serving the Engine API and JSON-RPC after the previous block.
+    serve_ms: u64 = 0,
+    /// Fetches that found no new block.
+    polls: u64 = 0,
+
+    fn add(sum: *Gap, gap: Gap) void {
+        inline for (@typeInfo(Gap).@"struct".field_names) |name| {
+            @field(sum, name) += @field(gap, name);
+        }
+    }
+};
+
 /// Executes blocks until `--blocks`, `--duration`, or the first failure (1).
 fn run_blocks(run: *Run) !u8 {
     while (!run.done()) {
         var block: el_source.Block = undefined;
-        if (!try run.feed.next(&block)) {
+        const asked_ms = run.now_ms();
+        const got = try run.feed.next(&block);
+        const fetched_ms = run.now_ms();
+        run.gap.fetch_ms += @intCast(fetched_ms - asked_ms);
+        if (!got) {
             // Nothing new yet: make what we have durable, then wait for the next block.
+            run.gap.polls += 1;
             try run.flush();
+            const flushed_ms = run.now_ms();
+            run.gap.flush_ms += @intCast(flushed_ms - fetched_ms);
             if (!run.at_tip and run.feed.at_tip) {
                 std.debug.print("el-run: at the tip, block {d}\n", .{run.db.head_info.number});
             }
             run.at_tip = run.feed.at_tip;
             try serve_idle(run, tip_wait_ms);
+            run.gap.idle_ms += @intCast(run.now_ms() - flushed_ms);
             continue;
         }
         if (!try run_one(run, &block)) return 1;
+        const served_ms = run.now_ms();
         if (run.feed.at_tip and (run.engine != null or run.rpc != null)) {
             try serve_idle(run, tip_serve_ms);
         } else {
             if (run.engine) |service| service.poll();
             if (run.rpc) |service| service.poll();
         }
+        const flushed_ms = run.now_ms();
+        run.gap.serve_ms += @intCast(flushed_ms - served_ms);
         run.unflushed += 1;
         if (run.unflushed >= flush_every) try run.flush();
+        run.gap.flush_ms += @intCast(run.now_ms() - flushed_ms);
         if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
     }
     return 0;
+}
+
+/// At the tip, accounts the gap before `number` (executed in `exec_ms`) and prints a
+/// `slow block` line when its lag rose by more than `slow_rise_ms` over the previous block's.
+fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64) void {
+    assert(run.feed.at_tip);
+    const gap = run.gap;
+    run.gap = .{};
+    run.gap_sum.add(gap);
+    run.gap_blocks += 1;
+    const rise_ms = lag_ms -| run.lag_last_ms;
+    run.lag_last_ms = lag_ms;
+    if (rise_ms <= slow_rise_ms) return;
+    std.debug.print("slow block {d}: lag_ms {d} (+{d}), before it: fetch {d} ms ({d} empty), " ++
+        "flush {d} ms, idle {d} ms, serve {d} ms; exec {d} ms\n", .{
+        number,       lag_ms,  rise_ms, gap.fetch_ms, gap.polls, gap.flush_ms, gap.idle_ms,
+        gap.serve_ms, exec_ms,
+    });
 }
 
 /// Serves the Engine API and the JSON-RPC server for `duration_ms` while no block is
@@ -453,6 +514,9 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         run.tip_blocks += 1;
         run.lag_sum_ms += lag_ms;
         run.lag_max_ms = @max(run.lag_max_ms, lag_ms);
+        account_gap(run, block.number, elapsed, lag_ms);
+    } else {
+        run.gap = .{};
     }
     std.debug.print("block {d} hash {x} {d} txs {d} gas {d} ms lag_ms {d} checks ok\n", .{
         block.number, block.hash, outcome.transactions, outcome.gas_used, elapsed, lag_ms,
@@ -531,6 +595,7 @@ fn summary(run: *Run) void {
         run.feed.switches,
         elapsed_s,
     });
+    print_gap(run);
     print_phases(run);
     if (run.engine) |service| service.engine.summary();
     if (run.rpc) |service| service.api.summary();
@@ -539,6 +604,26 @@ fn summary(run: *Run) void {
         run.peers_printed_ms = now;
         run.feed.pool.print_peers();
     }
+}
+
+/// Milliseconds per tip block between two blocks' execution, by what el-run was doing,
+/// since the last summary; then starts the next interval.
+fn print_gap(run: *Run) void {
+    if (run.gap_blocks == 0) return;
+    const sum = run.gap_sum;
+    const blocks: f64 = @floatFromInt(run.gap_blocks);
+    std.debug.print("tip ms/block: fetch {d:.1} flush {d:.1} idle {d:.1} serve {d:.1}, " ++
+        "{d:.2} empty fetches, {d} blocks\n", .{
+        @as(f64, @floatFromInt(sum.fetch_ms)) / blocks,
+        @as(f64, @floatFromInt(sum.flush_ms)) / blocks,
+        @as(f64, @floatFromInt(sum.idle_ms)) / blocks,
+        @as(f64, @floatFromInt(sum.serve_ms)) / blocks,
+        @as(f64, @floatFromInt(sum.polls)) / blocks,
+        run.gap_blocks,
+    });
+    run.gap_sum = .{};
+    run.gap_blocks = 0;
+    assert(run.gap_sum.fetch_ms == 0);
 }
 
 /// Milliseconds per committed block in each runner phase (`Runner.Stats.time`).
