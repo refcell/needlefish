@@ -396,6 +396,25 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   `len <= 1024` so the optimizer drops the index checks. Code, memory and stack checks that
   can fire all remain; 383 -> 321 panic branches, loop 6% smaller. A/B, 4 rounds: ReleaseSafe
   1.12x geometric mean (factorial 1.47x, weth 1.26x, fibonacci 1.15x, curve 1.11-1.14x).
+- ReleaseSafe, P7: the loop still bounds-checked every opcode fetch and PUSH immediate
+  against the padded code, every JUMPDEST bitmap read, and every memory word against the
+  shared buffer. None can fire: pc stays inside the zero-padded code (an opcode moves it at
+  most 33 bytes, a jump lands below `len`, and every padding byte is a STOP, which exits),
+  the bitmap has (len + 7) / 8 bytes, and `grow` keeps `memory.len <= bytes.len`. `run`
+  asserts the padding and bitmap invariants once per frame entry and reads through
+  pointers; memory keeps its range assert. 331 -> 151 panic branches in the safe loop, and
+  ReleaseFast compiles to the same code. A u64 `Frame.pc`, which would also drop the 29
+  sync-point `@intCast`s, gained as much in ReleaseSafe but changed ReleaseFast's register
+  allocation (curve_tricrypto2 0.87x), so pc stays u32 in the frame. CALLDATALOAD reads a
+  word wholly inside the calldata in place: the zero-padded copy (memcpy, memset, then a
+  32-byte load of the bytes just stored) stalled on store forwarding in both builds.
+  ReleaseFast's curve_tricrypto2 moves by up to 5% when only the code's address changes
+  (identical loop bytes), so single-case ReleaseFast differences below that are layout.
+- Safe-build checks measured and kept: the remaining checks in 256-bit division are
+  TigerStyle asserts (Knuth's D3 bound, normalization, the remainder bound), worth at most
+  ~1.1-1.2x on multi-limb divisors in a micro bench. Overflow-free forms of the secp256k1
+  squaring carries and the safegcd limb updates measured inside noise (ecrecover 1.03x)
+  and were not kept.
 - hash_10k chains KECCAK256 over 32 fresh bytes, so no memo helps. evm2's keccak-asm uses the
   same AVX-512 lane-per-register permutation as `permute_one`, and ours runs within ~4% of
   it; needlefish's interpreter share of the case is smaller than evm2's. A 32/64-byte fast
@@ -433,6 +452,13 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: B1 at P7 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.27x (P6 1.24x on
+  another VM; interleaved A/Bs against P6: 1.043x for once-per-frame code bounds, then
+  1.014x for CALLDATALOAD), ReleaseFast 1.37x, both memos 1.38x. ReleaseSafe gaps: curve
+  0.85-0.87x -> 0.93-0.96x, entry_point 0.85x -> 0.93x, routers now 1.04-1.05x. Still
+  behind: hash_10k 0.90x in both builds; snailtracer, erc20_transfer 0.93-0.95x. Base
+  10-block replay vs P6: 550/550 headers, EVM time 1.015x (CI 1.000-1.033); the safegcd
+  check fix (crypto lane log) cuts sender recovery 1.198 -> 1.074 ms per block.
 - 2026-11-10: Base 10-block replay at ee94b4f (`base replay bench
   src/infra/replay/testdata/base-mainnet-53715983-10.nfrp 10 --evm-only`, ReleaseSafe
   -Dcpu=native, taskset -c 3). Both binaries built the same way and run alternately, 3 rounds

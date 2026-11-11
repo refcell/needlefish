@@ -369,6 +369,14 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
   modes run every vector plus seeded round trips, a batch test, and a batch test.
 
 ## Log
+- 2026-11-11 (evm lane): safegcd `invert` checks its result with a Barrett product (mu
+  fixed at comptime) instead of `inverse * x % m`: LLVM lowers the wide `%` to a bit-serial
+  loop of about 70k instructions at 256 bits, run on every inversion of a safe-build
+  signature recovery (the ecrecover precompile and each sender). ReleaseSafe ecrecover 47.9 -> 43.0 us (statetest, 8 interleaved
+  rounds); Base 10-block replay sender recovery 1.198 -> 1.074 ms per block. The tests
+  compare the Barrett product with `%` on all four moduli. Overflow-free forms of the field
+  squaring carries and the safegcd limb updates (no overflow checks in safe builds)
+  measured inside noise (ecrecover 1.03x) and were not kept.
 - 2026-11-09 (evm lane): secp256k1 field add, sub, half, small multiples and the product
   reduction are written on whole u256/u320 words, so LLVM emits straight add-with-carry
   chains instead of u128 accumulator steps: ecrecover 42.2 -> 40.9 us (scratch bench,
