@@ -276,6 +276,36 @@ test "disc service: large simulated cluster converges (-Dslow-tests)" {
     try expect_convergence(16, 20_000, 8);
 }
 
+test "disc service: lookup results are published even when their bucket is full" {
+    // The OP Stack DHT is shared by every chain, so a node's k-buckets fill with the first
+    // chain nodes it meets. Node 1 keeps one node per bucket; lookups through the boot node
+    // still return every node, and each must reach the dialer (sigp `Discovered`).
+    const node_count = 12;
+    const cluster = try Cluster.init(std.testing.allocator, 0xb0c4e7, node_count, 0);
+    defer cluster.deinit();
+    const small = &cluster.services[1];
+    const secret = small.secret;
+    const record = small.local_record;
+    small.deinit(std.testing.allocator);
+    small.* = try Service.init(std.testing.allocator, .{
+        .chain_id = chain_id,
+        .lookup_interval_ns = 1000 * ns_per_ms,
+        .table = .{
+            .bucket_size = 1,
+            .replacements_max = 1,
+            .subnet_bucket_max = 0,
+            .subnet_table_max = 0,
+        },
+    }, secret, record, cluster.prngs[1].random());
+    cluster.boot_all_from(0);
+    cluster.run(8000 * ns_per_ms);
+    try std.testing.expect(small.table.live_count() < node_count - 2);
+    for (0..node_count) |index| {
+        if (index == 1) continue;
+        try std.testing.expect(cluster.discovered[1][index]);
+    }
+}
+
 test "disc service: 10% packet loss, retries keep every node discovered" {
     const cluster = try Cluster.init(std.testing.allocator, 0x1055, 6, 100_000);
     defer cluster.deinit();

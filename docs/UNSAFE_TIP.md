@@ -75,6 +75,32 @@ The check fails closed: after a rotation, new blocks are rejected as `invalid_si
   base/base). It takes a peer's slot as soon as one frees. The gater's redial limits
   still apply.
 
+### Correction (2026-11-11): the scarcity was our discovery, not NAT
+
+The small population above, and a 15-minute mainnet run on 2026-11-11 with 0 gossip blocks
+(at most 1 peer, 216 go-aways, 39 records published), came from a discovery bug. discv5
+handed a record to the dialer only when it fit in the Kademlia table (16 per bucket). The
+DHT is shared by every OP Stack chain, so the few Base nodes that fit were the well-known
+ones. Those are base/base nodes that fill all 30 connection slots with their own outbound
+dials, and they refuse every other connection: a yamux go-away, code 0, before identify. That is
+rust-libp2p `connection_limits`. sigp discv5 reports every lookup result
+(`Discovered`), and base/base dials every valid one. needlefish now does the same. The
+rust-libp2p cross-check above was given our peer list, so it could not catch this.
+
+Measured on Base mainnet from an outbound-only orb with no inbound port (0 accepted). Both
+binaries are ReleaseSafe, ran at the same time for 600 s, and used the default unsafe-watch
+flags:
+
+| binary | records published | peers at end | valid signed blocks | links | lag avg |
+|---|---|---|---|---|---|
+| before | 28 | 0 | 0 | - | - |
+| after | 534 | 6 (base/base, op-node, other) | 2,902 | 2,895 ok, 3 gaps, 0 reorgs | 37 ms |
+
+The before binary got 656 go-aways and no gossip RPCs. The after binary validated every
+block: 0 rejected, 0 bad signer.
+
+Port forwarding still helps (inbound peers), but it is not needed to receive gossip.
+
 ## Snapshot to tip
 
 Gossip only carries the live window. Blocks older than 60 s are rejected

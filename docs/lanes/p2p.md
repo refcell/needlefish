@@ -46,6 +46,15 @@ behind a small interface and switch later.
   busy base/base peers go-away at their connection limit and non-mesh links idle out
   after 60 s, so a node must keep asking for a slot. Test: redials happen only when
   enabled, skip connected and other-chain nodes, and wait for the interval after a failure.
+- [x] Dial every discovered chain node, not only table entries (2026-11-11). discv5
+  published a record only when `Table.insert` added or updated it, so once the k-buckets
+  of the shared OP Stack DHT filled, new Base nodes were parked and never dialed. A node
+  saw about 30 to 40 Base records, all well-known base/base nodes at their 30-connection
+  limit (yamux go-away code 0 before identify). That was the cause of "no gossip behind
+  NAT", not NAT itself. sigp discv5 emits `Discovered` for every lookup result and
+  base/base dials each valid one, so `on_found_record` now publishes every valid result.
+  Test: a node with one entry per bucket still publishes every cluster node (fails
+  before the fix). Live, outbound-only: see docs/UNSAFE_TIP.md "Correction".
 - [ ] Peer-based backfill: base/base has no req/resp. The viable path is devp2p eth/68
   against reth (SYNC_PLAN M8); see docs/UNSAFE_TIP.md.
   - [x] RLPx and eth/68 codecs (`src/execution/p2p`), with seeded and coverage fuzz of
@@ -562,3 +571,4 @@ behind a small interface and switch later.
 - 2026-11-05: gossip validation parity audit; version-matrix and schedule-replay tests.
 - 2026-11-05: discv5 table refuses stale-record endpoint moves.
 - 2026-11-06: first live Base Sepolia gossip blocks (`base unsafe-watch`); known-node redial.
+- 2026-11-11: discovery publishes every lookup result; outbound-only mainnet gossip works.

@@ -777,7 +777,10 @@ pub const Service = struct {
         now_ns: u64,
     ) void {
         const advertised = endpoint_of(record) orelse return;
-        if (advertised.eql(from)) return service.learn(record, now_ns);
+        if (advertised.eql(from)) {
+            _ = service.learn(record, now_ns);
+            return;
+        }
         service.stats.unverifiable_enr += 1;
         if (service.is_banned(record.node_id(), now_ns)) return;
         service.publish(record);
@@ -808,7 +811,7 @@ pub const Service = struct {
             const advertised = endpoint_of(&verifying.record) orelse return;
             if (!advertised.eql(from)) return;
             service.stats.unverifiable_enr_verified += 1;
-            service.learn(&verifying.record, now_ns);
+            _ = service.learn(&verifying.record, now_ns);
             return;
         }
     }
@@ -829,18 +832,23 @@ pub const Service = struct {
     }
 
     /// Inserts a verified record; publishes it and probes a full bucket's oldest entry.
-    fn learn(service: *Service, record: *const enr.Record, now_ns: u64) void {
-        if (service.is_banned(record.node_id(), now_ns)) return;
-        const endpoint = endpoint_of(record) orelse return;
+    /// Returns whether the record was published.
+    fn learn(service: *Service, record: *const enr.Record, now_ns: u64) bool {
+        if (service.is_banned(record.node_id(), now_ns)) return false;
+        const endpoint = endpoint_of(record) orelse return false;
         // Known nodes are published again (base/base forwards every lookup result), so
         // the dialer can reconnect peers that dropped, subject to the gater's redial cap.
         switch (service.table.insert(record, endpoint, now_ns)) {
-            .added, .updated => service.publish(record),
-            .pending => |value| {
-                const entry = service.table.get(value.least_recent) orelse return;
-                service.send_ping(entry.node_id, entry.endpoint, entry.record.public_key, now_ns);
+            .added, .updated => {
+                service.publish(record);
+                return true;
             },
-            else => {},
+            .pending => |value| {
+                const entry = service.table.get(value.least_recent) orelse return false;
+                service.send_ping(entry.node_id, entry.endpoint, entry.record.public_key, now_ns);
+                return false;
+            },
+            else => return false,
         }
     }
 
@@ -1020,7 +1028,15 @@ pub const Service = struct {
             return;
         }
         if (std.mem.eql(u8, &node_id, &service.local_id)) return;
-        service.learn(&record, now_ns);
+        // Every lookup result is dialable, not only the ones that fit the table: sigp
+        // discv5 reports each (`Discovered`) and base/base dials every valid one. The
+        // DHT is shared by all OP Stack chains, so the few chain nodes that fit the
+        // k-buckets are the well-known ones, and on Base mainnet those are full.
+        const published = service.learn(&record, now_ns);
+        const known = service.table.get(node_id) != null;
+        if (!published and !known and !service.is_banned(node_id, now_ns)) {
+            service.publish(&record);
+        }
         if (service.lookup.active) _ = service.lookup.add(&record);
     }
 };
