@@ -452,6 +452,17 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: onchain_lm_v2 (0.97x evm2 in both builds) is not a packing cost. Attributing
+  samples to opcodes through the dispatch jump table and comparing with evm2's per-handler
+  symbols: ADD +4.4 ms, SHL +4.1, MLOAD +3.1, MUL +1.6, JUMPDEST +1.6, SAR -5.0 per 245 ms
+  transaction. The ADD/MUL result packing is the same 7 uops as evm2's (vmovq/vpunpcklqdq
+  against vmovq/vpinsrq), and MLOAD differs by two spill reloads. LLVM lowers a variable
+  `u256 <<`/`>>` through the stack (two 32-byte stores, loads at a computed offset), while evm2
+  shifts in registers; a register funnel shift (`shld` + cmov, evm2's form) for SHL, SHR and
+  BYTE measured as noise in 10 interleaved rounds (geomean 1.001x ReleaseSafe, 0.999x
+  ReleaseFast; onchain_lm_v2 0.997x / 1.013x): each 8-byte load lies inside one 32-byte
+  store, so it forwards. Not kept. The per-opcode differences sit on handler entries, where
+  the preceding indirect jump's mispredicts land; no single handler explains the 3%.
 - 2026-11-11: B1 at P9 (10 rounds; the orb paused several times): ReleaseSafe 1.30x,
   ReleaseFast 1.39x vs evm2 tail-call. ReleaseSafe curve-stableswap 1.01x, curve_tricrypto2
   1.00x, uniswap_v3_pool 0.98x; behind: entry_point 0.94x, onchain_lm_v2 and burntpix 0.96x,
