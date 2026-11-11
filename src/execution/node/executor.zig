@@ -776,6 +776,7 @@ pub const Executor = struct {
             .nonce = caller.info.nonce,
             .chain_id = executor.spec.chain_id,
             .access_list = call.access_list,
+            .skip_sender_code_check = true,
         };
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         return switch (result) {
@@ -813,6 +814,7 @@ pub const Executor = struct {
             .nonce = caller.info.nonce,
             .chain_id = executor.spec.chain_id,
             .access_list = call.access_list,
+            .skip_sender_code_check = true,
         };
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         const executed = switch (result) {

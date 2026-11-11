@@ -222,6 +222,11 @@ test "executor: simulate runs a call without committing" {
     try testing.expectEqual(@as(u64, 21_000), transfer_result.executed.gas_used);
     const poor = try f.executor.simulate(&block_env(1), .{ .to = target, .value = 1 });
     try testing.expect(poor == .invalid);
+    // A contract may be the sender of a call (EIP-3607 binds signed transactions only).
+    const from_contract = try f.executor.simulate(&block_env(1), .{ .from = target, .to = target });
+    try testing.expect(from_contract == .executed);
+    try testing.expect(from_contract.executed.success);
+    try testing.expectEqual(@as(u8, 0x2a), from_contract.executed.output[31]);
 }
 
 /// Random transfer blocks checked against a balance/nonce model.

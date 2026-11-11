@@ -72,6 +72,9 @@ pub const TxEnv = struct {
     is_system_transaction: bool = false,
     /// EIP-8130: the signed transaction; `envelope` must carry its EIP-2718 encoding.
     eip8130: ?*const eip8130.Signed = null,
+    /// An unsigned call (eth_call, eth_simulateV1): a sender with code may call, as geth
+    /// and reth allow. EIP-3607 rejects it only for signed transactions.
+    skip_sender_code_check: bool = false,
 };
 
 pub const Invalid = enum {
@@ -251,7 +254,7 @@ fn validate_and_buy_gas(
     fees: ?*const op.Fees,
 ) state_module.Error!?Invalid {
     const sender = try evm.state.load(tx.caller);
-    if (sender.info.has_code()) {
+    if (sender.info.has_code() and !tx.skip_sender_code_check) {
         const code = try evm.state.code(sender);
         const delegated = fork.at_least(.prague) and bytecode.delegation_target(code) != null;
         if (!delegated) return .sender_has_code;
