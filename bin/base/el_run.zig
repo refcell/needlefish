@@ -501,6 +501,35 @@ fn print_phases(run: *const Run) void {
         std.debug.print(" {s} {d:.2}", .{ name[0 .. name.len - 3], per_block_ms });
     }
     std.debug.print("\n", .{});
+    print_room(run);
+}
+
+/// What the `room` phase waited on (`import/room.zig`'s counters, since the start): ms per
+/// committed block by what the storage was doing during the waiting ticks, the waits by the
+/// condition that was short, and the checkpoints asked for and started.
+fn print_room(run: *const Run) void {
+    const stats = &run.runner.stats;
+    assert(stats.blocks > 0);
+    const room = &stats.room;
+    const blocks: f64 = @floatFromInt(stats.blocks);
+    std.debug.print("room ms/block:", .{});
+    inline for (@typeInfo(base.execution.import.room.Phase).@"enum".field_names) |name| {
+        const phase = @field(base.execution.import.room.Phase, name);
+        const ns: f64 = @floatFromInt(room.ns(phase));
+        std.debug.print(" {s} {d:.2}", .{ name, ns / 1e6 / blocks });
+    }
+    std.debug.print(", waits {d} (queue {d} journal {d} admission {d} start {d}), " ++
+        "checkpoints requested {d} ahead {d} started {d}, busy retries {d}\n", .{
+        room.waits,
+        room.short_queue,
+        room.short_journal,
+        room.short_admission,
+        room.start_waits,
+        room.checkpoints_requested,
+        room.checkpoints_ahead,
+        room.checkpoints_started,
+        stats.busy_retries,
+    });
 }
 
 test "el-run: flags" {
