@@ -567,11 +567,7 @@ inline fn environment_value(
         op.ORIGIN => s.push(primitives.address_to_u256(evm.tx.origin)),
         op.CALLER => s.push(primitives.address_to_u256(f.caller)),
         op.CALLVALUE => s.push(f.value),
-        op.CALLDATALOAD => {
-            var word: [32]u8 = undefined;
-            memory_module.copy_padded(&word, f.input, s.peek(0).*);
-            write(s.peek(0), primitives.word_from_be(&word));
-        },
+        op.CALLDATALOAD => write(s.peek(0), calldata_word(f.input, s.peek(0).*)),
         op.CALLDATASIZE => s.push(f.input.len),
         op.CODESIZE => s.push(f.analyzed.len),
         op.GASPRICE => s.push(evm.tx.gas_price),
@@ -579,6 +575,19 @@ inline fn environment_value(
         op.CHAINID => s.push(evm.config.chain_id),
         else => block_value(fork, opcode, s, evm),
     }
+}
+
+/// CALLDATALOAD: the word at `offset` in `input`, zero-padded past its end. A word wholly
+/// inside the input is read in place; going through a zero-padded buffer (memcpy, memset,
+/// then a 32-byte load of the bytes just stored) stalled on store forwarding.
+inline fn calldata_word(input: []const u8, offset: u256) u256 {
+    if (offset < input.len and input.len - @as(usize, @intCast(offset)) >= 32) {
+        const start: usize = @intCast(offset);
+        return primitives.word_from_be(input[start..][0..32]);
+    }
+    var word: [32]u8 = undefined;
+    memory_module.copy_padded(&word, input, offset);
+    return primitives.word_from_be(&word);
 }
 
 /// Environment opcodes that copy into memory or read state (sync points).
