@@ -6,93 +6,52 @@
 [![Status](https://img.shields.io/badge/status-alpha-yellow?style=for-the-badge)](#status)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
 
-needlefish is [Base](https://base.org), the Ethereum L2, rewritten from scratch in Zig: execution
-client, rollup consensus node, block builder, batcher, and tooling, with zero dependencies.
-L2 blocks are full blocks at Base's native 200 ms subsecond cadence; there are no flashblocks.
+**[Base](https://base.org), the Ethereum L2, rewritten from scratch in Zig.**
 
-It is a ground-up port of the public [base/base](https://github.com/base/base) repository and
-keeps its layout, so every crate there has an obvious home here.
+needlefish is a complete Base node stack: execution client, rollup consensus node, block
+builder, batcher, and fault-proof tooling, built on the Zig standard library and nothing
+else. It is a ground-up port of [base/base](https://github.com/base/base) and keeps its
+layout, so every crate there has an obvious home here. L2 blocks are full blocks at Base's
+native 200 ms cadence; there are no flashblocks.
 
 <p align="center">
   <img src="docs/assets/replay-demo.gif" width="800"
-    alt="just replay fetches the latest 10 Base mainnet blocks and replays them offline">
+    alt="needlefish fetches the latest 10 Base mainnet blocks and replays them offline">
 </p>
 
-needlefish syncs Base mainnet. A needlefish node started from Base's public reth
-snapshot at block 54528124. needlefish imported the snapshot only after recomputing its
-state root from every account and storage slot and matching it to the block header. As of
-November 11, 2026, the node had executed 1.63 million consecutive blocks from
-execution-layer peers over devp2p, and every block's state root, receipts root, gas, bloom
-and hash matched. It follows the tip at a median of about 180 ms behind, and its consensus
-node's safe and finalized heads equal mainnet.base.org's by number and hash. A sampler
-compares state at the head with the public chain every 5 minutes, and has found 0
-mismatches in 1,344 calls. [docs/MAINNET.md](docs/MAINNET.md) has the steps to run one.
+## Highlights
+
+- **Syncs Base mainnet.** A needlefish node has executed more than 1.6 million consecutive
+  mainnet blocks from a verified snapshot, with every block's state root, receipts root, gas,
+  bloom, and hash matching the canonical chain. Its safe and finalized heads match
+  mainnet.base.org's.
+- **Zero dependencies.** Keccak, secp256k1, BN254, BLS12-381, KZG, brotli, the EVM, the trie,
+  the storage engine, devp2p, HTTP, and JSON-RPC are all implemented here.
+- **Tested like a database.** Deterministic simulation of the whole cluster with fault
+  injection, coverage-guided fuzzing of every decoder, and differential tests against public
+  Ethereum vectors.
+- **Fast.** Up to 24x faster than base/base's executor on mainnet blocks once state roots
+  are included. See the [benchmarks](#benchmarks).
 
 ## Status
 
-needlefish follows Base mainnet as a verifying node: execution and the consensus node's safe
-and finalized heads, as above. The rest is younger:
+needlefish runs on Base mainnet as a verifying node. The first one started from Base's public
+reth snapshot at block 54528124 and accepted it only after recomputing the state root from
+every account and storage slot. By November 11, 2026, it had executed 1.63 million
+consecutive blocks fetched from execution-layer peers. It follows the tip at a median of about
+180 ms. Every 5 minutes, a sampler compares balances, nonces, code, storage, and proofs at the
+head with the public chain; it has found 0 mismatches in 1,344 calls.
 
-- The unsafe head comes from devp2p peers. Base's consensus gossip network (`el-run
-  --gossip`) has not delivered mainnet blocks yet: it needs inbound ports, and the node so
-  far ran behind NAT.
-- The node keeps only the head state: no archive queries, no transaction pool, and its RPC
-  is read-only.
-- Setup is manual ([docs/MAINNET.md](docs/MAINNET.md)), and nothing restarts the processes
-  for you.
-- The sequencer, batcher, proposer and challenger have only run on the local
-  [devnet](#local-devnet), never on a public network. Do not run them with real funds.
+What is not there yet:
 
-## Design
-
-- **Zero dependencies.** Only the Zig standard library: no C libraries, no vendored code,
-  `build.zig.zon` has an empty `.dependencies`. Keccak, secp256k1, BN254, BLS12-381, KZG,
-  brotli, the EVM, the trie, the storage engine, HTTP, and JSON-RPC are all implemented here.
-- **TigerStyle.** Assertions on every precondition, postcondition, and invariant; static
-  allocation at startup; every loop and queue bounded; no recursion; functions ≤ 70 lines.
-  See [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md).
-- **Deterministic simulation testing.** All network, disk, time, and randomness go through an
-  injected IO layer. The simulator runs the real component code on simulated infrastructure
-  with fault injection, and any run replays exactly from its seed.
-- **Fuzzed.** Every decoder, parser, and state machine has a coverage-guided fuzz target and a
-  seeded fuzz run that executes with the normal test suite.
-- **io_uring.** Completion-based IO on Linux, kqueue on macOS, the same API in simulation.
-- **Fast.** Performance is designed in and measured; see [Benchmarks](#benchmarks).
-
-## Benchmarks
-
-Measured on a 4-vCPU cloud VM (not a dedicated server). The comparison is executor against
-executor: needlefish's block executor and base/base's stateless executor
-(`base-proof-executor`, the block builder of its fault-proof program) replay the same Base
-mainnet blocks from the same witness, single-threaded, needlefish `ReleaseSafe` against
-base/base `maxperf`, both tuned for the native CPU. Both reproduce every canonical header.
-Medians of the window time over 30 warm runs (5 for 1,000 blocks), with the 95% interval
-of the speedup:
-
-| Blocks | Phase | needlefish | base/base | Speedup |
-| --- | --- | ---: | ---: | ---: |
-| 100 (53775088..) | execution | 5.17 ms/block | 8.86 ms/block | 1.72x (1.64-1.75) |
-| 100 (53775088..) | execution + state and receipts roots | 8.06 ms/block | 61.26 ms/block | 7.60x (7.33-7.73) |
-| 1,000 (54048836..) | execution + state and receipts roots | 6.88 ms/block | 169.34 ms/block | 24.62x (24.19-24.79) |
-| 100, EVM only | transactions over a flat in-memory state | 3.92 ms/block | 3.33 ms/block | 0.85x (0.78-0.98) |
-
-- The execution gap is reading state from the witness: with state reads taken out (EVM
-  only), base/base's interpreter (revm) is about 15% faster than needlefish's.
-- The root gap is an algorithm: base/base's proof executor re-hashes every trie node it
-  holds on every block, so its root time grows with the window; needlefish caches node
-  hashes and re-hashes only dirty nodes. base/base's node (reth) computes roots
-  differently; it is compared separately below.
-- base/base wins on the interpreter, on sender recovery (C libsecp256k1), and on the
-  executor's memory (181 MiB peak against needlefish's 780 MiB in `ReleaseSafe`, 224 MiB in
-  `ReleaseFast`, on 100 blocks).
-- Node to node, on a small synthetic devnet chain (332 blocks, 12,778 transactions, a
-  10,000-account state), needlefish's node answers `engine_newPayload` in 4.00 ms median
-  against `base-reth-node`'s 8.03 ms. A node-to-node comparison on mainnet state has not
-  been measured yet.
-
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the full build matrix, the phase breakdown and
-profiles, the environment, and `etc/bench/reproduce.sh`. Micro benchmarks (`just bench`)
-are in [docs/PERF.md](docs/PERF.md).
+- **Gossip.** The unsafe head comes from execution-layer peers. Base's consensus gossip
+  network has not been tested on mainnet yet.
+- **History.** The node keeps only the head state. There are no archive queries and no
+  transaction pool, and its RPC is read-only.
+- **Operations.** Setup is a sequence of manual steps. Nothing restarts the processes for
+  you.
+- **Sequencing.** The sequencer, batcher, proposer, and challenger have only run on the
+  [local devnet](#local-devnet), never on a public network. Do not run them with real funds.
 
 ## Installation
 
@@ -101,33 +60,40 @@ git clone https://github.com/refcell/needlefish && cd needlefish
 just release
 ```
 
-`just release` needs [`just`](https://github.com/casey/just) and `curl`. It uses Zig 0.17.1 from
-`PATH`, or downloads it into `.cache/zig`, and writes optimized binaries to `zig-out/bin`.
-needlefish has no other build dependency. There are no tagged releases; build from `main`.
+`just release` needs [just](https://github.com/casey/just) and `curl`. It uses Zig 0.17.1 from
+your `PATH`, or downloads it, and writes optimized binaries to `zig-out/bin`. There are no
+other build dependencies and no tagged releases yet; build from `main`.
 
 ## Usage
 
-Everything ships in one multi-tool binary, `base`, mirroring base/base's `bin/` entry points as
-subcommands: `node`, `consensus`, `batcher`, `proposer`, `challenger`, `replay`, operator tools,
-and more. `base` with no arguments lists them all.
+Everything ships in one binary, `base`, with a subcommand for each of base/base's entry
+points: `node`, `consensus`, `batcher`, `proposer`, `challenger`, `replay`, operator tools,
+and more. Run `base` with no arguments to list them.
+
+### Run a Base mainnet node
+
+A mainnet node takes four steps:
+
+1. Download the state from Base's public snapshot.
+2. Import it. The import verifies every account and slot against the snapshot block's
+   header.
+3. Follow the chain with `base el-run`, which executes and checks every block it receives
+   from peers.
+4. Run `base consensus` to derive the safe and finalized heads from Ethereum L1.
+
+The [mainnet guide](docs/MAINNET.md) covers each step, the hardware it needs (about 3.5 TB of
+NVMe), and the node's current limits.
+
+### Replay mainnet blocks
 
 ```sh
-base version                    # version and git revision
-base devnet init --out .devnet  # generate a local devnet: genesis, rollup config, JWT
-base replay run src/infra/replay/testdata/base-mainnet-53715983-10.nfrp  # replay 10 mainnet blocks
-just replay 100                 # fetch the latest 100 mainnet blocks and replay them offline
+just replay        # fetch the latest 10 Base mainnet blocks and replay them offline
+just replay 100    # the same for the latest 100
 ```
 
-### Base mainnet node
-
-```sh
-base snapshot-import --db mdbx.dat --chain base-mainnet --blake3 <hash> --out mainnet.nf
-base el-run --db mainnet.nf --chain base-mainnet --peers peers.txt --rpc --engine.addr ...
-base consensus --rollup-config rollup.json --l1 ... --l1-beacon ... --l2 ...
-```
-
-[docs/MAINNET.md](docs/MAINNET.md) walks through every step: the snapshot download, the
-verified import, finding peers, el-run, and the consensus node.
+Replay fetches recent blocks and the state they touch from public RPC, re-executes them
+offline, and checks every header field against the chain. It needs no snapshot and no disk
+beyond a small cache. [Learn how replay works](docs/REPLAY.md).
 
 ### Local devnet
 
@@ -135,12 +101,12 @@ The devnet runs natively, with no Docker and no external L1: needlefish brings i
 chain.
 
 ```sh
-just devnet up       # init configs, start every component
-just devnet status   # pids and chain heads
-just devnet smoke    # end to end: L2 tx sequenced, batched to L1, derived by the verifier
-just devnet logs     # tail all logs
+just devnet up       # generate configs and start every component
+just devnet status   # processes and chain heads
+just devnet smoke    # end to end: an L2 transaction is sequenced, batched, and derived
+just devnet logs     # follow every log
 just devnet down     # stop everything
-just devnet reset    # wipe .devnet/ and start fresh
+just devnet reset    # wipe the devnet and start fresh
 ```
 
 | Process | Command | Ports |
@@ -152,18 +118,74 @@ just devnet reset    # wipe .devnet/ and start fresh
 | L2 verifier EL | `base node` | http 10545, engine 10551 |
 | L2 verifier CL | `base consensus` | rpc 8547 |
 
-L1 is chain 900 with 2 s blocks; L2 is chain 901 with native 200 ms blocks and every hardfork
-active at genesis. Prefunded accounts come from the public dev mnemonic
+L1 is chain 900 with 2 s blocks; L2 is chain 901 with 200 ms blocks and every hardfork active
+at genesis. Prefunded accounts come from the public dev mnemonic
 `test test test test test test test test test test test junk`. Everything the devnet writes,
-including the generated JWT secret, stays in the git-ignored `.devnet/` directory.
-[docs/DEVNET.md](docs/DEVNET.md) has the full process contract, flags, and smoke test.
+including its generated JWT secret, stays in a git-ignored `.devnet` directory. The
+[devnet guide](docs/DEVNET.md) documents every process, flag, and the smoke test.
+
+## Design
+
+- **Zero dependencies.** Only the Zig standard library: no C libraries and no vendored code.
+- **TigerStyle.** Assertions on every precondition, postcondition, and invariant; static
+  allocation at startup; every loop and queue bounded; no recursion; short functions. Read
+  the [style guide](docs/TIGER_STYLE.md).
+- **Deterministic simulation testing.** All network, disk, time, and randomness go through an
+  injected IO layer. The simulator runs the real components on simulated infrastructure with
+  fault injection, and any run replays exactly from its seed.
+- **Fuzzed.** Every decoder, parser, and state machine has a coverage-guided fuzz target and a
+  seeded fuzz run that executes with the normal test suite.
+- **io_uring.** Completion-based IO on Linux, kqueue on macOS, and the same API in simulation.
+
+The [architecture overview](docs/ARCHITECTURE.md) shows how the pieces fit together.
+
+## Benchmarks
+
+needlefish's block executor against base/base's stateless executor (`base-proof-executor`),
+replaying the same Base mainnet blocks from the same witness. Both run single-threaded, built
+for the native CPU (needlefish `ReleaseSafe`, base/base `maxperf`), and both reproduce every
+canonical header. Times are medians per block over 30 warm runs (5 for 1,000 blocks) on a
+4-vCPU cloud VM:
+
+| Blocks | Work | needlefish | base/base | Speedup (95% CI) |
+| ---: | --- | ---: | ---: | ---: |
+| 100 | Execution | 5.17 ms | 8.86 ms | **1.72x** (1.64–1.75) |
+| 100 | Execution + state and receipts roots | 8.06 ms | 61.26 ms | **7.60x** (7.33–7.73) |
+| 1,000 | Execution + state and receipts roots | 6.88 ms | 169.34 ms | **24.62x** (24.19–24.79) |
+| 100 | EVM only, over a flat in-memory state | 3.92 ms | 3.33 ms | **0.85x** (0.78–0.98) |
+
+- **Roots.** base/base's proof executor re-hashes every trie node it holds on every block,
+  so its root time grows with the window. needlefish caches node hashes and re-hashes only
+  dirty nodes.
+- **Where base/base wins.**
+  - The interpreter: revm is about 15% faster with state reads taken out.
+  - Sender recovery, which uses the C libsecp256k1.
+  - Memory: 181 MiB peak against needlefish's 780 MiB in `ReleaseSafe` (224 MiB in
+    `ReleaseFast`) on 100 blocks.
+- **Node to node.** On a synthetic devnet chain of 332 blocks and 12,778 transactions,
+  needlefish answers `engine_newPayload` in 4.00 ms median, against `base-reth-node`'s
+  8.03 ms. A node-to-node comparison on mainnet state has not been measured yet.
+
+The [full benchmark report](docs/BENCHMARKS.md) has the build matrix, phase breakdown,
+profiles, environment, and a script to reproduce every number. Micro benchmarks run with
+`just bench` and are tracked in the [performance notes](docs/PERF.md).
+
+## Documentation
+
+- [Mainnet guide](docs/MAINNET.md): run a node that syncs Base mainnet.
+- [Replay](docs/REPLAY.md): re-execute mainnet blocks offline.
+- [Devnet](docs/DEVNET.md): the local all-Zig devnet.
+- [Architecture](docs/ARCHITECTURE.md): how the components fit together.
+- [Benchmarks](docs/BENCHMARKS.md): methodology and full results.
+- [Sync plan](docs/SYNC_PLAN.md): the road to a fully verified mainnet node.
+- [Style guide](docs/TIGER_STYLE.md): the TigerStyle rules this codebase follows.
 
 ## Contributing
 
-`just` lists every development recipe: tests, fuzzing, deterministic simulation, and
-benchmarks. Contributor rules are in [AGENTS.md](AGENTS.md); the design is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md).
+Run `just` to list every development recipe: tests, fuzzing, deterministic simulation, and
+benchmarks. Read the [contributor guide](AGENTS.md) before opening a change; it covers the
+rules every commit follows.
 
 ## License
 
-[MIT](LICENSE).
+needlefish is released under the [MIT License](LICENSE).
