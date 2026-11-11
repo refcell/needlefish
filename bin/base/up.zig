@@ -256,7 +256,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     const described = try read_node_file(&up);
     if (try lock_held(&up)) {
         if (described) |node| return watch_node(&up, node);
-        view.header(up.chain.name, up.chain.config.chain_id, up.datadir);
+        view.header(up.chain.name, up.chain.config.chain_id, shown_path(&up, up.datadir));
         view.ok("node", "another `base up` is preparing this datadir (snapshot or import); " ++
             "its terminal and {s}/logs show its progress", .{up.datadir});
         return 0;
@@ -267,7 +267,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         // set up (lock, download, import) over it because it did not answer once.
         if (!left_by_base_up(&up, &node)) return refuse_silent_node(&up, &node);
     };
-    view.header(up.chain.name, up.chain.config.chain_id, up.datadir);
+    view.header(up.chain.name, up.chain.config.chain_id, shown_path(&up, up.datadir));
     if (!try prepare_datadir(&up)) return 1;
     // One `base up` per datadir; the lock lasts as long as this process.
     const lock = take_lock(&up) catch |err| switch (err) {
@@ -494,6 +494,17 @@ fn node_answers(up: *const Up, node: *const NodeFile) !bool {
     return error.WrongChain;
 }
 
+/// `path` as the header shows it: under $HOME as `~/...`, so a screen never names the user.
+fn shown_path(up: *const Up, path: []const u8) []const u8 {
+    const home = up.home orelse return path;
+    assert(path.len > 0);
+    if (home.len == 0 or home.len >= path.len) return path;
+    if (!std.mem.startsWith(u8, path, home) or path[home.len] != '/') return path;
+    const shown = std.fmt.allocPrint(up.arena, "~{s}", .{path[home.len..]}) catch return path;
+    assert(shown[0] == '~');
+    return shown;
+}
+
 /// Shows a running node, read-only, until Ctrl-C.
 fn watch_node(up: *Up, node: NodeFile) !u8 {
     if (node.chain) |name| switch (up_check.resolve_chain(name)) {
@@ -502,7 +513,7 @@ fn watch_node(up: *Up, node: NodeFile) !u8 {
     };
     const detail = try std.fmt.allocPrint(up.arena, "{s}  read-only view, Ctrl-C leaves it " ++
         "running", .{
-        up.datadir,
+        shown_path(up, up.datadir),
     });
     up.view.header(up.chain.name, up.chain.config.chain_id, detail);
     return up_run.watch(up.gpa, up.io, up.view, .{
@@ -534,18 +545,19 @@ fn left_by_base_up(up: *const Up, node: *const NodeFile) bool {
 /// Fails closed on a described node that does not answer: nothing is set up or touched.
 fn refuse_silent_node(up: *const Up, node: *const NodeFile) u8 {
     assert(node.el_rpc != null or node.el_log != null);
-    up.view.header(up.chain.name, up.chain.config.chain_id, up.datadir);
+    const datadir = shown_path(up, up.datadir);
+    up.view.header(up.chain.name, up.chain.config.chain_id, datadir);
     if (node.el_rpc) |url| {
         up.view.fail("node", "{s}/node.json describes a node at {s} that does not answer", .{
-            up.datadir, url,
+            datadir, url,
         });
     } else {
         up.view.fail("node", "{s}/node.json describes a node whose log {s} does not exist", .{
-            up.datadir, node.el_log.?,
+            datadir, node.el_log.?,
         });
     }
     up.view.fix("start that node, or delete {s}/node.json to set up a new node here", .{
-        up.datadir,
+        datadir,
     });
     return 1;
 }
