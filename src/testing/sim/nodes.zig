@@ -78,7 +78,8 @@ pub const L1Block = struct {
 };
 
 pub const Message = union(enum) {
-    unsafe_block: struct { number: u64, payload: u64, hash: u64 },
+    /// `sync`: an answer to a `sync_request` (catch-up), not gossip of a new block.
+    unsafe_block: struct { number: u64, payload: u64, hash: u64, sync: bool = false },
     sync_request: struct { number_first: u64 },
     batch_submit: Batch,
     l1_block: L1Block,
@@ -240,6 +241,7 @@ pub const Sequencer = struct {
                 .number = number,
                 .payload = sequencer.chain.payloads[number],
                 .hash = sequencer.chain.hashes[number],
+                .sync = true,
             } });
         }
     }

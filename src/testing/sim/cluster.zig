@@ -34,6 +34,11 @@
 //!     sequencer drift; it never equivocates or rewinds (across restarts too), its gossip
 //!     is its recorded chain, and after healing it produces on time and its safe head
 //!     reaches its unsafe head
+//!   - real gossip (`Config.real_gossip`, the consensus lane's p2p service on every
+//!     sequencer and verifier node, see `real_gossip.zig`): every block a node's service
+//!     validates and hands out is the sequencer's block at that height, and after healing
+//!     the newest published block reaches every verifier node whose clock is close enough
+//!     to the sequencer's to pass the gossip timestamp window
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -46,11 +51,16 @@ const real_verifier = @import("real_verifier.zig");
 const real_sequencer = @import("real_sequencer.zig");
 const real_execution = @import("real_execution.zig");
 const real_reference = @import("real_reference.zig");
+const real_gossip = @import("real_gossip.zig");
+const gossip_bridge = @import("../../consensus/service/gossip_bridge.zig");
 const RealBatcher = real_batcher.RealBatcher;
 const NodeId = network_module.NodeId;
 
 pub const verifier_count_max = network_module.node_count_max - nodes.node_verifier_first;
 pub const step_ns: u64 = 10 * std.time.ns_per_ms;
+/// Largest clock skew with real gossip: two clocks then differ by at most 4 s, inside the
+/// gossip validation window (5 s into the future).
+pub const gossip_clock_skew_ns_max: u64 = 2 * std.time.ns_per_s;
 const ns_per_s = std.time.ns_per_s;
 
 /// Byzantine channels use mid-size frames: a few frames each, so shuffling matters but
@@ -119,6 +129,25 @@ pub const Config = struct {
     /// reference engine executes the sequencer chain (`real_reference.zig`). Needs
     /// `real_verifier` or `real_sequencer`.
     real_execution: bool = false,
+    /// Carry unsafe blocks over the consensus lane's real p2p gossip (`real_gossip.zig`):
+    /// signed SSZ payloads through gossipsub on simulated connections, instead of model
+    /// `unsafe_block` messages to the real verifier. Catch-up (`sync_request`) stays a
+    /// model message. Needs `real_execution` (gossip validation checks real block hashes)
+    /// and `real_sequencer`: validation rejects blocks older than 60 s, and only the real
+    /// sequencer keeps block timestamps on its clock. The model sequencer stamps block `n`
+    /// with `n * 2 s` whenever it produces it, so its blocks fall behind the clock by its
+    /// total downtime and every peer would reject them and graylist it.
+    real_gossip: bool = false,
+    /// BUG(p2p): with real gossip, the sequencer also publishes blocks older than the
+    /// 60 s gossip window, as base/base's seal pipeline does (commit, gossip, insert). A
+    /// real sequencer that fell behind (lost L1, crashed) catches up with such blocks;
+    /// every peer rejects them (`timestamp_past`), and one rejection graylists the
+    /// sequencer (P4 weight -140.4475 against -40) for hours, because base/base's
+    /// `score_decay` shrinks the counter to 99%, not 1%, per 600 s. Those peers then drop
+    /// every later block, and a verifier stops following the unsafe chain. Off (the sim
+    /// skips stale blocks; catch-up goes through `sync_request`) until needlefish decides
+    /// on the sequencer side or the decay; see docs/lanes/dst-fuzz.md.
+    publish_stale_gossip: bool = false,
 
     /// Swarm testing: a random but valid configuration per seed. Different seeds explore
     /// different corners (one verifier vs many, lossy vs clean, flaky vs stable).
@@ -176,6 +205,14 @@ pub const Config = struct {
         config.real_execution = prng.chance(1, 2);
         if (!config.real_verifier and !config.real_sequencer) config.real_execution = false;
         config.fit_real_execution();
+        // Drawn last; see `real_gossip` for why it needs both.
+        config.real_gossip = prng.chance(1, 2) and config.real_execution and
+            config.real_sequencer;
+        // Gossip validation rejects blocks more than 5 s in the future, so peers need
+        // NTP-grade clocks (base/base has no allowance either).
+        if (config.real_gossip) {
+            config.clock_skew_ns_max = @min(config.clock_skew_ns_max, gossip_clock_skew_ns_max);
+        }
         config.validate();
         return config;
     }
@@ -203,6 +240,9 @@ pub const Config = struct {
         assert(config.l1_block_txs_min >= 1);
         assert(config.l1_block_txs_min <= nodes.l1_batches_max);
         assert(!config.real_execution or config.real_verifier or config.real_sequencer);
+        assert(!config.real_gossip or (config.real_execution and config.real_sequencer));
+        assert(!config.real_gossip or config.clock_skew_ns_max <= gossip_clock_skew_ns_max);
+        assert(!config.publish_stale_gossip or config.real_gossip);
     }
 
     pub fn block_count_max(config: Config) u64 {
@@ -277,6 +317,10 @@ pub const Cluster = struct {
     /// invariant it reported (checked with the other safety invariants).
     reference: ?*real_reference.Reference,
     reference_failure: ?[]const u8 = null,
+    /// Real gossip: every sequencer and verifier node's p2p service, and the highest
+    /// sequencer block published so far.
+    gossip: ?*real_gossip.RealGossip,
+    gossip_published: u64 = 0,
     /// Real verifier safe head floor; reset on its restarts and on L1 reorgs.
     real_safe_floor: u64 = 0,
     real_reorgs_seen: u64 = 0,
@@ -306,11 +350,8 @@ pub const Cluster = struct {
         errdefer l1.deinit(allocator);
         var sequencer_chain = try nodes.Chain.init(allocator, config.block_count_max());
         errdefer sequencer_chain.deinit(allocator);
-        var batcher = try nodes.Batcher.init(
-            allocator,
-            config.l1_block_count_max(),
-            config.frame_size,
-        );
+        const l1_blocks = config.l1_block_count_max();
+        var batcher = try nodes.Batcher.init(allocator, l1_blocks, config.frame_size);
         errdefer batcher.deinit(allocator);
         var tx_pool = try codec.TxPool.init(allocator, config.tx_count_max());
         errdefer tx_pool.deinit(allocator);
@@ -325,6 +366,8 @@ pub const Cluster = struct {
         batcher.submitting = real == null;
         const reference = try create_reference(allocator, config, seed, &sequencer_chain);
         errdefer if (reference) |r| r.destroy();
+        const gossip = try create_gossip(allocator, config, seed, reference);
+        errdefer if (gossip) |g| g.destroy();
         const verifier_real = try create_real(real_verifier.RealVerifier, allocator, config, seed);
         errdefer if (verifier_real) |v| v.destroy();
         const sequencer_real =
@@ -362,6 +405,7 @@ pub const Cluster = struct {
             .real_verifier = verifier_real,
             .real_sequencer = sequencer_real,
             .reference = reference,
+            .gossip = gossip,
             .allocator = allocator,
             .verifiers = verifiers,
         };
@@ -379,6 +423,25 @@ pub const Cluster = struct {
         reference.attach(chain);
         assert(chain.real);
         return reference;
+    }
+
+    /// Real gossip's p2p services on the sequencer and verifier nodes, validating against
+    /// the reference engine's rollup config.
+    fn create_gossip(
+        allocator: std.mem.Allocator,
+        config: Config,
+        seed: u64,
+        reference: ?*real_reference.Reference,
+    ) !?*real_gossip.RealGossip {
+        if (!config.real_gossip) return null;
+        assert(config.real_execution);
+        return try real_gossip.RealGossip.create(
+            allocator,
+            seed,
+            1 + config.verifier_count,
+            &reference.?.rollup, // Proof: real execution creates the reference.
+            config.network,
+        );
     }
 
     /// The real driver node of type `T` when the config enables it, else null.
@@ -409,6 +472,7 @@ pub const Cluster = struct {
         if (cluster.real) |real| real.destroy(allocator);
         if (cluster.real_verifier) |v| v.destroy();
         if (cluster.real_sequencer) |s| s.destroy();
+        if (cluster.gossip) |g| g.destroy();
         if (cluster.reference) |r| r.destroy();
         cluster.sequencer.chain.deinit(allocator);
         cluster.l1.deinit(allocator);
@@ -460,6 +524,7 @@ pub const Cluster = struct {
             cluster.deliver();
             cluster.tick();
             try cluster.tick_real_sequencer();
+            try cluster.tick_gossip();
             try cluster.check_safety();
         }
         cluster.report.steps = steps_max;
@@ -497,6 +562,8 @@ pub const Cluster = struct {
             .unsafe_block => |block| block,
             else => return,
         };
+        // With real gossip, new blocks come from the node's p2p service instead.
+        if (cluster.gossip != null and !block.sync) return;
         verifier.on_unsafe_block(
             &cluster.sequencer,
             cluster.real_verifier_view(),
@@ -551,6 +618,75 @@ pub const Cluster = struct {
                 .hash = block.hash,
             } });
         }
+    }
+
+    fn gossip_world(cluster: *const Cluster) real_gossip.World {
+        const gossip = cluster.gossip.?;
+        var world: real_gossip.World = .{ .global_ns = cluster.now_ns };
+        for (0..gossip.peer_count) |peer| {
+            const node = real_gossip.RealGossip.node_of(@intCast(peer));
+            world.up[peer] = cluster.up(node);
+            const local_ns = @as(i64, @intCast(cluster.now_ns)) + cluster.clock_offset_ns[node];
+            world.local_ns[peer] = @intCast(@max(0, local_ns));
+            for (0..gossip.peer_count) |other| {
+                const other_node = real_gossip.RealGossip.node_of(@intCast(other));
+                world.linked[peer][other] = cluster.linked(node, other_node);
+            }
+        }
+        return world;
+    }
+
+    /// Real gossip: steps every p2p service and connection, the sequencer publishes each
+    /// new block the reference engine executed, and every verifier node pops what its
+    /// service validated; the first one hands it to the real verifier's driver.
+    fn tick_gossip(cluster: *Cluster) Failure!void {
+        const gossip = cluster.gossip orelse return;
+        const world = cluster.gossip_world();
+        gossip.step(&world) catch |err| std.debug.panic("real gossip: {s}", .{@errorName(err)});
+        const chain = &cluster.sequencer.chain;
+        const reference = cluster.reference.?.engine;
+        while (world.up[0] and cluster.gossip_published < cluster.sequencer.head) {
+            const number = cluster.gossip_published + 1;
+            const hash = chain.real_hashes[number];
+            if (hash.eql(.zero)) break; // Not executed by the reference engine yet.
+            var transactions: [real_execution.block_transactions_max][]const u8 = undefined;
+            const payload = reference.payload_of(hash, &transactions) orelse break;
+            const envelope: gossip_bridge.Envelope = .{
+                .payload = payload,
+                .parent_beacon_block_root = reference.header(hash).?.parent_beacon_block_root,
+            };
+            cluster.gossip_published = number;
+            // BUG(p2p): see `Config.publish_stale_gossip`.
+            if (!cluster.config.publish_stale_gossip and gossip.stale(&world, payload.timestamp)) {
+                gossip.stats.stale_skipped += 1;
+                continue;
+            }
+            gossip.publish(&world, &envelope);
+        }
+        var peer: u8 = 1;
+        while (peer < gossip.peer_count) : (peer += 1) {
+            for (0..real_gossip.blocks_per_step_max) |_| {
+                const received = gossip.pop_block(peer) orelse break;
+                const number = received.payload.block_number;
+                const node = real_gossip.RealGossip.node_of(peer);
+                if (number == 0 or number > cluster.sequencer.head or
+                    !received.payload.block_hash.eql(chain.real_hashes[number]))
+                {
+                    const reason = "real gossip delivered a block off the sequencer chain";
+                    return cluster.fail(reason, node);
+                }
+                if (peer == 1) cluster.insert_gossip(&received);
+            }
+        }
+    }
+
+    fn insert_gossip(cluster: *Cluster, received: *const real_gossip.Envelope) void {
+        const verifier = cluster.real_verifier orelse return;
+        var buffer: [4096]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        const decoded = gossip_bridge.decode_gossip(fixed.allocator(), received) catch
+            unreachable; // Proof: model blocks hold 2 transactions and no withdrawals.
+        verifier.insert_gossip(&decoded);
     }
 
     fn tick(cluster: *Cluster) void {
@@ -930,12 +1066,41 @@ pub const Cluster = struct {
             if (v.safe_head != head) return cluster.fail("verifier safe head lags", v.id);
         }
         try cluster.check_real_sequencer_liveness();
+        try cluster.check_gossip_liveness();
         if (cluster.real_verifier) |verifier| {
             if (verifier.safe_number() != head) {
                 return cluster.fail("real verifier safe head lags", nodes.node_verifier_first);
             }
             if (verifier.unsafe_number() != head) {
                 return cluster.fail("real verifier unsafe head lags", nodes.node_verifier_first);
+            }
+        }
+    }
+
+    /// After healing every node is up and linked, so connections come back and the mesh
+    /// forms again: the newest published block reaches every verifier node, unless that
+    /// node's clock is far enough from the sequencer's that gossip validation rejects the
+    /// block's timestamp (as a real node with a skewed clock does).
+    fn check_gossip_liveness(cluster: *Cluster) Failure!void {
+        const gossip = cluster.gossip orelse return;
+        if (cluster.gossip_published != cluster.sequencer.head) {
+            return cluster.fail("real gossip did not publish the sequencer head", 1);
+        }
+        const head = cluster.gossip_published;
+        if (head == 0) return;
+        const window_ns = cluster.config.production_end_ns - cluster.config.fault_end_ns;
+        if (window_ns < 10 * ns_per_s) return;
+        const sequencer_offset = cluster.clock_offset_ns[nodes.node_sequencer];
+        var peer: u8 = 1;
+        while (peer < gossip.peer_count) : (peer += 1) {
+            const node = real_gossip.RealGossip.node_of(peer);
+            const lead_ns = sequencer_offset - cluster.clock_offset_ns[node];
+            const margin_ns = 1 * ns_per_s;
+            const future_ns: i64 = @intCast(real_gossip.timestamp_future_max_ns - margin_ns);
+            const past_ns: i64 = @intCast(real_gossip.timestamp_age_max_ns - margin_ns);
+            if (lead_ns > future_ns or lead_ns < -past_ns) continue;
+            if (gossip.head_popped[peer] != head) {
+                return cluster.fail("real gossip head lags", node);
             }
         }
     }
@@ -982,6 +1147,7 @@ pub const Cluster = struct {
                 v.id, v.safe_head, v.unsafe_head, v.follower.cursor,
             });
         }
+        if (cluster.gossip) |gossip| gossip.print_state(cluster.gossip_published);
         if (cluster.real_sequencer) |sequencer| {
             const driver = &sequencer.driver;
             std.debug.print(
@@ -1491,4 +1657,94 @@ test "cluster: real execution recovers from crashes and power loss on its db" {
     }
     // Some power loss found unsynced blocks, which the restarted node re-derived.
     try std.testing.expect(blocks_lost > 0);
+}
+
+test "cluster: real p2p gossip carries every block to every verifier without faults" {
+    for ([_]bool{ false, true }) |verifier_real| {
+        var cluster = try Cluster.init(std.testing.allocator, 71, .{
+            .verifier_count = 3,
+            .crashes_per_minute = 0,
+            .partitions_per_minute = 0,
+            .real_verifier = verifier_real,
+            .real_sequencer = true,
+            .real_execution = true,
+            .real_gossip = true,
+            .fault_end_ns = 0,
+            .production_end_ns = 120 * ns_per_s,
+            .settle_end_ns = 400 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const gossip = cluster.gossip.?;
+        try std.testing.expect(report.sequencer_head >= 59);
+        try std.testing.expectEqual(report.sequencer_head, gossip.stats.published);
+        // Every verifier node validated every block exactly once (seen-cache dedup).
+        for (1..gossip.peer_count) |peer| {
+            try std.testing.expectEqual(report.sequencer_head, gossip.stats.popped[peer]);
+        }
+        try std.testing.expectEqual(@as(u64, 0), gossip.stats.resets_requested);
+        if (!verifier_real) continue;
+        // Every block reached the driver once over p2p and was kept.
+        const verifier = cluster.real_verifier.?;
+        try std.testing.expectEqual(report.sequencer_head, verifier.gossip_p2p);
+        try std.testing.expectEqual(report.sequencer_head, verifier.gossip_kept);
+        try std.testing.expectEqual(report.sequencer_head, verifier.unsafe_number());
+        try std.testing.expectEqual(@as(u64, 0), verifier.exec.?.builds);
+    }
+}
+
+test "cluster: real p2p gossip survives crashes, partitions, drops, and clock skew" {
+    for ([_]u64{ 72, 73, 74 }) |seed| {
+        var cluster = try Cluster.init(std.testing.allocator, seed, .{
+            .verifier_count = 3,
+            .network = .{ .latency_ns_max = 300 * std.time.ns_per_ms, .drop_ppm = 100_000 },
+            .crashes_per_minute = 4,
+            .partitions_per_minute = 3,
+            .disk_fault_ppm = 300_000,
+            .clock_skew_ns_max = gossip_clock_skew_ns_max,
+            .real_verifier = true,
+            .real_sequencer = true,
+            .real_execution = true,
+            .real_gossip = true,
+            .fault_end_ns = 240 * ns_per_s,
+            .production_end_ns = 300 * ns_per_s,
+            .settle_end_ns = 700 * ns_per_s,
+        });
+        defer cluster.deinit(std.testing.allocator);
+        const report = try cluster.run();
+        const gossip = cluster.gossip.?;
+        try std.testing.expect(gossip.stats.resets_crash + gossip.stats.resets_stall > 0);
+        try std.testing.expect(gossip.stats.connects > gossip.pair_count);
+        for (1..gossip.peer_count) |peer| {
+            try std.testing.expectEqual(report.sequencer_head, gossip.head_popped[peer]);
+        }
+        try std.testing.expectEqual(report.sequencer_head, cluster.real_verifier.?.safe_number());
+    }
+}
+
+test "cluster: BUG(p2p) stale catch-up gossip graylists the sequencer" {
+    // Seed 27: the real sequencer loses L1 behind partitions, falls more than 60 s behind,
+    // and catches up publishing stale blocks; the gate (`publish_stale_gossip`) skips them.
+    const config = @import("swarm.zig").config_for_seed(27);
+    try std.testing.expect(config.real_gossip and !config.publish_stale_gossip);
+    for ([_]bool{ false, true }) |stale| {
+        var gated = config;
+        gated.publish_stale_gossip = stale;
+        var cluster = try Cluster.init(std.testing.allocator, 27, gated);
+        defer cluster.deinit(std.testing.allocator);
+        cluster.log_failures = false;
+        const outcome = cluster.run();
+        const gossip = cluster.gossip.?;
+        if (!stale) {
+            _ = try outcome;
+            try std.testing.expect(gossip.stats.stale_skipped > 0);
+            try std.testing.expect(!gossip.graylists_sequencer(1));
+            continue;
+        }
+        // Without the gate the first verifier graylists the sequencer and never sees the
+        // newest block over gossip.
+        try std.testing.expectError(error.LivenessViolation, outcome);
+        try std.testing.expect(gossip.graylists_sequencer(1));
+        try std.testing.expect(gossip.head_popped[1] < cluster.sequencer.head);
+    }
 }

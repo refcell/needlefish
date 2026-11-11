@@ -91,6 +91,18 @@ fn run_one(allocator: std.mem.Allocator, seed: u64) !void {
             },
         );
     }
+    if (cluster.gossip) |gossip| {
+        const stats = gossip.stats;
+        std.debug.print(
+            "  real gossip: published={d} frames={d} connects={d} resets crash={d} " ++
+                "stall={d} overflow={d} requested={d} popped[1]={d}\n",
+            .{
+                stats.published,        stats.frames_delivered, stats.connects,
+                stats.resets_crash,     stats.resets_stall,     stats.resets_overflow,
+                stats.resets_requested, stats.popped[1],
+            },
+        );
+    }
     if (cluster.real_verifier) |verifier| {
         const driver = &verifier.driver;
         std.debug.print(
@@ -116,7 +128,7 @@ fn print_config(config: Config) void {
             "clock_skew_max={d}ms l1_reorgs/min={d} spam/min={d} real_batcher={} " ++
             "evictions/min={d} reorg_tx_loss={d}ppm frame_size={d} " ++
             "l1_block_txs_min={d} byzantine/min={d} real_verifier={} real_sequencer={} " ++
-            "real_execution={}\n",
+            "real_execution={} real_gossip={}\n",
         .{
             config.verifier_count,
             config.network.latency_ns_min / ms,
@@ -140,6 +152,7 @@ fn print_config(config: Config) void {
             config.real_verifier,
             config.real_sequencer,
             config.real_execution,
+            config.real_gossip,
         },
     );
 }

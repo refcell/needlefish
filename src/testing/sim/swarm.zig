@@ -190,7 +190,7 @@ pub fn run_range(allocator: std.mem.Allocator, seed_first: u64, count: u64) !Ran
     return result;
 }
 
-const reduction_count = 22;
+const reduction_count = 23;
 
 /// Apply reduction `index` to `config`. Returns null when it would change nothing.
 fn reduce(config: Config, index: u32) ?Config {
@@ -225,10 +225,12 @@ fn reduce(config: Config, index: u32) ?Config {
         19 => next.real_execution = false,
         20 => next.real_verifier = false,
         21 => next.real_sequencer = false,
+        22 => next.real_gossip = false,
         else => unreachable,
     }
-    // Real execution needs a real driver node.
+    // Real execution needs a real driver node; real gossip needs it and the real sequencer.
     if (!next.real_verifier and !next.real_sequencer) next.real_execution = false;
+    if (!next.real_execution or !next.real_sequencer) next.real_gossip = false;
     if (std.meta.eql(next, config)) return null;
     next.validate();
     return next;
@@ -275,6 +277,7 @@ test "swarm: reductions shrink and stay valid" {
     try std.testing.expect(!config.real_verifier);
     try std.testing.expect(!config.real_sequencer);
     try std.testing.expect(!config.real_execution);
+    try std.testing.expect(!config.real_gossip);
 }
 
 test "swarm: seed range" {

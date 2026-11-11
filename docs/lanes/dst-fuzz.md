@@ -24,8 +24,11 @@ provably robust.
   - [x] Execution: the execution lane's engine (Engine API handlers, payload builder, EVM,
     state db) behind the real verifier/sequencer drivers instead of the sim engine, with
     disk faults on its durable db.
-  - [ ] P2P: the consensus p2p gossip stack (envelope encode/validate, signer checks)
-    carrying unsafe blocks over the sim network instead of model messages.
+  - [x] P2P: the consensus p2p gossip stack (envelope encode/validate, signer checks)
+    carrying unsafe blocks over the sim network instead of model messages
+    (`sim/real_gossip.zig`, `Config.real_gossip`). Discovery (discv5) and the libp2p
+    byte pipeline (noise, yamux) are not in the cluster; they have their own SimIo DST in
+    `consensus/p2p` (`transport_test.zig`, `interop_test.zig`).
 - [ ] Sim at native 200 ms blocks (project owner direction, AGENTS.md rule 10): sim rollup
   activates every fork through Denim at genesis (subsecond blocks, Holocene derivation,
   `BaseTimeUpdateTx`), model sequencer/verifiers/batcher move to ms timestamps (5 blocks
@@ -355,3 +358,37 @@ provably robust.
   on the local branch `wip/dst-fuzz-200ms` (not pushed, not green): Denim 200 ms family for
   model nodes, real components at 200 ms, FCU-head restart asserts, `sim/slots.zig` slot
   invariants. Open seeds on main: 44150, 44794 (safe-head lag by 1).
+- 2026-11-11: real p2p gossip in the cluster (`sim/real_gossip.zig`, `Config.real_gossip`,
+  drawn last in `Config.random`, only with real execution and the real sequencer; swarm
+  reduction 22). The sequencer and every verifier node run the consensus lane's IO-free
+  `p2p.Service`; the sequencer signs each block the reference engine executed
+  (`gossip_bridge.encode_gossip`, `publish_block`), framed gossipsub RPCs cross simulated
+  connections, and the first verifier hands what its service validated to the real driver
+  (`gossip_bridge.decode_gossip`, `RealVerifier.insert_gossip`); model `unsafe_block`
+  messages only carry `sync_request` catch-up then. Connections act like TCP under the
+  cluster's faults: in-order frames with seeded latency, drops become a 200 ms
+  retransmit, partitions stall and reset after 10 s, crashes reset every connection and
+  rebuild the service, resets redial through `Service.dial` after 1 s. Invariants: every
+  block a service hands out is the sequencer's block at that height (safety); after
+  healing the newest block reaches every verifier whose clock is within the gossip
+  timestamp window of the sequencer's (liveness). Gossip seeds cap clock skew at 2 s
+  (validation rejects blocks > 5 s in the future). The model sequencer is excluded: it
+  stamps block `n` with `n * 2 s` whenever it produces it, so after downtime its blocks
+  are older than the 60 s window. Tests: fault-free delivery (every verifier validates
+  every block exactly once, the driver takes every block from gossip) and crashes +
+  partitions + drops + skew (seeds 72-74).
+  Finding, gated as `BUG(p2p)` (`Config.publish_stale_gossip`, off): a real sequencer
+  that falls more than 60 s behind (L1 lost behind partitions, crash) catches up by
+  sealing and gossiping every block, as base/base's seal pipeline does. Peers reject
+  them (`timestamp_past` is Reject in base/base `block_validity.rs`), and one rejected
+  block puts the sequencer under the graylist threshold (P4 weight -140.4475 x topic 0.8
+  against -40). base/base's `score_decay` shrinks the counter to 99% per 600 s (op-node:
+  to 1%), so the graylist lasts hours (about 8 h from the decay alone): those peers ignore
+  every later block, and
+  a verifier follows only the safe chain. In the sim the real verifier's unsafe head then
+  stays at its safe head, and the real batcher (which uses it as its rollup node) stops
+  posting. Repro: swarm seed 27 with the gate off (test `BUG(p2p) stale catch-up gossip
+  graylists the sequencer`); seeds 84, 86, 98, 104, 203, 256, 305 failed before the gate.
+  With the gate the sim skips blocks older than 55 s on the sequencer's clock and peers
+  catch up through `sync_request`. Options for the owner: do not gossip blocks already
+  outside the window (sequencer side), or decay like op-node.

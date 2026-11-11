@@ -9,6 +9,7 @@ pub const real_batcher = @import("real_batcher.zig");
 pub const real_verifier = @import("real_verifier.zig");
 pub const real_sequencer = @import("real_sequencer.zig");
 pub const real_execution = @import("real_execution.zig");
+pub const real_gossip = @import("real_gossip.zig");
 pub const nodes = @import("nodes.zig");
 pub const cluster = @import("cluster.zig");
 pub const swarm = @import("swarm.zig");

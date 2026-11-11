@@ -646,6 +646,8 @@ pub const RealVerifier = struct {
     sync_ns: u64 = 0,
     gossip_received: u64 = 0,
     gossip_kept: u64 = 0,
+    /// Blocks that reached the driver over real p2p gossip (`insert_gossip`).
+    gossip_p2p: u64 = 0,
     /// Real execution: the execution lane's engine replaces `engine` (left idle).
     exec: ?*real_execution.ExecEngine = null,
     exec_client: real_execution.Client = undefined,
@@ -794,6 +796,20 @@ pub const RealVerifier = struct {
             .parent_beacon_block_root = attributes.parent_beacon_block_root,
         };
         verifier.gossip_kept += @intFromBool(verifier.driver.insert_unsafe(&envelope));
+    }
+
+    /// Real gossip (`Config.real_gossip`): a block this node's p2p service received,
+    /// validated (signer, timestamp window, block hash) and decoded, as the binary's
+    /// `tick_gossip` hands it to the driver.
+    pub fn insert_gossip(verifier: *RealVerifier, envelope: *const InsertEnvelope) void {
+        const number = envelope.payload.block_number;
+        assert(number > 0);
+        verifier.gossip_received += 1;
+        verifier.gossip_p2p += 1;
+        verifier.sequencer_head_known = @max(verifier.sequencer_head_known, number);
+        if (verifier.driver.phase != .running) return;
+        if (number <= verifier.unsafe_number()) return;
+        verifier.gossip_kept += @intFromBool(verifier.driver.insert_unsafe(envelope));
     }
 
     /// Real execution: the gossiped payload is the block the reference engine executed for
