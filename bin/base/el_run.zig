@@ -86,12 +86,23 @@ const usage =
 ;
 
 const flush_every = 64;
+/// At the tip, blocks do not wait for durability: each idle wait first ticks the storage toward
+/// it for at most `tip_flush_ms` (waiting for it there held blocks for up to 9 s behind a
+/// checkpoint on Base mainnet). The storage's room before each block still bounds the
+/// committed but not yet durable blocks; past `tip_unflushed_max` of them, el-run waits.
+const tip_flush_ms = 10;
+const tip_flush_ticks_max = 4096;
+const tip_unflushed_max = 1024;
 /// `--cache-mb` bounds: one cache set of 64 KiB blocks at least, 1 TiB at most.
 const cache_mb_min: u32 = 1;
 const cache_mb_max: u32 = 1 << 20;
 const summary_interval_ms = 10_000;
 const peers_interval_ms = 60_000;
 const tip_wait_ms = 100;
+/// At the tip, after a fetch found no new block: the shortest wait before asking again, once
+/// the next block's slot time has passed (before it, el-run waits for the slot time). A
+/// fixed `tip_wait_ms` here delayed each block by about half of it on average.
+const tip_poll_ms = 25;
 /// At the tip, the servers' time after each block. Following one peer, the feed waits for
 /// the next block inside `next` and then returns it, so el-run can go minutes without its
 /// idle wait; a single `poll` per block answered about one engine request, which held a
@@ -105,7 +116,10 @@ const slow_rise_ms = 400;
 
 comptime {
     assert(tip_serve_ms < tip_wait_ms);
+    assert(tip_poll_ms < tip_wait_ms);
     assert(tip_wait_ms < slow_rise_ms);
+    assert(tip_flush_ms < tip_wait_ms);
+    assert(flush_every < tip_unflushed_max);
 }
 
 const Flags = struct {
@@ -279,6 +293,22 @@ const Run = struct {
         try run.runner.flush();
         run.unflushed = 0;
     }
+
+    /// At the tip: ticks the storage toward durability for at most `tip_flush_ms`, without
+    /// waiting for it.
+    fn flush_idle(run: *Run) !void {
+        assert(run.feed.at_tip);
+        if (run.unflushed == 0) return;
+        const deadline_ms = run.now_ms() + tip_flush_ms;
+        for (0..tip_flush_ticks_max) |_| {
+            if (try run.runner.flush_tick()) {
+                run.unflushed = 0;
+                return;
+            }
+            if (run.now_ms() >= deadline_ms) return;
+        }
+        assert(run.unflushed > 0);
+    }
 };
 
 fn execute(
@@ -415,14 +445,14 @@ fn run_blocks(run: *Run) !u8 {
         if (!got) {
             // Nothing new yet: make what we have durable, then wait for the next block.
             run.gap.polls += 1;
-            try run.flush();
+            if (run.feed.at_tip) try run.flush_idle() else try run.flush();
             const flushed_ms = run.now_ms();
             run.gap.flush_ms += @intCast(flushed_ms - fetched_ms);
             if (!run.at_tip and run.feed.at_tip) {
                 std.debug.print("el-run: at the tip, block {d}\n", .{run.db.head_info.number});
             }
             run.at_tip = run.feed.at_tip;
-            try serve_idle(run, tip_wait_ms);
+            try serve_idle(run, poll_wait_ms(run));
             run.gap.idle_ms += @intCast(run.now_ms() - flushed_ms);
             continue;
         }
@@ -437,7 +467,8 @@ fn run_blocks(run: *Run) !u8 {
         const flushed_ms = run.now_ms();
         run.gap.serve_ms += @intCast(flushed_ms - served_ms);
         run.unflushed += 1;
-        if (run.unflushed >= flush_every) try run.flush();
+        const flush_at: u32 = if (run.feed.at_tip) tip_unflushed_max else flush_every;
+        if (run.unflushed >= flush_at) try run.flush();
         run.gap.flush_ms += @intCast(run.now_ms() - flushed_ms);
         if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
     }
@@ -460,6 +491,18 @@ fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64) void {
         number,       lag_ms,  rise_ms, gap.fetch_ms, gap.polls, gap.flush_ms, gap.idle_ms,
         gap.serve_ms, exec_ms,
     });
+}
+
+/// How long to wait after a fetch found no new block: at the tip, until the next block's slot
+/// time, then `tip_poll_ms` between fetches; behind it (the pool), `tip_wait_ms`.
+fn poll_wait_ms(run: *const Run) u64 {
+    if (!run.feed.at_tip) return tip_wait_ms;
+    const now = Io.Clock.real.now(run.io);
+    const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+    const due_ms = run.rollup.l2_block_timestamp_ms(run.feed.next_number);
+    const wait_ms = std.math.clamp(due_ms -| now_ms, tip_poll_ms, tip_wait_ms);
+    assert(wait_ms >= tip_poll_ms and wait_ms <= tip_wait_ms);
+    return wait_ms;
 }
 
 /// Serves the Engine API and the JSON-RPC server for `duration_ms` while no block is

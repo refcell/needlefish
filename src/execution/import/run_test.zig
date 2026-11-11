@@ -533,7 +533,15 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
         var sequences: [blocks_count]u64 = undefined;
         // Durable through block 4, then blocks 5..7 only queued when the storage crashes.
         for (0..4) |index| sequences[index] = (try harness.pass(@intCast(index))).sequence;
-        try harness.runner.flush();
+        if (seed == 1) {
+            // el-run's way at the tip: one tick at a time, until durable.
+            var ticks: u32 = 0;
+            while (!try harness.runner.flush_tick()) : (ticks += 1) {
+                try testing.expect(ticks < run.ticks_max);
+            }
+            const db = harness.disk.db;
+            try testing.expectEqual(db.submitted_sequence, db.durable_sequence);
+        } else try harness.runner.flush();
         const crash_after: u32 = 7 + @as(u32, @intCast(seed));
         for (4..crash_after) |index| {
             sequences[index] = (try harness.pass(@intCast(index))).sequence;

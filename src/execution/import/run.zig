@@ -675,6 +675,18 @@ pub fn RunnerType(comptime Storage: type) type {
             assert(ticks <= quiet_ticks_max);
         }
 
+        /// One storage tick toward durability, when a committed block is not yet durable;
+        /// true when every committed block is. For a caller that makes blocks durable in its
+        /// idle time rather than waiting for it (`flush`).
+        pub fn flush_tick(self: *Runner) Error!bool {
+            const db = self.db;
+            assert(db.durable_sequence <= db.submitted_sequence);
+            if (db.durable_sequence == db.submitted_sequence) return true;
+            if (db.phase != .ready) return error.NotReady;
+            self.tick();
+            return db.durable_sequence == db.submitted_sequence;
+        }
+
         /// Ticks until every committed block is durable (bounded).
         pub fn flush(self: *Runner) Error!void {
             const db = self.db;
