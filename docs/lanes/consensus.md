@@ -311,7 +311,10 @@ from devp2p. Semantics (`bin/base/el_engine.zig`):
 - Single-threaded: the HTTP server runs on its own completion IO, driven by el-run only
   between blocks (non-blocking `poll`) and during the idle wait at the tip (`wait` replaces
   the 100 ms sleep). Requests never run while the runner executes or commits, and the engine
-  is a plain state machine tested over SimIo.
+  is a plain state machine tested over SimIo. At the tip el-run also serves for 30 ms after
+  every block (`tip_serve_ms`): following one peer, the feed waits for the next block inside
+  `next`, so the idle wait can go unused for hours, and one `poll` per block held a Base
+  mainnet verifier's consolidation near 1 block/s (2026-11-11). Behind the tip, `poll` only.
 - JWT: HS256 bearer token with `iat` within the window (`utilities.jwt`), 401 otherwise.
 
 Run (paths are examples; the JWT secret is a runtime file, never committed):

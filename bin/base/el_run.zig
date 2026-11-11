@@ -92,6 +92,16 @@ const cache_mb_max: u32 = 1 << 20;
 const summary_interval_ms = 10_000;
 const peers_interval_ms = 60_000;
 const tip_wait_ms = 100;
+/// At the tip, the servers' time after each block. Following one peer, the feed waits for
+/// the next block inside `next` and then returns it, so el-run can go minutes without its
+/// idle wait; a single `poll` per block answered about one engine request, which held a
+/// verifier's consolidation near 1 block/s on Base mainnet. Blocks there execute in ~25 ms
+/// of their 200 ms slot, so 30 ms leaves room to catch up; behind the tip, `poll` only.
+const tip_serve_ms = 30;
+
+comptime {
+    assert(tip_serve_ms < tip_wait_ms);
+}
 
 const Flags = struct {
     db: []const u8 = "",
@@ -378,8 +388,12 @@ fn run_blocks(run: *Run) !u8 {
             continue;
         }
         if (!try run_one(run, &block)) return 1;
-        if (run.engine) |service| service.poll();
-        if (run.rpc) |service| service.poll();
+        if (run.feed.at_tip and (run.engine != null or run.rpc != null)) {
+            try serve_idle(run, tip_serve_ms);
+        } else {
+            if (run.engine) |service| service.poll();
+            if (run.rpc) |service| service.poll();
+        }
         run.unflushed += 1;
         if (run.unflushed >= flush_every) try run.flush();
         if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
