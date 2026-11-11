@@ -14,29 +14,19 @@ It is a ground-up port of the public [base/base](https://github.com/base/base) r
 keeps its layout, so every crate there has an obvious home here.
 
 <p align="center">
-  <img src="docs/assets/mainnet-sync.gif" width="800"
-    alt="a needlefish node following the Base mainnet tip, every block checked against mainnet.base.org">
+  <img src="docs/assets/replay-demo.gif" width="800"
+    alt="just replay fetches the latest 10 Base mainnet blocks and replays them offline">
 </p>
 
-needlefish syncs Base mainnet. Above is a live needlefish node on a desktop machine,
-recorded on November 11, 2026. `base el-run` executes every block it gets from
-execution-layer peers over devp2p. It checks each block's state root, receipts root, gas,
-bloom and hash, and follows the tip at a median of 181 ms behind. Each line shows that
-mainnet.base.org has the same block hash. `base consensus` derives the safe and finalized
-heads from Ethereum L1, and they equal mainnet.base.org's by number and hash. The watcher is
-`etc/scripts/sync-watch.py` ([video](docs/assets/mainnet-sync.mp4); 75 s of recording, with
-the middle at 6x).
-
-The node started from Base's public reth snapshot at block 54528124. needlefish imported it
-only after recomputing the state root from every account and storage slot and matching it to
-the block header. By that recording, the node had executed 1.63 million consecutive mainnet
-blocks with every check passing. A sampler had also compared balances, nonces, code,
-storage and `eth_getProof` at the head with the public chain every 5 minutes: 0 mismatches
-in 1,344 calls. [docs/MAINNET.md](docs/MAINNET.md) has the steps to run one and its limits.
-
-`just replay` re-executes the latest Base mainnet blocks offline from public RPC and checks
-every header field, with no snapshot ([docs/REPLAY.md](docs/REPLAY.md),
-[video](docs/assets/replay-demo.mp4)).
+needlefish syncs Base mainnet. A needlefish node started from Base's public reth
+snapshot at block 54528124. needlefish imported the snapshot only after recomputing its
+state root from every account and storage slot and matching it to the block header. As of
+November 11, 2026, the node had executed 1.63 million consecutive blocks from
+execution-layer peers over devp2p, and every block's state root, receipts root, gas, bloom
+and hash matched. It follows the tip at a median of about 180 ms behind, and its consensus
+node's safe and finalized heads equal mainnet.base.org's by number and hash. A sampler
+compares state at the head with the public chain every 5 minutes, and has found 0
+mismatches in 1,344 calls. [docs/MAINNET.md](docs/MAINNET.md) has the steps to run one.
 
 ## Status
 
@@ -137,8 +127,7 @@ base consensus --rollup-config rollup.json --l1 ... --l1-beacon ... --l2 ...
 ```
 
 [docs/MAINNET.md](docs/MAINNET.md) walks through every step: the snapshot download, the
-verified import, finding peers, el-run, the consensus node, and `etc/scripts/sync-watch.py`
-to watch the node against mainnet.base.org.
+verified import, finding peers, el-run, and the consensus node.
 
 ### Local devnet
 

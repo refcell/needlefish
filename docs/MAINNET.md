@@ -110,20 +110,10 @@ Start it once el-run is at the tip (it logs `el-run: at the tip`) and its engine
 at least 16,384 blocks (the `engine:` summary line's `ring`), about 55 minutes after el-run
 starts. `optimism_syncStatus` on port 7546 reports the safe and finalized heads.
 
-## 7. Watch it against the public chain
-
-```sh
-python3 -I etc/scripts/sync-watch.py --log $D/follow.log
-```
-
-`sync-watch.py` only reads. It prints every block el-run commits with el-run's checks and
-mainnet.base.org's hash for the same number. Every 5 s it compares safe and finalized with
-mainnet.base.org by number and hash. It exits 1 on any difference.
-
 ## Limits
 
-- **Unsafe head.** It comes from devp2p peers (a median of 181 ms behind the tip in the
-  README recording), not from the consensus gossip network.
+- **Unsafe head.** It comes from devp2p peers (a median of about 180 ms behind the tip on
+  the first node), not from the consensus gossip network.
 - **State history.** The database keeps only the head state. RPC calls for older state
   return "historical state unavailable", and blocks and receipts are served only for the
   blocks el-run executed since it started.
