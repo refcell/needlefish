@@ -261,8 +261,11 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
             "its terminal and {s}/logs show its progress", .{up.datadir});
         return 0;
     }
-    if (described) |node| if (!owns_orphans(&up, &node) and try node_answers(&up, &node)) {
-        return watch_node(&up, node);
+    if (described) |node| if (!owns_orphans(&up, &node)) {
+        if (try node_answers(&up, &node)) return watch_node(&up, node);
+        // A node.json that `base up` did not leave behind names someone else's node: never
+        // set up (lock, download, import) over it because it did not answer once.
+        if (!left_by_base_up(&up, &node)) return refuse_silent_node(&up, &node);
     };
     view.header(up.chain.name, up.chain.config.chain_id, up.datadir);
     if (!try prepare_datadir(&up)) return 1;
@@ -515,6 +518,36 @@ fn watch_node(up: *Up, node: NodeFile) !u8 {
 fn owns_orphans(up: *const Up, node: *const NodeFile) bool {
     for (node.pids) |entry| if (runs_this_node(up, entry.pid)) return true;
     return false;
+}
+
+/// Whether `node.json` is a stale one a killed `base up` wrote: it names children (a
+/// hand-written description names none) and none of them runs any more.
+fn left_by_base_up(up: *const Up, node: *const NodeFile) bool {
+    if (node.pids.len == 0) return false;
+    for (node.pids) |entry| {
+        assert(entry.pid > 1);
+        if (up_check.process_running(up.io, @intCast(entry.pid))) return false;
+    }
+    return true;
+}
+
+/// Fails closed on a described node that does not answer: nothing is set up or touched.
+fn refuse_silent_node(up: *const Up, node: *const NodeFile) u8 {
+    assert(node.el_rpc != null or node.el_log != null);
+    up.view.header(up.chain.name, up.chain.config.chain_id, up.datadir);
+    if (node.el_rpc) |url| {
+        up.view.fail("node", "{s}/node.json describes a node at {s} that does not answer", .{
+            up.datadir, url,
+        });
+    } else {
+        up.view.fail("node", "{s}/node.json describes a node whose log {s} does not exist", .{
+            up.datadir, node.el_log.?,
+        });
+    }
+    up.view.fix("start that node, or delete {s}/node.json to set up a new node here", .{
+        up.datadir,
+    });
+    return 1;
 }
 
 /// Stops children a killed `base up` left running (named in `node.json`, still running this
