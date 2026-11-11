@@ -180,7 +180,8 @@ pub const Time = struct {
     transactions_ns: u64 = 0,
     post_block_ns: u64 = 0,
     receipts_root_ns: u64 = 0,
-    /// Folding the block into the state: on disk, the sparse root and record write-back.
+    /// Folding the block into the state: on disk, the sparse root and record write-back
+    /// (the trie-path prefetch before it is in `prefetch_ns`).
     commit_ns: u64 = 0,
     state_root_ns: u64 = 0,
     /// The header checks after execution.
@@ -285,6 +286,9 @@ pub fn RunnerType(comptime Storage: type) type {
         clock: ?Executor.Clock = null,
         hinter: ?Hinter = null,
         prefetching: Prefetching = .all,
+        /// The current attempt's trie-path prefetch: it runs inside the executor's commit
+        /// phase, and is reported as prefetch, not commit.
+        paths_ns: u64 = 0,
 
         /// Executes on `db`, an open disk-mode database with a head (an import's head N or
         /// a block this runner committed). Heap-pinned: the executor points at the StateDb.
@@ -386,6 +390,7 @@ pub fn RunnerType(comptime Storage: type) type {
             // No code slice of an earlier block or attempt is in use: the executor's state
             // cache starts empty each block.
             db.codes_release();
+            self.paths_ns = 0;
             // The state holds the block before its entry is queued: no checkpoint between.
             db.hold_checkpoints(true);
             defer db.hold_checkpoints(false);
@@ -509,7 +514,8 @@ pub fn RunnerType(comptime Storage: type) type {
                 }
             }
             self.prefetch_run(prefetch_state);
-            self.stats.time.prefetch_ns += self.now_ns() -| start_ns;
+            self.paths_ns = self.now_ns() -| start_ns;
+            self.stats.time.prefetch_ns += self.paths_ns;
         }
 
         /// The runner's hints (see the file comment). Senders come from the executor's
@@ -571,7 +577,9 @@ pub fn RunnerType(comptime Storage: type) type {
             time.transactions_ns += execution_ns - phases.pre_block_ns - phases.recovery_ns;
             time.post_block_ns += phases.post_block_ns;
             time.receipts_root_ns += phases.receipts_root_ns;
-            time.commit_ns += phases.commit_ns;
+            // The commit phase ran the path prefetch first; it is counted in prefetch.
+            assert(self.paths_ns <= phases.commit_ns);
+            time.commit_ns += phases.commit_ns - self.paths_ns;
             time.state_root_ns += phases.state_root_ns;
             time.check_ns += check_ns;
             time.journal_ns += journal_ns;
