@@ -14,11 +14,6 @@ else. It is a ground-up port of [base/base](https://github.com/base/base) and ke
 layout, so every crate there has an obvious home here. L2 blocks are full blocks at Base's
 native 200 ms cadence; there are no flashblocks.
 
-<p align="center">
-  <img src="docs/assets/replay-demo.gif" width="800"
-    alt="needlefish fetches the latest 10 Base mainnet blocks and replays them offline">
-</p>
-
 ## Highlights
 
 - **Syncs Base mainnet.** A needlefish node has executed more than 1.6 million consecutive
