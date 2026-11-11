@@ -19,6 +19,10 @@
 //! mismatching block exits 1 with the head on its parent; nothing is skipped. Commits are
 //! made durable every `flush_every` blocks and whenever no block is waiting.
 //!
+//! `--prefetch all|tx|none` picks the runner's prefetches (`import.run.Prefetching`): `all`
+//! (the default) reads ahead before execution and the commit's trie paths, `tx` only before
+//! execution, `none` neither. Results never depend on it; it is for comparing speeds.
+//!
 //! With `--engine.addr <ip:port> --engine.jwt <file>` it also serves the Engine API to a
 //! verifier `base consensus` (`el_engine.zig`), between blocks and while idle at the tip.
 //!
@@ -74,6 +78,7 @@ const usage =
     \\                   [--engine.rollup-out <rollup.json>] [--gossip [--p2p.* ...]]
     \\                   [--rpc] [--rpc.addr <ip:port>] [--rpc.ring-blocks <n>]
     \\                   [--rpc.ring-mb <n>] [--rpc.tx-index <entries>]
+    \\                   [--prefetch all|tx|none]
     \\
 ;
 
@@ -90,6 +95,7 @@ const Flags = struct {
     config: *const ChainConfig = &base.common.chains.sepolia,
     blocks: ?u64 = null,
     duration_s: ?u64 = null,
+    prefetching: import_run.Prefetching = .all,
     engine: el_engine.Flags = .{},
     /// The read-only JSON-RPC server (`--rpc`, `--rpc.*`).
     rpc: el_rpc.Flags = .{},
@@ -137,6 +143,9 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, name, "--blocks")) {
             flags.blocks = try std.fmt.parseInt(u64, value, 10);
             if (flags.blocks.? == 0) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, name, "--prefetch")) {
+            flags.prefetching = std.meta.stringToEnum(import_run.Prefetching, value) orelse
+                return error.InvalidArguments;
         } else if (std.mem.eql(u8, name, "--duration")) {
             flags.duration_s = try std.fmt.parseInt(u64, value, 10);
             if (flags.duration_s.? == 0) return error.InvalidArguments;
@@ -249,6 +258,7 @@ fn execute(
     config.executor.state_gas_basis = base.execution.node.executor.default_state_gas_basis;
     var awake: AwakeClock = .{ .io = init.io };
     config.clock = awake.clock();
+    config.prefetching = flags.prefetching;
     const runner = try Runner.create(gpa, db, flags.chain.spec, driver, config);
     defer runner.destroy(gpa);
     const head = db.head_info;
@@ -310,9 +320,8 @@ fn run_reported(run: *Run, parent: [32]u8) !u8 {
     assert(run.blocks == 0);
     run.started_ms = run.now_ms();
     run.last_summary_ms = run.started_ms;
-    std.debug.print("el-run: executing {s} from block {d} (parent {x}), blocks over devp2p\n", .{
-        run.flags.chain.name, run.first, parent,
-    });
+    std.debug.print("el-run: executing {s} from block {d} (parent {x}), blocks over devp2p, " ++
+        "prefetch {t}\n", .{ run.flags.chain.name, run.first, parent, run.flags.prefetching });
     const status = try run_blocks(run);
     try run.flush();
     summary(run);
@@ -547,10 +556,14 @@ test "el-run: flags" {
     try std.testing.expectEqual(@as(?u64, 1800), set.duration_s);
     const defaults = try parse_flags(&.{ "--enode", enode_text, "--db", "x" });
     try std.testing.expectEqual(@as(u64, 84532), defaults.config.chain_id);
+    try std.testing.expectEqual(import_run.Prefetching.all, defaults.prefetching);
+    const off = try parse_flags(&.{ "--db", "x", "--enode", enode_text, "--prefetch", "none" });
+    try std.testing.expectEqual(import_run.Prefetching.none, off.prefetching);
     const rejected = [_][]const []const u8{
         &.{ "--db", "x", "--enode", enode_text, "--blocks", "0" },
         &.{ "--db", "x", "--enode", enode_text, "--chain", "op-mainnet" },
         &.{ "--db", "x", "--enode", enode_text, "--duration" },
+        &.{ "--db", "x", "--enode", enode_text, "--prefetch", "paths" },
     };
     for (rejected) |args| try std.testing.expectError(error.InvalidArguments, parse_flags(args));
     const engine = try parse_flags(&.{

@@ -25,7 +25,8 @@
 //! hit the cache. The executor's commit (the runner is its backend, over the StateDb) does
 //! the same first for the branch records the root update will resolve: the trie paths of
 //! the block's dirty accounts and slots, and of the slots' owners. Best effort: results
-//! never depend on what was prefetched.
+//! never depend on what was prefetched. `Config.prefetching` turns the commit's prefetch,
+//! or both, off.
 //!
 //! Busy: a block is held (`hold_checkpoints`) from execution to its journal entry, so no
 //! checkpoint can start in between. Before each block the runner therefore makes room for
@@ -149,10 +150,15 @@ pub const Error = error{
     CheckpointFailed,
 } || database.OperationError || state_db_module.Error;
 
+/// Which prefetches the runner makes (see the file comment): `all` both, `tx` only the one
+/// before execution (no trie paths before the commit), `none` neither. Results never change.
+pub const Prefetching = enum { all, tx, none };
+
 pub const Config = struct {
     executor: executor_module.Config,
     /// Times the phases into `Stats.time` (and the executor's `last_phases`); none: zeros.
     clock: ?Executor.Clock = null,
+    prefetching: Prefetching = .all,
 };
 
 /// Accounts every Base block touches: the fee vaults and the L1Block predeploy.
@@ -278,6 +284,7 @@ pub fn RunnerType(comptime Storage: type) type {
         stats: Stats = .{},
         clock: ?Executor.Clock = null,
         hinter: ?Hinter = null,
+        prefetching: Prefetching = .all,
 
         /// Executes on `db`, an open disk-mode database with a head (an import's head N or
         /// a block this runner committed). Heap-pinned: the executor points at the StateDb.
@@ -316,6 +323,7 @@ pub fn RunnerType(comptime Storage: type) type {
                 try Executor.init_backend(allocator, spec, self.backend(), config.executor);
             self.executor.phase_clock = config.clock;
             self.clock = config.clock;
+            self.prefetching = config.prefetching;
             return self;
         }
 
@@ -424,6 +432,7 @@ pub fn RunnerType(comptime Storage: type) type {
         /// Reads the blocks of the state `block` will likely touch into the block cache, all
         /// at once, ticking until done (bounded; an unfinished prefetch skips the next).
         fn prefetch(self: *Runner, block: *const Block, header: *const Header) void {
+            if (self.prefetching == .none) return;
             const prefetch_state = self.db.flat.?.prefetch orelse return;
             if (prefetch_state.running) return;
             const start_ns = self.now_ns();
@@ -474,6 +483,7 @@ pub fn RunnerType(comptime Storage: type) type {
         /// Reads ahead the branch records the commit's root update resolves: along the trie
         /// paths of the block's dirty accounts and slots, and of the slots' owners.
         fn prefetch_paths(self: *Runner, evm_state: *const evm.State) void {
+            if (self.prefetching != .all) return;
             const prefetch_state = self.db.flat.?.prefetch orelse return;
             if (prefetch_state.running) return;
             const start_ns = self.now_ns();

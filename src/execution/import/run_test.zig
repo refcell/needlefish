@@ -759,3 +759,28 @@ test "import run: the runner's own prefetch hints read blocks ahead" {
     try testing.expect(stats.reads > 0 and stats.rounds > 0);
     try testing.expect(harness.runner.stats.time.prefetch_ns > 0);
 }
+
+test "import run: prefetching tx skips the commit's paths, none prefetches nothing" {
+    const keys = derive_keys();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    inline for (.{ run.Prefetching.tx, run.Prefetching.none }) |prefetching| {
+        const harness = try Harness.create(arena_state.allocator(), &keys, 7);
+        defer harness.destroy();
+        harness.runner.prefetching = prefetching;
+        const before = harness.disk.db.flat.?.prefetch.?.stats;
+        for (0..blocks_count) |index| _ = try harness.pass(@intCast(index));
+        try harness.runner.flush();
+        try harness.expect_oracle_state();
+        const stats = harness.disk.db.flat.?.prefetch.?.stats;
+        const runs = stats.runs - before.runs;
+        if (prefetching == .none) {
+            try testing.expectEqual(@as(u64, 0), runs);
+            try testing.expectEqual(before.keys, stats.keys);
+        } else {
+            // One prefetch per attempt (before execution), none before the commit.
+            try testing.expectEqual(blocks_count + harness.runner.stats.busy_retries, runs);
+            try testing.expect(stats.keys > before.keys);
+        }
+    }
+}
