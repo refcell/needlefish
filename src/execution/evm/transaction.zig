@@ -428,6 +428,12 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     }
     const sender = try evm.state.load(tx.caller);
     try evm.state.set_balance(sender, sender.info.balance +| tx.mint);
+    // A value the sender cannot pay after the mint is a top-level OutOfFunds, which revm
+    // reports as a halt, so the deposit fails and consumes its whole gas limit (base/base
+    // `catch_error`). A nested call's failed transfer only fails that frame.
+    if (sender.info.balance < tx.value) {
+        return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
+    }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);
     try evm.state.touch(sender);
     evm.tx = .{ .origin = tx.caller, .gas_price = 0, .blob_hashes = &.{} };

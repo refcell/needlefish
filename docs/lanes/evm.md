@@ -452,6 +452,10 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: deposits whose value exceeds the sender's balance after the mint now fail with
+  their whole gas limit (revm maps a top-level OutOfFunds to a halt; base/base `catch_error`).
+  We reverted the call at intrinsic gas instead, so state matched but gas used did not: the
+  live Base Sepolia follower refused block 57122811 on gas_used. Regression test in op_test.
 - 2026-11-11: onchain_lm_v2 (0.97x evm2 in both builds) is not a packing cost. Attributing
   samples to opcodes through the dispatch jump table and comparing with evm2's per-handler
   symbols: ADD +4.4 ms, SHL +4.1, MLOAD +3.1, MUL +1.6, JUMPDEST +1.6, SAR -5.0 per 245 ms

@@ -79,6 +79,32 @@ test "op: halted deposit keeps mint and nonce, consumes the gas limit" {
     try testing.expectEqual(@as(u64, 6), (try h.state.load(depositor)).info.nonce);
 }
 
+test "op: deposit whose value exceeds balance plus mint fails with its whole gas limit" {
+    // Base Sepolia block 57122811, tx 2: a 0.15 ETH deposit worth more than its sender held,
+    // gas limit 100,000; the reference receipt says status 0 and gasUsed 100,000.
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .jovian };
+    try h.database.put_account(depositor, 3, 7, &.{});
+    var tx = deposit(target, 100_000);
+    tx.mint = 1;
+    const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.halt, executed.status);
+    try testing.expectEqual(@as(u64, 100_000), executed.gas_used);
+    try testing.expectEqual(@as(u256, 4), try balance(&h, depositor));
+    try testing.expectEqual(@as(u64, 8), (try h.state.load(depositor)).info.nonce);
+    try testing.expectEqual(@as(u256, 0), try balance(&h, target));
+
+    // Exactly enough after the mint: the transfer goes through at intrinsic gas.
+    tx.value = 5;
+    const paid = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.success, paid.status);
+    try testing.expectEqual(@as(u64, 21_000), paid.gas_used);
+    try testing.expectEqual(@as(u256, 0), try balance(&h, depositor));
+    try testing.expectEqual(@as(u256, 5), try balance(&h, target));
+}
+
 test "op: deposits need OP rules and reject system transactions since Regolith" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
