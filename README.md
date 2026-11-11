@@ -3,7 +3,7 @@
 [![Zig](https://img.shields.io/badge/Zig-0.17.1-F7A41D?style=for-the-badge&logo=zig&logoColor=white)](#installation)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey?style=for-the-badge&logo=linux&logoColor=white)](#installation)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=for-the-badge)](#design)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange?style=for-the-badge)](#installation)
+[![Status](https://img.shields.io/badge/status-alpha-yellow?style=for-the-badge)](#status)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
 
 needlefish is [Base](https://base.org), the Ethereum L2, rewritten from scratch in Zig: execution
@@ -14,18 +14,44 @@ It is a ground-up port of the public [base/base](https://github.com/base/base) r
 keeps its layout, so every crate there has an obvious home here.
 
 <p align="center">
-  <img src="docs/assets/replay-demo.gif" width="800"
-    alt="just replay fetches the latest 10 Base mainnet blocks and replays them offline">
+  <img src="docs/assets/mainnet-sync.gif" width="800"
+    alt="a needlefish node following the Base mainnet tip, every block checked against mainnet.base.org">
 </p>
 
-`just replay` fetches the latest 10 Base mainnet blocks and the state they touch from public
-RPC, re-executes them offline, and checks every header field against the chain
-([docs/REPLAY.md](docs/REPLAY.md), [video](docs/assets/replay-demo.mp4)). `just replay 100`
-does the same for 100 blocks: 100 consecutive mainnet blocks (1747 transactions) reproduce
-exactly.
+needlefish syncs Base mainnet. Above is a live needlefish node on a desktop machine,
+recorded on November 11, 2026. `base el-run` executes every block it gets from
+execution-layer peers over devp2p. It checks each block's state root, receipts root, gas,
+bloom and hash, and follows the tip at a median of 181 ms behind. Each line shows that
+mainnet.base.org has the same block hash. `base consensus` derives the safe and finalized
+heads from Ethereum L1, and they equal mainnet.base.org's by number and hash. The watcher is
+`etc/scripts/sync-watch.py` ([video](docs/assets/mainnet-sync.mp4); 75 s of recording, with
+the middle at 6x).
 
-> [!WARNING]
-> needlefish is not production-ready. Do not run it against a real network or with real funds.
+The node started from Base's public reth snapshot at block 54528124. needlefish imported it
+only after recomputing the state root from every account and storage slot and matching it to
+the block header. By that recording, the node had executed 1.63 million consecutive mainnet
+blocks with every check passing. A sampler had also compared balances, nonces, code,
+storage and `eth_getProof` at the head with the public chain every 5 minutes: 0 mismatches
+in 1,344 calls. [docs/MAINNET.md](docs/MAINNET.md) has the steps to run one and its limits.
+
+`just replay` re-executes the latest Base mainnet blocks offline from public RPC and checks
+every header field, with no snapshot ([docs/REPLAY.md](docs/REPLAY.md),
+[video](docs/assets/replay-demo.mp4)).
+
+## Status
+
+needlefish follows Base mainnet as a verifying node: execution and the consensus node's safe
+and finalized heads, as above. The rest is younger:
+
+- The unsafe head comes from devp2p peers. Base's consensus gossip network (`el-run
+  --gossip`) has not delivered mainnet blocks yet: it needs inbound ports, and the node so
+  far ran behind NAT.
+- The node keeps only the head state: no archive queries, no transaction pool, and its RPC
+  is read-only.
+- Setup is manual ([docs/MAINNET.md](docs/MAINNET.md)), and nothing restarts the processes
+  for you.
+- The sequencer, batcher, proposer and challenger have only run on the local
+  [devnet](#local-devnet), never on a public network. Do not run them with real funds.
 
 ## Design
 
@@ -71,8 +97,8 @@ of the speedup:
   `ReleaseFast`, on 100 blocks).
 - Node to node, on a small synthetic devnet chain (332 blocks, 12,778 transactions, a
   10,000-account state), needlefish's node answers `engine_newPayload` in 4.00 ms median
-  against `base-reth-node`'s 8.03 ms. needlefish cannot hold mainnet state yet, so there
-  is no mainnet node comparison.
+  against `base-reth-node`'s 8.03 ms. A node-to-node comparison on mainnet state has not
+  been measured yet.
 
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has the full build matrix, the phase breakdown and
 profiles, the environment, and `etc/bench/reproduce.sh`. Micro benchmarks (`just bench`)
@@ -101,6 +127,18 @@ base devnet init --out .devnet  # generate a local devnet: genesis, rollup confi
 base replay run src/infra/replay/testdata/base-mainnet-53715983-10.nfrp  # replay 10 mainnet blocks
 just replay 100                 # fetch the latest 100 mainnet blocks and replay them offline
 ```
+
+### Base mainnet node
+
+```sh
+base snapshot-import --db mdbx.dat --chain base-mainnet --blake3 <hash> --out mainnet.nf
+base el-run --db mainnet.nf --chain base-mainnet --peers peers.txt --rpc --engine.addr ...
+base consensus --rollup-config rollup.json --l1 ... --l1-beacon ... --l2 ...
+```
+
+[docs/MAINNET.md](docs/MAINNET.md) walks through every step: the snapshot download, the
+verified import, finding peers, el-run, the consensus node, and `etc/scripts/sync-watch.py`
+to watch the node against mainnet.base.org.
 
 ### Local devnet
 
