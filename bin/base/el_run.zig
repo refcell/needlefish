@@ -424,6 +424,8 @@ const Gap = struct {
     idle_ms: u64 = 0,
     /// Serving the Engine API and JSON-RPC after the previous block.
     serve_ms: u64 = 0,
+    /// The previous block's hooks (`block_committed`) and log line, and summaries.
+    log_ms: u64 = 0,
     /// Fetches that found no new block.
     polls: u64 = 0,
 
@@ -470,7 +472,11 @@ fn run_blocks(run: *Run) !u8 {
         const flush_at: u32 = if (run.feed.at_tip) tip_unflushed_max else flush_every;
         if (run.unflushed >= flush_at) try run.flush();
         run.gap.flush_ms += @intCast(run.now_ms() - flushed_ms);
-        if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) summary(run);
+        if (run.now_ms() - run.last_summary_ms >= summary_interval_ms) {
+            const summary_ms = run.now_ms();
+            summary(run);
+            run.gap.log_ms += @intCast(run.now_ms() - summary_ms);
+        }
     }
     return 0;
 }
@@ -487,9 +493,9 @@ fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64) void {
     run.lag_last_ms = lag_ms;
     if (rise_ms <= slow_rise_ms) return;
     std.debug.print("slow block {d}: lag_ms {d} (+{d}), before it: fetch {d} ms ({d} empty), " ++
-        "flush {d} ms, idle {d} ms, serve {d} ms; exec {d} ms\n", .{
-        number,       lag_ms,  rise_ms, gap.fetch_ms, gap.polls, gap.flush_ms, gap.idle_ms,
-        gap.serve_ms, exec_ms,
+        "flush {d} ms, idle {d} ms, serve {d} ms, log {d} ms; exec {d} ms\n", .{
+        number,       lag_ms,     rise_ms, gap.fetch_ms, gap.polls, gap.flush_ms, gap.idle_ms,
+        gap.serve_ms, gap.log_ms, exec_ms,
     });
 }
 
@@ -545,6 +551,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         return false;
     }
     assert(run.db.head_info.number == block.number);
+    const hooks_ms = run.now_ms();
     block_committed(run, block, outcome.receipts);
     run.blocks += 1;
     run.transactions += outcome.transactions;
@@ -564,6 +571,8 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
     std.debug.print("block {d} hash {x} {d} txs {d} gas {d} ms lag_ms {d} checks ok\n", .{
         block.number, block.hash, outcome.transactions, outcome.gas_used, elapsed, lag_ms,
     });
+    // After `account_gap`: the next block's gap.
+    run.gap.log_ms += @intCast(run.now_ms() - hooks_ms);
     return true;
 }
 
@@ -655,12 +664,14 @@ fn print_gap(run: *Run) void {
     if (run.gap_blocks == 0) return;
     const sum = run.gap_sum;
     const blocks: f64 = @floatFromInt(run.gap_blocks);
-    std.debug.print("tip ms/block: fetch {d:.1} flush {d:.1} idle {d:.1} serve {d:.1}, " ++
+    std.debug.print("tip ms/block: fetch {d:.1} flush {d:.1} idle {d:.1} serve {d:.1} " ++
+        "log {d:.1}, " ++
         "{d:.2} empty fetches, {d} blocks\n", .{
         @as(f64, @floatFromInt(sum.fetch_ms)) / blocks,
         @as(f64, @floatFromInt(sum.flush_ms)) / blocks,
         @as(f64, @floatFromInt(sum.idle_ms)) / blocks,
         @as(f64, @floatFromInt(sum.serve_ms)) / blocks,
+        @as(f64, @floatFromInt(sum.log_ms)) / blocks,
         @as(f64, @floatFromInt(sum.polls)) / blocks,
         run.gap_blocks,
     });
