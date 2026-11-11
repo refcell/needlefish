@@ -2,10 +2,10 @@
 //! state on disk (disk-state import plan, Q4 and step 7). The four flat trees (`flat_trees.zig`)
 //! hold every account record (with its storage root), every slot, and every branch record
 //! (`branch_record.zig`) of the account trie and of each storage trie, exactly as a bulk import
-//! writes them; nothing of the state lives in RAM between blocks except the root.
+//! writes them; nothing of the state lives in RAM between blocks except the root and caches.
 //!
-//! Per block (`apply`, forward or unwind): a `SparseState` starts from the current root and
-//! applies the changeset (a destroyed account's storage slot by slot, so its records are seen).
+//! Per block (`apply`, forward or unwind): a `SparseState` at the current root applies the
+//! changeset (a destroyed account's storage slot by slot, so its records are seen).
 //! Nodes it needs resolve through a `Fallback` backed by a per-block locator memo: hash -> how
 //! to rebuild its preimage, either a branch record at (owner, hang) via `get_branch` or a leaf
 //! at (owner, key, depth) from `get_account`/`get_slot`. Resolving a record registers its
@@ -23,6 +23,14 @@
 //! accounts whose only change is storage; a removed account is a tombstone) and slots (zero is
 //! a tombstone) are written. Every read happens before the first write, and nothing is written
 //! unless every put fits the memtables (`error.Busy`: compact and retry).
+//!
+//! Carry: a walk (`apply`, `verify_leaf`) that succeeded leaves the sparse trie and the memo at
+//! the root, so the next walk starts on them (the trie's upper levels stay resolved) while
+//! they are small (`carry_ready`); else, and after `set_root`, it starts fresh. Carrying is
+//! safe because a memo entry's bytes are content-addressed and every resolution hashes to its
+//! reference, and a locator never outlives its record unresolved: a record or leaf changes
+//! only where the walk resolved it, which stores its bytes, and bytes win over locators.
+//! A carried walk that fails anyway (memo full, say) is redone fresh, which is the oracle.
 //!
 //! Reads for the evm path (`basic`, `account`, `storage`) are synchronous point lookups. A read
 //! error sets a sticky `fault`: reads then return absent / zero and `apply` fails with
@@ -149,8 +157,11 @@ pub const Clock = struct {
 
 /// Counters since init (and, under a `Clock`, summed phase times of successful applies).
 pub const Stats = struct {
-    /// Successful `apply` calls.
+    /// Successful `apply` calls, how many started on the trie the walk before left (carry),
+    /// and carried walks that failed and were redone fresh.
     blocks: u64 = 0,
+    blocks_carried: u64 = 0,
+    carry_retries: u64 = 0,
     /// Branch records resolved by hash, how many of them read the branch trees, and how
     /// many the record cache answered.
     records_resolved: u64 = 0,
@@ -229,6 +240,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         account_writes_len: u32 = 0,
         /// Live puts, or journal replay puts (`FlatTrees.Mode`).
         mode: FlatTrees.Mode = .live,
+        /// The sparse trie and the memo hold `state_root` from the last successful walk.
+        carried: bool = false,
         /// Sticky: a tree read failed.
         fault: bool = false,
         /// This block: a preimage could not be built or did not hash to its reference.
@@ -327,6 +340,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         pub fn set_root(self: *Self, state_root: Hash) void {
             self.state_root = state_root;
             self.fault = false;
+            self.carried = false;
             // The trees may have moved (a reopen, a crash, an import): forget their reads.
             self.forget_reads();
             assert(std.mem.eql(u8, &self.state_root, &state_root));
@@ -394,7 +408,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 if (record != null) return error.Corrupt;
                 return;
             }
-            self.begin_block();
+            self.begin_block(false);
             const bytes = fallback_node(self, &self.state_root);
             if (bytes == null or self.fault or self.corrupt or self.memo_full) {
                 return error.Corrupt;
@@ -408,15 +422,31 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// Reads the account at `address_hash` (and the slot at `slot_hash`) through the
         /// trie from the root: every node is rebuilt from branch records and flat leaves and
         /// checked against the hash its parent names, so a missing or wrong record on the
-        /// path is `error.Corrupt` (an import's self-check). Writes nothing; starts a fresh
-        /// walk, as a block does.
+        /// path is `error.Corrupt` (an import's self-check). Writes nothing; walks as a block
+        /// does (on the carried trie when there is one).
         pub fn verify_leaf(
             self: *Self,
             address_hash: *const Hash,
             slot_hash: ?*const Hash,
         ) Error!Leaf {
             if (self.fault) return error.Corrupt;
-            self.begin_block();
+            const carry = self.carry_ready();
+            return self.read_leaf(address_hash, slot_hash, carry) catch |err| {
+                if (!carry or self.fault) return err;
+                self.stats.carry_retries += 1;
+                return self.read_leaf(address_hash, slot_hash, false);
+            };
+        }
+
+        fn read_leaf(
+            self: *Self,
+            address_hash: *const Hash,
+            slot_hash: ?*const Hash,
+            carry: bool,
+        ) Error!Leaf {
+            self.begin_block(carry);
+            // Reads only resolve nodes: a walk that succeeds leaves the trie at the root.
+            self.carried = false;
             const leaf_account = self.sparse_state.account_hashed(address_hash) catch |err| {
                 return self.sparse_error(err);
             };
@@ -429,6 +459,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             if (self.fault or self.corrupt) return error.Corrupt;
             if (self.memo_full) return error.Full;
             assert(leaf_account != null or word == 0);
+            self.carried = true;
             return .{ .account = leaf_account, .word = word };
         }
 
@@ -523,8 +554,20 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             if (self.fault) return error.Corrupt;
             const applied = if (forward) changeset else try self.reverse(changeset);
             try self.check_wipes(applied);
+            const carry = self.carry_ready();
+            self.apply_walk(applied, carry) catch |err| {
+                // Busy is retried by the caller (fresh: the trie moved); a fault is final.
+                if (!carry or err == error.Busy or self.fault) return err;
+                self.stats.carry_retries += 1;
+                return self.apply_walk(applied, false);
+            };
+        }
+
+        fn apply_walk(self: *Self, applied: *const Changeset, carry: bool) Error!void {
             const start_ns = self.now_ns();
-            self.begin_block();
+            self.begin_block(carry);
+            // The trie moves to the post-state: carried again only once written back.
+            self.carried = false;
             self.sparse_state.apply(applied) catch |err| return self.sparse_error(err);
             const updated_ns = self.now_ns();
             const new_root = self.sparse_state.state_root();
@@ -544,9 +587,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             self.write_slots(applied);
             self.write_records();
             self.state_root = new_root;
+            self.carried = true;
             assert(!self.fault and !self.corrupt);
             const stats = &self.stats;
             stats.blocks += 1;
+            stats.blocks_carried += @intFromBool(carry);
             stats.record_writes += self.record_writes_len;
             stats.update_ns += updated_ns -| start_ns;
             stats.root_ns += rooted_ns -| updated_ns;
@@ -613,11 +658,36 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             if (self.fault) return error.Corrupt;
         }
 
-        fn begin_block(self: *Self) void {
-            self.memo.clearRetainingCapacity();
-            self.memo_bytes_len = 0;
+        /// Whether the next walk can start on the trie and memo the last one left: they hold
+        /// the root and are small enough (else a fresh walk empties them). The memo stays at
+        /// a sixteenth of its bounds: past that its lookups miss the CPU caches, and the
+        /// record diff (thousands of lookups a block) costs more than carrying saves.
+        fn carry_ready(self: *Self) bool {
+            if (!self.carried) return false;
+            const trie_nodes = &self.sparse_state.trie;
+            const roomy = self.memo.count() <= self.config.memo_entries_max / 16 and
+                self.memo_bytes_len <= self.memo_bytes.len / 16 and
+                trie_nodes.free_count >= trie_nodes.nodes.len / 2 and
+                self.sparse_state.storage_roots.count() <= self.config.storage_tries_max / 2;
+            if (!roomy) return false;
+            // Clean after a successful walk: the root hash is the cached one, not recomputed.
+            return std.mem.eql(u8, &self.sparse_state.state_root(), &self.state_root);
+        }
+
+        /// Starts a walk at `state_root`: on the carried trie and memo (`carry`, which
+        /// `carry_ready` allowed), else on empty ones.
+        fn begin_block(self: *Self, carry: bool) void {
             self.corrupt = false;
             self.memo_full = false;
+            if (carry) {
+                assert(self.carried);
+                assert(self.memo.count() > 0 or
+                    std.mem.eql(u8, &self.state_root, &node.empty_root));
+                return;
+            }
+            self.carried = false;
+            self.memo.clearRetainingCapacity();
+            self.memo_bytes_len = 0;
             self.sparse_state.reset(self.state_root, .{ .number = 0, .hash = @splat(0) });
             self.sparse_state.set_fallback(.{
                 .context = self,

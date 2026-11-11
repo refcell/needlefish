@@ -265,6 +265,8 @@ const Counts = struct {
     /// Records the record cache answered, and cache entries checked against the build.
     cache_hits: u64 = 0,
     cache_matched: u64 = 0,
+    /// Blocks applied on the trie the walk before left.
+    carried: u64 = 0,
 };
 
 fn nibble_at(hash: *const Hash, index: usize) u8 {
@@ -1081,6 +1083,7 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
         try run.step();
     }
     counts.cache_hits += run.disk.stats.record_cache_hits;
+    counts.carried += run.disk.stats.blocks_carried;
 }
 
 test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bulk build" {
@@ -1103,6 +1106,9 @@ test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bul
     // The record cache answers and is checked against the build.
     try testing.expect(counts.cache_hits >= 500);
     try testing.expect(counts.cache_matched >= 1000);
+    // Blocks start on the trie the walk before left (after a reopen or a crash, the
+    // check's proofs walked fresh first).
+    try testing.expect(counts.carried >= (counts.blocks + counts.unwinds) / 2);
 }
 
 test "disk state: a record off its reference is Corrupt; an unlisted wipe is Unsupported" {
@@ -1172,4 +1178,34 @@ test "disk state: a record off its reference is Corrupt; an unlisted wipe is Uns
     }
     try reference.set_account(node.keccak256(&account.address), trie_account(info));
     try testing.expectEqualSlices(u8, &try reference.root(), &disk.root());
+    // A carried walk that fails is redone fresh, and the fresh failure stands: the flat
+    // record of an account no walk resolved yet is off its leaf's reference.
+    try testing.expect(disk.carried);
+    const other = &model.accounts.items[1];
+    const other_hash = node.keccak256(&other.address);
+    const stored = (try trees.get_account(&other_hash)).?;
+    var forged = other.info;
+    forged.nonce += 7;
+    const forged_value = flat_trees_module.account_encode(&forged, &stored.storage_root);
+    const original_value = flat_trees_module.account_encode(&other.info, &stored.storage_root);
+    try trees.accounts.put(&other_hash, &forged_value);
+    var other_info = other.info;
+    other_info.balance +%= 1;
+    changeset.clear();
+    try changeset.add_account(.{ .address = other.address, .old = other.info, .new = other_info });
+    const retries = disk.stats.carry_retries;
+    const after_update = disk.root();
+    try testing.expectError(error.Corrupt, disk.apply(&changeset, true));
+    try testing.expectEqual(retries + 1, disk.stats.carry_retries);
+    try testing.expectEqualSlices(u8, &after_update, &disk.root());
+    try testing.expect(!disk.carried);
+    // Restored (the trees moved under it: rebind, dropping the reads), the block applies
+    // fresh and leaves a trie to carry.
+    try trees.accounts.put(&other_hash, &original_value);
+    disk.set_root(after_update);
+    try disk.apply(&changeset, true);
+    try testing.expectEqual(retries + 1, disk.stats.carry_retries);
+    try reference.set_account(other_hash, trie_account(other_info));
+    try testing.expectEqualSlices(u8, &try reference.root(), &disk.root());
+    try testing.expect(disk.carried);
 }
