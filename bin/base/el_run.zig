@@ -23,6 +23,9 @@
 //! (the default) reads ahead before execution and the commit's trie paths, `tx` only before
 //! execution, `none` neither. Results never depend on it; it is for comparing speeds.
 //!
+//! `--cache-mb <n>` sizes the flat trees' block cache (default: the database shape's, 4 GiB
+//! for the node shapes). Memory only, not part of the file: any size opens any database.
+//!
 //! With `--engine.addr <ip:port> --engine.jwt <file>` it also serves the Engine API to a
 //! verifier `base consensus` (`el_engine.zig`), between blocks and while idle at the tip.
 //!
@@ -78,11 +81,14 @@ const usage =
     \\                   [--engine.rollup-out <rollup.json>] [--gossip [--p2p.* ...]]
     \\                   [--rpc] [--rpc.addr <ip:port>] [--rpc.ring-blocks <n>]
     \\                   [--rpc.ring-mb <n>] [--rpc.tx-index <entries>]
-    \\                   [--prefetch all|tx|none]
+    \\                   [--prefetch all|tx|none] [--cache-mb <n>]
     \\
 ;
 
 const flush_every = 64;
+/// `--cache-mb` bounds: one cache set of 64 KiB blocks at least, 1 TiB at most.
+const cache_mb_min: u32 = 1;
+const cache_mb_max: u32 = 1 << 20;
 const summary_interval_ms = 10_000;
 const peers_interval_ms = 60_000;
 const tip_wait_ms = 100;
@@ -96,6 +102,8 @@ const Flags = struct {
     blocks: ?u64 = null,
     duration_s: ?u64 = null,
     prefetching: import_run.Prefetching = .all,
+    /// The flat trees' block cache in MiB (null: the shape's).
+    cache_mb: ?u32 = null,
     engine: el_engine.Flags = .{},
     /// The read-only JSON-RPC server (`--rpc`, `--rpc.*`).
     rpc: el_rpc.Flags = .{},
@@ -143,6 +151,10 @@ fn parse_flags(args: []const []const u8) !Flags {
         } else if (std.mem.eql(u8, name, "--blocks")) {
             flags.blocks = try std.fmt.parseInt(u64, value, 10);
             if (flags.blocks.? == 0) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, name, "--cache-mb")) {
+            const cache_mb = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
+            if (cache_mb < cache_mb_min or cache_mb > cache_mb_max) return error.InvalidArguments;
+            flags.cache_mb = cache_mb;
         } else if (std.mem.eql(u8, name, "--prefetch")) {
             flags.prefetching = std.meta.stringToEnum(import_run.Prefetching, value) orelse
                 return error.InvalidArguments;
@@ -180,7 +192,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s} is not a counts record\n", .{counts_path});
         return 1;
     };
-    const sizing = try to_disk.sizing(Storage, counts, to_disk.node_shape(counts));
+    var sizing = try to_disk.sizing(Storage, counts, to_disk.node_shape(counts));
+    if (flags.cache_mb) |cache_mb| {
+        sizing.config.flat_cache_blocks = cache_blocks_of(cache_mb, &sizing.config);
+    }
     var backend = try snapshot_import_out.backend_init();
     defer backend.deinit();
     const Opened = snapshot_import_out.Opened;
@@ -320,8 +335,12 @@ fn run_reported(run: *Run, parent: [32]u8) !u8 {
     assert(run.blocks == 0);
     run.started_ms = run.now_ms();
     run.last_summary_ms = run.started_ms;
+    const config = &run.db.config;
+    const cache_mb = @as(u64, config.flat_cache_blocks) * config.engine.checkpoint_block_size >> 20;
     std.debug.print("el-run: executing {s} from block {d} (parent {x}), blocks over devp2p, " ++
-        "prefetch {t}\n", .{ run.flags.chain.name, run.first, parent, run.flags.prefetching });
+        "prefetch {t}, block cache {d} MiB\n", .{
+        run.flags.chain.name, run.first, parent, run.flags.prefetching, cache_mb,
+    });
     const status = try run_blocks(run);
     try run.flush();
     summary(run);
@@ -332,6 +351,16 @@ fn run_reported(run: *Run, parent: [32]u8) !u8 {
         });
     }
     return status;
+}
+
+/// Blocks of the flat trees' cache in `cache_mb` MiB (at least one cache set).
+fn cache_blocks_of(cache_mb: u32, config: *const base.execution.db.database.Config) u32 {
+    const block_size: u64 = config.engine.checkpoint_block_size;
+    assert(block_size > 0 and block_size <= 1 << 20);
+    const ways = base.execution.db.storage.table.BlockCache.ways;
+    const blocks = @max(ways, (@as(u64, cache_mb) << 20) / block_size);
+    assert(blocks <= std.math.maxInt(u32));
+    return @intCast(blocks);
 }
 
 /// Executes blocks until `--blocks`, `--duration`, or the first failure (1).
@@ -559,11 +588,15 @@ test "el-run: flags" {
     try std.testing.expectEqual(import_run.Prefetching.all, defaults.prefetching);
     const off = try parse_flags(&.{ "--db", "x", "--enode", enode_text, "--prefetch", "none" });
     try std.testing.expectEqual(import_run.Prefetching.none, off.prefetching);
+    try std.testing.expectEqual(@as(?u32, null), defaults.cache_mb);
+    const cached = try parse_flags(&.{ "--db", "x", "--enode", enode_text, "--cache-mb", "32768" });
+    try std.testing.expectEqual(@as(?u32, 32768), cached.cache_mb);
     const rejected = [_][]const []const u8{
         &.{ "--db", "x", "--enode", enode_text, "--blocks", "0" },
         &.{ "--db", "x", "--enode", enode_text, "--chain", "op-mainnet" },
         &.{ "--db", "x", "--enode", enode_text, "--duration" },
         &.{ "--db", "x", "--enode", enode_text, "--prefetch", "paths" },
+        &.{ "--db", "x", "--enode", enode_text, "--cache-mb", "0" },
     };
     for (rejected) |args| try std.testing.expectError(error.InvalidArguments, parse_flags(args));
     const engine = try parse_flags(&.{
