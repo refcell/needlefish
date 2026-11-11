@@ -33,11 +33,15 @@ const el_run = @import("el_run.zig");
 const state_check = @import("state_check.zig");
 const derive_check = @import("derive_check.zig");
 const https_bridge = @import("https_bridge.zig");
+const up = @import("up.zig");
 
 const usage =
     \\usage: base <command> [args]
     \\
+    \\Run a Base mainnet node: base up   (base up --help for options)
+    \\
     \\commands:
+    \\  up         run a Base node from nothing: snapshot, import, execution, consensus
     \\  version    print version
     \\  devnet     generate local devnet config (base devnet init)
     \\  batcher    submit L2 batches to L1
@@ -105,6 +109,11 @@ test {
     _ = state_check;
     _ = derive_check;
     _ = https_bridge;
+    _ = up;
+    _ = @import("up_check.zig");
+    _ = @import("up_tar.zig");
+    _ = @import("up_snapshot.zig");
+    _ = @import("up_run.zig");
     _ = @import("derive_check_net.zig");
     _ = @import("el_source.zig");
     _ = @import("el_pool.zig");
@@ -159,6 +168,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "proof")) {
         std.process.exit(try proof.main(init, args[2..]));
+    }
+    if (std.mem.eql(u8, command, "up")) {
+        std.process.exit(try up.main(init, args[2..]));
     }
     if (try infra_main(init, command, args[2..])) |status| std.process.exit(status);
     std.debug.print("unknown command: {s}\n{s}", .{ command, usage });

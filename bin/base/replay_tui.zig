@@ -16,26 +16,26 @@ const bar_width = 32;
 pub const Style = struct {
     color: bool,
 
-    fn code(style: Style, comptime sequence: []const u8) []const u8 {
+    pub fn code(style: Style, comptime sequence: []const u8) []const u8 {
         return if (style.color) "\x1b[" ++ sequence ++ "m" else "";
     }
 
-    fn reset(style: Style) []const u8 {
+    pub fn reset(style: Style) []const u8 {
         return style.code("0");
     }
-    fn dim(style: Style) []const u8 {
+    pub fn dim(style: Style) []const u8 {
         return style.code("2");
     }
-    fn bold(style: Style) []const u8 {
+    pub fn bold(style: Style) []const u8 {
         return style.code("1");
     }
-    fn green(style: Style) []const u8 {
+    pub fn green(style: Style) []const u8 {
         return style.code("32");
     }
-    fn red(style: Style) []const u8 {
+    pub fn red(style: Style) []const u8 {
         return style.code("31");
     }
-    fn cyan(style: Style) []const u8 {
+    pub fn cyan(style: Style) []const u8 {
         return style.code("36");
     }
 };

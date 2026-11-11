@@ -15,6 +15,7 @@ pub const storage_range = @import("storage_range.zig");
 pub const account = @import("account.zig");
 pub const eth = @import("eth.zig");
 pub const eth_proof = @import("eth_proof.zig");
+pub const eth_config = @import("eth_config.zig");
 pub const engine_json = @import("engine_json.zig");
 pub const engine = @import("engine.zig");
 test {

@@ -735,7 +735,7 @@ pub fn write_rollup_config(std_io: Io, path: []const u8, config: *const ChainCon
     std.debug.print("el-run: wrote the {d} rollup config to {s}\n", .{ config.chain_id, path });
 }
 
-fn rollup_text(buffer: []u8, config: *const ChainConfig) ![]const u8 {
+pub fn rollup_text(buffer: []u8, config: *const ChainConfig) ![]const u8 {
     const rollup = rollup_config_for(config);
     var out: std.Io.Writer = .fixed(buffer);
     var writer = json.Writer.init(&out);
