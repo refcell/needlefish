@@ -12,7 +12,7 @@ needlefish is a complete Base node stack: execution client, rollup consensus nod
 builder, batcher, and fault-proof tooling, built on the Zig standard library and nothing
 else. It is a ground-up port of [base/base](https://github.com/base/base) and keeps its
 layout, so every crate there has an obvious home here. L2 blocks are full blocks at Base's
-native 200 ms cadence; there are no flashblocks.
+native 200 ms cadence.
 
 <p align="center">
   <img src="docs/assets/base-up-demo.gif" width="800"
