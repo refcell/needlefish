@@ -51,16 +51,26 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     const analyzed = f.analyzed;
     var registers = Registers{ .pc = f.pc, .gas = f.gas, .stack = f.stack };
     const r = &registers;
+    // Opcodes and PUSH immediates are read through `code` without per-read bounds checks,
+    // which safe builds would otherwise pay on every opcode. Every read stays inside the
+    // padded code: `pc` starts inside it; an opcode inside the original code moves `pc` at
+    // most 33 bytes forward (PUSH32), or to a JUMPDEST below `len`; and any byte past `len`
+    // is padding, a STOP, which exits. Asserted once per entry instead.
+    assert(analyzed.code.len == @as(u64, analyzed.len) + bytecode.padding_bytes);
+    assert(std.mem.allEqual(u8, analyzed.code[analyzed.len..], 0));
+    assert(r.pc < analyzed.code.len);
+    assert(analyzed.jumpdests.len == (@as(u64, analyzed.len) + 7) / 8);
+    const code = analyzed.code.ptr;
     // Set when a step halts. A plain `bool` continue flag instead of a `?Exit` result: Zig
     // lowered the optional to a load from a constant global, and a branch, on every opcode.
     var exit: Exit = undefined;
     loop: {
-        dispatch: switch (analyzed.code[r.pc]) {
+        dispatch: switch (code[r.pc]) {
             inline else => |opcode| {
                 const start = opcode_profile.now();
                 defer opcode_profile.record(opcode, start);
                 if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
-                continue :dispatch analyzed.code[r.pc];
+                continue :dispatch code[r.pc];
             },
         }
     }
@@ -123,7 +133,7 @@ inline fn step(
         }
     }
     // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes, `Analyzed.len` is a
-    // u32), and the next `analyzed.code[r.pc]` is still bounds-checked.
+    // u32; see `run`).
     r.pc +%= 1;
     if (comptime in_registers(opcode)) {
         return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
@@ -501,8 +511,8 @@ fn copy_to_memory(
 
 inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analyzed) void {
     comptime assert(size >= 1 and size <= 32);
-    // The code is padded, so an immediate running past the end reads zeros.
-    const immediate = analyzed.code[r.pc..][0..size];
+    // The code is padded, so an immediate running past the end reads zeros (see `run`).
+    const immediate = analyzed.code.ptr[r.pc..][0..size];
     const value: u256 = if (size <= 8) blk: {
         var buffer: [8]u8 = @splat(0);
         buffer[8 - size ..].* = immediate.*;
@@ -513,7 +523,7 @@ inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analy
         break :blk primitives.word_from_be(&buffer);
     };
     r.stack.push(value);
-    // Cannot wrap: the immediate's slice above is bounds-checked against the padded code.
+    // Cannot wrap: `pc` stays within the padded code (see `run`).
     r.pc +%= size;
 }
 

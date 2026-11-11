@@ -61,15 +61,17 @@ pub const Memory = struct {
         memory.len = len_new;
     }
 
+    // `slice` and `word` index `bytes.ptr`: the assert bounds the range by `len`, and `grow`
+    // keeps `len <= bytes.len`, so a second check against `bytes.len` could never fire.
     pub inline fn slice(memory: *const Memory, offset: u64, size: u64) []u8 {
         assert(offset + size <= memory.len);
         const start: usize = @intCast(offset);
-        return memory.bytes[start..][0..@intCast(size)];
+        return memory.bytes.ptr[start..][0..@intCast(size)];
     }
 
     pub inline fn word(memory: *const Memory, offset: u64) *[32]u8 {
         assert(offset + 32 <= memory.len);
-        return memory.bytes[@intCast(offset)..][0..32];
+        return memory.bytes.ptr[@intCast(offset)..][0..32];
     }
 };
 

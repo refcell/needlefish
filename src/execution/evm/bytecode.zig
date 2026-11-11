@@ -23,7 +23,9 @@ pub const Analyzed = struct {
     pub inline fn is_jumpdest(analyzed: *const Analyzed, destination: u256) bool {
         if (destination >= analyzed.len) return false;
         const index: u32 = @intCast(destination);
-        return (analyzed.jumpdests[index >> 3] >> @intCast(index & 7)) & 1 == 1;
+        // `index < len` and the bitmap has (len + 7) / 8 bytes (`analyze`; the interpreter
+        // asserts it once per frame entry), so the read needs no per-JUMP bounds check.
+        return (analyzed.jumpdests.ptr[index >> 3] >> @intCast(index & 7)) & 1 == 1;
     }
 
     /// The original code without padding.
@@ -42,6 +44,7 @@ pub fn analyze(code: []const u8, out: []u8) Analyzed {
     assert(code.len <= std.math.maxInt(u32));
     const padded = out[0 .. code.len + padding_bytes];
     const bitmap = out[code.len + padding_bytes ..];
+    assert(bitmap.len == (code.len + 7) / 8);
     @memcpy(padded[0..code.len], code);
     @memset(padded[code.len..], 0);
     @memset(bitmap, 0);
