@@ -134,37 +134,57 @@ comptime {
 }
 
 /// One message on x86-64 with AVX-512 (F and VL): every lane in its own 128-bit register.
-/// The 32 vector registers hold the state without spills, `vprolq` rotates, and LLVM fuses
-/// three-input logic (theta's xors, chi) into `vpternlogq`; this is how evm2's keccak
-/// compiles. 264-272 ns per 64-byte hash on a 2.6 GHz Xeon, against 555 for `permute(u64)`
-/// and 636-675 for std. Other targets keep `permute(u64)` (aarch64 measured it best).
+/// The 32 vector registers hold the state without spills, `vprolq` rotates, and three-input
+/// logic (theta, chi) is one `vpternlogq`; this is how evm2's keccak compiles. 259-262 ns
+/// per 32- or 64-byte hash on a 2.6 GHz Xeon (evm2's keccak-asm 249), against 555 for
+/// `permute(u64)` and 636-675 for std. Other targets keep `permute(u64)` (aarch64 measured
+/// it best).
 const spread_lanes = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and
     builtin.cpu.hasAll(.x86, &.{ .avx512f, .avx512vl });
 
+/// A state lane in the low half of a 128-bit register (`spread_lanes`).
+const Spread = @Vector(2, u64);
+
+extern fn @"llvm.x86.avx512.pternlog.q.128"(a: Spread, b: Spread, c: Spread, imm: i32) Spread;
+
+/// `a ^ b ^ c` as one `vpternlogq`. Written with `^`, LLVM reassociates theta's
+/// `lane ^ left ^ rotl(right)` into a shared `left ^ rotl(right)` and a two-input xor per lane:
+/// 30 xors a round where 25 suffice (keccak-asm calls the intrinsic too).
+inline fn xor3(a: Spread, b: Spread, c: Spread) Spread {
+    comptime assert(spread_lanes);
+    return @"llvm.x86.avx512.pternlog.q.128"(a, b, c, 0x96);
+}
+
 fn permute_one(state: *[25]u64) void {
     if (comptime !spread_lanes) return permute(u64, state);
-    const Lane = @Vector(2, u64);
-    var lanes: [25]Lane = undefined;
+    var lanes: [25]Spread = undefined;
     inline for (0..25) |lane| lanes[lane] = .{ state[lane], 0 };
-    for (round_constants) |round_constant| round_spread(Lane, &lanes, round_constant);
+    permute_spread(&lanes);
     inline for (0..25) |lane| state[lane] = lanes[lane][0];
+}
+
+inline fn permute_spread(lanes: *[25]Spread) void {
+    for (round_constants) |round_constant| round_spread(lanes, round_constant);
 }
 
 /// The textbook round: theta, then rho and pi into a second array, then chi. With a lane
 /// per register it beats the in-place `round` (264 against 330 ns): no lane waits on the
 /// rho-pi cycle's chain of moves.
-inline fn round_spread(comptime Lane: type, state: *[25]Lane, round_constant: u64) void {
+inline fn round_spread(state: *[25]Spread, round_constant: u64) void {
     @setEvalBranchQuota(10_000);
-    var parity: [5]Lane = undefined;
+    var parity: [5]Spread = undefined;
     inline for (0..5) |x| {
-        parity[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20];
+        const three = xor3(state[x], state[x + 5], state[x + 10]);
+        parity[x] = xor3(three, state[x + 15], state[x + 20]);
     }
-    var moved: [25]Lane = undefined;
+    var moved: [25]Spread = undefined;
     inline for (0..5) |x| {
-        const theta = parity[(x + 4) % 5] ^ rotl(Lane, parity[(x + 1) % 5], 1);
+        const left = parity[(x + 4) % 5];
+        const right = rotl(Spread, parity[(x + 1) % 5], 1);
         inline for (0..5) |y| {
             const destination = y + 5 * ((2 * x + 3 * y) % 5);
-            moved[destination] = rotl(Lane, state[x + 5 * y] ^ theta, rho_by_lane[x + 5 * y]);
+            const lane = xor3(state[x + 5 * y], left, right);
+            moved[destination] = rotl(Spread, lane, rho_by_lane[x + 5 * y]);
         }
     }
     inline for (0..5) |y| {
@@ -173,7 +193,39 @@ inline fn round_spread(comptime Lane: type, state: *[25]Lane, round_constant: u6
             state[x + 5 * y] = moved[x + 5 * y] ^ (~next & moved[(x + 2) % 5 + 5 * y]);
         }
     }
-    state[0] ^= splat(Lane, round_constant);
+    state[0] ^= splat(Spread, round_constant);
+}
+
+/// Keccak-256 of a message shorter than one block (`spread_lanes`), loaded straight into the
+/// lane registers: no 25-lane state in memory to absorb into and copy in and out. 32 and 64
+/// bytes (a word, a mapping slot's key and slot) are padded at comptime.
+fn keccak256_short(data: []const u8) Digest {
+    comptime assert(spread_lanes);
+    assert(data.len < rate_bytes);
+    var lanes: [25]Spread = @splat(@splat(0));
+    switch (data.len) {
+        inline 32, 64 => |length| {
+            inline for (0..length / 8) |lane| {
+                lanes[lane][0] = std.mem.readInt(u64, data[lane * 8 ..][0..8], .little);
+            }
+            lanes[length / 8][0] = 0x01;
+        },
+        else => {
+            var block: [rate_bytes]u8 = @splat(0);
+            @memcpy(block[0..data.len], data);
+            block[data.len] = 0x01;
+            inline for (0..rate_lanes) |lane| {
+                lanes[lane][0] = std.mem.readInt(u64, block[lane * 8 ..][0..8], .little);
+            }
+        },
+    }
+    lanes[rate_lanes - 1][0] ^= 0x80 << 56;
+    permute_spread(&lanes);
+    var out: Digest = undefined;
+    inline for (0..4) |lane| {
+        std.mem.writeInt(u64, out[lane * 8 ..][0..8], lanes[lane][0], .little);
+    }
+    return out;
 }
 
 inline fn absorb_block(state: *[25]u64, block: *const [rate_bytes]u8) void {
@@ -193,6 +245,9 @@ fn squeeze(state: *const [25]u64) Digest {
 
 /// One-shot Keccak-256.
 pub fn keccak256(data: []const u8) Digest {
+    if (comptime spread_lanes) {
+        if (data.len < rate_bytes) return keccak256_short(data);
+    }
     var state: [25]u64 = @splat(0);
     var remaining = data;
     while (remaining.len >= rate_bytes) {

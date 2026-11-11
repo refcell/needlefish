@@ -369,6 +369,16 @@ ecrecover sets the accepted ratio (~9.5 ns/gas). Above it: p256 under RIP-7212 p
   modes run every vector plus seeded round trips, a batch test, and a batch test.
 
 ## Log
+- 2026-11-11 (evm lane): Keccak-256 on AVX-512 matches keccak-asm's round. Written with `^`,
+  LLVM reassociated theta's `lane ^ left ^ rotl(right)` into a shared term plus a two-input
+  xor per lane (35 `vpternlogq` and 30 xors a round); `xor3` calls the
+  `llvm.x86.avx512.pternlog.q.128` intrinsic so each lane is one `vpternlogq` (60 a round,
+  the loop keccak-asm compiles to). Messages under one block load straight into the lane
+  registers (32 and 64 bytes padded at comptime) instead of absorbing into a 25-lane state
+  in memory. 64-byte hash 278 -> 259 ns (keccak-asm 249) on the 2.6 GHz Xeon. evm2
+  fixtures vs the previous build, 10 interleaved rounds: hash_10k 1.112x in both builds,
+  erc20_transfer 1.106x ReleaseSafe / 1.070x ReleaseFast. Base replay: every header and
+  state root matches; EVM-only 1.004x, block total 1.03x (commit and root hashing).
 - 2026-11-11 (evm lane): safegcd `invert` checks its result with a Barrett product (mu
   fixed at comptime) instead of `inverse * x % m`: LLVM lowers the wide `%` to a bit-serial
   loop of about 70k instructions at 256 bits, run on every inversion of a safe-build
