@@ -59,8 +59,32 @@ pub fn Modulus(comptime Int: type, comptime modulus: Int) type {
             const sign_negative = f[limb_count - 1] < 0;
             assert(f[0] == 1 or f[0] == limb_mask);
             const inverse = reduce(&d, sign_negative);
-            assert(@as(@Int(.unsigned, 2 * bits), inverse) * x % modulus == 1);
+            assert(mul_mod(inverse, x) == 1);
             return inverse;
+        }
+
+        /// Bit length k of the modulus and Barrett's mu = floor(2^2k / m).
+        const modulus_bits = bits - @clz(modulus);
+        const Barrett = @Int(.unsigned, (2 * modulus_bits + 2 + 63) / 64 * 64);
+        const barrett_mu: Barrett = (@as(Barrett, 1) << (2 * modulus_bits)) / modulus;
+
+        /// a * b mod m for a, b < m by Barrett reduction (HAC 14.42, base 2) with mu fixed at
+        /// comptime: `invert`'s safe-build self-check. LLVM lowers a wide `%` to a bit-serial
+        /// loop of about 70k instructions at 256 bits, on every inversion of an ecrecover.
+        fn mul_mod(a: Int, b: Int) Int {
+            assert(a < modulus and b < modulus);
+            // Wrapping operations cannot wrap: x < 2^2k, q1 * mu < 2^(2k + 2) fits `Barrett`,
+            // and q3 <= floor(x / m), so x - q3 m is in [0, 3m) (HAC 14.42).
+            const x: Barrett = @as(Barrett, a) *% b;
+            const q1 = x >> (modulus_bits - 1);
+            const q3 = (q1 *% barrett_mu) >> (modulus_bits + 1);
+            var remainder = x -% q3 *% modulus;
+            var rounds: u32 = 0;
+            while (remainder >= modulus) : (rounds += 1) {
+                assert(rounds < 2);
+                remainder -= modulus;
+            }
+            return @intCast(remainder);
         }
 
         fn update_de(d: *Signed62, e: *Signed62, t: Matrix) void {
@@ -269,7 +293,14 @@ fn check_modulus(comptime Int: type, comptime modulus: Int, seed: u64) !void {
         if (x == 0) continue;
         const inverse = Inverse.invert(x);
         try testing.expectEqual(@as(Wide, 1), @as(Wide, inverse) * x % modulus);
+        // The Barrett product behind `invert`'s self-check, against the wide `%`.
+        const y = (inverse ^ @as(Int, @truncate(prng.int(u64)))) % modulus;
+        const expected: Int = @intCast(@as(Wide, x) * y % modulus);
+        try testing.expectEqual(expected, Inverse.mul_mod(x, y));
     }
+    const top = modulus - 1;
+    const expected_top: Int = @intCast(@as(Wide, top) * top % modulus);
+    try testing.expectEqual(expected_top, Inverse.mul_mod(top, top));
 }
 
 test "safegcd: bn254, p256, bls12-381 and secp256k1 moduli" {
