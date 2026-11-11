@@ -452,6 +452,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-11: B1 at P8 (10 rounds, idle) vs evm2 tail-call: ReleaseSafe 1.29x, ReleaseFast
+  1.38x, both memos 1.39x. hash_10k 0.90x -> 0.99x and erc20_transfer 0.93x -> 1.06x in
+  both builds (keccak theta, crypto lane log); snailtracer at parity. Left in ReleaseSafe:
+  curve 0.95-0.97x, entry_point 0.95x, uniswap_v3_pool 0.96x, onchain_lm_v2 and burntpix
+  0.97x. Profiles put that cost in TigerStyle asserts on the division and secp256k1 field
+  paths, not in the dispatch loop (entry_point: point doubling 1.21x its ReleaseFast cost);
+  the safe-build memsets in curve and entry_point profiles are the untimed state reset.
+  Open lead: `div_rem_with` still assembles the single-limb remainder in 8- and 16-byte
+  stores and copies the result with 32-byte loads (one more forwarding stall, about a
+  quarter of its time in snailtracer).
 - 2026-11-11: division without store-forwarding stalls. `uint.div_rem` returned its 64-byte
   `DivRem` through memory and the handler reloaded it with wide loads straddling the callee's
   narrower stores (a misaligned 32-byte reload in curve_3pool), and the single-limb path
