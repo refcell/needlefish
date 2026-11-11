@@ -160,10 +160,6 @@ pub const ChannelOut = struct {
         return channel.input_length >= channel.config.input_bytes_target();
     }
 
-    pub fn input_bytes(channel: *const ChannelOut) u32 {
-        return channel.input_length;
-    }
-
     /// Compresses the collected batches. Afterwards, `next_frame` yields frames.
     pub fn close(channel: *ChannelOut) void {
         assert(channel.state == .open);

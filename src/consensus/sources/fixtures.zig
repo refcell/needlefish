@@ -228,13 +228,6 @@ pub const ReceiptSet = struct {
     }
 };
 
-/// Wraps a JSON-RPC `result` in a response envelope.
-pub fn rpc_response(buffer: []u8, id: u64, result: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{
-        id, result,
-    });
-}
-
 /// A Holocene L2 block JSON whose first transaction is an Ecotone L1 info deposit.
 pub fn l2_block_json(buffer: []u8, number: u64, header_hash: *[32]u8) ![]const u8 {
     const info: protocol.l1_info.L1BlockInfo = .{

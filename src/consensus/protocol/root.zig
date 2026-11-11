@@ -31,7 +31,6 @@ pub const SystemConfig = system_config.SystemConfig;
 pub const DepositTx = deposits.DepositTx;
 pub const L1BlockInfo = l1_info.L1BlockInfo;
 pub const SingleBatch = batch.SingleBatch;
-pub const BatchValidity = batch.Validity;
 pub const SpanBatch = span_batch.SpanBatch;
 pub const RawSpanBatch = span_batch.RawSpanBatch;
 

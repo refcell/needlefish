@@ -368,7 +368,6 @@ pub fn Rpc(comptime limits: Limits) type {
     }
     return struct {
         const Self = @This();
-        pub const limits_config = limits;
 
         subscriptions: [limits.subscriptions_max]SubOpts = undefined,
         subscriptions_count: u32 = 0,

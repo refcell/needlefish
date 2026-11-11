@@ -129,10 +129,6 @@ pub fn Client(comptime IO: type, comptime Context: type) type {
             try client.stream.send(.text, payload);
         }
 
-        pub fn send_binary(client: *Self, payload: []const u8) SendError!void {
-            try client.stream.send(.binary, payload);
-        }
-
         /// Sends an empty ping (keepalive); compare `pongs_received` later for the reply.
         pub fn ping(client: *Self) SendError!void {
             try client.stream.ping("");

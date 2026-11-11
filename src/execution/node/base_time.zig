@@ -125,12 +125,6 @@ pub fn address_word(value: Address) u256 {
     return std.mem.readInt(u160, &value, .big);
 }
 
-/// The millisecond part stored in the BaseTime predeploy.
-pub fn stored_millis_part(state: *evm.State) evm.state.Error!u16 {
-    const word = try state.storage_value(proxy_address, millis_part_slot);
-    return @truncate(word);
-}
-
 /// Minimal proxy runtime for test genesis allocations (any non-empty code passes the
 /// install checks): forwards nothing, returns empty.
 pub const test_proxy_code = [_]u8{0x00};

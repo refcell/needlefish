@@ -1316,10 +1316,6 @@ pub const SparseTrie = struct {
         assert(count <= self.fresh);
         return count;
     }
-
-    pub fn free_nodes(self: *const SparseTrie) u32 {
-        return self.free_count;
-    }
 };
 
 const testing = std.testing;

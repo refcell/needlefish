@@ -360,14 +360,6 @@ pub const Table = struct {
         assert(count <= output.len);
         return count;
     }
-
-    /// Least recently seen live entry in the bucket at `distance`, for liveness pings.
-    pub fn least_recent_at(table: *Table, distance: u16) ?NodeId {
-        assert(distance >= 1 and distance <= bucket_count);
-        const bucket = &table.buckets[distance - 1];
-        if (bucket.live_count == 0) return null;
-        return table.least_recent(bucket);
-    }
 };
 
 fn insert_sorted(output: []*const Entry, count: usize, entry: *const Entry, target: NodeId) usize {

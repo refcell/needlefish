@@ -44,7 +44,6 @@ pub const AccountInfo = changeset.AccountInfo;
 pub const State = state.State;
 pub const Overlay = overlay.Overlay;
 pub const ChainStore = chain.ChainStore;
-pub const HistoryStore = history.Store;
 pub const SparseState = witness.SparseState;
 
 test {

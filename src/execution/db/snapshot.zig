@@ -24,8 +24,6 @@ const node = @import("../trie/node.zig");
 pub const magic: u32 = 0x534e464e; // "NFNS"
 pub const version: u16 = 1;
 
-pub const LoadError = error{ InvalidSnapshot, RootMismatch } || state_module.Error;
-
 fn write_int(sink: anytype, comptime T: type, value: T) !void {
     var bytes: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &bytes, value, .little);

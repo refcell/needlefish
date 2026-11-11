@@ -44,11 +44,6 @@ pub const Gauge = struct {
 
 pub const buckets_max = 16;
 
-/// Exponential default buckets for latencies in seconds: 1 ms .. ~16 s.
-pub const latency_buckets_s = [_]f64{
-    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 16,
-};
-
 /// A histogram with fixed upper bounds. Observations are in the metric's base unit (usually
 /// seconds). The sum is kept in nanounits as an integer so updates stay atomic.
 pub const Histogram = struct {
