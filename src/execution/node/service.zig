@@ -303,6 +303,50 @@ comptime {
     assert(proofs_history_window_default == 300);
 }
 
+/// Grows a durable node's block retention to its proofs history window. A historical
+/// witness re-executes the retained block over the window's state, so without this
+/// `debug_executionWitness` stops at the retention (1024 blocks, 3.4 min of 200 ms blocks)
+/// however long the window is, too short for a prover that waits for L1 finality. The
+/// record byte budget grows at the same bytes per block, and the checkpoint image, which
+/// holds the retained blocks, grows by the same bytes and keeps its commits per checkpoint.
+/// A database written with a longer retention does not open with a shorter one.
+pub fn retain_window(config: *db_module.database.Config, window: u32) void {
+    const chain = &config.chain;
+    if (window <= chain.blocks_max) return;
+    assert(chain.blocks_max > 0);
+    const added_blocks: u64 = window - chain.blocks_max;
+    const added_bytes = added_blocks * (chain.bytes_max / chain.blocks_max);
+    assert(chain.bytes_max + added_bytes <= std.math.maxInt(u32));
+    const staging_before = config.checkpoint_staging_bytes;
+    chain.blocks_max = window;
+    chain.bytes_max += @intCast(added_bytes);
+    config.checkpoint_staging_bytes += added_bytes;
+    const per_commit: u64 = config.checkpoint_bytes_per_commit;
+    const image_bytes = per_commit * config.checkpoint_staging_bytes;
+    // staging_before > 0: the database asserts the staging holds a checkpoint header.
+    const scaled = std.math.divCeil(u64, image_bytes, staging_before) catch unreachable;
+    config.checkpoint_bytes_per_commit = @intCast(@min(scaled, std.math.maxInt(u32)));
+    assert(chain.blocks_max == window);
+    assert(config.checkpoint_bytes_per_commit >= per_commit);
+}
+
+test "service: the block retention covers the proofs history window" {
+    const limits: Limits = .{};
+    var config = limits.durable;
+    const before = config;
+    retain_window(&config, 1000);
+    try std.testing.expectEqual(before.chain.blocks_max, config.chain.blocks_max);
+    retain_window(&config, 8192);
+    try std.testing.expectEqual(@as(u32, 8192), config.chain.blocks_max);
+    // 16 MiB for 1024 blocks: 16 KiB per block.
+    try std.testing.expectEqual(@as(u32, 128 << 20), config.chain.bytes_max);
+    const staging = before.checkpoint_staging_bytes + (112 << 20);
+    try std.testing.expectEqual(staging, config.checkpoint_staging_bytes);
+    // 40 MiB at 4 MiB a commit: 10 commits per checkpoint before and after.
+    const commits = std.math.divCeil(u64, staging, config.checkpoint_bytes_per_commit);
+    try std.testing.expectEqual(@as(u64, 10), try commits);
+}
+
 /// Sizes the historical window (`db.history.Store` "Sizing" and "Byte budget"). Versions:
 /// the budget's worth of each size class plus one block of the per-block bound, so the
 /// byte budget binds before a capacity (the pools are lazily committed: unused capacity
@@ -491,7 +535,10 @@ pub fn Service(comptime IO: type) type {
             }
             // A durable node's history window lives in the database (fed by its head moves).
             const window = service.options.proofs_history_window;
-            if (window > 0) config.history = history_config(limits, window);
+            if (window > 0) {
+                config.history = history_config(limits, window);
+                retain_window(&config, window);
+            }
             config.changeset = .{
                 .accounts_max = limits.state.block_accounts_max,
                 .storage_max = limits.state.block_slots_max,
