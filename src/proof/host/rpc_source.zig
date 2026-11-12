@@ -17,6 +17,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const endpoint_module = @import("../rpc/endpoint.zig");
+const raw_json = @import("../rpc/raw_json.zig");
 const json = @import("../../utilities/json/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
@@ -107,7 +108,11 @@ pub fn RpcSource(comptime IO: type) type {
 
         /// One blocking call, with the host's error set.
         fn call(endpoint: *Endpoint, method: []const u8, param: Param) SourceError![]const u8 {
-            return endpoint.call(method, &.{param}) catch |err| switch (err) {
+            return endpoint.call(method, &.{param}) catch |err| source_error(err);
+        }
+
+        fn source_error(err: endpoint_module.Error) SourceError {
+            return switch (err) {
                 error.NotFound => error.NotFound,
                 error.CallFailed => error.SourceFailed,
             };
@@ -127,8 +132,7 @@ pub fn RpcSource(comptime IO: type) type {
 
         fn raw_header(context: *anyopaque, chain: Chain, hash: Hash) SourceError![]const u8 {
             const endpoint = of(context).endpoint_of(chain);
-            const raw = try call(endpoint, "debug_getRawHeader", .{ .hash = hash });
-            return hex_value(endpoint, raw);
+            return raw_json.header(endpoint, .{ .hash = hash }) catch |err| source_error(err);
         }
 
         fn transactions(
@@ -138,15 +142,20 @@ pub fn RpcSource(comptime IO: type) type {
         ) SourceError![]const []const u8 {
             const source = of(context);
             const endpoint = source.endpoint_of(chain);
-            const raw = try call(endpoint, "debug_getRawBlock", .{ .hash = hash });
+            const debug = raw_json.debug_call(endpoint, "debug_getRawBlock", .{ .hash = hash });
+            const raw = (debug catch |err| return source_error(err)) orelse {
+                const items_max = source.options.items_max;
+                return raw_json.transactions(endpoint, hash, items_max) catch |err|
+                    source_error(err);
+            };
             const block = try hex_value(endpoint, raw);
             return source.block_transactions(endpoint, block) catch error.SourceFailed;
         }
 
         fn receipts(context: *anyopaque, hash: Hash) SourceError![]const []const u8 {
             const source = of(context);
-            const raw = try call(&source.l1, "debug_getRawReceipts", .{ .hash = hash });
-            return source.hex_list(&source.l1, raw);
+            const items_max = source.options.items_max;
+            return raw_json.receipts(&source.l1, hash, items_max) catch |err| source_error(err);
         }
 
         fn blob(context: *anyopaque, hash: Hash, timestamp: u64) SourceError!handler_module.Blob {
@@ -169,8 +178,9 @@ pub fn RpcSource(comptime IO: type) type {
             const source = of(context);
             assert(attributes_json.len > 0);
             const l2 = &source.l2;
-            const raw = try call(l2, "debug_getRawHeader", .{ .hash = parent_hash });
-            const parent = rlp.decode_exact(consensus.Header, try hex_value(l2, raw)) catch
+            const parent_raw = raw_json.header(l2, .{ .hash = parent_hash }) catch |err|
+                return source_error(err);
+            const parent = rlp.decode_exact(consensus.Header, parent_raw) catch
                 return error.SourceFailed;
             const number = std.math.add(u64, parent.number, 1) catch return error.SourceFailed;
             const witness = try call(l2, "debug_executionWitness", .{ .number = number });
@@ -233,8 +243,7 @@ pub fn RpcSource(comptime IO: type) type {
             const endpoint = source.endpoint_of(chain);
             endpoint.reset();
             const block: Block = if (number) |value| .{ .number = value } else .latest;
-            const raw = try call(endpoint, "debug_getRawHeader", block.param());
-            return hex_value(endpoint, raw);
+            return raw_json.header(endpoint, block.param()) catch |err| source_error(err);
         }
 
         /// The `state`, `codes` and `keys` entries of an execution witness object.

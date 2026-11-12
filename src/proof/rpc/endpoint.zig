@@ -119,6 +119,9 @@ pub fn Endpoint(comptime IO: type) type {
         calls: u64 = 0,
         /// The JSON-RPC error of the last call that failed with one (arena copies).
         last_error: ?rpc.client.RpcError = null,
+        /// The node answered a `debug_getRaw*` call with "method not found": `raw_json`
+        /// rebuilds those results from the `eth_*` methods.
+        debug_raw_missing: bool = false,
 
         pub fn init(
             allocator: std.mem.Allocator,

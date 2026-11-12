@@ -74,6 +74,29 @@ pub fn decode_block(
     return receipts;
 }
 
+/// The EIP-2718 receipt encodings of an `eth_getBlockReceipts` result, verified against
+/// `receipts_root` (the raw receipts where `debug_getRawReceipts` is missing).
+pub fn encode_block(
+    allocator: Allocator,
+    raw: []const u8,
+    receipts_root: B256,
+    limits: Limits,
+) Error![]const []const u8 {
+    const count = try object.array_count(raw, limits.receipts_max);
+    const encoded = try allocator.alloc([]const u8, count);
+    var iterator = try object.ArrayIterator.init(raw);
+    for (encoded) |*item| {
+        const element = (try iterator.next()) orelse unreachable; // Counted above.
+        const decoded = try decode(allocator, allocator, element.raw, true, limits);
+        const value = decoded.consensus orelse unreachable; // Verified decodes build it.
+        item.* = value.encode_to(try allocator.alloc(u8, value.encoded_length()));
+    }
+    assert(try iterator.next() == null);
+    const root: B256 = .{ .bytes = ordered.ordered_trie_root(encoded) };
+    if (!root.eql(receipts_root)) return error.RootMismatch;
+    return encoded;
+}
+
 fn decode(
     allocator: Allocator,
     scratch: Allocator,

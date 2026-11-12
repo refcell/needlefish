@@ -3,6 +3,7 @@
 
 pub const endpoint = @import("endpoint.zig");
 pub const clients = @import("clients.zig");
+pub const raw_json = @import("raw_json.zig");
 pub const Endpoint = endpoint.Endpoint;
 pub const Pump = endpoint.Pump;
 pub const Block = endpoint.Block;

@@ -6,6 +6,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 const endpoint_module = @import("endpoint.zig");
+const raw_json = @import("raw_json.zig");
 
 const Error = endpoint_module.Error;
 const Block = endpoint_module.Block;
@@ -24,17 +25,16 @@ pub fn Execution(comptime EndpointType: type) type {
             return endpoint_module.parse_quantity(try self.endpoint.call("eth_blockNumber", &.{}));
         }
 
-        /// The raw RLP header (`debug_getRawHeader`), valid until the next call.
+        /// The raw RLP header (`debug_getRawHeader`, else rebuilt from the block JSON),
+        /// valid until the next call.
         pub fn raw_header(self: Self, block: Block) Error![]const u8 {
-            const raw = try self.endpoint.call("debug_getRawHeader", &.{block.param()});
-            const bytes = try self.endpoint.hex(raw);
+            const bytes = try raw_json.header(self.endpoint, block.param());
             if (bytes.len == 0) return error.CallFailed;
             return bytes;
         }
 
         pub fn raw_header_by_hash(self: Self, hash: Hash) Error![]const u8 {
-            const raw = try self.endpoint.call("debug_getRawHeader", &.{.{ .hash = hash }});
-            return self.endpoint.hex(raw);
+            return raw_json.header(self.endpoint, .{ .hash = hash });
         }
 
         /// `eth_call` return data, valid until the next call.

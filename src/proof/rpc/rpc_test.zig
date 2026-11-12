@@ -10,8 +10,15 @@ const json = @import("../../utilities/json/root.zig");
 const endpoint_module = @import("endpoint.zig");
 const clients = @import("clients.zig");
 const contracts = @import("../contracts/root.zig");
+const keccak256 = @import("../../common/primitives/root.zig").keccak256;
 
 const Endpoint = endpoint_module.Endpoint(io.SimIo);
+
+/// A public Sepolia block (number 12090253) as `eth_getBlockByHash` returns it.
+const sepolia_header = @embedFile(
+    "../../consensus/sources/testdata/sepolia_l1_12090253_header.json",
+);
+const sepolia_hash = "bb528dde0066f2187e97eddaba129037d4421843720843ab3ddb961729c13b0b";
 
 const hash_a = "\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
 
@@ -19,13 +26,16 @@ const hash_a = "\"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const Canned = struct {
     last: [1024]u8 = undefined,
     last_size: usize = 0,
+    /// Answer `debug_*` with "method not found", like public L1 endpoints.
+    debug_missing: bool = false,
 
     fn handle(canned: *Canned, request: *const http.Request, response: *http.ResponseBuilder) void {
         const body = request.body;
         canned.last_size = @min(body.len, canned.last.len);
         @memcpy(canned.last[0..canned.last_size], body[0..canned.last_size]);
         const method_raw = (json.find_path(body, &.{"method"}) catch null) orelse "";
-        const result = answer(method_raw);
+        const debug = std.mem.startsWith(u8, method_raw, "\"debug_");
+        const result = if (canned.debug_missing and debug) method_missing else answer(method_raw);
         const out = response.writer();
         out.print("{{\"jsonrpc\":\"2.0\",\"id\":{s},", .{
             (json.find_path(body, &.{"id"}) catch null) orelse "0",
@@ -42,6 +52,7 @@ const Canned = struct {
                     "00000000000000000000000000000007\"",
             },
             .{ "\"eth_getBalance\"", "\"result\":\"0xde0b6b3a7640000\"" },
+            .{ "\"eth_getBlockByHash\"", "\"result\":" ++ sepolia_header },
             .{ "\"debug_getRawHeader\"", "\"result\":\"0xc0\"" },
             .{
                 "\"optimism_outputAtBlock\"",
@@ -60,8 +71,10 @@ const Canned = struct {
             },
         };
         inline for (table) |row| if (std.mem.eql(u8, method, row[0])) return row[1];
-        return "\"error\":{\"code\":-32601,\"message\":\"method not found\"}";
+        return method_missing;
     }
+
+    const method_missing = "\"error\":{\"code\":-32601,\"message\":\"method not found\"}";
 };
 
 const Server = http.Server(io.SimIo, *Canned, Canned.handle);
@@ -169,4 +182,30 @@ test "rpc: typed execution and rollup calls over HTTP" {
     try testing.expectError(error.CallFailed, rollup.output_at_block(13));
     try testing.expectError(error.NotFound, endpoint.call("eth_unknown", &.{}));
     try testing.expectEqual(@as(u64, 8), endpoint.calls);
+}
+
+test "rpc: raw headers fall back to block JSON where debug methods are missing" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    harness.canned.debug_missing = true;
+    var endpoint: Endpoint = .init(testing.allocator, &harness.client, .{
+        .context = harness,
+        .step = Harness.step,
+    }, 10_000);
+    defer endpoint.deinit();
+    const execution: clients.Execution(Endpoint) = .{ .endpoint = &endpoint };
+    var hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&hash, sepolia_hash);
+
+    const header = try execution.raw_header_by_hash(hash);
+    try testing.expectEqualSlices(u8, &hash, &keccak256(header).bytes);
+    try testing.expect(endpoint.debug_raw_missing);
+    try testing.expectEqual(@as(u64, 2), endpoint.calls); // debug, then the JSON block.
+    // Remembered: the next header goes straight to the JSON method.
+    _ = try execution.raw_header_by_hash(hash);
+    try testing.expectEqual(@as(u64, 3), endpoint.calls);
+    // The node returns that block whatever hash is asked for: it must not be accepted.
+    var other = hash;
+    other[31] ^= 1;
+    try testing.expectError(error.CallFailed, execution.raw_header_by_hash(other));
 }

@@ -560,6 +560,32 @@ pub fn decode_block(
     return transactions;
 }
 
+/// The EIP-2718 encodings of a block's `transactions` array of full objects, verified
+/// against `transactions_root` (the raw block body where `debug_getRawBlock` is missing).
+/// Senders are not recovered: the root binds every signed field.
+pub fn encode_block(
+    allocator: Allocator,
+    raw: []const u8,
+    transactions_root: B256,
+    limits: Limits,
+) Error![]const []const u8 {
+    const count = try object.array_count(raw, limits.transactions_max);
+    const encoded = try allocator.alloc([]const u8, count);
+    const options: Options = .{ .limits = limits, .recover_senders = false };
+    var iterator = try object.ArrayIterator.init(raw);
+    for (encoded) |*item| {
+        const element = (try iterator.next()) orelse unreachable; // Counted above.
+        if (element.value.tag != .object_begin) return error.InvalidJson;
+        const decoded = try decode(allocator, allocator, element.raw, options);
+        const envelope = decoded.envelope orelse return error.UnsupportedTransaction;
+        item.* = envelope.encode_to(try allocator.alloc(u8, envelope.encoded_length()));
+    }
+    assert(try iterator.next() == null);
+    const root: B256 = .{ .bytes = ordered.ordered_trie_root(encoded) };
+    if (!root.eql(transactions_root)) return error.RootMismatch;
+    return encoded;
+}
+
 fn compute_root(scratch: Allocator, envelopes: []const ?Envelope, size: usize) Error!B256 {
     const bytes = try scratch.alloc(u8, size);
     const items = try scratch.alloc([]const u8, envelopes.len);
