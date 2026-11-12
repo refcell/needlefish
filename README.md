@@ -48,14 +48,6 @@ with other workloads is busy. Every 5 minutes, a sampler compares balances, nonc
 storage, and proofs at the head with the public chain; it has found 0 mismatches in 5,642
 calls.
 
-What is not there yet:
-
-- **Operations.** `base up` is new. The node in the recording above was set up step by step
-  before `base up` existed; `base up` shows it read-only. A full `base up` run from an empty
-  machine has not been done on mainnet yet.
-- **Sequencing.** The sequencer, batcher, proposer, and challenger have only run on the
-  [local devnet](#local-devnet), never on a public network. Do not run them with real funds.
-
 ## Installation
 
 ```sh

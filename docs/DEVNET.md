@@ -5,6 +5,9 @@
 state and writes a fresh genesis; `DEVNET_KEEP=1 just devnet up` keeps it. Everything the devnet writes lives in
 `.devnet/` (git-ignored): generated configs, the JWT secret, data dirs, pids, logs.
 
+> **Do not run the sequencer, batcher, proposer, or challenger with real funds.** They have
+> only run on this local devnet so far, never on a public network with real value.
+
 This file is the **process contract** between the batcher-devnet lane (which owns the
 scripts) and the lanes that own each binary. If you change a flag or port here, change
 `etc/devnet/devnet.sh` in the same commit.
