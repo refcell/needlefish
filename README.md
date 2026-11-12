@@ -50,8 +50,6 @@ calls.
 
 What is not there yet:
 
-- **History.** The node keeps only the head state. There are no archive queries and no
-  transaction pool, and its RPC is read-only.
 - **Operations.** `base up` is new. The node in the recording above was set up step by step
   before `base up` existed; `base up` shows it read-only. A full `base up` run from an empty
   machine has not been done on mainnet yet.
@@ -94,6 +92,34 @@ Run it again to resume after an interruption; it never re-imports over a verifie
 On a datadir where a node is already running, it shows that node's live view instead. The
 [mainnet guide](docs/MAINNET.md) covers the hardware it needs (about 3.5 TB of NVMe), each
 step in detail, and the node's current limits.
+
+### History and transactions
+
+The execution node keeps a bounded window of history, not all of it. Started with
+`--archive <file>`, it stores every block it executes on disk: the block, its transactions
+and receipts, and the value each account, storage slot, and trie node had before the block
+changed it. State queries (`eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
+`eth_getTransactionCount`, `eth_call`, `eth_getProof`) then answer at any block in the
+window, by number or by hash. Blocks, transactions, and receipts are served from the window
+once they leave the 16,384-block in-memory ring.
+
+The file has a fixed size, `--archive.size-gb` (default 512). On mainnet a block takes
+about 343 KiB, or 141 GiB a day, so the default holds about 1.5 million blocks, or 3.6
+days. When the file is full, the oldest blocks go. A block outside the window is refused
+with an error that names the window. A full archive is out of reach for this design: at
+today's density, mainnet's 56 million blocks would need about 20 TB, ten times the node's
+whole database. A node that starts from a snapshot has also never executed the older
+blocks. Use an archive endpoint for those.
+
+`eth_sendRawTransaction` checks the transaction and adds it to the node's pool
+(`txpool_status`, the `pending` nonce). With `--rollup.sequencer-http
+https://mainnet-sequencer.base.org`, it also forwards the transaction to the Base sequencer
+and returns the sequencer's answer, as base/base and op-geth do.
+
+On a mainnet node that archived 23,754 blocks, 1,734 state answers at past blocks (balances,
+nonces, code, storage, and `eth_call`, by number and by hash) and blocks, transactions, and
+receipts from the archive all matched mainnet.base.org. Twenty `eth_getProof` answers
+matched base.drpc.org exactly; mainnet.base.org does not serve proofs that old.
 
 ### Replay mainnet blocks
 

@@ -336,26 +336,53 @@ first start. `--p2p.disabled` keeps the first run to derivation: with gossip
 on, gossiped blocks above el-run's head answer SYNCING and the consensus unsafe head then
 moves only by consolidation (the adopt-existing-block path), which also works.
 
-## el-run JSON-RPC (read-only)
+## el-run JSON-RPC, archive, pool
 
 `base el-run --rpc` (127.0.0.1:8545; `--rpc.addr IP:PORT` for another) serves the common
-read methods from what el-run itself executed, never proxied (`bin/base/el_rpc.zig`):
-`web3_clientVersion`, `net_version`, `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
-`eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`, `eth_getProof`,
-`eth_getBlockByNumber`/`ByHash`, `eth_getTransactionByHash`, `eth_getTransactionReceipt`,
-`eth_getBlockReceipts`. Decisions:
-- State is the database head only: the disk database keeps no state history, so a block
-  parameter naming another block is -32000 "historical state unavailable", never an answer
-  from the wrong state. `eth_getProof` at the head walks the branch records
-  (`DiskState.prove`, every node checked against its parent's hash; byte-identical to the
-  in-memory trie's proofs in `disk_state_test`). `eth_call` gas is capped at 50M.
+methods from what el-run itself executed, never proxied (`bin/base/el_rpc.zig`):
+`web3_clientVersion`, `net_version`, `eth_chainId`, `eth_blockNumber`, `eth_gasPrice`,
+`eth_maxPriorityFeePerGas`, `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
+`eth_getStorageAt`, `eth_call`, `eth_getProof`, `eth_getBlockByNumber`/`ByHash`,
+`eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`,
+`eth_sendRawTransaction`, `txpool_status`. Decisions:
+- State at the head reads the database; at an older block it reads through the archive
+  (`--archive <file>`, `bin/base/el_archive.zig`, `execution.archive`). Outside the archive's
+  window the answer is -32000 naming the window, never an answer from the wrong state.
+  `eth_getProof` walks the branch records (`DiskState.prove`, `prove_at` for older roots;
+  byte-identical to the in-memory trie's proofs in `disk_state_test`). `eth_call` gas is
+  capped at 50M and runs in the target block's environment.
+- Archive design: a bounded window, not a full archive. Per block it appends one unit:
+  header, transaction hashes, the block's record, and the old value of every key the block
+  wrote (accounts and branch records from `DiskState.capture_enable`, slots from the
+  changeset). Units sit in a ring in one fixed-size file (`--archive.size-gb`, default 512,
+  min 8), grouped in segments of 8,192 blocks; a sealed segment gets a sorted fingerprint
+  index (4 KiB pages, fences, a Bloom filter), the open one an in-memory hash chain. The
+  oldest segment is evicted when the file is full. A view (`DiskState.view_begin`) reads
+  the trie from the old state root and each key from the first archived block after it that
+  changed it, else the head. Numbers (Base mainnet, 23,754 blocks from 54528125): 343 KiB
+  per block, 141 GiB a day, so 512 GiB holds about 1.5M blocks (3.6 days). A full archive
+  of 56M blocks would be about 20 TB, ten times the 1.9 TB head database, and a snapshot
+  node never executed the older blocks. Tip cost: the append is one sequential write per
+  block (synced every 64) after the commit, timed in the `archive:` summary line; block
+  execution with the capture on had the same p50 (20 ms) over the same blocks as the live
+  node. The archive never stops the node: an unusable capture or an oversized block
+  restarts the window at the next block; at startup it is cut back to the database head.
 - Blocks, transactions and receipts come from an RPC ring filled by `block_committed` with
   the executed receipts (`import.run.Outcome.receipts`): one `node.chain.Record` per block
   (header, transactions, receipts), `--rpc.ring-blocks` 16,384 / `--rpc.ring-mb` 1024,
   committed as written, plus a lossy 4-way transaction hash index (`--rpc.tx-index`, 2^21
-  entries, 48 MiB) whose hits are checked against the stored bytes. Older executed blocks are
-  -32000 naming the ring range; above the head or unknown: `null`. The ring starts empty at
-  every start.
+  entries, 48 MiB) whose hits are checked against the stored bytes; past the ring, from the
+  archive's records. Blocks held by neither are -32000 naming the range; above the head or
+  unknown: `null`. The ring starts empty at every start.
+- Transactions: `eth_sendRawTransaction` checks (chain, signature, intrinsic gas, fees) and
+  adds to `txpool.Pool` (by sender and nonce against the head; `txpool_status`, `pending`
+  nonce, pending transactions by hash). After each block the pool drops included
+  transactions and re-reads those senders, and every 64 blocks all senders. With
+  `--rollup.sequencer-http <url>` (`bin/base/el_sequencer.zig`, base/base and op-geth's
+  flag) it also forwards to the sequencer on one of 8 `std.Io` tasks and answers with the
+  sequencer's answer (the parked HTTP response resumes in `Service.prepare`). Fee
+  suggestions are op-geth's: tip 0.001 gwei, gas price = head base fee + tip (matches
+  mainnet.base.org).
 - `safe`/`finalized` are the Engine API's last valid forkchoice labels (needs
   `--engine.addr`); otherwise an error.
 - Same model as the Engine API: own completion IO, polled between blocks and in the idle
@@ -363,10 +390,15 @@ read methods from what el-run itself executed, never proxied (`bin/base/el_rpc.z
   runs while a block executes or commits, and the database stays single-threaded.
   Limitation: while a catch-up download waits for peers (`Pool.next`, up to 5 min) requests
   wait too; at the tip the feed does not block.
-- Not yet: `optimism_syncStatus` (needs the consensus node's labels), logs/filters,
-  historical state.
+- Not yet: `optimism_syncStatus` (needs the consensus node's labels), logs/filters.
 
 ## Log
+- 2026-11-12: el-run history and transactions: the archive window (`--archive`), state,
+  proofs and `eth_call` at older blocks, blocks past the ring, the pool, and sequencer
+  forwarding (`--rollup.sequencer-http`). Checked on a copy of the mainnet database over
+  23,754 archived blocks against mainnet.base.org (1,734 state answers by number and hash;
+  blocks, transactions, receipts from the archive) and base.drpc.org (20 proofs, exact). A
+  signed transaction forwarded to mainnet-sequencer.base.org came back with its error.
 - 2026-11-08: verifier on el-run (Base Sepolia): consolidation now warns with the first
   attributes mismatch per block. It showed `transaction_content` at index 0, the L1 info
   deposit: the node priced blob fees with Cancun's fraction (block 56166090: 11 instead of 2).

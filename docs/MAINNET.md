@@ -116,10 +116,17 @@ starts. `optimism_syncStatus` on port 7546 reports the safe and finalized heads.
 
 - **Unsafe head.** It comes from devp2p peers (a median of about 180 ms behind the tip on
   the first node), not from the consensus gossip network.
-- **State history.** The database keeps only the head state. RPC calls for older state
-  return "historical state unavailable", and blocks and receipts are served only for the
-  blocks el-run executed since it started.
-- **RPC.** Reads only: there is no transaction pool and no `eth_sendRawTransaction`.
+- **State history.** The database keeps only the head state. With `--archive <file>
+  --archive.size-gb N` (default 512), el-run also keeps a window of history on disk, about
+  343 KiB per mainnet block (141 GiB a day, so about 3.6 days with the default). State,
+  proofs, `eth_call`, blocks, and receipts are served at any block in that window. Older
+  blocks, and blocks executed before the archive started, are refused with an error naming
+  the window. Without `--archive`, older state is "historical state unavailable", and blocks
+  are served only from the in-memory ring. The `archive:` summary line reports the window,
+  its size, and the time each append took.
+- **Transactions.** `eth_sendRawTransaction` adds to el-run's pool. Add
+  `--rollup.sequencer-http https://mainnet-sequencer.base.org` to forward transactions to
+  the sequencer; without it they never reach a block.
 - **Restarts.**
   - Restarting el-run empties its engine ring, so consensus has to wait for it to warm up
     again.
