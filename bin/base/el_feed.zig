@@ -128,6 +128,16 @@ pub const Feed = struct {
         }
     }
 
+    /// Block `next_number`, which links to `parent`, came from another source (gossip):
+    /// the follower skips it and continues after it.
+    pub fn adopt(feed: *Feed, block: *const el_source.Block) void {
+        assert(feed.mode == .follow and feed.at_tip);
+        assert(block.number == feed.next_number);
+        feed.advance(block);
+        feed.source.?.skip(block.number, block.hash);
+        assert(feed.source.?.next_number == feed.next_number);
+    }
+
     fn advance(feed: *Feed, block: *const el_source.Block) void {
         assert(block.number == feed.next_number);
         feed.next_number += 1;

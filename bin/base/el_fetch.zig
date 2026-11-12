@@ -238,7 +238,7 @@ fn run_pool(init: std.process.Init, flags: *const Flags, path: []const u8) !u8 {
     };
     defer feed.destroy();
     const gossip = if (flags.gossip)
-        try el_gossip.Gossip.start(init.gpa, io, flags.chain, flags.args)
+        try el_gossip.Gossip.start(init.gpa, io, flags.chain, null, flags.args)
     else
         null;
     defer if (gossip) |value| value.destroy();

@@ -356,6 +356,20 @@ pub const Source = struct {
         return true;
     }
 
+    /// Block `number` (the next one) came from elsewhere with `hash`: hands out `number + 1`
+    /// next. A fetched batch that holds `number` keeps its later blocks only when they
+    /// continue `hash`.
+    pub fn skip(source: *Source, number: u64, hash: [32]u8) void {
+        assert(number == source.next_number);
+        if (source.index < source.batch.count) {
+            const same = std.mem.eql(u8, &source.batch.hash(source.index), &hash);
+            source.index = if (same) source.index + 1 else source.batch.count;
+        }
+        assert(source.index <= source.batch.count);
+        source.next_number = number + 1;
+        source.parent = hash;
+    }
+
     fn refill_reconnecting(source: *Source) !bool {
         while (true) {
             return source.refill() catch |err| switch (err) {

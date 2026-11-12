@@ -32,7 +32,12 @@
 //! With `--gossip` (and any `--p2p.*` flags) it also joins the consensus gossip network
 //! (`el_gossip.zig`) and checks every committed block against the sequencer-signed gossip
 //! block at its height, when gossip delivers one: equal hashes anchor the devp2p chain to
-//! the sequencer, a different hash prints `GOSSIP CONFLICT`.
+//! the sequencer, a different hash prints `GOSSIP CONFLICT`. At the tip it also executes the
+//! signed gossip block for the next height when exactly one arrived and it links to the head
+//! (`el_gossip.Blocks`): gossip arrives within about 100 ms of a block's slot, a single
+//! devp2p peer seconds later at times. devp2p is asked once the next block is
+//! `gossip_grace_ms` overdue, and at least every `devp2p_keepalive_ms` so the follow
+//! connection stays open.
 
 const std = @import("std");
 const Io = std.Io;
@@ -109,6 +114,10 @@ const tip_poll_ms = 25;
 /// verifier's consolidation near 1 block/s on Base mainnet. Blocks there execute in ~25 ms
 /// of their 200 ms slot, so 30 ms leaves room to catch up; behind the tip, `poll` only.
 const tip_serve_ms = 30;
+/// With `--gossip` at the tip: how long after a block's slot time el-run waits for its signed
+/// gossip block before asking devp2p for it, and the longest it leaves devp2p unasked.
+const gossip_grace_ms = 250;
+const devp2p_keepalive_ms = 2_000;
 
 /// At the tip, a block whose lag rose by more than this over the previous block's gets a
 /// `slow block` line saying where the time before it went.
@@ -258,6 +267,8 @@ const Run = struct {
     first: u64,
     started_ms: i64,
     last_summary_ms: i64,
+    /// When `feed.next` was last called (devp2p), for `devp2p_keepalive_ms`.
+    devp2p_asked_ms: i64 = 0,
     peers_printed_ms: i64 = 0,
     blocks: u64 = 0,
     transactions: u64 = 0,
@@ -360,7 +371,7 @@ fn execute(
         service.api.engine = &engine_service.engine;
     };
     const gossip = if (flags.gossip)
-        try el_gossip.Gossip.start(gpa, init.io, flags.config, flags.args)
+        try el_gossip.Gossip.start(gpa, init.io, flags.config, flags.chain.spec, flags.args)
     else
         null;
     defer if (gossip) |value| value.destroy();
@@ -441,7 +452,7 @@ fn run_blocks(run: *Run) !u8 {
     while (!run.done()) {
         var block: el_source.Block = undefined;
         const asked_ms = run.now_ms();
-        const got = try run.feed.next(&block);
+        const got = try next_block(run, &block);
         const fetched_ms = run.now_ms();
         run.gap.fetch_ms += @intCast(fetched_ms - asked_ms);
         if (!got) {
@@ -479,6 +490,29 @@ fn run_blocks(run: *Run) !u8 {
         }
     }
     return 0;
+}
+
+/// The next block: at the tip with `--gossip`, the signed gossip block when it links to the
+/// head; from devp2p (`feed.next`) otherwise, or once the block is `gossip_grace_ms` overdue,
+/// or after `devp2p_keepalive_ms` without asking. False: nothing new yet.
+fn next_block(run: *Run, block: *el_source.Block) !bool {
+    const gossip = run.gossip orelse return run.feed.next(block);
+    if (run.feed.mode != .follow or !run.feed.at_tip) return run.feed.next(block);
+    const parent = run.feed.parent orelse return run.feed.next(block);
+    if (gossip.take(run.feed.next_number, parent)) |taken| {
+        assert(taken.number == run.feed.next_number);
+        block.* = taken;
+        run.feed.adopt(block);
+        return true;
+    }
+    const now = Io.Clock.real.now(run.io);
+    const now_ms: u64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_ms));
+    const due_ms = run.rollup.l2_block_timestamp_ms(run.feed.next_number);
+    const overdue = now_ms >= due_ms + gossip_grace_ms;
+    const asked_ms = run.now_ms();
+    if (!overdue and asked_ms - run.devp2p_asked_ms < devp2p_keepalive_ms) return false;
+    run.devp2p_asked_ms = asked_ms;
+    return run.feed.next(block);
 }
 
 /// At the tip, accounts the gap before `number` (executed in `exec_ms`) and prints a
