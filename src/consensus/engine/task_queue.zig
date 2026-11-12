@@ -277,7 +277,14 @@ pub const EngineTaskQueue = struct {
     fn fail(queue: *EngineTaskQueue, index: u32, kind: Kind, err: task.Error) Failure {
         const failure: Failure = .{ .kind = kind, .err = err, .severity = task.severity(err) };
         switch (failure.severity) {
-            .temporary, .deferred, .critical => {
+            // The sequencer drops its block on a non-fatal seal error and builds the next
+            // one (base/base `SealTaskError::is_fatal`): a retry would ask for the same
+            // payload id, which the engine may no longer have.
+            .temporary, .deferred => if (kind == .seal) queue.release(index) else {
+                restart(&queue.slots[index].task);
+                queue.active = null;
+            },
+            .critical => {
                 restart(&queue.slots[index].task);
                 queue.active = null;
             },

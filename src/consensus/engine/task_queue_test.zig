@@ -474,6 +474,10 @@ test "seal: fetches, imports, and canonicalizes the payload" {
     mock.get_payload_error = error.RpcFailed;
     try queue.enqueue(.{ .seal = .{ .payload_id = @splat(1), .attributes = &attributes } });
     try expect_failure(step_until_done(&queue, &mock), error.GetPayloadFailed, .temporary);
+    // Dropped, not retried with a payload id the engine may have discarded.
+    try testing.expectEqual(@as(u32, 0), queue.len());
+    try testing.expect(step_until_done(&queue, &mock) == .idle);
+    try queue.enqueue(.{ .seal = .{ .payload_id = @splat(1), .attributes = &attributes } });
     mock.get_payload_error = null;
     var v3 = chain.fixtures[12].payload();
     v3.blob_gas_used = 0;
@@ -630,6 +634,27 @@ test "consolidate: mismatch builds and seals the derived block as safe" {
     try testing.expectEqual(@as(u64, 1), queue.state.mismatches);
     try testing.expectEqual(@as(u64, 6), queue.state.mismatch_last_number);
     try testing.expect(queue.state.mismatch_last != null);
+}
+
+test "consolidate: a derived block the engine answers SYNCING for is retried, not lost" {
+    var chain: Chain = undefined;
+    chain.init();
+    var mock: MockEngine = .{};
+    for (chain.fixtures[0..6]) |*fixture| mock.set_block(fixture.block());
+    mock.payload = .{ .payload = chain.fixtures[6].payload(), .block_value = 0 };
+    var queue = try new_queue(state_at(5, 5, 0));
+    defer queue.deinit(testing.allocator);
+    const attributes = chain.fixtures[6].attributes(info(5));
+    try queue.enqueue(.{ .consolidate = &attributes });
+    // The build is accepted; the forkchoice update that makes the sealed block safe is not.
+    mock.forkchoice_script.push(.valid);
+    mock.forkchoice_script.push(.syncing);
+    try expect_failure(step_until_done(&queue, &mock), error.ConsolidateDidNotApply, .deferred);
+    try testing.expect(queue.state.sync_state.safe_head.eql(info(5)));
+    try testing.expect(step_until_done(&queue, &mock) == .completed);
+    try testing.expect(queue.state.sync_state.unsafe_head.eql(info(6)));
+    try testing.expect(queue.state.sync_state.safe_head.eql(info(6)));
+    try testing.expect(queue.state.sync_state.local_safe_head.eql(info(6)));
 }
 
 test "consolidate: trailing bytes in an attribute transaction force a rebuild" {

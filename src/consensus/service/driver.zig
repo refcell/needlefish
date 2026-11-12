@@ -677,7 +677,10 @@ pub const Driver = struct {
         driver.stats.engine_failures += 1;
         driver.note(failure.err);
         switch (failure.severity) {
-            .temporary, .deferred => {}, // The task stays queued and is retried.
+            // The task stays queued and is retried, except a seal: its block was dropped.
+            .temporary, .deferred => if (failure.kind == .seal) {
+                driver.building = false;
+            },
             .critical => driver.stats.critical_errors += 1,
             .reset => driver.request_reset(),
             .flush => {

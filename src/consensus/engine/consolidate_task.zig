@@ -64,7 +64,13 @@ pub const ConsolidateTask = struct {
                     consolidate.phase = .seal;
                 },
                 .seal => {
-                    _ = try consolidate.seal.step(context, engine_state, client);
+                    const block = try consolidate.seal.step(context, engine_state, client);
+                    // A SYNCING forkchoice update (the engine could not move its state to
+                    // the block yet) leaves the safe head behind; the pipeline has already
+                    // consumed the batch, so completing here would lose the block for good.
+                    if (!engine_state.sync_state.local_safe_head.eql(block)) {
+                        return error.ConsolidateDidNotApply;
+                    }
                     return;
                 },
             }
