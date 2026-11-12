@@ -21,7 +21,7 @@ native 200 ms cadence.
 
 ## Highlights
 
-- **Syncs Base mainnet.** A needlefish node has executed more than 1.6 million consecutive
+- **Syncs Base mainnet.** A needlefish node has executed more than 2 million consecutive
   mainnet blocks from a verified snapshot, with every block's state root, receipts root, gas,
   bloom, and hash matching the canonical chain. Its safe and finalized heads match
   mainnet.base.org's.
@@ -37,15 +37,20 @@ native 200 ms cadence.
 
 needlefish runs on Base mainnet as a verifying node. The first one started from Base's public
 reth snapshot at block 54528124 and accepted it only after recomputing the state root from
-every account and storage slot. By November 11, 2026, it had executed 1.63 million
+every account and storage slot. By November 12, 2026, it had executed 2.04 million
 consecutive blocks fetched from execution-layer peers. It follows the tip at a median of about
-180 ms. Every 5 minutes, a sampler compares balances, nonces, code, storage, and proofs at the
-head with the public chain; it has found 0 mismatches in 1,344 calls.
+110 ms. In the recording above, `base up` shows 299 consecutive blocks in 60 s, every check
+passing, at 102 ms of lag on average (median 86 ms, at most 394 ms). Over a whole day some
+blocks still arrive seconds late (p99 about 7 s), when the one execution-layer peer it follows
+is slow or the disk is busy. Every 5 minutes, a sampler compares balances, nonces, code,
+storage, and proofs at the head with the public chain; it has found 0 mismatches in 5,082
+calls.
 
 What is not there yet:
 
-- **Gossip.** The unsafe head comes from execution-layer peers. Base's consensus gossip
-  network has not been tested on mainnet yet.
+- **Gossip.** The unsafe head comes from execution-layer peers. Joining Base's consensus
+  gossip network works on mainnet (1,817 sequencer-signed blocks in a 10-minute test), but the
+  node does not execute blocks from it yet.
 - **History.** The node keeps only the head state. There are no archive queries and no
   transaction pool, and its RPC is read-only.
 - **Operations.** `base up` is new. The node in the recording above was set up step by step
