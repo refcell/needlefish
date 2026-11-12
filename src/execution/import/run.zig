@@ -687,6 +687,27 @@ pub fn RunnerType(comptime Storage: type) type {
             return db.durable_sequence == db.submitted_sequence;
         }
 
+        /// One storage tick between blocks, for a caller with idle time (el-run at the tip):
+        /// asks for a checkpoint where the next `make_room` would (`Room.request_idle`) and
+        /// ticks toward durability and toward a wanted checkpoint's start, so the next block
+        /// waits for neither. True once there is nothing for a tick to advance: every
+        /// committed block durable, and no checkpoint waiting to start or writing unpaced
+        /// (a paced one writes as commits grant it). `make_room` still checks room before
+        /// every block; only when the storage does that work changes.
+        pub fn idle_tick(self: *Runner) Error!bool {
+            const db = self.db;
+            assert(!db.checkpoints_held);
+            if (db.phase != .ready) return error.NotReady;
+            if (db.checkpoint_error != null) return error.CheckpointFailed;
+            Room.request_idle(db, &self.stats.room);
+            const durable = db.durable_sequence == db.submitted_sequence;
+            const writing = db.engine.checkpoint_phase != .idle and !db.engine.checkpoint_paused();
+            if (durable and !Room.start_pending(db) and !writing) return true;
+            self.tick();
+            assert(db.durable_sequence <= db.submitted_sequence);
+            return false;
+        }
+
         /// Ticks until every committed block is durable (bounded).
         pub fn flush(self: *Runner) Error!void {
             const db = self.db;

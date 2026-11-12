@@ -588,6 +588,41 @@ test "import run: blocks N+1.. on an imported database match the oracle across a
     try testing.expect(checkpoints >= 3 + requested / 2);
 }
 
+test "import run: idle ticks between blocks make the next block's room; a crash keeps all" {
+    const keys = derive_keys();
+    for ([_]bool{ false, true }) |idle| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const harness = try Harness.create(arena_state.allocator(), &keys, 0);
+        defer harness.destroy();
+        for (0..blocks_count) |index| {
+            _ = try harness.pass(@intCast(index));
+            if (!idle) continue;
+            // el-run's way at the tip: tick while waiting for the next block, until quiet.
+            var ticks: u32 = 0;
+            while (!try harness.runner.idle_tick()) : (ticks += 1) {
+                try testing.expect(ticks < run.ticks_max);
+            }
+        }
+        const room = harness.runner.stats.room;
+        try testing.expect(room.checkpoints_requested >= 2);
+        // Without idle ticks the next block waits while a checkpoint frees the journal; with
+        // them every checkpoint is asked for, starts, and finishes between blocks.
+        try testing.expectEqual(idle, room.waits == 0);
+        if (!idle) continue;
+        // Quiet means durable: a crash now keeps every block.
+        const db = harness.disk.db;
+        try testing.expectEqual(db.submitted_sequence, db.durable_sequence);
+        harness.runner.destroy(testing.allocator);
+        harness.disk.sim.crash();
+        try harness.disk.reopen();
+        harness.runner = try harness.runner_create();
+        const last = &harness.blocks[blocks_count - 1];
+        try testing.expectEqualSlices(u8, &last.hash, &harness.disk.db.head_info.hash);
+        try harness.expect_oracle_state();
+    }
+}
+
 /// Block `index` with its header changed by `tamper` and resealed (hash recomputed).
 fn tampered(
     arena: std.mem.Allocator,

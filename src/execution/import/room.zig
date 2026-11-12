@@ -153,6 +153,15 @@ pub fn RoomType(comptime Database: type) type {
             assert(!db.checkpoints_held);
         }
 
+        /// Between blocks (none held): asks for a checkpoint where the next `make_room`
+        /// would, so it starts in the idle time before that block rather than at it.
+        pub fn request_idle(db: *Database, stats: *Stats) void {
+            assert(!db.checkpoints_held);
+            if (db.phase != .ready or db.checkpoint_error != null) return;
+            request(db, stats);
+            assert(stats.checkpoints_ahead <= stats.checkpoints_requested);
+        }
+
         /// Asks for a checkpoint when the journal is half full, room is short, or the
         /// admission span is past the ahead share (and none is wanted or running).
         fn request(db: *Database, stats: *Stats) void {

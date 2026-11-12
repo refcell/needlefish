@@ -99,6 +99,9 @@ const usage =
 ;
 
 const flush_every = 64;
+/// Journal entries queued behind the commit in flight: 12.8 s of 200 ms blocks (the shapes'
+/// 8 filled within one 1.6 s sync, and the next block waited for it).
+const queue_entries: u32 = 64;
 /// At the tip, blocks do not wait for durability: each idle wait first ticks the storage toward
 /// it for at most `tip_flush_ms` (waiting for it there held blocks for up to 9 s behind a
 /// checkpoint on Base mainnet). The storage's room before each block still bounds the
@@ -252,6 +255,9 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     if (flags.cache_mb) |cache_mb| {
         sizing.config.flat_cache_blocks = cache_blocks_of(cache_mb, &sizing.config);
     }
+    // One group commit is in flight at a time, and its sync can take seconds on a busy disk:
+    // the queue behind it holds `queue_entries` blocks before the runner waits. Memory only.
+    sizing.config.queue_entries_max = @max(sizing.config.queue_entries_max, queue_entries);
     var backend = try snapshot_import_out.backend_init();
     defer backend.deinit();
     const Opened = snapshot_import_out.Opened;
@@ -325,20 +331,17 @@ const Run = struct {
         run.unflushed = 0;
     }
 
-    /// At the tip: ticks the storage toward durability for at most `tip_flush_ms`, without
-    /// waiting for it.
+    /// At the tip: ticks the storage for at most `tip_flush_ms` toward durability and toward
+    /// the checkpoint the next block's room would wait for (`Runner.idle_tick`), without
+    /// waiting for either.
     fn flush_idle(run: *Run) !void {
         assert(run.feed.at_tip);
-        if (run.unflushed == 0) return;
         const deadline_ms = run.now_ms() + tip_flush_ms;
         for (0..tip_flush_ticks_max) |_| {
-            if (try run.runner.flush_tick()) {
-                run.unflushed = 0;
-                return;
-            }
-            if (run.now_ms() >= deadline_ms) return;
+            const quiet = try run.runner.idle_tick();
+            if (run.db.durable_sequence == run.db.submitted_sequence) run.unflushed = 0;
+            if (quiet or run.now_ms() >= deadline_ms) return;
         }
-        assert(run.unflushed > 0);
     }
 };
 
