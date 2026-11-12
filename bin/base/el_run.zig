@@ -662,6 +662,8 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         .header_rlp = block.header_rlp,
         .transactions = block.transactions,
     };
+    // At the tip el-run ticks the storage between blocks, where wanted checkpoints start.
+    run.runner.defer_start = run.feed.at_tip;
     const started = run.now_ms();
     var exec = ExecSplit.begin(&run.runner.stats);
     const outcome = run.runner.execute(&runner_block) catch |err| {
@@ -856,12 +858,14 @@ fn print_room(run: *const Run) void {
         std.debug.print(" {s} {d:.2}", .{ name, ns / 1e6 / blocks });
     }
     std.debug.print(", waits {d} (queue {d} journal {d} admission {d} start {d}), " ++
-        "checkpoints requested {d} ahead {d} started {d}, busy retries {d}\n", .{
+        "starts deferred {d}, checkpoints requested {d} ahead {d} started {d}, " ++
+        "busy retries {d}\n", .{
         room.waits,
         room.short_queue,
         room.short_journal,
         room.short_admission,
         room.start_waits,
+        room.starts_deferred,
         room.checkpoints_requested,
         room.checkpoints_ahead,
         room.checkpoints_started,

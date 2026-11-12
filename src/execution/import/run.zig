@@ -286,6 +286,9 @@ pub fn RunnerType(comptime Storage: type) type {
         clock: ?Executor.Clock = null,
         hinter: ?Hinter = null,
         prefetching: Prefetching = .all,
+        /// A caller that ticks the storage between blocks (`idle_tick`) sets this: the next
+        /// block waits for a wanted checkpoint to start only once it is due (`room.zig`).
+        defer_start: bool = false,
         /// The current attempt's trie-path prefetch: it runs inside the executor's commit
         /// phase, and is reported as prefetch, not commit.
         paths_ns: u64 = 0,
@@ -640,7 +643,8 @@ pub fn RunnerType(comptime Storage: type) type {
         /// Ticks until the next block has room (`room.zig`), counting the ticks.
         fn make_room(self: *Runner) Error!void {
             const driver: to_disk.Driver = .{ .context = self, .tick = tick_counted };
-            Room.make_room(self.db, driver, self.clock, &self.stats.room) catch |err| {
+            const room = &self.stats.room;
+            Room.make_room(self.db, driver, self.clock, room, self.defer_start) catch |err| {
                 return switch (err) {
                     error.NotReady => error.NotReady,
                     error.CheckpointFailed => error.CheckpointFailed,

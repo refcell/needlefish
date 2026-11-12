@@ -358,6 +358,15 @@ const Harness = struct {
     clock_ns: u64 = 0,
 
     fn create(arena: std.mem.Allocator, keys: *const Keys, seed: u64) !*Harness {
+        return create_shaped(arena, keys, seed, shape_run);
+    }
+
+    fn create_shaped(
+        arena: std.mem.Allocator,
+        keys: *const Keys,
+        seed: u64,
+        shape: to_disk.Shape,
+    ) !*Harness {
         const self = try arena.create(Harness);
         const genesis = genesis_of(keys);
         const source = try arena.create(to_disk_test.Source);
@@ -379,7 +388,7 @@ const Harness = struct {
             parent = block.hash;
         }
         self.addresses_fill(keys);
-        self.disk = try to_disk_test.Run.init_shaped(source, seed, shape_run);
+        self.disk = try to_disk_test.Run.init_shaped(source, seed, shape);
         errdefer self.disk.deinit();
         var importer = self.disk.importer();
         const root = try to_disk_test.import_into(&importer, source, &chain);
@@ -619,6 +628,47 @@ test "import run: idle ticks between blocks make the next block's room; a crash 
         harness.runner = try harness.runner_create();
         const last = &harness.blocks[blocks_count - 1];
         try testing.expectEqualSlices(u8, &last.hash, &harness.disk.db.head_info.hash);
+        try harness.expect_oracle_state();
+    }
+}
+
+test "import run: deferred checkpoint starts let blocks through until due; crashes recover" {
+    const keys = derive_keys();
+    // A journal large enough that checkpoints are wanted before room is short.
+    var shape = shape_run;
+    shape.journal_size_bytes = 48 * sector_size;
+    for ([_]bool{ false, true }) |defer_start| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const harness = try Harness.create_shaped(arena_state.allocator(), &keys, 0, shape);
+        defer harness.destroy();
+        harness.runner.defer_start = defer_start;
+        var sequences: [blocks_count]u64 = undefined;
+        for (0..blocks_count) |index| {
+            sequences[index] = (try harness.pass(@intCast(index))).sequence;
+            // el-run's idle budget: a few ticks, not always enough for a checkpoint to start.
+            for (0..2) |_| _ = try harness.runner.idle_tick();
+        }
+        const room = harness.runner.stats.room;
+        try testing.expectEqual(defer_start, room.starts_deferred > 0);
+        try testing.expect(harness.disk.db.checkpoints_completed > 0);
+        // A crash with blocks not yet durable: the head is a committed block at or after the
+        // durable one, and the rest pass again.
+        const durable = harness.disk.db.durable_sequence;
+        var acknowledged: u64 = head_number;
+        for (sequences, 0..) |sequence, index| {
+            if (sequence <= durable) acknowledged = head_number + 1 + index;
+        }
+        harness.runner.destroy(testing.allocator);
+        harness.disk.sim.crash();
+        try harness.disk.reopen();
+        harness.runner = try harness.runner_create();
+        const head = harness.disk.db.head_info;
+        try testing.expect(head.number >= acknowledged);
+        const recovered = &harness.blocks[@intCast(head.number - head_number - 1)];
+        try testing.expectEqualSlices(u8, &recovered.hash, &head.hash);
+        for (head.number - head_number..blocks_count) |index| _ = try harness.pass(@intCast(index));
+        try harness.runner.flush();
         try harness.expect_oracle_state();
     }
 }

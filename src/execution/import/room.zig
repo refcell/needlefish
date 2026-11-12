@@ -37,6 +37,17 @@ pub const ticks_max: u32 = to_disk.busy_ticks_max;
 pub const ahead_numerator: u64 = 2;
 pub const ahead_denominator: u64 = 3;
 
+/// With `make_room`'s `defer_start` (a caller that ticks the storage between blocks), a
+/// wanted checkpoint holds up the next block only once it is due: the journal or the
+/// admission span past this share of its usable room. Before that it starts in idle time.
+pub const due_numerator: u64 = 5;
+pub const due_denominator: u64 = 6;
+
+comptime {
+    assert(ahead_numerator * due_denominator < due_numerator * ahead_denominator);
+    assert(due_numerator < due_denominator);
+}
+
 /// What the storage was doing during a waiting tick.
 pub const Phase = enum {
     /// A checkpoint is wanted but the journal queue (or a commit) has not drained.
@@ -64,6 +75,8 @@ pub const Stats = struct {
     short_admission: u64 = 0,
     /// Waits for a wanted checkpoint to start (room was not short).
     start_waits: u64 = 0,
+    /// Blocks let through with a wanted checkpoint not yet started (`defer_start`).
+    starts_deferred: u64 = 0,
     /// Checkpoints asked for (`ahead`: before room was short), and those seen to start
     /// during a wait.
     checkpoints_requested: u64 = 0,
@@ -110,6 +123,20 @@ pub fn RoomType(comptime Database: type) type {
             return span * ahead_denominator > usable * ahead_numerator;
         }
 
+        /// The journal or the admission span is past the due share of its usable room: a
+        /// wanted checkpoint must start before the next block, deferred or not.
+        pub fn start_due(db: *const Database) bool {
+            const journal = &db.engine.journal;
+            const entry_max = Database.Engine.JournalType.entry_size_max(journal.config);
+            const journal_usable = journal.config.zone_size_bytes -| 2 * entry_max;
+            const journal_due = journal_used(db) * due_denominator > journal_usable * due_numerator;
+            const disk_config = db.config.disk_state.?;
+            const span = db.disk_writes_closed + db.disk_writes_pending + db.disk_writes_current;
+            const usable = disk_config.replay_record_writes_max -|
+                2 * @as(u64, disk_config.record_writes_max);
+            return journal_due or span * due_denominator > usable * due_numerator;
+        }
+
         /// A checkpoint is wanted and has not started: it starts once nothing is held, the
         /// queue has drained, and the trees and codes are ready.
         pub fn start_pending(db: *const Database) bool {
@@ -126,12 +153,15 @@ pub fn RoomType(comptime Database: type) type {
 
         /// Ticks until the next block can be journaled and rolled back without a checkpoint
         /// (none can start while a block is held), asking for checkpoints as needed. Like the
-        /// durable node, also asks for one once the journal is half full.
+        /// durable node, also asks for one once the journal is half full. A wanted checkpoint
+        /// is waited for until it starts; with `defer_start`, only once it is due
+        /// (`start_due`): the caller ticks the storage between blocks, where it starts.
         pub fn make_room(
             db: *Database,
             driver: to_disk.Driver,
             clock: ?Clock,
             stats: *Stats,
+            defer_start: bool,
         ) Error!void {
             stats.calls += 1;
             var ticks: u32 = 0;
@@ -139,9 +169,10 @@ pub fn RoomType(comptime Database: type) type {
                 if (db.phase != .ready) return error.NotReady;
                 if (db.checkpoint_error != null) return error.CheckpointFailed;
                 request(db, stats);
-                if (roomy(db) and !start_pending(db)) break;
+                const start_wait = start_pending(db) and (!defer_start or start_due(db));
+                if (roomy(db) and !start_wait) break;
                 if (ticks >= ticks_max) return error.Stalled;
-                if (ticks == 0) wait_begin(db, stats);
+                if (ticks == 0) wait_begin(db, stats, defer_start);
                 // Commits pace a checkpoint (and its code flush), and none come while the
                 // runner waits for one. A full queue waits for commits: no lift.
                 if (start_pending(db) or !journal_roomy(db) or !admission_roomy(db)) {
@@ -151,6 +182,10 @@ pub fn RoomType(comptime Database: type) type {
             }
             assert(roomy(db));
             assert(!db.checkpoints_held);
+            if (start_pending(db)) {
+                assert(defer_start and !start_due(db));
+                stats.starts_deferred += 1;
+            }
         }
 
         /// Between blocks (none held): asks for a checkpoint where the next `make_room`
@@ -177,7 +212,7 @@ pub fn RoomType(comptime Database: type) type {
             assert(stats.checkpoints_ahead <= stats.checkpoints_requested);
         }
 
-        fn wait_begin(db: *const Database, stats: *Stats) void {
+        fn wait_begin(db: *const Database, stats: *Stats, defer_start: bool) void {
             assert(db.phase == .ready);
             stats.waits += 1;
             if (!queue_roomy(db)) {
@@ -188,6 +223,7 @@ pub fn RoomType(comptime Database: type) type {
                 stats.short_admission += 1;
             } else {
                 assert(start_pending(db));
+                assert(!defer_start or start_due(db));
                 stats.start_waits += 1;
             }
             const causes = stats.short_queue + stats.short_journal + stats.short_admission +

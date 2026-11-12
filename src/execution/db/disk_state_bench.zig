@@ -1040,7 +1040,7 @@ fn RunType(comptime Storage: type) type {
         /// Room for this block's entry and branch writes, as `import/run.zig` makes it.
         fn make_room(self: *Run) !void {
             const clock: room_module.Clock = .{ .context = self, .now_ns = now_ns };
-            try Room.make_room(&self.db, self.driver, clock, &self.room);
+            try Room.make_room(&self.db, self.driver, clock, &self.room, false);
             assert(Room.roomy(&self.db));
         }
 
