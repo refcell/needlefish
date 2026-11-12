@@ -28,6 +28,15 @@ L1_BEACON=${L1_BEACON-http://127.0.0.1:31052}
 L1_UPSTREAM=${L1_UPSTREAM-https://ethereum-sepolia-rpc.publicnode.com,https://ethereum-sepolia-beacon-api.publicnode.com}
 L2_CHAIN_ID=${L2_CHAIN_ID:-20261112}
 GAME_TYPE=621
+# L2 blocks per dispute game, with an intermediate root every tenth: 1800 is one game every
+# 6 min, about 240 Sepolia transactions a day from the proposer. Every upgrade is active from
+# genesis, so the contracts use the subsecond-block ("fast") intervals; the slow pair, set
+# to a tenth for the same root count, never applies. A multiple of 100.
+GAME_INTERVAL=${GAME_INTERVAL:-1800}
+# Blocks the verifier EL keeps witnesses for. The prover proves a game once L1 finalized it,
+# about 13 min (3900 blocks) after its last block, so the window covers finality, a game,
+# and the proving time: 8192 blocks is 27 min.
+WITNESS_WINDOW=${WITNESS_WINDOW:-8192}
 # The deploy lands well before the L2 starts, so its fork activations are history by then.
 GENESIS_LEAD_S=${GENESIS_LEAD_S:-1200}
 
@@ -112,6 +121,7 @@ write_deploy_config() {
     --arg seq "$(addr sequencer)" --arg prop "$(addr proposer)" \
     --arg chal "$(addr challenger)" --arg nitro "$NITRO" --arg sp1 "$SP1" \
     --arg root "$anchor_root" --argjson T "$T" --argjson P "$P" --argjson l2 "$L2_CHAIN_ID" \
+    --argjson interval "$GAME_INTERVAL" \
     --argjson l1 "$(cast chain-id --rpc-url "$L1_RPC")" '
     .finalSystemOwner = $owner | .proxyAdminOwner = $owner | .guardian = $owner
     | .baseFeeVaultRecipient = $owner | .l1FeeVaultRecipient = $owner
@@ -125,8 +135,10 @@ write_deploy_config() {
     | .teeImageHash = ("0x" + ("01" * 32)) | .zkRangeHash = ("0x" + ("01" * 32))
     | .zkAggregationHash = ("0x" + ("01" * 32)) | .multiproofConfigHash = ("0x" + ("01" * 32))
     | .multiproofGenesisOutputRoot = $root | .multiproofGenesisBlockNumber = 0
-    | .multiproofSlowBlockInterval = 100 | .multiproofSlowIntermediateBlockInterval = 10
-    | .multiproofFastBlockInterval = 3000 | .multiproofFastIntermediateBlockInterval = 300
+    | .multiproofSlowBlockInterval = ($interval / 10)
+    | .multiproofSlowIntermediateBlockInterval = ($interval / 100)
+    | .multiproofFastBlockInterval = $interval
+    | .multiproofFastIntermediateBlockInterval = ($interval / 10)
     | .proofMaturityDelaySeconds = 600 | .disputeGameFinalityDelaySeconds = 600
     | .delayedWETHWithdrawalDelay = 600
     | .protocolVersionsInitialSchedule = [range(14) | $P]
@@ -257,13 +269,14 @@ post_deploy() {
       NF_TEE_REGISTRY=$(deployed TEEProverRegistryProxy) NF_GAME_TYPE=$GAME_TYPE \
       NF_SIGNERS=$(addr enclave) NF_CONFIG_HASH=$config_hash \
       forge script scripts/nf/NfPostDeploy.s.sol:NfPostDeploy --rpc-url "$L1_RPC" \
-      --private-key "$(key deployer)" --broadcast --slow) >"$CONFIG/post-deploy.log" 2>&1 ||
+      --private-key "$(key deployer)" --broadcast --start-fresh --slow) >"$CONFIG/post-deploy.log" 2>&1 ||
     { tail -n 20 "$CONFIG/post-deploy.log"; die "post deploy failed"; }
   printf '%s\n' "$config_hash" >"$CONFIG/config-hash"
 }
 
 cmd_deploy() {
   need_tools
+  [ $((GAME_INTERVAL % 100)) -eq 0 ] || die "GAME_INTERVAL must be a multiple of 100"
   [ -s "$KEYS/deployer.key" ] || die "run 'keys' first"
   [ -f "$CONFIG/rollup.json" ] && die "$CONFIG/rollup.json exists; this chain is deployed"
   mkdir -p "$CONFIG"
@@ -284,7 +297,7 @@ cmd_deploy() {
   local simulated
   simulated=$(jq -S '{L1CrossDomainMessengerProxy, L1StandardBridgeProxy, L1ERC721BridgeProxy}' \
     "$CONFIG/deployments.json")
-  system_deploy --broadcast
+  system_deploy --broadcast --start-fresh
   [ "$simulated" = "$(jq -S '{L1CrossDomainMessengerProxy, L1StandardBridgeProxy,
     L1ERC721BridgeProxy}' "$CONFIG/deployments.json")" ] ||
     die "deployed bridge proxies differ from the simulation the L2 genesis used"
@@ -345,13 +358,14 @@ cmd_up() {
     --authrpc.jwtsecret "$CONFIG/jwt.hex" --builder.enabled
   unit ver-el "$BASE" node --chain "$CONFIG/l2-genesis.json" --datadir "$NF_L2_DIR/ver-el" \
     --http.port "$PORT_VER_HTTP" --authrpc.port "$PORT_VER_ENGINE" \
-    --authrpc.jwtsecret "$CONFIG/jwt.hex" --proofs-history --proofs-history.window 36000
+    --authrpc.jwtsecret "$CONFIG/jwt.hex" --proofs-history --proofs-history.window "$WITNESS_WINDOW"
   wait_http "$L2:$PORT_SEQ_HTTP"
   wait_http "$L2:$PORT_VER_HTTP"
   mkdir -p "$NF_L2_DIR/seq-cl" "$NF_L2_DIR/ver-cl"
   unit seq-cl "$BASE" consensus --rollup-config "$CONFIG/rollup.json" --l1 "$L1_RPC" \
     "${beacon_args[@]}" --l2 "$L2:$PORT_SEQ_ENGINE" --l2-jwt "$CONFIG/jwt.hex" \
     --rpc.port "$PORT_SEQ_CL" --rpc.enable-admin --sequencer \
+    --metrics.enabled --metrics.addr 127.0.0.1 --metrics.port $((PORT_SEQ_CL + 1)) \
     --p2p.sequencer.key.path "$KEYS/sequencer.key" \
     --p2p.listen.ip 127.0.0.1 --p2p.listen.tcp "$PORT_SEQ_P2P" --p2p.listen.udp $((PORT_SEQ_P2P + 1)) \
     --p2p.bootstore "$NF_L2_DIR/seq-cl/bootstore.json" \
@@ -361,6 +375,7 @@ cmd_up() {
   unit ver-cl "$BASE" consensus --rollup-config "$CONFIG/rollup.json" --l1 "$L1_RPC" \
     "${beacon_args[@]}" --l2 "$L2:$PORT_VER_ENGINE" --l2-jwt "$CONFIG/jwt.hex" \
     --rpc.port "$PORT_VER_CL" --p2p.listen.ip 127.0.0.1 \
+    --metrics.enabled --metrics.addr 127.0.0.1 --metrics.port $((PORT_VER_CL + 1)) \
     --p2p.listen.tcp "$PORT_VER_P2P" --p2p.listen.udp $((PORT_VER_P2P + 1)) \
     --p2p.bootstore "$NF_L2_DIR/ver-cl/bootstore.json" --p2p.bootnodes "$enr" \
     --safedb.path "$NF_L2_DIR/ver-cl/safedb.bin" --checkpoint.path "$NF_L2_DIR/ver-cl/checkpoint.bin"
@@ -419,16 +434,19 @@ l2_output() { # block -> output root (verifier's rollup node)
 cmd_deposit() {
   local value=${1:-0.01}
   cast send "$(deployed OptimismPortalProxy)" --value "${value}ether" --private-key "$(key user)" \
-    --rpc-url "$L1_RPC" --json | jq -r '"deposit tx \(.transactionHash) block \(.blockNumber | tonumber) status \(.status)"'
+    --rpc-url "$L1_RPC" --json | jq -r '"deposit tx \(.transactionHash) block \(.blockNumber) status \(.status)"'
 }
 
 # Withdraws VALUE ether from the user's L2 balance to its L1 address with `base withdrawer`
 # (`initiate`, then `run` proves against a game and finalizes once the game resolves).
 cmd_withdraw() {
-  local command=${1:-run} value_wei
+  local command=${1:-run} value_wei l2=$PORT_VER_HTTP
   value_wei=$(cast to-wei "${2:-0.001}")
+  # `base node` does not forward transactions: the initiating one goes to the sequencer.
+  # Proving reads historical state proofs, which the verifier keeps (--proofs-history).
+  [ "$command" = initiate ] && l2=$PORT_SEQ_HTTP
   BASE_WITHDRAWER_PRIVATE_KEY=$(key user) "$BASE" withdrawer "$command" \
-    --l1-rpc-url "$L1_RPC" --l2-rpc-url "http://127.0.0.1:$PORT_VER_HTTP" \
+    --l1-rpc-url "$L1_RPC" --l2-rpc-url "http://127.0.0.1:$l2" \
     --portal "$(deployed OptimismPortalProxy)" --l1-chain-id "$(cast chain-id --rpc-url "$L1_RPC")" \
     --l2-chain-id "$L2_CHAIN_ID" --journal "$NF_L2_DIR/withdrawer.journal" \
     --target "$(addr user)" --value-wei "$value_wei"
