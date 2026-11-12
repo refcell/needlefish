@@ -52,6 +52,7 @@ const metrics_module = @import("metrics.zig");
 const follow = @import("follow.zig");
 const conductor_module = @import("conductor.zig");
 const ws_rpc_module = @import("ws_rpc.zig");
+const OutputCache = @import("output_cache.zig").OutputCache;
 const upgrade_signal = @import("../../utilities/upgrade_signal/root.zig");
 const base_rpc = @import("../rpc/base.zig");
 
@@ -309,6 +310,8 @@ pub fn Node(comptime IO: type) type {
         l2: l2_provider.L2Provider(IO),
         /// Message passer storage roots for pre-Isthmus `optimism_outputAtBlock`.
         message_passer: message_passer_roots.MessagePasserRoots(IO),
+        /// Finalized `optimism_outputAtBlock` answers, kept past the L2 provider's TTL.
+        outputs: OutputCache = .{},
         l2_view: L2View(IO),
         blobs: ?*Blobs = null,
         blob_view: BlobView(IO),
@@ -983,6 +986,7 @@ pub fn Node(comptime IO: type) type {
             node.l1.tick();
             node.l2.tick();
             node.message_passer.tick();
+            node.tick_outputs();
             node.polling.tick();
             if (node.blobs) |blobs| blobs.tick();
             if (node.forwarder) |forwarder| forwarder.tick();
@@ -1208,13 +1212,51 @@ pub fn Node(comptime IO: type) type {
             tag: rollup_rpc.BlockTag,
         ) error{ NotAvailable, NotFound }!rollup_rpc.OutputAtBlock {
             const node = from_context(context);
+            if (tag == .number) {
+                const number = tag.number;
+                if (node.outputs.get(number)) |cached| return cached;
+                const result = node.output_at(.{ .number = number }) catch |err| {
+                    if (err == error.NotAvailable and number <= node.finalized_number()) {
+                        node.outputs.request(number);
+                    }
+                    return err;
+                };
+                if (number <= node.finalized_number()) node.outputs.put(result);
+                return result;
+            }
             const key: l2_provider.Request = switch (tag) {
-                .number => |number| .{ .number = number },
+                .number => unreachable, // Handled above.
                 .earliest => .{ .number = node.rollup.genesis.l2.number },
                 .latest, .pending => .{ .label = .latest },
                 .safe => .{ .label = .safe },
                 .finalized => .{ .label = .finalized },
             };
+            return node.output_at(key);
+        }
+
+        fn finalized_number(node: *const Self) u64 {
+            return node.driver.sync_state().finalized_head.block_info.number;
+        }
+
+        /// Keeps fetching the finalized outputs the RPC was asked for until they are cached.
+        fn tick_outputs(node: *Self) void {
+            var numbers: [OutputCache.pending_max]u64 = undefined;
+            const pending = node.outputs.pending_numbers();
+            @memcpy(numbers[0..pending.len], pending);
+            for (numbers[0..pending.len]) |number| {
+                const result = node.output_at(.{ .number = number }) catch |err| {
+                    if (err == error.NotFound) node.outputs.resolve(number);
+                    continue;
+                };
+                node.outputs.put(result);
+            }
+            assert(node.outputs.pending_numbers().len <= pending.len);
+        }
+
+        fn output_at(
+            node: *Self,
+            key: l2_provider.Request,
+        ) error{ NotAvailable, NotFound }!rollup_rpc.OutputAtBlock {
             const block = node.l2.l2_block_ref(key) catch |err| return switch (err) {
                 error.NotFound => error.NotFound,
                 else => error.NotAvailable,
