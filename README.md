@@ -41,9 +41,10 @@ every account and storage slot. By November 12, 2026, it had executed 2.10 milli
 consecutive blocks. At the tip it executes the sequencer-signed block from Base's consensus
 gossip network as soon as it arrives, checks it like any other block, and falls back to
 execution-layer peers when gossip is late. Over its first 36,200 blocks this way, 97% came
-from gossip and the median lag was 23 ms (p90 107 ms). In the recording above, `base up` shows 299 consecutive blocks in 60 s, every check
-passing, at 102 ms of lag on average (median 86 ms, at most 394 ms). A few blocks still take
-seconds (p99 6.9 s) when the disk it shares with other workloads is busy. Every 5 minutes, a sampler compares balances, nonces, code,
+from gossip and the median lag was 23 ms (p90 107 ms). In the recording above, `base up`
+shows 299 consecutive blocks in 60 s, every check passing, at 45 ms of lag on average (median
+21 ms, at most 987 ms). A few blocks still take seconds (p99 6.9 s) when the disk it shares
+with other workloads is busy. Every 5 minutes, a sampler compares balances, nonces, code,
 storage, and proofs at the head with the public chain; it has found 0 mismatches in 5,642
 calls.
 
