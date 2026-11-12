@@ -250,6 +250,9 @@ pub const Model = struct {
 };
 
 const Counts = struct {
+    captured_records: u64 = 0,
+    captured_accounts: u64 = 0,
+    proved_at: u64 = 0,
     blocks: u64 = 0,
     unwinds: u64 = 0,
     checkpoints: u64 = 0,
@@ -810,6 +813,50 @@ fn check(
     try testing.expect(!disk.fault);
 }
 
+/// History capture: the old value of every account record and branch record the last
+/// apply wrote is the pre-state's, as a fresh build of it writes them (null: absent).
+fn check_capture(
+    arena: std.mem.Allocator,
+    disk: *const DiskState,
+    pre: *const Built,
+    counts: *Counts,
+) !void {
+    const capture = disk.capture.?;
+    try testing.expect(!capture.failed);
+    var records: std.AutoHashMapUnmanaged(RecordKey, []const u8) = .empty;
+    defer records.deinit(arena);
+    for (pre.records.accounts.items) |record| {
+        try records.put(arena, record_key(record.key), record.value);
+    }
+    for (pre.records.storage.items) |record| {
+        try records.put(arena, record_key(record.key), record.value);
+    }
+    for (disk.last_record_writes()) |*write| {
+        const key = if (write.owner) |*owner|
+            record_key(&branch_record.storage_key(owner, write.hang.slice()))
+        else
+            record_key(&branch_record.path_key(write.hang.slice()));
+        const want = records.get(key);
+        const got = disk.record_old(write);
+        try testing.expectEqual(want == null, got == null);
+        if (want) |value| {
+            try testing.expectEqualSlices(u8, value, got.?);
+            counts.captured_records += 1;
+        }
+    }
+    for (disk.last_account_writes()) |*write| {
+        var want: ?Account = null;
+        for (pre.accounts.items) |entry| {
+            if (std.mem.eql(u8, &entry.key, &write.key)) want = entry.account;
+        }
+        try testing.expectEqual(want == null, write.old == null);
+        const account = want orelse continue;
+        const encoded = flat_trees_module.account_encode(&account.info, &account.storage_root);
+        try testing.expectEqualSlices(u8, &encoded, &write.old.?);
+        counts.captured_accounts += 1;
+    }
+}
+
 /// Proofs over the records (`DiskState.prove`) equal the in-memory trie's byte for byte, for
 /// a sample of accounts and slots (present and absent).
 fn check_proofs(disk: *DiskState, reference: *StateTrie, universe: *const Universe) !void {
@@ -842,6 +889,103 @@ fn check_proofs(disk: *DiskState, reference: *StateTrie, universe: *const Univer
         try expect_proof_eql(&proofs.want_account, &proofs.disk_account);
         try expect_proof_eql(&proofs.want_storage, &proofs.disk_storage);
     }
+}
+
+/// The captured old values as an overlay: keys `kind ++ key`, old value (null: absent).
+const OldValues = struct {
+    map: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    arena: std.mem.Allocator,
+
+    fn put(
+        self: *OldValues,
+        kind: disk_state.OverlayKind,
+        key: []const u8,
+        old: ?[]const u8,
+    ) !void {
+        const full = try self.arena.alloc(u8, key.len + 1);
+        full[0] = @backingInt(kind);
+        @memcpy(full[1..], key);
+        const value = if (old) |bytes| try self.arena.dupe(u8, bytes) else null;
+        try self.map.put(self.arena, full, value);
+    }
+
+    fn lookup(
+        context: *anyopaque,
+        kind: disk_state.OverlayKind,
+        key: []const u8,
+    ) disk_state.OverlayValue {
+        const self: *OldValues = @ptrCast(@alignCast(context));
+        var full: [1 + branch_record.storage_key_bytes]u8 = undefined;
+        full[0] = @backingInt(kind);
+        @memcpy(full[1..][0..key.len], key);
+        const value = self.map.get(full[0 .. key.len + 1]) orelse return .trees;
+        return .{ .value = value };
+    }
+};
+
+/// `prove_at` the pre-state of the block just applied, over the captured old values,
+/// equals the reference (still at the pre-state) for every account and slot the block
+/// changed and a sample of the rest; the head state reads the same afterwards.
+fn check_prove_at(run: *Run, pre_root: Hash) !void {
+    const disk = &run.disk;
+    var olds: OldValues = .{ .arena = run.arena };
+    for (disk.last_account_writes()) |*write| {
+        const old: ?[]const u8 = if (write.old) |*bytes| bytes else null;
+        try olds.put(.account, &write.key, old);
+    }
+    for (run.changeset.storage_changes()) |change| {
+        const key = flat_trees_module.storage_key(&node.keccak256(&change.address), change.slot);
+        var word: [32]u8 = undefined;
+        std.mem.writeInt(u256, &word, change.old, .big);
+        try olds.put(.slot, &key, if (change.old == 0) null else &word);
+    }
+    for (disk.last_record_writes()) |*write| {
+        const old = disk.record_old(write);
+        if (write.owner) |*owner| {
+            const key = branch_record.storage_key(owner, write.hang.slice());
+            try olds.put(.storage_branch, &key, old);
+        } else {
+            try olds.put(.account_branch, &branch_record.path_key(write.hang.slice()), old);
+        }
+    }
+    const overlay: disk_state.Overlay = .{ .context = &olds, .lookup = OldValues.lookup };
+    const Proofs = struct {
+        disk_account: StateTrie.AccountProof,
+        disk_storage: StateTrie.StorageProof,
+        want_account: StateTrie.AccountProof,
+        want_storage: StateTrie.StorageProof,
+    };
+    const proofs = try testing.allocator.create(Proofs);
+    defer testing.allocator.destroy(proofs);
+    const head_root = disk.root();
+    for (run.changeset.account_changes()) |change| {
+        const key = node.keccak256(&change.address);
+        const account_proof = &proofs.disk_account;
+        _ = try disk.prove_at(pre_root, overlay, &key, null, account_proof, &proofs.disk_storage);
+        try run.reference.prove_account(key, &proofs.want_account);
+        try expect_proof_eql(&proofs.want_account, &proofs.disk_account);
+        run.counts.proved_at += 1;
+    }
+    for (run.changeset.storage_changes()) |change| {
+        const owner = node.keccak256(&change.address);
+        const slot = slot_hash(change.slot);
+        const leaf = try disk.prove_at(
+            pre_root,
+            overlay,
+            &owner,
+            &slot,
+            &proofs.disk_account,
+            &proofs.disk_storage,
+        );
+        try testing.expectEqual(change.old, leaf.word);
+        try run.reference.prove_account(owner, &proofs.want_account);
+        run.reference.prove_storage(owner, slot, &proofs.want_storage);
+        try expect_proof_eql(&proofs.want_account, &proofs.disk_account);
+        try expect_proof_eql(&proofs.want_storage, &proofs.disk_storage);
+        run.counts.proved_at += 1;
+    }
+    try testing.expectEqualSlices(u8, &head_root, &disk.root());
+    try testing.expect(disk.overlay == null and !disk.fault);
 }
 
 fn expect_proof_eql(want: anytype, got: anytype) !void {
@@ -936,11 +1080,18 @@ const Run = struct {
     checkpoint_depth: usize = 0,
     checkpoint_root: Hash,
     counts: *Counts,
+    /// The state the last `finish` checked: the pre-state of the next apply (only).
+    previous: ?*const Built,
 
     fn forward(self: *Run) !void {
         try random_block(&self.prng, &self.model, &self.changeset, self.counts);
         try apply_block(self.harness, &self.disk, &self.changeset, true);
+        const pre_state = self.previous;
+        if (pre_state) |pre| try check_capture(self.arena, &self.disk, pre, self.counts);
+        self.previous = null;
         try self.universe.add_writes(self.arena, &self.disk, self.counts);
+        // The reference still holds the pre-state.
+        if (pre_state) |pre| try check_prove_at(self, pre.root);
         try apply_model(&self.model, &self.reference, &self.changeset, true);
         const bytes = try self.arena.alloc(u8, self.changeset.encoded_length());
         try self.applied.append(self.arena, self.changeset.encode(bytes));
@@ -954,6 +1105,8 @@ const Run = struct {
         try self.changeset.decode(bytes);
         if (disk) {
             try apply_block(self.harness, &self.disk, &self.changeset, false);
+            if (self.previous) |pre| try check_capture(self.arena, &self.disk, pre, self.counts);
+            self.previous = null;
             try self.universe.add_writes(self.arena, &self.disk, self.counts);
             self.counts.unwinds += 1;
         }
@@ -1005,12 +1158,14 @@ const Run = struct {
         // Compaction between blocks: later reads cross flushes and merges.
         self.harness.trees().compact(4);
         for (0..self.prng.below(8)) |_| self.harness.sim.tick();
-        const built = try build_state(self.arena, &self.model);
-        try self.universe.add_built(self.arena, &built);
+        const built = try self.arena.create(Built);
+        built.* = try build_state(self.arena, &self.model);
+        self.previous = built;
+        try self.universe.add_built(self.arena, built);
         try check(
             self.harness,
             &self.disk,
-            &built,
+            built,
             &self.reference,
             &self.universe,
             self.counts,
@@ -1053,6 +1208,7 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
         .changeset = try Changeset.init(testing.allocator, changeset_config),
         .checkpoint_root = undefined,
         .counts = counts,
+        .previous = undefined,
     };
     defer run.changeset.deinit(testing.allocator);
     defer run.reference.deinit(testing.allocator);
@@ -1068,6 +1224,8 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
     run.checkpoint_root = built.root;
     run.disk = try DiskState.init(testing.allocator, harness.trees(), built.root, disk_config);
     defer run.disk.deinit(testing.allocator);
+    try run.disk.capture_enable(testing.allocator);
+    run.previous = &built;
     try run.universe.add_built(arena, &built);
     try check(harness, &run.disk, &built, &run.reference, &run.universe, counts);
     for (0..blocks) |index| {
@@ -1106,6 +1264,9 @@ test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bul
     // The record cache answers and is checked against the build.
     try testing.expect(counts.cache_hits >= 500);
     try testing.expect(counts.cache_matched >= 1000);
+    // History capture rebuilt every pre-state record and account (`check_capture`).
+    try testing.expect(counts.captured_records >= 500 and counts.captured_accounts >= 200);
+    try testing.expect(counts.proved_at >= 300);
     // Blocks start on the trie the walk before left (after a reopen or a crash, the
     // check's proofs walked fresh first).
     try testing.expect(counts.carried >= (counts.blocks + counts.unwinds) / 2);

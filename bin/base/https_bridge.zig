@@ -253,7 +253,7 @@ fn failure_body(fetched: Fetched) []const u8 {
 }
 
 /// A request as forwarded upstream.
-const Exchange = struct {
+pub const Exchange = struct {
     method: http.Method,
     url: []const u8,
     body: []const u8,
@@ -452,10 +452,10 @@ pub const Worker = struct {
         return body;
     }
 
-    const Forwarded = struct { fetched: Fetched, attempts: u32 };
+    pub const Forwarded = struct { fetched: Fetched, attempts: u32 };
 
     /// Up to `retries + 1` attempts within one `timeout_ms` deadline.
-    fn forward(worker: *Worker, exchange: *const Exchange) Forwarded {
+    pub fn forward(worker: *Worker, exchange: *const Exchange) Forwarded {
         const settings = worker.settings;
         const deadline_ms = worker.now_ms() + settings.timeout_ms;
         var fetched: Fetched = .timed_out;

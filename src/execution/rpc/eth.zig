@@ -58,7 +58,7 @@ pub const methods = core_methods ++ @import("eth_more.zig").methods ++ filters_m
     @import("validity.zig").methods ++ @import("account.zig").methods ++
     @import("storage_range.zig").methods ++ @import("insert_validated.zig").methods ++
     @import("sender_nonce.zig").methods;
-const send_sync = @import("send_sync.zig");
+pub const send_sync = @import("send_sync.zig");
 const filters_module = @import("filters.zig");
 const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");

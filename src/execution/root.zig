@@ -8,6 +8,7 @@ pub const txpool = @import("txpool/root.zig");
 pub const payload = @import("payload/root.zig");
 pub const trie = @import("trie/root.zig");
 pub const db = @import("db/root.zig");
+pub const archive = @import("archive/root.zig");
 pub const engine = @import("engine/root.zig");
 pub const node = @import("node/root.zig");
 pub const rpc = @import("rpc/root.zig");

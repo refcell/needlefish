@@ -195,11 +195,40 @@ pub const RecordWrite = struct {
     hang: Nibbles,
     value_start: u32,
     value_len: u32,
+    /// With history capture: the record before the block (`old_len` 0: none).
+    old_start: u32 = 0,
+    old_len: u32 = 0,
 };
 
-const AccountWrite = struct {
+pub const AccountWrite = struct {
     key: Hash,
     value: ?[flat_trees_module.account_value_size]u8,
+    /// With history capture: the account record before the block (null: absent).
+    old: ?[flat_trees_module.account_value_size]u8 = null,
+};
+
+/// An older state for `prove_at`: per key, the value it had then when that differs from
+/// the trees' (`value`, null for absent), else `trees`. `failed` (the history could not be
+/// read) makes the walk `error.Corrupt`, never a fault of the head state.
+pub const Overlay = struct {
+    context: *anyopaque,
+    lookup: *const fn (context: *anyopaque, kind: OverlayKind, key: []const u8) OverlayValue,
+};
+
+pub const OverlayKind = enum { account, slot, account_branch, storage_branch };
+pub const OverlayValue = union(enum) { trees, value: ?[]const u8, failed };
+
+/// History capture (`capture_enable`): every successful apply also keeps the value each
+/// written account record and branch record had before the block, for an archive of
+/// reverse diffs. It never fails a block: a pre-state record it cannot rebuild marks the
+/// block's capture `failed` instead.
+pub const Capture = struct {
+    old_bytes: []u8,
+    old_bytes_len: u32 = 0,
+    /// Successful forward applies since `capture_enable`; the capture describes the last.
+    sequence: u64 = 0,
+    forward: bool = false,
+    failed: bool = false,
 };
 
 /// Largest leaf encoding: a 64-nibble path (33-byte hex prefix) and an account value.
@@ -240,6 +269,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         account_writes_len: u32 = 0,
         /// Live puts, or journal replay puts (`FlatTrees.Mode`).
         mode: FlatTrees.Mode = .live,
+        capture: ?Capture = null,
+        /// Set only between `view_begin` and `view_end`: reads see the overlay's state.
+        overlay: ?Overlay = null,
+        /// The head's root while a view is open.
+        head_root: Hash = @splat(0),
         /// The sparse trie and the memo hold `state_root` from the last successful walk.
         carried: bool = false,
         /// Sticky: a tree read failed.
@@ -317,6 +351,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.capture) |*capture| lazy.free(allocator, capture.old_bytes);
             self.record_cache.deinit(allocator);
             self.swapped.deinit(allocator);
             lazy.free(allocator, self.account_writes);
@@ -329,6 +364,27 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             self.read_accounts.deinit(allocator);
             self.sparse_state.deinit(allocator);
             self.* = undefined;
+        }
+
+        /// Starts keeping pre-state values on every apply (see `Capture`).
+        pub fn capture_enable(self: *Self, allocator: std.mem.Allocator) !void {
+            assert(self.capture == null);
+            const old_bytes = try lazy.alloc(allocator, u8, self.config.record_write_bytes_max);
+            self.capture = .{ .old_bytes = old_bytes };
+            assert(self.capture.?.sequence == 0);
+        }
+
+        /// The account records the last apply wrote (with `old` under capture).
+        pub fn last_account_writes(self: *const Self) []const AccountWrite {
+            return self.account_writes[0..self.account_writes_len];
+        }
+
+        /// The record `write` replaced, under capture (null: none, or no capture).
+        pub fn record_old(self: *const Self, write: *const RecordWrite) ?[]const u8 {
+            const capture = &(self.capture orelse return null);
+            if (write.old_len == 0) return null;
+            assert(write.old_start + write.old_len <= capture.old_bytes_len);
+            return capture.old_bytes[write.old_start..][0..write.old_len];
         }
 
         /// The state root after every `apply` so far.
@@ -350,6 +406,30 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         // state and is not remembered).
 
         pub fn account(self: *Self, address_hash: *const Hash) ?Account {
+            if (self.overlay) |overlay| {
+                switch (overlay.lookup(overlay.context, .account, address_hash)) {
+                    .trees => {},
+                    .failed => {
+                        self.corrupt = true;
+                        return null;
+                    },
+                    .value => |value| {
+                        const bytes = value orelse return null;
+                        if (bytes.len != flat_trees_module.account_value_size) {
+                            self.corrupt = true;
+                            return null;
+                        }
+                        return flat_trees_module.account_decode(
+                            bytes[0..flat_trees_module.account_value_size],
+                        );
+                    },
+                }
+                // Not remembered: the read memo holds the head state only.
+                return self.trees.get_account(address_hash) catch {
+                    self.fault = true;
+                    return null;
+                };
+            }
             if (self.read_accounts.get(address_hash.*)) |record| {
                 self.stats.read_memo_hits += 1;
                 return record;
@@ -380,6 +460,27 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// The slot word, 0 when absent.
         pub fn storage(self: *Self, address_hash: *const Hash, slot_hash: *const Hash) u256 {
             const key = flat_trees_module.storage_key_hashed(address_hash, slot_hash);
+            if (self.overlay) |overlay| {
+                switch (overlay.lookup(overlay.context, .slot, &key)) {
+                    .trees => {},
+                    .failed => {
+                        self.corrupt = true;
+                        return 0;
+                    },
+                    .value => |value| {
+                        const bytes = value orelse return 0;
+                        if (bytes.len != 32) {
+                            self.corrupt = true;
+                            return 0;
+                        }
+                        return std.mem.readInt(u256, bytes[0..32], .big);
+                    },
+                }
+                return self.trees.get_slot(address_hash, slot_hash) catch {
+                    self.fault = true;
+                    return 0;
+                };
+            }
             if (self.read_slots.get(key)) |word| {
                 self.stats.read_memo_hits += 1;
                 return word;
@@ -414,6 +515,46 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 return error.Corrupt;
             }
             assert(std.mem.eql(u8, &node.keccak256(bytes.?), &self.state_root));
+        }
+
+        /// Reads (`account`, `storage`, `prove`, ...) see an older state from now until
+        /// `view_end`: the trie from `state_root`, every key through `overlay`. The head
+        /// state is untouched: the walks start fresh, and the next block starts fresh too
+        /// (nothing of the older state is carried or remembered). No `apply` meanwhile.
+        pub fn view_begin(self: *Self, state_root: Hash, overlay: Overlay) void {
+            assert(self.overlay == null);
+            self.forget_reads();
+            self.overlay = overlay;
+            self.head_root = self.state_root;
+            self.state_root = state_root;
+            self.carried = false;
+            assert(self.overlay != null);
+        }
+
+        pub fn view_end(self: *Self) void {
+            assert(self.overlay != null);
+            self.overlay = null;
+            self.state_root = self.head_root;
+            self.carried = false;
+            self.corrupt = false;
+            self.forget_reads();
+            assert(self.overlay == null);
+        }
+
+        /// `prove` inside a `view_begin` .. `view_end` of `state_root` and `overlay`.
+        pub fn prove_at(
+            self: *Self,
+            state_root: Hash,
+            overlay: Overlay,
+            address_hash: *const Hash,
+            slot_hash: ?*const Hash,
+            account_proof: anytype,
+            storage_proof: anytype,
+        ) Error!Leaf {
+            if (self.fault) return error.Corrupt;
+            self.view_begin(state_root, overlay);
+            defer self.view_end();
+            return self.prove(address_hash, slot_hash, account_proof, storage_proof);
         }
 
         /// What `verify_leaf` read through the trie.
@@ -551,6 +692,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// Moves the state by one block: `changeset` forward, or backward (`forward` false:
         /// its old values). On error nothing was written and the root is unchanged.
         pub fn apply(self: *Self, changeset: *const Changeset, forward: bool) Error!void {
+            assert(self.overlay == null);
             if (self.fault) return error.Corrupt;
             const applied = if (forward) changeset else try self.reverse(changeset);
             try self.check_wipes(applied);
@@ -576,6 +718,10 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             const rooted_ns = self.now_ns();
             self.record_writes_len = 0;
             self.record_bytes_len = 0;
+            if (self.capture) |*capture| {
+                capture.old_bytes_len = 0;
+                capture.failed = false;
+            }
             try self.diff(null, &self.state_root, &new_root);
             try self.diff_storage(applied);
             try self.collect_accounts(applied);
@@ -589,6 +735,10 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             self.state_root = new_root;
             self.carried = true;
             assert(!self.fault and !self.corrupt);
+            if (self.capture) |*capture| {
+                capture.forward = applied != &self.swapped;
+                capture.sequence += 1;
+            }
             const stats = &self.stats;
             stats.blocks += 1;
             stats.blocks_carried += @intFromBool(carry);
@@ -825,6 +975,31 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         /// missing, flagged).
         fn read_record(self: *Self, owner: ?*const Hash, hang: []const u8) ?[]const u8 {
             self.stats.record_reads += 1;
+            if (self.overlay) |overlay| {
+                var key_buffer: [branch_record.storage_key_bytes]u8 = undefined;
+                var key: []const u8 = undefined;
+                var kind: OverlayKind = undefined;
+                if (owner) |hash| {
+                    key_buffer = branch_record.storage_key(hash, hang);
+                    key = key_buffer[0..];
+                    kind = .storage_branch;
+                } else {
+                    key_buffer[0..branch_record.path_key_bytes].* = branch_record.path_key(hang);
+                    key = key_buffer[0..branch_record.path_key_bytes];
+                    kind = .account_branch;
+                }
+                switch (overlay.lookup(overlay.context, kind, key)) {
+                    .trees => {},
+                    .failed => return self.fail(),
+                    .value => |value| {
+                        const bytes = value orelse return self.fail();
+                        if (bytes.len == 0 or bytes.len > branch_record.value_bytes_max) {
+                            return self.fail();
+                        }
+                        return bytes;
+                    },
+                }
+            }
             const value = self.trees.get_branch(owner, hang) catch {
                 self.fault = true;
                 return null;
@@ -1074,6 +1249,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             post: ?*const sparse.Decoded,
         ) Error!void {
             const pre_record = is_record_top(position, &frame.pre, pre);
+            const old = if (pre_record) self.capture_record(position, pre.?) else null;
             if (is_record_top(position, &frame.post, post)) {
                 var record: Record = .{};
                 try self.build_record(position, post.?, &record);
@@ -1085,10 +1261,42 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 if (frame.post.ref.is_hash()) {
                     self.record_cache.put(&frame.post.ref.root_hash(), position, value);
                 }
-                return self.add_write(owner, position, value);
+                return self.add_write(owner, position, value, old);
             }
-            if (pre_record) return self.add_write(owner, position, null);
+            if (pre_record) return self.add_write(owner, position, null, old);
         }
+
+        /// Under capture: the pre-state record at `position` into the capture's bytes.
+        fn capture_record(
+            self: *Self,
+            position: []const u8,
+            top: *const sparse.Decoded,
+        ) ?OldRange {
+            const capture = &(self.capture orelse return null);
+            if (capture.failed) return null;
+            var record: Record = .{};
+            self.build_record(position, top, &record) catch {
+                capture.failed = true;
+                return null;
+            };
+            branch_record.validate_path(position, &record) catch {
+                capture.failed = true;
+                return null;
+            };
+            var buffer: [branch_record.value_bytes_max]u8 = undefined;
+            const value = branch_record.encode(&record, &buffer);
+            assert(value.len > 0);
+            if (capture.old_bytes.len - capture.old_bytes_len < value.len) {
+                capture.failed = true;
+                return null;
+            }
+            const start = capture.old_bytes_len;
+            @memcpy(capture.old_bytes[start..][0..value.len], value);
+            capture.old_bytes_len += @intCast(value.len);
+            return .{ .start = start, .len = @intCast(value.len) };
+        }
+
+        const OldRange = struct { start: u32, len: u32 };
 
         fn build_record(
             self: *const Self,
@@ -1157,6 +1365,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             owner: ?Hash,
             position: []const u8,
             value: ?[]const u8,
+            old: ?OldRange,
         ) Error!void {
             if (self.record_writes_len == self.record_writes.len) return error.Full;
             const bytes = value orelse &.{};
@@ -1167,6 +1376,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 .hang = Nibbles.from_nibbles(position),
                 .value_start = self.record_bytes_len,
                 .value_len = @intCast(bytes.len),
+                .old_start = if (old) |range| range.start else 0,
+                .old_len = if (old) |range| range.len else 0,
             };
             self.record_writes_len += 1;
             self.record_bytes_len += @intCast(bytes.len);
@@ -1263,6 +1474,13 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             const write = &self.account_writes[self.account_writes_len];
             write.key = node.keccak256(address);
             write.value = null;
+            write.old = null;
+            if (self.capture != null) {
+                // The trees still hold the pre-state: no write happened yet this block.
+                if (self.account(&write.key)) |pre| {
+                    write.old = flat_trees_module.account_encode(&pre.info, &pre.storage_root);
+                }
+            }
             const info = self.sparse_state.basic(address.*) catch return error.Corrupt;
             if (info) |account_info| {
                 const storage_root = self.sparse_state.account_storage_root(address.*) catch {

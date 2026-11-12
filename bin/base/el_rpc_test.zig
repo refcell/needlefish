@@ -1,6 +1,7 @@
-//! Tests of el-run's read-only JSON-RPC (`el_rpc.zig`) over a fake node: block, transaction
-//! and receipt reads from the RPC ring (eviction, unknown and future blocks), head-only state
-//! reads, `eth_call` bounds, and block parameter parsing.
+//! Tests of el-run's JSON-RPC (`el_rpc.zig`) over a fake node: block, transaction and
+//! receipt reads from the RPC ring (eviction, unknown and future blocks), head-only state
+//! reads, `eth_call` bounds, block parameter parsing; with a fake archive, older blocks and
+//! state at older blocks (views opened and closed around each read); the pool.
 
 const std = @import("std");
 const base = @import("base");
@@ -93,8 +94,13 @@ const Fixture = struct {
 const FakeNode = struct {
     fixture: *const Fixture,
     head_index: usize = 0,
-    /// The gas of the last simulated call.
+    /// The gas and block of the last simulated call.
     call_gas: ?u64 = null,
+    call_number: u64 = 0,
+    /// The block an archive view shows (null: the head).
+    view: ?u64 = null,
+    /// The nonce and balance of `dev_address` (the pool test's sender).
+    dev_nonce: u64 = 0,
 
     const address: Address = @splat(0xaa);
     const code = [_]u8{ 0x60, 0x00 };
@@ -145,10 +151,17 @@ const FakeNode = struct {
         return fake.fixture.hashes[@intCast(number - Fixture.first)];
     }
 
-    fn account(_: *anyopaque, wanted: Address) ?el_rpc.Account {
+    fn account(context: *anyopaque, wanted: Address) ?el_rpc.Account {
+        const fake = of(context);
+        if (std.mem.eql(u8, &wanted, &dev_address)) {
+            const empty = base.execution.trie.node.empty_code_hash;
+            return .{ .nonce = fake.dev_nonce, .balance = 1 << 80, .code_hash = empty };
+        }
         if (!std.mem.eql(u8, &wanted, &address)) return null;
         const code_hash = primitives.keccak256(&code).bytes;
-        return .{ .nonce = 3, .balance = 1_000_000_007, .code_hash = code_hash };
+        // At an older block: a balance that names the block.
+        const balance: u256 = if (fake.view) |number| 1000 * number else 1_000_000_007;
+        return .{ .nonce = 3, .balance = balance, .code_hash = code_hash };
     }
 
     fn storage(_: *anyopaque, wanted: Address, slot: u256) u256 {
@@ -178,8 +191,9 @@ const FakeNode = struct {
         call: Executor.Call,
     ) base.execution.node.executor.Error!Executor.Simulated {
         const fake = of(context);
-        std.debug.assert(env.number == Fixture.first + fake.head_index);
+        std.debug.assert(env.number == fake.view orelse Fixture.first + fake.head_index);
         fake.call_gas = call.gas;
+        fake.call_number = env.number;
         const output = &.{ 0xbe, 0xef };
         return .{ .executed = .{ .success = true, .gas_used = 21_000, .output = output } };
     }
@@ -206,7 +220,7 @@ const Setup = struct {
         for (0..head_index + 1) |index| {
             setup.fake.head_index = index;
             const block = setup.fixture.block(index);
-            setup.api.store.on_block(&block, &setup.fixture.receipts[index]);
+            _ = setup.api.store.on_block(&block, &setup.fixture.receipts[index]);
         }
     }
 
@@ -224,7 +238,100 @@ const Setup = struct {
     }
 };
 
+/// The archive behind the fixture: every block's record (a store holding all of them), the
+/// window `oldest..head`, and views that set the fake node's `view`.
+const FakeHistory = struct {
+    store: el_rpc.Store,
+    fake: *FakeNode,
+    oldest: u64,
+    views_open: u32 = 0,
+    views: u32 = 0,
+
+    fn init(history: *FakeHistory, setup: *Setup, oldest: u64) !void {
+        const flags: el_rpc.Flags = .{ .ring_blocks = 16, .ring_mib = 1, .index_entries = 64 };
+        history.* = .{
+            .store = try el_rpc.Store.init(testing.allocator, &flags),
+            .fake = &setup.fake,
+            .oldest = oldest,
+        };
+        for (0..setup.fake.head_index + 1) |index| {
+            const block = setup.fixture.block(index);
+            _ = history.store.on_block(&block, &setup.fixture.receipts[index]);
+        }
+        setup.api.history = .{
+            .context = history,
+            .window_fn = window,
+            .block_fn = block_at,
+            .find_block_fn = find_block,
+            .find_transaction_fn = find_transaction,
+            .view_begin_fn = view_begin,
+            .view_end_fn = view_end,
+        };
+    }
+
+    fn deinit(history: *FakeHistory) void {
+        history.store.deinit(testing.allocator);
+    }
+
+    fn of(context: *anyopaque) *FakeHistory {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn window(context: *anyopaque) ?el_rpc.Window {
+        const history = of(context);
+        return .{ .oldest = history.oldest, .head = Fixture.first + history.fake.head_index };
+    }
+
+    fn block_at(context: *anyopaque, number: u64) anyerror!?el_rpc.Archived {
+        const history = of(context);
+        if (number < history.oldest) return null;
+        const stored = history.store.record(number) orelse return null;
+        return .{ .hash = stored.hash, .bytes = stored.bytes };
+    }
+
+    fn find_block(context: *anyopaque, hash: Hash) anyerror!?u64 {
+        const history = of(context);
+        var number = history.oldest;
+        while (number <= Fixture.first + history.fake.head_index) : (number += 1) {
+            const stored = history.store.record(number) orelse continue;
+            if (std.mem.eql(u8, &stored.hash, &hash)) return number;
+        }
+        return null;
+    }
+
+    fn find_transaction(context: *anyopaque, hash: Hash) anyerror!?el_rpc.Location {
+        const location = of(context).store.find(&hash) orelse return null;
+        if (location.number < of(context).oldest) return null;
+        return location;
+    }
+
+    fn view_begin(context: *anyopaque, number: u64, state_root: Hash) void {
+        const history = of(context);
+        std.debug.assert(history.views_open == 0);
+        std.debug.assert(state_root.len == 32);
+        history.views_open += 1;
+        history.views += 1;
+        history.fake.view = number;
+    }
+
+    fn view_end(context: *anyopaque) void {
+        const history = of(context);
+        std.debug.assert(history.views_open == 1);
+        history.views_open -= 1;
+        history.fake.view = null;
+    }
+};
+
 const address_hex = repeat("aa", 20);
+/// The dev mnemonic's first account (every Ethereum devnet's): the pool test's sender.
+const dev_key = [32]u8{
+    0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff, 0x94,
+    0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+};
+const dev_address: Address = .{
+    0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce,
+    0x6a, 0xb8, 0x82, 0x72, 0x79, 0xcf, 0xff, 0xb9, 0x22, 0x66,
+};
 
 /// `text` `count` times.
 fn repeat(comptime text: []const u8, comptime count: usize) []const u8 {
@@ -255,6 +362,15 @@ test "el rpc: blocks by number and hash from the ring; evicted, future and unkno
         \\{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}
     );
     try expect_contains(text, "\"result\":\"0x69\"");
+    // Fees: the head's base fee (1,000,000 wei) plus op-geth's 0.001 gwei tip floor.
+    text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"eth_maxPriorityFeePerGas","params":[]}
+    );
+    try expect_contains(text, "\"result\":\"0xf4240\"");
+    text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"eth_gasPrice","params":[]}
+    );
+    try expect_contains(text, "\"result\":\"0x1e8480\"");
     var hash_text: [66]u8 = undefined;
     text = try setup.request(
         \\{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x67",false]}
@@ -352,7 +468,7 @@ test "el rpc: the transaction index never answers from a reused bucket" {
     defer setup.deinit();
     for (0..Fixture.count) |index| {
         setup.fake.head_index = index;
-        setup.api.store.on_block(&setup.fixture.block(index), &setup.fixture.receipts[index]);
+        _ = setup.api.store.on_block(&setup.fixture.block(index), &setup.fixture.receipts[index]);
     }
     for (0..Fixture.count) |index| {
         for (0..2) |which| {
@@ -447,4 +563,126 @@ test "el rpc: flags" {
     try testing.expectError(error.InvalidArguments, flags.parse("--rpc.tx-index", "1000"));
     try testing.expectError(error.InvalidArguments, flags.parse("--rpc.ring-blocks", "1"));
     try testing.expectError(error.InvalidArguments, flags.parse("--rpc.ring-mb", "0"));
+}
+
+test "el rpc: the archive serves blocks past the ring and state at older blocks" {
+    var setup: Setup = .{};
+    try setup.init(2, 5); // Blocks 100..105, the ring keeps 104..105.
+    defer setup.deinit();
+    var history: FakeHistory = undefined;
+    try history.init(&setup, 101);
+    defer history.deinit();
+    var hash_text: [66]u8 = undefined;
+    // Block 102 left the ring: the archive answers by number, by hash, and its transaction.
+    var text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x66",false]}
+    );
+    try expect_contains(text, hex(&setup.fixture.hashes[2], &hash_text));
+    var body_buffer: [256]u8 = undefined;
+    var body = try std.fmt.bufPrint(&body_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":" ++
+        "\"eth_getBlockByHash\",\"params\":[\"{s}\",false]}}", .{hash_text});
+    text = try setup.request(body);
+    try expect_contains(text, "\"number\":\"0x66\"");
+    var tx_text: [66]u8 = undefined;
+    _ = hex(&setup.fixture.tx_hash(2, 1), &tx_text);
+    body = try std.fmt.bufPrint(&body_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":" ++
+        "\"eth_getTransactionReceipt\",\"params\":[\"{s}\"]}}", .{tx_text});
+    text = try setup.request(body);
+    try expect_contains(text, "\"blockNumber\":\"0x66\"");
+    try expect_contains(text, "\"cumulativeGasUsed\":\"0x11558\"");
+    // Block 100 is below the window: executed, but not held.
+    text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x64",false]}
+    );
+    try expect_contains(text, "archive keeps blocks 101..105");
+    // State at an older block reads through a view of it; the head reads the head.
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBalance\"," ++
+        "\"params\":[\"0x" ++ address_hex ++ "\",\"0x66\"]}");
+    try expect_contains(text, "\"result\":\"0x18e70\""); // 1000 * 102.
+    try testing.expectEqual(@as(?u64, null), setup.fake.view);
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBalance\"," ++
+        "\"params\":[\"0x" ++ address_hex ++ "\",\"latest\"]}");
+    try expect_contains(text, "\"result\":\"0x3b9aca07\"");
+    // The state after block 100 is block 101's pre-state: in the window; 99 is not.
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\"," ++
+        "\"params\":[{\"to\":\"0x" ++ address_hex ++ "\"},\"0x64\"]}");
+    try expect_contains(text, "\"result\":\"0xbeef\"");
+    try testing.expectEqual(@as(u64, 100), setup.fake.call_number);
+    history.oldest = 102;
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBalance\"," ++
+        "\"params\":[\"0x" ++ address_hex ++ "\",\"0x64\"]}");
+    try expect_contains(text, "keeps the state of blocks 101..105, not block 100");
+    try testing.expectEqual(@as(u32, 2), history.views);
+    try testing.expectEqual(@as(u32, 0), history.views_open);
+}
+
+test "el rpc: eth_sendRawTransaction pools the transaction until a block includes it" {
+    var setup: Setup = .{};
+    try setup.init(4, 5);
+    defer setup.deinit();
+    setup.api.node.recoverer = consensus.signature.recover_address;
+    const transaction: consensus.Eip1559 = .{
+        .chain_id = spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 21_000,
+        .to = .{ .call = .{ .bytes = @splat(0x22) } },
+        .value = 1,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(transaction, dev_key);
+    var raw_buffer: [256]u8 = undefined;
+    const raw = envelope.encode_to(&raw_buffer);
+    var body_buffer: [800]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"method\":\"eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}", .{raw});
+    var hash_text: [66]u8 = undefined;
+    _ = hex(&envelope.hash().bytes, &hash_text);
+    var text = try setup.request(body);
+    try expect_contains(text, &hash_text);
+    // The same transaction again: the pool already has it.
+    text = try setup.request(body);
+    try expect_contains(text, "AlreadyKnown");
+    text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}
+    );
+    try expect_contains(text, "\"pending\":\"0x1\",\"queued\":\"0x0\"");
+    const dev_hex = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":" ++
+        "\"eth_getTransactionCount\",\"params\":[\"" ++ dev_hex ++ "\",\"pending\"]}");
+    try expect_contains(text, "\"result\":\"0x1\"");
+    text = try setup.request("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":" ++
+        "\"eth_getTransactionCount\",\"params\":[\"" ++ dev_hex ++ "\",\"latest\"]}");
+    try expect_contains(text, "\"result\":\"0x0\"");
+    var by_hash: [256]u8 = undefined;
+    const by_hash_body = try std.fmt.bufPrint(&by_hash, "{{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"method\":\"eth_getTransactionByHash\",\"params\":[\"{s}\"]}}", .{hash_text});
+    text = try setup.request(by_hash_body);
+    try expect_contains(text, "\"from\":\"" ++ dev_hex ++ "\"");
+    try expect_contains(text, "\"blockHash\":null");
+    // A block includes it: the pool drops it, the sender's nonce moves on.
+    setup.fake.dev_nonce = 1;
+    var block = setup.fixture.block(5);
+    const included = [_][]const u8{raw};
+    block.transactions = &included;
+    const receipts = [_]consensus.Receipt{.{
+        .tx_type = .eip1559,
+        .status = true,
+        .cumulative_gas_used = 21_000,
+    }};
+    _ = setup.api.on_block(&block, &receipts);
+    text = try setup.request(
+        \\{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}
+    );
+    try expect_contains(text, "\"pending\":\"0x0\"");
+    // A transaction for another chain never enters the pool.
+    var other = transaction;
+    other.chain_id = 1;
+    const other_raw = (try consensus.tx.sign(other, dev_key)).encode_to(&raw_buffer);
+    const other_body = try std.fmt.bufPrint(&body_buffer, "{{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"method\":\"eth_sendRawTransaction\",\"params\":[\"0x{x}\"]}}", .{other_raw});
+    text = try setup.request(other_body);
+    try expect_contains(text, "WrongChainId");
 }

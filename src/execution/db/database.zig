@@ -2020,9 +2020,11 @@ pub fn DatabaseType(comptime Storage: type) type {
         ) ProofError!?history_module.AccountState {
             assert(slots.len == storage_proofs.len and slots.len == values.len);
             if (self.phase != .ready or !self.head_info.present) return error.NotReady;
-            // Disk mode keeps no history: the head only, walked over the records.
-            if (self.disk != null) {
-                if (number != self.head_info.number) return error.HistoryUnavailable;
+            // Disk mode: the head, or the block a history view shows, walked over the records.
+            if (self.disk) |*disk| {
+                // An older block only inside a view of it (`DiskState.view_begin`).
+                const viewing = disk.overlay != null;
+                if (number != self.head_info.number and !viewing) return error.HistoryUnavailable;
                 return self.proof_disk(address, slots, account_proof, storage_proofs, values);
             }
             if (self.history_tracking()) |store| {

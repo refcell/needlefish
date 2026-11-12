@@ -3,15 +3,25 @@
 //! node.
 //!
 //! - State (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`,
-//!   `eth_call`, `eth_getProof`) is read from the database's head state. The disk database
-//!   keeps no state history, so a block parameter naming any other block is an error
-//!   (-32000 "historical state unavailable"), never an answer from the wrong state.
+//!   `eth_call`, `eth_getProof`) is read from the database's head state, or with el-run's
+//!   archive (`--archive`, `History`) at any block of its window: the archive opens a view
+//!   of that block's state for the request (`view_begin_fn`), and the same reads answer from
+//!   it. A block outside the window is an error (-32000 "historical state unavailable"),
+//!   never an answer from the wrong state.
 //! - Blocks, transactions and receipts (`eth_getBlockByNumber`/`ByHash`,
 //!   `eth_getTransactionByHash`, `eth_getTransactionReceipt`, `eth_getBlockReceipts`) come
 //!   from the RPC ring (`Store`): every block el-run commits, with its receipts as executed,
 //!   kept in memory up to `--rpc.ring-blocks` / `--rpc.ring-mb`, plus a transaction hash
-//!   index over it. A block that el-run executed but no longer holds is an error (-32000);
-//!   a block above the head or an unknown hash is `null`. The ring starts empty at startup.
+//!   index over it; then from the archive, which keeps the same records on disk. A block
+//!   that el-run executed but holds in neither is an error (-32000); a block above the head
+//!   or an unknown hash is `null`. The ring starts empty at startup.
+//! - Transactions (`eth_sendRawTransaction`): decoded, checked (chain, signature, intrinsic
+//!   gas, fees) and added to el-run's pool (`txpool.Pool`: by sender and nonce, against the
+//!   head state; `txpool_status`, pending transactions by hash, the `pending` nonce). With
+//!   `--rollup.sequencer-http` (`el_sequencer.zig`) the transaction is also forwarded to the
+//!   sequencer, whose answer is the call's answer (as base/base); without it the pool's
+//!   verdict is. After each block the pool drops what the block included and re-reads the
+//!   accounts of those senders (and of every sender each `pool_sweep_blocks`).
 //! - `safe` and `finalized` are the labels of the Engine API's last valid forkchoice update
 //!   (`--engine.addr`); without one they are an error.
 //!
@@ -21,12 +31,13 @@
 //! The database is not shared with another thread: its reads fill the disk state's read memo
 //! and pin codes. Requests are bounded: `eth_call` gas is capped at `call_gas_max`, request
 //! bodies at `request_bytes_max`, batches at `rpc.batch_size_max`. Binds to 127.0.0.1 by
-//! default.
+//! default. Only `eth_sendRawTransaction` changes anything, and only the pool.
 
 const std = @import("std");
 const base = @import("base");
 const el_ring = @import("el_ring.zig");
 const el_engine = @import("el_engine.zig");
+const el_sequencer = @import("el_sequencer.zig");
 
 const json = base.utilities.json;
 const rpc = base.utilities.rpc;
@@ -41,6 +52,8 @@ const eth = base.execution.rpc.eth;
 const eth_proof = base.execution.rpc.eth_proof;
 const node_chain = base.execution.node.chain;
 const state_trie = base.execution.trie.state_trie;
+const txpool = base.execution.txpool;
+const send_sync = base.execution.rpc.eth.send_sync;
 const ChainSpec = base.execution.chainspec.ChainSpec;
 const Executor = base.execution.node.executor.Executor;
 const BlockEnv = base.execution.node.executor.BlockEnv;
@@ -64,6 +77,13 @@ pub const call_gas_max: u64 = 50_000_000;
 pub const request_bytes_max = 1 << 20;
 /// Largest record (header, transactions, receipts) of one block the ring stores.
 pub const record_bytes_max = 64 << 20;
+/// Blocks between re-reads of every pool sender's account.
+pub const pool_sweep_blocks = 64;
+const pool_config: txpool.Config = .{
+    .tx_capacity = 4096,
+    // The sequencer judges the block gas limit; the pool only bounds a transaction by it.
+    .block_gas_limit = 1 << 30,
+};
 
 pub const Flags = struct {
     addr: ?[]const u8 = null,
@@ -71,6 +91,8 @@ pub const Flags = struct {
     ring_mib: u32 = 1024,
     /// Transaction index entries (a power of two); about four per retained transaction.
     index_entries: u32 = 1 << 21,
+    /// `--rollup.sequencer-http`: where `eth_sendRawTransaction` forwards to.
+    sequencer_url: ?[]const u8 = null,
 
     /// Parses one `--rpc.*` flag; false when `name` is not one.
     pub fn parse(flags: *Flags, name: []const u8, value: []const u8) error{InvalidArguments}!bool {
@@ -217,6 +239,31 @@ pub fn runner_node(comptime Runner: type, runner: *Runner) Node {
     };
 }
 
+// ---- History: el-run's archive -----------------------------------------------------------
+
+/// Blocks and state older than the ring and the head (`el_archive.zig`). Records of blocks
+/// `oldest..head`, state after blocks `oldest - 1..head`. Errors are a damaged archive.
+pub const History = struct {
+    context: *anyopaque,
+    window_fn: *const fn (context: *anyopaque) ?Window,
+    /// Block `number`'s hash and record (`node.chain.Record` bytes), valid until the next
+    /// history call; null when not archived.
+    block_fn: *const fn (context: *anyopaque, number: u64) anyerror!?Archived,
+    find_block_fn: *const fn (context: *anyopaque, hash: Hash) anyerror!?u64,
+    find_transaction_fn: *const fn (context: *anyopaque, hash: Hash) anyerror!?Location,
+    /// The node's state reads (account, storage, proof, simulate) see the state after
+    /// block `number` (its state root `state_root`, in the window) until `view_end_fn`.
+    view_begin_fn: *const fn (context: *anyopaque, number: u64, state_root: Hash) void,
+    view_end_fn: *const fn (context: *anyopaque) void,
+
+    fn window(history: *const History) ?Window {
+        return history.window_fn(history.context);
+    }
+};
+
+pub const Window = struct { oldest: u64, head: u64 };
+pub const Archived = struct { hash: Hash, bytes: []const u8 };
+
 // ---- The store: executed blocks with their receipts ------------------------------------
 
 /// Transaction hash -> (block number, index), set-associative and lossy: each hash maps to a
@@ -293,16 +340,17 @@ pub const Store = struct {
     }
 
     /// The per-block hook: `block` was executed (`receipts`, one per transaction) and
-    /// committed as the database head.
+    /// committed as the database head. Returns the block's record (valid until the next
+    /// call), null when it is too large to encode.
     pub fn on_block(
         store: *Store,
         block: *const el_ring.Block,
         receipts: []const consensus.Receipt,
-    ) void {
+    ) ?[]const u8 {
         assert(receipts.len == block.transactions.len);
         const encoded = encode_record(store.staging, block, receipts) orelse {
             store.drop(block.number);
-            return;
+            return null;
         };
         store.ring.push(&.{
             .number = block.number,
@@ -310,13 +358,17 @@ pub const Store = struct {
             .header_rlp = encoded,
             .transactions = &.{},
         }) catch |err| switch (err) {
-            error.BlockTooLarge => return store.drop(block.number),
+            error.BlockTooLarge => {
+                store.drop(block.number);
+                return encoded;
+            },
         };
         for (block.transactions, 0..) |transaction, position| {
             const hash = primitives.keccak256(transaction).bytes;
             store.index.insert(&hash, block.number, @intCast(position));
         }
         assert(store.ring.newest_number().? == block.number);
+        return encoded;
     }
 
     fn drop(store: *Store, number: u64) void {
@@ -426,11 +478,18 @@ fn block_size(stored: *const Stored) u64 {
 
 pub const Stats = struct {
     requests: u64 = 0,
-    /// Reads of an executed block that left the ring.
+    /// Reads of an executed block held in neither the ring nor the archive.
     ring_misses: u64 = 0,
-    /// State reads that named a block other than the head.
+    /// Blocks, transactions, and receipts the archive answered.
+    archive_reads: u64 = 0,
+    /// State reads that named a block outside the archive's window (or without one).
     historical: u64 = 0,
+    /// State reads at an older block the archive answered.
+    historical_served: u64 = 0,
     calls: u64 = 0,
+    /// `eth_sendRawTransaction` calls the pool took, and the ones it refused.
+    pool_added: u64 = 0,
+    pool_refused: u64 = 0,
 };
 
 pub const Api = struct {
@@ -439,6 +498,18 @@ pub const Api = struct {
     store: Store,
     /// The Engine API's forkchoice labels (`safe`, `finalized`), when it runs.
     engine: ?*const el_engine.Engine = null,
+    /// el-run's archive (`--archive`), when it runs.
+    history: ?History = null,
+    pool: txpool.Pool,
+    /// Pool senders' indexes (`pool_sweep`).
+    pool_senders: []u32,
+    blocks_since_sweep: u32 = 0,
+    /// `--rollup.sequencer-http`, when set.
+    sequencer: ?*el_sequencer.Forwarder = null,
+    /// The request being routed: its id when it is a single call (null: a batch), and the
+    /// sequencer slot its `eth_sendRawTransaction` started (to park its response).
+    send_id: ?[]const u8 = null,
+    send_slot: ?u32 = null,
     /// Call data decoding space.
     scratch: []u8,
     proofs: *eth_proof.Scratch,
@@ -458,17 +529,25 @@ pub const Api = struct {
         const scratch = try lazy_alloc.alloc(allocator, u8, request_bytes_max);
         errdefer lazy_alloc.free(allocator, scratch);
         const proofs = try allocator.create(eth_proof.Scratch);
+        errdefer allocator.destroy(proofs);
+        var pool = try txpool.Pool.init(allocator, pool_config);
+        errdefer pool.deinit(allocator);
+        const pool_senders = try allocator.alloc(u32, pool.sender_capacity());
         api.* = .{
             .spec = spec,
             .node = node,
             .store = store,
             .scratch = scratch,
             .proofs = proofs,
+            .pool = pool,
+            .pool_senders = pool_senders,
         };
         assert(api.store.ring.count == 0);
     }
 
     pub fn deinit(api: *Api, allocator: std.mem.Allocator) void {
+        allocator.free(api.pool_senders);
+        api.pool.deinit(allocator);
         allocator.destroy(api.proofs);
         lazy_alloc.free(allocator, api.scratch);
         api.store.deinit(allocator);
@@ -484,14 +563,62 @@ pub const Api = struct {
         api.stats.requests += 1;
         if (request.method != .POST) return response.fail(405);
         defer api.node.release_fn(api.node.context);
+        api.send_id = send_sync.request_id(request.body);
+        api.send_slot = null;
         const outcome = Router.handle(api, request.body, response.writer());
         if (outcome == .empty) response.status = 204;
+        const slot = api.send_slot orelse return;
+        api.send_slot = null;
+        const id = api.send_id.?; // Set only for a single call.
+        // A notification (no id) gets no answer: nothing to wait for.
+        if (outcome != .response or std.mem.eql(u8, id, "null")) return;
+        api.sequencer.?.park(slot, response.defer_response(), id);
+    }
+
+    /// The per-block hook: the RPC ring's (`Store.on_block`, whose record it returns), then
+    /// the pool's: the block's transactions leave it, their senders' accounts are re-read.
+    pub fn on_block(
+        api: *Api,
+        block: *const el_ring.Block,
+        receipts: []const consensus.Receipt,
+    ) ?[]const u8 {
+        const record = api.store.on_block(block, receipts);
+        for (block.transactions) |raw| {
+            const hash = primitives.keccak256(raw);
+            const tx = api.pool.get(hash) orelse continue;
+            const sender = tx.sender;
+            _ = api.pool.remove(hash);
+            api.pool_refresh(sender);
+        }
+        api.blocks_since_sweep += 1;
+        if (api.blocks_since_sweep >= pool_sweep_blocks) api.pool_sweep();
+        return record;
+    }
+
+    fn pool_refresh(api: *Api, sender: primitives.Address) void {
+        const account = api.node.account_fn(api.node.context, sender.bytes);
+        api.pool.update_account(sender, .{
+            .nonce = if (account) |found| found.nonce else 0,
+            .balance = if (account) |found| found.balance else 0,
+        });
+    }
+
+    /// Re-reads every pool sender's account: drops what was included without the pool
+    /// seeing it (a replacement sent elsewhere), promotes what became payable.
+    fn pool_sweep(api: *Api) void {
+        api.blocks_since_sweep = 0;
+        const count = api.pool.sorted_senders(api.pool_senders);
+        for (api.pool_senders[0..count]) |index| {
+            api.pool_refresh(api.pool.sender_address(index));
+        }
+        assert(api.pool.count() <= pool_config.tx_capacity);
     }
 
     pub fn summary(api: *const Api) void {
         const ring = &api.store.ring;
         std.debug.print("rpc: ring {d} blocks {?d}..{?d} {d} MiB, requests {d}, calls {d}, " ++
-            "ring misses {d}, historical refused {d}, dropped {d}\n", .{
+            "ring misses {d}, archive reads {d}, historical served {d} refused {d}, " ++
+            "dropped {d}, pool {d} (added {d} refused {d})\n", .{
             ring.count,
             ring.oldest_number(),
             ring.newest_number(),
@@ -499,9 +626,15 @@ pub const Api = struct {
             api.stats.requests,
             api.stats.calls,
             api.stats.ring_misses,
+            api.stats.archive_reads,
+            api.stats.historical_served,
             api.stats.historical,
             api.store.dropped,
+            api.pool.count(),
+            api.stats.pool_added,
+            api.stats.pool_refused,
         });
+        if (api.sequencer) |forwarder| forwarder.summary();
     }
 };
 
@@ -516,6 +649,8 @@ const methods = [_]rpc.Method(*Api){
     .{ .name = "net_version", .handler = net_version },
     .{ .name = "eth_chainId", .handler = chain_id },
     .{ .name = "eth_blockNumber", .handler = block_number },
+    .{ .name = "eth_gasPrice", .handler = gas_price },
+    .{ .name = "eth_maxPriorityFeePerGas", .handler = max_priority_fee },
     .{ .name = "eth_getBalance", .handler = get_balance },
     .{ .name = "eth_getTransactionCount", .handler = get_transaction_count },
     .{ .name = "eth_getCode", .handler = get_code },
@@ -527,6 +662,8 @@ const methods = [_]rpc.Method(*Api){
     .{ .name = "eth_getBlockReceipts", .handler = get_block_receipts },
     .{ .name = "eth_call", .handler = eth_call },
     .{ .name = "eth_getProof", .handler = get_proof },
+    .{ .name = "eth_sendRawTransaction", .handler = send_raw_transaction },
+    .{ .name = "txpool_status", .handler = txpool_status },
 };
 
 pub const Router = rpc.Router(*Api, &methods);
@@ -551,6 +688,23 @@ fn chain_id(api: *Api, call: *Call) HandlerError!void {
 fn block_number(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     try call.writer.quantity(api.node.head().number);
+}
+
+/// The tip el-run suggests: op-geth's floor for OP Stack chains (`MinSuggestedPriorityFee`,
+/// 0.001 gwei). Base blocks rarely fill, so the floor is what the sequencer needs.
+const suggested_priority_fee: u64 = 1_000_000;
+
+/// `eth_gasPrice`: the head's base fee plus the suggested tip, as op-geth.
+fn gas_price(api: *Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    const head = try head_header(api, call);
+    const base_fee = head.base_fee_per_gas orelse 0;
+    try call.writer.quantity(@as(u128, base_fee) + suggested_priority_fee);
+}
+
+fn max_priority_fee(_: *Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    try call.writer.quantity(suggested_priority_fee);
 }
 
 // ---- Block parameters ----------------------------------------------------------------
@@ -618,14 +772,23 @@ fn resolve(api: *Api, call: *Call, tag: Tag) HandlerError!?Label {
         },
         .number => |number| {
             if (number > head.number) return null;
-            const hash = api.store.ring.hash_at(number) orelse
-                api.node.canonical_hash_fn(api.node.context, number) orelse
+            if (api.store.ring.hash_at(number)) |hash| return .{ .number = number, .hash = hash };
+            if (api.node.canonical_hash_fn(api.node.context, number)) |hash| {
+                return .{ .number = number, .hash = hash };
+            }
+            const archived = try archived_block(api, call, number) orelse
                 return fail_missing(api, call, number);
-            return .{ .number = number, .hash = hash };
+            return .{ .number = number, .hash = archived.hash };
         },
         .hash => |hash| {
             if (api.store.ring.number_of(hash)) |number| return .{ .number = number, .hash = hash };
-            const header_rlp = api.node.header_fn(api.node.context, hash) orelse return null;
+            const header_rlp = api.node.header_fn(api.node.context, hash) orelse {
+                const history = api.history orelse return null;
+                const found = history.find_block_fn(history.context, hash) catch |err|
+                    return fail_archive(call, err);
+                const number = found orelse return null;
+                return .{ .number = number, .hash = hash };
+            };
             const header = consensus.Header.decode(header_rlp) catch unreachable; // Stored.
             const canonical = api.node.canonical_hash_fn(api.node.context, header.number);
             if (canonical == null or !std.mem.eql(u8, &canonical.?, &hash)) return null;
@@ -634,8 +797,31 @@ fn resolve(api: *Api, call: *Call, tag: Tag) HandlerError!?Label {
     }
 }
 
+/// Block `number`'s archived hash and record, when the archive holds it.
+fn archived_block(api: *Api, call: *Call, number: u64) HandlerError!?Archived {
+    const history = api.history orelse return null;
+    const archived = history.block_fn(history.context, number) catch |err|
+        return fail_archive(call, err);
+    if (archived != null) api.stats.archive_reads += 1;
+    return archived;
+}
+
+fn fail_archive(call: *Call, err: anyerror) HandlerError {
+    var buffer: [96]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, "archive read failed: {t}", .{err}) catch
+        "archive read failed";
+    return call.fail(rpc.code.server_error, message);
+}
+
 fn fail_missing(api: *Api, call: *Call, number: u64) HandlerError {
     api.stats.ring_misses += 1;
+    if (api.history) |history| if (history.window()) |window| {
+        const message = std.fmt.bufPrint(&api.message_buffer, "block {d} is not held: " ++
+            "el-run's archive keeps blocks {d}..{d}", .{
+            number, window.oldest, window.head,
+        }) catch "block not held";
+        return call.fail(rpc.code.server_error, message);
+    };
     const ring = &api.store.ring;
     if (ring.count == 0) {
         return call.fail(rpc.code.server_error, "block not held: el-run's RPC ring is empty " ++
@@ -648,21 +834,47 @@ fn fail_missing(api: *Api, call: *Call, number: u64) HandlerError {
     return call.fail(rpc.code.server_error, message);
 }
 
-/// Requires the optional block parameter `raw` to name the head: the only state el-run has.
-fn require_head(api: *Api, call: *Call, raw: ?[]const u8) HandlerError!void {
-    const text = raw orelse return;
-    if (std.mem.eql(u8, text, "null")) return;
+/// The block whose state the optional block parameter `raw` names: null for the head.
+/// Otherwise opens the archive's view of it (the caller ends it, `view_end`), or fails.
+fn view_state(api: *Api, call: *Call, raw: ?[]const u8) HandlerError!?Label {
+    const text = raw orelse return null;
+    if (std.mem.eql(u8, text, "null")) return null;
     const tag = try parse_tag(text);
-    if (tag == .latest) return;
+    if (tag == .latest) return null;
     const head = api.node.head();
     const label = try resolve(api, call, tag) orelse
         return call.fail(rpc.code.server_error, "header not found");
-    if (std.mem.eql(u8, &label.hash, &head.hash)) return;
+    if (std.mem.eql(u8, &label.hash, &head.hash)) return null;
+    assert(label.number < head.number);
+    const history = api.history orelse return fail_historical(api, call, label.number, null);
+    const window = history.window() orelse return fail_historical(api, call, label.number, null);
+    // State after block `oldest - 1` is block `oldest`'s pre-state.
+    if (label.number + 1 < window.oldest) {
+        return fail_historical(api, call, label.number, window);
+    }
+    const header = try header_at(api, call, label);
+    history.view_begin_fn(history.context, label.number, header.state_root.bytes);
+    api.stats.historical_served += 1;
+    return label;
+}
+
+fn view_end(api: *Api, label: ?Label) void {
+    if (label == null) return;
+    const history = api.history.?;
+    history.view_end_fn(history.context);
+}
+
+fn fail_historical(api: *Api, call: *Call, number: u64, window: ?Window) HandlerError {
     api.stats.historical += 1;
-    const message = std.fmt.bufPrint(&api.message_buffer, "historical state unavailable: " ++
-        "el-run keeps only the head state (block {d}), not block {d}", .{
-        head.number, label.number,
-    }) catch "historical state unavailable";
+    const fallback = "historical state unavailable";
+    const buffer = &api.message_buffer;
+    const message = if (window) |held| std.fmt.bufPrint(buffer, fallback ++ ": el-run's " ++
+        "archive keeps the state of blocks {d}..{d}, not block {d}", .{
+        held.oldest -| 1, held.head, number,
+    }) catch fallback else std.fmt.bufPrint(buffer, fallback ++ ": el-run keeps only the " ++
+        "head state (block {d}), not block {d} (run with --archive)", .{
+        api.node.head().number, number,
+    }) catch fallback;
     return call.fail(rpc.code.server_error, message);
 }
 
@@ -670,8 +882,10 @@ fn require_head(api: *Api, call: *Call, raw: ?[]const u8) HandlerError!void {
 
 fn read_account(api: *Api, call: *Call) HandlerError!?Account {
     const address = try call.params.fixed(20);
-    try require_head(api, call, try call.params.optional_raw());
+    const raw = try call.params.optional_raw();
     try call.params.finish();
+    const view = try view_state(api, call, raw);
+    defer view_end(api, view);
     return api.node.account_fn(api.node.context, address);
 }
 
@@ -681,8 +895,17 @@ fn get_balance(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn get_transaction_count(api: *Api, call: *Call) HandlerError!void {
-    const account = try read_account(api, call);
-    try call.writer.quantity(if (account) |found| found.nonce else 0);
+    const address = try call.params.fixed(20);
+    const raw = try call.params.optional_raw();
+    try call.params.finish();
+    const view = try view_state(api, call, raw);
+    const account = api.node.account_fn(api.node.context, address);
+    view_end(api, view);
+    var nonce = if (account) |found| found.nonce else 0;
+    // `pending`: past the sender's pooled transactions with consecutive nonces.
+    const pending = raw != null and std.mem.eql(u8, raw.?, "\"pending\"");
+    if (pending) nonce = api.pool.next_nonce(.{ .bytes = address }, nonce);
+    try call.writer.quantity(nonce);
 }
 
 fn get_code(api: *Api, call: *Call) HandlerError!void {
@@ -696,9 +919,11 @@ fn get_code(api: *Api, call: *Call) HandlerError!void {
 fn get_storage_at(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
     const slot = try parse_slot(try call.params.string());
-    try require_head(api, call, try call.params.optional_raw());
+    const raw = try call.params.optional_raw();
     try call.params.finish();
+    const view = try view_state(api, call, raw);
     const word = api.node.storage_fn(api.node.context, address, slot);
+    view_end(api, view);
     var bytes: [32]u8 = undefined;
     std.mem.writeInt(u256, &bytes, word, .big);
     try call.writer.data(&bytes);
@@ -714,12 +939,18 @@ pub fn parse_slot(text: []const u8) HandlerError!u256 {
 
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
     const call_raw = try call.params.raw();
-    try require_head(api, call, try call.params.optional_raw());
+    const raw = try call.params.optional_raw();
     try call.params.finish();
     var message = try eth.parse_call(api.scratch, call_raw);
     // Absent: the executor's default (the block limit, EIP-7825-capped from Osaka on).
     if (message.gas) |gas| message.gas = @min(gas, call_gas_max);
-    const header = try head_header(api, call);
+    const view = try view_state(api, call, raw);
+    defer view_end(api, view);
+    const header = if (view) |label|
+        try header_at(api, call, label)
+    else
+        try head_header(api, call);
+    // The call runs in the context of the block whose state it reads (as geth's eth_call).
     const env = node_chain.env_of(&header);
     api.stats.calls += 1;
     const simulated = api.node.simulate_fn(api.node.context, &env, message) catch |err| {
@@ -733,6 +964,16 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
             try call.writer.data(executed.output);
         },
     }
+}
+
+/// The header of block `label` (ring, database, archive).
+fn header_at(api: *Api, call: *Call, label: Label) HandlerError!consensus.Header {
+    if (api.node.header_fn(api.node.context, label.hash)) |bytes| {
+        return consensus.Header.decode(bytes) catch unreachable; // Stored by the runner.
+    }
+    const stored = try read_label(api, call, label);
+    assert(stored.record.header.number == label.number);
+    return stored.record.header;
 }
 
 fn head_header(api: *Api, call: *Call) HandlerError!consensus.Header {
@@ -751,8 +992,10 @@ fn get_proof(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
     var keys: [eth_proof.storage_keys_max]Hash = undefined;
     const keys_count = try eth_proof.parse_keys(try call.params.raw(), &keys);
-    try require_head(api, call, try call.params.optional_raw());
+    const raw = try call.params.optional_raw();
     try call.params.finish();
+    const view = try view_state(api, call, raw);
+    defer view_end(api, view);
     const proofs = api.proofs;
     const found = try prove(api, call, address, null, &proofs.storage);
     const w = call.writer;
@@ -797,12 +1040,79 @@ fn prove(
     return .{ .account = account, .value = values[0] };
 }
 
+// ---- Transactions ---------------------------------------------------------------------
+
+fn send_raw_transaction(api: *Api, call: *Call) HandlerError!void {
+    const half = api.scratch.len / 2;
+    const raw = try call.params.data(api.scratch[0..half]);
+    try call.params.finish();
+    const header = try head_header(api, call);
+    const validated = txpool.validate.validate_known(
+        raw,
+        api.scratch[half..],
+        api.spec,
+        header.timestamp + 1,
+        api.node.recoverer,
+        null,
+    ) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+    const tx = validated.tx;
+    const sequencer = api.sequencer orelse {
+        if (validated.lane != null) {
+            return call.fail(rpc.code.server_error, "EIP-8130 transactions need a sequencer " ++
+                "(--rollup.sequencer-http)");
+        }
+        pool_add(api, &tx) catch |err| return call.fail(rpc.code.server_error, @errorName(err));
+        return call.writer.data(&tx.hash.bytes);
+    };
+    const slot = sequencer.slot_free() orelse return call.fail(rpc.code.server_error, "too " ++
+        "many transactions are being forwarded to the sequencer; retry");
+    // As base/base: the sequencer's verdict counts; the local pool keeps what it can.
+    if (validated.lane == null) pool_add(api, &tx) catch {};
+    sequencer.submit(slot, raw);
+    if (api.send_id != null) api.send_slot = slot;
+    try call.writer.data(&tx.hash.bytes);
+}
+
+/// Adds `tx` to the pool against the sender's head account.
+fn pool_add(api: *Api, tx: *const txpool.Tx) txpool.AddError!void {
+    const account = api.node.account_fn(api.node.context, tx.sender.bytes);
+    _ = api.pool.add(tx.*, .{
+        .nonce = if (account) |found| found.nonce else 0,
+        .balance = if (account) |found| found.balance else 0,
+    }) catch |err| {
+        api.stats.pool_refused += 1;
+        return err;
+    };
+    api.stats.pool_added += 1;
+}
+
+fn txpool_status(api: *Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    const w = call.writer;
+    try w.begin_object();
+    try w.key("pending");
+    try w.quantity(api.pool.pending_count);
+    try w.key("queued");
+    try w.quantity(api.pool.queued_count);
+    try w.end_object();
+}
+
 // ---- Blocks, transactions, receipts ----------------------------------------------------
 
-/// The retained record of `label`, an error when it left the ring.
+/// The record of retained block `number`: the ring's, else the archive's.
+fn stored_at(api: *Api, call: *Call, number: u64) HandlerError!?Stored {
+    if (api.store.record(number)) |stored| return stored;
+    const archived = try archived_block(api, call, number) orelse return null;
+    const record = node_chain.Record.decode(archived.bytes) catch
+        return fail_archive(call, error.InvalidRecord);
+    if (record.header.number != number) return fail_archive(call, error.InvalidRecord);
+    return .{ .hash = archived.hash, .bytes = archived.bytes, .record = record };
+}
+
+/// The retained record of `label`, an error when neither the ring nor the archive has it.
 fn read_label(api: *Api, call: *Call, label: Label) HandlerError!Stored {
     const number = label.number;
-    const stored = api.store.record(number) orelse return fail_missing(api, call, number);
+    const stored = try stored_at(api, call, number) orelse return fail_missing(api, call, number);
     if (!std.mem.eql(u8, &stored.hash, &label.hash)) {
         return call.fail(rpc.code.server_error, "block is no longer el-run's chain");
     }
@@ -838,11 +1148,36 @@ fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     try write_block(api, call, .{ .hash = hash }, full);
 }
 
+/// Where transaction `hash` is (ring, else archive) and its block's record.
+fn find_transaction(api: *Api, call: *Call, hash: *const Hash) HandlerError!?Found {
+    if (api.store.find(hash)) |location| {
+        // Proof: just found.
+        return .{ .location = location, .stored = api.store.record(location.number).? };
+    }
+    const history = api.history orelse return null;
+    const found = history.find_transaction_fn(history.context, hash.*) catch |err|
+        return fail_archive(call, err);
+    const location = found orelse return null;
+    const stored = try stored_at(api, call, location.number) orelse
+        return fail_archive(call, error.MissingBlock);
+    if (nth_transaction(stored.record, location.index) == null) {
+        return fail_archive(call, error.MissingTransaction);
+    }
+    return .{ .location = location, .stored = stored };
+}
+
+const Found = struct { location: Location, stored: Stored };
+
 fn get_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
     try call.params.finish();
-    const location = api.store.find(&hash) orelse return call.writer.null_value();
-    const stored = api.store.record(location.number).?; // Proof: just found.
+    const found = try find_transaction(api, call, &hash) orelse {
+        const pending = api.pool.get(.{ .bytes = hash }) orelse return call.writer.null_value();
+        try call.writer.out.ensureUnusedCapacity(3 * pending.raw.len + 4096);
+        return format.transaction(call.writer, pending.raw, null, api.node.recoverer);
+    };
+    const location = found.location;
+    const stored = found.stored;
     const raw = nth_transaction(stored.record, location.index).?;
     try call.writer.out.ensureUnusedCapacity(3 * raw.len + 4096);
     try format.transaction(call.writer, raw, .{
@@ -859,8 +1194,9 @@ fn get_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
 fn get_transaction_receipt(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
     try call.params.finish();
-    const location = api.store.find(&hash) orelse return call.writer.null_value();
-    const stored = api.store.record(location.number).?; // Proof: just found.
+    const found = try find_transaction(api, call, &hash) orelse return call.writer.null_value();
+    const location = found.location;
+    const stored = found.stored;
     try call.writer.out.ensureUnusedCapacity(json_size_bound(&stored));
     const w = call.writer;
     const recoverer = api.node.recoverer;
@@ -909,9 +1245,10 @@ pub const Service = struct {
     address: io_module.Address = undefined,
     last_tick_ns: u64 = 0,
 
-    /// Null without `--rpc`/`--rpc.addr`. Listens.
+    /// Null without `--rpc`/`--rpc.addr`. Listens. `io` runs the sequencer forwards.
     pub fn start(
         allocator: std.mem.Allocator,
+        io: Io,
         flags: *const Flags,
         spec: *const ChainSpec,
         node: Node,
@@ -920,6 +1257,11 @@ pub const Service = struct {
         const address = io_module.Address.parse(addr) catch return error.InvalidRpcAddress;
         if (address.port == 0) return error.InvalidRpcAddress;
         const service = try create(allocator, address, spec, node, flags, server_options);
+        errdefer service.destroy(allocator);
+        if (flags.sequencer_url) |url| {
+            service.api.sequencer = try el_sequencer.Forwarder.create(allocator, io, url);
+            std.debug.print("el-run: eth_sendRawTransaction forwards to {s}\n", .{url});
+        }
         std.debug.print("el-run: JSON-RPC on {f} (read-only), ring {d} blocks / {d} MiB\n", .{
             service.address, flags.ring_blocks, flags.ring_mib,
         });
@@ -949,6 +1291,7 @@ pub const Service = struct {
     }
 
     pub fn destroy(service: *Service, allocator: std.mem.Allocator) void {
+        if (service.api.sequencer) |forwarder| forwarder.destroy(allocator);
         service.server.deinit();
         service.io.deinit();
         service.api.deinit(allocator);
@@ -974,6 +1317,7 @@ pub const Service = struct {
     }
 
     fn prepare(service: *Service) void {
+        if (service.api.sequencer) |forwarder| forwarder.poll(&service.server);
         const now_ns = service.io.now_monotonic_ns();
         if (now_ns -| service.last_tick_ns < timeout_tick_interval_ns) return;
         service.last_tick_ns = now_ns;
@@ -983,4 +1327,5 @@ pub const Service = struct {
 
 test {
     _ = @import("el_rpc_test.zig");
+    _ = @import("el_sequencer.zig");
 }
