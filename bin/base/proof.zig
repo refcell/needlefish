@@ -19,6 +19,7 @@ const usage =
     \\                      [--l1-genesis <file>]  (L1 chains that are not built in)
     \\
 ++ proof_verify_tee.usage ++
+    \\       base proof config-hash <rollup.json>
     \\
     \\  replay   run the fault-proof client over a recorded preimage archive
     \\  run      prove a claim against L1/L2 execution RPCs (native mode) and
@@ -26,6 +27,8 @@ const usage =
     \\  both exit 0 if the claimed output root holds, 1 if it does not
     \\  verify-tee  check a prover-service TEE receipt offline: rebuild the signed journal
     \\              and recover its signer (exit 0 when it verifies)
+    \\  config-hash  print the chain's per-chain config hash (AggregateVerifier CONFIG_HASH),
+    \\               as a local-mode enclave derives it for a chain without a pinned hash
     \\
 ;
 
@@ -34,12 +37,35 @@ const archive_bytes_max = 4 << 30;
 
 pub const Command = union(enum) {
     replay: []const u8,
+    config_hash: []const u8,
 };
 
 pub fn parse(args: []const []const u8) error{InvalidArguments}!Command {
     if (args.len != 2) return error.InvalidArguments;
     if (std.mem.eql(u8, args[0], "replay")) return .{ .replay = args[1] };
+    if (std.mem.eql(u8, args[0], "config-hash")) return .{ .config_hash = args[1] };
     return error.InvalidArguments;
+}
+
+/// The canonical config hash of a rollup config file (`PerChainConfig` with forced defaults).
+fn config_hash(init: std.process.Init, path: []const u8) !u8 {
+    const text = try Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(1 << 20));
+    defer init.gpa.free(text);
+    const rollup = base.consensus.protocol.rollup_json.parse(text) catch |err| {
+        std.debug.print("proof: {s}: {t}\n", .{ path, err });
+        return 2;
+    };
+    var config = base.proof.primitives.PerChainConfig.from_rollup_config(&rollup) orelse {
+        std.debug.print("proof: {s} has no genesis system config\n", .{path});
+        return 2;
+    };
+    config.force_defaults();
+    std.debug.assert(config.chain_id == rollup.l2_chain_id);
+    var buffer: [80]u8 = undefined;
+    var stdout = Io.File.stdout().writer(init.io, &buffer);
+    try stdout.interface.print("0x{x}\n", .{&config.hash()});
+    try stdout.interface.flush();
+    return 0;
 }
 
 pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
@@ -64,7 +90,10 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     };
-    const path = command.replay;
+    const path = switch (command) {
+        .replay => |replay| replay,
+        .config_hash => |rollup| return config_hash(init, rollup),
+    };
     const allocator = init.gpa;
     const bytes = try Io.Dir.cwd().readFileAlloc(
         init.io,
@@ -99,6 +128,8 @@ test "proof: argument parsing" {
     const replay = try parse(&.{ "replay", "run.nfpa" });
     try std.testing.expectEqualStrings("run.nfpa", replay.replay);
     try std.testing.expectError(error.InvalidArguments, parse(&.{"replay"}));
+    const hash = try parse(&.{ "config-hash", "rollup.json" });
+    try std.testing.expectEqualStrings("rollup.json", hash.config_hash);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "record", "x" }));
 }
 

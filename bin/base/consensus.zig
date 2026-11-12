@@ -19,7 +19,8 @@ const usage =
     \\         [--rpc.ws-enabled [--rpc.ws-port P]] [--rpc.enable-admin] [--rpc.dev-enabled]
     \\         [--rpc.disabled] [--rpc.execution-forwarding-endpoint URL]
     \\         [--l1.verifier-confs N] [--sequencer.l1-confs N] [--sequencer.recover]
-    \\         [--sequencer [--sequencer.key-index N]] [--log.level LEVEL]
+    \\         [--sequencer [--sequencer.key-index N | --p2p.sequencer.key.path FILE]]
+    \\         [--log.level LEVEL]
     \\         [--p2p.disabled | --p2p.NAME VALUE ...]
     \\         [--upgrade-signal.contract ADDRESS] [--upgrade-signal.l1-block-tag TAG]
     \\         [--checkpoint.path FILE] [--safedb.path FILE]
@@ -61,6 +62,9 @@ pub const Flags = struct {
     metrics_port: u16 = base.consensus.service.metrics.default_port,
     sequencer: bool = false,
     sequencer_key_index: u32 = 0,
+    /// Hex secp256k1 key the sequencer signs gossip with (base/base
+    /// `--p2p.sequencer.key.path`); without it the dev mnemonic key at `sequencer_key_index`.
+    sequencer_key_path: ?[]const u8 = null,
     log_level: log.Level = .info,
     /// Unsafe-block gossip, on unless `--p2p.disabled` (base/base default).
     p2p_disabled: bool = false,
@@ -187,6 +191,9 @@ fn apply_value(flags: *Flags, arg: []const u8, value: []const u8) !void {
         flags.metrics_port = try std.fmt.parseInt(u16, value, 10);
     } else if (eql(u8, arg, "--sequencer.key-index")) {
         flags.sequencer_key_index = try std.fmt.parseInt(u32, value, 10);
+    } else if (eql(u8, arg, "--p2p.sequencer.key.path")) {
+        if (value.len == 0) return error.InvalidValue;
+        flags.sequencer_key_path = value;
     } else if (eql(u8, arg, "--checkpoint.path")) {
         if (value.len == 0) return error.InvalidValue;
         flags.checkpoint_path = value;
@@ -211,7 +218,8 @@ pub fn parse_flags(args: []const []const u8) !Flags {
     var p2p_count: usize = 0;
     var index: usize = 0;
     while (index < args.len) {
-        if (std.mem.startsWith(u8, args[index], "--p2p.")) {
+        const sequencer_key = std.mem.eql(u8, args[index], "--p2p.sequencer.key.path");
+        if (std.mem.startsWith(u8, args[index], "--p2p.") and !sequencer_key) {
             const span = try p2p_flag_span(args, index);
             if (std.mem.eql(u8, args[index], "--p2p.disabled")) {
                 flags.p2p_disabled = true;
@@ -356,10 +364,12 @@ fn p2p_settings(
     logger: *log.Logger,
 ) !?consensus.service.node.P2p {
     if (flags.p2p_disabled) return null;
-    const sequencer_key: ?[32]u8 = if (flags.sequencer)
-        accounts.derive_dev(flags.sequencer_key_index).private_key
+    const sequencer_key: ?[32]u8 = if (!flags.sequencer)
+        null
+    else if (flags.sequencer_key_path) |path|
+        try read_sequencer_key(init, path)
     else
-        null;
+        accounts.derive_dev(flags.sequencer_key_index).private_key;
     // base/base order: the L1 SystemConfig (read at runtime by the node), then the built-in
     // chain config, then the flag; a sequencer falls back to its own key.
     const own_signer = if (sequencer_key) |key| accounts.address_of(key) else null;
@@ -391,6 +401,15 @@ fn p2p_settings(
     };
 }
 
+/// A 32-byte hex key file (optional `0x`, surrounding whitespace ignored).
+fn read_sequencer_key(init: std.process.Init, path: []const u8) ![32]u8 {
+    var buffer: [128]u8 = undefined;
+    const text = try Io.Dir.cwd().readFile(init.io, path, &buffer);
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    std.debug.assert(trimmed.len <= buffer.len);
+    return base.common.primitives.hex.decode_array(32, trimmed);
+}
+
 test "consensus: flags" {
     const flags = try parse_flags(&.{
         "--rollup-config", "r.json",                "--l1",       "http://127.0.0.1:8545",
@@ -414,6 +433,11 @@ test "consensus: flags" {
     try std.testing.expectEqual(@as(u16, 9300), with_p2p.p2p.listen_tcp);
     try std.testing.expectEqual(@as(u16, 9301), with_p2p.p2p.listen_udp);
     try std.testing.expect(with_p2p.p2p.no_discovery);
+    const keyed = try parse_flags(&(required ++ [_][]const u8{
+        "--sequencer", "--p2p.sequencer.key.path", "seq.key", "--p2p.listen.tcp", "9302",
+    }));
+    try std.testing.expectEqualStrings("seq.key", keyed.sequencer_key_path.?);
+    try std.testing.expectEqual(@as(u16, 9302), keyed.p2p.listen_tcp);
     const disabled = try parse_flags(&(required ++ [_][]const u8{"--p2p.disabled"}));
     const upgrade = try parse_flags(&(required ++ [_][]const u8{
         "--upgrade-signal.contract",     "0x7480afc8d99a5c645c247db5a1e4a4f440e6e095",
