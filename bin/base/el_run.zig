@@ -56,6 +56,7 @@ const unsafe_watch = @import("unsafe_watch.zig");
 const el_engine = @import("el_engine.zig");
 const el_rpc = @import("el_rpc.zig");
 const el_archive = @import("el_archive.zig");
+const log_relay = @import("log_relay.zig");
 
 const to_disk = base.execution.import.to_disk;
 const import_run = base.execution.import.run;
@@ -231,6 +232,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     };
+    // A line per block: a busy disk must not hold up the next block (`log_relay.zig`).
+    log_relay.start(init.io);
     const gpa = init.gpa;
     const counts_path = try std.fmt.allocPrint(gpa, "{s}.counts", .{flags.db});
     defer gpa.free(counts_path);
@@ -558,7 +561,7 @@ fn next_block(run: *Run, block: *el_source.Block) !bool {
 
 /// At the tip, accounts the gap before `number` (executed in `exec_ms`) and prints a
 /// `slow block` line when its lag rose by more than `slow_rise_ms` over the previous block's.
-fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64) void {
+fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64, exec: *const ExecSplit) void {
     assert(run.feed.at_tip);
     const gap = run.gap;
     run.gap = .{};
@@ -572,6 +575,48 @@ fn account_gap(run: *Run, number: u64, exec_ms: i64, lag_ms: u64) void {
         number,       lag_ms,     rise_ms, gap.fetch_ms, gap.polls, gap.flush_ms, gap.idle_ms,
         gap.serve_ms, gap.log_ms, exec_ms,
     });
+    print_exec_split(exec);
+}
+
+const phase_count = @typeInfo(base.execution.import.room.Phase).@"enum".field_names.len;
+
+/// One block's runner phase times and room wait (`import.run.Stats`), as deltas.
+const ExecSplit = struct {
+    time: import_run.Time,
+    room_phase_ns: [phase_count]u64,
+
+    fn begin(stats: *const import_run.Stats) ExecSplit {
+        comptime assert(phase_count == @typeInfo(@TypeOf(stats.room.phase_ns)).array.len);
+        return .{ .time = stats.time, .room_phase_ns = stats.room.phase_ns };
+    }
+
+    /// The change since `begin`: the runner's times only grow.
+    fn end(split: *ExecSplit, stats: *const import_run.Stats) void {
+        inline for (@typeInfo(import_run.Time).@"struct".field_names) |name| {
+            assert(@field(stats.time, name) >= @field(split.time, name));
+            @field(split.time, name) = @field(stats.time, name) - @field(split.time, name);
+        }
+        for (&split.room_phase_ns, stats.room.phase_ns) |*before, now| {
+            assert(now >= before.*);
+            before.* = now - before.*;
+        }
+    }
+};
+
+/// A slow block's execution by phase: those of 5 ms or more, and the room wait's storage phases.
+fn print_exec_split(exec: *const ExecSplit) void {
+    std.debug.print("  exec split:", .{});
+    inline for (@typeInfo(import_run.Time).@"struct".field_names) |name| {
+        const ms = @field(exec.time, name) / std.time.ns_per_ms;
+        if (ms >= 5) std.debug.print(" {s} {d}", .{ name[0 .. name.len - 3], ms });
+    }
+    std.debug.print("; room by storage phase:", .{});
+    const phases = @typeInfo(base.execution.import.room.Phase).@"enum".field_names;
+    inline for (phases, 0..) |name, index| {
+        const ms = exec.room_phase_ns[index] / std.time.ns_per_ms;
+        if (ms >= 5) std.debug.print(" {s} {d}", .{ name, ms });
+    }
+    std.debug.print(" (ms)\n", .{});
 }
 
 /// How long to wait after a fetch found no new block: at the tip, until the next block's slot
@@ -615,6 +660,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         .transactions = block.transactions,
     };
     const started = run.now_ms();
+    var exec = ExecSplit.begin(&run.runner.stats);
     const outcome = run.runner.execute(&runner_block) catch |err| {
         std.debug.print("el-run: block {d} hash {x}: refused: {t}; database head {d} hash {x}\n", .{
             block.number, block.hash, err, run.db.head_info.number, run.db.head_info.hash,
@@ -622,6 +668,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         return false;
     };
     const elapsed = run.now_ms() - started;
+    exec.end(&run.runner.stats);
     if (!outcome.ok()) {
         report_failure(run, &outcome);
         return false;
@@ -640,7 +687,7 @@ fn run_one(run: *Run, block: *const el_source.Block) !bool {
         run.tip_blocks += 1;
         run.lag_sum_ms += lag_ms;
         run.lag_max_ms = @max(run.lag_max_ms, lag_ms);
-        account_gap(run, block.number, elapsed, lag_ms);
+        account_gap(run, block.number, elapsed, lag_ms, &exec);
     } else {
         run.gap = .{};
     }

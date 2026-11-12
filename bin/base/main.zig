@@ -30,6 +30,7 @@ const unsafe_watch = @import("unsafe_watch.zig");
 const el_fetch = @import("el_fetch.zig");
 const el_peers = @import("el_peers.zig");
 const el_run = @import("el_run.zig");
+const log_relay = @import("log_relay.zig");
 const state_check = @import("state_check.zig");
 const derive_check = @import("derive_check.zig");
 const https_bridge = @import("https_bridge.zig");
@@ -106,6 +107,7 @@ test {
     _ = el_fetch;
     _ = el_peers;
     _ = el_run;
+    _ = log_relay;
     _ = state_check;
     _ = derive_check;
     _ = https_bridge;
@@ -171,6 +173,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "proof")) {
         std.process.exit(try proof.main(init, args[2..]));
     }
+    // Internal: el-run's stderr relay (`log_relay.zig`).
+    if (std.mem.eql(u8, command, "log-relay")) std.process.exit(log_relay.main());
     if (std.mem.eql(u8, command, "up")) {
         std.process.exit(try up.main(init, args[2..]));
     }
