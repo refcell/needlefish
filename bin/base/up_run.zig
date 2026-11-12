@@ -40,6 +40,8 @@ pub const Ports = struct {
     consensus: u16,
     l1: u16,
     beacon: u16,
+    /// Gossip's libp2p TCP port; discovery takes UDP `gossip + 1` (with `Settings.gossip`).
+    gossip: u16,
 };
 
 pub const Settings = struct {
@@ -55,6 +57,8 @@ pub const Settings = struct {
     l1_candidates: struct { rpcs: []const []const u8, beacons: []const []const u8 },
     peers_path: []const u8,
     consensus: bool,
+    /// el-run also executes sequencer-signed gossip blocks at the tip (`el-run --gossip`).
+    gossip: bool,
     stop: *const std.atomic.Value(bool),
 };
 
@@ -528,14 +532,23 @@ pub const Node = struct {
                     settings.peers_path, "--duration",                                   "3600",
                 });
             },
-            .el => try list.appendSlice(arena, &.{
-                "el-run",                      "--db",             settings.db,
-                "--chain",                     chain,              "--peers",
-                settings.peers_path,           "--rpc",            "--rpc.addr",
-                try address(arena, ports.rpc), "--engine.addr",    try address(arena, ports.engine),
-                "--engine.jwt",                settings.jwt_path,  "--engine.ring-blocks",
-                "65536",                       "--engine.ring-mb", "2048",
-            }),
+            .el => {
+                const rpc = try address(arena, ports.rpc);
+                const engine = try address(arena, ports.engine);
+                try list.appendSlice(arena, &.{
+                    "el-run",            "--db",             settings.db,
+                    "--chain",           chain,              "--peers",
+                    settings.peers_path, "--rpc",            "--rpc.addr",
+                    rpc,                 "--engine.addr",    engine,
+                    "--engine.jwt",      settings.jwt_path,  "--engine.ring-blocks",
+                    "65536",             "--engine.ring-mb", "2048",
+                });
+                if (settings.gossip) try list.appendSlice(arena, &.{
+                    "--gossip",
+                    try std.fmt.allocPrint(arena, "--p2p.listen.tcp={d}", .{ports.gossip}),
+                    try std.fmt.allocPrint(arena, "--p2p.listen.udp={d}", .{ports.gossip + 1}),
+                });
+            },
             .bridge => try list.appendSlice(arena, &.{
                 "https-bridge", "--routes",
                 try std.fmt.allocPrint(arena, "{d}={s},{d}={s}", .{

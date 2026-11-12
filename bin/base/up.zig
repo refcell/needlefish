@@ -3,7 +3,8 @@
 //!     base up [--chain base-mainnet|base-sepolia] [--datadir <dir>] [--db <file>]
 //!             [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
 //!             [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
-//!             [--download.connections <n>] [--reimport] [--dry-run] [--plain]
+//!             [--download.connections <n>] [--gossip [--gossip.port <n>]] [--reimport]
+//!             [--dry-run] [--plain]
 //!
 //! Every run checks the setup first, then does only what is missing, in order:
 //! 1. Snapshot (`up_snapshot.zig`): the chain's latest public snapshot, downloaded and
@@ -44,7 +45,8 @@ const usage =
     \\usage: base up [--chain base-mainnet|base-sepolia] [--datadir <dir>] [--db <file>]
     \\               [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
     \\               [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
-    \\               [--download.connections <n>] [--reimport] [--dry-run] [--plain]
+    \\               [--download.connections <n>] [--gossip [--gossip.port <n>]]
+    \\               [--reimport] [--dry-run] [--plain]
     \\
     \\Runs a Base node that follows the tip, from nothing: downloads and verifies the latest
     \\public snapshot, imports it, then runs the execution node (blocks over devp2p) and the
@@ -61,6 +63,9 @@ const usage =
     \\  --engine.port Engine API port on 127.0.0.1 (default 8551)
     \\  --consensus.port  consensus RPC port on 127.0.0.1 (default 7545)
     \\  --download.connections  parallel snapshot downloads (default 8)
+    \\  --gossip     also join Base's consensus gossip and execute the sequencer-signed block
+    \\               at the tip as it arrives (devp2p stays the fallback)
+    \\  --gossip.port   gossip TCP port on all interfaces, UDP one above (default 9222)
     \\  --reimport    delete the datadir's database and import the latest snapshot again
     \\  --dry-run     check everything and print the plan; change nothing
     \\  --plain       no color and no redrawn lines (the default without a terminal)
@@ -77,6 +82,8 @@ const Flags = struct {
     l1: ?[]const u8 = null,
     l1_beacon: ?[]const u8 = null,
     consensus: bool = true,
+    gossip: bool = false,
+    gossip_port: ?u16 = null,
     rpc_port: ?u16 = null,
     engine_port: ?u16 = null,
     consensus_port: ?u16 = null,
@@ -116,6 +123,10 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.plain = true;
             continue;
         }
+        if (std.mem.eql(u8, name, "--gossip")) {
+            flags.gossip = true;
+            continue;
+        }
         if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) return error.Help;
         if (index + 1 == args.len) return fail_flag("{s} needs a value", .{name});
         index += 1;
@@ -123,6 +134,9 @@ fn parse_flags(args: []const []const u8) !Flags {
     }
     if (flags.reimport and flags.db != null) {
         return fail_flag("--reimport replaces the datadir's own database, not a --db file", .{});
+    }
+    if (flags.gossip_port != null and !flags.gossip) {
+        return fail_flag("--gossip.port needs --gossip", .{});
     }
     if (!flags.consensus and (flags.l1 != null or flags.l1_beacon != null)) {
         return fail_flag("--no-consensus runs without L1; drop --l1 and --l1-beacon", .{});
@@ -148,6 +162,11 @@ fn parse_valued(flags: *Flags, name: []const u8, value: []const u8) !void {
         flags.engine_port = try port_flag(name, value);
     } else if (eql(u8, name, "--consensus.port")) {
         flags.consensus_port = try port_flag(name, value);
+    } else if (eql(u8, name, "--gossip.port")) {
+        flags.gossip_port = try port_flag(name, value);
+        if (flags.gossip_port.? == std.math.maxInt(u16)) {
+            return fail_flag("--gossip.port takes up to 65534 (UDP uses the port above)", .{});
+        }
     } else if (eql(u8, name, "--download.connections")) {
         flags.connections = std.fmt.parseInt(u32, value, 10) catch 0;
         if (flags.connections == 0 or flags.connections > connections_max) {
@@ -621,7 +640,14 @@ fn run_stages(up: *Up) !u8 {
     }
     if (dry_run) {
         print_plan(up, ready, ports, l1, if (snapshot) |*value| value else null);
-        return @intFromBool(problems > 0);
+        if (problems > 0) {
+            up.view.fail("dry run", "{d} check{s} failed (above); nothing was changed", .{
+                problems, if (problems == 1) "" else "s",
+            });
+            return 1;
+        }
+        up.view.ok("dry run", "nothing was changed", .{});
+        return 0;
     }
     if (!ready) {
         const stage = try fetch_snapshot(up, &snapshot.?);
@@ -735,24 +761,39 @@ fn lock_holder(up: *const Up) ?u32 {
 }
 
 fn pick_ports(up: *const Up) !?up_run.Ports {
-    const Want = struct { flag: []const u8, default: u16, named: ?u16 };
+    const Want = struct { flag: []const u8, default: u16, named: ?u16, udp_next: bool = false };
     const wants = [_]Want{
         .{ .flag = "--rpc.port", .default = 8545, .named = up.flags.rpc_port },
         .{ .flag = "--engine.port", .default = 8551, .named = up.flags.engine_port },
         .{ .flag = "--consensus.port", .default = 7545, .named = up.flags.consensus_port },
         .{ .flag = "", .default = 28545, .named = null }, // The bridge's L1 RPC route.
         .{ .flag = "", .default = 25052, .named = null }, // The bridge's L1 beacon route.
+        // Gossip: libp2p on TCP, discv5 on UDP one above (only used with --gossip).
+        .{
+            .flag = "--gossip.port",
+            .default = 9222,
+            .named = up.flags.gossip_port,
+            .udp_next = true,
+        },
     };
     var chosen: [wants.len]u16 = undefined;
     for (wants, 0..) |want, index| {
+        if (want.udp_next and !up.flags.gossip) {
+            chosen[index] = want.default;
+            continue;
+        }
         const wanted = want.named orelse want.default;
         const taken = chosen[0..index];
-        chosen[index] = up_check.pick_port(up.io, wanted, want.named != null, taken) catch {
-            up.view.fail("ports", "port {d} ({s}) is in use by another program", .{
+        const named = want.named != null;
+        chosen[index] = up_check.pick_port(up.io, wanted, named, taken, want.udp_next) catch {
+            if (want.udp_next) {
+                up.view.fail("ports", "TCP {d} or UDP {d} ({s}) is in use by another " ++
+                    "program", .{ wanted, wanted +% 1, want.flag });
+            } else up.view.fail("ports", "port {d} ({s}) is in use by another program", .{
                 wanted, want.flag,
             });
             up.view.fix("pick a free one with {s} <port>, or stop the program on it " ++
-                "(ss -ltnp 'sport = :{d}')", .{ want.flag, wanted });
+                "(ss -lntup 'sport = :{d}')", .{ want.flag, wanted });
             return null;
         };
         if (chosen[index] != wanted and want.flag.len > 0) {
@@ -765,12 +806,16 @@ fn pick_ports(up: *const Up) !?up_run.Ports {
     up.view.ok("ports", "JSON-RPC {d}, Engine API {d}, consensus {d} (127.0.0.1)", .{
         chosen[0], chosen[1], chosen[2],
     });
+    if (up.flags.gossip) up.view.ok("gossip", "TCP {d}, UDP {d} (all interfaces)", .{
+        chosen[5], chosen[5] + 1,
+    });
     return .{
         .rpc = chosen[0],
         .engine = chosen[1],
         .consensus = chosen[2],
         .l1 = chosen[3],
         .beacon = chosen[4],
+        .gossip = chosen[5],
     };
 }
 
@@ -813,8 +858,9 @@ fn choose_l1(up: *const Up) !?L1Plan {
             up.view.warn("L1: {s}", .{report.text()});
             up.view.note("the execution node runs without L1; consensus starts once one " ++
                 "answers (retried every 5 minutes)", .{});
-            up.view.fix("pass --l1 <Ethereum JSON-RPC> and --l1-beacon <beacon API>, or " ++
-                "--no-consensus", .{});
+            if (named) up.view.fix("check that the --l1 and --l1-beacon you named are up, or " ++
+                "pass others; --no-consensus runs without L1", .{}) else up.view.fix("pass " ++
+                "--l1 <Ethereum JSON-RPC> and --l1-beacon <beacon API>, or --no-consensus", .{});
             break :none .{ .waiting = .{ .rpcs = rpcs, .beacons = beacons } };
         },
     };
@@ -1028,6 +1074,10 @@ fn print_plan(
         "plan: el-run on JSON-RPC 127.0.0.1:{d}, Engine API 127.0.0.1:{d}",
         .{ ports.rpc, ports.engine },
     );
+    if (up.flags.gossip) view.note("plan: el-run joins gossip on TCP {d} and UDP {d}; it " ++
+        "executes the sequencer-signed block at the tip, devp2p as the fallback", .{
+        ports.gossip, ports.gossip + 1,
+    });
     switch (l1) {
         .disabled => view.note("plan: no consensus (--no-consensus)", .{}),
         .chosen => view.note("plan: consensus on 127.0.0.1:{d} once el-run's engine ring is " ++
@@ -1036,7 +1086,6 @@ fn print_plan(
         }),
         .waiting => view.note("plan: consensus once an L1 endpoint answers", .{}),
     }
-    view.ok("dry run", "nothing was changed", .{});
 }
 
 /// Downloads and extracts the snapshot (rounds: a round that loses chunks to a decode error
@@ -1421,6 +1470,7 @@ fn start_node(up: *const Up, ports: up_run.Ports, l1: L1Plan) !u8 {
         .jwt_secret = secret,
         .peers_path = up.path("peers.txt", .{}),
         .consensus = l1 != .disabled,
+        .gossip = up.flags.gossip,
         .l1 = if (l1 == .chosen) l1.chosen.l1 else null,
         .l1_candidates = switch (l1) {
             .disabled => .{ .rpcs = &.{}, .beacons = &.{} },
@@ -1471,7 +1521,11 @@ test "up: flags" {
         &.{ "--rpc.port", "70000" },         &.{ "--l1", "ethereum-rpc.publicnode.com" },
         &.{ "--download.connections", "0" }, &.{"--bogus"},
         &.{ "--db", "x", "--reimport" },     &.{ "--no-consensus", "--l1", "https://x" },
+        &.{ "--gossip.port", "9322" },       &.{ "--gossip", "--gossip.port", "65535" },
     };
+    const gossip = try parse_flags(&.{ "--gossip", "--gossip.port", "9422" });
+    try testing.expect(gossip.gossip and !defaults.gossip);
+    try testing.expectEqual(@as(?u16, 9422), gossip.gossip_port);
     for (invalid) |args| try testing.expectError(error.InvalidArguments, parse_flags(args));
     try testing.expectError(error.Help, parse_flags(&.{"--help"}));
 }

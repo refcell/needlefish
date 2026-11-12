@@ -212,21 +212,44 @@ pub fn port_free(io: Io, port: u16) bool {
     return true;
 }
 
+/// Whether nothing holds UDP `port` on any address (gossip's discovery binds 0.0.0.0).
+pub fn udp_port_free(io: Io, port: u16) bool {
+    assert(port != 0);
+    const address: Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
+    const socket = address.bind(io, .{ .mode = .dgram }) catch return false;
+    socket.close(io);
+    return true;
+}
+
 pub const PortError = error{ PortInUse, NoFreePort };
 
+/// A busy default port moves up by this much, not by one: it is usually another node's, and
+/// that node's other ports sit one above (8545, 8546), so `port + 1` is often a port of a node
+/// that is down only for a moment (a restart), and the two would collide when it comes back.
+pub const port_stride = 100;
+
 /// `wanted` when free; when not and the operator did not name it, the next free port above
-/// it that no other port of this node (`taken`) uses.
-pub fn pick_port(io: Io, wanted: u16, named: bool, taken: []const u16) PortError!u16 {
+/// it (in `port_stride` steps) that no other port of this node (`taken`) uses. `udp_next`:
+/// UDP `port + 1` must be free too (gossip: TCP for libp2p, UDP for discovery).
+pub fn pick_port(
+    io: Io,
+    wanted: u16,
+    named: bool,
+    taken: []const u16,
+    udp_next: bool,
+) PortError!u16 {
     assert(wanted != 0);
     const tries_max = 100;
-    var port = wanted;
+    var port: u32 = wanted;
     for (0..tries_max) |_| {
-        if (std.mem.indexOfScalar(u16, taken, port) == null and port_free(io, port)) {
-            return port;
-        }
+        const port_16: u16 = @intCast(port);
+        const free = std.mem.indexOfScalar(u16, taken, port_16) == null and
+            port_free(io, port_16) and
+            (!udp_next or (port < std.math.maxInt(u16) and udp_port_free(io, port_16 + 1)));
+        if (free) return port_16;
         if (named) return error.PortInUse;
-        if (port == std.math.maxInt(u16)) break;
-        port += 1;
+        port += port_stride;
+        if (port + @intFromBool(udp_next) > std.math.maxInt(u16)) break;
     }
     return error.NoFreePort;
 }
@@ -578,12 +601,24 @@ test "up check: a busy port moves unless named" {
     defer server.deinit(io);
     const busy = server.socket.address.getPort();
     try testing.expect(!port_free(io, busy));
-    try testing.expectError(error.PortInUse, pick_port(io, busy, true, &.{}));
-    const moved = try pick_port(io, busy, false, &.{});
-    try testing.expect(moved > busy);
+    try testing.expectError(error.PortInUse, pick_port(io, busy, true, &.{}, false));
+    const moved = try pick_port(io, busy, false, &.{}, false);
+    // Not `busy + 1`: that is where a sibling node's next port usually is.
+    try testing.expect(moved > busy and (moved - busy) % port_stride == 0);
     // A port another of this node's servers took is skipped too.
-    const skipped = try pick_port(io, moved, false, &.{moved});
+    const skipped = try pick_port(io, moved, false, &.{moved}, false);
     try testing.expect(skipped > moved);
+    // Gossip's pair: a busy UDP `port + 1` moves the TCP port as well.
+    const udp_address: Io.net.IpAddress = .{ .ip4 = .unspecified(0) };
+    const udp = try udp_address.bind(io, .{ .mode = .dgram });
+    defer udp.close(io);
+    const udp_busy = udp.address.getPort();
+    try testing.expect(!udp_port_free(io, udp_busy));
+    if (udp_busy > 1 and port_free(io, udp_busy - 1)) {
+        const pair = try pick_port(io, udp_busy - 1, false, &.{}, true);
+        try testing.expect(pair != udp_busy - 1);
+        try testing.expectError(error.PortInUse, pick_port(io, udp_busy - 1, true, &.{}, true));
+    }
 }
 
 test "up check: lock holders from /proc/locks" {
