@@ -110,10 +110,12 @@ test {
     _ = derive_check;
     _ = https_bridge;
     _ = up;
+    _ = @import("up.zig");
     _ = @import("up_check.zig");
     _ = @import("up_tar.zig");
     _ = @import("up_snapshot.zig");
     _ = @import("up_run.zig");
+    _ = @import("up_view.zig");
     _ = @import("derive_check_net.zig");
     _ = @import("el_source.zig");
     _ = @import("el_pool.zig");

@@ -137,7 +137,9 @@ pub const View = struct {
     ) void {
         const s = view.style;
         if (!s.color) {
-            if (now_ms - view.last_plain_progress_ms < plain_progress_ms) return;
+            // Saturating: the first call subtracts minInt (a wrapped difference is negative
+            // and would hold every later line back).
+            if (now_ms -| view.last_plain_progress_ms < plain_progress_ms) return;
             view.last_plain_progress_ms = now_ms;
         }
         view.settle();
@@ -429,4 +431,26 @@ test "up view: a tail yields whole lines as the file grows" {
     try file.writePositionalAll(io, "ond\nthird\n", 18);
     try testing.expectEqualStrings("second\nthird\n", tail.read(io));
     try testing.expectEqualStrings("", tail.read(io));
+}
+
+test "up view: plain progress prints its first line, then one per interval" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(io, "out.log", .{});
+    defer file.close(io);
+    var buffer: [1024]u8 = undefined;
+    var view: View = .{
+        .file_writer = file.writerStreaming(io, &buffer),
+        .style = .{ .color = false },
+    };
+    const now_ms: i64 = 5_000_000;
+    view.progress(now_ms, "snapshot", 0.25, "first", .{});
+    view.progress(now_ms + plain_progress_ms - 1, "snapshot", 0.5, "held back", .{});
+    view.progress(now_ms + plain_progress_ms, "snapshot", 0.75, "second", .{});
+    var read_buffer: [1024]u8 = undefined;
+    const text = try tmp.dir.readFile(io, "out.log", &read_buffer);
+    try testing.expect(std.mem.indexOf(u8, text, "25%  first\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "held back") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "75%  second\n") != null);
 }
