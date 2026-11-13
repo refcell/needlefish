@@ -516,10 +516,23 @@ pub const ChunkReader = struct {
 };
 
 /// Members written into a directory, created as they start.
+///
+/// A restarted extraction (a resumed `base up`) decodes the archive from its first chunk
+/// again, but does not rewrite what an earlier run already wrote: a member file is kept, and
+/// below its length (`kept`) each decoded range is compared with the bytes on disk and written
+/// only where they differ. Reads instead of hundreds of GB of writes on a disk the node may
+/// share; the member's blake3 is still over the decoded bytes, and the file ends equal to them.
 pub const DirectoryOutput = struct {
     io: Io,
     dir: Io.Dir,
     file: ?Io.File = null,
+    /// Bytes of the open member on disk from an earlier run that are compared, not written.
+    kept: u64 = 0,
+    /// Bytes compared equal and so not written (all members, this run).
+    skipped: u64 = 0,
+    compare_buffer: [compare_bytes]u8 = undefined,
+
+    const compare_bytes = 1 << 20;
 
     pub fn output(directory: *DirectoryOutput) up_tar.Output {
         return .{ .context = directory, .open = open, .write = write, .close = close };
@@ -532,18 +545,50 @@ pub const DirectoryOutput = struct {
         if (std.fs.path.dirname(member.path)) |parent| {
             try directory.dir.createDirPath(directory.io, parent);
         }
-        directory.file = try directory.dir.createFile(directory.io, member.path, .{});
+        const file = try directory.dir.createFile(directory.io, member.path, .{
+            .read = true,
+            .truncate = false,
+        });
+        errdefer file.close(directory.io);
+        const length = try file.length(directory.io);
+        // A longer file is not this member's: the tail past its size goes.
+        if (length > member.size) try file.setLength(directory.io, member.size);
+        directory.file = file;
+        directory.kept = @min(length, member.size);
     }
 
     fn write(context: *anyopaque, bytes: []const u8, offset: u64) anyerror!void {
         const directory: *DirectoryOutput = @ptrCast(@alignCast(context));
-        try directory.file.?.writePositionalAll(directory.io, bytes, offset);
+        const file = directory.file.?;
+        var done: usize = 0;
+        while (done < bytes.len and offset + done < directory.kept) {
+            const at = offset + done;
+            const length: usize = @intCast(@min(
+                bytes.len - done,
+                directory.kept - at,
+                compare_bytes,
+            ));
+            const disk = directory.compare_buffer[0..length];
+            const got = try file.readPositionalAll(directory.io, disk, at);
+            if (got != length or !std.mem.eql(u8, disk, bytes[done..][0..length])) {
+                // From the first difference on, the earlier run's bytes are not trusted.
+                directory.kept = at;
+                break;
+            }
+            directory.skipped += length;
+            done += length;
+        }
+        assert(done <= bytes.len);
+        if (done < bytes.len) {
+            try file.writePositionalAll(directory.io, bytes[done..], offset + done);
+        }
     }
 
     fn close(context: *anyopaque) anyerror!void {
         const directory: *DirectoryOutput = @ptrCast(@alignCast(context));
         directory.file.?.close(directory.io);
         directory.file = null;
+        directory.kept = 0;
     }
 };
 
@@ -678,4 +723,55 @@ test "up snapshot: chunk ranges tile the archive" {
         }
         try testing.expectEqual(size, expected_start);
     }
+}
+
+test "up snapshot: a resumed extraction keeps the bytes it wrote, rewrites from a difference" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var content: [5000]u8 = undefined;
+    for (&content, 0..) |*byte, index| byte.* = @truncate(index *% 7 +% 3);
+    const member: up_tar.Member = .{
+        .path = "db/mdbx.dat",
+        .size = content.len,
+        .blake3 = @splat(0),
+    };
+    // An earlier run wrote 3000 bytes, one of them damaged at 1500.
+    var earlier = content[0..3000].*;
+    earlier[1500] ^= 0xff;
+    try tmp.dir.createDirPath(io, "db");
+    try tmp.dir.writeFile(io, .{ .sub_path = member.path, .data = &earlier });
+    const directory = try testing.allocator.create(DirectoryOutput);
+    defer testing.allocator.destroy(directory);
+    directory.* = .{ .io = io, .dir = tmp.dir };
+    const output = directory.output();
+    try output.open(output.context, 0, &member);
+    var offset: usize = 0;
+    while (offset < content.len) : (offset += 1000) {
+        try output.write(output.context, content[offset..][0..1000], offset);
+    }
+    try output.close(output.context);
+    var read_buffer: [6000]u8 = undefined;
+    try testing.expectEqualSlices(
+        u8,
+        &content,
+        try tmp.dir.readFile(io, member.path, &read_buffer),
+    );
+    // The first 1000 bytes matched and were not written again; the damaged range was.
+    try testing.expectEqual(@as(u64, 1000), directory.skipped);
+    // A file longer than the member (not this member's bytes) ends at the member's size.
+    var longer: [5500]u8 = undefined;
+    @memcpy(longer[0..5000], &content);
+    @memset(longer[5000..], 0xaa);
+    try tmp.dir.writeFile(io, .{ .sub_path = member.path, .data = &longer });
+    directory.skipped = 0;
+    try output.open(output.context, 0, &member);
+    try output.write(output.context, &content, 0);
+    try output.close(output.context);
+    try testing.expectEqualSlices(
+        u8,
+        &content,
+        try tmp.dir.readFile(io, member.path, &read_buffer),
+    );
+    try testing.expectEqual(@as(u64, content.len), directory.skipped);
 }
