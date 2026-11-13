@@ -964,7 +964,7 @@ pub fn Node(comptime IO: type) type {
                 .engine = &node.polling,
                 .l1_head = node.watcher.head(.latest),
                 .l1_finalized = node.watcher.head(.finalized),
-                .checkpoints = if (node.checkpoints) |store| store.loaded else null,
+                .checkpoints = if (node.checkpoints) |store| store.current() else null,
             };
         }
 

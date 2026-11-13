@@ -146,6 +146,7 @@ pub fn CheckpointStore(comptime IO: type) type {
         });
 
         file: File,
+        /// The newest heads recorded (the loaded ones until `update` moves them).
         checkpoints: Checkpoints = .{},
         /// The checkpoints read at start (null until the read finished).
         loaded: ?Checkpoints = null,
@@ -201,6 +202,14 @@ pub fn CheckpointStore(comptime IO: type) type {
             if (changed) store.file.save();
             assert(!changed or store.checkpoints.safe != null or
                 store.checkpoints.finalized != null);
+        }
+
+        /// The newest recorded heads, null until the stored image was read. A start
+        /// discovery after the engine restarted under a running node sees what this node
+        /// derived since its own start, not only what it read then.
+        pub fn current(store: *const Self) ?Checkpoints {
+            if (store.loaded == null) return null;
+            return store.checkpoints;
         }
 
         fn on_loaded(store: *Self, contents: []const u8) void {
@@ -343,6 +352,7 @@ test "checkpoint: store persists heads across restarts and survives a crash" {
     try testing.expect(store.checkpoints.finalized == null);
     while (store.file.phase != .idle) harness.world.run_for_ns(ns_per_ms);
     store.update(safe, finalized);
+    try testing.expect(std.meta.eql(finalized, store.current().?.finalized.?));
     harness.close(&store);
     try harness.open(&store);
     try testing.expect(std.meta.eql(safe, store.loaded.?.safe.?));

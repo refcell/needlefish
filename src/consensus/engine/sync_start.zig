@@ -126,7 +126,9 @@ pub const StartFinder = struct {
                             return error.BlockNotFound;
                         break :blk try checkpoint_for(client, .safe, header);
                     };
-                    finder.state.safe_head = block orelse finder.state.finalized_head;
+                    const ahead = try checkpoint_ahead(client, .safe, block);
+                    finder.state.safe_head = ahead orelse block orelse
+                        finder.state.finalized_head;
                     finder.phase = .unsafe_head;
                 },
                 .unsafe_head => {
@@ -153,8 +155,34 @@ pub const StartFinder = struct {
     fn finalized_step(finder: *StartFinder, client: anytype) Error!void {
         assert(finder.phase == .finalized);
         const block = try client.l2_block_info_by_label(.finalized);
-        finder.state.finalized_head = block orelse finder.genesis_head();
+        const ahead = try checkpoint_ahead(client, .finalized, block);
+        finder.state.finalized_head = ahead orelse block orelse finder.genesis_head();
         finder.phase = .safe;
+    }
+
+    /// The engine's canonical block at the checkpoint for `label` when the checkpoint is
+    /// ahead of the engine's `labeled` block. An engine restarted without its safe and
+    /// finalized labels (needlefish's keeps only its head, and only its newest blocks) then
+    /// resumes from the heads this node derived instead of walking back to blocks the engine
+    /// no longer holds; base/base gets the same from reth, which persists the labels.
+    fn checkpoint_ahead(
+        client: anytype,
+        label: CheckpointLabel,
+        labeled: ?L2BlockInfo,
+    ) Error!?L2BlockInfo {
+        const checkpoint = client.l2_checkpoint(label) orelse return null;
+        const number = checkpoint.block_info.number;
+        if (labeled) |block| {
+            if (block.block_info.number >= number) return null;
+        }
+        const canonical = client.l2_block_info_by_number(number) catch |err| switch (err) {
+            error.Pruned => return null,
+            else => return err,
+        };
+        const block = canonical orelse return null;
+        if (!block.block_info.hash.eql(checkpoint.block_info.hash)) return null;
+        assert(block.block_info.number == number);
+        return block;
     }
 
     /// The checkpoint for `label` when it matches the pruned block's header.
@@ -280,6 +308,8 @@ const TestClient = struct {
     pruned_below: u64 = 0,
     last_pruned: ?BlockInfo = null,
     checkpoints: [2]?L2BlockInfo = .{ null, null }, // safe, finalized
+    /// Blocks below this number are gone (an engine's retention after a restart).
+    retained_from: u64 = 0,
 
     fn l1_hash(number: u64, canonical: bool) Hash {
         var hash: Hash = .{ .bytes = @splat(if (canonical) 0xaa else 0xbb) };
@@ -329,7 +359,7 @@ const TestClient = struct {
 
     pub fn l2_block_info_by_number(client: *TestClient, number: u64) ProviderError!?L2BlockInfo {
         try client.maybe_unavailable();
-        if (number >= client.l2_count) return null;
+        if (number >= client.l2_count or number < client.retained_from) return null;
         return client.answer(client.l2[number]);
     }
 
@@ -343,7 +373,7 @@ const TestClient = struct {
 
     pub fn l2_block_info_by_hash(client: *TestClient, hash: Hash) ProviderError!?L2BlockInfo {
         try client.maybe_unavailable();
-        for (client.l2[0..client.l2_count]) |block| {
+        for (client.l2[client.retained_from..client.l2_count]) |block| {
             if (block.block_info.hash.eql(hash)) return block;
         }
         return null;
@@ -432,6 +462,41 @@ test "sync start: pruned heads recover from checkpoints or the earliest unpruned
     client.pruned_below = 30;
     finder = StartFinder.init(&rollup);
     try testing.expectError(error.LatestPruned, run(&finder, &client));
+}
+
+test "sync start: an engine that lost its labels resumes from the checkpoints" {
+    var rollup: RollupConfig = .{ .seq_window_size = 100 };
+    var client = TestClient.init(30, std.math.maxInt(u64));
+    rollup.genesis.l2.hash = client.l2[0].block_info.hash;
+    // Restarted: safe and finalized read as genesis, and blocks below 20 are gone, so the
+    // safe walk (the window reaches genesis) would hit a missing block.
+    client.labels = .{ 29, 0, 0 };
+    client.retained_from = 20;
+    var lost = StartFinder.init(&rollup);
+    try testing.expectError(error.BlockNotFound, run(&lost, &client));
+
+    client.checkpoints = .{ client.l2[25], client.l2[22] };
+    var finder = StartFinder.init(&rollup);
+    const state = try run(&finder, &client);
+    try testing.expectEqual(@as(u64, 29), state.unsafe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 25), state.safe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 22), state.finalized_head.block_info.number);
+
+    // A checkpoint the engine does not hold at its number (another branch) is not used.
+    var other = client.l2[25];
+    other.block_info.hash = .{ .bytes = @splat(0x77) };
+    client.checkpoints = .{ other, client.l2[22] };
+    client.retained_from = 0;
+    var mismatch = StartFinder.init(&rollup);
+    const walked = try run(&mismatch, &client);
+    try testing.expectEqual(@as(u64, 22), walked.safe_head.block_info.number);
+    // A checkpoint behind the engine's label is not used either.
+    client.labels = .{ 29, 27, 24 };
+    client.checkpoints = .{ client.l2[25], client.l2[22] };
+    var behind = StartFinder.init(&rollup);
+    const labeled = try run(&behind, &client);
+    try testing.expectEqual(@as(u64, 27), labeled.safe_head.block_info.number);
+    try testing.expectEqual(@as(u64, 24), labeled.finalized_head.block_info.number);
 }
 
 test "sync start: seeded fuzz, the binary search finds the earliest unpruned block" {
