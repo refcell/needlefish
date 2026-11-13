@@ -9,76 +9,14 @@ const testing = std.testing;
 
 const codec = @import("witness_codec.zig");
 const witness = @import("witness.zig");
-const state_module = @import("state.zig");
-const overlay_module = @import("overlay.zig");
-const changeset_module = @import("changeset.zig");
-const evm_backend = @import("evm_backend.zig");
+const witness_test = @import("witness_test.zig");
 const trie = @import("../trie/root.zig");
-const HeaderChain = @import("witness_header_chain.zig").HeaderChain;
 const Prng = @import("../../testing/prng.zig").Prng;
 
-const State = state_module.State;
-const Overlay = overlay_module.Overlay;
-const Changeset = changeset_module.Changeset;
-const Address = state_module.Address;
-const AccountInfo = state_module.AccountInfo;
-const Hash = state_module.Hash;
+const Hash = witness_test.Hash;
 const Witness = witness.Witness;
 const keccak256 = trie.node.keccak256;
-
-const addresses_total = 48;
-const genesis_accounts = 32;
-const slot_ids = 10;
-const headers_total = 4;
-
-const state_config: state_module.Config = .{
-    .accounts_max = 128,
-    .storage_slots_max = 1024,
-    .codes_max = 64,
-    .code_bytes_max = 64 * 32,
-    .account_nodes_max = 1024,
-    .storage_nodes_max = 8192,
-};
-
-const changeset_config: changeset_module.Config = .{
-    .accounts_max = 128,
-    .storage_max = 1024,
-    .codes_max = 64,
-    .code_bytes_max = 64 * 32,
-};
-
-const overlay_config: overlay_module.Config = .{
-    .accounts_max = 128,
-    .slots_max = 1024,
-    .codes_max = 64,
-};
-
-const keys_config: witness.KeySet.Config = .{
-    .accounts_max = 128,
-    .slots_max = 1024,
-    .codes_max = 64,
-    .block_numbers_max = 16,
-};
-
-const sparse_config: witness.SparseState.Config = .{
-    .nodes_max = 4096,
-    .node_bytes_max = 1 << 21,
-    .codes_max = 64,
-    .code_bytes_max = 64 * 32,
-    .headers_max = 16,
-    .trie_nodes_max = 16384,
-    .storage_tries_max = 128,
-};
-
-const witness_config: Witness.Config = .{
-    .state_nodes_max = 4096,
-    .state_bytes_max = 1 << 21,
-    .codes_max = 64,
-    .code_bytes_max = 64 * 32,
-    .keys_max = 128 + 1024,
-    .headers_max = 16,
-    .header_bytes_max = 1024,
-};
+const header_of = witness_test.header_of;
 
 /// Small witnesses for the decoder fuzz and the hand-built cases.
 const small_config: Witness.Config = .{
@@ -91,101 +29,19 @@ const small_config: Witness.Config = .{
     .header_bytes_max = 64,
 };
 
-fn address_of(index: u64) Address {
-    var address: Address = @splat(0);
-    address[0] = 0xa0;
-    address[19] = @intCast(index);
-    return address;
-}
-
-/// `rlp([1, 1, 1, 1, 1, 1, 1, 1, number])`, a minimal header-shaped list (number < 128).
-fn header_of(number: u8) [10]u8 {
-    std.debug.assert(number > 0 and number < 0x80);
-    return .{ 0xc9, 1, 1, 1, 1, 1, 1, 1, 1, number };
-}
-
-fn random_info(prng: *Prng, overlay: *Overlay) !AccountInfo {
-    var info: AccountInfo = .{ .nonce = prng.below(4), .balance = prng.below(1 << 40) };
-    if (prng.chance(1, 3)) {
-        var code: [24]u8 = undefined;
-        prng.fill(&code);
-        info.code_hash = try overlay.insert_code(code[0..prng.range(1, code.len)]);
-    }
-    return info;
-}
-
-fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
-    for (0..genesis_accounts) |index| {
-        const address = address_of(index);
-        try overlay.set_account(address, try random_info(prng, overlay));
-        for (0..prng.below(6)) |_| {
-            try overlay.set_storage(address, prng.below(slot_ids), prng.range(1, 1 << 20));
-        }
-    }
-    _ = try overlay.commit(changeset);
-}
-
-fn random_reads(prng: *Prng, state: *State, recorder: *witness.Recorder) !void {
-    const database = recorder.database();
-    for (0..16) |_| {
-        const address = address_of(prng.below(addresses_total));
-        switch (prng.below(4)) {
-            0 => _ = try database.basic(address),
-            1 => _ = try database.storage(address, prng.below(slot_ids)),
-            2 => if (state.basic(address)) |info| {
-                _ = try database.code_by_hash(info.code_hash);
-            },
-            else => _ = try database.block_hash(prng.range(1, headers_total)),
-        }
-    }
-}
-
-fn random_writes(prng: *Prng, overlay: *Overlay) !void {
-    for (0..16) |_| {
-        const address = address_of(prng.below(addresses_total));
-        const exists = overlay.basic(address) != null;
-        switch (prng.below(10)) {
-            0...2 => try overlay.set_account(address, try random_info(prng, overlay)),
-            3...6 => if (exists) {
-                const value = if (prng.chance(1, 2)) 0 else prng.range(1, 1 << 20);
-                try overlay.set_storage(address, prng.below(slot_ids), value);
-            },
-            7, 8 => if (exists) try overlay.set_account(address, null),
-            else => if (exists) try overlay.wipe_storage(address),
-        }
-    }
-}
-
+/// `witness_test`'s fixture plus a decoded copy and encode buffers.
 const Fixture = struct {
-    state: State,
-    overlay: Overlay,
-    changeset: Changeset,
-    recorder: witness.Recorder,
-    builder: witness.Builder,
-    built: Witness,
+    base: witness_test.Fixture,
     decoded: Witness,
-    sparse: witness.SparseState,
-    chain: HeaderChain,
     encoder: codec.Encoder,
     buffer: []u8,
     again: []u8,
 
     fn init(fixture: *Fixture) !void {
         const allocator = testing.allocator;
-        fixture.state = try State.init(allocator, state_config);
-        fixture.overlay = try Overlay.init(allocator, &fixture.state, overlay_config);
-        fixture.changeset = try Changeset.init(allocator, changeset_config);
-        const inner = evm_backend.database(&fixture.state);
-        fixture.recorder = try witness.Recorder.init(allocator, inner, keys_config);
-        fixture.builder = try witness.Builder.init(allocator, .{
-            .sparse = sparse_config,
-            .keys = keys_config,
-        });
-        fixture.built = try Witness.init(allocator, witness_config);
-        fixture.decoded = try Witness.init(allocator, witness_config);
-        fixture.sparse = try witness.SparseState.init(allocator, sparse_config);
-        fixture.chain = .{};
-        fixture.encoder = try codec.Encoder.init(allocator, witness_config);
+        try fixture.base.init();
+        fixture.decoded = try Witness.init(allocator, witness_test.witness_config);
+        fixture.encoder = try codec.Encoder.init(allocator, witness_test.witness_config);
         fixture.buffer = try allocator.alloc(u8, 1 << 22);
         fixture.again = try allocator.alloc(u8, 1 << 22);
     }
@@ -195,37 +51,10 @@ const Fixture = struct {
         allocator.free(fixture.again);
         allocator.free(fixture.buffer);
         fixture.encoder.deinit(allocator);
-        fixture.sparse.deinit(allocator);
         fixture.decoded.deinit(allocator);
-        fixture.built.deinit(allocator);
-        fixture.builder.deinit(allocator);
-        fixture.recorder.deinit(allocator);
-        fixture.changeset.deinit(allocator);
-        fixture.overlay.deinit(allocator);
-        fixture.state.deinit(allocator);
+        fixture.base.deinit();
     }
 };
-
-/// Builds one block's witness on headers ending at a parent holding `pre_root`; returns the
-/// witness-only post-state root.
-fn build_block(prng: *Prng, fixture: *Fixture, pre_root: Hash) !Hash {
-    const keys = &fixture.recorder.keys;
-    keys.clear();
-    fixture.chain.build(headers_total, pre_root);
-    for (1..headers_total + 1) |number| {
-        fixture.state.set_block_hash(number, fixture.chain.hash(number));
-    }
-    try random_reads(prng, &fixture.state, &fixture.recorder);
-    try random_writes(prng, &fixture.overlay);
-    try fixture.overlay.build_changeset(&fixture.changeset);
-    return fixture.builder.build(
-        &fixture.state,
-        keys,
-        &fixture.changeset,
-        fixture.chain.headers(),
-        &fixture.built,
-    );
-}
 
 /// Every built state node and code is found by digest in the decoded witness; keys too.
 fn check_lookup(prng: *Prng, built: *const Witness, decoded: *const Witness) !void {
@@ -256,9 +85,10 @@ fn check_lookup(prng: *Prng, built: *const Witness, decoded: *const Witness) !vo
 }
 
 fn round_trip_block(prng: *Prng, fixture: *Fixture) !void {
-    const pre_root = try fixture.state.state_root();
-    const sparse_root = try build_block(prng, fixture, pre_root);
-    const built = &fixture.built;
+    const base = &fixture.base;
+    const pre_root = try base.state.state_root();
+    const sparse_root = try witness_test.build_block(prng, base, pre_root);
+    const built = &base.built;
     const decoded = &fixture.decoded;
     const size = try fixture.encoder.encoded_size(built);
     const written = try fixture.encoder.encode(built, fixture.buffer);
@@ -273,12 +103,12 @@ fn round_trip_block(prng: *Prng, fixture: *Fixture) !void {
     const again = try fixture.encoder.encode(decoded, fixture.again);
     try testing.expectEqualSlices(u8, fixture.buffer[0..written], fixture.again[0..again]);
     try check_lookup(prng, built, decoded);
-    const sparse = &fixture.sparse;
-    sparse.reset(pre_root, fixture.chain.parent());
+    const sparse = &base.sparse;
+    sparse.reset(pre_root, base.chain.parent());
     try sparse.load(decoded);
-    try witness.replay(sparse, &fixture.recorder.keys, &fixture.changeset);
+    try witness.replay(sparse, &base.recorder.keys, &base.changeset);
     try testing.expectEqual(sparse_root, sparse.state_root());
-    const post_root = try fixture.overlay.commit(&fixture.changeset);
+    const post_root = try base.overlay.commit(&base.changeset);
     try testing.expectEqual(post_root, sparse.state_root());
 }
 
@@ -289,7 +119,7 @@ test "witness codec: builder witnesses round-trip and replay to the same root" {
         var fixture: Fixture = undefined;
         try fixture.init();
         defer fixture.deinit();
-        try genesis(&prng, &fixture.overlay, &fixture.changeset);
+        try witness_test.genesis(&prng, &fixture.base.overlay, &fixture.base.changeset);
         for (0..3) |_| try round_trip_block(&prng, &fixture);
     }
 }

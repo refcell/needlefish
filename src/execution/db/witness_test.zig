@@ -20,7 +20,7 @@ const Overlay = overlay_module.Overlay;
 const Changeset = changeset_module.Changeset;
 const Address = state_module.Address;
 const AccountInfo = state_module.AccountInfo;
-const Hash = state_module.Hash;
+pub const Hash = state_module.Hash;
 
 const addresses_total = 64;
 const genesis_accounts = 40;
@@ -66,7 +66,7 @@ const sparse_config: witness.SparseState.Config = .{
     .storage_tries_max = 128,
 };
 
-const witness_config: witness.Witness.Config = .{
+pub const witness_config: witness.Witness.Config = .{
     .state_nodes_max = 4096,
     .state_bytes_max = 1 << 21,
     .codes_max = 64,
@@ -84,7 +84,7 @@ fn address_of(index: u64) Address {
 }
 
 /// `rlp([1, 1, 1, 1, 1, 1, 1, 1, number])`, a minimal header-shaped list (number < 128).
-fn header_of(number: u8) [10]u8 {
+pub fn header_of(number: u8) [10]u8 {
     std.debug.assert(number > 0 and number < 0x80);
     return .{ 0xc9, 1, 1, 1, 1, 1, 1, 1, 1, number };
 }
@@ -99,7 +99,7 @@ fn random_info(prng: *Prng, overlay: *Overlay) !AccountInfo {
     return info;
 }
 
-fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
+pub fn genesis(prng: *Prng, overlay: *Overlay, changeset: *Changeset) !void {
     for (0..genesis_accounts) |index| {
         const address = address_of(index);
         try overlay.set_account(address, try random_info(prng, overlay));
@@ -192,7 +192,7 @@ fn check_minimal(
     }
 }
 
-const Fixture = struct {
+pub const Fixture = struct {
     state: State,
     overlay: Overlay,
     changeset: Changeset,
@@ -202,7 +202,7 @@ const Fixture = struct {
     sparse: witness.SparseState,
     chain: HeaderChain,
 
-    fn init(fixture: *Fixture) !void {
+    pub fn init(fixture: *Fixture) !void {
         const allocator = testing.allocator;
         fixture.state = try State.init(allocator, state_config);
         fixture.overlay = try Overlay.init(allocator, &fixture.state, overlay_config);
@@ -218,7 +218,7 @@ const Fixture = struct {
         fixture.chain = .{};
     }
 
-    fn deinit(fixture: *Fixture) void {
+    pub fn deinit(fixture: *Fixture) void {
         const allocator = testing.allocator;
         fixture.sparse.deinit(allocator);
         fixture.built.deinit(allocator);
@@ -230,23 +230,30 @@ const Fixture = struct {
     }
 };
 
-fn run_block(prng: *Prng, fixture: *Fixture) !void {
+/// Builds one random block's witness on headers ending at a parent holding `pre_root`;
+/// returns the witness-only post-state root.
+pub fn build_block(prng: *Prng, fixture: *Fixture, pre_root: Hash) !Hash {
     const state = &fixture.state;
-    const keys = &fixture.recorder.keys;
-    keys.clear();
-    const pre_root = try state.state_root();
+    fixture.recorder.keys.clear();
     set_headers(&fixture.chain, state, pre_root);
     try random_reads(prng, state, &fixture.recorder);
     try random_writes(prng, &fixture.overlay);
     try fixture.overlay.build_changeset(&fixture.changeset);
-    const built = &fixture.built;
-    const sparse_root = try fixture.builder.build(
+    return fixture.builder.build(
         state,
-        keys,
+        &fixture.recorder.keys,
         &fixture.changeset,
         fixture.chain.headers(),
-        built,
+        &fixture.built,
     );
+}
+
+fn run_block(prng: *Prng, fixture: *Fixture) !void {
+    const state = &fixture.state;
+    const keys = &fixture.recorder.keys;
+    const pre_root = try state.state_root();
+    const sparse_root = try build_block(prng, fixture, pre_root);
+    const built = &fixture.built;
     try testing.expectEqual(keys.codes.len, built.codes.count + empty_codes(keys));
     const sparse = &fixture.sparse;
     sparse.reset(pre_root, fixture.chain.parent());
