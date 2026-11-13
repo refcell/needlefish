@@ -8,6 +8,7 @@ const testing = std.testing;
 const io = @import("../../utilities/io/root.zig");
 const http = @import("../../utilities/http/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
+const consensus = @import("../../common/consensus/root.zig");
 const fixture = @import("../../execution/node/test_fixture.zig");
 const db_module = @import("../../execution/db/root.zig");
 const eth = @import("../../execution/rpc/eth.zig");
@@ -66,8 +67,10 @@ const Harness = struct {
     node: *fixture.Node,
     api: eth.Api,
     generator: db_module.witness_block.Generator,
-    /// Large enough for `eth_getProof`'s buffers.
-    scratch: [@max(1 << 16, @sizeOf(eth_proof.Scratch) + 64)]u8 = undefined,
+    /// Serves `eth_getProof` below the head, as a `--proofs-history` node does.
+    history: db_module.history.Store,
+    /// Large enough for `eth_getProof`'s buffers, historical ones included.
+    scratch: [@max(1 << 18, @sizeOf(eth_proof.Scratch) + 64)]u8 = undefined,
     world: io.SimWorld,
     server_io: io.SimIo,
     client_io: io.SimIo,
@@ -85,6 +88,20 @@ const Harness = struct {
         harness.generator =
             try db_module.witness_block.Generator.init(allocator, state, generator_config);
         errdefer harness.generator.deinit(allocator);
+        harness.history = try .init(allocator, .{
+            .window_blocks = 8,
+            .paths_max = 1 << 12,
+            .small_versions_max = 1 << 12,
+            .large_versions_max = 1 << 10,
+            .prune_per_commit = 256,
+        });
+        errdefer harness.history.deinit(allocator);
+        // A message passer no mined block touches, with storage (a withdrawal).
+        const passer = consensus.predeploys.l2_to_l1_message_passer.bytes;
+        try harness.node.db.put_account(passer, 0, 0, &.{0x00});
+        try harness.node.db.put_storage(passer, 1, 1);
+        try harness.node.db.trie().track_changes(allocator);
+        try harness.node.chain.attach_history(&harness.history);
         harness.api = .{
             .spec = fixture.spec,
             .chain = &harness.node.chain,
@@ -141,6 +158,7 @@ const Harness = struct {
         harness.world.deinit();
         harness.generator.deinit(allocator);
         harness.node.destroy();
+        harness.history.deinit(allocator);
         allocator.destroy(harness);
     }
 
@@ -149,15 +167,15 @@ const Harness = struct {
         harness.world.run_for_ns(std.time.ns_per_ms);
     }
 
-    /// Two transfers in one canonical block on the head; returns its hash.
-    fn mine(harness: *Harness) ![32]u8 {
+    /// Two transfers (senders' `nonce`) in one canonical block on the head; returns its hash.
+    fn mine(harness: *Harness, nonce: u64, timestamp: u64) ![32]u8 {
         const node = harness.node;
         var buffers: [2][256]u8 = undefined;
-        try fixture.submit(node, 1, 0, 1000, &buffers[0]);
-        try fixture.submit(node, 2, 0, 7, &buffers[1]);
+        try fixture.submit(node, 1, nonce, 1000, &buffers[0]);
+        try fixture.submit(node, 2, nonce, 7, &buffers[1]);
         const head: primitives.B256 = .{ .bytes = node.chain.head_hash() };
-        const hash = try fixture.build(node, head, 12, 0xfe);
-        const version = engine_types.forkchoice_version(fixture.spec, 12);
+        const hash = try fixture.build(node, head, timestamp, 0xfe);
+        const version = engine_types.forkchoice_version(fixture.spec, timestamp);
         _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(hash), null);
         return hash.bytes;
     }
@@ -167,7 +185,8 @@ test "rpc source: L1 provider reads a mined block through hints served over HTTP
     const harness = try Harness.create();
     defer harness.destroy();
     const genesis_hash = harness.node.chain.head_hash();
-    const block_hash = try harness.mine();
+    const block_hash = try harness.mine(0, 12);
+    _ = try harness.mine(1, 24);
     var source: Source = .init(testing.allocator, &harness.l1, &harness.l2, .{
         .context = harness,
         .step = Harness.step,
@@ -203,15 +222,25 @@ test "rpc source: L1 provider reads a mined block through hints served over HTTP
     try testing.expect(parent.hash.eql(.{ .bytes = genesis_hash }));
     try testing.expect(source.calls() >= 4);
 
-    // The payload witness of the canonical child of genesis.
+    // The payload witness of the canonical child of block 1 (below the head: history).
     const count = store.count();
     var data: [32 + 2]u8 = undefined;
-    data[0..32].* = genesis_hash;
+    data[0..32].* = block_hash;
     data[32..].* = "{}".*;
     try handler.handle(.l2_payload_witness, &data);
     try testing.expect(store.count() > count);
-    const root = harness.node.chain.record(genesis_hash).?.header.state_root.bytes;
-    try testing.expect(store.get(.keccak256(root)) != null);
+    const parent_root = harness.node.chain.record(block_hash).?.header.state_root.bytes;
+    try testing.expect(store.get(.keccak256(parent_root)) != null);
+    // It also holds the L2ToL1MessagePasser's account in the parent state, which the block
+    // never touches (the client reads the passer's storage root to seal the block).
+    const keccak = @import("../../common/crypto/keccak.zig");
+    const passer = consensus.predeploys.l2_to_l1_message_passer;
+    var scratch: @import("../../execution/trie/root.zig").RlpNode = .{};
+    resolver.reset();
+    const passer_key = keccak.keccak256(&passer.bytes);
+    const trie_reader = resolver.resolver();
+    const passer_leaf = try mpt.key_reader.get(trie_reader, parent_root, &passer_key, &scratch);
+    try testing.expect(passer_leaf != null);
 
     // A storage proof hint stores the account path in block 1's state (EIP-2935 leaps).
     var proof_data: [60]u8 = undefined;
@@ -222,8 +251,6 @@ test "rpc source: L1 provider reads a mined block through hints served over HTTP
     try handler.handle(.l2_account_storage_proof, &proof_data);
     const state_root = harness.node.chain.record(block_hash).?.header.state_root.bytes;
     resolver.reset();
-    var scratch: @import("../../execution/trie/root.zig").RlpNode = .{};
-    const keccak = @import("../../common/crypto/keccak.zig");
     const account_key = keccak.keccak256(&account);
     const leaf = try mpt.key_reader.get(resolver.resolver(), state_root, &account_key, &scratch);
     try testing.expect(leaf != null);

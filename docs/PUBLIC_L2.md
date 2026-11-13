@@ -85,7 +85,13 @@ local anvil with chain id 11155111 rehearses the whole flow without spending Sep
 - The prover could not prove a finalized game: a durable `base node` served execution
   witnesses only for its last 1024 retained blocks (3.4 min of 200 ms blocks) whatever
   `--proofs-history.window` said, and L1 finality alone takes about 13 min. The retention
-  now grows to the window; the verifier keeps `WITNESS_WINDOW` (8192 blocks, 27 min).
+  now grows to the window; the verifier keeps `WITNESS_WINDOW` (16384 blocks, 55 min; a
+  game whose blocks leave it can never be proven, and every later game waits on it).
+- No proof held: the proof host fed the client the execution witness of each block, which
+  lacks the L2ToL1MessagePasser account when the block does not touch it, but the client
+  reads that account's storage root to seal every Isthmus block (base/base's
+  `debug_executePayload` witness force-loads it). The host now adds the passer's account
+  proof at the parent (`eth_getProof`) to the payload witness.
 - Open: unsafe gossip reaches the verifier in bursts, so its unsafe head trails the
   sequencer by about 10 to 30 s and catches up when derivation fills the gap. The safe
   chain is unaffected.

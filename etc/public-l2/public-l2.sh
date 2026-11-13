@@ -35,8 +35,9 @@ GAME_TYPE=621
 GAME_INTERVAL=${GAME_INTERVAL:-1800}
 # Blocks the verifier EL keeps witnesses for. The prover proves a game once L1 finalized it,
 # about 13 min (3900 blocks) after its last block, so the window covers finality, a game,
-# and the proving time: 8192 blocks is 27 min.
-WITNESS_WINDOW=${WITNESS_WINDOW:-8192}
+# and the proving time with room for a stalled prover to catch up: 16384 blocks is 55 min.
+# A game whose blocks leave the window can never be proven, and every later game waits on it.
+WITNESS_WINDOW=${WITNESS_WINDOW:-16384}
 # The deploy lands well before the L2 starts, so its fork activations are history by then.
 GENESIS_LEAD_S=${GENESIS_LEAD_S:-1200}
 

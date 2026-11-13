@@ -10,7 +10,9 @@
 //! The payload witness is the execution witness of the endpoint's canonical child of the
 //! parent (`debug_executionWitness(parent + 1)`): when the derived block equals the
 //! canonical one (an honest chain), it is exactly the witness of building it; otherwise
-//! the client fails with a missing preimage instead of proving a wrong state. Blobs (beacon
+//! the client fails with a missing preimage instead of proving a wrong state. It also carries
+//! the L2ToL1MessagePasser's account proof at the parent (`eth_getProof`), which base/base's
+//! `debug_executePayload` witness force-loads for the withdrawals root. Blobs (beacon
 //! API) and single preimages are not served yet: `NotFound`.
 
 const std = @import("std");
@@ -184,7 +186,17 @@ pub fn RpcSource(comptime IO: type) type {
                 return error.SourceFailed;
             const number = std.math.add(u64, parent.number, 1) catch return error.SourceFailed;
             const witness = try call(l2, "debug_executionWitness", .{ .number = number });
-            return source.witness_items(witness);
+            // base/base's payload witness (`debug_executePayload`) force-loads the
+            // L2ToL1MessagePasser so the client can seal the Isthmus withdrawals root; a
+            // block's execution witness lacks it when the block does not touch the passer.
+            const passer = l2.call("eth_getProof", &.{
+                .{ .address = consensus.predeploys.l2_to_l1_message_passer.bytes },
+                .{ .raw_json = "[]" },
+                .{ .number = parent.number },
+            }) catch |err| return source_error(err);
+            const passer_nodes = (json.find_path(passer, &.{"accountProof"}) catch null) orelse
+                return error.SourceFailed;
+            return source.witness_items(witness, passer_nodes);
         }
 
         fn storage_proof(
@@ -246,13 +258,22 @@ pub fn RpcSource(comptime IO: type) type {
             return raw_json.header(endpoint, block.param()) catch |err| source_error(err);
         }
 
-        /// The `state`, `codes` and `keys` entries of an execution witness object.
-        fn witness_items(source: *Self, raw: []const u8) SourceError![]const []const u8 {
+        /// The `state`, `codes` and `keys` entries of an execution witness object, then the
+        /// nodes of the JSON array `extra_nodes`.
+        fn witness_items(
+            source: *Self,
+            raw: []const u8,
+            extra_nodes: []const u8,
+        ) SourceError![]const []const u8 {
+            var lists: [4][]const u8 = undefined;
+            for ([_][]const u8{ "state", "codes", "keys" }, lists[0..3]) |name, *list| {
+                list.* = (json.find_path(raw, &.{name}) catch return error.SourceFailed) orelse
+                    return error.SourceFailed;
+            }
+            lists[3] = extra_nodes;
             var all: std.ArrayList([]const u8) = .empty;
             const allocator = source.l2.arena.allocator();
-            for ([_][]const u8{ "state", "codes", "keys" }) |name| {
-                const list = (json.find_path(raw, &.{name}) catch return error.SourceFailed) orelse
-                    return error.SourceFailed;
+            for (lists) |list| {
                 const items = try source.hex_list(&source.l2, list);
                 if (all.items.len + items.len > source.options.items_max) {
                     return error.SourceFailed;
