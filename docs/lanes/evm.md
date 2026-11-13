@@ -452,6 +452,23 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-13: instruction fusion. Instruction pair and triple counts over the 100-block
+  mainnet window (30.6M instructions) showed PUSH2 JUMPI 4.7%, JUMP JUMPDEST 4.1%, PUSH1
+  PUSH1 2.7%; hardware counters (Zen 5) put 35% of the interpreter's slots in frontend
+  stalls, with the instruction-cache misses and branch redirects on handler entries. Two
+  changes: a taken JUMP/JUMPI also charges the JUMPDEST it lands on and continues after it
+  (1.01x alone), and `bytecode.fusions` lists 59 sequences (2 to 5 instructions, only the
+  last may jump) that `analyze` marks in a dispatch copy of the code (`Analyzed.ops`, fused
+  bytes 0xb0+, all undefined opcodes) so one handler runs them in order, each with its own
+  stack check and gas. A jump into the middle dispatches the original byte; an original
+  0xb0+ byte dispatches INVALID. Mainnet window EVM time 1.05-1.06x, B1 geomean 1.01x
+  (contract-heavy 1.10-1.24x, 21k-gas cases 0.92-0.96x). EEST stable 44039/44039, develop
+  63556/63556, every replay header matches.
+- 2026-11-13: benchmarked against base/base's node path (`nf-replay-bench --node`:
+  `BaseEvmConfig` + reth `executor_for_block` + `merge_transitions`, node keccak features)
+  instead of only the proof executor; `replay bench --evm-only` warms the analysis cache
+  before timing, as revm's harness and a running node do. needlefish 1.34x on mainnet
+  blocks, 1.94x revm on B1 (docs/BENCHMARKS.md).
 - 2026-11-11: deposits whose value exceeds the sender's balance after the mint now fail with
   their whole gas limit (revm maps a top-level OutOfFunds to a halt; base/base `catch_error`).
   We reverted the call at intrinsic gas instead, so state matched but gas used did not: the

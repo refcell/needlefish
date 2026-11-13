@@ -30,8 +30,8 @@ native 200 ms cadence.
 - **Tested like a database.** Deterministic simulation of the whole cluster with fault
   injection, coverage-guided fuzzing of every decoder, and differential tests against public
   Ethereum vectors.
-- **Fast.** Up to 24x faster than base/base's executor on mainnet blocks once state roots
-  are included. See the [benchmarks](#benchmarks).
+- **Fast.** Executes Base mainnet blocks 1.34x faster than base/base's node (revm), and
+  standard EVM benchmarks 1.9x faster than revm. See the [benchmarks](#benchmarks).
 
 ## Status
 
@@ -170,34 +170,39 @@ The [architecture overview](docs/ARCHITECTURE.md) shows how the pieces fit toget
 
 ## Benchmarks
 
-needlefish's block executor against base/base's stateless executor (`base-proof-executor`),
-replaying the same Base mainnet blocks from the same witness. Both run single-threaded, built
-for the native CPU (needlefish `ReleaseSafe`, base/base `maxperf`), and both reproduce every
-canonical header. Times are medians per block over 30 warm runs (5 for 1,000 blocks) on a
-4-vCPU cloud VM:
+Measured November 13, 2026 on one core of an AMD Ryzen AI MAX+ 395 (Zen 5), with needlefish
+built `ReleaseSafe` (the shipped build) and `ReleaseFast`, and the Rust side built for the same
+CPU. Each comparison names what it runs on the other side:
 
-| Blocks | Work | needlefish | base/base | Speedup (95% CI) |
-| ---: | --- | ---: | ---: | ---: |
-| 100 | Execution | 5.17 ms | 8.86 ms | **1.72x** (1.64–1.75) |
-| 100 | Execution + state and receipts roots | 8.06 ms | 61.26 ms | **7.60x** (7.33–7.73) |
-| 1,000 | Execution + state and receipts roots | 6.88 ms | 169.34 ms | **24.62x** (24.19–24.79) |
-| 100 | EVM only, over a flat in-memory state | 3.92 ms | 3.33 ms | **0.85x** (0.78–0.98) |
+| Workload | Compared with | needlefish | Other side | needlefish speedup (95% CI) |
+| --- | --- | ---: | ---: | ---: |
+| 100 Base mainnet blocks (53775088+), EVM execution per window | base/base node (`base-reth-node`'s block execution path, revm) | 108.1 ms | 144.5 ms | **1.34x** (1.29–1.43) |
+| 31 standard EVM fixtures (evm2's suite), geometric mean | revm 43 | | | **1.94x** (`ReleaseFast` 2.11x) |
+| 31 standard EVM fixtures (evm2's suite), geometric mean | evm2 (reth's new EVM, stable build) | | | **1.76x** |
+| Synthetic devnet chain, `engine_newPayload` median (earlier run, 4-vCPU VM) | `base-reth-node` | 4.00 ms | 8.03 ms | **2.0x** |
 
-- **Roots.** base/base's proof executor re-hashes every trie node it holds on every block,
-  so its root time grows with the window. needlefish caches node hashes and re-hashes only
-  dirty nodes.
-- **Where base/base wins.**
-  - The interpreter: revm is about 15% faster with state reads taken out.
-  - Sender recovery, which uses the C libsecp256k1.
-  - Memory: 181 MiB peak against needlefish's 780 MiB in `ReleaseSafe` (224 MiB in
-    `ReleaseFast`) on 100 blocks.
-- **Node to node.** On a synthetic devnet chain of 332 blocks and 12,778 transactions,
-  needlefish answers `engine_newPayload` in 4.00 ms median, against `base-reth-node`'s
-  8.03 ms. A node-to-node comparison on mainnet state has not been measured yet.
+- **Mainnet blocks.** Both sides execute the same blocks from the same pre-state, held in
+  memory, single-threaded, with senders recovered beforehand. Every block must reproduce its
+  canonical gas used and receipts root, or the run fails. The base/base side is the code
+  `base-reth-node` runs on a new payload: its `BaseEvmConfig`, reth's `executor_for_block`,
+  every transaction, the post-block changes and `merge_transitions`, built with the node's
+  `asm-keccak` and `keccak-cache-global` features. Its database is replaced by an in-memory
+  `CacheDB`, which favours it (a node reads accounts and slots from MDBX), and its precompile
+  result cache is not installed. Times are medians of one pass over the window, over 10 fresh
+  processes per side. State roots are not in this comparison: reth computes them against its
+  database, and an offline harness for that does not exist yet.
+- **EVM fixtures.** One transaction per case, repeated on a reused EVM after an untimed state
+  reset, every engine reporting the same gas used. revm and evm2 run through evm2's own CLI at
+  the pinned commit. The cases range from 21k-gas transfers (needlefish about 2x revm) to
+  contract-heavy ones such as Uniswap, Curve, and Seaport (1.7–2.3x).
+- **Not compared here.** Earlier versions of this table compared against base/base's fault
+  proof executor (`base-proof-executor`), which re-hashes its whole trie on every block; that
+  is not how a Base node runs. Those numbers stay in the
+  [full report](docs/BENCHMARKS.md#proof-executor-comparison), labelled as such.
 
-The [full benchmark report](docs/BENCHMARKS.md) has the build matrix, phase breakdown,
-profiles, environment, and a script to reproduce every number. Micro benchmarks run with
-`just bench` and are tracked in the [performance notes](docs/PERF.md).
+The [full benchmark report](docs/BENCHMARKS.md) has every case, the method, and scripts to
+reproduce each number. Micro benchmarks run with `just bench` and are tracked in the
+[performance notes](docs/PERF.md).
 
 ## Documentation
 

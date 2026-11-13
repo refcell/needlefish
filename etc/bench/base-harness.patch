@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index e442af545..9c5a8fc4e 100644
+index e442af5..39cc2d1 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -13250,6 +13250,26 @@ dependencies = [
+@@ -13250,6 +13250,34 @@ dependencies = [
   "tokio",
  ]
  
@@ -11,17 +11,25 @@ index e442af545..9c5a8fc4e 100644
 +version = "0.0.0"
 +dependencies = [
 + "alloy-consensus 2.5.0",
++ "alloy-eips 2.5.0",
++ "alloy-evm",
 + "alloy-primitives",
 + "alloy-rlp",
 + "alloy-rpc-types-engine",
 + "alloy-rpc-types-eth 2.5.0",
 + "base-common-chains",
++ "base-common-consensus",
 + "base-common-evm",
 + "base-common-genesis",
 + "base-common-rpc-types-engine",
++ "base-execution-chainspec",
++ "base-execution-consensus",
++ "base-execution-evm",
 + "base-proof-executor",
 + "base-proof-mpt",
 + "miniz_oxide 0.9.1",
++ "reth-evm",
++ "reth-primitives-traits",
 + "revm",
 + "serde_json",
 +]
@@ -30,7 +38,7 @@ index e442af545..9c5a8fc4e 100644
  name = "nix"
  version = "0.26.4"
 diff --git a/Cargo.toml b/Cargo.toml
-index 91c615656..96f570c67 100644
+index 91c6156..96f570c 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -11,6 +11,7 @@ exclude = [".github/"]
@@ -43,10 +51,10 @@ index 91c615656..96f570c67 100644
    "bin/[a-o]*",
 diff --git a/bench/nf-replay/Cargo.toml b/bench/nf-replay/Cargo.toml
 new file mode 100644
-index 000000000..209af098b
+index 0000000..62ed3e5
 --- /dev/null
 +++ b/bench/nf-replay/Cargo.toml
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,43 @@
 +[package]
 +name = "nf-replay-bench"
 +description = "Replays a needlefish .nfrp archive through base/base's stateless block executor"
@@ -61,24 +69,41 @@ index 000000000..209af098b
 +base-common-evm = { workspace = true, features = ["std"] }
 +base-common-chains = { workspace = true, features = ["std"] }
 +base-common-genesis = { workspace = true, features = ["std"] }
++# The node's block execution path (`--node`): base/base's node EVM config and reth's executor.
++base-execution-evm = { workspace = true, features = ["std"] }
++base-execution-chainspec = { workspace = true }
++base-execution-consensus = { workspace = true, features = ["std"] }
++base-common-consensus = { workspace = true, features = ["reth"] }
++reth-evm = { workspace = true }
++reth-primitives-traits = { workspace = true, features = ["std"] }
++alloy-evm = { workspace = true, features = ["std"] }
++alloy-eips = { workspace = true, features = ["std"] }
 +base-common-rpc-types-engine = { workspace = true, features = ["std"] }
 +alloy-rpc-types-engine = { workspace = true, features = ["std"] }
 +# The crypto backends base/base's node (`base-reth-node`) builds with: C libsecp256k1 for
 +# sender recovery and ECRECOVER, blst, c-kzg and aws-lc P256. The proof executor alone
-+# would build pure-Rust k256 and arkworks instead.
++# would build pure-Rust k256 and arkworks instead. Keccak as the node binaries build it by
++# default (`bin/node` features `asm-keccak` and `keccak-cache-global`).
 +alloy-consensus = { workspace = true, features = ["std", "secp256k1"] }
-+alloy-primitives = { workspace = true, features = ["std"] }
++alloy-primitives = { workspace = true, features = ["std", "asm-keccak", "keccak-cache-global"] }
 +alloy-rlp = { workspace = true, features = ["std"] }
 +alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
 +serde_json = { workspace = true, features = ["std"] }
 +miniz_oxide = { workspace = true, features = ["std"] }
-+revm = { workspace = true, features = ["std", "secp256k1", "blst", "c-kzg", "p256-aws-lc-rs"] }
++revm = { workspace = true, features = [
++    "std",
++    "secp256k1",
++    "blst",
++    "c-kzg",
++    "p256-aws-lc-rs",
++    "asm-keccak",
++] }
 diff --git a/bench/nf-replay/src/main.rs b/bench/nf-replay/src/main.rs
 new file mode 100644
-index 000000000..2ce26ce89
+index 0000000..9e1ae67
 --- /dev/null
 +++ b/bench/nf-replay/src/main.rs
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,575 @@
 +//! Replays a needlefish `.nfrp` replay archive through base/base's stateless block executor
 +//! (`base-proof-executor::StatelessL2Builder`) and prints one `BENCH` line per block.
 +//!
@@ -96,6 +121,13 @@ index 000000000..2ce26ce89
 +//! filled from the `NFPS` file `base replay bench --evm-only --prestate-out` writes): senders
 +//! recovered before the timed region, no `TrieDB`, no state root. A block counts when its gas
 +//! used and receipts root match the canonical header.
++//!
++//! `--node` (with `--evm-only`) runs the blocks the way base/base's node (`base-reth-node`)
++//! executes a new payload instead of through the proof executor: the node's `BaseEvmConfig`
++//! for Base mainnet, reth's `ConfigureEvm::executor_for_block` over a `State` with bundle
++//! updates, every transaction, `apply_post_execution_changes`, and `merge_transitions`
++//! (reth's engine tree, `payload_validator.rs`). The node's database is replaced by the same
++//! flat in-memory pre-state, and its precompile result cache is not installed.
 +
 +use std::{
 +    collections::{HashMap, HashSet},
@@ -474,8 +506,88 @@ index 000000000..2ce26ce89
 +    }
 +}
 +
++/// `--evm-only --node`: base/base's node execution path over the flat pre-state.
++fn node_only(blocks: &[Block], attrs: &[BasePayloadAttributes], prestate: &str, warm: u32) {
++    use alloy_consensus::{BlockBody, TxReceipt};
++    use alloy_eips::eip2718::Decodable2718;
++    use alloy_evm::block::BlockExecutor;
++    use base_common_consensus::{BaseBlock, BaseTxEnvelope};
++    use base_execution_chainspec::BaseChainSpec;
++    use base_execution_evm::BaseEvmConfig;
++    use reth_evm::ConfigureEvm;
++    use reth_primitives_traits::SealedBlock;
++    use revm::database::states::bundle_state::BundleRetention;
++
++    let pre = load_prestate(prestate);
++    let spec = Arc::new(BaseChainSpec::mainnet());
++    let evm_config = BaseEvmConfig::base(Arc::clone(&spec));
++    let sealed: Vec<SealedBlock<BaseBlock>> = blocks
++        .iter()
++        .map(|block| {
++            let transactions = block
++                .transactions
++                .iter()
++                .map(|raw| BaseTxEnvelope::decode_2718_exact(raw).expect("transaction"))
++                .collect();
++            let withdrawals =
++                block.header.withdrawals_root.map(|_| alloy_eips::eip4895::Withdrawals::default());
++            let body = BlockBody { transactions, ommers: Vec::new(), withdrawals };
++            SealedBlock::new_unchecked(BaseBlock::new(block.header.clone(), body), block.hash)
++        })
++        .collect();
++    let recovered: Vec<Vec<_>> = attrs
++        .iter()
++        .map(|attrs| {
++            attrs.recovered_transactions_with_encoded().collect::<Result<Vec<_>, _>>().unwrap()
++        })
++        .collect();
++    for run in 0..=warm {
++        let mut db = State::builder().with_database(pre.clone()).with_bundle_update().build();
++        for ((block, sealed), transactions) in blocks.iter().zip(&sealed).zip(&recovered) {
++            let start = now_ns();
++            let mut executor = evm_config.executor_for_block(&mut db, sealed).expect("executor");
++            executor.apply_pre_execution_changes().expect("pre-execution");
++            let pre_ns = now_ns() - start;
++            for transaction in transactions {
++                executor.execute_transaction(transaction).expect("transaction");
++            }
++            let exec_ns = now_ns() - start;
++            let result = executor.apply_post_execution_changes().expect("post-execution");
++            let post_ns = now_ns() - start - exec_ns;
++            let commit_start = now_ns();
++            db.merge_transitions(BundleRetention::Reverts);
++            let commit_ns = now_ns() - commit_start;
++            let receipts_start = now_ns();
++            let with_bloom = result.receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
++            let receipts_root = base_execution_consensus::calculate_receipt_root(
++                &with_bloom,
++                spec.as_ref(),
++                block.header.timestamp,
++            );
++            let receipts_ns = now_ns() - receipts_start;
++            let total_ns = now_ns() - start;
++            let ok = receipts_root == block.header.receipts_root
++                && result.gas_used == block.header.gas_used;
++            println!(
++                "BENCH run={run} block={} txs={} gas={} exec_ns={exec_ns} total_ns={total_ns} \
++                 pre_ns={pre_ns} recover_ns=0 post_ns={post_ns} receipts_ns={receipts_ns} \
++                 commit_ns={commit_ns} root_ns=0 ok={}",
++                block.header.number,
++                block.transactions.len(),
++                result.gas_used,
++                u8::from(ok),
++            );
++            if !ok {
++                eprintln!("mismatch at {}", block.header.number);
++                std::process::exit(1);
++            }
++        }
++    }
++}
++
 +fn main() {
 +    let mut args: Vec<String> = std::env::args().collect();
++    let node = args.iter().position(|arg| arg == "--node").map(|at| args.remove(at)).is_some();
 +    let prestate = args.iter().position(|arg| arg == "--evm-only").map(|at| {
 +        let path = args.remove(at + 1);
 +        args.remove(at);
@@ -494,6 +606,10 @@ index 000000000..2ce26ce89
 +    let config = ChainConfig::rollup_config_by_chain_id(8453).expect("Base mainnet config");
 +    let store = Arc::new(store);
 +    let attrs: Vec<BasePayloadAttributes> = blocks.iter().map(attributes).collect();
++    if let Some(prestate) = prestate.as_deref().filter(|_| node) {
++        node_only(&blocks, &attrs, prestate, warm);
++        return;
++    }
 +    if let Some(prestate) = prestate {
 +        evm_only(&config, &blocks, &attrs, &parent, &prestate, warm);
 +        return;
@@ -564,7 +680,7 @@ index 000000000..2ce26ce89
 +    }
 +}
 diff --git a/crates/proof/executor/src/builder/assemble.rs b/crates/proof/executor/src/builder/assemble.rs
-index 8fddad48f..4fe0485b9 100644
+index 8fddad4..4fe0485 100644
 --- a/crates/proof/executor/src/builder/assemble.rs
 +++ b/crates/proof/executor/src/builder/assemble.rs
 @@ -39,7 +39,10 @@ where
@@ -589,7 +705,7 @@ index 8fddad48f..4fe0485b9 100644
              if self.config.is_feature_active_cascading(BaseFeature::L2ToL1MessageRoot, timestamp) {
                  Some(self.message_passer_account(block_env.number.saturating_to::<u64>())?)
 diff --git a/crates/proof/executor/src/builder/core.rs b/crates/proof/executor/src/builder/core.rs
-index cf4631222..d258fb716 100644
+index cf46312..d258fb7 100644
 --- a/crates/proof/executor/src/builder/core.rs
 +++ b/crates/proof/executor/src/builder/core.rs
 @@ -7,7 +7,8 @@
@@ -767,7 +883,7 @@ index cf4631222..d258fb716 100644
  
  /// The outcome of a block building operation, returning the sealed block [`Header`] and the
 diff --git a/crates/proof/executor/src/builder/mod.rs b/crates/proof/executor/src/builder/mod.rs
-index 111df55bb..dd61953c9 100644
+index 111df55..dd61953 100644
 --- a/crates/proof/executor/src/builder/mod.rs
 +++ b/crates/proof/executor/src/builder/mod.rs
 @@ -1,7 +1,7 @@
@@ -780,7 +896,7 @@ index 111df55bb..dd61953c9 100644
  mod assemble;
  pub use assemble::compute_receipts_root;
 diff --git a/crates/proof/executor/src/db/mod.rs b/crates/proof/executor/src/db/mod.rs
-index ab05efed0..914d7f723 100644
+index ab05efe..914d7f7 100644
 --- a/crates/proof/executor/src/db/mod.rs
 +++ b/crates/proof/executor/src/db/mod.rs
 @@ -335,6 +335,11 @@ where
@@ -796,7 +912,7 @@ index ab05efed0..914d7f723 100644
          while header.number > block_number {
              header = self
 diff --git a/crates/proof/executor/src/db/traits.rs b/crates/proof/executor/src/db/traits.rs
-index 199c817cd..bacb9b7fe 100644
+index 199c817..bacb9b7 100644
 --- a/crates/proof/executor/src/db/traits.rs
 +++ b/crates/proof/executor/src/db/traits.rs
 @@ -33,6 +33,11 @@ pub trait TrieDBProvider: TrieProvider {
@@ -812,7 +928,7 @@ index 199c817cd..bacb9b7fe 100644
  
  /// The default, no-op implementation of the [`TrieDBProvider`] trait, used for testing.
 diff --git a/crates/proof/executor/src/lib.rs b/crates/proof/executor/src/lib.rs
-index f1bec8240..b867d5e47 100644
+index f1bec82..b867d5e 100644
 --- a/crates/proof/executor/src/lib.rs
 +++ b/crates/proof/executor/src/lib.rs
 @@ -11,7 +11,7 @@ mod db;
@@ -825,7 +941,7 @@ index f1bec8240..b867d5e47 100644
  mod errors;
  pub use errors::{
 diff --git a/crates/proof/mpt/src/node.rs b/crates/proof/mpt/src/node.rs
-index 8254d7bc6..6134579b8 100644
+index 8254d7b..6134579 100644
 --- a/crates/proof/mpt/src/node.rs
 +++ b/crates/proof/mpt/src/node.rs
 @@ -418,6 +418,17 @@ impl TrieNode {
@@ -847,7 +963,7 @@ index 8254d7bc6..6134579b8 100644
                              non_empty_node.unblind(fetcher)?;
                              self.collapse_if_possible(fetcher)?;
 diff --git a/crates/proof/mpt/src/traits.rs b/crates/proof/mpt/src/traits.rs
-index be103a8bd..453711aab 100644
+index be103a8..453711a 100644
 --- a/crates/proof/mpt/src/traits.rs
 +++ b/crates/proof/mpt/src/traits.rs
 @@ -22,6 +22,12 @@ pub trait TrieProvider {

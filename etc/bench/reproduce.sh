@@ -117,6 +117,7 @@ configs() { # configs <full|headline|evm>
     if [ "$1" = evm ]; then
         echo "nf-safe-native-evm $cpu_single nf-evm $(nf_bin ReleaseSafe native)"
         echo "nf-fast-native-evm $cpu_single nf-evm $(nf_bin ReleaseFast native)"
+        echo "base-node-native-evm $cpu_single base-node-evm $(base_bin maxperf native)"
         echo "base-maxperf-native-evm $cpu_single base-evm $(base_bin maxperf native)"
         echo "base-release-native-evm $cpu_single base-evm $(base_bin release native)"
         return
@@ -166,6 +167,8 @@ run_one() { # run_one <dir> <iteration> <mode> <label> <cpus> <kind> <binary> [<
     nf-evm) set -- "$binary" replay bench "$archive" "$passes" --evm-only ;;
     base) set -- "$binary" "$archive" "$parent" "$passes" ;;
     base-evm) set -- "$binary" "$archive" "$parent" "$passes" --evm-only "$prestate" ;;
+    base-node-evm)
+        set -- "$binary" "$archive" "$parent" "$passes" --evm-only "$prestate" --node ;;
     esac
     [ "$mode" = cold ] && drop_caches
     launch "$pin" /usr/bin/time -v -o "$dir/time.tmp" "$@" >"$dir/bench.tmp" ||
@@ -220,6 +223,8 @@ summarize() { # summarize <name>
     echo "== results: $1"
     if [ "$1" = evm100 ]; then
         zig run -OReleaseSafe etc/bench/stats.zig -- \
+            --pair nf-safe-native-evm/base-node-native-evm \
+            --pair nf-fast-native-evm/base-node-native-evm \
             --pair nf-safe-native-evm/base-maxperf-native-evm \
             --pair nf-fast-native-evm/base-maxperf-native-evm \
             --pair nf-safe-native-evm/base-release-native-evm <"$dir/results.txt"

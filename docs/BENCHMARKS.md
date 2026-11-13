@@ -1,17 +1,133 @@
-# Benchmarks: needlefish vs base/base
+# Benchmarks: needlefish vs base/base and revm
 
 needlefish and the Rust [base/base](https://github.com/base/base) implementation execute the
 same real Base mainnet blocks from the same pre-state, on the same machine, and both must
-reproduce every block's canonical header (state root, receipts root, gas used, block hash).
-A block that does not reproduce fails the run, and the numbers do not count.
+reproduce every block's canonical header (EVM only: gas used and receipts root). A block
+that does not reproduce fails the run, and the numbers do not count.
 
-This is the second version of this document. The first version (one laptop run) had the
+Each comparison names what runs on the other side, because base/base has two block
+executors: the node (`base-reth-node`, reth's engine over revm) and the fault proof executor
+(`base-proof-executor`, which re-hashes its whole trie on every block). The
+[first section](#against-the-base-node-and-revm) compares against the node and against revm
+on standard EVM fixtures. The [proof executor comparison](#proof-executor-comparison) below it
+is older and compares against the proof executor only.
+
+## Against the Base node and revm
+
+Measured November 13, 2026 on one core (pinned, SMT sibling not reserved) of an AMD Ryzen AI
+MAX+ 395 (Zen 5, 32 threads), at nice 19 while a live mainnet node ran on other cores.
+needlefish at `main` after the instruction fusion change, `-Dcpu=native`; base/base at
+`a8b34b69` with `maxperf` and `-C target-cpu=native`.
+
+### Mainnet blocks against the node's execution path
+
+The 100-block window (Base mainnet 53775088 to 53775187) over a flat in-memory pre-state,
+senders recovered before the timed region, single-threaded
+([EVM only](#evm-only) in the method). 10 rounds; each round runs every configuration once
+as a fresh process, in a rotated order, with 3 more passes in the same process (*repeat*).
+Every block of every pass reproduced its gas used and receipts root.
+
+| configuration | ms per 100 blocks, first pass (95% CI) | repeat passes (95% CI) | Mgas/s |
+| --- | ---: | ---: | ---: |
+| needlefish `ReleaseSafe` | 108.1 (105.7-110.0) | 107.6 (106.6-108.1) | 2514 |
+| needlefish `ReleaseFast` | 109.8 (107.5-116.1) | 108.8 (107.6-110.5) | 2499 |
+| needlefish `ReleaseSafe` before instruction fusion | 114.5 (112.0-116.7) | 113.5 (111.8-114.7) | 2375 |
+| base/base node path (revm) | 144.5 (139.8-153.6) | 138.0 (135.8-138.8) | 1881 |
+| base/base proof executor, EVM only (revm) | 138.8 (133.6-139.4) | 132.5 (131.4-134.9) | 1959 |
+
+| faster | slower | first pass (95% CI) | repeat (95% CI) |
+| --- | --- | ---: | ---: |
+| needlefish `ReleaseSafe` | base/base node path | 1.34x (1.29-1.43) | 1.28x (1.26-1.30) |
+| needlefish `ReleaseFast` | base/base node path | 1.32x (1.26-1.41) | 1.27x (1.24-1.29) |
+| needlefish `ReleaseSafe` before fusion | base/base node path | 1.26x (1.21-1.35) | 1.22x (1.19-1.24) |
+| needlefish `ReleaseSafe` | needlefish before fusion | 1.06x (1.03-1.09) | 1.05x (1.04-1.07) |
+
+- **The node path** (`nf-replay-bench --evm-only <prestate> --node`) is what `base-reth-node`
+  runs for a new payload (reth `crates/engine/tree/src/tree/payload_validator.rs`): the
+  node's `BaseEvmConfig` for Base mainnet, `ConfigureEvm::executor_for_block` over a `State`
+  with bundle updates, `apply_pre_execution_changes`, every transaction,
+  `apply_post_execution_changes`, and `merge_transitions`. It is built with the features the
+  node binaries enable by default, `asm-keccak` and `keccak-cache-global`. What differs from
+  the running node: its database is an in-memory `CacheDB` instead of MDBX behind reth's
+  execution cache (this favours it), its precompile result cache is not installed, and no
+  prewarming threads run. *Execution* is pre-block changes plus transactions on both sides;
+  post-block changes and the commit (`merge_transitions`, needlefish `Backend.commit`) are
+  timed separately.
+- **Before this run the comparison was unfair to revm in two ways**, both fixed: the harness
+  built revm with the portable Keccak instead of the node's `asm-keccak` and global Keccak
+  cache (1.15x slower on this window), and it analyzed bytecode while filling `CacheDB`,
+  outside the timed region, while needlefish analyzed inside it. needlefish now analyzes
+  the window's code into its process-lifetime analysis cache before timing, as a running
+  node holds it. Under the old harness needlefish's `main` measured 1.28x; the earlier
+  0.85x in this document came from a different, slower machine and an older needlefish.
+- **State roots** are not compared with the node: reth computes them against its database,
+  and there is no offline harness for that yet.
+
+### EVM fixtures against revm and evm2
+
+evm2's 31 fixtures (`data/*.json` minus the precompile cases) as in
+[EVM vs evm2](#evm-vs-evm2), 8 rounds, keccak memo off on every side. revm 43 and evm2 run
+through evm2's CLI (`--engine revm`, `--engine evm2`, stable-Rust build). Median µs per
+transaction over processes; the speedup is the ratio of medians.
+
+| case | gas | needlefish ReleaseSafe µs | ReleaseFast µs | evm2 µs | revm µs | ReleaseSafe vs revm | ReleaseFast vs revm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aggregation_router_v6 | 321324 | 104.759 | 101.024 | 142.648 | 149.895 | 1.43x | 1.48x |
+| airdrop | 23435 | 0.413 | 0.351 | 0.920 | 0.881 | 2.13x | 2.51x |
+| balancer_vault | 77348 | 25.711 | 24.770 | 40.482 | 44.859 | 1.74x | 1.81x |
+| bswap64 | 21986 | 0.567 | 0.487 | 1.125 | 1.136 | 2.00x | 2.33x |
+| bswap64_opt | 21836 | 0.532 | 0.464 | 1.036 | 1.070 | 2.01x | 2.31x |
+| burntpix | 92399448 | 16437.311 | 16907.208 | 32943.487 | 44647.039 | 2.72x | 2.64x |
+| counter | 43363 | 0.384 | 0.325 | 0.903 | 0.818 | 2.13x | 2.52x |
+| curve_3pool | 55057 | 9.636 | 9.320 | 14.380 | 18.548 | 1.92x | 1.99x |
+| curve-stableswap-2pool | 157780 | 28.781 | 28.663 | 50.964 | 62.051 | 2.16x | 2.16x |
+| curve_tricrypto2 | 100307 | 21.330 | 19.957 | 35.349 | 45.558 | 2.14x | 2.28x |
+| eip2935 | 23365 | 0.361 | 0.305 | 0.813 | 0.758 | 2.10x | 2.48x |
+| eip4788 | 25496 | 0.391 | 0.325 | 0.858 | 0.796 | 2.04x | 2.45x |
+| entry_point_v0_7 | 251245 | 117.324 | 113.529 | 138.730 | 146.704 | 1.25x | 1.29x |
+| erc20_transfer | 13529850 | 3668.921 | 3726.171 | 4366.317 | 5143.326 | 1.40x | 1.38x |
+| factorial | 87203 | 15.828 | 15.825 | 30.506 | 42.793 | 2.70x | 2.70x |
+| fiat_token | 23445 | 0.414 | 0.350 | 0.920 | 0.845 | 2.04x | 2.42x |
+| fibonacci-calldata | 84203 | 14.196 | 14.063 | 30.318 | 43.197 | 3.04x | 3.07x |
+| hash_10k | 2572907 | 2267.415 | 2278.490 | 2710.522 | 3092.054 | 1.36x | 1.36x |
+| onchain_lm_v2 | 456640284 | 161527.275 | 159499.692 | 239351.467 | 291067.024 | 1.80x | 1.82x |
+| push0_proxy | 23652 | 0.406 | 0.331 | 0.889 | 0.875 | 2.16x | 2.65x |
+| seaport | 24051 | 0.647 | 0.563 | 1.128 | 1.096 | 1.69x | 1.95x |
+| snailtracer | 205087902 | 24138.335 | 23901.860 | 42233.907 | 54970.656 | 2.28x | 2.30x |
+| succinct_staking | 49735 | 3.494 | 3.120 | 5.996 | 7.133 | 2.04x | 2.29x |
+| uniswap_v2_pair | 23568 | 0.463 | 0.390 | 0.996 | 0.964 | 2.08x | 2.47x |
+| uniswap_v3_pool | 79765 | 6.913 | 6.841 | 10.455 | 12.764 | 1.85x | 1.87x |
+| uniswap_v4_pool_manager | 100521 | 3.598 | 3.418 | 5.560 | 6.667 | 1.85x | 1.95x |
+| univ2_router | 22601 | 0.558 | 0.494 | 1.232 | 1.272 | 2.28x | 2.57x |
+| universal_router | 116932 | 27.617 | 26.919 | 42.192 | 45.846 | 1.66x | 1.70x |
+| usdc_proxy | 25644 | 0.529 | 0.441 | 1.051 | 1.015 | 1.92x | 2.30x |
+| usdt | 41285 | 2.034 | 1.941 | 3.311 | 3.620 | 1.78x | 1.87x |
+| weth | 51318 | 1.264 | 1.166 | 1.973 | 2.110 | 1.67x | 1.81x |
+| geometric mean | | | | | | 1.94x | 2.11x |
+
+- needlefish `ReleaseSafe` is 1.94x revm and 1.76x evm2 by geometric mean, `ReleaseFast`
+  2.11x revm. The same `ReleaseSafe` before instruction fusion was 1.92x revm: fusion gains
+  1.10-1.24x on contract-heavy cases (balancer_vault, universal_router, snailtracer) and
+  costs 4-8% on the 21k-gas cases and 3% on onchain_lm_v2. The cause of that cost is not
+  measured; the analysis cache is kept across iterations, so it is not analysis time. A
+  likely candidate is the larger interpreter (59 fused handlers).
+- The precompile fixtures, measured separately: ecrecover 25 µs on both sides (revm uses C
+  libsecp256k1), bn254 pairing 610 µs against 800 µs, modexp from 0.8x to 2x.
+
+## Proof executor comparison
+
+Everything from here to [Correctness found along the way](#correctness-found-along-the-way)
+compares needlefish with base/base's **fault proof executor** (`base-proof-executor`,
+`StatelessL2Builder`), not with its node. It was measured on a 4-vCPU cloud VM before
+November 13, 2026, with the harness that built revm without the node's Keccak features.
+
+This is the second version of this comparison. The first version (one laptop run) had the
 biases listed in [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md): few runs, no confidence intervals,
 7 recovery threads against 1, a faster needlefish build than base/base's, and no
 attribution. This version follows that plan. It runs on a cloud VM rather than a dedicated
 server; [What these numbers are not](#what-these-numbers-are-not) says what that costs.
 
-## Summary
+### Summary
 
 Headline pair: needlefish `ReleaseSafe` against base/base `maxperf`, both tuned for the
 native CPU, both single-threaded, fresh process, page cache warm. Times are the median
@@ -674,7 +790,11 @@ computed. base/base's `--evm-only` loads the same file into a revm `CacheDB`, re
 senders up front, and runs `bench_execute_in_memory` per block over one `State` that keeps
 every block's changes. Both must match each block's gas used and receipts root (needlefish
 also the logs bloom). The EVM time is *transactions*. revm analyzes bytecode (jump tables)
-when the `CacheDB` is filled, outside the timed region; needlefish analyzes during execution.
+when the `CacheDB` is filled, outside the timed region; needlefish analyzes the recorded code
+into its process-lifetime analysis cache before each timed pass (since November 13, 2026;
+before that it analyzed during execution). With `--node` the base/base harness runs the
+node's execution path instead of `bench_execute_in_memory`
+([Against the Base node and revm](#mainnet-blocks-against-the-nodes-execution-path)).
 
 ### Runs and statistics
 
