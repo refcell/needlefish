@@ -623,7 +623,7 @@ fn run_stages(up: *Up) !u8 {
     const ready = database == .ready and !(dry_run and up.flags.reimport);
     // A dry run reports every failed check; a run stops at the first.
     var problems: u32 = 0;
-    const ports = try pick_ports(up) orelse return 1;
+    var ports = try pick_ports(up) orelse return 1;
     const l1 = try choose_l1(up) orelse if (dry_run) blk: {
         problems += 1;
         break :blk L1Plan.disabled;
@@ -654,6 +654,9 @@ fn run_stages(up: *Up) !u8 {
         if (stage != 0 or stop_requested.load(.acquire)) return stage;
         const imported = try import_snapshot(up, &snapshot.?);
         if (imported != 0 or stop_requested.load(.acquire)) return imported;
+        // Hours went by: a port free at the start (a neighbour node restarting then) may be
+        // taken now, so the node's ports are picked again right before it binds them.
+        ports = try pick_ports(up) orelse return 1;
     }
     return start_node(up, ports, l1);
 }
@@ -1117,7 +1120,11 @@ fn fetch_snapshot(up: *const Up, snapshot: *const Snapshot) !u8 {
                 });
                 return 0;
             },
-            .stopped => return 0,
+            .stopped => {
+                up.view.note("stopped; the downloaded chunks are kept: run the same command " ++
+                    "again to resume", .{});
+                return 0;
+            },
             .retry => continue,
             .failed => |reason| {
                 up.view.fail("snapshot", "{s}", .{reason});
@@ -1306,7 +1313,11 @@ fn import_snapshot(up: *const Up, snapshot: *const Snapshot) !u8 {
         try Io.Dir.cwd().createDirPath(up.io, up.path("import", .{}));
         const started_ms = up.now_ms();
         const status = try run_import(up, snapshot);
-        if (stop_requested.load(.acquire)) return 0;
+        if (stop_requested.load(.acquire)) {
+            up.view.note("stopped; the import is not resumable: the next run imports from the " ++
+                "extracted snapshot again (it is kept)", .{});
+            return 0;
+        }
         if (status == 0) return finish_import(up, snapshot);
         var buffer: [4096]u8 = undefined;
         const tail = read_tail(up.io, up.path("logs/import.log", .{}), &buffer);
