@@ -3,8 +3,8 @@
 //!     base up [--chain base-mainnet|base-sepolia] [--datadir <dir>] [--db <file>]
 //!             [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
 //!             [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
-//!             [--download.connections <n>] [--gossip [--gossip.port <n>]] [--reimport]
-//!             [--dry-run] [--plain]
+//!             [--download.connections <n>] [--download.rate <MB/s>]
+//!             [--gossip [--gossip.port <n>]] [--reimport] [--dry-run] [--plain]
 //!
 //! Every run checks the setup first, then does only what is missing, in order:
 //! 1. Snapshot (`up_snapshot.zig`): the chain's latest public snapshot, downloaded and
@@ -45,8 +45,8 @@ const usage =
     \\usage: base up [--chain base-mainnet|base-sepolia] [--datadir <dir>] [--db <file>]
     \\               [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
     \\               [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
-    \\               [--download.connections <n>] [--gossip [--gossip.port <n>]]
-    \\               [--reimport] [--dry-run] [--plain]
+    \\               [--download.connections <n>] [--download.rate <MB/s>]
+    \\               [--gossip [--gossip.port <n>]] [--reimport] [--dry-run] [--plain]
     \\
     \\Runs a Base node that follows the tip, from nothing: downloads and verifies the latest
     \\public snapshot, imports it, then runs the execution node (blocks over devp2p) and the
@@ -63,6 +63,8 @@ const usage =
     \\  --engine.port Engine API port on 127.0.0.1 (default 8551)
     \\  --consensus.port  consensus RPC port on 127.0.0.1 (default 7545)
     \\  --download.connections  parallel snapshot downloads (default 8)
+    \\  --download.rate  cap the snapshot download, in MB/s (default: none); leave room on the
+    \\               link when a node on it fetches blocks over the same connection
     \\  --gossip     also join Base's consensus gossip and execute the sequencer-signed block
     \\               at the tip as it arrives (devp2p stays the fallback)
     \\  --gossip.port   gossip TCP port on all interfaces, UDP one above (default 9222)
@@ -88,6 +90,8 @@ const Flags = struct {
     engine_port: ?u16 = null,
     consensus_port: ?u16 = null,
     connections: u32 = 8,
+    /// MB/s; 0: no cap.
+    rate_mb_per_s: u32 = 0,
     reimport: bool = false,
     dry_run: bool = false,
     /// No color and no redraws (also without a TTY).
@@ -101,6 +105,7 @@ const Flags = struct {
 };
 
 const connections_max = 64;
+const rate_mb_per_s_max = 100_000;
 
 fn parse_flags(args: []const []const u8) !Flags {
     var flags: Flags = .{};
@@ -166,6 +171,11 @@ fn parse_valued(flags: *Flags, name: []const u8, value: []const u8) !void {
         flags.gossip_port = try port_flag(name, value);
         if (flags.gossip_port.? == std.math.maxInt(u16)) {
             return fail_flag("--gossip.port takes up to 65534 (UDP uses the port above)", .{});
+        }
+    } else if (eql(u8, name, "--download.rate")) {
+        flags.rate_mb_per_s = std.fmt.parseInt(u32, value, 10) catch 0;
+        if (flags.rate_mb_per_s == 0 or flags.rate_mb_per_s > rate_mb_per_s_max) {
+            return fail_flag("--download.rate takes 1 to {d} (MB/s)", .{rate_mb_per_s_max});
         }
     } else if (eql(u8, name, "--download.connections")) {
         flags.connections = std.fmt.parseInt(u32, value, 10) catch 0;
@@ -1106,6 +1116,9 @@ fn fetch_snapshot(up: *const Up, snapshot: *const Snapshot) !u8 {
         up_check.format_bytes(&b[1], snapshot.mdbx_bytes()),
         up.flags.connections,
     });
+    if (up.flags.rate_mb_per_s > 0) {
+        up.view.note("download capped at {d} MB/s (--download.rate)", .{up.flags.rate_mb_per_s});
+    }
     const rounds_max = 6;
     for (0..rounds_max) |_| {
         switch (try snapshot_round(up, snapshot)) {
@@ -1168,6 +1181,8 @@ fn snapshot_round(up: *const Up, snapshot: *const Snapshot) !RoundOutcome {
         .stop = undefined,
     }, .extraction = undefined };
     round.download.stop = &round.halt;
+    round.download.rate_bytes_per_s = @as(u64, up.flags.rate_mb_per_s) * 1_000_000;
+    round.download.started_ms = up.now_ms();
     try round.download.count_existing();
     round.extraction = .{
         .sink = undefined,
@@ -1532,11 +1547,15 @@ test "up: flags" {
         &.{ "--rpc.port", "70000" },         &.{ "--l1", "ethereum-rpc.publicnode.com" },
         &.{ "--download.connections", "0" }, &.{"--bogus"},
         &.{ "--db", "x", "--reimport" },     &.{ "--no-consensus", "--l1", "https://x" },
+        &.{ "--download.rate", "0" },        &.{ "--download.rate", "fast" },
         &.{ "--gossip.port", "9322" },       &.{ "--gossip", "--gossip.port", "65535" },
     };
     const gossip = try parse_flags(&.{ "--gossip", "--gossip.port", "9422" });
     try testing.expect(gossip.gossip and !defaults.gossip);
     try testing.expectEqual(@as(?u16, 9422), gossip.gossip_port);
+    const capped = try parse_flags(&.{ "--download.rate", "6" });
+    try testing.expectEqual(@as(u32, 6), capped.rate_mb_per_s);
+    try testing.expectEqual(@as(u32, 0), defaults.rate_mb_per_s);
     for (invalid) |args| try testing.expectError(error.InvalidArguments, parse_flags(args));
     try testing.expectError(error.Help, parse_flags(&.{"--help"}));
 }

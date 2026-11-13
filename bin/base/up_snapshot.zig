@@ -226,6 +226,12 @@ pub const Download = struct {
     /// Archive bytes on disk (complete chunks and parts).
     bytes: std.atomic.Value(u64) = .init(0),
     failure: std.atomic.Value(Failure) = .init(.none),
+    /// The cap on all workers together (`--download.rate`); 0: none. A node on the same link
+    /// fetches its blocks over it, and a saturated link delays them by seconds.
+    rate_bytes_per_s: u64 = 0,
+    /// Bytes received this run, and when the run started (the cap's budget).
+    received: std.atomic.Value(u64) = .init(0),
+    started_ms: i64 = 0,
 
     pub fn chunk_range(download: *const Download, index: u32) struct { start: u64, end: u64 } {
         assert(index < download.chunks);
@@ -264,6 +270,17 @@ pub const Download = struct {
             if (size == range.end - range.start) return size;
         }
         return stat_size(download.io, download.dir, name.part()) orelse 0;
+    }
+
+    /// How long a worker waits before reading more, for `received` bytes to stay within the
+    /// rate cap since `started_ms`; 0 without a cap.
+    pub fn throttle_ms(download: *const Download, now_ms: i64) u64 {
+        const rate = download.rate_bytes_per_s;
+        if (rate == 0) return 0;
+        assert(now_ms >= download.started_ms);
+        const due_ms = download.received.load(.monotonic) * 1000 / rate;
+        const elapsed_ms: u64 = @intCast(now_ms - download.started_ms);
+        return due_ms -| elapsed_ms;
     }
 
     /// A worker: claims chunks in order until none is left or the download halts.
@@ -442,7 +459,14 @@ const Worker = struct {
             };
             offset += got;
             _ = download.bytes.fetchAdd(got, .monotonic);
+            _ = download.received.fetchAdd(got, .monotonic);
             worker.progress_ms.store(worker.now_ms(), .release);
+            // Under a cap, reading later slows the sender (TCP flow control) on the link.
+            const wait_ms = download.throttle_ms(worker.now_ms());
+            if (wait_ms > 0) {
+                try Io.sleep(download.io, .fromMilliseconds(@intCast(wait_ms)), .awake);
+                worker.progress_ms.store(worker.now_ms(), .release);
+            }
         }
         assert(offset == length);
     }
@@ -774,4 +798,27 @@ test "up snapshot: a resumed extraction keeps the bytes it wrote, rewrites from 
         try tmp.dir.readFile(io, member.path, &read_buffer),
     );
     try testing.expectEqual(@as(u64, content.len), directory.skipped);
+}
+
+test "up snapshot: the rate cap holds the workers to rate x elapsed" {
+    var stop: std.atomic.Value(bool) = .init(false);
+    var download: Download = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .dir = undefined,
+        .url = "",
+        .archive_bytes = 1,
+        .chunks = 1,
+        .stop = &stop,
+        .started_ms = 10_000,
+    };
+    // No cap: never waits.
+    download.received.store(1 << 40, .monotonic);
+    try testing.expectEqual(@as(u64, 0), download.throttle_ms(10_000));
+    // 4 MB/s: 10 MB received 1 s in are due at 2.5 s, so 1.5 s to wait; none once due.
+    download.rate_bytes_per_s = 4_000_000;
+    download.received.store(10_000_000, .monotonic);
+    try testing.expectEqual(@as(u64, 1_500), download.throttle_ms(11_000));
+    try testing.expectEqual(@as(u64, 0), download.throttle_ms(12_500));
+    try testing.expectEqual(@as(u64, 0), download.throttle_ms(20_000));
 }
