@@ -32,6 +32,8 @@ pub const chunks_max: u32 = 1 << 20;
 const stall_ms: i64 = 120_000;
 const attempts_max: u32 = 1000;
 const backoff_ms_max: u64 = 60_000;
+/// Unused rate-cap budget kept (a short burst after a quiet second is fine).
+const rate_burst_ms: u64 = 1_000;
 const read_buffer_bytes = 1 << 20;
 const listing_bytes_max = 1 << 20;
 const manifest_bytes_max = 16 << 20;
@@ -229,9 +231,10 @@ pub const Download = struct {
     /// The cap on all workers together (`--download.rate`); 0: none. A node on the same link
     /// fetches its blocks over it, and a saturated link delays them by seconds.
     rate_bytes_per_s: u64 = 0,
-    /// Bytes received this run, and when the run started (the cap's budget).
+    /// Bytes received this run, and when the cap's budget started: moved forward over idle
+    /// time (a pause, a stall), so at most `rate_burst_ms` of unused budget is ever banked.
     received: std.atomic.Value(u64) = .init(0),
-    started_ms: i64 = 0,
+    started_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn chunk_range(download: *const Download, index: u32) struct { start: u64, end: u64 } {
         assert(index < download.chunks);
@@ -273,13 +276,22 @@ pub const Download = struct {
     }
 
     /// How long a worker waits before reading more, for `received` bytes to stay within the
-    /// rate cap since `started_ms`; 0 without a cap.
-    pub fn throttle_ms(download: *const Download, now_ms: i64) u64 {
+    /// rate cap since `started_ms`; 0 without a cap. Budget a pause left unused is dropped
+    /// (beyond `rate_burst_ms`): after hours stopped, the download would else run uncapped
+    /// until it had made up the whole pause.
+    pub fn throttle_ms(download: *Download, now_ms: i64) u64 {
         const rate = download.rate_bytes_per_s;
         if (rate == 0) return 0;
-        assert(now_ms >= download.started_ms);
+        const started_ms = download.started_ms.load(.monotonic);
         const due_ms = download.received.load(.monotonic) * 1000 / rate;
-        const elapsed_ms: u64 = @intCast(now_ms - download.started_ms);
+        const elapsed_ms: u64 = @intCast(@max(now_ms - started_ms, 0));
+        if (elapsed_ms > due_ms + rate_burst_ms) {
+            const moved_ms = now_ms - @as(i64, @intCast(due_ms + rate_burst_ms));
+            assert(moved_ms > started_ms);
+            // A lost race means another worker moved it to the same place.
+            _ = download.started_ms.cmpxchgStrong(started_ms, moved_ms, .monotonic, .monotonic);
+            return 0;
+        }
         return due_ms -| elapsed_ms;
     }
 
@@ -810,7 +822,7 @@ test "up snapshot: the rate cap holds the workers to rate x elapsed" {
         .archive_bytes = 1,
         .chunks = 1,
         .stop = &stop,
-        .started_ms = 10_000,
+        .started_ms = .init(10_000),
     };
     // No cap: never waits.
     download.received.store(1 << 40, .monotonic);
@@ -820,5 +832,10 @@ test "up snapshot: the rate cap holds the workers to rate x elapsed" {
     download.received.store(10_000_000, .monotonic);
     try testing.expectEqual(@as(u64, 1_500), download.throttle_ms(11_000));
     try testing.expectEqual(@as(u64, 0), download.throttle_ms(12_500));
-    try testing.expectEqual(@as(u64, 0), download.throttle_ms(20_000));
+    // An hour stopped (the governor's pause) is not banked: 8 MB more right after it are due
+    // 2 s after the last ones, and only the 1 s burst is credited, so 1 s to wait.
+    const resumed_ms = 12_500 + 3_600_000;
+    try testing.expectEqual(@as(u64, 0), download.throttle_ms(resumed_ms));
+    download.received.store(18_000_000, .monotonic);
+    try testing.expectEqual(@as(u64, 1_000), download.throttle_ms(resumed_ms));
 }

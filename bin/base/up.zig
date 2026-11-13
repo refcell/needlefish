@@ -1182,7 +1182,7 @@ fn snapshot_round(up: *const Up, snapshot: *const Snapshot) !RoundOutcome {
     }, .extraction = undefined };
     round.download.stop = &round.halt;
     round.download.rate_bytes_per_s = @as(u64, up.flags.rate_mb_per_s) * 1_000_000;
-    round.download.started_ms = up.now_ms();
+    round.download.started_ms = .init(up.now_ms());
     try round.download.count_existing();
     round.extraction = .{
         .sink = undefined,
@@ -1205,16 +1205,24 @@ fn snapshot_round(up: *const Up, snapshot: *const Snapshot) !RoundOutcome {
 
 /// Redraws the snapshot bar until the extraction ends, the download fails, or a stop.
 fn watch_round(up: *const Up, snapshot: *const Snapshot, round: *Round) void {
-    const started_ms = up.now_ms();
-    const started_bytes = round.download.bytes.load(.acquire);
+    // The rate over the last `rate_window_ms`, not since the start: a run paused for hours
+    // (SIGSTOP) shows its current rate and a true ETA once it runs again.
+    const rate_window_ms = 10_000;
+    var sample_ms = up.now_ms();
+    var sample_bytes = round.download.bytes.load(.acquire);
+    var rate: f64 = 0;
     while (!round.extraction.done.load(.acquire)) {
         if (stop_requested.load(.acquire) or round.download.failed() != .none) return;
         Io.sleep(up.io, .fromMilliseconds(500), .awake) catch return;
         const now = up.now_ms();
         const bytes = round.download.bytes.load(.acquire);
         const extracted = round.extraction.sink.written.load(.acquire);
-        const elapsed_s = @as(f64, @floatFromInt(@max(now - started_ms, 1))) / 1000;
-        const rate = @as(f64, @floatFromInt(bytes -| started_bytes)) / elapsed_s;
+        if (now - sample_ms >= rate_window_ms) {
+            const window_s = @as(f64, @floatFromInt(now - sample_ms)) / 1000;
+            rate = @as(f64, @floatFromInt(bytes -| sample_bytes)) / window_s;
+            sample_ms = now;
+            sample_bytes = bytes;
+        }
         const total: f64 = @floatFromInt(snapshot.archive_bytes);
         const left_s = (total - @as(f64, @floatFromInt(bytes))) / @max(rate, 1);
         var b: [4][32]u8 = undefined;
