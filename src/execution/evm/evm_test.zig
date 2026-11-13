@@ -81,6 +81,7 @@ pub const Harness = struct {
 pub const caller = primitives.address_from_int(0xca11e7);
 const contract = primitives.address_from_int(0xc0de);
 const other = primitives.address_from_int(0x07e7);
+const third = primitives.address_from_int(0x7317d);
 
 fn push1(value: u8) [2]u8 {
     return .{ op.PUSH1, value };
@@ -294,11 +295,17 @@ test "evm: fused instructions charge and halt like the instructions they run" {
     try std.testing.expectEqual(@as(u64, 100_000 - 30), outcome.gas_remaining);
     // Out of gas at the second instruction of the fused PUSH1 PUSH1.
     const starved = try h.call(.cancun, contract, &.{}, 5);
-    try std.testing.expectEqual(evm_module.Status.halt, starved.status);
+    try std.testing.expectEqual(evm_module.Exit.out_of_gas, starved.exit);
     // Underflow at the second POP of a fused POP POP.
     try h.database.put_account(other, 0, 1, &.{ op.PUSH1, 1, op.POP, op.POP, op.STOP });
     const underflow = try h.call(.cancun, other, &.{}, 50_000);
-    try std.testing.expectEqual(evm_module.Status.halt, underflow.status);
+    try std.testing.expectEqual(evm_module.Exit.stack_underflow, underflow.exit);
+    // Out of gas at the third of four fused instructions, which the up-front check of the
+    // whole sequence sees before the first runs: the halt reason is still out of gas.
+    const shift = [_]u8{ op.PUSH1, 1, op.PUSH1, 1, op.PUSH1, 4, op.SHL, op.SUB, op.STOP };
+    try h.database.put_account(third, 0, 1, &shift);
+    const late = try h.call(.cancun, third, &.{}, 8);
+    try std.testing.expectEqual(evm_module.Exit.out_of_gas, late.exit);
 }
 
 test "evm: opcodes undefined before their fork halt" {

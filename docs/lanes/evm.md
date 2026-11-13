@@ -452,6 +452,16 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-13: 21k-gas regression after fusion found and fixed. Retired instructions per
+  small transaction fell with fusion (10,707 against 10,938) while cycles rose; the cycles
+  sat in `std.mem.allEqual` over the 33 padding bytes, which `run` asserts once per frame
+  entry and which fusion doubled (code and `ops`). `bytecode.padding_zero` checks the same
+  bytes with one 32-byte vector compare and one byte: small fixtures 1.06x the pre-fusion
+  build (fusion alone 0.96x), mainnet window 1.04x (CI 1.02-1.07) over the fusion build.
+  Rejected after measuring: sync-point handlers out of line (`@call(.never_inline,
+  execute)`, the dispatch function 53 KB -> 37 KB) 0.99x; checking a fused sequence's stack
+  bounds and charging its static gas once, with a checked fallback for exact halt reasons,
+  0.96x (CI 0.93-0.99): the fallback copies grew the dispatch function to 66 KB.
 - 2026-11-13: instruction fusion. Instruction pair and triple counts over the 100-block
   mainnet window (30.6M instructions) showed PUSH2 JUMPI 4.7%, JUMP JUMPDEST 4.1%, PUSH1
   PUSH1 2.7%; hardware counters (Zen 5) put 35% of the interpreter's slots in frontend

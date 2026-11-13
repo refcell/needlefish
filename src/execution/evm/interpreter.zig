@@ -57,10 +57,10 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     // `pc` at most 33 bytes forward (PUSH32), or past a JUMPDEST below `len`; and any byte
     // past `len` is padding, a STOP, which exits. Asserted once per entry instead.
     assert(analyzed.code.len == @as(u64, analyzed.len) + bytecode.padding_bytes);
-    assert(std.mem.allEqual(u8, analyzed.code[analyzed.len..], 0));
+    assert(bytecode.padding_zero(analyzed.code));
     assert(r.pc < analyzed.code.len);
     assert(analyzed.ops.len == analyzed.code.len);
-    assert(std.mem.allEqual(u8, analyzed.ops[analyzed.len..], 0));
+    assert(bytecode.padding_zero(analyzed.ops));
     assert(analyzed.jumpdests.len == (@as(u64, analyzed.len) + 7) / 8);
     // Dispatch reads `ops`, the code with fused instructions marked (`bytecode.fusions`), at
     // the same offsets and with the same padding.

@@ -108,9 +108,12 @@ transaction over processes; the speedup is the ratio of medians.
 - needlefish `ReleaseSafe` is 1.94x revm and 1.76x evm2 by geometric mean, `ReleaseFast`
   2.11x revm. The same `ReleaseSafe` before instruction fusion was 1.92x revm: fusion gains
   1.10-1.24x on contract-heavy cases (balancer_vault, universal_router, snailtracer) and
-  costs 4-8% on the 21k-gas cases and 3% on onchain_lm_v2. The cause of that cost is not
-  measured; the analysis cache is kept across iterations, so it is not analysis time. A
-  likely candidate is the larger interpreter (59 fused handlers).
+  cost 4-8% on the 21k-gas cases and 3% on onchain_lm_v2. The 21k-gas cost was the safe
+  build's per-frame check that the code padding is zero: fusion added a second byte loop
+  over 33 bytes, about 9% of the interpreter's cycles on such a transaction. A single
+  32-byte compare per buffer replaced both loops; on the 12 smallest fixtures (12 rounds)
+  needlefish is now 1.06x its pre-fusion build, where fusion alone measured 0.96x. The
+  table above predates that fix.
 - The precompile fixtures, measured separately: ecrecover 25 µs on both sides (revm uses C
   libsecp256k1), bn254 pairing 610 µs against 800 µs, modexp from 0.8x to 2x.
 
