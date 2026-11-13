@@ -35,6 +35,8 @@ README.
       fixture suite with one loop on both sides (`etc/bench/evm2-harness.patch` adds the `nf`
       runner to evm2's CLI crate); `stats.zig --cases` prints per-case medians and speedups and
       refuses cases whose gas differs between engines.
+- [ ] Node to node on Base mainnet state, replacing the proof-executor headline: follow
+      [BENCHMARK_NODE_PLAN.md](../BENCHMARK_NODE_PLAN.md) (N0 doc fix first, then N1-N5).
 - [ ] Rerun on a dedicated server (frequency control, PMU, `perf stat` instructions and
       cycles per block); this round ran on a 4-vCPU cloud VM.
 
