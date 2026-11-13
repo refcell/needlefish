@@ -290,7 +290,11 @@ cmd_deploy() {
   local now T P root
   now=$(cast block latest -f timestamp --rpc-url "$L1_RPC")
   T=$((now + GENESIS_LEAD_S))
-  P=$((now - 600))
+  # Upgrades activate 8 h back: a pipeline reset walks back the channel timeout in force at
+  # its safe head's time minus Denim's 6 h sequencer drift (base/base `pipeline/core.rs`).
+  # Granite any later makes that the pre-Granite 300 L1 blocks (18000 L2 blocks), past what
+  # the sequencer EL keeps, so a restart in the chain's first hours could never resume.
+  P=$((now - 8 * 3600))
   printf 'T=%s\nP=%s\n' "$T" "$P" >"$CONFIG/times.env"
   log "L2 genesis time $T, upgrades activated at $P"
   deploy_placeholders
@@ -433,13 +437,14 @@ cmd_status() {
 # --- exercises -----------------------------------------------------------------------------
 
 l2_output() { # block -> output root (verifier's rollup node)
-  # The node answers "output not available yet" while it fetches a block it was not asked
-  # for before, so ask again for a while.
-  local _
-  for _ in $(seq 1 20); do
-    rpc "http://127.0.0.1:$PORT_VER_CL" optimism_outputAtBlock "[\"$(printf '0x%x' "$1")\"]" |
-      jq -er .result.outputRoot 2>/dev/null && return 0
-    sleep 1
+  # The node answers "output not available yet" while it fetches a block that is not
+  # finalized, and keeps the fetched output only briefly, so ask again quickly.
+  local _ root
+  for _ in $(seq 1 60); do
+    root=$(rpc "http://127.0.0.1:$PORT_VER_CL" optimism_outputAtBlock \
+      "[\"$(printf '0x%x' "$1")\"]" | jq -er .result.outputRoot 2>/dev/null) &&
+      { echo "$root"; return 0; }
+    sleep 0.3
   done
   return 1
 }

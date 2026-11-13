@@ -41,9 +41,21 @@ Because the subsecond-block upgrade is active from genesis, the contracts apply 
 "fast" interval pair to every game; the deploy sets that pair to `GAME_INTERVAL`.
 The factory's initial bond for game type 621 is 0, so proposing costs gas only.
 
+Two properties of `AggregateVerifier` shape the exercises:
+
+- A game with only a TEE proof resolves `SLOW_FINALIZATION_DELAY` (a 5-day contract
+  constant) after it was created; the 600 s delays only follow that. A withdrawal proven
+  against a game finalizes about 5 days after the game, so `withdraw run` waits that long.
+- A successful TEE nullification nullifies the TEE verifier itself: the challenger's
+  counter-proof shows an enclave signed a wrong root, so every TEE-proven game is refuted
+  and every later `create` reverts with `Nullified()` until governance installs a new
+  verifier. `bad-claim` is therefore the last exercise: run it after the withdrawal has
+  finalized.
+
 The L2 genesis is the `base devnet init` template with L2Genesis predeploy allocs for the
 simulated bridge proxy addresses (the deploy checks they match after broadcasting). Every
-fork up to Denim is active from genesis, so the chain runs Base's 200 ms blocks.
+fork up to Denim is active from genesis, so the chain runs Base's 200 ms blocks. The forks
+activate 8 hours before the deploy: see the restart entry below.
 
 ## Run it
 
@@ -99,6 +111,12 @@ local anvil with chain id 11155111 rehearses the whole flow without spending Sep
   longer had, and retried forever. Start discovery now resumes from the node's own safe and
   finalized checkpoints (`--checkpoint.path`, the current ones, not only those read at
   start) when the EL holds them, and the sequencer EL keeps `SEQ_RETAIN` (8192) blocks.
+  Still stuck after that: the pipeline reset walks back the channel timeout in force at the
+  safe head's time minus the max sequencer drift (base/base `pipeline/core.rs`), and Denim
+  makes that drift 6 hours. With the forks activated 10 minutes before the deploy, Granite's
+  50-block timeout did not apply for the chain's first hours and the walk took the old 300
+  L1 blocks, about 18000 L2 blocks, back past what the EL keeps. The deploy now activates
+  every fork 8 hours back.
 - Open: the verifier receives the sequencer's gossip only in stretches. A gap leaves the
   next block missing, later blocks are buffered or ignored, and the unsafe head waits for
   derivation, about every 24 s. Each catch-up imports about 120 blocks at once, which fills
