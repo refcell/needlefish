@@ -31,6 +31,21 @@ pub const Upgrade = enum(u8) {
     /// base/base `BaseUpgrade::LATEST`.
     pub const latest: Upgrade = .beryl;
 
+    /// The upgrade whose activation also activates `upgrade`, if any.
+    pub fn implied_by(upgrade: Upgrade) ?Upgrade {
+        return switch (upgrade) {
+            .regolith => .canyon,
+            .canyon => .delta,
+            .delta => .ecotone,
+            .ecotone => .fjord,
+            .fjord => .granite,
+            .granite => .holocene,
+            .holocene => .isthmus,
+            .isthmus => .jovian,
+            else => null,
+        };
+    }
+
     /// Whether this upgrade includes `feature`, by ordinal (EVM spec semantics).
     pub fn is_feature_enabled(upgrade: Upgrade, feature: BaseFeature) bool {
         return @backingInt(feature.activation_upgrade()) <= @backingInt(upgrade);
