@@ -48,8 +48,11 @@ const hashes_max = 2;
 
 pub const Outcome = enum { matched, conflict, pending };
 
-/// Signed blocks kept for `take`: the newest `pending_max` heights (3.2 s at 200 ms).
-pub const pending_max = 16;
+/// Signed blocks kept for `take`: the newest `pending_max` heights (51.2 s at 200 ms), so a
+/// run that stalls behind the tip (a slow disk sync, a slow devp2p fetch) catches up from
+/// gossip, which has every block, rather than from devp2p alone. Memory is touched only as
+/// blocks fill the slots: about 256 average blocks.
+pub const pending_max = 256;
 /// A kept block's header and transactions; a larger block is left to devp2p.
 const pending_bytes_max = 4 << 20;
 const pending_transactions_max = el_source.transactions_max;
@@ -667,4 +670,27 @@ test "el-gossip: blocks are taken once, only when they link, never after a repla
     try std.testing.expect(blocks.take(701, hash_700) == null);
     try std.testing.expect(blocks.take(701 + pending_max, @splat(0x20)) != null);
     try std.testing.expectEqual(@as(u64, 2), blocks.taken);
+}
+
+test "el-gossip: a run 200 blocks behind the newest signed block takes every one in order" {
+    var blocks: Blocks = .{};
+    try blocks.init(std.testing.allocator, 1 << 12);
+    defer blocks.deinit(std.testing.allocator);
+    const one = [_][]const u8{"\x02\x01"};
+    var storage: [256]u8 = undefined;
+    // 40 s of 200 ms blocks arrive while the run is held at 900.
+    const behind = 200;
+    var hashes: [behind + 1][32]u8 = undefined;
+    hashes[0] = @splat(0x30);
+    for (1..behind + 1) |index| {
+        var signed = TestBlock.init(900 + index, hashes[index - 1], &one, &storage);
+        try blocks.convert(test_spec, &signed.envelope);
+        blocks.store();
+        hashes[index] = signed.header.hash().bytes;
+    }
+    for (1..behind + 1) |index| {
+        const taken = blocks.take(900 + index, hashes[index - 1]) orelse return error.NotKept;
+        try std.testing.expectEqualSlices(u8, &hashes[index], &taken.hash);
+    }
+    try std.testing.expectEqual(@as(u64, behind), blocks.taken);
 }
