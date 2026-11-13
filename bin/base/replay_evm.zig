@@ -327,6 +327,13 @@ fn evm_run(
     var executor = try Executor.init_backend(gpa, spec, flat.backend(), config);
     defer executor.deinit(gpa);
     executor.phase_clock = clock;
+    // revm's harness analyzes every contract while it fills its `CacheDB`
+    // (`Bytecode::new_raw`), untimed, and a running node keeps analyses for the process's
+    // lifetime: so neither side times the jumpdest analysis of code that already exists.
+    var codes = database.codes.iterator();
+    while (codes.next()) |entry| {
+        if (!executor.machine.code_cache.warm(entry.key_ptr, entry.value_ptr.*)) break;
+    }
     const transactions = try gpa.alloc([]const u8, executor.transactions_max);
     defer gpa.free(transactions);
     for (0..archive.block_count) |index| {

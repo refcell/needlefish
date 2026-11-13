@@ -51,26 +51,34 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     const analyzed = f.analyzed;
     var registers = Registers{ .pc = f.pc, .gas = f.gas, .stack = f.stack };
     const r = &registers;
-    // Opcodes and PUSH immediates are read through `code` without per-read bounds checks,
-    // which safe builds would otherwise pay on every opcode. Every read stays inside the
-    // padded code: `pc` starts inside it; an opcode inside the original code moves `pc` at
-    // most 33 bytes forward (PUSH32), or to a JUMPDEST below `len`; and any byte past `len`
-    // is padding, a STOP, which exits. Asserted once per entry instead.
+    // Opcodes (through `ops`) and PUSH immediates (through `code`) are read without per-read
+    // bounds checks, which safe builds would otherwise pay on every opcode. Every read stays
+    // inside the padded code: `pc` starts inside it; an opcode inside the original code moves
+    // `pc` at most 33 bytes forward (PUSH32), or past a JUMPDEST below `len`; and any byte
+    // past `len` is padding, a STOP, which exits. Asserted once per entry instead.
     assert(analyzed.code.len == @as(u64, analyzed.len) + bytecode.padding_bytes);
     assert(std.mem.allEqual(u8, analyzed.code[analyzed.len..], 0));
     assert(r.pc < analyzed.code.len);
+    assert(analyzed.ops.len == analyzed.code.len);
+    assert(std.mem.allEqual(u8, analyzed.ops[analyzed.len..], 0));
     assert(analyzed.jumpdests.len == (@as(u64, analyzed.len) + 7) / 8);
-    const code = analyzed.code.ptr;
+    // Dispatch reads `ops`, the code with fused instructions marked (`bytecode.fusions`), at
+    // the same offsets and with the same padding.
+    const ops = analyzed.ops.ptr;
     // Set when a step halts. A plain `bool` continue flag instead of a `?Exit` result: Zig
     // lowered the optional to a load from a constant global, and a branch, on every opcode.
     var exit: Exit = undefined;
     loop: {
-        dispatch: switch (code[r.pc]) {
+        dispatch: switch (ops[r.pc]) {
             inline else => |opcode| {
                 const start = opcode_profile.now();
                 defer opcode_profile.record(opcode, start);
-                if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
-                continue :dispatch code[r.pc];
+                if (comptime bytecode.fusion(opcode)) |parts| {
+                    inline for (parts) |part| {
+                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) break :loop;
+                    }
+                } else if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                continue :dispatch ops[r.pc];
             },
         }
     }
@@ -153,6 +161,11 @@ inline fn step(
     return true;
 }
 
+comptime {
+    // A fused instruction runs on the registers throughout, and only its last part jumps.
+    for (bytecode.fusions) |parts| for (parts) |part| assert(in_registers(part));
+}
+
 /// Opcodes that run on the registers: they read frame and block fields and may charge memory
 /// expansion from the gas register, but never call into state, return, or start a frame.
 fn in_registers(comptime opcode: u8) bool {
@@ -216,10 +229,7 @@ inline fn execute_registers(
         op.DUP1...op.DUP16 => s.dup(opcode - op.DUP1 + 1),
         op.SWAP1...op.SWAP16 => s.swap(opcode - op.SWAP1 + 1),
         op.POP => _ = s.pop(),
-        op.JUMP, op.JUMPI => if (!jump(opcode == op.JUMPI, r, analyzed)) {
-            exit.* = .invalid_jump;
-            return false;
-        },
+        op.JUMP, op.JUMPI => return jump(fork, opcode == op.JUMPI, r, analyzed, exit),
         op.JUMPDEST => {},
         op.PC => s.push(r.pc - 1),
         op.MSIZE => s.push(f.memory.len),
@@ -569,19 +579,35 @@ inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analy
     r.pc +%= size;
 }
 
-/// JUMP, or JUMPI when `conditional`. False on a jump to a non-JUMPDEST (invalid jump).
+/// JUMP, or JUMPI when `conditional`. A taken jump also runs the JUMPDEST it lands on, which
+/// only charges its gas: every taken jump would otherwise dispatch one (6.6% of the
+/// instructions on Base mainnet blocks). False with `exit` set when the frame halts.
 inline fn jump(
+    comptime fork: Fork,
     comptime conditional: bool,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
+    exit: *Exit,
 ) bool {
     const destination = r.stack.pop();
     if (conditional) {
         const condition = r.stack.pop();
         if (condition == 0) return true;
     }
-    if (!analyzed.is_jumpdest(destination)) return false;
-    r.pc = @intCast(destination);
+    if (!analyzed.is_jumpdest(destination)) {
+        exit.* = .invalid_jump;
+        return false;
+    }
+    const remaining = @subWithOverflow(r.gas, comptime gas.static_cost(fork, op.JUMPDEST));
+    r.gas = remaining[0];
+    if (remaining[1] != 0) {
+        @branchHint(.cold);
+        exit.* = .out_of_gas;
+        return false;
+    }
+    // Cannot wrap or leave the code: the JUMPDEST is below `len`.
+    r.pc = @as(u64, @intCast(destination)) + 1;
+    assert(r.pc <= analyzed.len);
     return true;
 }
 

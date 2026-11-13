@@ -265,6 +265,8 @@ test "evm: halts consume all gas" {
         &.{op.ADD},
         &.{ op.PUSH1, 3, op.JUMP },
         &.{0x0c},
+        // An original byte that analysis uses for a fused instruction is still undefined.
+        &.{@import("bytecode.zig").fused_first},
         &.{ op.PUSH1, 0, op.PUSH1, 1, op.PUSH1, 0, op.RETURNDATACOPY },
     };
     for (cases, 0..) |code, i| {
@@ -274,6 +276,29 @@ test "evm: halts consume all gas" {
         try std.testing.expectEqual(evm_module.Status.halt, outcome.status);
         try std.testing.expectEqual(@as(u64, 0), outcome.gas_remaining);
     }
+}
+
+test "evm: fused instructions charge and halt like the instructions they run" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    // (1 << 4) - 1, through the fused PUSH1 PUSH1 and PUSH1 SHL; PUSH1 PUSH1 SHL SUB starts at
+    // the second PUSH1, which execution runs as part of the first pair.
+    const mask = comptime return_word(&[_]u8{
+        op.PUSH1, 1, op.PUSH1, 1, op.PUSH1, 4, op.SHL, op.SUB,
+    });
+    try h.database.put_account(contract, 0, 1, mask);
+    const outcome = try h.call(.cancun, contract, &.{}, 100_000);
+    try std.testing.expectEqual(evm_module.Status.success, outcome.status);
+    try std.testing.expectEqual(@as(u256, 15), primitives.b256_to_u256(outcome.output[0..32].*));
+    try std.testing.expectEqual(@as(u64, 100_000 - 30), outcome.gas_remaining);
+    // Out of gas at the second instruction of the fused PUSH1 PUSH1.
+    const starved = try h.call(.cancun, contract, &.{}, 5);
+    try std.testing.expectEqual(evm_module.Status.halt, starved.status);
+    // Underflow at the second POP of a fused POP POP.
+    try h.database.put_account(other, 0, 1, &.{ op.PUSH1, 1, op.POP, op.POP, op.STOP });
+    const underflow = try h.call(.cancun, other, &.{}, 50_000);
+    try std.testing.expectEqual(evm_module.Status.halt, underflow.status);
 }
 
 test "evm: opcodes undefined before their fork halt" {
