@@ -16,6 +16,8 @@ const assert = std.debug.assert;
 
 /// Back to multi-peer catch-up when the follower is this far behind the schedule.
 const behind_max_blocks = 4 * el_pool.segment_blocks;
+/// Waits of 50 ms for the round-trip probes before choosing the follower.
+const probe_waits_max = 40;
 /// Re-read the peer file this often, adding new peers (`el-peers --out` appends to it).
 const reload_interval_ms = 60_000;
 
@@ -144,13 +146,21 @@ pub const Feed = struct {
         feed.parent = block.hash;
     }
 
-    /// Parks the pool and follows on the fastest peer's open connection, taken over from
-    /// its worker: a peer may refuse a reconnect or a second connection from us.
+    /// Parks the pool, measures every connected peer's round trip, and follows on the
+    /// nearest peer's open connection, taken over from its worker: a peer may refuse a
+    /// reconnect or a second connection from us.
     fn follow(feed: *Feed) !void {
         assert(feed.mode == .catch_up and feed.source == null);
         feed.pool.park();
+        // Workers finish their segment first; a round trip at the tip is tens of ms.
+        if (feed.pool.probe() > 0) {
+            for (0..probe_waits_max) |_| {
+                if (!feed.pool.probing()) break;
+                try feed.io.sleep(.fromMilliseconds(50), .awake);
+            }
+        }
         var targets: [1]el_source.Target = undefined;
-        if (feed.pool.targets_by_rate(&targets) == 0) return error.NoFollower;
+        if (feed.pool.targets_by_latency(&targets) == 0) return error.NoFollower;
         const source = try feed.allocator.create(el_source.Source);
         errdefer feed.allocator.destroy(source);
         try source.init_unconnected(feed.allocator, feed.io, targets[0], .{
@@ -162,7 +172,7 @@ pub const Feed = struct {
         // Workers finishing a segment are not lent; give them a moment.
         var target: ?el_source.Target = null;
         for (0..20) |_| {
-            target = feed.pool.lend_fastest(&source.peer);
+            target = feed.pool.lend_nearest(&source.peer);
             if (target != null) break;
             try feed.io.sleep(.fromMilliseconds(50), .awake);
         }

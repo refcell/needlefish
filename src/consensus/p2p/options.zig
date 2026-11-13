@@ -50,6 +50,16 @@ pub const Options = struct {
     bootstore: ?[]const u8 = null,
     no_bootstore: bool = false,
     unsafe_block_signer: ?primitives.Address = null,
+    /// The preset these options started from (`--p2p.profile`).
+    profile: Profile = .base,
+    /// Publish to every topic peer above the publish threshold, not only the mesh
+    /// (`--p2p.gossip.mesh.floodpublish`, base/base, default off).
+    flood_publish: bool = false,
+    /// Mesh grafts and trims prefer peers that delivered blocks first (needlefish only).
+    prefer_first_deliverers: bool = false,
+    /// `redial.known-interval` also re-dials chain nodes found by lookups that did not fit
+    /// the discovery table (needlefish only: most Base nodes are such nodes).
+    redial_discovered: bool = false,
 
     pub fn bootnode_slice(options: *const Options) []const []const u8 {
         assert(options.bootnodes_count <= bootnodes_max);
@@ -57,11 +67,60 @@ pub const Options = struct {
     }
 };
 
+/// `--p2p.profile`: the preset other `--p2p.*` flags apply over.
+pub const Profile = enum {
+    /// base/base defaults.
+    base,
+    /// Aggressive settings for a follower that wants each block as early as possible: more
+    /// peers, faster discovery and re-dialing, a wider mesh that prefers first deliverers.
+    /// Everything stays within what base/base and op-node peers accept (see
+    /// docs/lanes/p2p.md, "Low-latency profile").
+    low_latency,
+
+    pub fn preset(profile: Profile) Options {
+        return switch (profile) {
+            .base => .{},
+            .low_latency => low_latency,
+        };
+    }
+};
+
+/// The `low-latency` profile.
+pub const low_latency: Options = .{
+    .profile = .low_latency,
+    .peers_hi = 48,
+    .max_pending_outgoing = 32,
+    .gossip_mesh_d = 12,
+    .gossip_mesh_lo = 10,
+    .gossip_mesh_dhi = 20,
+    .gossip_mesh_dlazy = 12,
+    .discovery_interval_s = 1,
+    .redial = 0,
+    .pending_dial_timeout_s = 10,
+    .redial_known_interval_s = 3,
+    .flood_publish = true,
+    .prefer_first_deliverers = true,
+    .redial_discovered = true,
+};
+
+comptime {
+    assert(low_latency.gossip_mesh_lo <= low_latency.gossip_mesh_d);
+    assert(low_latency.gossip_mesh_d <= low_latency.gossip_mesh_dhi);
+    // Every established peer needs a gossip router slot (`router.peers_max` is 64).
+    assert(low_latency.peers_hi < 64);
+}
+
 pub const Error = error{ UnknownFlag, MissingValue, InvalidValue, TooManyBootnodes };
 
-/// Parses every `--p2p.*` argument in `args` over the defaults.
+/// Parses every `--p2p.*` argument in `args` over base/base defaults.
 pub fn parse(args: []const []const u8) Error!Options {
-    var options: Options = .{};
+    return parse_profile(args, .base);
+}
+
+/// Parses every `--p2p.*` argument in `args` over the `--p2p.profile` preset, or over
+/// `default` when `args` names none.
+pub fn parse_profile(args: []const []const u8, default: Profile) Error!Options {
+    var options = (try find_profile(args) orelse default).preset();
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
@@ -81,8 +140,35 @@ pub fn parse(args: []const []const u8) Error!Options {
     return options;
 }
 
+/// The last `--p2p.profile` in `args`, if any.
+fn find_profile(args: []const []const u8) Error!?Profile {
+    var found: ?Profile = null;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        const name = "--p2p.profile";
+        if (!std.mem.startsWith(u8, arg, name)) continue;
+        const rest = arg[name.len..];
+        const text = if (rest.len == 0) blk: {
+            if (index + 1 >= args.len) return error.MissingValue;
+            index += 1;
+            break :blk args[index];
+        } else if (rest[0] == '=') rest[1..] else continue;
+        found = try profile_of(text);
+    }
+    return found;
+}
+
+fn profile_of(text: []const u8) Error!Profile {
+    if (eql(text, "base")) return .base;
+    if (eql(text, "low-latency")) return .low_latency;
+    return error.InvalidValue;
+}
+
 const bool_flags = [_][]const u8{
-    "no-discovery", "scoring.topics", "topic-scoring", "ban.peers", "no-bootstore",
+    "no-discovery",        "scoring.topics",    "topic-scoring",
+    "ban.peers",           "no-bootstore",      "gossip.mesh.floodpublish",
+    "gossip.prefer-first", "redial.discovered",
 };
 
 pub fn is_bool(name: []const u8) bool {
@@ -111,6 +197,9 @@ fn apply(options: *Options, name: []const u8, value: ?[]const u8) Error!void {
         options.bootnodes_file = text;
     } else if (eql(name, "bootstore")) {
         options.bootstore = text;
+    } else if (eql(name, "profile")) {
+        // Applied first, by `find_profile` (the last one wins).
+        _ = try profile_of(text);
     } else if (eql(name, "unsafe.block.signer")) {
         options.unsafe_block_signer = primitives.Address.from_hex(text) catch
             return error.InvalidValue;
@@ -122,6 +211,9 @@ fn apply_bool(options: *Options, name: []const u8, value: bool) void {
     if (eql(name, "scoring.topics") or eql(name, "topic-scoring")) options.topic_scoring = value;
     if (eql(name, "ban.peers")) options.ban_peers = value;
     if (eql(name, "no-bootstore")) options.no_bootstore = value;
+    if (eql(name, "gossip.mesh.floodpublish")) options.flood_publish = value;
+    if (eql(name, "gossip.prefer-first")) options.prefer_first_deliverers = value;
+    if (eql(name, "redial.discovered")) options.redial_discovered = value;
 }
 
 /// Returns true when `name` is a numeric option (and stores it).
@@ -246,6 +338,27 @@ test "options: parses both value forms, bools, lists, and skips other flags" {
     try testing.expectEqualStrings("enode://b", options.bootnode_slice()[1]);
     try testing.expectEqual(score.Level.off, options.scoring);
     try testing.expectEqual(@as(u8, 0x11), options.unsafe_block_signer.?.bytes[19]);
+}
+
+test "options: profiles are presets that later flags override" {
+    const plain = try parse(&.{"--p2p.peers.hi=40"});
+    try testing.expectEqual(Profile.base, plain.profile);
+    try testing.expect(!plain.flood_publish and !plain.redial_discovered);
+    const fast = try parse(&.{ "--p2p.peers.hi=40", "--p2p.profile", "low-latency" });
+    try testing.expectEqual(Profile.low_latency, fast.profile);
+    // An explicit flag wins over the preset wherever it appears.
+    try testing.expectEqual(@as(u32, 40), fast.peers_hi);
+    try testing.expectEqual(low_latency.gossip_mesh_d, fast.gossip_mesh_d);
+    try testing.expect(fast.flood_publish and fast.prefer_first_deliverers);
+    const off = try parse(&.{
+        "--p2p.profile=low-latency",
+        "--p2p.gossip.mesh.floodpublish=false",
+    });
+    try testing.expect(!off.flood_publish and off.redial_discovered);
+    const back = try parse_profile(&.{"--p2p.profile=base"}, .low_latency);
+    try testing.expectEqual(@as(u32, 30), back.peers_hi);
+    try testing.expectError(error.InvalidValue, parse(&.{"--p2p.profile=fast"}));
+    try testing.expectError(error.MissingValue, parse(&.{"--p2p.profile"}));
 }
 
 test "options: rejects unknown flags, bad values, and missing values" {

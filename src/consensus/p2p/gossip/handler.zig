@@ -53,6 +53,10 @@ pub const Mesh = struct {
     d_low: u32 = 6,
     d_high: u32 = 12,
     d_lazy: u32 = 6,
+    /// `--p2p.gossip.mesh.floodpublish` (`Router.Config.flood_publish`).
+    flood_publish: bool = false,
+    /// `Router.Config.prefer_first_deliverers`.
+    prefer_first_deliverers: bool = false,
 };
 
 pub const Stats = struct {
@@ -144,6 +148,8 @@ pub const BlockGossip = struct {
             .d_lazy = config.mesh.d_lazy,
             .d_score = @min(4, config.mesh.d),
             .d_out = @min(2, config.mesh.d / 2),
+            .flood_publish = config.mesh.flood_publish,
+            .prefer_first_deliverers = config.mesh.prefer_first_deliverers,
             .peer_params = score.peer_params(
                 config.score_level,
                 config.topic_scoring,

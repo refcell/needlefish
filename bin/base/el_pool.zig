@@ -86,6 +86,10 @@ pub const Worker = struct {
     /// When the worker last finished a request on its connection.
     last_request_ms: i64 = 0,
     keepalives: u32 = 0,
+    /// Round trip of a one-header request (moving average; 0 before the first).
+    rtt_ms: u64 = 0,
+    /// Asked by `probe` to measure `rtt_ms` now.
+    probing: bool = false,
 
     /// Blocks per second while fetching (0 before the first segment).
     pub fn rate(worker: *const Worker) u64 {
@@ -384,7 +388,8 @@ pub const Pool = struct {
                     return job;
                 }
             }
-            if (worker.peer.connected and now - worker.last_request_ms >= keepalive_ms) {
+            const keepalive_due = now - worker.last_request_ms >= keepalive_ms;
+            if (worker.peer.connected and (worker.probing or keepalive_due)) {
                 worker.busy = true;
                 var job = pool.make_job(pool.base_segment);
                 job.keepalive = true;
@@ -481,29 +486,64 @@ pub const Pool = struct {
         worker.blocks += count;
     }
 
-    fn finish_keepalive(pool: *Pool, worker: *Worker) void {
+    /// `rtt_ms` is the request's round trip, or null when it failed.
+    fn finish_keepalive(pool: *Pool, worker: *Worker, rtt_ms: ?u64) void {
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
         defer pool.condition.broadcast(pool.io);
         assert(worker.busy);
         worker.busy = false;
+        worker.probing = false;
         worker.last_request_ms = pool.now_ms();
         worker.keepalives += 1;
+        const sample = rtt_ms orelse return;
+        // 0 means unmeasured, so a measured round trip is at least 1 ms.
+        const previous = if (worker.rtt_ms == 0) sample else worker.rtt_ms;
+        worker.rtt_ms = @max((3 * previous + sample) / 4, 1);
+        assert(worker.rtt_ms > 0);
     }
 
-    /// Lends the open connection of the fastest idle peer: swaps it with `peer` (an
-    /// unconnected one, which the worker reconnects when it next fetches). Returns the
+    /// Asks every connected worker to measure its round trip now (one header request).
+    /// Returns how many were asked; `probing` turns false once they all answered.
+    pub fn probe(pool: *Pool) u32 {
+        pool.mutex.lockUncancelable(pool.io);
+        defer pool.mutex.unlock(pool.io);
+        defer pool.condition.broadcast(pool.io);
+        var asked: u32 = 0;
+        for (pool.workers[0..pool.worker_count]) |worker| {
+            if (!worker.peer.connected) continue;
+            worker.probing = true;
+            asked += 1;
+        }
+        assert(asked <= pool.worker_count);
+        return asked;
+    }
+
+    pub fn probing(pool: *Pool) bool {
+        pool.mutex.lockUncancelable(pool.io);
+        defer pool.mutex.unlock(pool.io);
+        for (pool.workers[0..pool.worker_count]) |worker| {
+            if (worker.probing and worker.peer.connected) return true;
+        }
+        return false;
+    }
+
+    /// Lends the open connection of the nearest idle peer (`nearer`): swaps it with `peer`
+    /// (an unconnected one, which the worker reconnects when it next fetches). Returns the
     /// lent peer's target, or null when no idle worker is connected. Park first.
-    pub fn lend_fastest(pool: *Pool, peer: *el_source.Peer) ?el_source.Target {
+    pub fn lend_nearest(pool: *Pool, peer: *el_source.Peer) ?el_source.Target {
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
         assert(pool.parked and !peer.connected);
         var best: ?*Worker = null;
         for (pool.workers[0..pool.worker_count]) |worker| {
             if (worker.busy or !worker.peer.connected) continue;
-            if (best == null or worker.rate() > best.?.rate()) best = worker;
+            if (best == null or nearer({}, worker, best.?)) best = worker;
         }
         const worker = best orelse return null;
+        std.debug.print("el-pool: lending peer {s}: rtt {d} ms, {d} blocks/s\n", .{
+            worker.label, worker.rtt_ms, worker.rate(),
+        });
         std.mem.swap(el_source.Peer, &worker.peer, peer);
         worker.peer.quiet = true;
         peer.quiet = false;
@@ -511,14 +551,14 @@ pub const Pool = struct {
         return worker.target;
     }
 
-    /// Every peer's target, fastest fetch rate first, into `output`; returns how many.
-    pub fn targets_by_rate(pool: *Pool, output: []el_source.Target) usize {
+    /// Every peer's target, nearest first (`nearer`), into `output`; returns how many.
+    pub fn targets_by_latency(pool: *Pool, output: []el_source.Target) usize {
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
         var order: [workers_max]*Worker = undefined;
         const workers = order[0..pool.worker_count];
         @memcpy(workers, pool.workers[0..pool.worker_count]);
-        std.mem.sort(*Worker, workers, {}, faster);
+        std.mem.sort(*Worker, workers, {}, nearer);
         const count = @min(output.len, workers.len);
         for (output[0..count], workers[0..count]) |*target, worker| target.* = worker.target;
         return count;
@@ -529,10 +569,12 @@ pub const Pool = struct {
         defer pool.mutex.unlock(pool.io);
         for (pool.workers[0..pool.worker_count]) |worker| {
             std.debug.print("  peer {s}: {d} blocks, {d} blocks/s fetching, {d} failures, " ++
-                "{d} behind, {d} rejected, {d} hedges, {d} keepalives, connected {}\n", .{
-                worker.label,    worker.blocks,     worker.rate(),
-                worker.failures, worker.behind,     worker.rejected,
-                worker.hedges,   worker.keepalives, worker.peer.connected,
+                "{d} behind, {d} rejected, {d} hedges, {d} keepalives, rtt {d} ms, " ++
+                "connected {}\n", .{
+                worker.label,          worker.blocks,     worker.rate(),
+                worker.failures,       worker.behind,     worker.rejected,
+                worker.hedges,         worker.keepalives, worker.rtt_ms,
+                worker.peer.connected,
             });
         }
     }
@@ -550,7 +592,14 @@ pub fn last_block_at(rollup: *const RollupConfig, time_ms: u64) u64 {
     return low;
 }
 
-fn faster(_: void, a: *Worker, b: *Worker) bool {
+/// Following the tip asks for one block at a time, so the round trip sets the lag, not
+/// the bulk rate: lower `rtt_ms` first, peers with no measurement after those with one,
+/// then the faster fetch rate.
+fn nearer(_: void, a: *Worker, b: *Worker) bool {
+    if (a.rtt_ms != b.rtt_ms) {
+        if (a.rtt_ms == 0 or b.rtt_ms == 0) return b.rtt_ms == 0;
+        return a.rtt_ms < b.rtt_ms;
+    }
     return a.rate() > b.rate();
 }
 
@@ -568,8 +617,11 @@ fn work(worker: *Worker) void {
     const pool = worker.pool;
     while (pool.take(worker)) |job| {
         if (job.keepalive) {
-            worker.peer.keepalive(job.first) catch worker.peer.close();
-            pool.finish_keepalive(worker);
+            const started = pool.now_ms();
+            const answered = if (worker.peer.keepalive(job.first)) true else |_| false;
+            if (!answered) worker.peer.close();
+            const elapsed: u64 = @intCast(@max(pool.now_ms() - started, 0));
+            pool.finish_keepalive(worker, if (answered) elapsed else null);
             continue;
         }
         const started = pool.now_ms();
@@ -594,4 +646,21 @@ test "el-pool: the tip estimate inverts the block schedule" {
         try std.testing.expectEqual(number, last_block_at(&rollup, time_ms));
         try std.testing.expectEqual(number - 1, last_block_at(&rollup, time_ms - 1));
     }
+}
+
+test "el-pool: the follower is the nearest peer, unmeasured peers last" {
+    var workers: [3]Worker = undefined;
+    // Fast bulk peer far away, slow bulk peer nearby, an unmeasured peer.
+    for (&workers, [_]u64{ 167, 20, 0 }, [_]u64{ 92, 23, 500 }) |*worker, rtt, rate| {
+        worker.rtt_ms = rtt;
+        worker.blocks = rate;
+        worker.fetch_ms = 1000;
+    }
+    try std.testing.expect(nearer({}, &workers[1], &workers[0]));
+    try std.testing.expect(!nearer({}, &workers[0], &workers[1]));
+    try std.testing.expect(nearer({}, &workers[0], &workers[2]));
+    try std.testing.expect(!nearer({}, &workers[2], &workers[0]));
+    // Equal round trips: the faster peer first.
+    workers[2].rtt_ms = 20;
+    try std.testing.expect(nearer({}, &workers[2], &workers[1]));
 }

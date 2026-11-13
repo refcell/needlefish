@@ -82,7 +82,10 @@ pub fn service_config(
             .d_low = options.gossip_mesh_lo,
             .d_high = options.gossip_mesh_dhi,
             .d_lazy = options.gossip_mesh_dlazy,
+            .flood_publish = options.flood_publish,
+            .prefer_first_deliverers = options.prefer_first_deliverers,
         },
+        .redial_discovered = options.redial_discovered,
         .score_level = options.scoring,
         .topic_scoring = options.topic_scoring,
     };

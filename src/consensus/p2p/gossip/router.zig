@@ -65,6 +65,12 @@ pub const Config = struct {
     /// v1.2: messages larger than this trigger IDONTWANT to mesh peers (rust-libp2p
     /// `idontwant_message_size_threshold`).
     idontwant_size_min: u32 = 1000,
+    /// Publish to every topic peer above `publish_threshold`, not only the mesh (libp2p
+    /// `flood_publish`; base/base `--p2p.gossip.mesh.floodpublish`, default off).
+    flood_publish: bool = false,
+    /// Grafts and mesh trims prefer peers with more first deliveries (needlefish only):
+    /// with topic scoring off every score ties, and the choice is otherwise random.
+    prefer_first_deliverers: bool = false,
     message_id: MessageIdFn,
     message_id_context: ?*anyopaque = null,
     thresholds: score.Thresholds = score.thresholds,
@@ -127,6 +133,9 @@ const Peer = struct {
     queue_head: u32 = 0,
     queue_count: u32 = 0,
     dropped: u64 = 0,
+    /// Valid messages this peer delivered before any other peer (local only; scoring
+    /// counts them only with topic scoring on).
+    first_deliveries: u64 = 0,
     /// The peer negotiated `/meshsub/1.2.0` and understands IDONTWANT.
     idontwant_capable: bool = false,
     /// Ids the peer told us not to send (ring; covers ids we have not seen yet).
@@ -217,6 +226,8 @@ pub const Stats = struct {
     prunes_received: u64 = 0,
     ihaves_received: u64 = 0,
     iwants_received: u64 = 0,
+    /// Message ids we asked for in IWANT after an IHAVE.
+    iwant_ids_sent: u64 = 0,
 };
 
 pub const Router = struct {
@@ -747,6 +758,10 @@ pub const Router = struct {
     }
 
     fn credit_deliveries(router: *Router, delivery: *const Delivery) void {
+        // A source that disconnected meanwhile left `peers` (`remove_peer`).
+        if (delivery.source != no_source and in_set(delivery.peers, delivery.source)) {
+            router.peer(delivery.source).first_deliveries += 1;
+        }
         const params = router.topic_params() orelse return;
         var peers = delivery.peers;
         while (peers != 0) : (peers &= peers - 1) {
@@ -797,11 +812,13 @@ pub const Router = struct {
             .first_ns = now_ns,
             .peers = 0,
         };
-        // Without a mesh (e.g. right after joining), send to up to D topic peers.
-        if (router.mesh[topic] == 0) {
+        // Flood publishing, or without a mesh (e.g. right after joining): send to topic
+        // peers directly, every one or up to D.
+        const flood = router.config.flood_publish;
+        if (flood or router.mesh[topic] == 0) {
             const threshold = router.config.thresholds.publish_threshold;
             const eligible = router.candidates(topic, threshold);
-            delivery.peers = router.pick_random(eligible, router.config.d);
+            delivery.peers = if (flood) eligible else router.pick_random(eligible, router.config.d);
             var targets = delivery.peers;
             while (targets != 0) : (targets &= targets - 1) {
                 router.stats.slow_peer += @intFromBool(router.peers[@ctz(targets)].enqueue(&id));
@@ -908,7 +925,7 @@ pub const Router = struct {
         const size = @popCount(router.mesh[topic]);
         if (size < config.d_low) {
             const available = router.graftable(topic, now_ns, 0);
-            var picked = router.pick_random(available, config.d - size);
+            var picked = router.pick_mesh(available, config.d - size);
             while (picked != 0) : (picked &= picked - 1) {
                 router.graft_peer(@intCast(@ctz(picked)), topic, now_ns);
             }
@@ -971,7 +988,7 @@ pub const Router = struct {
             keep |= router.best_peer(router.mesh[topic] & ~keep) orelse break;
         }
         const others = router.mesh[topic] & ~keep;
-        keep |= router.pick_random(others, router.config.d - @popCount(keep));
+        keep |= router.pick_mesh(others, router.config.d - @popCount(keep));
         keep = router.swap_in_outbound(topic, keep);
         var prune = router.mesh[topic] & ~keep;
         while (prune != 0) : (prune &= prune - 1) {
@@ -999,9 +1016,40 @@ pub const Router = struct {
         var scan = set;
         while (scan != 0) : (scan &= scan - 1) {
             const slot: Slot = @intCast(@ctz(scan));
-            if (router.peers[slot].score > router.peers[best].score) best = slot;
+            const candidate = &router.peers[slot];
+            const current = &router.peers[best];
+            const tie = candidate.score == current.score and router.config.prefer_first_deliverers;
+            if (candidate.score > current.score or
+                (tie and candidate.first_deliveries > current.first_deliveries)) best = slot;
         }
         return bit(best);
+    }
+
+    /// At most `count` members of `set` for the mesh: random, or with
+    /// `prefer_first_deliverers` the peers with the most first deliveries (random among
+    /// those with none).
+    fn pick_mesh(router: *Router, set: PeerSet, count: u32) PeerSet {
+        if (!router.config.prefer_first_deliverers) return router.pick_random(set, count);
+        var remaining = set;
+        var result: PeerSet = 0;
+        var picked: u32 = 0;
+        while (remaining != 0 and picked < count) : (picked += 1) {
+            var best: ?Slot = null;
+            var scan = remaining;
+            while (scan != 0) : (scan &= scan - 1) {
+                const slot: Slot = @intCast(@ctz(scan));
+                const deliveries = router.peers[slot].first_deliveries;
+                if (deliveries == 0) continue;
+                if (best == null or deliveries > router.peers[best.?].first_deliveries) best = slot;
+            }
+            const slot = best orelse break;
+            result |= bit(slot);
+            remaining &= ~bit(slot);
+        }
+        result |= router.pick_random(remaining, count - @popCount(result));
+        assert(@popCount(result) <= count);
+        assert(result & ~set == 0);
+        return result;
     }
 
     fn opportunistic_graft(router: *Router, topic: u8, now_ns: u64) void {
@@ -1137,6 +1185,7 @@ pub const Router = struct {
                 router.id_slices[index] = id;
             }
             try message.add_iwant(router.id_slices[0..target.iwant_count]);
+            router.stats.iwant_ids_sent += target.iwant_count;
             target.iwant_count = 0;
         }
         if (target.idontwant_out_count > 0) {

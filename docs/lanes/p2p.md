@@ -492,6 +492,65 @@ behind a small interface and switch later.
 - Bans stay base/base-shaped (discovery ban + disconnect, no TCP gate): a banned peer may
   redial, but its retained gossipsub score keeps it graylisted and it is banned again.
 
+- Low-latency profile (`--p2p.profile low-latency`, `options.low_latency`): the default for
+  receive-only followers (`base unsafe-watch`, `el-run`/`el-fetch --gossip`);
+  `--p2p.profile base` restores base/base defaults, and any explicit `--p2p.*` flag wins
+  over the preset. `base consensus` keeps base/base defaults. Values (base/base in
+  brackets): `peers.hi` 48 (30), `max-pending-outgoing` 32 (16), `pending-dial.timeout`
+  10 s (30 s), `discovery.interval` 1 s (5 s), `redial` unlimited (500 per 60 min),
+  `redial.known-interval` 3 s (off), `redial.discovered` on, mesh D/Dlo/Dhi/Dlazy
+  12/10/20/12 (8/6/12/6), flood publish on (off), `gossip.prefer-first` on.
+  - Why: an outbound-only node gets only the slots peers free up, and on Base mainnet a
+    lookup finds most Base nodes outside our k-buckets. `redial.discovered` keeps up to
+    512 discovered chain records and re-dials them in turn, as many as the pending-dial
+    limit allows every 3 s, so a freed slot is taken within seconds, not at the next
+    lookup that happens to return that node.
+  - Mesh choice prefers first deliverers (`Router.Config.prefer_first_deliverers`):
+    grafts and trims pick the peers that delivered the most blocks first, random among
+    the rest. Topic scoring stays off like base/base, so scores tie and the choice was
+    random before. This changes only whom we graft, not anyone's score.
+  - Compatibility: nothing here changes what peers see from us except more connection
+    attempts and GRAFTs. Full peers answer a dial with a yamux go-away before identify
+    and score nothing; we never GRAFT inside a PRUNE backoff (a behaviour penalty).
+    Validation, scoring weights and thresholds, the 500 ms heartbeat and IDONTWANT
+    (meshsub 1.2, messages over 1000 bytes) are unchanged: the heartbeat paces our own
+    mesh repair and IHAVEs, not when peers send to us. Flood publish matters only to a
+    publisher: a sequencer then sends each block to every topic peer. That also spreads a
+    stale catch-up block (`BUG(p2p)`, docs/lanes/dst-fuzz.md) to more peers at once, so
+    the profile is not for a sequencer until that is resolved.
+  - Measured on Base mainnet from gene, outbound-only, `base unsafe-watch --duration 600`,
+    one ReleaseFast build with only `--p2p.profile` changed. Lag is arrival minus the
+    block's timestamp (ms, p50/p90/p99/max); meshed is the average number of peers in our
+    mesh. The two side-by-side pairs ran at the same time (ports swapped between them);
+    the sequential pairs ran back to back.
+
+    | run | profile | blocks | lag p50/p90/p99/max | peers | meshed | gaps | stale |
+    |---|---|---|---|---|---|---|---|
+    | side by side 1 | base | 1,769 | 6984/10762/16686/26263 | 1.9 | 1.0 | 28 | 96 |
+    | side by side 1 | low-latency | 2,790 | 1226/6915/11388/12526 | 3.4 | 2.8 | 77 | 384 |
+    | side by side 2 | base | 2,170 | 699/2478/6820/11328 | 2.2 | 0.4 | 273 | 678 |
+    | side by side 2 | low-latency | 2,727 | 6/340/2014/3566 | 3.7 | 2.1 | 21 | 39 |
+    | sequential 1 | base | 2,961 | 71/706/4870/10448 | 3.5 | 2.2 | 82 | 142 |
+    | sequential 1 | low-latency | 2,861 | 45/6480/14224/17979 | 4.4 | 4.1 | 53 | 146 |
+    | sequential 2 | low-latency | 2,678 | 69/18564/43413/45453 | 3.0 | 1.9 | 10 | 11 |
+    | sequential 2 | base | 1,906 | 155/13241/23668/37977 | 3.0 | 1.1 | 54 | 202 |
+
+    The profile reliably finds more peers and meshes about twice as many, and its median
+    and last-five-minute lag are lower in every pair. Run-to-run variance (which peers free
+    a slot for an outbound-only node) is larger than the settings, and the tails come from
+    stretches where the only mesh peer relays late: in sequential 2 one op-node peer fell
+    up to 45 s behind and we rejected 33 of its blocks as `timestamp_past` (our score of
+    it, not its score of us). 0 bad signers and no rejections of ours in any run.
+  - devp2p fallback (`el_pool`/`el_feed`): the follow peer is now the one with the lowest
+    round trip (a one-header request each connected peer answers when the pool parks),
+    not the highest bulk rate: on Base mainnet the 100 and 77 blocks/s peers answered in
+    88 and 297 ms, the nearest in 17 to 19 ms. Racing several devp2p peers was not built:
+    gossip now delivers almost every block first (the live mainnet el-run executed 97 %
+    of its tip blocks from gossip, which led devp2p by 546 ms on average), so devp2p only
+    fills gaps. el-run's fallback timing (250 ms past the slot, then every 2 s; 25 ms
+    polls) is unchanged: its tip lag is p50 20 ms and its tail is execution stalls on a
+    busy disk, not the network.
+
 ## Log
 - 2026-11-05: lane created by coordinator.
 - 2026-11-05: `peers` identity: ENR (EIP-778 v4, opstack key, text form), peer ids,
@@ -572,3 +631,4 @@ behind a small interface and switch later.
 - 2026-11-05: discv5 table refuses stale-record endpoint moves.
 - 2026-11-06: first live Base Sepolia gossip blocks (`base unsafe-watch`); known-node redial.
 - 2026-11-11: discovery publishes every lookup result; outbound-only mainnet gossip works.
+- 2026-11-12: low-latency p2p profile for followers; devp2p follows the nearest peer.

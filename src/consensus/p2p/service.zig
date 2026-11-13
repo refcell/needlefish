@@ -65,6 +65,11 @@ pub const Config = struct {
     /// dials only what each lookup returns). A node behind NAT gets no inbound peers, and
     /// busy peers refuse outbound ones until a slot frees, so it must keep asking.
     redial_known_interval_ns: u64 = 0,
+    /// Re-dial from every chain record discovery published (`discovered_records_max`, in
+    /// turn) instead of only discovery-table entries: lookups find most Base nodes outside
+    /// the k-buckets, and a node that refused us once is otherwise dialed again only when
+    /// a later lookup returns it (needlefish only, `--p2p.redial.discovered`).
+    redial_discovered: bool = false,
     mcache: @import("gossip/mcache.zig").Config = .{},
     /// Compressed accepted blocks held until consensus pops them (`handler.Config`).
     accepted_bytes: u32 = 32 * (1 << 20),
@@ -72,6 +77,9 @@ pub const Config = struct {
     score_level: @import("peers/score.zig").Level = .light,
     topic_scoring: bool = true,
 };
+
+/// Chain records remembered for `Config.redial_discovered` (about 350 KiB).
+pub const discovered_records_max = 512;
 
 pub const Command = union(enum) {
     /// Open a TCP connection and run the libp2p pipeline as dialer.
@@ -203,6 +211,12 @@ pub const Service = struct {
     next_gater_prune_ns: u64 = 0,
     next_dial_prune_ns: u64 = 0,
     next_redial_known_ns: u64 = 0,
+    /// Chain records discovery published, for `redial_discovered` (empty when off): a ring
+    /// that replaces the oldest record, and the next one `redial_known` dials.
+    discovered: []enr.Record = &.{},
+    discovered_count: u32 = 0,
+    discovered_next: u32 = 0,
+    redial_cursor: u32 = 0,
     /// Time of the latest `tick` (for calls that carry no time, like admin RPC).
     now_ns: u64 = 0,
     stats: Stats = .{},
@@ -252,10 +266,15 @@ pub const Service = struct {
         service.limits = try connections.Manager.init(allocator, config.limits);
         errdefer service.limits.deinit(allocator);
         service.peerstore = try Peerstore.init(allocator, config.peerstore_capacity);
+        errdefer service.peerstore.deinit(allocator);
+        if (config.redial_discovered) {
+            service.discovered = try allocator.alloc(enr.Record, discovered_records_max);
+        }
         return service;
     }
 
     pub fn destroy(service: *Service, allocator: std.mem.Allocator) void {
+        allocator.free(service.discovered);
         service.peerstore.deinit(allocator);
         service.limits.deinit(allocator);
         service.gater.deinit(allocator);
@@ -311,8 +330,23 @@ pub const Service = struct {
                 service.count_dial_error(.invalid_enr);
                 continue;
             };
+            if (service.discovered.len > 0) service.remember(record);
             service.dial(&address, now_ns);
         }
+    }
+
+    /// Keeps `record` for `redial_known`: replaces the same node's record, else the oldest.
+    fn remember(service: *Service, record: *const enr.Record) void {
+        assert(service.discovered.len == discovered_records_max);
+        // The same key is the same node (comparing node ids would decompress every key).
+        for (service.discovered[0..service.discovered_count]) |*known| {
+            if (!std.mem.eql(u8, &known.public_key, &record.public_key)) continue;
+            if (record.sequence >= known.sequence) known.* = record.*;
+            return;
+        }
+        service.discovered[service.discovered_next] = record.*;
+        service.discovered_next = (service.discovered_next + 1) % discovered_records_max;
+        service.discovered_count = @min(service.discovered_count + 1, discovered_records_max);
     }
 
     /// Dials `address` unless the gater, limits, or an existing connection forbid it.
@@ -547,8 +581,11 @@ pub const Service = struct {
     }
 
     /// Dials every node in the discovery table that is on this chain and not connected,
-    /// subject to the gater and the pending-dial limit like any other dial.
+    /// subject to the gater and the pending-dial limit like any other dial. With
+    /// `redial_discovered`, dials the remembered records instead, in turn from where the
+    /// last round stopped, until the pending-dial limit is reached.
     fn redial_known(service: *Service, now_ns: u64) void {
+        if (service.discovered.len > 0) return service.redial_discovered(now_ns);
         const chain_id = service.config.rollup.l2_chain_id;
         var entries: [32]*const disc.table.Entry = undefined;
         var dialed: u32 = 0;
@@ -567,6 +604,29 @@ pub const Service = struct {
         }
         service.stats.redials += dialed;
         assert(distance == 257);
+    }
+
+    fn redial_discovered(service: *Service, now_ns: u64) void {
+        const count = service.discovered_count;
+        assert(count <= discovered_records_max);
+        const limits = &service.limits;
+        var visited: u32 = 0;
+        while (visited < count) : (visited += 1) {
+            if (limits.pending_outbound >= limits.limits.pending_outbound_max) break;
+            const index = service.redial_cursor % count;
+            service.redial_cursor = (index + 1) % count;
+            const record = &service.discovered[index];
+            const address = multiaddr.from_enr(record) orelse continue;
+            const peer = address.peer() orelse continue;
+            if (service.slot_of(&peer) != null) continue;
+            if (service.gater.is_dialing(peer)) continue;
+            const banned = service.discovery.bans_count > 0 and
+                service.discovery.is_banned(record.node_id(), now_ns);
+            if (banned) continue;
+            service.dial(&address, now_ns);
+            service.stats.redials += 1;
+        }
+        assert(visited <= count);
     }
 
     /// Disconnects peers under the ban threshold and bans them in discovery.

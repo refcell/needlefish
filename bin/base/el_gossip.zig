@@ -6,6 +6,9 @@
 //! reports each block it accepts on its chain. Every height seen on both sides is compared:
 //! equal hashes anchor the block to the sequencer; a different hash is a conflict.
 //!
+//! The network uses the `low-latency` p2p profile unless `--p2p.profile base` is given
+//! (`p2p.options.low_latency`).
+//!
 //! Gossip delivery is best effort, so a height with no gossip is unanchored, not failed.
 //! `Anchor` is the pure bookkeeping: a ring of recent heights, each holding up to
 //! `hashes_max` signed hashes and the caller's hash, so gossip may arrive before or after
@@ -316,7 +319,8 @@ pub const Gossip = struct {
         args: []const []const u8,
     ) !*Gossip {
         if (spec) |value| assert(value.chain_id == chain.chain_id);
-        var options = try p2p.options.parse(args);
+        // A follower only receives: the low-latency preset unless `--p2p.profile base`.
+        var options = try p2p.options.parse_profile(args, .low_latency);
         // Without inbound reachability (NAT), keep asking known peers for a slot.
         if (options.redial_known_interval_s == 0) options.redial_known_interval_s = 10;
         const gossip = try allocator.create(Gossip);

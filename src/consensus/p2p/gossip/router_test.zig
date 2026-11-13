@@ -281,6 +281,49 @@ test "router: mesh keeps the outbound quota when trimmed" {
     }
 }
 
+test "router: the mesh prefers first deliverers; flood publish reaches peers outside it" {
+    const cluster = try std.testing.allocator.create(Cluster);
+    defer std.testing.allocator.destroy(cluster);
+    try cluster.init(6, 21, .{
+        .message_id = test_message_id,
+        .d = 2,
+        .d_low = 2,
+        .d_high = 3,
+        .d_score = 0,
+        .d_out = 0,
+        .prefer_first_deliverers = true,
+        .mcache = .{ .entries_max = 256, .arena_bytes = 1 << 20 },
+    });
+    defer cluster.deinit();
+    for (1..6) |node| cluster.connect(0, node);
+    try cluster.flush();
+    // Nodes 3 and 5 each deliver blocks to node 0 first; nodes 1, 2 and 4 never do.
+    var payload: [32]u8 = @splat(7);
+    for ([_]usize{ 3, 3, 5, 3, 5 }, 0..) |origin, round| {
+        payload[0] = @truncate(round);
+        _ = try cluster.routers[origin].publish(0, &payload, cluster.now_ns);
+        try cluster.flush();
+    }
+    try std.testing.expectEqual(@as(u32, 5), cluster.received[0]);
+    const router = &cluster.routers[0];
+    try std.testing.expectEqual(@as(u64, 0), router.mesh_peers(0));
+    cluster.now_ns += 500 * ns_per_ms;
+    router.heartbeat(cluster.now_ns);
+    const first = (@as(u64, 1) << @intCast(cluster.slots[0][3].?)) |
+        (@as(u64, 1) << @intCast(cluster.slots[0][5].?));
+    try std.testing.expectEqual(first, router.mesh_peers(0));
+    // The heartbeat's IHAVEs let nodes 1, 2 and 4 fetch the earlier blocks first.
+    try cluster.flush();
+    const before = cluster.received;
+    // Flood publish: every topic peer gets it at once, not only the two mesh peers.
+    router.config.flood_publish = true;
+    _ = try router.publish(0, "flooded", cluster.now_ns);
+    try cluster.flush();
+    for (1..6) |node| {
+        try std.testing.expectEqual(before[node] + 1, cluster.received[node]);
+    }
+}
+
 test "router: IDONTWANT is sent for large messages and honored when forwarding" {
     var prng = Prng.init(4);
     var router = try Router.init(std.testing.allocator, scored_config(), prng.random());

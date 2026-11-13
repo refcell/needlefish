@@ -8,6 +8,10 @@
 //!                       [--quiet] [--archive <path>] [--p2p.* ...]
 //!     base unsafe-watch --check-archive <path> [--chain ...]
 //!
+//! `--p2p.*` flags apply over the `low-latency` profile (`p2p.options.low_latency`): more
+//! peers, faster discovery and re-dialing, a wider mesh. `--p2p.profile base` restores
+//! base/base defaults.
+//!
 //! `--archive` appends every accepted block, as gossiped, to a gossip archive
 //! (`p2p.gossip.archive`), so execution can replay a p2p-only block stream later.
 //! `--check-archive` re-verifies such a file offline (signer, block hash, parent links).
@@ -194,7 +198,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         return 2;
     };
     const rollup = rollup_for(flags.chain);
-    var options = try p2p.options.parse(args);
+    // A watcher only receives, so it takes the low-latency preset unless told otherwise.
+    var options = try p2p.options.parse_profile(args, .low_latency);
     const signer = options.unsafe_block_signer orelse flags.chain.unsafe_block_signer.?;
     if (flags.check_archive) |path| return check_archive(init, &rollup, signer, path);
     // Without inbound reachability (NAT), keep asking known peers for a slot.
@@ -440,9 +445,10 @@ fn report_network(network: *const Network) void {
     for (&service.connected, 0..) |*connection, slot| {
         if (!connection.active) continue;
         const index: p2p.gossip.router.Slot = @intCast(slot);
-        std.debug.print("  peer {d} agent {s} topics 0b{b:0>4} mesh 0b{b:0>4}\n", .{
-            slot,                      connection.info.agent_version.slice(),
-            router.peers[slot].topics, mesh_topics(router, index),
+        std.debug.print("  peer {d} agent {s} topics 0b{b:0>4} mesh 0b{b:0>4} first {d}\n", .{
+            slot,                                connection.info.agent_version.slice(),
+            router.peers[slot].topics,           mesh_topics(router, index),
+            router.peers[slot].first_deliveries,
         });
         const info = &connection.info;
         for (info.protocols[0..info.protocols_count]) |*name| {
