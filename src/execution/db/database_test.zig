@@ -67,7 +67,47 @@ const addresses_max = 32;
 const slots_per_account = 8;
 const sequences_max = 16 * 1024;
 const known_blocks_max = 64;
-const ticks_max = 200_000;
+
+/// Drives a `Database` over `SimStorage`; shared by the database test files.
+pub const drive = struct {
+    const ticks_max = 400_000;
+
+    pub fn tick_until(
+        db: *const Database,
+        sim: *SimStorage,
+        comptime done: fn (*const Database) bool,
+    ) !void {
+        var ticks: u32 = 0;
+        while (!done(db)) : (ticks += 1) {
+            if (ticks >= ticks_max) return error.Timeout;
+            sim.tick();
+        }
+    }
+
+    pub fn not_formatting(db: *const Database) bool {
+        return db.phase != .formatting;
+    }
+
+    pub fn not_opening(db: *const Database) bool {
+        return db.phase != .opening;
+    }
+
+    pub fn idle(db: *const Database) bool {
+        return db.idle();
+    }
+
+    /// No checkpoint wanted or running, and nothing else in flight.
+    pub fn settled(db: *const Database) bool {
+        return !db.checkpoint_wanted and db.engine.checkpoint_phase == .idle and db.idle();
+    }
+
+    pub fn open(db: *Database, sim: *SimStorage) !void {
+        db.open();
+        try tick_until(db, sim, not_opening);
+        if (db.open_error) |err| return err;
+        try testing.expectEqual(database.Phase.ready, db.phase);
+    }
+};
 
 fn address_of(index: u64) state_module.Address {
     var address: state_module.Address = @splat(0x11);
@@ -137,24 +177,12 @@ const Harness = struct {
     }
 
     fn tick_until(self: *Harness, comptime done: fn (*const Database) bool) !void {
-        var ticks: u32 = 0;
-        while (!done(&self.db)) : (ticks += 1) {
-            if (ticks >= ticks_max) return error.Timeout;
-            self.sim.tick();
-        }
+        return drive.tick_until(&self.db, self.sim, done);
     }
 
-    fn not_formatting(db: *const Database) bool {
-        return db.phase != .formatting;
-    }
-
-    fn not_opening(db: *const Database) bool {
-        return db.phase != .opening;
-    }
-
-    fn idle(db: *const Database) bool {
-        return db.idle();
-    }
+    const not_formatting = drive.not_formatting;
+    const not_opening = drive.not_opening;
+    const idle = drive.idle;
 
     /// Formats, opens, and commits a genesis block.
     fn format(self: *Harness, format_id: u128) !void {
@@ -176,10 +204,7 @@ const Harness = struct {
     }
 
     fn open(self: *Harness) !void {
-        self.db.open();
-        try self.tick_until(not_opening);
-        if (self.db.open_error) |err| return err;
-        try testing.expectEqual(database.Phase.ready, self.db.phase);
+        return drive.open(&self.db, self.sim);
     }
 
     /// Simulates a restart: a fresh database value over the same storage.

@@ -27,6 +27,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 
 const database = @import("database.zig");
+const drive = @import("database_test.zig").drive;
 const storage = @import("storage/storage.zig");
 const SimStorage = @import("storage/sim_storage.zig").SimStorage;
 const state_module = @import("state.zig");
@@ -187,28 +188,13 @@ const Node = struct {
     }
 
     fn tick_until(self: *Node, comptime done: fn (*const Database) bool) !void {
-        var ticks: u32 = 0;
-        while (!done(&self.db)) : (ticks += 1) {
-            if (ticks >= ticks_max) return error.Timeout;
-            self.sim.tick();
-        }
+        return drive.tick_until(&self.db, self.sim, done);
     }
 
-    fn not_formatting(db: *const Database) bool {
-        return db.phase != .formatting;
-    }
-
-    fn not_opening(db: *const Database) bool {
-        return db.phase != .opening;
-    }
-
-    fn idle(db: *const Database) bool {
-        return db.idle();
-    }
-
-    fn settled(db: *const Database) bool {
-        return !db.checkpoint_wanted and db.engine.checkpoint_phase == .idle and db.idle();
-    }
+    const not_formatting = drive.not_formatting;
+    const not_opening = drive.not_opening;
+    const idle = drive.idle;
+    const settled = drive.settled;
 
     fn format(self: *Node, format_id: u128) !void {
         self.db.format(format_id);
@@ -217,10 +203,7 @@ const Node = struct {
     }
 
     fn open(self: *Node) !void {
-        self.db.open();
-        try self.tick_until(not_opening);
-        if (self.db.open_error) |err| return err;
-        try testing.expectEqual(database.Phase.ready, self.db.phase);
+        return drive.open(&self.db, self.sim);
     }
 
     fn reopen(self: *Node) !void {

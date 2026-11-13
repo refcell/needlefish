@@ -26,6 +26,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 
 const database = @import("database.zig");
+const drive = @import("database_test.zig").drive;
 const storage = @import("storage/storage.zig");
 const superblock_module = @import("storage/superblock.zig");
 const checkpoint_module = @import("storage/checkpoint.zig");
@@ -107,7 +108,6 @@ const overlay_config: overlay_module.Config = .{
 const addresses_max = 32;
 const sequences_max = 64 * 1024;
 const known_blocks_max = 64;
-const ticks_max = 400_000;
 /// Build-time caps well below the state's, so blocks applied later (reorgs) still fit.
 const codes_cap = 160;
 const code_bytes_cap = 256 * 1024;
@@ -229,24 +229,12 @@ const Harness = struct {
     }
 
     fn tick_until(self: *Harness, comptime done: fn (*const Database) bool) !void {
-        var ticks: u32 = 0;
-        while (!done(&self.db)) : (ticks += 1) {
-            if (ticks >= ticks_max) return error.Timeout;
-            self.sim.tick();
-        }
+        return drive.tick_until(&self.db, self.sim, done);
     }
 
-    fn not_formatting(db: *const Database) bool {
-        return db.phase != .formatting;
-    }
-
-    fn not_opening(db: *const Database) bool {
-        return db.phase != .opening;
-    }
-
-    fn idle(db: *const Database) bool {
-        return db.idle();
-    }
+    const not_formatting = drive.not_formatting;
+    const not_opening = drive.not_opening;
+    const idle = drive.idle;
 
     fn format(self: *Harness, format_id: u128) !void {
         self.db.format(format_id);
@@ -264,10 +252,7 @@ const Harness = struct {
     }
 
     fn open(self: *Harness) !void {
-        self.db.open();
-        try self.tick_until(not_opening);
-        if (self.db.open_error) |err| return err;
-        try testing.expectEqual(database.Phase.ready, self.db.phase);
+        return drive.open(&self.db, self.sim);
     }
 
     fn reopen(self: *Harness) !void {
