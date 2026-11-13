@@ -38,6 +38,11 @@ GAME_INTERVAL=${GAME_INTERVAL:-1800}
 # and the proving time with room for a stalled prover to catch up: 16384 blocks is 55 min.
 # A game whose blocks leave the window can never be proven, and every later game waits on it.
 WITNESS_WINDOW=${WITNESS_WINDOW:-16384}
+# Blocks the sequencer EL keeps across a restart. A durable `base node` keeps 1024 unless its
+# proofs window is longer, and a consensus node resetting its pipeline after an engine restart
+# walks its safe head back one channel timeout of L1 origins (50 L1 blocks, about 3000 L2
+# blocks): with fewer the sequencer can never resume.
+SEQ_RETAIN=${SEQ_RETAIN:-8192}
 # The deploy lands well before the L2 starts, so its fork activations are history by then.
 GENESIS_LEAD_S=${GENESIS_LEAD_S:-1200}
 
@@ -356,7 +361,8 @@ cmd_up() {
   fi
   unit seq-el "$BASE" node --chain "$CONFIG/l2-genesis.json" --datadir "$NF_L2_DIR/seq-el" \
     --http.port "$PORT_SEQ_HTTP" --authrpc.port "$PORT_SEQ_ENGINE" \
-    --authrpc.jwtsecret "$CONFIG/jwt.hex" --builder.enabled
+    --authrpc.jwtsecret "$CONFIG/jwt.hex" --builder.enabled \
+    --proofs-history --proofs-history.window "$SEQ_RETAIN"
   unit ver-el "$BASE" node --chain "$CONFIG/l2-genesis.json" --datadir "$NF_L2_DIR/ver-el" \
     --http.port "$PORT_VER_HTTP" --authrpc.port "$PORT_VER_ENGINE" \
     --authrpc.jwtsecret "$CONFIG/jwt.hex" --proofs-history --proofs-history.window "$WITNESS_WINDOW"
@@ -427,8 +433,15 @@ cmd_status() {
 # --- exercises -----------------------------------------------------------------------------
 
 l2_output() { # block -> output root (verifier's rollup node)
-  rpc "http://127.0.0.1:$PORT_VER_CL" optimism_outputAtBlock "[\"$(printf '0x%x' "$1")\"]" |
-    jq -er .result.outputRoot
+  # The node answers "output not available yet" while it fetches a block it was not asked
+  # for before, so ask again for a while.
+  local _
+  for _ in $(seq 1 20); do
+    rpc "http://127.0.0.1:$PORT_VER_CL" optimism_outputAtBlock "[\"$(printf '0x%x' "$1")\"]" |
+      jq -er .result.outputRoot 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
 }
 
 # Sends VALUE ether from the user key to the portal: a deposit to the same address on L2.

@@ -92,6 +92,15 @@ local anvil with chain id 11155111 rehearses the whole flow without spending Sep
   reads that account's storage root to seal every Isthmus block (base/base's
   `debug_executePayload` witness force-loads it). The host now adds the passer's account
   proof at the parent (`eth_getProof`) to the payload witness.
-- Open: unsafe gossip reaches the verifier in bursts, so its unsafe head trails the
-  sequencer by about 10 to 30 s and catches up when derivation fills the gap. The safe
-  chain is unaffected.
+- A sequencer never resumed after its EL restarted. `base node` keeps only its head across
+  a restart (no safe or finalized label) and only its newest 1024 blocks, so the consensus
+  node's start discovery walked back toward genesis and its pipeline reset walked one
+  channel timeout of L1 origins (about 3000 L2 blocks) back, both into blocks the EL no
+  longer had, and retried forever. Start discovery now resumes from the node's own safe and
+  finalized checkpoints (`--checkpoint.path`, the current ones, not only those read at
+  start) when the EL holds them, and the sequencer EL keeps `SEQ_RETAIN` (8192) blocks.
+- Open: the verifier receives the sequencer's gossip only in stretches. A gap leaves the
+  next block missing, later blocks are buffered or ignored, and the unsafe head waits for
+  derivation, about every 24 s. Each catch-up imports about 120 blocks at once, which fills
+  the EL's 8-entry commit queue; reads that need the head state then fail with "head state
+  unavailable" for a moment (about 1 in 100 calls). The safe chain is unaffected.
