@@ -58,6 +58,22 @@ pub const opaque_branch: [2 + 2 * 33 + 15]u8 = blk: {
     break :blk bytes;
 };
 
+/// Folds an executed block into `sparse`, keeps the code it deployed (later blocks may call
+/// it), and empties the evm cache so the next block reads the new state.
+pub fn commit_block(sparse: *SparseState, changeset: *db.Changeset, state: *evm.State) !void {
+    try sparse.apply_evm(state, changeset);
+    var accounts = state.accounts.valueIterator();
+    while (accounts.next()) |account| {
+        if (!account.dirty or !account.in_database) continue;
+        const code = account.info.code orelse continue;
+        if (code.len == 0) continue;
+        try sparse.add_code_hashed(&account.info.code_hash, code);
+    }
+    state.accounts.clearRetainingCapacity();
+    state.slots.clearRetainingCapacity();
+    state.code_store_len = 0;
+}
+
 /// The EVM serves BLOCKHASH for the 256 most recent ancestors.
 pub const block_hash_window = 256;
 /// Gap entries kept per kind; more are counted, not kept.
@@ -588,20 +604,8 @@ pub const Replayer = struct {
         };
     }
 
-    /// Folds the block into the sparse tries, keeps the code it deployed (later blocks may
-    /// call it), and empties the evm cache so the next block reads the new state.
     fn commit(self: *Replayer, state: *evm.State) !void {
-        try self.sparse.apply_evm(state, &self.changeset);
-        var accounts = state.accounts.valueIterator();
-        while (accounts.next()) |account| {
-            if (!account.dirty or !account.in_database) continue;
-            const code = account.info.code orelse continue;
-            if (code.len == 0) continue;
-            try self.sparse.add_code_hashed(&account.info.code_hash, code);
-        }
-        state.accounts.clearRetainingCapacity();
-        state.slots.clearRetainingCapacity();
-        state.code_store_len = 0;
+        try commit_block(&self.sparse, &self.changeset, state);
     }
 
     fn backend_root(context: *anyopaque) node_executor.BackendError!Hash {

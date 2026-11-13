@@ -574,20 +574,8 @@ pub const Follower = struct {
         };
     }
 
-    /// Folds the block into the sparse tries, keeps the code it deployed, and empties the
-    /// evm cache so the next block reads the new state.
     fn commit(self: *Follower, state: *evm.State) !void {
-        try self.sparse.apply_evm(state, &self.changeset);
-        var accounts = state.accounts.valueIterator();
-        while (accounts.next()) |account| {
-            if (!account.dirty or !account.in_database) continue;
-            const code = account.info.code orelse continue;
-            if (code.len == 0) continue;
-            try self.sparse.add_code_hashed(&account.info.code_hash, code);
-        }
-        state.accounts.clearRetainingCapacity();
-        state.slots.clearRetainingCapacity();
-        state.code_store_len = 0;
+        try replayer.commit_block(&self.sparse, &self.changeset, state);
     }
 
     fn backend_root(context: *anyopaque) node_executor.BackendError!Hash {
