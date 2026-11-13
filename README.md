@@ -37,16 +37,16 @@ native 200 ms cadence.
 
 needlefish runs on Base mainnet as a verifying node. The first one started from Base's public
 reth snapshot at block 54528124 and accepted it only after recomputing the state root from
-every account and storage slot. By November 12, 2026, it had executed 2.10 million
+every account and storage slot. By November 13, 2026, it had executed 2.3 million
 consecutive blocks. At the tip it executes the sequencer-signed block from Base's consensus
 gossip network as soon as it arrives, checks it like any other block, and falls back to
-execution-layer peers when gossip is late. Over its first 36,200 blocks this way, 97% came
-from gossip and the median lag was 23 ms (p90 107 ms). In the recording above, `base up`
-shows 299 consecutive blocks in 60 s, every check passing, at 45 ms of lag on average (median
-21 ms, at most 987 ms). A few blocks still take seconds (p99 6.9 s) when the disk it shares
-with other workloads is busy. Every 5 minutes, a sampler compares balances, nonces, code,
-storage, and proofs at the head with the public chain; it has found 0 mismatches in 5,642
-calls.
+execution-layer peers when gossip is late. Over its latest 44,000 blocks, 99% came from
+gossip and the median lag was 22 ms (p90 59 ms, p99 284 ms). In the recording above,
+`base up` shows 299 consecutive blocks in 60 s, every check passing, at 33 ms of lag on
+average (median 23 ms, at most 273 ms). About 1 block in 500 still takes over a second, when
+the disk it shares with other workloads is busy. Every 5 minutes, a sampler compares
+balances, nonces, code, storage, and proofs at the head with the public chain; it has found
+0 mismatches in 7,266 calls.
 
 ## Installation
 
