@@ -16,7 +16,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const lazy = @import("../../../utilities/lazy_alloc/root.zig");
 
-const key_size_max = @import("table.zig").key_size_max;
+const table_module = @import("table.zig");
+const key_size_max = table_module.key_size_max;
 
 /// `value_size`: the value size, or (`variable`) the largest value size.
 pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime varies: bool) type {
@@ -117,7 +118,8 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime v
             while (probes < self.slots.len) : (probes += 1) {
                 const entry = self.slots[slot];
                 if (entry == 0) return null;
-                if (std.mem.eql(u8, &self.keys[entry - 1], key)) return entry - 1;
+                const found = table_module.bytes_equal(key_size, &self.keys[entry - 1], key);
+                if (found) return entry - 1;
                 slot = (slot + 1) & mask;
             }
             unreachable; // The index is never full.
@@ -144,7 +146,9 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime v
                     self.slots[slot] = self.count;
                     break self.count - 1;
                 }
-                if (std.mem.eql(u8, &self.keys[existing - 1], key)) break existing - 1;
+                if (table_module.bytes_equal(key_size, &self.keys[existing - 1], key)) {
+                    break existing - 1;
+                }
                 slot = (slot + 1) & mask;
             } else unreachable; // The index is never full.
             self.value_bytes_total -= self.value(entry).len;
@@ -169,7 +173,7 @@ pub fn MemtableType(comptime key_size: u32, comptime value_size: u32, comptime v
         }
 
         fn less(self: *Memtable, a: u32, b: u32) bool {
-            return std.mem.order(u8, &self.keys[a], &self.keys[b]) == .lt;
+            return table_module.bytes_order(key_size, &self.keys[a], &self.keys[b]) == .lt;
         }
     };
 }

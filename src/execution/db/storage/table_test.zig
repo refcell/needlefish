@@ -449,3 +449,56 @@ test "table: a claimed cache slot is empty until filled, and drops the address's
     try testing.expectEqualSlices(u8, &block, cache.get(new).?[0..64]);
     try testing.expect(cache.get(old) == null);
 }
+
+fn check_bytes_compare(comptime size: u32, a: *const [size]u8, b: *const [size]u8) !void {
+    const expected = std.mem.order(u8, a, b);
+    try testing.expectEqual(expected, table_module.bytes_order(size, a, b));
+    try testing.expectEqual(expected.invert(), table_module.bytes_order(size, b, a));
+    try testing.expectEqual(expected == .eq, table_module.bytes_equal(size, a, b));
+    try testing.expectEqual(std.mem.eql(u8, a, b), table_module.bytes_equal(size, b, a));
+}
+
+fn check_bytes_compare_size(comptime size: u32, prng: *Prng) !void {
+    var a: [size]u8 = undefined;
+    var b: [size]u8 = undefined;
+    var round: u32 = 0;
+    while (round < 2000) : (round += 1) {
+        prng.fill(&a);
+        // Random, shared 32-byte owner prefix, or one byte apart (every position, both
+        // directions, including the sign bit and the last byte).
+        switch (prng.below(4)) {
+            0 => prng.fill(&b),
+            1 => {
+                prng.fill(&b);
+                @memcpy(b[0..@min(size, 32)], a[0..@min(size, 32)]);
+            },
+            2 => {
+                b = a;
+                const position = prng.below(size);
+                b[position] = @as(u8, 1) << @intCast(prng.below(8)) ^ a[position];
+            },
+            else => {
+                b = a;
+                b[size - 1] = a[size - 1] +% @as(u8, @intCast(prng.range(1, 255)));
+            },
+        }
+        try check_bytes_compare(size, &a, &b);
+        try check_bytes_compare(size, &a, &a);
+    }
+    // Extremes: 0x00.. vs 0xff.. differing in the last byte only.
+    @memset(&a, 0xff);
+    b = a;
+    b[size - 1] = 0;
+    try check_bytes_compare(size, &a, &b);
+    @memset(&a, 0);
+    b = a;
+    b[0] = 0x80;
+    try check_bytes_compare(size, &a, &b);
+}
+
+test "table: bytes_order and bytes_equal match std.mem for every key size" {
+    var prng = Prng.init(0x6b65_795f_6f72_6472);
+    inline for (.{ 1, 7, 8, 9, 32, 33, 64, 65, 72 }) |size| {
+        try check_bytes_compare_size(size, &prng);
+    }
+}

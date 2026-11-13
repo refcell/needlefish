@@ -209,6 +209,38 @@ pub const BlockCache = struct {
 /// Keys up to 72 bytes: the widest key space is a storage-branch path key (65 bytes).
 pub const key_size_max: u32 = 72;
 
+/// `std.mem.order` for two keys of one comptime size: big-endian 8-byte words (a word's
+/// numeric order is its bytes' lexicographic order), then the tail bytes one at a time.
+/// Unrolled at comptime, so a key sharing a 32-byte owner prefix costs four word compares.
+pub fn bytes_order(comptime size: u32, a: *const [size]u8, b: *const [size]u8) std.math.Order {
+    comptime assert(size > 0 and size <= key_size_max);
+    comptime var offset: u32 = 0;
+    inline while (offset + 8 <= size) : (offset += 8) {
+        const word_a = std.mem.readInt(u64, a[offset..][0..8], .big);
+        const word_b = std.mem.readInt(u64, b[offset..][0..8], .big);
+        if (word_a != word_b) return if (word_a < word_b) .lt else .gt;
+    }
+    inline while (offset < size) : (offset += 1) {
+        if (a[offset] != b[offset]) return if (a[offset] < b[offset]) .lt else .gt;
+    }
+    return .eq;
+}
+
+/// `std.mem.eql` for two keys of one comptime size: native 8-byte words XORed together, then
+/// the tail bytes, with one branch at the end.
+pub fn bytes_equal(comptime size: u32, a: *const [size]u8, b: *const [size]u8) bool {
+    comptime assert(size > 0 and size <= key_size_max);
+    var difference: u64 = 0;
+    comptime var offset: u32 = 0;
+    inline while (offset + 8 <= size) : (offset += 8) {
+        const word_a = std.mem.readInt(u64, a[offset..][0..8], .little);
+        const word_b = std.mem.readInt(u64, b[offset..][0..8], .little);
+        difference |= word_a ^ word_b;
+    }
+    inline while (offset < size) : (offset += 1) difference |= a[offset] ^ b[offset];
+    return difference == 0;
+}
+
 /// Bytes after the fence keys that keep `Info` free of implicit padding (whose bytes would be
 /// undefined in a checkpoint): the counts start 8-aligned and the size is a multiple of 16.
 fn info_padding_size(key_size: u32) u32 {
@@ -290,7 +322,7 @@ pub fn TableType(comptime Storage: type, comptime key_size: u32) type {
         }
 
         pub fn key_order(a: *const Key, b: *const Key) std.math.Order {
-            return std.mem.order(u8, a, b);
+            return bytes_order(key_size, a, b);
         }
 
         // Data block decoding. `payload` has passed `data_valid`.
