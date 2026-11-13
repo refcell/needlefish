@@ -28,61 +28,6 @@ pub const Kqueue = if (supported) KqueueImpl else struct {
     pub const unsupported = true;
 };
 
-/// A FIFO of completions threaded through `Completion.next`.
-fn Queue(comptime Completion: type) type {
-    return struct {
-        head: ?*Completion = null,
-        tail: ?*Completion = null,
-        count: u32 = 0,
-
-        const Self = @This();
-
-        fn push(queue: *Self, completion: *Completion) void {
-            assert(completion.next == null);
-            if (queue.tail) |tail| tail.next = completion else queue.head = completion;
-            queue.tail = completion;
-            queue.count += 1;
-        }
-
-        fn pop(queue: *Self) ?*Completion {
-            const completion = queue.head orelse return null;
-            queue.head = completion.next;
-            if (queue.head == null) queue.tail = null;
-            completion.next = null;
-            queue.count -= 1;
-            return completion;
-        }
-
-        /// Unlinks `target` if queued. O(n); used only by `cancel`.
-        fn remove(queue: *Self, target: *Completion) bool {
-            var previous: ?*Completion = null;
-            var cursor = queue.head;
-            var budget = queue.count;
-            while (cursor) |completion| : (budget -= 1) {
-                assert(budget > 0);
-                if (completion == target) {
-                    if (previous) |p| p.next = completion.next else queue.head = completion.next;
-                    if (queue.tail == completion) queue.tail = previous;
-                    completion.next = null;
-                    queue.count -= 1;
-                    return true;
-                }
-                previous = completion;
-                cursor = completion.next;
-            }
-            return false;
-        }
-
-        fn contains(queue: *const Self, target: *const Completion) bool {
-            var cursor = queue.head;
-            while (cursor) |completion| : (cursor = completion.next) {
-                if (completion == target) return true;
-            }
-            return false;
-        }
-    };
-}
-
 const KqueueImpl = struct {
     pub const Fd = os.fd_t;
     pub const Completion = struct {
@@ -109,11 +54,11 @@ const KqueueImpl = struct {
 
     kq: Fd,
     /// Operations ready to attempt (new or woken by readiness).
-    unqueued: Queue(Completion) = .{},
+    unqueued: common.Queue(Completion) = .{},
     /// Operations finished, waiting for their callback.
-    completed: Queue(Completion) = .{},
+    completed: common.Queue(Completion) = .{},
     /// Pending timeouts.
-    timeouts: Queue(Completion) = .{},
+    timeouts: common.Queue(Completion) = .{},
     /// Operations parked on a kevent; the kernel holds pointers to them.
     parked_count: u32 = 0,
     /// Kevents to register on the next kevent call.

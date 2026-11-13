@@ -475,6 +475,61 @@ pub fn Methods(comptime IO: type) type {
     };
 }
 
+/// A FIFO of completions threaded through `Completion.next`, shared by the OS backends.
+pub fn Queue(comptime Completion: type) type {
+    return struct {
+        head: ?*Completion = null,
+        tail: ?*Completion = null,
+        count: u32 = 0,
+
+        const Self = @This();
+
+        pub fn push(queue: *Self, completion: *Completion) void {
+            assert(completion.next == null);
+            if (queue.tail) |tail| tail.next = completion else queue.head = completion;
+            queue.tail = completion;
+            queue.count += 1;
+        }
+
+        pub fn pop(queue: *Self) ?*Completion {
+            const completion = queue.head orelse return null;
+            queue.head = completion.next;
+            if (queue.head == null) queue.tail = null;
+            completion.next = null;
+            queue.count -= 1;
+            return completion;
+        }
+
+        /// Unlinks `target` if queued. O(n); used only by `cancel`.
+        pub fn remove(queue: *Self, target: *Completion) bool {
+            var previous: ?*Completion = null;
+            var cursor = queue.head;
+            var budget = queue.count;
+            while (cursor) |completion| : (budget -= 1) {
+                assert(budget > 0);
+                if (completion == target) {
+                    if (previous) |p| p.next = completion.next else queue.head = completion.next;
+                    if (queue.tail == completion) queue.tail = previous;
+                    completion.next = null;
+                    queue.count -= 1;
+                    return true;
+                }
+                previous = completion;
+                cursor = completion.next;
+            }
+            return false;
+        }
+
+        pub fn contains(queue: *const Self, target: *const Completion) bool {
+            var cursor = queue.head;
+            while (cursor) |completion| : (cursor = completion.next) {
+                if (completion == target) return true;
+            }
+            return false;
+        }
+    };
+}
+
 /// Runs the callback of a finished completion. Backends call this exactly once per
 /// operation after storing the result. The completion is reset first so the callback may
 /// submit a new operation on it.

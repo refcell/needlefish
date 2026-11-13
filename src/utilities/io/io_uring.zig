@@ -29,60 +29,6 @@ const loop_iterations_max = 1 << 20;
 /// `user_data` of cancel SQEs. Completions are never at address zero.
 const cancel_user_data: u64 = 0;
 
-fn Queue(comptime Completion: type) type {
-    return struct {
-        head: ?*Completion = null,
-        tail: ?*Completion = null,
-        count: u32 = 0,
-
-        const Self = @This();
-
-        fn push(queue: *Self, completion: *Completion) void {
-            assert(completion.next == null);
-            if (queue.tail) |tail| tail.next = completion else queue.head = completion;
-            queue.tail = completion;
-            queue.count += 1;
-        }
-
-        fn pop(queue: *Self) ?*Completion {
-            const completion = queue.head orelse return null;
-            queue.head = completion.next;
-            if (queue.head == null) queue.tail = null;
-            completion.next = null;
-            queue.count -= 1;
-            return completion;
-        }
-
-        /// Unlinks `target` if queued. O(n); used only by `cancel`.
-        fn remove(queue: *Self, target: *Completion) bool {
-            var previous: ?*Completion = null;
-            var cursor = queue.head;
-            var budget = queue.count;
-            while (cursor) |completion| : (budget -= 1) {
-                assert(budget > 0);
-                if (completion == target) {
-                    if (previous) |p| p.next = completion.next else queue.head = completion.next;
-                    if (queue.tail == completion) queue.tail = previous;
-                    completion.next = null;
-                    queue.count -= 1;
-                    return true;
-                }
-                previous = completion;
-                cursor = completion.next;
-            }
-            return false;
-        }
-
-        fn contains(queue: *const Self, target: *const Completion) bool {
-            var cursor = queue.head;
-            while (cursor) |completion| : (cursor = completion.next) {
-                if (completion == target) return true;
-            }
-            return false;
-        }
-    };
-}
-
 const LinuxIoUring = struct {
     pub const Fd = os.fd_t;
     pub const Completion = struct {
@@ -114,13 +60,13 @@ const LinuxIoUring = struct {
 
     ring: linux.IoUring,
     /// Operations that did not fit in the SQ.
-    unqueued: Queue(Completion) = .{},
+    unqueued: common.Queue(Completion) = .{},
     /// Reaped completions waiting for their callback.
-    completed: Queue(Completion) = .{},
+    completed: common.Queue(Completion) = .{},
     /// SQEs submitted to the kernel whose CQE has not been reaped.
     in_kernel: u32 = 0,
     /// In-kernel operations whose cancel SQE did not fit in the SQ yet.
-    to_cancel: Queue(Completion) = .{},
+    to_cancel: common.Queue(Completion) = .{},
 
     pub const Options = struct { entries: u16 = entries_default };
 
