@@ -135,6 +135,16 @@ pub const RecordCache = struct {
         return self.value_at(slot);
     }
 
+    /// `get` without marking the entry referenced or counting a hit or miss: a lookup that
+    /// must not change what the cache keeps.
+    pub fn peek(self: *const RecordCache, hash: *const Hash, hang: []const u8) ?[]const u8 {
+        assert(hang.len <= branch_record.hang_nibbles_max);
+        const key = branch_record.path_key(hang);
+        const slot = self.find(hash, &key) orelse return null;
+        assert(self.lengths[slot] > 0);
+        return self.value_at(slot);
+    }
+
     /// Caches the verified record `value` hanging at `hang` with top node hash `hash`.
     pub fn put(self: *RecordCache, hash: *const Hash, hang: []const u8, value: []const u8) void {
         assert(hang.len <= branch_record.hang_nibbles_max);
@@ -147,7 +157,8 @@ pub const RecordCache = struct {
         self.lengths[slot] = @intCast(value.len);
         self.referenced[slot] = false;
         @memcpy(self.values[slot * value_bytes_max ..][0..value.len], value);
-        assert(std.mem.eql(u8, self.value_at(slot), value));
+        // Not a plain assert: the comparison is a call the optimizer keeps.
+        if (std.debug.runtime_safety) assert(std.mem.eql(u8, self.value_at(slot), value));
     }
 
     /// One cached record (for checks).

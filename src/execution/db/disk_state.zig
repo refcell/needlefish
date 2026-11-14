@@ -115,9 +115,41 @@ const Locator = union(enum) {
     /// extension above it.
     bytes_only,
     /// The top node (extension, else branch; or a leaf-root record's leaf) of a record.
-    record: struct { owner: ?Hash, hang: Nibbles },
+    record: struct { owner: ?Hash, hang: Hang },
     /// A leaf `depth` nibbles down: its path is `key`'s nibbles from `depth` on.
     leaf: struct { owner: ?Hash, key: Hash, depth: u8 },
+};
+
+/// A record's hang path in a locator, packed two nibbles a byte (high first): it keeps memo
+/// entries small, and a block registers thousands of them.
+const Hang = struct {
+    len: u8 = 0,
+    nibbles_packed: [32]u8 = @splat(0),
+
+    /// Up to 64 nibbles: a corrupt record may name a record child below depth 63, which
+    /// fails only when resolved.
+    const nibbles_max = 64;
+
+    fn from_nibbles(path: []const u8) Hang {
+        assert(path.len <= nibbles_max);
+        var result: Hang = .{ .len = @intCast(path.len) };
+        for (path, 0..) |nibble, index| {
+            assert(nibble < 16);
+            const shift: u3 = if (index % 2 == 0) 4 else 0;
+            result.nibbles_packed[index / 2] |= nibble << shift;
+        }
+        return result;
+    }
+
+    fn unpack(self: *const Hang) Nibbles {
+        assert(self.len <= nibbles_max);
+        var result: Nibbles = .{ .len = self.len };
+        for (result.data[0..self.len], 0..) |*nibble, index| {
+            const byte = self.nibbles_packed[index / 2];
+            nibble.* = if (index % 2 == 0) byte >> 4 else byte & 0x0f;
+        }
+        return result;
+    }
 };
 
 const Entry = struct {
@@ -164,6 +196,15 @@ const View = struct {
         if (offset == 0) return .{};
         assert(self.layout.kind != .leaf and offset < self.source.len);
         return sparse.child_ref_at(self.source, offset);
+    }
+
+    /// The child reference's bytes at `nibble`, in place; empty for none.
+    fn child_item(self: *const View, nibble: u8) []const u8 {
+        assert(nibble < 16);
+        const offset = self.layout.child_offsets[nibble];
+        if (offset == 0) return &.{};
+        assert(self.layout.kind != .leaf and offset < self.source.len);
+        return sparse.child_item_at(self.source, offset);
     }
 };
 
@@ -217,8 +258,10 @@ pub const Stats = struct {
     account_reads: u64 = 0,
     slot_reads: u64 = 0,
     read_memo_hits: u64 = 0,
-    /// Branch-record puts and tombstones written.
+    /// Branch-record puts and tombstones written, and puts whose children's kinds and leaf
+    /// keys came from the pre-state record where they kept their references (`record_hint`).
     record_writes: u64 = 0,
+    record_hints: u64 = 0,
     /// Sparse trie updates with node resolution, the root hash, the record diff and
     /// account collection, and the puts.
     update_ns: u64 = 0,
@@ -279,6 +322,9 @@ const leaf_bytes_max = 3 + 34 + 2 + state_trie.account_rlp_bytes_max;
 
 comptime {
     assert(leaf_bytes_max <= 3 + 34 + 2 + sparse.value_bytes_max);
+    // A locator is an owner and a key or packed hang (memo entries stay small).
+    assert(@sizeOf(Entry) <= 80);
+    assert(Hang.nibbles_max == 2 * @sizeOf(@FieldType(Hang, "nibbles_packed")));
     assert(frames_max == 1025);
 }
 
@@ -960,7 +1006,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                     return null;
                 },
                 .record => |record| {
-                    return self.resolve_record(owner_of(&record.owner), record.hang.slice(), hash);
+                    const hang = record.hang.unpack();
+                    return self.resolve_record(owner_of(&record.owner), hang.slice(), hash);
                 },
                 .leaf => |leaf| {
                     return self.resolve_leaf(owner_of(&leaf.owner), &leaf.key, leaf.depth, hash);
@@ -1109,7 +1156,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                     child_hang.push(nibble);
                     self.register(&ref.root_hash(), .{ .record = .{
                         .owner = owner_value,
-                        .hang = child_hang,
+                        .hang = Hang.from_nibbles(child_hang.slice()),
                     } });
                 }
             }
@@ -1182,7 +1229,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         fn view_locator(locator: *const Locator) Error!View {
             switch (locator.*) {
                 .leaf => |*leaf| {
-                    assert(leaf.depth < 64);
+                    assert(leaf.depth <= 64);
                     const key = Nibbles.from_bytes(&leaf.key);
                     return .{ .layout = .{
                         .kind = .leaf,
@@ -1293,9 +1340,16 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         ) u32 {
             assert(frame.depth < 64);
             var frames_len = frames_len_start;
+            // Two branches: their children compare in place, as `Cursor.eql` would.
+            const branches = pre != null and post != null and
+                pre.?.layout.kind == .branch and post.?.layout.kind == .branch;
             var nibble: u8 = 16;
             while (nibble > 0) {
                 nibble -= 1;
+                if (branches) {
+                    const pre_item = pre.?.child_item(nibble);
+                    if (std.mem.eql(u8, pre_item, post.?.child_item(nibble))) continue;
+                }
                 const pre_child = child_cursor(&frame.pre, pre, nibble);
                 const post_child = child_cursor(&frame.post, post, nibble);
                 if (pre_child.eql(&post_child)) continue;
@@ -1349,8 +1403,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             const pre_record = is_record_top(position, &frame.pre, pre);
             const old = if (pre_record) self.capture_record(position, pre.?) else null;
             if (is_record_top(position, &frame.post, post)) {
+                var hint: Record = undefined;
+                const hinted = pre_record and self.record_hint(position, &frame.pre, &hint);
+                self.stats.record_hints += @intFromBool(hinted);
                 var record: Record = .{};
-                try self.build_record(position, post.?, &record);
+                try self.build_record(position, post.?, if (hinted) &hint else null, &record);
                 branch_record.validate_path(position, &record) catch return error.Corrupt;
                 var buffer: [branch_record.value_bytes_max]u8 = undefined;
                 const value = branch_record.encode(&record, &buffer);
@@ -1373,7 +1430,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             const capture = &(self.capture orelse return null);
             if (capture.failed) return null;
             var record: Record = .{};
-            self.build_record(position, top, &record) catch {
+            self.build_record(position, top, null, &record) catch {
                 capture.failed = true;
                 return null;
             };
@@ -1396,10 +1453,32 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         const OldRange = struct { start: u32, len: u32 };
 
+        /// The pre-state record at `position` into `hint`, when its top is hashed and the
+        /// record cache holds it (as it does for records this block resolved). A post-state
+        /// child with the same reference at the same nibble below the same branch path is
+        /// the same child (content addressing), so `fill_branch` takes its kind and leaf key
+        /// from the hint instead of the memo.
+        fn record_hint(
+            self: *const Self,
+            position: []const u8,
+            cursor: *const Cursor,
+            hint: *Record,
+        ) bool {
+            assert(cursor.offset == 0);
+            if (!cursor.ref.is_hash()) return false;
+            const value = self.record_cache.peek(cursor.ref.bytes[1..33], position) orelse {
+                return false;
+            };
+            // Cached values were decoded or encoded when cached; a failure only loses the hint.
+            branch_record.decode(value, hint) catch return false;
+            return !branch_record.is_leaf_root(hint);
+        }
+
         fn build_record(
             self: *const Self,
             position: []const u8,
             top: *const View,
+            hint: ?*const Record,
             record: *Record,
         ) Error!void {
             const layout = &top.layout;
@@ -1420,18 +1499,28 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                     var path = Nibbles.from_nibbles(position);
                     if (path.len + layout.path.len >= 64) return error.Corrupt;
                     path.append(layout.path.slice());
-                    try self.fill_branch(path.slice(), &branch, record);
+                    // The hint serves only below the same extension (the same branch path).
+                    const same = if (hint) |value|
+                        std.mem.eql(u8, value.extension_slice(), layout.path.slice())
+                    else
+                        false;
+                    try self.fill_branch(path.slice(), &branch, if (same) hint else null, record);
                 },
-                .branch => try self.fill_branch(position, top, record),
+                .branch => {
+                    const same = if (hint) |value| value.extension_len == 0 else false;
+                    try self.fill_branch(position, top, if (same) hint else null, record);
+                },
             }
         }
 
         /// Masks, child references, and leaf keys (the branch path, the nibble, the leaf's
-        /// own path) of the branch at `branch_path`.
+        /// own path) of the branch at `branch_path`; `hint` is a record of a branch at the
+        /// same path (`record_hint`).
         fn fill_branch(
             self: *const Self,
             branch_path: []const u8,
             branch: *const View,
+            hint: ?*const Record,
             record: *Record,
         ) Error!void {
             assert(branch.layout.kind == .branch);
@@ -1445,6 +1534,17 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 record.children[child] = sparse.child_ref_at(branch.source, offset);
                 const ref = &record.children[child];
                 child += 1;
+                if (hint) |value| {
+                    if (hint_child(value, @intCast(nibble), ref)) |leaf_key| {
+                        if (leaf_key) |key| {
+                            record.leaf_keys[leaf] = key.*;
+                            leaf += 1;
+                        } else {
+                            record.tree_mask |= bit;
+                        }
+                        continue;
+                    }
+                }
                 var suffix: Nibbles = undefined;
                 if (!try self.child_leaf(ref.slice(), &suffix)) {
                     record.tree_mask |= bit;
@@ -1459,6 +1559,19 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             }
             if (child < 2) return error.Corrupt;
             assert(leaf == record.leaf_count());
+        }
+
+        /// What `hint` says of the child at `nibble` when it holds the same reference there:
+        /// a record (null), or a leaf (its key). Null when it does not.
+        fn hint_child(hint: *const Record, nibble: u8, ref: *const RlpNode) ??*const Hash {
+            assert(nibble < 16);
+            const bit = @as(u16, 1) << @intCast(nibble);
+            if (hint.state_mask & bit == 0) return null;
+            const below = bit - 1;
+            const index = @popCount(hint.state_mask & below);
+            if (!std.mem.eql(u8, hint.children[index].slice(), ref.slice())) return null;
+            if (hint.tree_mask & bit != 0) return @as(?*const Hash, null);
+            return &hint.leaf_keys[@popCount(hint.leaf_mask() & below)];
         }
 
         fn add_write(

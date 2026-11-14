@@ -250,6 +250,7 @@ const Counts = struct {
     leaf_root_puts: u64 = 0,
     /// Records the record cache answered, and cache entries checked against the build.
     cache_hits: u64 = 0,
+    record_hints: u64 = 0,
     cache_matched: u64 = 0,
     /// Blocks applied on the trie the walk before left.
     carried: u64 = 0,
@@ -1169,7 +1170,7 @@ fn setup(harness: *Harness, arena: std.mem.Allocator, model: *const Model, seed:
     return built;
 }
 
-fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
+fn run_seed(seed: u64, blocks: u32, cache_entries: u32, counts: *Counts) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1205,7 +1206,9 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
     }
     const built = try setup(harness, arena, &run.model, seed);
     run.checkpoint_root = built.root;
-    run.disk = try DiskState.init(testing.allocator, harness.trees(), built.root, disk_config);
+    var seed_config = disk_config;
+    seed_config.record_cache_entries = cache_entries;
+    run.disk = try DiskState.init(testing.allocator, harness.trees(), built.root, seed_config);
     defer run.disk.deinit(testing.allocator);
     try run.disk.capture_enable(testing.allocator);
     run.previous = &built;
@@ -1224,13 +1227,14 @@ fn run_seed(seed: u64, blocks: u32, counts: *Counts) !void {
         try run.step();
     }
     counts.cache_hits += run.disk.stats.record_cache_hits;
+    counts.record_hints += run.disk.stats.record_hints;
     counts.carried += run.disk.stats.blocks_carried;
 }
 
 test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bulk build" {
     var counts: Counts = .{};
     for (0..8) |seed| {
-        run_seed(seed, 40, &counts) catch |err| {
+        run_seed(seed, 40, disk_config.record_cache_entries, &counts) catch |err| {
             std.debug.print("disk state: failing seed={d}\n", .{seed});
             return err;
         };
@@ -1253,6 +1257,21 @@ test "disk state: seeded blocks, unwinds, checkpoints, crashes match a fresh bul
     // Blocks start on the trie the walk before left (after a reopen or a crash, the
     // check's proofs walked fresh first).
     try testing.expect(counts.carried >= (counts.blocks + counts.unwinds) / 2);
+}
+
+test "disk state: records built from pre-state hints match a fresh bulk build" {
+    // A record cache holding every record: most changed records find their pre-state record
+    // there, so most children come from the hint rather than the memo.
+    var counts: Counts = .{};
+    for (0..3) |seed| {
+        run_seed(0x4141 + seed, 24, 4096, &counts) catch |err| {
+            std.debug.print("disk state: failing hinted seed={d}\n", .{seed});
+            return err;
+        };
+    }
+    try testing.expect(counts.blocks >= 50);
+    try testing.expect(counts.record_hints >= 100);
+    try testing.expect(counts.captured_records >= 100);
 }
 
 test "disk state: a record off its reference is Corrupt; an unlisted wipe is Unsupported" {

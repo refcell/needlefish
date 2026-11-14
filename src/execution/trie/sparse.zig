@@ -155,7 +155,7 @@ pub fn child_ref_at(bytes: []const u8, offset: u32) RlpNode {
 }
 
 /// The bytes of the reference `child_ref_at` returns, in place.
-fn child_item_at(bytes: []const u8, offset: u32) []const u8 {
+pub fn child_item_at(bytes: []const u8, offset: u32) []const u8 {
     assert(offset > 0 and offset < bytes.len);
     const prefix = bytes[offset];
     const length: u32 = if (prefix == 0xa0) 33 else 1 + @as(u32, prefix - 0xc0);

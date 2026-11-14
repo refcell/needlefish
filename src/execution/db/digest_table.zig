@@ -19,7 +19,7 @@ const lazy = @import("../../utilities/lazy_alloc/root.zig");
 pub const Hash = [32]u8;
 
 /// The smallest index (slots), the one `clear` returns to.
-pub const slots_active_min: u32 = 1024;
+pub const slots_active_min: u32 = 1 << 14;
 
 /// An index slot: `fingerprint << 32 | (entry + 1)`, 0 when empty.
 const fingerprint_mask: u64 = 0xffff_ffff_0000_0000;
@@ -183,18 +183,19 @@ test "digest table: matches a hash map across growth, clears, and a full table" 
     var prng = Prng.init(0xd16e57);
     var model: std.AutoHashMapUnmanaged(Hash, u64) = .empty;
     defer model.deinit(testing.allocator);
-    const entries_max: u32 = 3000;
+    // Past `slots_active_min / 2` entries: the index grows twice.
+    const entries_max: u32 = 3 * slots_active_min / 2;
     var table = try Table.init(testing.allocator, entries_max);
     defer table.deinit(testing.allocator);
     var keys: std.ArrayList(Hash) = .empty;
     defer keys.deinit(testing.allocator);
     var round: u32 = 0;
-    while (round < 6) : (round += 1) {
+    while (round < 4) : (round += 1) {
         table.clear();
         model.clearRetainingCapacity();
         keys.clearRetainingCapacity();
         const narrow = round % 2 == 1;
-        const operations = 1000 + prng.below(4 * entries_max);
+        const operations = 1000 + prng.below(2 * entries_max);
         for (0..operations) |_| {
             const key = if (keys.items.len > 0 and prng.chance(1, 3))
                 keys.items[prng.below(keys.items.len)]
@@ -224,5 +225,8 @@ test "digest table: matches a hash map across growth, clears, and a full table" 
             try testing.expectEqual(model.contains(key), table.contains(&key));
         }
         try testing.expect(2 * table.count() <= table.slots_active);
+        if (table.count() > slots_active_min) {
+            try testing.expect(table.slots_active == 4 * slots_active_min);
+        }
     }
 }
