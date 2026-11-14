@@ -36,6 +36,7 @@ pub const flat_trees = @import("flat_trees.zig");
 pub const disk_state = @import("disk_state.zig");
 pub const branch_record = @import("branch_record.zig");
 pub const record_cache = @import("record_cache.zig");
+pub const digest_table = @import("digest_table.zig");
 pub const database = @import("database.zig");
 pub const bench = @import("bench.zig");
 

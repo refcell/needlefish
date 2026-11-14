@@ -54,6 +54,7 @@ const changeset_module = @import("changeset.zig");
 const flat_trees_module = @import("flat_trees.zig");
 const branch_record = @import("branch_record.zig");
 const record_cache_module = @import("record_cache.zig");
+const digest_table = @import("digest_table.zig");
 
 const node = trie.node;
 const sparse = trie.sparse;
@@ -148,6 +149,48 @@ const Cursor = struct {
         return .{ .ref = RlpNode.from_hash(hash.*), .hangs = true };
     }
 };
+
+/// A node of the walk as `sparse.decode_layout` reads it: its child references stay in
+/// `source` (memo bytes, or the inline reference it came from), never copied out whole.
+const View = struct {
+    layout: sparse.Layout,
+    /// Empty for a leaf known only by its locator (no children).
+    source: []const u8 = &.{},
+
+    /// The child reference at `nibble` (slot 0 of an extension); length 0 for none.
+    fn child_ref(self: *const View, nibble: u8) RlpNode {
+        assert(nibble < 16);
+        const offset = self.layout.child_offsets[nibble];
+        if (offset == 0) return .{};
+        assert(self.layout.kind != .leaf and offset < self.source.len);
+        return sparse.child_ref_at(self.source, offset);
+    }
+};
+
+/// A hash map keyed by keccak digests, or by a concatenation of them (a storage key: owner
+/// and slot hash): the keys' words are uniform already, so their first words are the hash.
+fn DigestMap(comptime Key: type, comptime Value: type) type {
+    comptime assert(@sizeOf(Key) % 32 == 0 and @sizeOf(Key) > 0);
+    const load_percentage = std.hash_map.default_max_load_percentage;
+    return std.HashMapUnmanaged(Key, Value, DigestContext(Key), load_percentage);
+}
+
+fn DigestContext(comptime Key: type) type {
+    return struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            var result: u64 = 0;
+            var offset: usize = 0;
+            while (offset < key.len) : (offset += 32) {
+                result ^= std.mem.readInt(u64, key[offset..][0..8], .little);
+            }
+            return result;
+        }
+
+        pub fn eql(_: @This(), a: Key, b: Key) bool {
+            return std.mem.eql(u8, &a, &b);
+        }
+    };
+}
 
 /// Reads a monotonic clock for `Stats` phase times (the caller's, through its IO).
 pub const Clock = struct {
@@ -249,11 +292,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         sparse_state: SparseState,
         /// Verified records across blocks (content-addressed: never stale).
         record_cache: RecordCache,
-        memo: std.AutoHashMapUnmanaged(Hash, Entry) = .empty,
+        memo: digest_table.DigestTableType(Entry),
         /// The account records and slots read since the last write-back (or `set_root`),
         /// as the trees hold them: every tree write goes through `apply`, which clears it.
-        read_accounts: std.AutoHashMapUnmanaged(Hash, ?Account) = .empty,
-        read_slots: std.AutoHashMapUnmanaged([flat_trees_module.storage_key_size]u8, u256) =
+        read_accounts: DigestMap(Hash, ?Account) = .empty,
+        read_slots: DigestMap([flat_trees_module.storage_key_size]u8, u256) =
             .empty,
         memo_bytes: []u8,
         memo_bytes_len: u32 = 0,
@@ -306,10 +349,12 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             });
             errdefer sparse_state.deinit(allocator);
             sparse_state.delete_destroyed_storage = true;
-            var memo: std.AutoHashMapUnmanaged(Hash, Entry) = .empty;
-            try memo.ensureTotalCapacity(allocator, config.memo_entries_max);
+            var memo = try digest_table.DigestTableType(Entry).init(
+                allocator,
+                config.memo_entries_max,
+            );
             errdefer memo.deinit(allocator);
-            var read_accounts: std.AutoHashMapUnmanaged(Hash, ?Account) = .empty;
+            var read_accounts: DigestMap(Hash, ?Account) = .empty;
             try read_accounts.ensureTotalCapacity(allocator, config.read_memo_accounts_max);
             errdefer read_accounts.deinit(allocator);
             var read_slots: @FieldType(Self, "read_slots") = .empty;
@@ -648,9 +693,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             while (depth < proof.ends.len) : (depth += 1) {
                 var bytes = ref.slice();
                 if (ref.is_hash()) {
-                    const entry = self.memo.get(ref.root_hash()) orelse return error.Corrupt;
+                    const entry = self.memo.get_ptr(ref.bytes[1..33]) orelse {
+                        return error.Corrupt;
+                    };
                     if (entry.bytes_len == 0) return error.Corrupt;
-                    bytes = self.entry_bytes(&entry);
+                    bytes = self.entry_bytes(entry);
                     const start = if (proof.count == 0) 0 else proof.ends[proof.count - 1];
                     if (start + bytes.len > proof.buffer.len) return error.Full;
                     @memcpy(proof.buffer[start..][0..bytes.len], bytes);
@@ -836,7 +883,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 return;
             }
             self.carried = false;
-            self.memo.clearRetainingCapacity();
+            self.memo.clear();
             self.memo_bytes_len = 0;
             self.sparse_state.reset(self.state_root, .{ .number = 0, .hash = @splat(0) });
             self.sparse_state.set_fallback(.{
@@ -856,19 +903,25 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         /// Adds a locator for `hash` unless it has one (content-addressed: any one serves).
         fn register(self: *Self, hash: *const Hash, locator: Locator) void {
-            if (self.memo.contains(hash.*)) return;
-            if (self.memo.count() >= self.config.memo_entries_max) {
+            _ = self.register_entry(hash, locator);
+        }
+
+        /// `register`, returning `hash`'s entry (null: absent and the memo is full).
+        fn register_entry(self: *Self, hash: *const Hash, locator: Locator) ?*Entry {
+            assert(self.memo.capacity() == self.config.memo_entries_max);
+            const result = self.memo.get_or_put(hash) orelse {
                 self.memo_full = true;
-                return;
-            }
-            self.memo.putAssumeCapacityNoClobber(hash.*, .{ .locator = locator });
+                return null;
+            };
+            if (!result.found_existing) result.value_ptr.* = .{ .locator = locator };
+            assert(self.memo.count() <= self.config.memo_entries_max);
+            return result.value_ptr;
         }
 
         /// Stores `bytes` as `hash`'s preimage (once) and returns the stored copy.
         fn store_bytes(self: *Self, hash: *const Hash, bytes: []const u8) ?[]const u8 {
             assert(bytes.len > 0);
-            self.register(hash, .bytes_only);
-            const entry = self.memo.getPtr(hash.*) orelse return null;
+            const entry = self.register_entry(hash, .bytes_only) orelse return null;
             if (entry.bytes_len > 0) return self.entry_bytes(entry);
             if (self.memo_bytes.len - self.memo_bytes_len < bytes.len) {
                 self.memo_full = true;
@@ -894,12 +947,14 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         fn fallback_node(context: *anyopaque, hash: *const Hash) ?[]const u8 {
             const self: *Self = @ptrCast(@alignCast(context));
-            const entry = self.memo.get(hash.*) orelse {
+            const entry = self.memo.get_ptr(hash) orelse {
                 self.corrupt = true;
                 return null;
             };
-            if (entry.bytes_len > 0) return self.entry_bytes(&entry);
-            switch (entry.locator) {
+            if (entry.bytes_len > 0) return self.entry_bytes(entry);
+            // A copy, though entries never move: resolving adds entries.
+            const locator = entry.locator;
+            switch (locator) {
                 .bytes_only => {
                     self.corrupt = true;
                     return null;
@@ -934,16 +989,19 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             want: *const Hash,
         ) ?[]const u8 {
             self.stats.records_resolved += 1;
-            var value_buffer: [branch_record.value_bytes_max]u8 = undefined;
+            // A cached value is decoded in place: nothing below touches the record cache
+            // before the decode is done.
             const cached = self.record_cache.get(want, hang);
-            const value = if (cached) |bytes| value: {
-                self.stats.record_cache_hits += 1;
-                @memcpy(value_buffer[0..bytes.len], bytes);
-                break :value value_buffer[0..bytes.len];
-            } else self.read_record(owner, hang) orelse return null;
+            if (cached != null) self.stats.record_cache_hits += 1;
+            const value = cached orelse (self.read_record(owner, hang) orelse return null);
             var record: Record = undefined;
             branch_record.decode(value, &record) catch return self.fail();
-            branch_record.validate_path(hang, &record) catch return self.fail();
+            if (cached == null) {
+                branch_record.validate_path(hang, &record) catch return self.fail();
+            } else if (std.debug.runtime_safety) {
+                // Cached records were validated at this hang (or built at it) when cached.
+                branch_record.validate_path(hang, &record) catch unreachable;
+            }
             if (branch_record.is_leaf_root(&record)) {
                 assert(hang.len == 0);
                 return self.resolve_leaf(owner, &record.leaf_keys[0], 0, want);
@@ -1105,59 +1163,78 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         // The walk.
 
-        /// The node at `ref`, decoded: from its inline bytes, its memo bytes, or (a leaf known
-        /// only by its locator) its path alone.
-        fn view(self: *const Self, ref: *const RlpNode) Error!sparse.Decoded {
-            assert(ref.len > 0);
-            if (!ref.is_hash()) return sparse.decode_node(ref.slice()) catch error.Corrupt;
-            const entry = self.memo.get(ref.root_hash()) orelse return error.Corrupt;
-            if (entry.bytes_len > 0) {
-                return sparse.decode_node(self.entry_bytes(&entry)) catch error.Corrupt;
+        /// The node at `ref` (its reference bytes), decoded in place: from its inline bytes,
+        /// its memo bytes, or (a leaf known only by its locator) its path alone.
+        fn view(self: *const Self, ref: []const u8) Error!View {
+            assert(ref.len > 0 and ref.len <= 33);
+            var source = ref;
+            if (ref.len == 33) {
+                const entry = self.memo.get_ptr(ref[1..33]) orelse return error.Corrupt;
+                if (entry.bytes_len == 0) return view_locator(&entry.locator);
+                source = self.entry_bytes(entry);
             }
-            switch (entry.locator) {
-                .leaf => |leaf| {
+            const layout = sparse.decode_layout(source) catch return error.Corrupt;
+            assert(layout.kind != .leaf or layout.path.len <= sparse.key_nibbles);
+            return .{ .layout = layout, .source = source };
+        }
+
+        /// A node without bytes: only a leaf locator says what it is.
+        fn view_locator(locator: *const Locator) Error!View {
+            switch (locator.*) {
+                .leaf => |*leaf| {
+                    assert(leaf.depth < 64);
                     const key = Nibbles.from_bytes(&leaf.key);
-                    return .{
+                    return .{ .layout = .{
                         .kind = .leaf,
                         .path = Nibbles.from_nibbles(key.slice()[leaf.depth..]),
-                    };
+                    } };
                 },
                 .record, .bytes_only => return error.Corrupt,
             }
         }
 
-        /// Whether `ref` is a leaf, and its path: `view`, except that a record never resolved
-        /// (an untouched child of a changed branch) is known to be one by its locator.
-        fn child_view(self: *const Self, ref: *const RlpNode) Error!sparse.Decoded {
-            if (ref.is_hash()) {
-                const entry = self.memo.get(ref.root_hash()) orelse return error.Corrupt;
-                if (entry.bytes_len == 0 and entry.locator == .record) return .{ .kind = .branch };
+        /// Whether the child at `ref` is a leaf, and then its path into `path`: `view`,
+        /// except that a record never resolved (an untouched child of a changed branch) is
+        /// known to be one by its locator.
+        fn child_leaf(self: *const Self, ref: []const u8, path: *Nibbles) Error!bool {
+            assert(ref.len > 0 and ref.len <= 33);
+            if (ref.len == 33) {
+                const entry = self.memo.get_ptr(ref[1..33]) orelse return error.Corrupt;
+                if (entry.bytes_len == 0 and entry.locator == .record) return false;
             }
-            return self.view(ref);
+            const child = try self.view(ref);
+            if (child.layout.kind != .leaf) return false;
+            path.* = child.layout.path;
+            return true;
         }
 
         /// Steps a cursor whose extension path is all behind it onto the branch below.
-        fn normalize(self: *const Self, cursor: *Cursor) Error!void {
-            if (cursor.is_none()) return;
-            const current = try self.view(&cursor.ref);
-            if (current.kind != .extension or cursor.offset < current.path.len) return;
-            assert(cursor.offset == current.path.len);
-            cursor.* = .{ .ref = current.children[0] };
+        /// Returns the cursor's node when the cursor stayed on it (null: none, or stepped).
+        fn normalize(self: *const Self, cursor: *Cursor) Error!?View {
+            if (cursor.is_none()) return null;
+            const current = try self.view(cursor.ref.slice());
+            if (current.layout.kind != .extension) return current;
+            if (cursor.offset < current.layout.path.len) return current;
+            assert(cursor.offset == current.layout.path.len);
+            // Built aside: the child's bytes may lie in the cursor's own (inline) reference.
+            const child = current.child_ref(0);
+            cursor.* = .{ .ref = child };
             assert(!cursor.is_none());
+            return null;
         }
 
-        fn child_cursor(cursor: *const Cursor, current: ?*const sparse.Decoded, nibble: u8) Cursor {
+        fn child_cursor(cursor: *const Cursor, current: ?*const View, nibble: u8) Cursor {
             const decoded = current orelse return .{};
-            switch (decoded.kind) {
+            switch (decoded.layout.kind) {
                 .leaf => return .{},
                 .extension => {
-                    assert(cursor.offset < decoded.path.len);
-                    if (decoded.path.data[cursor.offset] != nibble) return .{};
+                    assert(cursor.offset < decoded.layout.path.len);
+                    if (decoded.layout.path.data[cursor.offset] != nibble) return .{};
                     return .{ .ref = cursor.ref, .offset = cursor.offset + 1 };
                 },
                 .branch => {
                     assert(cursor.offset == 0);
-                    const child = decoded.children[nibble];
+                    const child = decoded.child_ref(nibble);
                     if (child.len == 0) return .{};
                     return .{ .ref = child, .hangs = true };
                 },
@@ -1188,54 +1265,75 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 var frame = self.frames[frames_len];
                 if (frame.depth > 0) path[frame.depth - 1] = frame.nibble;
                 const position = path[0..frame.depth];
-                try self.normalize(&frame.pre);
-                try self.normalize(&frame.post);
+                // Each side's node is decoded once: `normalize` hands it back unless it
+                // stepped below an extension.
+                var pre = try self.normalize(&frame.pre);
+                var post = try self.normalize(&frame.post);
                 if (frame.pre.eql(&frame.post)) continue;
-                const pre = if (frame.pre.is_none()) null else try self.view(&frame.pre.ref);
-                const post = if (frame.post.is_none()) null else try self.view(&frame.post.ref);
+                if (pre == null and !frame.pre.is_none()) {
+                    pre = try self.view(frame.pre.ref.slice());
+                }
+                if (post == null and !frame.post.is_none()) {
+                    post = try self.view(frame.post.ref.slice());
+                }
                 try self.diff_position(owner, position, &frame, opt(&pre), opt(&post));
                 if (!descends(opt(&pre)) and !descends(opt(&post))) continue;
                 if (frame.depth == 64) return error.Corrupt;
-                var nibble: u8 = 16;
-                while (nibble > 0) {
-                    nibble -= 1;
-                    const pre_child = child_cursor(&frame.pre, opt(&pre), nibble);
-                    const post_child = child_cursor(&frame.post, opt(&post), nibble);
-                    if (pre_child.eql(&post_child)) continue;
-                    assert(frames_len < self.frames.len);
-                    self.frames[frames_len] = .{
-                        .depth = frame.depth + 1,
-                        .nibble = nibble,
-                        .pre = pre_child,
-                        .post = post_child,
-                    };
-                    frames_len += 1;
-                }
+                frames_len = self.push_children(&frame, opt(&pre), opt(&post), frames_len);
             }
         }
 
-        fn opt(decoded: *const ?sparse.Decoded) ?*const sparse.Decoded {
+        /// Pushes the frames of the children where the two sides differ, nibble 15 first.
+        fn push_children(
+            self: *Self,
+            frame: *const Frame,
+            pre: ?*const View,
+            post: ?*const View,
+            frames_len_start: u32,
+        ) u32 {
+            assert(frame.depth < 64);
+            var frames_len = frames_len_start;
+            var nibble: u8 = 16;
+            while (nibble > 0) {
+                nibble -= 1;
+                const pre_child = child_cursor(&frame.pre, pre, nibble);
+                const post_child = child_cursor(&frame.post, post, nibble);
+                if (pre_child.eql(&post_child)) continue;
+                assert(frames_len < self.frames.len);
+                self.frames[frames_len] = .{
+                    .depth = frame.depth + 1,
+                    .nibble = nibble,
+                    .pre = pre_child,
+                    .post = post_child,
+                };
+                frames_len += 1;
+            }
+            assert(frames_len - frames_len_start <= 16);
+            return frames_len;
+        }
+
+        fn opt(decoded: *const ?View) ?*const View {
             if (decoded.*) |*value| return value;
             return null;
         }
 
         /// Only extensions and branches have records below them (leaves end the path).
-        fn descends(decoded: ?*const sparse.Decoded) bool {
+        fn descends(decoded: ?*const View) bool {
             const value = decoded orelse return false;
-            return value.kind != .leaf;
+            return value.layout.kind != .leaf;
         }
 
         /// Whether the cursor's node is a record's top at `position`.
         fn is_record_top(
             position: []const u8,
             cursor: *const Cursor,
-            decoded: ?*const sparse.Decoded,
+            decoded: ?*const View,
         ) bool {
             const value = decoded orelse return false;
             if (cursor.offset != 0) return false;
             if (!cursor.hangs and position.len > 0) return false;
             // A leaf is a record (a leaf root) only as a whole trie.
-            return value.kind != .leaf or position.len == 0;
+            return value.layout.kind != .leaf or position.len == 0;
         }
 
         /// The record write at `position`: the post-state's record, else a tombstone where
@@ -1245,8 +1343,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             owner: ?Hash,
             position: []const u8,
             frame: *const Frame,
-            pre: ?*const sparse.Decoded,
-            post: ?*const sparse.Decoded,
+            pre: ?*const View,
+            post: ?*const View,
         ) Error!void {
             const pre_record = is_record_top(position, &frame.pre, pre);
             const old = if (pre_record) self.capture_record(position, pre.?) else null;
@@ -1270,7 +1368,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         fn capture_record(
             self: *Self,
             position: []const u8,
-            top: *const sparse.Decoded,
+            top: *const View,
         ) ?OldRange {
             const capture = &(self.capture orelse return null);
             if (capture.failed) return null;
@@ -1301,25 +1399,27 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         fn build_record(
             self: *const Self,
             position: []const u8,
-            top: *const sparse.Decoded,
+            top: *const View,
             record: *Record,
         ) Error!void {
-            switch (top.kind) {
+            const layout = &top.layout;
+            switch (layout.kind) {
                 .leaf => {
                     assert(position.len == 0);
-                    if (top.path.len != 64) return error.Corrupt;
+                    if (layout.path.len != 64) return error.Corrupt;
                     var key: Hash = undefined;
-                    _ = top.path.pack(&key);
+                    _ = layout.path.pack(&key);
                     record.* = branch_record.leaf_root(&key);
                 },
                 .extension => {
-                    record.extension_len = top.path.len;
-                    @memcpy(record.extension[0..top.path.len], top.path.slice());
-                    const branch = try self.view(&top.children[0]);
-                    if (branch.kind != .branch) return error.Corrupt;
+                    record.extension_len = layout.path.len;
+                    @memcpy(record.extension[0..layout.path.len], layout.path.slice());
+                    const child = top.child_ref(0);
+                    const branch = try self.view(child.slice());
+                    if (branch.layout.kind != .branch) return error.Corrupt;
                     var path = Nibbles.from_nibbles(position);
-                    if (path.len + top.path.len >= 64) return error.Corrupt;
-                    path.append(top.path.slice());
+                    if (path.len + layout.path.len >= 64) return error.Corrupt;
+                    path.append(layout.path.slice());
                     try self.fill_branch(path.slice(), &branch, record);
                 },
                 .branch => try self.fill_branch(position, top, record),
@@ -1331,28 +1431,29 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
         fn fill_branch(
             self: *const Self,
             branch_path: []const u8,
-            branch: *const sparse.Decoded,
+            branch: *const View,
             record: *Record,
         ) Error!void {
-            assert(branch.kind == .branch);
+            assert(branch.layout.kind == .branch);
             if (branch_path.len >= 64) return error.Corrupt;
             var child: u32 = 0;
             var leaf: u32 = 0;
-            for (&branch.children, 0..) |*ref, nibble| {
-                if (ref.len == 0) continue;
+            for (branch.layout.child_offsets, 0..) |offset, nibble| {
+                if (offset == 0) continue;
                 const bit = @as(u16, 1) << @intCast(nibble);
                 record.state_mask |= bit;
-                record.children[child] = ref.*;
+                record.children[child] = sparse.child_ref_at(branch.source, offset);
+                const ref = &record.children[child];
                 child += 1;
-                const decoded = try self.child_view(ref);
-                if (decoded.kind != .leaf) {
+                var suffix: Nibbles = undefined;
+                if (!try self.child_leaf(ref.slice(), &suffix)) {
                     record.tree_mask |= bit;
                     continue;
                 }
-                if (branch_path.len + 1 + decoded.path.len != 64) return error.Corrupt;
+                if (branch_path.len + 1 + suffix.len != 64) return error.Corrupt;
                 var key = Nibbles.from_nibbles(branch_path);
                 key.push(@intCast(nibble));
-                key.append(decoded.path.slice());
+                key.append(suffix.slice());
                 _ = key.pack(&record.leaf_keys[leaf]);
                 leaf += 1;
             }
