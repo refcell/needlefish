@@ -150,7 +150,13 @@ pub fn execute(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) Error!transacti
     const outcome = try pre_call(evm, signed, tx.envelope, now_ms, context.upgrade);
     const params = try op.load_params(evm.state, context.rules());
     const max_gas = outcome.max_chargeable_gas();
-    const fees = op.Fees.compute(params, context.rules(), tx.envelope, max_gas);
+    const fees = op.Fees.compute(
+        params,
+        context.rules(),
+        tx.envelope,
+        tx.envelope_fastlz_size,
+        max_gas,
+    );
     const prepaid = try prepay(evm, &outcome, &fees);
     try warm_pre_call_accounts(fork, evm, &outcome);
     const pool = outcome.execution_gas_available;

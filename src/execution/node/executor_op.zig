@@ -68,11 +68,12 @@ pub fn apply_transitions(
 
 /// Jovian+: the DA footprint of a non-deposit transaction (`raw` is its EIP-2718
 /// encoding), with the scalar read from the L1Block predeploy as of the current state.
-pub fn da_footprint(state: *evm.State, raw: []const u8) evm.state.Error!u64 {
+/// `fastlz_size` is `flz.compress_length(raw)`.
+pub fn da_footprint(state: *evm.State, raw: []const u8, fastlz_size: u32) evm.state.Error!u64 {
     assert(raw.len > 0);
     assert(raw[0] != 0x7e);
     const params = try evm.op.load_params(state, .jovian);
-    return params.jovian_da_footprint(raw);
+    return params.jovian_da_footprint_sized(fastlz_size);
 }
 
 const testing = std.testing;

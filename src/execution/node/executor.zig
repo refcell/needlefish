@@ -16,6 +16,7 @@ const evm = @import("../evm/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
 const keccak = @import("../../common/crypto/keccak.zig");
+const flz = @import("../../common/flz/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const ordered = @import("../trie/ordered.zig");
 const chainspec = @import("../chainspec/root.zig");
@@ -973,10 +974,17 @@ pub const Executor = struct {
             if (!context.upgrade.at_least(.everest)) return error.TxTypeNotSupported;
         }
         // `tx.eip8130` points into `envelope`, which outlives `transact` below.
-        const tx = if (envelope == .eip8130)
+        var tx = if (envelope == .eip8130)
             eip8130_env(&envelope.eip8130, raw)
         else
             try executor.tx_env(envelope, raw);
+        // One FastLZ pass serves the Fjord L1 data fee and the Jovian DA footprint.
+        if (op) |context| {
+            if (envelope != .deposit and context.upgrade.at_least(.fjord)) {
+                assert(raw.len > 0);
+                tx.envelope_fastlz_size = flz.compress_length(raw);
+            }
+        }
         const deposit_gas_exempt = envelope == .deposit and !op.?.upgrade.at_least(.regolith);
         if (gas_used + tx.gas_limit > block.gas_limit and !deposit_gas_exempt) {
             return error.BlockGasExceeded;
@@ -1022,7 +1030,8 @@ pub const Executor = struct {
         const op = executor.machine.block.op;
         if (op) |context| {
             if (tx.tx_type == .deposit or !context.upgrade.at_least(.jovian)) return 0;
-            const footprint = try op_rules.da_footprint(executor.state, raw);
+            const size = tx.envelope_fastlz_size orelse flz.compress_length(raw);
+            const footprint = try op_rules.da_footprint(executor.state, raw, size);
             if (blob_gas_used +| footprint > block.gas_limit) return error.BlobGasExceeded;
             return footprint;
         }

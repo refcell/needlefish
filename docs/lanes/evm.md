@@ -452,6 +452,15 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-18: idle-machine rerun of the 100-block window against the node path: `ReleaseSafe`
+  1.30x (CI 1.27-1.32), `ReleaseFast` 1.36x; the November 16 1.39x was inflated by machine
+  load. Two profile items fixed, measured together at 1.01x (CI 0.95-1.11), within noise:
+  the executor runs FastLZ once per transaction and hands the length to the Fjord L1 fee and
+  the Jovian DA footprint (`TxEnv.envelope_fastlz_size`; it ran twice, 2.1% of block time),
+  and `begin_transaction` removes the transient keys a transaction inserted (up to 64)
+  instead of clearing the table's 256 KiB of metadata (1.1%), falling back to the full clear
+  past 64 keys or once tombstones pass an eighth of the capacity. Remaining non-interpreter
+  costs: the ecrecover precompile 9.6% of timed work (revm uses C libsecp256k1), keccak 5.9%.
 - 2026-11-16: the block's work around the interpreter. A call-graph profile of the timed
   window put `Flat.commit` (the bench commit; `evm_backend.commit_evm` in the node is the
   same loop) at 6.2% and the receipts root at 4.8%: 74% of the commit was the std hash map

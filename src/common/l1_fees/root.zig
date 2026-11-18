@@ -102,17 +102,33 @@ pub const L1FeeParams = struct {
 
     /// Jovian DA-footprint gas: estimated compressed bytes times the scalar.
     pub fn jovian_da_footprint(params: L1FeeParams, input: []const u8) u64 {
+        return params.jovian_da_footprint_sized(flz.compress_length(input));
+    }
+
+    /// `jovian_da_footprint` from the input's FastLZ length (`flz.compress_length`).
+    pub fn jovian_da_footprint_sized(params: L1FeeParams, fastlz_size: u32) u64 {
         const scalar = params.da_footprint_gas_scalar orelse return 0;
-        const bytes: u256 = flz.estimated_size(input) / 1_000_000;
+        const bytes: u256 = flz.estimated_size_from_fastlz_size(fastlz_size) / 1_000_000;
         const footprint = bytes *| scalar;
         return std.math.cast(u64, footprint) orelse std.math.maxInt(u64);
     }
 
     /// L1 data cost of `input` under `rules`. Deposits and empty input are exempt.
     pub fn tx_l1_cost(params: L1FeeParams, input: []const u8, rules: Rules) u256 {
+        return params.tx_l1_cost_sized(input, rules, null);
+    }
+
+    /// `tx_l1_cost` with the input's FastLZ length when the caller already has it.
+    pub fn tx_l1_cost_sized(
+        params: L1FeeParams,
+        input: []const u8,
+        rules: Rules,
+        fastlz_size: ?u32,
+    ) u256 {
         if (is_fee_exempt(input)) return 0;
         if (rules.at_least(.fjord)) {
-            return params.tx_l1_cost_fjord(input, flz.compress_length(input));
+            const size = fastlz_size orelse flz.compress_length(input);
+            return params.tx_l1_cost_fjord(input, size);
         }
         if (rules.at_least(.ecotone)) return params.tx_l1_cost_ecotone(input, rules);
         return params.tx_l1_cost_bedrock(input, rules);
@@ -198,6 +214,33 @@ test "l1 fees: DA footprint" {
     try testing.expectEqual(@as(u64, 0), reference_params().jovian_da_footprint(&.{ 2, 0xab }));
     const params: L1FeeParams = .{ .da_footprint_gas_scalar = 7 };
     try testing.expectEqual(@as(u64, 700), params.jovian_da_footprint(&.{ 0x02, 0xab, 0xcd }));
+}
+
+test "l1 fees: a given FastLZ length prices the same as compressing" {
+    // 1,000 bytes, random for 700 then repetitive: the compressed length is below the input
+    // length, and half of it is still above Fjord's minimum estimated size (100 bytes), so a
+    // wrong length changes both fees.
+    var input: [1000]u8 = undefined;
+    var prng = Prng.init(0xf1a5_7012);
+    for (&input, 0..) |*byte, index| {
+        byte.* = if (index < 700) @truncate(prng.below(256)) else @truncate(index % 9);
+    }
+    const size = flz.compress_length(&input);
+    try testing.expect(size < input.len and size > 400);
+    const params: L1FeeParams = .{
+        .l1_base_fee = 30_000_000_000,
+        .l1_base_fee_scalar = 2269,
+        .l1_blob_base_fee = 1,
+        .l1_blob_base_fee_scalar = 1_055_762,
+        .da_footprint_gas_scalar = 400,
+    };
+    const cost = params.tx_l1_cost(&input, .jovian);
+    try testing.expect(cost > 0);
+    try testing.expectEqual(cost, params.tx_l1_cost_sized(&input, .jovian, size));
+    try testing.expect(params.tx_l1_cost_sized(&input, .jovian, size / 2) < cost);
+    const footprint = params.jovian_da_footprint(&input);
+    try testing.expect(footprint > 0);
+    try testing.expectEqual(footprint, params.jovian_da_footprint_sized(size));
 }
 
 test "l1 fees: exemptions and operator fee" {

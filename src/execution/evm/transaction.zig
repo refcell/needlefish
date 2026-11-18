@@ -66,6 +66,9 @@ pub const TxEnv = struct {
     authorization_list: []const Authorization = &.{},
     /// OP Stack: the EIP-2718 encoded transaction, priced for the L1 data fee.
     envelope: []const u8 = &.{},
+    /// OP Stack: `flz.compress_length(envelope)` when the caller computed it (the block
+    /// executor, which also needs it for the Jovian DA footprint); null computes it here.
+    envelope_fastlz_size: ?u32 = null,
     /// Deposit (0x7e): wei minted to the caller from L1, kept even if execution fails.
     mint: u128 = 0,
     /// Deposit: legacy system-transaction flag, rejected since Regolith.
@@ -373,7 +376,13 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
     var fees: ?*const op.Fees = null;
     if (evm.block.op) |context| {
         const params = try op.load_params(evm.state, context.rules());
-        fees_storage = op.Fees.compute(params, context.rules(), tx.envelope, tx.gas_limit);
+        fees_storage = op.Fees.compute(
+            params,
+            context.rules(),
+            tx.envelope,
+            tx.envelope_fastlz_size,
+            tx.gas_limit,
+        );
         fees = &fees_storage;
     }
     if (try validate_and_buy_gas(fork, evm, tx, fees)) |invalid| {

@@ -223,6 +223,7 @@ pub const Fees = struct {
         params: L1FeeParams,
         rules: Rules,
         envelope: []const u8,
+        envelope_fastlz_size: ?u32,
         gas_limit: u64,
     ) Fees {
         const operator = if (rules.at_least(.isthmus))
@@ -231,7 +232,7 @@ pub const Fees = struct {
             0;
         return .{
             .params = params,
-            .l1 = params.tx_l1_cost(envelope, rules),
+            .l1 = params.tx_l1_cost_sized(envelope, rules, envelope_fastlz_size),
             .operator_charge = operator,
         };
     }

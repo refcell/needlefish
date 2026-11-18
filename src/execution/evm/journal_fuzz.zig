@@ -188,3 +188,38 @@ test "journal fuzz: nested checkpoints and reverts match a snapshot model" {
     defer h.deinit(std.testing.allocator);
     try fuzz.run_bytes(&h, fuzz_journal, .{ .seed = 0x10a7_0001, .iterations = 300 });
 }
+
+test "journal fuzz: transient storage is empty in every new transaction" {
+    // Transactions that store 1 to 100 keys: under the 64 keys `begin_transaction` removes one
+    // by one, over them (the full clear), and enough removals that the tombstone bound forces
+    // full clears between per-key ones (the harness table holds 256 keys).
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    const state = &h.state;
+    state.reset(h.database.interface());
+    var prng = Prng.init(0x7_5703e);
+    for (0..40) |transaction| {
+        state.begin_transaction();
+        const address = Fuzzer.address(transaction % 3);
+        const keys: u32 = @intCast(prng.range(1, 100));
+        for (0..keys) |key| {
+            try std.testing.expectEqual(@as(u256, 0), state.transient_load(address, key));
+            try state.transient_store(address, key, key + transaction + 1);
+        }
+        for (0..keys) |key| {
+            const value: u256 = key + transaction + 1;
+            try std.testing.expectEqual(value, state.transient_load(address, key));
+        }
+        try std.testing.expectEqual(keys, state.transient.count());
+        state.finalize_transaction(.cancun);
+    }
+    state.begin_transaction();
+    try std.testing.expectEqual(@as(u32, 0), state.transient.count());
+    for (0..3) |index| {
+        for (0..100) |key| {
+            const value = state.transient_load(Fuzzer.address(index), key);
+            try std.testing.expectEqual(@as(u256, 0), value);
+        }
+    }
+}

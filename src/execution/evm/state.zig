@@ -325,6 +325,8 @@ pub const StaticWarm = struct {
 /// A cached slot and its key (`State.touched_slots`).
 pub const SlotEntry = struct { key: *const StorageKey, slot: *Slot };
 
+const transient_keys_max = 64;
+
 pub const State = struct {
     database: Database,
     limits: Limits,
@@ -339,6 +341,14 @@ pub const State = struct {
     account_list: []*Account,
     slot_list: []SlotEntry,
     transient: StorageKeyMap(u256) = .empty,
+    /// The transient keys inserted this transaction, so `begin_transaction` removes those
+    /// instead of clearing the whole table's metadata (`transient_slots_max` bytes, 256 KiB
+    /// at the default). Past `transient_keys_max` keys it falls back to the full clear.
+    transient_keys: [transient_keys_max]StorageKey = undefined,
+    transient_keys_len: u32 = 0,
+    /// Tombstones left by per-key removal since the last full clear; they lengthen probes,
+    /// so a full clear runs once they pass an eighth of the capacity.
+    transient_removed: u32 = 0,
     /// EIP-2930 storage keys of the current transaction: warm without being read (as in
     /// revm), so a stateless witness need not hold a listed slot the EVM never reads.
     listed_slots: StorageKeyMap(void) = .empty,
@@ -395,8 +405,7 @@ pub const State = struct {
         state.database = database;
         state.accounts.clearRetainingCapacity();
         state.slots.clearRetainingCapacity();
-        // As in `begin_transaction`: an empty map has no tombstones, so skip the memset.
-        if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
+        state.clear_transient();
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
         state.journal_len = 0;
         state.logs_len = 0;
@@ -416,13 +425,29 @@ pub const State = struct {
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
-        // Entries are never removed (reverts restore values in place), so an empty map
-        // has no tombstones; skip the capacity-sized metadata memset (most transactions
-        // never TSTORE).
-        if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
+        state.clear_transient();
         assert(state.transient.count() == 0);
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
         assert(state.listed_slots.count() == 0);
+    }
+
+    /// Empties transient storage. Entries are removed only here (reverts restore values in
+    /// place), so the keys recorded since the last clear are every entry.
+    fn clear_transient(state: *State) void {
+        const count = state.transient.count();
+        defer state.transient_keys_len = 0;
+        if (count == 0) return;
+        const listed = state.transient_keys_len <= transient_keys_max;
+        const tombstones = state.transient_removed + count;
+        if (listed and tombstones <= state.transient.capacity() / 8) {
+            assert(count == state.transient_keys_len);
+            for (state.transient_keys[0..count]) |key| assert(state.transient.remove(key));
+            state.transient_removed = tombstones;
+        } else {
+            state.transient.clearRetainingCapacity();
+            state.transient_removed = 0;
+        }
+        assert(state.transient.count() == 0);
     }
 
     /// Warm an EIP-2930 storage key for the current transaction without reading it.
@@ -815,7 +840,13 @@ pub const State = struct {
                 return error.StateFull;
             }
             const entry = state.transient.getOrPutAssumeCapacity(key);
+            assert(!entry.found_existing);
             entry.value_ptr.* = 0;
+            // Saturates one past the list: too many keys, `clear_transient` clears it all.
+            if (state.transient_keys_len < transient_keys_max) {
+                state.transient_keys[state.transient_keys_len] = key;
+            }
+            state.transient_keys_len = @min(state.transient_keys_len + 1, transient_keys_max + 1);
             break :blk entry.value_ptr;
         };
         try state.record(.transient, @intFromPtr(pointer), pointer.*, 0);
