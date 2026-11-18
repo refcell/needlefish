@@ -1,17 +1,20 @@
 # Running a Base mainnet node
 
 `base up` runs all of this in one command; `base up --help` lists its options. This guide is
-what happens underneath, step by step. These are the steps the first needlefish Base mainnet
-node ran, from November 7, 2026, before `base up` existed. They take verified state from
-Base's public reth snapshot, execute every block after it from execution-layer peers over
-devp2p, and derive the safe and finalized heads from Ethereum L1. Every step is a `base`
-subcommand.
+what happens underneath, step by step: the first needlefish Base mainnet node ran these
+steps one at a time from November 7, 2026, and `base up` runs the same subcommands. They take
+verified state from Base's public reth snapshot, execute every block after it from
+execution-layer peers over devp2p, and derive the safe and finalized heads from Ethereum L1.
+[A `base up` run from an empty datadir](#base-up-from-an-empty-datadir) shows the whole path
+end to end.
 
 ## Requirements
 
 - About 3.5 TB free on one NVMe filesystem. The snapshot's state component is 761 GB
   compressed and 1.14 TB extracted. The needlefish database it is imported into is about
-  2 TB. The extracted snapshot can be deleted after the import.
+  2 TB. The extracted snapshot can be deleted after the import. `base up` deletes the
+  archive once it is extracted and the extraction once the import is verified, so its
+  preflight asks for about 3.3 TB free on mainnet: the extraction beside the new database.
 - An Ethereum L1 JSON-RPC and beacon API. Keyless public endpoints work:
   `https://ethereum-rpc.publicnode.com` and `https://ethereum-beacon-api.publicnode.com`.
 - Outbound TCP to execution-layer peers. Inbound ports are not needed.
@@ -111,6 +114,40 @@ $B consensus --rollup-config $D/rollup.json \
 Start it once el-run is at the tip (it logs `el-run: at the tip`) and its engine ring holds
 at least 16,384 blocks (the `engine:` summary line's `ring`), about 55 minutes after el-run
 starts. `optimism_syncStatus` on port 7546 reports the safe and finalized heads.
+
+## `base up` from an empty datadir
+
+`base up` has run the whole path from an empty datadir on Base Sepolia, on a desktop that
+also runs a mainnet and a Sepolia node on the same disk:
+
+```sh
+base up --chain base-sepolia --datadir ~/nf-up/base-sepolia --gossip --download.rate 6 \
+    --rpc.port 8645 --engine.port 8651 --consensus.port 7645 --gossip.port 9422
+```
+
+- **Snapshot.** Block 59326665: a 312.54 GB archive, extracted to 442.38 GB with every
+  file's blake3 checked. The download ran capped at 3 to 6 MB/s, and was paused for days so
+  the other nodes kept their disk. The first snapshot it started on was unpublished during
+  a pause; `base up` said so, deleted its chunks, and started over on the latest one.
+- **Import.** 5 h 10 min, done 10:10 UTC on November 18, 2026: the state root recomputed
+  from every account and storage slot matches block 59326665's header. The database is
+  756 GB.
+- **Follow.** el-run executed the 1.16 million blocks after the snapshot from devp2p peers
+  and reached the tip at 16:23 UTC, every block's checks passing. With `--gossip`, 3,792 of
+  its first 3,820 tip blocks after a restart came from gossip, 3 ms behind on average.
+- **Consensus.** At 22:45 UTC, safe block 60599118 and finalized block 60595717 equal
+  sepolia.base.org's safe and finalized heads by number and hash.
+- **Interruptions.** Ctrl-C during the download stops it with the chunks kept, and a rerun
+  resumes from them. A rerun after `kill -9` takes over the stale lock and resumes. A
+  resumed extraction compares the extracted files instead of rewriting them.
+- **Misconfiguration.** The checks run before anything is written and print the fix. Too
+  little disk (`FAIL disk 550.51 GB free ..., 3.29 TB more needed` for mainnet on that
+  desktop) and a named port another program holds stop the run. An L1 that refuses
+  connections or times out is a warning: el-run runs alone and consensus starts once the L1
+  answers, retried every 5 minutes.
+
+Mainnet takes the same command without `--chain`. It needs about 3.3 TB free, which the
+desktop above did not have beside its two nodes, so mainnet has not had a from-scratch run.
 
 ## Limits
 
