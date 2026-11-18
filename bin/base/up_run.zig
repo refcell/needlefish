@@ -322,6 +322,9 @@ pub const Node = struct {
     processes: [roles.len]Process,
     table: Table = undefined,
     warm: bool = false,
+    /// The next consensus start is the first on this el-run: its checkpoint and safedb name
+    /// blocks of an earlier run, which may lie outside this el-run's engine ring.
+    consensus_fresh: bool = true,
     l1: ?up_check.L1,
     peers_seen: bool = false,
     last_l1_probe_ms: i64 = 0,
@@ -415,15 +418,18 @@ pub const Node = struct {
             node.last_warm_poll_ms = now;
             node.warm = node.engine_warm();
         }
-        if (node.warm and node.process(.bridge).pid != null) try node.ensure(.consensus);
+        // At the tip, not merely warm: started while el-run catches up, consensus derives
+        // against blocks that leave the engine ring before it reaches them (NotFound forever).
+        const ready = node.warm and node.table.following;
+        if (ready and node.process(.bridge).pid != null) try node.ensure(.consensus);
     }
 
     fn set_note(node: *Node, peers: u32) void {
         const consensus = node.settings.consensus;
         if (peers == 0) return node.table.note("finding execution peers over discv4", .{});
         if (consensus and node.l1 == null) return node.table.note("consensus waits for L1", .{});
-        if (consensus and !node.warm) {
-            return node.table.note("consensus starts when el-run's engine ring is warm", .{});
+        if (consensus and !(node.warm and node.table.following)) {
+            return node.table.note("consensus starts when el-run is at the tip", .{});
         }
         node.table.note("", .{});
     }
@@ -434,6 +440,7 @@ pub const Node = struct {
         if (child.pid != null or node.now_ms() < child.restart_ms) return;
         var arena: std.heap.ArenaAllocator = .init(node.gpa);
         defer arena.deinit();
+        if (role == .consensus and node.consensus_fresh) try node.set_aside_consensus_state();
         const argv = try node.arguments(arena.allocator(), role);
         const log = try open_log(try node.log_path(arena.allocator(), role));
         defer log.close(node.io);
@@ -451,7 +458,12 @@ pub const Node = struct {
         spawned.id = null; // Reaped by `reap`, not by `std.process.Child`.
         child.started_ms = node.now_ms();
         child.starts += 1;
-        if (role == .el) node.warm = false;
+        if (role == .el) {
+            node.warm = false;
+            node.consensus_fresh = true;
+            node.table.following = false;
+        }
+        if (role == .consensus) node.consensus_fresh = false;
         if (role == .consensus) node.view.ok("consensus", "started: safe and finalized from " ++
             "L1 ({s})", .{host_of(node.l1.?.rpc)});
         try node.write_state();
@@ -617,6 +629,24 @@ pub const Node = struct {
     fn unix_s(node: *const Node) u64 {
         const now = Io.Clock.real.now(node.io);
         return @intCast(@max(0, now.toSeconds()));
+    }
+
+    /// Moves the consensus checkpoint and safedb to `*.old` (the live nodes' start script does
+    /// the same): the consensus node then finds its start in this el-run's ring.
+    fn set_aside_consensus_state(node: *Node) !void {
+        var arena: std.heap.ArenaAllocator = .init(node.gpa);
+        defer arena.deinit();
+        const datadir = node.settings.datadir;
+        for ([_][]const u8{ "checkpoint.bin", "safedb.bin" }) |name| {
+            const from = try std.fmt.allocPrint(arena.allocator(), "{s}/consensus/{s}", .{
+                datadir, name,
+            });
+            const to = try std.fmt.allocPrint(arena.allocator(), "{s}.old", .{from});
+            Io.Dir.cwd().rename(from, Io.Dir.cwd(), to, node.io) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
     }
 
     /// Whether el-run's engine ring answers `finalized` (it says "warming up" until it holds
