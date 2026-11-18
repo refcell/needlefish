@@ -30,7 +30,7 @@ native 200 ms cadence.
 - **Tested like a database.** Deterministic simulation of the whole cluster with fault
   injection, coverage-guided fuzzing of every decoder, and differential tests against public
   Ethereum vectors.
-- **Fast.** Executes Base mainnet blocks about 1.4x faster than base/base's node (revm), and
+- **Fast.** Executes Base mainnet blocks 1.3x faster than base/base's node (revm), and
   standard EVM benchmarks 1.8-1.9x faster than revm. See the [benchmarks](#benchmarks).
 
 ## Status
@@ -209,15 +209,15 @@ The [architecture overview](docs/ARCHITECTURE.md) shows how the pieces fit toget
 
 ## Benchmarks
 
-Measured on one core of an AMD Ryzen AI MAX+ 395 (Zen 5), mainnet blocks on November 16, 2026
-and EVM fixtures on November 13, with needlefish built `ReleaseSafe` (the shipped build) and
+Measured on one core of an AMD Ryzen AI MAX+ 395 (Zen 5), mainnet blocks on November 18, 2026 (idle
+machine) and EVM fixtures on November 13, with needlefish built `ReleaseSafe` (the shipped build) and
 `ReleaseFast`, and the Rust side built for the same CPU. Each comparison names what it runs
 on the other side:
 
 | Workload | Compared with | needlefish | Other side | needlefish speedup (95% CI) |
 | --- | --- | ---: | ---: | ---: |
-| 100 Base mainnet blocks (53775088+), EVM execution per window | base/base node (`base-reth-node`'s block execution path, revm) | 116.2 ms | 161.8 ms | **1.39x** (1.12–1.67) |
-| Same blocks, execution + receipts root + state commit | base/base node (same path, with `merge_transitions`) | 121.0 ms | 169.7 ms | **1.40x** (1.12–1.67) |
+| 100 Base mainnet blocks (53775088+), EVM execution per window | base/base node (`base-reth-node`'s block execution path, revm) | 104.3 ms | 135.8 ms | **1.30x** (1.27–1.32; `ReleaseFast` 1.36x) |
+| Same blocks, execution + receipts root + state commit | base/base node (same path, with `merge_transitions`) | 108.6 ms | 141.8 ms | **1.31x** (1.27–1.32) |
 | 31 standard EVM fixtures (evm2's suite), geometric mean | revm 43 | | | **1.94x** (`ReleaseFast` 2.11x) |
 | 31 standard EVM fixtures (evm2's suite), geometric mean | evm2 (reth's new EVM, stable build) | | | **1.76x** |
 | Synthetic devnet chain, `engine_newPayload` median (earlier run, 4-vCPU VM) | `base-reth-node` | 4.00 ms | 8.03 ms | **2.0x** |
@@ -230,9 +230,8 @@ on the other side:
   `asm-keccak` and `keccak-cache-global` features. Its database is replaced by an in-memory
   `CacheDB`, which favours it (a node reads accounts and slots from MDBX), and its precompile
   result cache is not installed. Times are medians of one pass over the window, over 10 fresh
-  processes per side. Other work kept the machine busy during the November 16 run, so the
-  intervals are wide; a tighter run of the same builds measured 1.30x (1.27–1.35) over
-  repeated passes. State roots are not in this comparison: reth computes them against its
+  processes per side, on an idle machine. An earlier 1.39x, measured while other work kept
+  the machine busy, overstated the lead and is replaced. State roots are not in this comparison: reth computes them against its
   database, and an offline harness for that does not exist yet.
 - **EVM fixtures.** One transaction per case, repeated on a reused EVM after an untimed state
   reset, every engine reporting the same gas used. revm and evm2 run through evm2's own CLI at

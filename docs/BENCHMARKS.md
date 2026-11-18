@@ -14,40 +14,36 @@ is older and compares against the proof executor only.
 
 ## Against the Base node and revm
 
-Mainnet blocks measured November 16, 2026, EVM fixtures November 13, on one core (pinned,
-SMT sibling not reserved) of an AMD Ryzen AI MAX+ 395 (Zen 5, 32 threads), at nice 19 while
-a live mainnet node ran on other cores. needlefish `-Dcpu=native`; base/base at `a8b34b69`
-with `maxperf` and `-C target-cpu=native`.
+Mainnet blocks measured November 18, 2026 on an idle machine (load average about 4), EVM
+fixtures November 13 and 16, on one core (pinned) of an AMD Ryzen AI MAX+ 395 (Zen 5, 32
+threads), at nice 19 while a live mainnet node ran on other cores. needlefish at `main`
+`bfb4869`, `-Dcpu=native`; base/base at `a8b34b69` with `maxperf` and `-C target-cpu=native`.
 
 ### Mainnet blocks against the node's execution path
 
 The 100-block window (Base mainnet 53775088 to 53775187) over a flat in-memory pre-state,
 senders recovered before the timed region, single-threaded
-([EVM only](#evm-only) in the method). 10 rounds; each round runs every configuration once
+([EVM only](#evm-only) in the method). 12 rounds; each round runs every configuration once
 as a fresh process, in a rotated order, with 3 more passes in the same process (*repeat*).
-Every block of every pass reproduced its gas used and receipts root. Other work kept the
-machine busy (load average 40-70 on 32 threads), so the intervals are wider than on
-November 13, when the previous build measured 108.1 ms against the node path's 144.5 ms.
+Every block of every pass reproduced its gas used and receipts root.
 
 | configuration | execution, first pass (95% CI) | repeat (95% CI) | + receipts root + commit, first pass | Mgas/s |
 | --- | ---: | ---: | ---: | ---: |
-| needlefish `ReleaseSafe` | 116.2 (104.4-145.9) | 131.7 (111.4-151.7) | 121.0 (108.5-151.6) | 2340 |
-| needlefish `ReleaseFast` | 118.3 (110.3-142.3) | 115.4 (111.4-130.5) | 122.7 (114.9-147.4) | 2298 |
-| needlefish `ReleaseSafe` before the commit change (`ffa0b83`) | 119.2 (115.8-145.4) | 127.8 (115.0-142.9) | 134.1 (130.3-164.2) | 2280 |
-| base/base node path (revm) | 161.8 (148.5-179.9) | 154.9 (147.6-168.0) | 169.7 (155.2-188.7) | 1680 |
+| needlefish `ReleaseSafe` | 104.3 (103.6-106.6) | 103.1 (102.7-103.9) | 108.6 (108.0-111.2) | 2606 |
+| needlefish `ReleaseFast` | 99.6 (99.1-101.3) | 100.0 (99.2-100.8) | 103.3 (102.8-105.1) | 2731 |
+| base/base node path (revm) | 135.8 (133.7-136.9) | 131.4 (130.3-131.9) | 141.8 (139.4-142.8) | 2002 |
 
 Milliseconds per 100 blocks.
 
 | faster | slower | execution, first pass (95% CI) | repeat (95% CI) | + receipts root + commit, first pass |
 | --- | --- | ---: | ---: | ---: |
-| needlefish `ReleaseSafe` | base/base node path | 1.39x (1.12-1.67) | 1.18x (1.02-1.45) | 1.40x (1.12-1.67) |
-| needlefish `ReleaseFast` | base/base node path | 1.37x (1.12-1.59) | 1.35x (1.18-1.47) | 1.39x (1.12-1.61) |
-| needlefish before the commit change | base/base node path | 1.35x (1.05-1.54) | 1.20x (1.06-1.39) | 1.27x (0.97-1.43) |
+| needlefish `ReleaseSafe` | base/base node path | 1.30x (1.27-1.32) | 1.27x (1.26-1.28) | 1.31x (1.27-1.32) |
+| needlefish `ReleaseFast` | base/base node path | 1.36x (1.33-1.38) | 1.31x (1.30-1.33) | 1.37x (1.34-1.38) |
 
-- **A tighter run of the same builds.** 8 rounds of the `ReleaseSafe` builds and the node path
-  the same evening: needlefish 1.33x the node path on execution (repeat 1.30x, CI 1.27-1.35)
-  and 1.34x with the receipts root and commit (repeat 1.31x, CI 1.27-1.37); the commit change
-  1.16x (CI 1.13-1.21) on execution + receipts root + commit.
+- **Earlier, noisier runs.** On November 16, with the machine at load average 40-70, the
+  same comparison measured 1.39x (CI 1.12-1.67); that figure was inflated by the load and is
+  replaced by the idle run above. The commit change of November 16 (below) measured 1.16x
+  (CI 1.13-1.21) on execution + receipts root + commit against the build before it.
 - **Per block, besides execution.** Receipts root 0.030 ms (node path 0.056 ms, before the
   change 0.065 ms) and commit 0.020 ms (node path `merge_transitions` 0.022 ms, before the
   change 0.097 ms). The commit walked the evm state's account and slot tables, sized for
