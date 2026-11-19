@@ -78,6 +78,19 @@ pub const TxEnv = struct {
     /// An unsigned call (eth_call, eth_simulateV1): a sender with code may call, as geth
     /// and reth allow. EIP-3607 rejects it only for signed transactions.
     skip_sender_code_check: bool = false,
+    /// An unvalidated RPC call (eth_call, eth_estimateGas, eth_simulateV1): no base-fee
+    /// check, no balance check, no fee charged or paid (revm's `disable_base_fee` and
+    /// `disable_fee_charge`, which reth sets for calls). A balance short of `value` halts
+    /// the call (`out_of_funds`) as revm's first frame does.
+    disable_fee_charge: bool = false,
+    /// An unvalidated RPC call other than eth_simulateV1's: a sender at nonce 2^64 - 1 still
+    /// runs, its nonce wrapping to zero (Nethermind, like geth, checks no nonce for a call).
+    wrap_max_nonce: bool = false,
+    /// An RPC call: no EIP-7825 per-transaction gas cap (reth lifts it for calls).
+    disable_tx_gas_cap: bool = false,
+    /// An RPC call: its gas may exceed the block's (revm `disable_block_gas_limit`, which
+    /// reth's `prepare_call_env` sets; the RPC gas cap bounds it instead).
+    disable_block_gas_limit: bool = false,
 };
 
 pub const Invalid = enum {
@@ -112,6 +125,9 @@ pub const Executed = struct {
     gas_used: u64,
     /// Refund applied (after the cap).
     gas_refunded: u64,
+    /// Gas spent before the refund, at least the EIP-7623 floor (revm
+    /// `max(total_gas_spent, floor_gas)`, eth_simulateV1's `maxUsedGas`).
+    gas_max_used: u64,
     output: []const u8,
     created: ?Address,
     logs: []const state_module.Log,
@@ -188,9 +204,11 @@ test "transaction: vector zero-byte count matches the byte loop" {
     }
 }
 
+/// `min(fee cap, base fee + tip)`, the sum saturating as revm's `saturating_add` (an RPC base
+/// fee override can make it overflow; Nethermind then takes the fee cap, the same price).
 pub fn effective_gas_price(tx: *const TxEnv, base_fee: u256) u256 {
     const priority = tx.gas_priority_fee orelse return tx.gas_price;
-    return @min(tx.gas_price, base_fee + priority);
+    return @min(tx.gas_price, base_fee +| priority);
 }
 
 fn type_supported(comptime fork: Fork, tx_type: TxType) bool {
@@ -208,15 +226,21 @@ fn type_supported(comptime fork: Fork, tx_type: TxType) bool {
 /// Checks that need no state.
 fn validate_env(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid {
     if (!type_supported(fork, tx.tx_type)) return .type_not_supported;
-    if (fork.at_least(.osaka) and tx.gas_limit > tx_gas_limit_cap) return .gas_cap_exceeded;
+    if (fork.at_least(.osaka) and !tx.disable_tx_gas_cap and tx.gas_limit > tx_gas_limit_cap) {
+        return .gas_cap_exceeded;
+    }
     if (tx.chain_id) |chain_id| {
         if (chain_id != evm.config.chain_id) return .chain_id_mismatch;
     }
-    if (tx.gas_limit > evm.block.gas_limit) return .gas_limit_too_high;
+    if (!tx.disable_block_gas_limit and tx.gas_limit > evm.block.gas_limit) {
+        return .gas_limit_too_high;
+    }
     if (tx.gas_priority_fee) |priority| {
         if (priority > tx.gas_price) return .priority_fee_above_max_fee;
     }
-    if (fork.at_least(.london) and tx.gas_price < evm.block.base_fee) return .fee_below_base_fee;
+    if (fork.at_least(.london) and !tx.disable_fee_charge and tx.gas_price < evm.block.base_fee) {
+        return .fee_below_base_fee;
+    }
     if (fork.at_least(.shanghai) and tx.to == null) {
         if (tx.data.len > evm.config.initcode_size_max) return .initcode_too_large;
     }
@@ -234,13 +258,15 @@ fn validate_env(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid
 }
 
 fn validate_blobs(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid {
-    if (tx.to == null) return .blob_create;
+    // revm `validate_eip4844_tx`'s order: the fee cap, then emptiness, versions, count.
+    if (tx.max_fee_per_blob_gas < evm.block.blob_base_fee) return .blob_fee_too_low;
     if (tx.blob_hashes.len == 0) return .blob_empty;
-    if (tx.blob_hashes.len > blobs_per_tx_max(fork)) return .blob_too_many;
     for (tx.blob_hashes) |hash| {
         if (hash[0] != blob_version_kzg) return .blob_version;
     }
-    if (tx.max_fee_per_blob_gas < evm.block.blob_base_fee) return .blob_fee_too_low;
+    if (tx.blob_hashes.len > blobs_per_tx_max(fork)) return .blob_too_many;
+    // A type-3 envelope cannot create; revm leaves that to decoding, so it comes last.
+    if (tx.to == null) return .blob_create;
     return null;
 }
 
@@ -261,9 +287,17 @@ fn validate_and_buy_gas(
         const delegated = fork.at_least(.prague) and bytecode.delegation_target(code) != null;
         if (!delegated) return .sender_has_code;
     }
-    if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
+    // A wrong nonce is reported before a sender's nonce of 2^64 - 1 (revm, Nethermind).
     if (tx.nonce < sender.info.nonce) return .nonce_too_low;
     if (tx.nonce > sender.info.nonce) return .nonce_too_high;
+    assert(!tx.wrap_max_nonce or tx.disable_fee_charge);
+    const nonce_max = sender.info.nonce == std.math.maxInt(u64);
+    if (nonce_max and !tx.wrap_max_nonce) return .nonce_overflow;
+    if (tx.disable_fee_charge) {
+        if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +% 1);
+        try evm.state.touch(sender);
+        return null;
+    }
     // OP Stack: the L1 data fee and the upfront operator fee count toward the balance.
     const op_cost: u512 = if (fees) |f| @as(u512, f.l1) + f.operator_charge else 0;
     const max_cost = @as(u512, tx.gas_limit) * tx.gas_price + tx.value +
@@ -284,7 +318,7 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     if (tx.to) |to| _ = try evm.state.access(to);
     try warm_system_addresses(fork, evm);
     for (tx.access_list) |item| {
-        _ = try evm.state.access(item.address);
+        try evm.state.warm_listed_account(item.address);
         for (item.storage_keys) |key| {
             try evm.state.warm_listed_slot(item.address, primitives.b256_to_u256(key));
         }
@@ -393,6 +427,7 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
         .origin = tx.caller,
         .gas_price = effective_gas_price(tx, evm.block.base_fee),
         .blob_hashes = tx.blob_hashes,
+        .wrap_max_nonce = tx.wrap_max_nonce,
     };
     try warm_addresses(fork, evm, tx);
     var authorization_refund: u64 = 0;
@@ -411,6 +446,32 @@ fn execute_top(
     intrinsic: Intrinsic,
 ) evm_module.Error!evm_module.Outcome {
     assert(intrinsic.gas <= tx.gas_limit);
+    if (tx.disable_fee_charge) {
+        // revm's first frame halts with `OutOfFunds`, returning its gas, when the caller
+        // cannot transfer `value` (the up-front balance check is disabled).
+        const caller = try evm.state.load(tx.caller);
+        if (caller.info.balance < tx.value) {
+            // The tracer sees the frame, as geth's EVM.Call enters it before the balance
+            // check; revm's call frame loads the callee (and its delegate) before the
+            // transfer fails, a create frame checks the balance first.
+            if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
+            if (evm.tracer != null) evm.trace_failed_top(fork, .{
+                .kind = if (tx.to == null) .create else .call,
+                .caller = tx.caller,
+                .target = tx.to orelse primitives.address_zero,
+                .value = tx.value,
+                .input = tx.data,
+                .gas_limit = tx.gas_limit - intrinsic.gas,
+            }, tx.nonce, .out_of_funds);
+            return .{
+                .status = .halt,
+                .exit = .out_of_funds,
+                .gas_remaining = tx.gas_limit - intrinsic.gas,
+                .gas_refund = 0,
+                .output = &.{},
+            };
+        }
+    }
     return evm.execute_fork(fork, .{
         .kind = if (tx.to == null) .create else .call,
         .caller = tx.caller,
@@ -431,10 +492,12 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // base/base `validate_env` rejects a system deposit since Regolith, and `catch_error`
     // turns that transaction error into a failed deposit like any other.
     if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit, .deposit_system_tx);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     const intrinsic = intrinsic_gas(fork, tx);
     if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit, .deposit_intrinsic_gas);
         return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };
     }
     const sender = try evm.state.load(tx.caller);
@@ -443,6 +506,10 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // reports as a halt, so the deposit fails and consumes its whole gas limit (base/base
     // `catch_error`). A nested call's failed transfer only fails that frame.
     if (sender.info.balance < tx.value) {
+        // revm's first frame loads the callee (and its EIP-7702 delegate) before the transfer
+        // fails, and the failed deposit keeps them loaded.
+        if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit - intrinsic.gas, .out_of_funds);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);
@@ -455,6 +522,27 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     }
     const accounted = account_gas(fork, tx, outcome, intrinsic, 0);
     return .{ .executed = finish(fork, evm, outcome, accounted) };
+}
+
+/// Gives the tracer a failed deposit's top frame (tracer-only: reads no state; a created
+/// address uses the nonce `deposit_env` already loaded).
+fn trace_failed_deposit(
+    comptime fork: Fork,
+    evm: *Evm,
+    tx: *const TxEnv,
+    gas_limit: u64,
+    exit: evm_module.Exit,
+) void {
+    assert(tx.tx_type == .deposit);
+    if (evm.tracer == null) return;
+    evm.trace_failed_top(fork, .{
+        .kind = if (tx.to == null) .create else .call,
+        .caller = tx.caller,
+        .target = tx.to orelse primitives.address_zero,
+        .value = tx.value,
+        .input = tx.data,
+        .gas_limit = gas_limit,
+    }, tx.nonce, exit);
 }
 
 fn fail_deposit(
@@ -476,13 +564,14 @@ fn fail_deposit(
         .exit = exit,
         .gas_used = tx.gas_limit,
         .gas_refunded = 0,
+        .gas_max_used = tx.gas_limit,
         .output = &.{},
         .created = null,
         .logs = &.{},
     };
 }
 
-const Accounted = struct { gas_used: u64, refund: u64 };
+const Accounted = struct { gas_used: u64, refund: u64, max_used: u64 };
 
 /// Apply the refund cap and the calldata floor.
 fn account_gas(
@@ -498,13 +587,18 @@ fn account_gas(
     const refund_requested: u64 = if (refund_counter > 0) @intCast(refund_counter) else 0;
     const refund = @min(refund_requested, gas_spent / gas.max_refund_quotient(fork));
     var gas_used = gas_spent - refund;
-    if (fork.at_least(.prague)) gas_used = @max(gas_used, intrinsic.floor);
+    // revm's floor gas is zero before Prague.
+    const floor: u64 = if (fork.at_least(.prague)) intrinsic.floor else 0;
+    gas_used = @max(gas_used, floor);
     assert(gas_used <= tx.gas_limit);
-    return .{ .gas_used = gas_used, .refund = refund };
+    const max_used = @max(gas_spent, floor);
+    assert(max_used >= gas_used and max_used <= tx.gas_limit);
+    return .{ .gas_used = gas_used, .refund = refund, .max_used = max_used };
 }
 
 /// Reimburse unused gas and pay the tip; on the OP Stack also refund the unused operator
-/// fee and credit the base fee, L1 fee, and operator fee vaults (the base fee is not burned).
+/// fee and credit the base fee, L1 fee, and operator fee vaults (the base fee is not
+/// burned). A call without fee charge pays nobody.
 fn pay_fees(
     comptime fork: Fork,
     evm: *Evm,
@@ -513,26 +607,44 @@ fn pay_fees(
     fees: ?*const op.Fees,
 ) evm_module.Error!void {
     assert(gas_used <= tx.gas_limit);
+    if (tx.disable_fee_charge) {
+        // Nethermind skips the OP rollup fees of an unvalidated call, collects no base fee
+        // at a zero price and credits the coinbase nothing, which still reads it: its
+        // prestateTracer lists the coinbase, not the fee vaults.
+        _ = try evm.state.load(evm.block.coinbase);
+        return;
+    }
+    var operator_used: u256 = 0;
+    if (fees) |f| operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
     const price = effective_gas_price(tx, evm.block.base_fee);
     var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
-    var operator_used: u256 = 0;
-    if (fees) |f| {
-        operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
-        reimbursement += f.operator_charge - operator_used;
-    }
+    if (fees) |f| reimbursement += f.operator_charge - operator_used;
     try credit(evm, tx.caller, reimbursement, false);
     const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
     try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
     const f = fees orelse return;
-    try credit(evm, op.l1_fee_vault, f.l1, true);
-    try credit(evm, op.base_fee_vault, evm.block.base_fee * gas_used, true);
-    try credit(evm, op.operator_fee_vault, operator_used, true);
+    try credit_vault(evm, op.l1_fee_vault, f.l1);
+    try credit_vault(evm, op.base_fee_vault, evm.block.base_fee * gas_used);
+    try credit_vault(evm, op.operator_fee_vault, operator_used);
 }
 
 fn credit(evm: *Evm, address: Address, amount: u256, touch: bool) evm_module.Error!void {
     const account = try evm.state.load(address);
     try evm.state.set_balance(account, account.info.balance + amount);
     if (touch) try evm.state.touch(account);
+}
+
+/// Credits an OP fee vault. A zero credit leaves the vault unseen by the transaction (the
+/// state change is the same): Nethermind's prestateTracer lists a vault only when the
+/// transaction credits it something (or its execution read it).
+fn credit_vault(evm: *Evm, address: Address, amount: u256) evm_module.Error!void {
+    const account = if (amount == 0)
+        try evm.state.load_unseen(address)
+    else
+        try evm.state.load(address);
+    assert(std.mem.eql(u8, &account.address, &address));
+    try evm.state.set_balance(account, account.info.balance + amount);
+    try evm.state.touch(account);
 }
 
 fn finish(
@@ -548,6 +660,7 @@ fn finish(
         .exit = outcome.exit,
         .gas_used = accounted.gas_used,
         .gas_refunded = accounted.refund,
+        .gas_max_used = accounted.max_used,
         .output = outcome.output,
         .created = outcome.created,
         .logs = logs,

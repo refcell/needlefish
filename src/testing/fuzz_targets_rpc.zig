@@ -10,8 +10,8 @@
 //!     only), and otherwise parses as JSON;
 //!   - a single request gets one response object, a batch an array of the predicted
 //!     responses in order, each with the predicted id and result or error code;
-//!   - a handler that overflows the output yields "response too large", never a torn
-//!     result;
+//!   - a handler that overflows the output yields jsonrpsee's "Response is too big"
+//!     (-32008), never a torn result;
 //!   - arbitrary bytes: the output is empty or valid JSON.
 
 const std = @import("std");
@@ -86,11 +86,15 @@ fn element(body: *Body, prng: *Prng) Expected {
         },
         1 => {
             body.print("{{\"method\":\"echo\",\"id\":1}}", .{}); // No jsonrpc member.
-            return .{ .respond = true, .error_code = rpc.code.invalid_request };
+            // jsonrpsee keeps the id of an invalid request.
+            const invalid = rpc.code.invalid_request;
+            return .{ .respond = true, .id = .number, .id_number = 1, .error_code = invalid };
         },
         2 => {
             body.print("{{\"jsonrpc\":\"2.0\",\"method\":7,\"id\":1}}", .{});
-            return .{ .respond = true, .error_code = rpc.code.invalid_request };
+            // jsonrpsee keeps the id of an invalid request.
+            const invalid = rpc.code.invalid_request;
+            return .{ .respond = true, .id = .number, .id_number = 1, .error_code = invalid };
         },
         else => return request_call(body, prng),
     }
@@ -122,7 +126,7 @@ fn request_call(body: *Body, prng: *Prng) Expected {
         },
         4 => {
             body.print(",\"method\":\"big\"", .{});
-            expected.error_code = rpc.code.internal_error;
+            expected.error_code = rpc.code.oversized_response;
         },
         else => {
             body.print(",\"method\":\"nope{d}\"", .{prng.below(9)});

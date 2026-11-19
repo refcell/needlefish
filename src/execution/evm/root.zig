@@ -30,11 +30,13 @@ pub const eip8130_simulate = @import("eip8130_simulate.zig");
 pub const bench = @import("bench.zig");
 pub const opcode_profile = @import("opcode_profile.zig");
 pub const coverage = @import("coverage.zig");
+pub const coverage_edges = @import("coverage_edges.zig");
 pub const state_test = @import("state_test.zig");
 pub const tx_check = @import("tx_check.zig");
 
 test {
     _ = @import("evm_test.zig");
+    _ = @import("coverage_edges.zig");
     _ = @import("op_test.zig");
     _ = @import("evm_fuzz.zig");
     _ = @import("arith_fuzz.zig");

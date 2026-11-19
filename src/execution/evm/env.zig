@@ -29,6 +29,8 @@ pub const TxContext = struct {
     /// Effective gas price paid per unit of gas.
     gas_price: u256 = 0,
     blob_hashes: []const B256 = &.{},
+    /// `TxEnv.wrap_max_nonce`: a top-level CREATE from a sender at nonce 2^64 - 1 wraps it.
+    wrap_max_nonce: bool = false,
 };
 
 pub const Config = struct {

@@ -937,7 +937,14 @@ fn cancel_ui_multiplier_update(context: *Context, privileged: bool) Error!void {
 
 fn update_extra_metadata(context: *Context, key: []const u8, value: []const u8) Error!void {
     if (key.len == 0) return context.revert_selector(error_invalid_metadata_key);
-    try storage.store(context, string_slot(key, base_extra_metadata), value);
+    // base/base `set_extra_metadata_value`: an empty value deletes the entry, clearing a
+    // long value's chunks in every fork (a write leaves them before Cobalt).
+    const slot = string_slot(key, base_extra_metadata);
+    if (value.len == 0) {
+        try storage.delete(context, slot);
+    } else {
+        try storage.store(context, slot, value);
+    }
     const length = encode_dynamic(context.out, &.{}, &.{ key, value });
     try context.emit(&.{event_extra_metadata_updated}, context.out[0..length]);
 }

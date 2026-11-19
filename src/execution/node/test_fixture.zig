@@ -73,6 +73,15 @@ pub const Node = struct {
     };
 
     pub fn create_with(chain_spec: *const chainspec.ChainSpec, shared: ?Shared) !*Node {
+        return create_numbered(chain_spec, shared, 0);
+    }
+
+    /// A node whose genesis block has `genesis_number` (a chain started from a later block).
+    pub fn create_numbered(
+        chain_spec: *const chainspec.ChainSpec,
+        shared: ?Shared,
+        genesis_number: u64,
+    ) !*Node {
         const node = try testing.allocator.create(Node);
         errdefer testing.allocator.destroy(node);
         node.spec = chain_spec;
@@ -102,10 +111,11 @@ pub const Node = struct {
         node.pool = try txpool.Pool.init(testing.allocator, .{});
         var genesis = if (shared) |s| s.genesis else genesis_header(try node.db.root());
         if (chain_spec.mode == .l2) genesis.extra_data = &l2_genesis_extra_data;
+        if (shared == null) genesis.number = genesis_number;
         const allocator = testing.allocator;
         node.chain = try Chain.init(allocator, chain_spec, &node.db, &node.executor, &genesis, .{
             .restoring = if (shared) |s| s.restoring else false,
-            .store = .{ .blocks_max = 256, .bytes_max = 1 << 20 },
+            .store = .{ .blocks_max = 512, .bytes_max = 1 << 20 },
             .staging_bytes = 1 << 18,
             .select_max = 64,
             .build_bytes = 1 << 16,

@@ -941,7 +941,7 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     const call_raw = try call.params.raw();
     const raw = try call.params.optional_raw();
     try call.params.finish();
-    var message = try eth.parse_call(api.scratch, call_raw);
+    var message = try eth.parse_call(api.scratch, call_raw, api.node.recoverer);
     // Absent: the executor's default (the block limit, EIP-7825-capped from Osaka on).
     if (message.gas) |gas| message.gas = @min(gas, call_gas_max);
     const view = try view_state(api, call, raw);
@@ -1136,14 +1136,14 @@ fn write_block(api: *Api, call: *Call, tag: Tag, full: bool) HandlerError!void {
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const tag = try parse_tag(try call.params.raw());
     if (tag == .hash) return error.InvalidParams;
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     try call.params.finish();
     try write_block(api, call, tag, full);
 }
 
 fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     try call.params.finish();
     try write_block(api, call, .{ .hash = hash }, full);
 }

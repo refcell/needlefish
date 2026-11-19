@@ -69,8 +69,31 @@ test "json: rejects malformed documents" {
     for (cases) |case| {
         try expectError(case[1], json.validate(case[0]));
     }
-    var deep: [json.depth_max + 1]u8 = @splat('[');
-    try expectError(error.DepthExceeded, json.validate(&deep));
+    // serde_json's limit: 127 levels scan, the 128th fails.
+    var deep: [2 * json.depth_max]u8 = @splat('[');
+    @memset(deep[json.depth_max..], ']');
+    try json.validate(&deep);
+    var deeper: [json.depth_max + 1]u8 = @splat('[');
+    try expectError(error.DepthExceeded, json.validate(&deeper));
+}
+
+test "json: the writer nests to writer_depth_max" {
+    var out: [2 * json.writer_depth_max + 32]u8 = undefined;
+    var buffer: std.Io.Writer = .fixed(&out);
+    var w: json.Writer = .init(&buffer);
+    for (0..json.writer_depth_max - 1) |_| try w.begin_array();
+    try w.begin_object();
+    try w.key("a");
+    try w.integer(1);
+    try w.key("b");
+    try w.integer(2);
+    try w.end_object();
+    try w.integer(3);
+    for (0..json.writer_depth_max - 1) |_| try w.end_array();
+    const text = buffer.buffered();
+    const head = json.writer_depth_max - 1;
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2},3]", text[head..][0..16]);
+    try std.testing.expectEqual(@as(u32, 0), w.depth);
 }
 
 test "json: skip jumps over nested values" {

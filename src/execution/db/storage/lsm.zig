@@ -121,6 +121,10 @@ pub const Stats = struct {
     cuts_overlap: u64 = 0,
     /// Blocks of an interrupted job that open released.
     orphans_released: u64 = 0,
+    /// Tables flushes and merges wrote.
+    tables_written: u64 = 0,
+    /// Merges by the level they wrote into.
+    merges_into: [levels_max]u64 = @splat(0),
 };
 
 pub const ValueMode = enum { fixed, variable };

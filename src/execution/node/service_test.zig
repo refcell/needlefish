@@ -186,6 +186,11 @@ const Harness = struct {
     }
 
     fn create_full(durable: bool, history_window: u32) !*Harness {
+        return create_numbered(durable, history_window, 0);
+    }
+
+    /// A harness whose genesis block has `genesis_number`.
+    fn create_numbered(durable: bool, history_window: u32, genesis_number: u64) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
         harness.world = try io.SimWorld.init(testing.allocator, .{ .seed = 11 });
@@ -200,6 +205,7 @@ const Harness = struct {
         try devnet.genesis.write_l1_genesis(&writer, &.{ .genesis_timestamp = genesis_time });
         harness.parsed = try genesis.parse(testing.allocator, writer.buffered());
         errdefer harness.parsed.deinit();
+        harness.parsed.value.number = genesis_number;
         harness.memory = .{ .buffer = &harness.log_buffer };
         harness.logger = .{ .sink = harness.memory.sink() };
         try harness.init_service();
@@ -338,6 +344,29 @@ test "service: durable proofs history lives in the database and survives restart
     const head = service.chain.header(service.chain.head_hash()).?;
     const restored = service.durable.?.database.history.?.window().?;
     try testing.expectEqual(head.number, restored.head);
+}
+
+test "service: a durable chain with a genesis above block 0 reopens with genesis oldest" {
+    const genesis_number: u64 = 30_008_523;
+    const harness = try Harness.create_numbered(true, 64, genesis_number);
+    defer harness.destroy();
+    const service = &harness.service;
+    const genesis_header = service.chain.header(service.chain.head_hash()).?;
+    try testing.expectEqual(genesis_number, genesis_header.number);
+    _ = try service.start();
+    harness.world.run_for_ns(7 * std.time.ns_per_s);
+    const window = service.durable.?.database.history.?.window().?;
+    try testing.expectEqual(genesis_number + 3, window.head);
+    try testing.expectEqual(genesis_number, window.oldest);
+    harness.world.run_for_ns(std.time.ns_per_s / 2); // Let the storage tick sync.
+    try harness.restart();
+    // The window reaches genesis but never unwinds it: nothing below genesis exists.
+    const restored = service.durable.?.database.history.?.window().?;
+    try testing.expectEqual(genesis_number, restored.oldest);
+    try testing.expect(service.durable.?.database.chain.canonical_hash(genesis_number - 1) == null);
+    const store = &service.chain.store;
+    const genesis_hash = store.canonical_hash(genesis_number).?;
+    try testing.expectEqualSlices(u8, &service.chain.genesis_hash, &genesis_hash);
 }
 
 test "service: dev L1 keeps blob sidecars of mined blob transactions" {

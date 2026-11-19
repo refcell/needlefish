@@ -32,7 +32,7 @@ pub fn execution_witness(chain: *Chain, generator: *Generator, hash: Hash) Error
     chain.ensure_head_state() catch return error.StateUnavailable;
     const stored = chain.record(hash) orelse return error.BlockUnavailable;
     const number = stored.header.number;
-    if (number == 0) return error.BlockUnavailable;
+    if (number <= chain.genesis_number) return error.BlockUnavailable;
     const canonical = chain.store.canonical_hash(number) orelse return error.BlockUnavailable;
     if (!std.mem.eql(u8, &canonical, &hash)) return error.BlockUnavailable;
     try witness_from_state(chain, generator, stored, hash);
@@ -45,7 +45,7 @@ pub fn built_witness(chain: *Chain, generator: *Generator, hash: Hash) Error!voi
     assert(generator.state == chain.db.state);
     if (!std.mem.eql(u8, &chain.state_hash, &hash)) return error.StateUnavailable;
     const stored = chain.record(hash) orelse return error.BlockUnavailable;
-    if (stored.header.number == 0) return error.BlockUnavailable;
+    if (stored.header.number <= chain.genesis_number) return error.BlockUnavailable;
     try witness_from_state(chain, generator, stored, hash);
     assert(std.mem.eql(u8, &chain.state_hash, &hash));
 }
@@ -53,7 +53,7 @@ pub fn built_witness(chain: *Chain, generator: *Generator, hash: Hash) Error!voi
 /// Witness of stored block `hash` relative to the state's current block.
 fn witness_from_state(chain: *Chain, generator: *Generator, stored: Record, hash: Hash) Error!void {
     const number = stored.header.number;
-    assert(number > 0);
+    assert(number > chain.genesis_number);
     var run: Run = .{ .chain = chain, .record = stored };
     const execute: witness_block.Execute = .{ .context = &run, .run = Run.execute };
     defer {
@@ -79,7 +79,7 @@ fn memory_witness(
     execute: witness_block.Execute,
 ) Error!Hash {
     const head = chain.store.ref(chain.state_hash) orelse return error.StateUnavailable;
-    assert(head.number >= number and number > 0);
+    assert(head.number >= number and number > chain.genesis_number);
     const depth = head.number - number + 1;
     if (depth > generator.changesets.len) return error.BlockUnavailable;
     const changesets = chain.db.recent_changesets(@intCast(depth), generator.changesets) orelse

@@ -68,4 +68,5 @@ test {
     _ = @import("branch_record_test.zig");
     _ = @import("disk_state_test.zig");
     _ = @import("database_disk_test.zig");
+    _ = @import("database_hashed_test.zig");
 }

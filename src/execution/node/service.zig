@@ -192,11 +192,11 @@ pub const Limits = struct {
         .changeset = undefined,
         .depth_max = 1024,
     },
-    /// Bound on a `debug_executionWitness` result's JSON: an HTTP large send buffer (16 MiB)
-    /// less the head reserve (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB). A
-    /// storage-heavy witness is ~2.6 MB of JSON. Larger witnesses fail with "witness too
-    /// large" instead of an overflowing response. Raising it needs a larger
-    /// `http.large_send_buffer_size` too.
+    /// Bound on a `debug_executionWitness` result's JSON: 16 MiB less the head reserve
+    /// (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB), inside an HTTP large send
+    /// buffer. A storage-heavy witness is ~2.6 MB of JSON. Larger witnesses fail with
+    /// "witness too large" instead of an overflowing response (and the generator's buffers
+    /// are sized from it). Raising it past `http.large_send_buffer_size` needs that too.
     witness_response_bytes_max: u32 = (16 << 20) - (2 << 10),
     http: http.server.Options = .{
         // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
@@ -204,10 +204,12 @@ pub const Limits = struct {
         .recv_buffer_size = 4 << 20,
         .send_buffer_size = 1 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
-        // Responses sized up front past 1 MiB (witnesses): 32 MiB reserved, committed only
-        // as written; two connections can send one at a time.
+        // Responses past 1 MiB (witnesses, traces, any JSON-RPC result): two buffers
+        // reserved, committed only as written; two connections can send one at a time.
+        // Each holds `rpc.response_bytes_max` (reth's default 160 MiB) after the 1 KiB
+        // head reserve: a block's struct logs with memory and `limit: 512` run ~100 MiB.
         .large_send_buffers_max = 2,
-        .large_send_buffer_size = 16 << 20,
+        .large_send_buffer_size = rpc.response_bytes_max + 1024,
     },
     beacon_http: http.server.Options = .{
         .connections_max = 8,
@@ -215,7 +217,13 @@ pub const Limits = struct {
         .send_buffer_size = 4 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = 1024 },
     },
-    rpc_scratch_bytes: u32 = 4 << 20,
+    /// The RPC handlers' scratch, reserved and committed only as touched. Traces hold one
+    /// transaction at a time in it (`trace.zig`): call frames (a quarter, ~100k frames),
+    /// prestate accounts and slots (an eighth each, ~35k and ~65k) and the block's cached
+    /// accounts (a quarter, ~90k), and the touched code (most of the rest). A transaction
+    /// under the EIP-7825 transaction gas cap (50M for a call) reaches ~8k (24k) cold slots
+    /// and ~6.5k (19k) cold accounts; a block's gas limit (240M on Base) ~92k cold accounts.
+    rpc_scratch_bytes: u32 = 64 << 20,
     /// eth_sendRawTransactionSync: the longest wait for inclusion (reth's default is 30 s;
     /// kept under the HTTP server's 30 s `io_timeout_ns`, which drops parked connections).
     send_raw_tx_sync_timeout_ms: u64 = 25_000,
@@ -608,6 +616,7 @@ pub fn Service(comptime IO: type) type {
             const blocks_max = durable.database.config.chain.blocks_max;
             const records = try allocator.alloc([]const u8, blocks_max);
             defer allocator.free(records);
+            for (durable.retained_side(records)) |record| try service.chain.restore_side(record);
             for (durable.retained(records)) |record| try service.chain.restore(record);
         }
 

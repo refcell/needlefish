@@ -65,7 +65,7 @@ const changeset_config: changeset_module.Config = .{
     .code_bytes_max = 1024,
 };
 
-const config_disk: database.Config = .{
+pub const config_disk: database.Config = .{
     .engine = .{
         // Large enough that the branch-write admission, not the journal, asks for checkpoints.
         .journal_size_bytes = 256 * sector_size,
@@ -146,32 +146,32 @@ const config_memory: database.Config = .{
     .checkpoint_staging_bytes = 1024 * 1024,
 };
 
-const overlay_config: overlay_module.Config = .{
+pub const overlay_config: overlay_module.Config = .{
     .accounts_max = 32,
     .slots_max = 160,
     .codes_max = 1,
 };
 
-fn address_of(index: u64) Address {
+pub fn address_of(index: u64) Address {
     var address: Address = @splat(0x44);
     address[0] = @intCast(index);
     return address;
 }
 
-fn hash_of(id: u32) Hash {
+pub fn hash_of(id: u32) Hash {
     var hash: Hash = @splat(0xd1);
     std.mem.writeInt(u32, hash[0..4], id + 1, .big);
     return hash;
 }
 
 /// One database with its overlay, pinned (the overlay points into it).
-const Node = struct {
+pub const Node = struct {
     db: Database,
     sim: *SimStorage,
     overlay: Overlay,
     config: database.Config,
 
-    fn init(self: *Node, sim: *SimStorage, config: database.Config) !void {
+    pub fn init(self: *Node, sim: *SimStorage, config: database.Config) !void {
         self.* = .{
             .db = try Database.init(testing.allocator, sim, config),
             .sim = sim,
@@ -182,7 +182,7 @@ const Node = struct {
         self.overlay = try Overlay.init(testing.allocator, &self.db.state, overlay_config);
     }
 
-    fn deinit(self: *Node) void {
+    pub fn deinit(self: *Node) void {
         self.overlay.deinit(testing.allocator);
         self.db.deinit(testing.allocator);
     }
@@ -196,7 +196,7 @@ const Node = struct {
     const idle = drive.idle;
     const settled = drive.settled;
 
-    fn format(self: *Node, format_id: u128) !void {
+    pub fn format(self: *Node, format_id: u128) !void {
         self.db.format(format_id);
         try self.tick_until(not_formatting);
         try self.open();
@@ -206,7 +206,7 @@ const Node = struct {
         return drive.open(&self.db, self.sim);
     }
 
-    fn reopen(self: *Node) !void {
+    pub fn reopen(self: *Node) !void {
         self.db.deinit(testing.allocator);
         self.db = try Database.init(testing.allocator, self.sim, self.config);
         self.overlay.discard();
@@ -215,7 +215,7 @@ const Node = struct {
     }
 
     /// Requests a checkpoint and drives it (unpaced) until it is written and all is idle.
-    fn checkpoint(self: *Node) !void {
+    pub fn checkpoint(self: *Node) !void {
         self.db.request_checkpoint();
         var ticks: u32 = 0;
         while (!settled(&self.db)) : (ticks += 1) {
@@ -227,7 +227,7 @@ const Node = struct {
     }
 
     /// `execute_and_commit`, ticking while busy (the oracle must take every block).
-    fn commit_retry(self: *Node, input: *const BlockInput) !database.Commit {
+    pub fn commit_retry(self: *Node, input: *const BlockInput) !database.Commit {
         var ticks: u32 = 0;
         while (true) : (ticks += 1) {
             if (ticks >= ticks_max) return error.Timeout;
@@ -241,7 +241,7 @@ const Node = struct {
         }
     }
 
-    fn set_head_retry(self: *Node, hash: Hash) !void {
+    pub fn set_head_retry(self: *Node, hash: Hash) !void {
         var ticks: u32 = 0;
         while (true) : (ticks += 1) {
             if (ticks >= ticks_max) return error.Timeout;

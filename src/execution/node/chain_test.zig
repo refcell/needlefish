@@ -131,6 +131,37 @@ test "chain: L2 blocks build and import; DA limits gate pool transactions" {
     try testing.expectEqual(types.Status.valid, (try import(builder, follower, second)).status);
 }
 
+test "chain: a genesis above block 0 builds, imports, and reorgs down to genesis" {
+    const genesis_number: u64 = 30_008_523;
+    const builder = try Node.create_numbered(spec, null, genesis_number);
+    defer builder.destroy();
+    const follower = try Node.create_numbered(spec, null, genesis_number);
+    defer follower.destroy();
+    var buffer: [256]u8 = undefined;
+    try submit(builder, 1, 0, 100, &buffer);
+    const genesis: B256 = .{ .bytes = builder.chain.genesis_hash };
+    const a1 = try build(builder, genesis, 12, 0xaa);
+    const a2 = try build(builder, a1, 24, 0xaa);
+    const b1 = try build(builder, genesis, 13, 0xbb);
+    try testing.expectEqual(genesis_number + 2, builder.chain.header(a2.bytes).?.number);
+    for ([_]B256{ a1, a2, b1 }) |hash| {
+        try testing.expectEqual(types.Status.valid, (try import(builder, follower, hash)).status);
+    }
+    const v = types.forkchoice_version(spec, 24);
+    for ([_]*Node{ builder, follower }) |node| {
+        _ = try node.engine.forkchoice_updated(v, forkchoice(a2), null);
+        try testing.expectEqual(@as(u256, 100), node.db.get_account(address_of(9).bytes).?.balance);
+        // The reorg unwinds to genesis and stops there: genesis is the oldest block.
+        _ = try node.engine.forkchoice_updated(v, forkchoice(b1), null);
+        try testing.expect(node.db.get_account(address_of(9).bytes) == null);
+        const store = &node.chain.store;
+        try testing.expectEqualSlices(u8, &genesis.bytes, &store.canonical_hash(genesis_number).?);
+        try testing.expectEqualSlices(u8, &b1.bytes, &store.canonical_hash(genesis_number + 1).?);
+        try testing.expect(store.canonical_hash(genesis_number + 2) == null);
+        try testing.expect(store.canonical_hash(0) == null);
+    }
+}
+
 test "chain: tampered payload is invalid and leaves state untouched" {
     const builder = try Node.create();
     defer builder.destroy();

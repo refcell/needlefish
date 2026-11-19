@@ -385,6 +385,24 @@ pub const State = struct {
         return entry.storage_slots > 0;
     }
 
+    /// Disk mode: the account record at trie key `address_hash` (no preimage needed).
+    pub fn account_hashed(self: *const State, address_hash: *const Hash) ?DiskAccount {
+        const disk = self.disk.?;
+        assert(self.account_table.count() == 0);
+        return disk.account(disk.context, address_hash);
+    }
+
+    /// Disk mode: the slot word at trie keys `address_hash`, `slot_hash`; 0 when absent.
+    pub fn storage_hashed(
+        self: *const State,
+        address_hash: *const Hash,
+        slot_hash: *const Hash,
+    ) u256 {
+        const disk = self.disk.?;
+        assert(self.storage_table.count() == 0);
+        return disk.storage(disk.context, address_hash, slot_hash);
+    }
+
     pub fn storage(self: *const State, address: Address, slot: u256) u256 {
         if (self.disk) |disk| {
             var slot_bytes: [32]u8 = undefined;
@@ -422,6 +440,15 @@ pub const State = struct {
         const bytes = reader.read(reader.context, &hash, code) orelse return null;
         assert(bytes.len == code.len);
         return bytes;
+    }
+
+    /// The code with this hash when the arena holds it; null when unknown, empty, or held in
+    /// a table only (durable: the table belongs to a checkpoint).
+    pub fn code_in_arena(self: *const State, hash: Hash) ?[]const u8 {
+        const code = self.code_table.get(hash) orelse return null;
+        if (code.table != 0) return null;
+        assert(code.len > 0);
+        return self.code_arena[code.offset..][0..code.len];
     }
 
     /// Whether a code with this hash is known (present without reading it).
@@ -713,11 +740,14 @@ pub const State = struct {
     }
 
     /// Applies a block forward.
+    /// A hashed changeset (`Changeset.hashed`) applies only in disk mode (`Unsupported`
+    /// otherwise: the tables are keyed by address).
     pub fn apply(self: *State, changeset: *const Changeset) Error!void {
         if (self.disk) |disk| {
             assert(self.account_table.count() == 0);
             try disk.apply(disk.context, changeset, true);
         } else {
+            if (changeset.hashed) return error.Unsupported;
             try self.apply_direction(changeset, true);
         }
         for (0..changeset.codes_len) |index| {
@@ -731,6 +761,7 @@ pub const State = struct {
             assert(self.account_table.count() == 0);
             return disk.apply(disk.context, changeset, false);
         }
+        if (changeset.hashed) return error.Unsupported;
         try self.apply_direction(changeset, false);
     }
 

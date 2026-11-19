@@ -11,6 +11,9 @@ pub const request = @import("request.zig");
 pub const adapter = @import("adapter.zig");
 pub const response = @import("response.zig");
 pub const coverage = @import("coverage.zig");
+pub const system_config = @import("system_config.zig");
+pub const trie = @import("trie.zig");
+pub const trie_request = @import("trie_request.zig");
 pub const Adapter = adapter.Adapter;
 pub const Coverage = coverage.Coverage;
 
@@ -30,6 +33,12 @@ pub fn handle_line(
         const text = error_text(arena, "invalid request", err);
         return response.write_error(out, id, text, features);
     };
+    if (std.mem.eql(u8, raw.mode, "systemConfig") and
+        std.mem.eql(u8, raw.chain, "base-mainnet"))
+    {
+        return system_config.handle(arena, raw.id, raw.systemConfig, out);
+    }
+    if (std.mem.eql(u8, raw.mode, "trie")) return handle_trie(self, arena, &raw, out, features);
     const case = request.decode(arena, &raw) catch |err| {
         const text = error_text(arena, "invalid request", err);
         return response.write_error(out, raw.id, text, features);
@@ -43,6 +52,32 @@ pub fn handle_line(
         return response.write_error(out, raw.id, text, features);
     };
     return response.write_outcome(out, raw.id, &outcome, features);
+}
+
+/// `trie` mode (`trie.zig`): every request starts from an empty state in its own databases.
+fn handle_trie(
+    self: *Adapter,
+    arena: std.mem.Allocator,
+    raw: *const request.RawRequest,
+    out: *std.Io.Writer,
+    features: ?*const Coverage,
+) std.Io.Writer.Error!void {
+    const raw_trie = raw.trie orelse {
+        return response.write_error(out, raw.id, "invalid request: MissingField trie", features);
+    };
+    const case = trie_request.decode(arena, &raw_trie) catch |err| {
+        const text = error_text(arena, "invalid request", err);
+        return response.write_error(out, raw.id, text, features);
+    };
+    const io = self.io orelse {
+        return response.write_error(out, raw.id, "trie mode needs file IO", features);
+    };
+    const outcome = trie.run(arena, self.allocator, io, &case) catch |err| {
+        const text = error_text(arena, "cannot run", err);
+        std.log.info("diff adapter: {s}: {s}", .{ raw.id orelse "(no id)", text });
+        return response.write_error(out, raw.id, text, features);
+    };
+    return trie.write(out, raw.id, &outcome, features);
 }
 
 /// `WitnessIncomplete: witness lacks trie node 0x.., reading account 0x.., executing
@@ -63,4 +98,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("adapter_test.zig");
     _ = @import("coverage.zig");
+    _ = @import("system_config.zig");
+    _ = @import("trie_test.zig");
+    _ = @import("trie_hooks_test.zig");
 }

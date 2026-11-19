@@ -51,6 +51,9 @@ pub const PostAccount = struct {
     address: Address,
     info: ?db.AccountInfo,
     storage: []const Slot,
+    /// Existed before the block, was destroyed in it, and exists after it: its storage
+    /// starts from empty, and `storage` lists only the slots written since.
+    wiped: bool = false,
 };
 
 pub const Outcome = struct {
@@ -144,6 +147,12 @@ pub const Adapter = struct {
     /// What the witness lacked in the last run.
     missing: Missing = .{},
     schedule: ?base_time.Schedule,
+    /// Accounts the last commit recreated after destroying them in the block (storage
+    /// cleared, present at the end).
+    destroyed: std.AutoHashMapUnmanaged(Address, void) = .empty,
+    /// File system access for `trie` mode's databases (its directory); without it trie
+    /// requests fail.
+    io: ?std.Io = null,
 
     pub const changeset_config: db.changeset.Config = .{
         .accounts_max = 1 << 16,
@@ -164,6 +173,8 @@ pub const Adapter = struct {
             .schedule = chain_module.denim_schedule_of(spec, 0, chains.mainnet.genesis_l2_time),
         };
         errdefer self.changeset.deinit(allocator);
+        try self.destroyed.ensureTotalCapacity(allocator, changeset_config.accounts_max);
+        errdefer self.destroyed.deinit(allocator);
         const backend: node_executor.Backend = .{
             .context = self,
             .database = self.database(),
@@ -180,6 +191,7 @@ pub const Adapter = struct {
         if (self.sparse_ready) self.sparse.deinit(self.allocator);
         self.executor.deinit(self.allocator);
         self.changeset.deinit(self.allocator);
+        self.destroyed.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -372,9 +384,11 @@ pub const Adapter = struct {
             const address = next_address(accounts, account_index, slots, slot_index);
             var info: ?db.AccountInfo = null;
             var changed = false;
+            var existed = true;
             if (account_index < accounts.len and eql(&accounts[account_index].address, &address)) {
                 const change = accounts[account_index];
                 info = change.new;
+                existed = change.old != null;
                 changed = !same_info(change.old, change.new);
                 account_index += 1;
             } else {
@@ -385,11 +399,18 @@ pub const Adapter = struct {
                 slot_index += 1;
             }
             const storage = try arena.alloc(Slot, if (info == null) 0 else slot_index - first);
+            // base/base: `original_info.is_some() && was_destroyed() && info.is_some()`.
+            const wiped = existed and info != null and self.destroyed.contains(address);
             for (storage, slots[first..][0..storage.len]) |*slot, change| {
                 slot.* = .{ .slot = change.slot, .value = change.new };
             }
-            if (!changed and storage.len == 0) continue;
-            try out.append(arena, .{ .address = address, .info = info, .storage = storage });
+            if (!changed and storage.len == 0 and !wiped) continue;
+            try out.append(arena, .{
+                .address = address,
+                .info = info,
+                .storage = storage,
+                .wiped = wiped,
+            });
         }
         assert(account_index == accounts.len and slot_index == slots.len);
         return out.items;
@@ -470,6 +491,15 @@ pub const Adapter = struct {
         state: *evm.State,
     ) node_executor.BackendError!void {
         const self: *Adapter = @ptrCast(@alignCast(context));
+        self.destroyed.clearRetainingCapacity();
+        for (state.touched_accounts()) |account| {
+            // Storage is cleared only by a destruction (SELFDESTRUCT or EIP-161 removal).
+            if (!account.storage_cleared or !account.in_database) continue;
+            if (self.destroyed.count() == changeset_config.accounts_max) {
+                return error.StateUnavailable;
+            }
+            self.destroyed.putAssumeCapacity(account.address, {});
+        }
         self.sparse.apply_evm(state, &self.changeset) catch |err| {
             if (err == error.WitnessIncomplete) {
                 self.sparse.incomplete = true;

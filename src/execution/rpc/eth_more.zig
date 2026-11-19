@@ -36,7 +36,8 @@ pub const methods = [_]rpc.Method(*Api){
     .{ .name = "txpool_status", .handler = txpool_status },
 };
 
-/// The block named by a number/tag parameter, or null (answered with JSON null).
+/// The block named by a block parameter (a tag, number or hash, as Nethermind reads it), or
+/// null (answered with JSON null).
 fn block_by_number(api: *Api, call: *Call) HandlerError!?Hash {
     const raw = try call.params.raw();
     return eth.resolve_block(api, call, raw) catch |err| switch (err) {
@@ -46,7 +47,7 @@ fn block_by_number(api: *Api, call: *Call) HandlerError!?Hash {
 }
 
 fn block_by_hash(api: *Api, call: *Call) HandlerError!?Hash {
-    const hash = try call.params.fixed(32);
+    const hash = try call.params.hash();
     return if (api.chain.store.ref(hash) != null) hash else null;
 }
 
@@ -92,7 +93,8 @@ fn uncle_count_by_number(api: *Api, call: *Call) HandlerError!void {
 fn uncle_by_index(api: *Api, call: *Call) HandlerError!void {
     _ = api;
     _ = try call.params.raw();
-    _ = try call.params.quantity(u64);
+    // Nethermind's index is a `UInt256`: any index past the (empty) uncle list is null.
+    _ = try call.params.quantity(u256);
     try call.params.finish();
     try call.writer.null_value();
 }
@@ -101,11 +103,15 @@ fn uncle_by_index(api: *Api, call: *Call) HandlerError!void {
 const Form = enum { object, raw };
 
 fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) HandlerError!void {
-    const index = try call.params.quantity(u64);
+    // Nethermind's index is a `UInt256`: one of 2^64 or more is past the end (null).
+    const index_wide = try call.params.quantity(u256);
     try call.params.finish();
-    const found = hash orelse return call.writer.null_value();
-    const record = api.chain.record(found) orelse return call.writer.null_value();
-    if (index >= transaction_count(record)) return call.writer.null_value();
+    // Nethermind's OP module (`GetTransactionByBlockAndIndex`) refuses an unknown block
+    // whatever the index; the raw forms answer null (the base module).
+    const found = hash orelse return missing_block(call, form);
+    const record = api.chain.record(found) orelse return missing_block(call, form);
+    if (index_wide >= transaction_count(record)) return call.writer.null_value();
+    const index: u64 = @intCast(index_wide);
     var transactions = record.transactions;
     for (0..index) |_| _ = transactions.bytes() catch unreachable;
     const raw = transactions.bytes() catch unreachable;
@@ -116,7 +122,15 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) Handler
         .index = @intCast(index),
         .base_fee = record.header.base_fee_per_gas,
         .timestamp_ms = format.timestamp_ms(record),
+        .timestamp = record.header.timestamp,
+        .deposit = format.deposit_receipt(record, @intCast(index)),
     }, api.chain.executor.recoverer);
+}
+
+fn missing_block(call: *Call, form: Form) HandlerError!void {
+    if (form == .raw) return call.writer.null_value();
+    assert(form == .object);
+    return call.fail(rpc.code.server_error, "header not found");
 }
 
 fn transaction_by_hash_index(api: *Api, call: *Call) HandlerError!void {
@@ -138,7 +152,7 @@ fn raw_by_number_index(api: *Api, call: *Call) HandlerError!void {
 /// `eth_getRawTransactionByHash`: the EIP-2718 bytes of a canonical or pooled transaction
 /// (pooled ones in canonical form, without a blob sidecar), null when unknown.
 fn raw_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const tx_hash = try call.params.fixed(32);
+    const tx_hash = try call.params.hash();
     try call.params.finish();
     if (api.chain.find_transaction(tx_hash)) |location| {
         const record = api.chain.record(location.block_hash).?;

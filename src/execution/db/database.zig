@@ -282,8 +282,33 @@ pub fn metadata_encode(info: HeadInfo) Metadata {
     return metadata;
 }
 
+/// The bytes of `metadata_encode`'s layout; the forkchoice head follows them.
+pub const metadata_head_size = 80;
+
+/// `metadata_encode`, and the forkchoice head (`Database.forkchoice_head`) when there is
+/// one: present u8 at 80, hash at 88.
+pub fn metadata_encode_forkchoice(info: HeadInfo, forkchoice_head: ?Hash) Metadata {
+    var metadata = metadata_encode(info);
+    const hash = forkchoice_head orelse return metadata;
+    assert(info.present);
+    metadata[metadata_head_size] = 1;
+    @memcpy(metadata[88..120], &hash);
+    return metadata;
+}
+
+/// The forkchoice head of metadata written by `metadata_encode_forkchoice`.
+pub fn metadata_forkchoice_head(metadata: *const Metadata) error{MetadataMismatch}!?Hash {
+    if (!std.mem.allEqual(u8, metadata[120..], 0)) return error.MetadataMismatch;
+    if (!std.mem.allEqual(u8, metadata[81..88], 0)) return error.MetadataMismatch;
+    return switch (metadata[metadata_head_size]) {
+        0 => if (std.mem.allEqual(u8, metadata[88..120], 0)) null else error.MetadataMismatch,
+        1 => metadata[88..120].*,
+        else => error.MetadataMismatch,
+    };
+}
+
 comptime {
-    assert(@sizeOf(Metadata) >= 80);
+    assert(@sizeOf(Metadata) >= 120);
     assert(block_entry_fixed_size == 101);
 }
 
@@ -634,6 +659,12 @@ pub fn DatabaseType(comptime Storage: type) type {
         staging_position: u64 = 0,
         phase: Phase = .closed,
         head_info: HeadInfo = .{},
+        /// The head the last forkchoice update chose (`set_forkchoice_head`, or
+        /// `commit_applied` of the block it adopts), recorded in each entry's metadata. A
+        /// restart resumes there (`Durable`), as reth persists the canonical head a
+        /// forkchoice update set: other head moves, such as executing a side block on its
+        /// parent, leave it. Null until the first one (and in a journal written before it).
+        forkchoice_head: ?Hash = null,
         /// Sequence of the newest journaled operation (queued, in flight, or durable).
         submitted_sequence: u64 = 0,
         /// Sequence of the newest durable entry.
@@ -1005,7 +1036,9 @@ pub fn DatabaseType(comptime Storage: type) type {
                 self.load_error = error.ReplayFailed;
                 return;
             };
-            if (!std.mem.eql(u8, &metadata_encode(self.head_info), entry.metadata)) {
+            const expected = metadata_encode(self.head_info);
+            const head = entry.metadata[0..metadata_head_size];
+            if (!std.mem.eql(u8, expected[0..metadata_head_size], head)) {
                 self.load_error = error.MetadataMismatch;
             }
         }
@@ -1043,9 +1076,13 @@ pub fn DatabaseType(comptime Storage: type) type {
             self.ensure_loaded();
             if (self.load_error == null) {
                 const metadata = metadata_encode(self.head_info);
-                if (!std.mem.eql(u8, &metadata, &engine.commit_metadata)) {
+                const head = engine.commit_metadata[0..metadata_head_size];
+                if (!std.mem.eql(u8, metadata[0..metadata_head_size], head)) {
                     self.load_error = error.MetadataMismatch;
                 }
+                if (metadata_forkchoice_head(&engine.commit_metadata)) |hash| {
+                    self.forkchoice_head = hash;
+                } else |err| self.load_error = err;
             }
             if (self.load_error) |err| {
                 self.open_error = err;
@@ -1107,6 +1144,23 @@ pub fn DatabaseType(comptime Storage: type) type {
             return self.queue_push(@intCast(body.len));
         }
 
+        /// Like `set_head`, and records `hash` as the forkchoice head (`forkchoice_head`).
+        /// Journals a head entry unless the head and the forkchoice head already are `hash`.
+        pub fn set_forkchoice_head(self: *Self, hash: Hash) OperationError!u64 {
+            try self.check_accepting(1, journal_module.entry_size_bytes(head_entry_size));
+            const at_head = self.head_info.present and
+                std.mem.eql(u8, &self.head_info.hash, &hash);
+            if (at_head) {
+                if (self.forkchoice_head) |current| {
+                    if (std.mem.eql(u8, &current, &hash)) return self.submitted_sequence;
+                }
+            } else try self.move_head(hash);
+            assert(std.mem.eql(u8, &self.head_info.hash, &hash));
+            self.forkchoice_head = hash;
+            const body = encode_head(&hash, self.queue_slot());
+            return self.queue_push(@intCast(body.len));
+        }
+
         /// Commits an executed block: builds its changeset from `overlay` (which must sit on
         /// this database's state at the current head), inserts the block with that changeset
         /// (`input.changeset` is ignored), moves the head to it, journals both as one
@@ -1140,9 +1194,30 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// (`input.changeset` is the changeset it applied on top of the head): inserts the
         /// block and moves the head without touching state, as one `block_and_head` entry.
         /// Replay applies the changeset through the usual path and ends in the same state.
-        /// A block already stored only moves the head (re-applying its changeset is
-        /// idempotent: changesets carry absolute values).
+        /// A block already stored (a side block executed again, e.g. after a restart dropped
+        /// the caller's copy) moves the head the same way but journals only a `head` entry.
+        /// Its stored changeset must not be applied again: re-applying is not idempotent (a
+        /// removed account's storage wipe finds no account the second time).
         pub fn commit_applied(self: *Self, input: *const BlockInput) OperationError!Commit {
+            return self.commit_applied_as(input, false);
+        }
+
+        /// `commit_applied` of the block a forkchoice update adopts: it becomes the
+        /// forkchoice head (`forkchoice_head`) too, in the same entry.
+        pub fn commit_applied_forkchoice(
+            self: *Self,
+            input: *const BlockInput,
+        ) OperationError!Commit {
+            const commit = try self.commit_applied_as(input, true);
+            assert(std.mem.eql(u8, &self.forkchoice_head.?, &input.hash));
+            return commit;
+        }
+
+        fn commit_applied_as(
+            self: *Self,
+            input: *const BlockInput,
+            forkchoice: bool,
+        ) OperationError!Commit {
             if (!self.head_info.present) return error.ParentNotHead;
             if (!std.mem.eql(u8, &self.head_info.hash, &input.parent_hash)) {
                 return error.ParentNotHead;
@@ -1150,14 +1225,18 @@ pub fn DatabaseType(comptime Storage: type) type {
             const size = block_entry_size(input);
             if (size > self.config.engine.entry_body_size_max) return error.BlockTooLarge;
             try self.check_accepting(1, journal_module.entry_size_bytes(size));
-            if (self.chain.meta(input.hash) != null) {
-                const sequence = try self.set_head(input.hash);
-                return .{ .sequence = sequence, .state_root = self.head_info.state_root };
-            }
-            try self.insert_check(input);
+            // A stored block's changeset (replay applies it) has the same account and storage
+            // changes as the caller's, from the same block on the same parent; only its codes
+            // may differ, as a code already stored is not listed again.
+            const stored = self.chain.block(input.hash);
+            if (stored) |view| {
+                assert(std.mem.eql(u8, &view.meta.parent_hash, &input.parent_hash));
+                assert(view.meta.number == input.number);
+            } else try self.insert_check(input);
             try self.flat_reserve_applied(input);
-            try self.chain_insert(input);
+            if (stored == null) try self.chain_insert(input);
             self.chain.plan_reorg(input.hash, &self.plan) catch |err| {
+                if (stored != null) return err;
                 // Stored in memory: journal it alone so replay stays in step.
                 const body = encode_block(input, self.queue_slot());
                 _ = self.queue_push(@intCast(body.len));
@@ -1181,8 +1260,13 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .state_root = state_root,
             };
             self.history_commit_head();
-            const body = encode_block_and_head(input, self.queue_slot());
+            if (forkchoice) self.forkchoice_head = input.hash;
+            const body = if (stored == null)
+                encode_block_and_head(input, self.queue_slot())
+            else
+                encode_head(&input.hash, self.queue_slot());
             const sequence = self.queue_push(@intCast(body.len));
+            assert(sequence == self.submitted_sequence);
             return .{ .sequence = sequence, .state_root = state_root };
         }
 
@@ -1317,7 +1401,10 @@ pub fn DatabaseType(comptime Storage: type) type {
             assert(length > 0 and length <= self.config.engine.entry_body_size_max);
             const index = (self.queue_head + self.queue_count) % self.config.queue_entries_max;
             self.queue_lengths[index] = length;
-            self.queue_metadata[index] = metadata_encode(self.head_info);
+            self.queue_metadata[index] = metadata_encode_forkchoice(
+                self.head_info,
+                self.forkchoice_head,
+            );
             self.queue_count += 1;
             self.submitted_sequence += 1;
             self.journal_bytes_pending += journal_module.entry_size_bytes(length);
@@ -1971,7 +2058,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// The oldest block the window can be rebuilt from: `head - window_blocks + 1`, or
         /// the state below the oldest canonical block whose changeset is still retained
-        /// (genesis is never unwound).
+        /// (genesis, at any number, is never unwound).
         fn history_rebuild_start(self: *const Self) u64 {
             const head = self.head_info.number;
             const window_blocks = self.config.history.?.window_blocks;
@@ -1980,7 +2067,8 @@ pub fn DatabaseType(comptime Storage: type) type {
             var start = head;
             while (start > lowest and start > 0) : (start -= 1) {
                 const hash = self.chain.canonical_hash(start) orelse break;
-                if (self.chain.block(hash) == null) break;
+                const view = self.chain.block(hash) orelse break;
+                if (std.mem.allEqual(u8, &view.meta.parent_hash, 0)) break; // Genesis.
             }
             assert(start >= lowest and start <= head);
             return start;
@@ -2102,6 +2190,30 @@ pub fn DatabaseType(comptime Storage: type) type {
                 std.mem.writeInt(u256, &slot_bytes, slot, .big);
                 const slot_hash = keccak256(&slot_bytes);
                 const found = disk.prove(&address_hash, &slot_hash, account_proof, proof);
+                value.* = (found catch |err| return disk_proof_error(err)).word;
+            }
+            return leaf.account;
+        }
+
+        /// `proof_at` by trie keys, for a caller without preimages: the account proof of
+        /// `address_hash`, and one storage proof and value per slot hash. Disk mode, at the
+        /// head (or inside a history view, as `proof_at`): `proof_disk`'s walks, unhashed.
+        pub fn proof_hashed(
+            self: *Self,
+            address_hash: *const Hash,
+            slot_hashes: []const Hash,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) ProofError!?history_module.AccountState {
+            assert(slot_hashes.len == storage_proofs.len and slot_hashes.len == values.len);
+            if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            const disk = if (self.disk) |*disk| disk else return error.HistoryUnavailable;
+            assert(!self.checkpoints_held);
+            const leaf = disk.prove(address_hash, null, account_proof, account_proof) catch |err|
+                return disk_proof_error(err);
+            for (slot_hashes, storage_proofs, values) |*slot_hash, *proof, *value| {
+                const found = disk.prove(address_hash, slot_hash, account_proof, proof);
                 value.* = (found catch |err| return disk_proof_error(err)).word;
             }
             return leaf.account;

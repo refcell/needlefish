@@ -36,6 +36,8 @@ pub const Exit = enum(u8) {
     revert,
     out_of_gas,
     invalid_opcode,
+    /// The designated INVALID opcode (0xfe); revm reports it apart (`InvalidFEOpcode`).
+    invalid_fe_opcode,
     stack_underflow,
     stack_overflow,
     invalid_jump,
@@ -45,6 +47,15 @@ pub const Exit = enum(u8) {
     invalid_code_prefix,
     create_collision,
     precompile_failure,
+    /// A precompile ran out of gas (revm `OutOfGas(Precompile)`).
+    precompile_out_of_gas,
+    /// The caller of an unvalidated RPC call cannot pay its `value` (revm `OutOfFunds`; a
+    /// transaction's first frame only, see `TxEnv.disable_fee_charge`).
+    out_of_funds,
+    /// A deposit rejected before any frame (a system deposit after Regolith, gas below
+    /// intrinsic). Never an EVM outcome: only the synthetic top frame a tracer is given.
+    deposit_system_tx,
+    deposit_intrinsic_gas,
     call,
     create,
     fatal,
@@ -150,9 +161,15 @@ pub const Outcome = struct {
 const Step = union(enum) { frame, done: Outcome };
 
 /// Call-frame tracing hook (debug_trace* callTracer). Every `enter` is matched by exactly
-/// one `exit` carrying that frame's outcome, in stack order; `log` fires as each LOG runs
-/// (a later revert of the frame is visible from its `exit` status). Null costs one branch
-/// per frame.
+/// one `exit` carrying that frame's outcome, in stack order (a successful creation's output
+/// is the deployed code); `log` fires as each LOG runs (a later revert of the frame is
+/// visible from its `exit` status). Null costs one branch per frame.
+///
+/// `step` and `step_end` (the struct logger) bracket every executed instruction: `step`
+/// sees the frame before it runs (`pc`, `gas`, stack, memory current), `step_end` after.
+/// With `step` set, frames run in a separately compiled interpreter (`interpreter.run`
+/// with `traced`), so untraced execution pays one branch per frame run and nothing per
+/// instruction.
 pub const Tracer = struct {
     context: *anyopaque,
     enter: *const fn (context: *anyopaque, frame: TraceFrame) void,
@@ -163,6 +180,23 @@ pub const Tracer = struct {
         topics: []const primitives.B256,
         data: []const u8,
     ) void,
+    step: ?*const fn (context: *anyopaque, frame: *const Frame, evm: *const Evm) void = null,
+    step_end: ?*const fn (
+        context: *anyopaque,
+        frame: *const Frame,
+        evm: *const Evm,
+        end: StepEnd,
+    ) void = null,
+};
+
+/// What `Tracer.step_end` learns about the instruction that just ran.
+pub const StepEnd = struct {
+    /// The exit when the instruction ended the frame's run (a halt, STOP/RETURN/REVERT, or a
+    /// CALL/CREATE suspending it); null when execution continues.
+    exit: ?Exit,
+    /// The opcode's static gas (charged before it runs; an out-of-gas halt may leave the
+    /// frame's `gas` wrapped).
+    static_cost: u64,
 };
 
 pub const StaticWarmCache = struct {
@@ -192,6 +226,8 @@ pub const TraceFrame = struct {
     input: []const u8,
     /// Call depth of the new frame (0 for the transaction's top frame).
     depth: u16,
+    /// A call whose target is a precompile or a native contract.
+    precompile: bool = false,
 };
 
 pub const Evm = struct {
@@ -292,14 +328,23 @@ pub const Evm = struct {
             evm.arena.release(0);
         }
         var step: Step = switch (message.kind) {
-            .call => try evm.traced_call(fork, .{
-                .kind = if (message.is_static) .staticcall else .call,
-                .target = message.target,
-                .code_address = try evm.resolve_code_address(fork, message.target),
-                .value = message.value,
-                .input = message.input,
-                .gas_limit = message.gas_limit,
-            }, null, message.caller),
+            .call => call: {
+                const code_address = try evm.resolve_code_address(fork, message.target);
+                // A delegate goes in loaded, so the frame does not stamp it as read.
+                const delegated = !std.mem.eql(u8, &code_address, &message.target);
+                break :call try evm.traced_call(fork, .{
+                    .kind = if (message.is_static) .staticcall else .call,
+                    .target = message.target,
+                    .code_address = code_address,
+                    .value = message.value,
+                    .input = message.input,
+                    .gas_limit = message.gas_limit,
+                    .code_account = if (delegated)
+                        (try evm.state.access_unseen(code_address)).account
+                    else
+                        null,
+                }, null, message.caller);
+            },
             .create => try evm.traced_create(fork, .{
                 .is_create2 = false,
                 .caller = message.caller,
@@ -312,14 +357,18 @@ pub const Evm = struct {
         while (true) {
             switch (step) {
                 .done => |outcome| {
-                    if (evm.tracer) |tracer| tracer.exit(tracer.context, outcome);
+                    if (evm.tracer) |tracer| try evm.trace_exit(tracer, outcome);
                     if (evm.frames_len == 0) return outcome;
                     evm.resume_parent(outcome);
                 },
                 .frame => {},
             }
             const frame = &evm.frames[evm.frames_len - 1];
-            const exit = interpreter.run(fork, evm, frame);
+            const stepping = evm.tracer != null and evm.tracer.?.step != null;
+            const exit = if (stepping)
+                interpreter.run(fork, true, evm, frame)
+            else
+                interpreter.run(fork, false, evm, frame);
             step = switch (exit) {
                 .fatal => return evm.fatal_error.?,
                 .call => try evm.traced_call(fork, evm.pending.call, frame, frame.address),
@@ -347,9 +396,22 @@ pub const Evm = struct {
                 .gas = request.gas_limit,
                 .input = request.input,
                 .depth = if (parent) |p| p.depth + 1 else 0,
+                .precompile = evm.is_precompile(fork, request.target),
             });
         }
         return evm.start_call(fork, request, parent, caller_address);
+    }
+
+    /// Reports a frame's outcome to the tracer; a successful creation reports the code it
+    /// deposited as its output (geth and revm-inspectors do; the frame itself returns none).
+    fn trace_exit(evm: *Evm, tracer: *const Tracer, outcome: Outcome) Error!void {
+        var traced = outcome;
+        if (outcome.created) |address| {
+            assert(outcome.status == .success);
+            assert(outcome.output.len == 0);
+            traced.output = try evm.state.code(try evm.state.load(address));
+        }
+        tracer.exit(tracer.context, traced);
     }
 
     fn traced_create(
@@ -376,13 +438,56 @@ pub const Evm = struct {
         return evm.start_create(fork, request, parent);
     }
 
-    /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code.
-    fn resolve_code_address(evm: *Evm, comptime fork: Fork, target: Address) Error!Address {
+    /// Whether a call to `target` runs a precompile or native contract: not when an RPC
+    /// state override made the address an ordinary account.
+    fn is_precompile(evm: *const Evm, comptime fork: Fork, target: Address) bool {
+        if (evm.state.is_ordinary(target)) return false;
+        return precompiles.lookup(fork, evm.op_upgrade(), target) != null or
+            native.lookup(evm.op_upgrade(), target) != null;
+    }
+
+    /// Reports a failed deposit's top-level frame to the tracer, ending with `exit` and all
+    /// its gas left: one whose value transfer fails (revm's first frame starts, then ends
+    /// with OutOfFunds), or one rejected before any frame (a frame built from the
+    /// transaction, as geth and Nethermind report it). `nonce` names a created address.
+    pub fn trace_failed_top(
+        evm: *Evm,
+        comptime fork: Fork,
+        message: Message,
+        nonce: u64,
+        exit: Exit,
+    ) void {
+        const tracer = evm.tracer orelse return;
+        const is_create = message.kind == .create;
+        tracer.enter(tracer.context, .{
+            .kind = if (is_create) .create else .call,
+            .from = message.caller,
+            .to = if (is_create) create_address(message.caller, nonce) else message.target,
+            .value = message.value,
+            .gas = message.gas_limit,
+            .input = message.input,
+            .depth = 0,
+            .precompile = !is_create and evm.is_precompile(fork, message.target),
+        });
+        tracer.exit(tracer.context, .{
+            .status = .halt,
+            .exit = exit,
+            .gas_remaining = message.gas_limit,
+            .gas_refund = 0,
+            .output = &.{},
+        });
+    }
+
+    /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code. The delegate
+    /// is loaded and warmed but not stamped as read: Nethermind's prestateTracer looks up
+    /// the callee's delegate as it was before the authorizations applied (the collector
+    /// lists that one), not the one this resolves to.
+    pub fn resolve_code_address(evm: *Evm, comptime fork: Fork, target: Address) Error!Address {
         if (!fork.at_least(.prague)) return target;
         const account = try evm.state.load(target);
         const code = try evm.state.code(account);
         const delegate = bytecode.delegation_target(code) orelse return target;
-        _ = try evm.state.access(delegate);
+        _ = try evm.state.access_unseen(delegate);
         return delegate;
     }
 
@@ -432,13 +537,8 @@ pub const Evm = struct {
         }
         // EIP-7702: dispatch keys off the called address, never the delegate, so a delegation
         // to a precompile (or native contract) runs that account's empty code, as in revm.
-        if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
-            return evm.run_precompile(precompile, request, checkpoint);
-        }
-        if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
-            const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
-            return evm.run_native(contract, request, checkpoint, call);
-        }
+        const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
+        if (try evm.run_builtin(fork, request, checkpoint, call)) |step| return step;
         const code_account = request.code_account orelse
             if (std.mem.eql(u8, &request.code_address, &address))
                 account
@@ -470,6 +570,25 @@ pub const Evm = struct {
             .checkpoint = checkpoint,
         }, parent);
         return .frame;
+    }
+
+    /// Runs the precompile or native contract at the called address, if any: none at an
+    /// address an RPC state override made ordinary, whose code runs (geth, Nethermind).
+    fn run_builtin(
+        evm: *Evm,
+        comptime fork: Fork,
+        request: CallRequest,
+        checkpoint: state_module.Checkpoint,
+        call: NativeCall,
+    ) Error!?Step {
+        if (evm.state.is_ordinary(request.target)) return null;
+        if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
+            return evm.run_precompile(precompile, request, checkpoint);
+        }
+        if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
+            return try evm.run_native(contract, request, checkpoint, call);
+        }
+        return null;
     }
 
     /// The account whose storage the new frame owns: the parent's for CALLCODE and
@@ -515,7 +634,10 @@ pub const Evm = struct {
         coverage.precompile(&request.target, request.input.len, @tagName(result.status));
         if (result.status != .success) {
             evm.state.revert(checkpoint);
-            return failed(0, .precompile_failure);
+            return failed(0, if (result.status == .out_of_gas)
+                .precompile_out_of_gas
+            else
+                .precompile_failure);
         }
         assert(result.gas_used <= request.gas_limit);
         return .{ .done = .{
@@ -571,6 +693,18 @@ pub const Evm = struct {
         } };
     }
 
+    /// A create that fails before deriving and loading its address (revm: depth, balance,
+    /// nonce). Only the prestate tracer learns the address (`State.note_unborn`); the
+    /// caller is the running frame's account, already cached, so nothing new is read.
+    fn unborn(evm: *Evm, request: CreateRequest) Error!Step {
+        const address = if (request.is_create2)
+            create2_address(request.caller, request.salt, request.init_code)
+        else
+            create_address(request.caller, (try evm.state.load(request.caller)).info.nonce);
+        evm.state.note_unborn(address);
+        return failed(request.gas_limit, .revert);
+    }
+
     fn start_create(
         evm: *Evm,
         comptime fork: Fork,
@@ -579,12 +713,16 @@ pub const Evm = struct {
     ) Error!Step {
         const depth: u16 = if (parent) |p| p.depth + 1 else 0;
         if (parent) |p| p.awaiting = .create;
-        if (depth > evm.config.depth_max) return failed(request.gas_limit, .revert);
+        if (depth > evm.config.depth_max) return evm.unborn(request);
         const caller = try evm.state.load(request.caller);
-        if (caller.info.balance < request.value) return failed(request.gas_limit, .revert);
-        if (caller.info.nonce == std.math.maxInt(u64)) return failed(request.gas_limit, .revert);
-        const nonce = caller.info.nonce;
-        try evm.state.set_nonce(caller, nonce + 1);
+        if (caller.info.balance < request.value) return evm.unborn(request);
+        const nonce_max = caller.info.nonce == std.math.maxInt(u64);
+        // An unvalidated RPC call wraps the nonce, and Nethermind then derives the address
+        // from the wrapped nonce (`GetRecipient`: zero stays zero).
+        const wrap = nonce_max and depth == 0 and evm.tx.wrap_max_nonce;
+        if (nonce_max and !wrap) return evm.unborn(request);
+        const nonce = if (wrap) 0 else caller.info.nonce;
+        try evm.state.set_nonce(caller, if (wrap) 0 else nonce + 1);
         const address = if (request.is_create2)
             create2_address(request.caller, request.salt, request.init_code)
         else

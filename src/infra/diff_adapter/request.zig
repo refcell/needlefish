@@ -57,6 +57,10 @@ pub const RawRequest = struct {
     transactions: []const []const u8 = &.{},
     witness: RawWitness = .{},
     trace: ?[]const u8 = null,
+    /// `systemConfig` mode only.
+    systemConfig: ?@import("system_config.zig").RawSystemConfig = null,
+    /// `trie` mode only.
+    trie: ?@import("trie_request.zig").RawTrie = null,
 };
 
 /// A decoded request.
@@ -83,6 +87,10 @@ pub const Error = error{
     InvalidField,
     InvalidAncestors,
     OutOfMemory,
+    /// `trie` mode: an `address`, `slotKey` or `slotKeys` entry does not hash to its key.
+    PreimageMismatch,
+    /// `trie` mode: an account op's `code` does not hash to its `codeHash`.
+    CodeMismatch,
 };
 
 /// Parses a request line. The result borrows `line` and `arena`.
@@ -175,12 +183,12 @@ fn required(field: ?[]const u8) Error![]const u8 {
     return field orelse error.MissingField;
 }
 
-fn quantity(comptime T: type, field: Error![]const u8) Error!T {
+pub fn quantity(comptime T: type, field: Error![]const u8) Error!T {
     const text = try field;
     return hex.decode_quantity(T, text) catch error.InvalidField;
 }
 
-fn fixed(comptime size: usize, field: anytype) Error![size]u8 {
+pub fn fixed(comptime size: usize, field: anytype) Error![size]u8 {
     const text: []const u8 = if (@TypeOf(field) == Error![]const u8) try field else field;
     if (!has_prefix(text)) return error.InvalidField;
     return hex.decode_array(size, text) catch error.InvalidField;

@@ -619,6 +619,8 @@ const KeyCursor = struct {
         if (self.given) |given| return given.slots[index];
         const changes = self.changeset.storage_changes();
         assert(index < changes.len);
+        // A hashed changeset carries the trie keys themselves.
+        if (self.changeset.hashed) return self.changeset.slot_key(changes[index].slot);
         if (index < self.slots_start or index >= self.slots_start + self.slots_len) {
             self.slots_start = index;
             self.slots_len = @min(key_chunk, changes.len - index);
@@ -632,6 +634,7 @@ const KeyCursor = struct {
         if (self.given) |given| return given.accounts[index];
         const accounts = self.changeset.account_changes();
         assert(index < accounts.len);
+        if (self.changeset.hashed) return self.changeset.account_key(&accounts[index].address);
         if (index < self.accounts_start or index >= self.accounts_start + self.accounts_len) {
             self.accounts_start = index;
             self.accounts_len = @min(key_chunk, accounts.len - index);
@@ -646,6 +649,7 @@ const KeyCursor = struct {
     fn storage_address(self: *const KeyCursor, index: usize) Hash {
         if (self.given) |given| return given.storage_addresses[index];
         const address = &self.changeset.storage_changes()[index].address;
+        if (self.changeset.hashed) return self.changeset.account_key(address);
         if (self.memo) |memo| return memo.address_hash(address);
         return node.keccak256(address);
     }

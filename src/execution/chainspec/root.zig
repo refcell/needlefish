@@ -132,6 +132,12 @@ pub const ChainSpec = struct {
     /// chains reject blob transactions and keep the blob header fields at zero).
     pub fn blob_params_at(spec: *const ChainSpec, timestamp: u64) ?BlobParams {
         if (spec.mode == .l2) return null;
+        return spec.blob_schedule_at(timestamp);
+    }
+
+    /// The Ethereum blob schedule at `timestamp`, on L2 too: base/base's RPC prices blob
+    /// gas from it (eth_blobBaseFee, eth_feeHistory) although OP blocks carry no blobs.
+    pub fn blob_schedule_at(spec: *const ChainSpec, timestamp: u64) ?BlobParams {
         if (spec.is_ethereum_fork_active(.bpo2, timestamp)) return BlobParams.bpo2;
         if (spec.is_ethereum_fork_active(.bpo1, timestamp)) return BlobParams.bpo1;
         if (spec.is_ethereum_fork_active(.osaka, timestamp)) return BlobParams.osaka;

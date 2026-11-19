@@ -12,6 +12,15 @@
 //!     side as nonce u64, balance [32], code_hash [32];
 //!   storage: address[20], slot[32], old[32], new[32];
 //!   codes: length u32, bytes (their hashes are recomputed on decode).
+//!
+//! Hashed changesets (`hashed`, version 2): keys in the tries' hashed key space, for a
+//! caller that has no preimages. `keys` lists every distinct owner (keccak256 of an address)
+//! in ascending order; an entry's `address` is its owner's ordinal in `keys` as a big-endian
+//! integer (`hashed_owner`), so address order and equality are those of the keys, and a
+//! slot is the hashed slot (keccak256 of the 32-byte slot) as a big-endian word. Every key
+//! is some entry's owner. `account_key` and `slot_key` give an entry's trie keys in either
+//! mode. The encoding is version 1's with the key table (count u32, keys) after the header.
+//! Only disk mode (`DiskState`) applies hashed changesets: its trees are keyed by hash.
 
 const std = @import("std");
 const lazy = @import("../../utilities/lazy_alloc/root.zig");
@@ -72,9 +81,22 @@ pub const Config = struct {
 
 pub const magic: u32 = 0x5343464e; // "NFCS"
 pub const version: u16 = 1;
+pub const version_hashed: u16 = 2;
 const header_bytes = 4 + 2 + 4 + 4 + 4;
 const account_side_bytes = 8 + 32 + 32;
 const storage_entry_bytes = 20 + 32 + 32 + 32;
+
+/// The longest encoding of a changeset within `config`: every account with both sides, every
+/// code, and (hashed) a distinct owner per entry.
+pub fn encoded_length_max(config: Config) u64 {
+    const accounts: u64 = config.accounts_max;
+    const storage: u64 = config.storage_max;
+    const length = header_bytes + accounts * (21 + 2 * account_side_bytes) +
+        storage * storage_entry_bytes + @as(u64, config.codes_max) * 4 +
+        config.code_bytes_max + 4 + (accounts + storage) * 32;
+    assert(length >= header_bytes + 4);
+    return length;
+}
 
 pub const Error = error{ ChangesetFull, InvalidChangeset };
 
@@ -92,9 +114,16 @@ pub const Changeset = struct {
     /// Sort scratch: two words per entry of the larger of `accounts` and `storage` (the
     /// order words and the radix sort's second buffer).
     order: []u64,
+    /// Hashed changeset (see the file comment): owners by ordinal, ascending.
+    hashed: bool = false,
+    keys: []Hash,
+    keys_len: u32 = 0,
 
     /// Buffers are reserved here and committed on first touch (`lazy_alloc`).
     pub fn init(allocator: std.mem.Allocator, config: Config) !Changeset {
+        const keys_max = @as(u64, config.accounts_max) + config.storage_max;
+        const keys = try lazy.alloc(allocator, Hash, @intCast(keys_max));
+        errdefer lazy.free(allocator, keys);
         const accounts = try lazy.alloc(allocator, AccountChange, config.accounts_max);
         errdefer lazy.free(allocator, accounts);
         const storage = try lazy.alloc(allocator, StorageChange, config.storage_max);
@@ -111,10 +140,12 @@ pub const Changeset = struct {
             .code_bytes = code_bytes,
             .code_ends = code_ends,
             .order = order,
+            .keys = keys,
         };
     }
 
     pub fn deinit(self: *Changeset, allocator: std.mem.Allocator) void {
+        lazy.free(allocator, self.keys);
         lazy.free(allocator, self.order);
         lazy.free(allocator, self.code_ends);
         lazy.free(allocator, self.code_bytes);
@@ -128,6 +159,57 @@ pub const Changeset = struct {
         self.storage_len = 0;
         self.code_bytes_len = 0;
         self.codes_len = 0;
+        self.hashed = false;
+        self.keys_len = 0;
+    }
+
+    /// Clears into an empty hashed changeset.
+    pub fn clear_hashed(self: *Changeset) void {
+        self.clear();
+        self.hashed = true;
+        assert(self.keys_len == 0);
+    }
+
+    /// Clears into an empty changeset of `other`'s mode, with its keys (a hashed changeset
+    /// rebuilt entry by entry from `other`'s, as an unwind reverses one).
+    pub fn clear_like(self: *Changeset, other: *const Changeset) Error!void {
+        self.clear();
+        self.hashed = other.hashed;
+        if (other.keys_len > self.keys.len) return error.ChangesetFull;
+        @memcpy(self.keys[0..other.keys_len], other.keys[0..other.keys_len]);
+        self.keys_len = other.keys_len;
+    }
+
+    /// The `address` of owner `key` in a hashed changeset. Owners are named in ascending
+    /// key order (the same key again names the same owner); add each owner's entries with
+    /// the address returned.
+    pub fn hashed_owner(self: *Changeset, key: *const Hash) Error!Address {
+        assert(self.hashed);
+        if (self.keys_len > 0) {
+            const last = &self.keys[self.keys_len - 1];
+            if (std.mem.eql(u8, last, key)) return ordinal_address(self.keys_len - 1);
+            assert(std.mem.order(u8, last, key) == .lt);
+        }
+        if (self.keys_len == self.keys.len) return error.ChangesetFull;
+        self.keys[self.keys_len] = key.*;
+        self.keys_len += 1;
+        return ordinal_address(self.keys_len - 1);
+    }
+
+    /// The account trie key of an entry's `address`: keccak256 of it, or (hashed) its key.
+    pub fn account_key(self: *const Changeset, address: *const Address) Hash {
+        if (!self.hashed) return keccak256(address);
+        const ordinal = address_key(address);
+        assert(ordinal < self.keys_len);
+        return self.keys[@intCast(ordinal)];
+    }
+
+    /// The storage trie key of an entry's `slot`: keccak256 of it, or (hashed) the slot.
+    pub fn slot_key(self: *const Changeset, slot: u256) Hash {
+        var bytes: Hash = undefined;
+        std.mem.writeInt(u256, &bytes, slot, .big);
+        if (self.hashed) return bytes;
+        return keccak256(&bytes);
     }
 
     pub fn account_changes(self: *const Changeset) []const AccountChange {
@@ -192,18 +274,29 @@ pub const Changeset = struct {
         }
         length += @as(u64, self.storage_len) * storage_entry_bytes;
         length += @as(u64, self.codes_len) * 4 + self.code_bytes_len;
+        if (self.hashed) length += 4 + @as(u64, self.keys_len) * 32;
         return length;
     }
 
     pub fn encode(self: *const Changeset, out: []u8) []u8 {
         const length = self.encoded_length();
         assert(out.len >= length);
+        assert(length <= encoded_length_max(.{
+            .accounts_max = @intCast(self.accounts.len),
+            .storage_max = @intCast(self.storage.len),
+            .codes_max = @intCast(self.code_ends.len),
+            .code_bytes_max = @intCast(self.code_bytes.len),
+        }));
         var writer: Writer = .{ .buffer = out };
         writer.int(u32, magic);
-        writer.int(u16, version);
+        writer.int(u16, if (self.hashed) version_hashed else version);
         writer.int(u32, self.accounts_len);
         writer.int(u32, self.storage_len);
         writer.int(u32, self.codes_len);
+        if (self.hashed) {
+            writer.int(u32, self.keys_len);
+            for (self.keys[0..self.keys_len]) |*key| writer.bytes(key);
+        }
         for (self.account_changes()) |*change| {
             writer.bytes(&change.address);
             const flags: u8 = @as(u8, @intFromBool(change.old != null)) |
@@ -232,13 +325,15 @@ pub const Changeset = struct {
         self.clear();
         var reader: Reader = .{ .buffer = input };
         if (try reader.int(u32) != magic) return error.InvalidChangeset;
-        if (try reader.int(u16) != version) return error.InvalidChangeset;
+        const encoding = try reader.int(u16);
+        if (encoding != version and encoding != version_hashed) return error.InvalidChangeset;
         const accounts_count = try reader.int(u32);
         const storage_count = try reader.int(u32);
         const codes_count = try reader.int(u32);
         if (accounts_count > self.accounts.len) return error.InvalidChangeset;
         if (storage_count > self.storage.len) return error.InvalidChangeset;
         if (codes_count > self.code_ends.len) return error.InvalidChangeset;
+        if (encoding == version_hashed) try self.decode_keys(&reader);
         for (0..accounts_count) |_| try self.decode_account(&reader);
         for (0..storage_count) |_| {
             const change: StorageChange = .{
@@ -257,13 +352,61 @@ pub const Changeset = struct {
         }
         if (reader.position != input.len) return error.InvalidChangeset;
         try self.check_sorted();
+        if (self.hashed) try self.check_owners();
+    }
+
+    /// A hashed changeset's key table: strictly ascending, at most one key per entry.
+    fn decode_keys(self: *Changeset, reader: *Reader) Error!void {
+        assert(!self.hashed and self.keys_len == 0);
+        self.hashed = true;
+        const count = try reader.int(u32);
+        if (count > self.keys.len) return error.InvalidChangeset;
+        for (0..count) |index| {
+            const key = (try reader.bytes(32))[0..32];
+            if (index > 0 and std.mem.order(u8, &self.keys[index - 1], key) != .lt) {
+                return error.InvalidChangeset;
+            }
+            self.keys[index] = key.*;
+        }
+        self.keys_len = count;
+        assert(self.keys_len <= self.keys.len);
+    }
+
+    /// Every entry of a hashed changeset names an ordinal of `keys`, and every ordinal is
+    /// named (in order: the entries are sorted), so the encoding is canonical.
+    fn check_owners(self: *const Changeset) Error!void {
+        assert(self.hashed);
+        const accounts = self.account_changes();
+        const storage = self.storage_changes();
+        var account_index: usize = 0;
+        var storage_index: usize = 0;
+        var next: u64 = 0;
+        while (account_index < accounts.len or storage_index < storage.len) : (next += 1) {
+            if (next >= self.keys_len) return error.InvalidChangeset;
+            var named = false;
+            if (account_index < accounts.len and
+                address_key(&accounts[account_index].address) == next)
+            {
+                named = true;
+                account_index += 1;
+            }
+            while (storage_index < storage.len and
+                address_key(&storage[storage_index].address) == next)
+            {
+                named = true;
+                storage_index += 1;
+            }
+            if (!named) return error.InvalidChangeset;
+        }
+        if (next != self.keys_len) return error.InvalidChangeset;
     }
 
     /// The account and storage entry counts of an encoded changeset (its header only).
     pub fn encoded_counts(input: []const u8) Error!struct { accounts: u32, storage: u32 } {
         var reader: Reader = .{ .buffer = input };
         if (try reader.int(u32) != magic) return error.InvalidChangeset;
-        if (try reader.int(u16) != version) return error.InvalidChangeset;
+        const encoding = try reader.int(u16);
+        if (encoding != version and encoding != version_hashed) return error.InvalidChangeset;
         const accounts = try reader.int(u32);
         const storage = try reader.int(u32);
         assert(reader.position == 14);
@@ -294,6 +437,13 @@ pub const Changeset = struct {
         }
     }
 };
+
+/// The `address` naming ordinal `ordinal` of a hashed changeset's keys.
+fn ordinal_address(ordinal: u32) Address {
+    var address: Address = undefined;
+    std.mem.writeInt(u160, &address, ordinal, .big);
+    return address;
+}
 
 /// Sorts `items` by `T.less_than` through an index array, then permutes `items` in place.
 /// Entries are 128+ bytes: sorting them directly copied entries on every compare and swap
@@ -518,6 +668,84 @@ test "changeset: seeded encode/decode roundtrip is canonical" {
             try testing.expectError(error.InvalidChangeset, b.decode(encoded[0..cut]));
         }
     }
+}
+
+/// A random hashed changeset: owners with random keys in ascending order, each with an
+/// account change, slots, or both.
+fn random_hashed_changeset(prng: *Prng, changeset: *Changeset) !void {
+    changeset.clear_hashed();
+    var key: Hash = @splat(0);
+    const owners = prng.below(16);
+    for (0..owners) |_| {
+        // Ascending: bump a random byte, zero the rest after it.
+        const position = prng.below(32);
+        key[position] +%= @intCast(prng.range(1, 255));
+        if (key[position] == 0) key[position] = 1;
+        @memset(key[position + 1 ..], 0);
+        if (changeset.keys_len > 0 and
+            std.mem.order(u8, &changeset.keys[changeset.keys_len - 1], &key) != .lt) continue;
+        const address = try changeset.hashed_owner(&key);
+        const with_account = prng.chance(1, 2);
+        if (with_account) {
+            var old = random_info(prng);
+            if (old == null) old = .{};
+            const new = random_info(prng);
+            try changeset.add_account(.{ .address = address, .old = old, .new = new });
+        }
+        const slots = if (with_account) prng.below(4) else prng.range(1, 4);
+        var slot: u256 = prng.int(u64);
+        for (0..slots) |_| {
+            slot += prng.range(1, 1 << 20);
+            try changeset.add_storage(.{ .address = address, .slot = slot, .old = 0, .new = 1 });
+        }
+    }
+    changeset.sort();
+}
+
+test "changeset: hashed changesets round-trip, name their keys, and decode strictly" {
+    var prng = Prng.init(0x4a54);
+    var a = try Changeset.init(testing.allocator, test_config);
+    defer a.deinit(testing.allocator);
+    var b = try Changeset.init(testing.allocator, test_config);
+    defer b.deinit(testing.allocator);
+    var buffer: [64 * 1024]u8 = undefined;
+    var second: [64 * 1024]u8 = undefined;
+    for (0..200) |_| {
+        try random_hashed_changeset(&prng, &a);
+        const encoded = a.encode(&buffer);
+        try testing.expectEqual(a.encoded_length(), encoded.len);
+        try b.decode(encoded);
+        try testing.expect(b.hashed);
+        try testing.expectEqualSlices(u8, encoded, b.encode(&second));
+        // Trie keys come from the key table and the slot word, not from hashing.
+        for (b.storage_changes()) |change| {
+            const owner = std.mem.readInt(u160, &change.address, .big);
+            const key = b.account_key(&change.address);
+            try testing.expectEqualSlices(u8, &b.keys[@intCast(owner)], &key);
+            const slot_key = b.slot_key(change.slot);
+            try testing.expectEqual(change.slot, std.mem.readInt(u256, &slot_key, .big));
+        }
+        // A copy of the mode and keys rebuilds the same changeset entry by entry.
+        try b.clear_like(&a);
+        for (a.account_changes()) |change| try b.add_account(change);
+        for (a.storage_changes()) |change| try b.add_storage(change);
+        try testing.expectEqualSlices(u8, encoded, b.encode(&second));
+        if (encoded.len > header_bytes) {
+            const cut = prng.below(encoded.len);
+            try testing.expectError(error.InvalidChangeset, b.decode(encoded[0..cut]));
+        }
+    }
+    // A key no entry names is refused (the encoding would not be canonical).
+    a.clear_hashed();
+    const first = try a.hashed_owner(&@as(Hash, @splat(1)));
+    _ = try a.hashed_owner(&@as(Hash, @splat(2)));
+    try a.add_account(.{ .address = first, .old = null, .new = .{} });
+    try testing.expectError(error.InvalidChangeset, b.decode(a.encode(&buffer)));
+    // Unhashed changesets hash their keys.
+    const address: Address = @splat(7);
+    a.clear();
+    try testing.expect(!a.hashed);
+    try testing.expectEqualSlices(u8, &keccak256(&address), &a.account_key(&address));
 }
 
 fn reference_less_than(_: void, a: StorageChange, b: StorageChange) bool {

@@ -847,8 +847,12 @@ pub fn CompactionType(comptime Tree: type) type {
                 assert(self.memtable_cursor == owner.immutable_memtable().count);
                 owner.immutable_memtable().reset();
                 owner.stats.flushes += 1;
-            } else owner.stats.merges += 1;
+            } else {
+                owner.stats.merges += 1;
+                owner.stats.merges_into[self.level_out] += 1;
+            }
             if (self.level_out + 1 == self.config.levels_count) owner.stats.merges_last += 1;
+            owner.stats.tables_written += self.output_count;
             for (self.outputs[0..self.output_count]) |slot| {
                 owner.level_insert(self.level_out, slot);
             }

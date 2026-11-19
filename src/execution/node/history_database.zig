@@ -2,7 +2,7 @@
 //! chain's history window (`Chain.proof_at`). Each account and slot read walks a proof,
 //! so it suits RPC simulation (eth_call, eth_estimateGas at older blocks), not block
 //! execution. Code is read from the head's code store (content addressed, never deleted)
-//! and BLOCKHASH from the head's canonical ring, which agrees with every canonical block
+//! and BLOCKHASH from the chain's canonical index, which agrees with every canonical block
 //! up to the one simulated.
 //!
 //! The first history failure is kept in `failure` (the evm only sees `DatabaseFailure`),
@@ -95,9 +95,14 @@ pub const HistoryDatabase = struct {
         return values[0];
     }
 
+    /// BLOCKHASH reads the canonical index, which reaches as far back as the block store.
+    /// The head state's 256-entry ring (what block execution reads) only covers the
+    /// simulated block's window while the head is within 256 blocks of it; past that, its
+    /// slots hold newer blocks and the ring reads as zero.
     fn block_hash(context: *anyopaque, number: u64) evm.state.Error!Hash {
         const self = from(context);
         if (number > self.number) return @splat(0);
+        if (self.chain.store.canonical_hash(number)) |hash| return hash;
         return self.chain.db.database().block_hash(number);
     }
 };

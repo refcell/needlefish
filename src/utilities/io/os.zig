@@ -334,6 +334,37 @@ pub fn pread(fd: fd_t, buffer: []u8, offset: u64) common.ReadError!usize {
     return error.Unexpected;
 }
 
+/// Blocking positional write: the bytes written. Retries interrupted calls a bounded number
+/// of times. For a blocking file backend; everything else goes through the completion
+/// backends.
+pub fn pwrite(fd: fd_t, buffer: []const u8, offset: u64) common.WriteError!usize {
+    assert(buffer.len > 0);
+    var attempts: u32 = 0;
+    while (attempts < 64) : (attempts += 1) {
+        const rc = system.pwrite(fd, buffer.ptr, buffer.len, @intCast(offset));
+        const err = errno(rc);
+        if (err == .INTR) continue;
+        if (err != .SUCCESS) return write_error(err);
+        const size: usize = @intCast(rc);
+        assert(size <= buffer.len);
+        return size;
+    }
+    return error.Unexpected;
+}
+
+/// Blocking fsync(2) of data and metadata.
+pub fn fsync(fd: fd_t) common.FsyncError!void {
+    assert(fd >= 0);
+    var attempts: u32 = 0;
+    while (attempts < 64) : (attempts += 1) {
+        const err = errno(system.fsync(fd));
+        if (err == .INTR) continue;
+        if (err != .SUCCESS) return fsync_error(err);
+        return;
+    }
+    return error.Unexpected;
+}
+
 pub fn close(fd: fd_t) void {
     // close(2) always releases the descriptor, even on EINTR/EIO; nothing to retry.
     _ = system.close(fd);

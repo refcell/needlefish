@@ -96,7 +96,7 @@ pub fn get_raw_receipts(api: *eth.Api, call: *Call) HandlerError!void {
 }
 
 pub fn get_raw_transaction(api: *eth.Api, call: *Call) HandlerError!void {
-    const tx_hash = try call.params.fixed(32);
+    const tx_hash = try call.params.hash();
     try call.params.finish();
     const location = api.chain.find_transaction(tx_hash) orelse return call.writer.data(&.{});
     const record = api.chain.record(location.block_hash).?;
@@ -156,7 +156,7 @@ const execute_hashes_max = 16;
 /// without a payload id or forkchoice change, and returns its execution witness. The
 /// block is stored as a side block; the attributes decode into the API's scratch.
 pub fn execute_payload(api: *eth.Api, call: *Call) HandlerError!void {
-    const parent = try call.params.fixed(32);
+    const parent = try call.params.hash();
     const raw = try call.params.raw();
     try call.params.finish();
     const generator = api.witness orelse

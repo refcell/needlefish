@@ -133,7 +133,7 @@ fn get_header_by_number(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn get_header_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const hash = try call.params.fixed(32);
+    const hash = try call.params.hash();
     try call.params.finish();
     try write_header(api, call, hash);
 }
