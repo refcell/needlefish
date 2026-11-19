@@ -7,6 +7,16 @@ correctly. It is written for agents and operators working on a dedicated Linux s
 Do every milestone on Base Sepolia (chain 84532) first, then on Base mainnet (chain 8453).
 Sepolia state is much smaller, so every failure is cheaper to find there.
 
+**Since November 18, 2026, mainnet only.** The live Sepolia node on gene was retired and its
+state deleted (the owner's decision, to free disk), so new builds no longer reach mainnet
+Sepolia-first. The rollout gate is a mainnet replay instead: before a build replaces the live
+mainnet el-run, that build runs `base replay fetch --count 20` (the latest mainnet blocks and
+their witness from public RPC) and `base replay run` on the result and on the committed
+archive, and it rolls only when every block reproduces its state root, receipts root, gas used
+and block hash. (`base follow` from a few hundred blocks back does not work as the gate: the
+public endpoint keeps no state that far behind the tip.) Upgrade activations are checked by
+replaying the activation window from mainnet blocks once they exist, or on a devnet before.
+
 ## Definition of done
 
 A needlefish node on mainnet is "syncing" when all of these hold for 7 consecutive days:
@@ -229,7 +239,8 @@ Join the Base mainnet consensus p2p network.
   blocks/s, Mgas/s, commit latency, disk growth, peer count), alerting on lag and on any
   verification mismatch, pruning policy for history.
 - Check: the 7-day definition of done above, including deliberate `kill -9`, reboots, a
-  full-disk warning drill, and an upgrade activation on Sepolia before it reaches mainnet.
+  full-disk warning drill, and an upgrade activation checked before it reaches mainnet
+  (on Sepolia until November 18, 2026; since then by mainnet replay or a devnet).
 
 ### M8. Execution-layer p2p
 
@@ -323,4 +334,5 @@ first assumed for a full archive.
   safe heads with a blob archiver; unsafe sync via gossip and RPC still works.
 - **Public RPC limits.** Use your own L1 and reference nodes for anything beyond M1 demos.
 - **Upgrades.** Base ships hardforks on a schedule. Track base/base releases and test each
-  activation on Sepolia first.
+  activation before mainnet (Sepolia until November 18, 2026; since then a devnet, then a
+  replay of the mainnet activation window before rolling).
