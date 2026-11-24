@@ -44,8 +44,10 @@ const Registers = struct {
     stack: Stack,
 };
 
-/// Run `frame` in place until it exits.
-pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
+/// Run `frame` in place until it exits. `traced` (the struct logger: `Tracer.step` set)
+/// compiles a second copy that dispatches on the raw code, one instruction per step
+/// (fused instructions run as their parts), and brackets each with the tracer's hooks.
+pub fn run(comptime fork: Fork, comptime traced: bool, evm: *Evm, frame: *Frame) Exit {
     @setEvalBranchQuota(100_000);
     const f = frame;
     // Immutable for the frame's lifetime: loaded once, not through `f` after every store.
@@ -65,7 +67,10 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     assert(analyzed.jumpdests.len == (@as(u64, analyzed.len) + 7) / 8);
     // Dispatch reads `ops`, the code with fused instructions marked (`bytecode.fusions`), at
     // the same offsets and with the same padding.
-    const ops = analyzed.ops.ptr;
+    // A traced run reads the raw code instead, where fusion marker bytes are undefined
+    // opcodes (asserted in `bytecode`).
+    const ops = if (traced) analyzed.code.ptr else analyzed.ops.ptr;
+    if (traced) assert(evm.tracer.?.step != null and evm.tracer.?.step_end != null);
     // Set when a step halts. A plain `bool` continue flag instead of a `?Exit` result: Zig
     // lowered the optional to a load from a constant global, and a branch, on every opcode.
     var exit: Exit = undefined;
@@ -74,17 +79,19 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
             inline else => |opcode| {
                 const start = opcode_profile.now();
                 defer opcode_profile.record(opcode, start);
-                if (comptime bytecode.fusion(opcode)) |parts| {
+                if (traced) {
+                    if (!traced_step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                } else if (comptime bytecode.fusion(opcode)) |parts| {
                     inline for (parts) |part| {
                         coverage.step(fork, part, f.depth);
-                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) {
+                        if (!step(fork, false, part, r, &analyzed, f, evm, &exit)) {
                             coverage.halt(part, exit);
                             break :loop;
                         }
                     }
                 } else {
                     coverage.step(fork, opcode, f.depth);
-                    if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) {
+                    if (!step(fork, false, opcode, r, &analyzed, f, evm, &exit)) {
                         coverage.halt(opcode, exit);
                         break :loop;
                     }
@@ -103,6 +110,7 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
 
 inline fn step(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime opcode: u8,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -112,7 +120,7 @@ inline fn step(
 ) bool {
     @setEvalBranchQuota(100_000);
     if (comptime !op.is_defined(fork, opcode) or opcode == op.INVALID) {
-        exit.* = .invalid_opcode;
+        exit.* = if (comptime opcode == op.INVALID) .invalid_fe_opcode else .invalid_opcode;
         return false;
     }
     const inputs: u32 = comptime op.table[opcode].inputs;
@@ -151,11 +159,10 @@ inline fn step(
             return false;
         }
     }
-    // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes, `Analyzed.len` is a
-    // u32; see `run`).
+    // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes; see `run`).
     r.pc +%= 1;
     if (comptime in_registers(opcode)) {
-        return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
+        return execute_registers(fork, traced, opcode, r, analyzed, f, evm, exit);
     }
     // Sync point: the opcode reads or writes frame state beyond the registers.
     f.pc = @intCast(r.pc);
@@ -170,6 +177,37 @@ inline fn step(
         return false;
     }
     return true;
+}
+
+/// One instruction of a traced run: the registers are written to the frame around it so the
+/// tracer's `step` and `step_end` see the frame current.
+inline fn traced_step(
+    comptime fork: Fork,
+    comptime opcode: u8,
+    r: *Registers,
+    analyzed: *const bytecode.Analyzed,
+    f: *Frame,
+    evm: *Evm,
+    exit: *Exit,
+) bool {
+    const tracer = evm.tracer.?;
+    f.pc = @intCast(r.pc);
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    assert(analyzed.code[f.pc] == opcode);
+    tracer.step.?(tracer.context, f, evm);
+    coverage.step(fork, opcode, f.depth);
+    const running = step(fork, true, opcode, r, analyzed, f, evm, exit);
+    if (!running) coverage.halt(opcode, exit.*);
+    f.pc = @intCast(r.pc);
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    assert(f.stack.len <= stack_module.limit);
+    tracer.step_end.?(tracer.context, f, evm, .{
+        .exit = if (running) null else exit.*,
+        .static_cost = comptime gas.static_cost(fork, opcode),
+    });
+    return running;
 }
 
 comptime {
@@ -197,6 +235,7 @@ fn in_registers(comptime opcode: u8) bool {
 
 inline fn execute_registers(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime opcode: u8,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -240,7 +279,7 @@ inline fn execute_registers(
         op.DUP1...op.DUP16 => s.dup(opcode - op.DUP1 + 1),
         op.SWAP1...op.SWAP16 => s.swap(opcode - op.SWAP1 + 1),
         op.POP => _ = s.pop(),
-        op.JUMP, op.JUMPI => return jump(fork, opcode == op.JUMPI, r, analyzed, exit),
+        op.JUMP, op.JUMPI => return jump(fork, traced, opcode == op.JUMPI, r, analyzed, exit),
         op.JUMPDEST => {},
         op.PC => s.push(r.pc - 1),
         op.MSIZE => s.push(f.memory.len),
@@ -592,9 +631,11 @@ inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analy
 
 /// JUMP, or JUMPI when `conditional`. A taken jump also runs the JUMPDEST it lands on, which
 /// only charges its gas: every taken jump would otherwise dispatch one (6.6% of the
-/// instructions on Base mainnet blocks). False with `exit` set when the frame halts.
+/// instructions on Base mainnet blocks); a `traced` run lands on it instead. False with
+/// `exit` set when the frame halts.
 inline fn jump(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime conditional: bool,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -608,6 +649,12 @@ inline fn jump(
     if (!analyzed.is_jumpdest(destination)) {
         exit.* = .invalid_jump;
         return false;
+    }
+    if (traced) {
+        // A traced run executes (and reports) the JUMPDEST as its own instruction.
+        r.pc = @intCast(destination);
+        assert(r.pc < analyzed.len);
+        return true;
     }
     const remaining = @subWithOverflow(r.gas, comptime gas.static_cost(fork, op.JUMPDEST));
     r.gas = remaining[0];
@@ -772,13 +819,26 @@ fn cold_slot_unaffordable(
     return !evm.state.is_slot_warm(f.account, key);
 }
 
+/// Fails an instruction that loaded an account before it could pay to run: as geth's
+/// prestateTracer (the failed opcode is reported with its error, and nothing is looked
+/// up), the account is left unseen unless the transaction read it before.
+fn fail_accessed(evm: *Evm, access: state_module.State.Access, exit: Exit) Exit {
+    assert(exit.status() != .success);
+    evm.state.unsee(access);
+    return exit;
+}
+
 fn external_account(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
     const s = &f.stack;
     const address = primitives.u256_to_address(s.pop());
     const extra = gas.cold_account_access_extra;
-    if (cold_account_unaffordable(fork, evm, address, f.gas, extra)) return .out_of_gas;
+    if (cold_account_unaffordable(fork, evm, address, f.gas, extra)) {
+        return .out_of_gas;
+    }
     const access = evm.state.access(address) catch |err| return evm.fail(err);
-    if (!charge_cold_account(fork, f, access.is_cold)) return .out_of_gas;
+    if (!charge_cold_account(fork, f, access.is_cold)) {
+        return fail_accessed(evm, access, .out_of_gas);
+    }
     const account = access.account;
     switch (opcode) {
         op.BALANCE => s.push(account.info.balance),
@@ -796,7 +856,9 @@ fn external_account(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *E
             const offset = s.pop();
             const size = s.pop();
             const code = evm.state.code(account) catch |err| return evm.fail(err);
-            return copy_to_memory(f, memory_offset, code, offset, size);
+            const exit = copy_to_memory(f, memory_offset, code, offset, size) orelse
+                return null;
+            return fail_accessed(evm, access, exit);
         },
         else => comptime unreachable,
     }
@@ -840,7 +902,10 @@ fn sstore(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     const access = evm.state.storage_access(f.account, key) catch |err| return evm.fail(err);
     const slot = access.slot;
     const cost = gas.sstore(fork, slot.original, slot.present, value, access.is_cold);
-    if (f.gas < cost.cost) return .out_of_gas;
+    if (f.gas < cost.cost) {
+        evm.state.unstamp_slot(access);
+        return .out_of_gas;
+    }
     f.gas -= cost.cost;
     f.refund += cost.refund;
     evm.state.storage_write(f.account, slot, value) catch |err| return evm.fail(err);
@@ -939,24 +1004,23 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
         const code = evm.state.code(access.account) catch |err| return evm.fail(err);
         if (bytecode.delegation_target(code)) |delegate| {
             const target_cold: u64 = if (access.is_cold) extra else 0;
-            if (after_value < target_cold + gas.warm_storage_read) return .out_of_gas;
-            const delegate_cold = target_cold + gas.cold_account_access;
-            if (cold_account_unaffordable(fork, evm, delegate, after_value, delegate_cold)) {
-                return .out_of_gas;
+            if (delegate_unaffordable(fork, evm, delegate, after_value, target_cold)) {
+                return fail_accessed(evm, access, .out_of_gas);
             }
             const delegated = evm.state.access(delegate) catch |err| return evm.fail(err);
             cost += if (delegated.is_cold) gas.cold_account_access else gas.warm_storage_read;
+            if (f.gas < cost) evm.state.unsee(delegated);
             code_address = delegate;
             code_account = delegated.account;
         }
     }
-    if (f.gas < cost) return .out_of_gas;
+    if (f.gas < cost) return fail_accessed(evm, access, .out_of_gas);
     f.gas -= cost;
     const requested: u64 = @intCast(@min(gas_requested, std.math.maxInt(u64)));
     var limit = requested;
     if (fork.at_least(.tangerine)) {
         limit = @min(requested, gas.all_but_one_64th(f.gas));
-    } else if (requested > f.gas) return .out_of_gas;
+    } else if (requested > f.gas) return fail_accessed(evm, access, .out_of_gas);
     f.gas -= limit;
     if (value != 0) limit += gas.call_stipend;
     evm.pending = .{ .call = .{
@@ -974,6 +1038,19 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
     return .call;
 }
 
+/// Whether a call cannot pay to load its target's EIP-7702 delegate (revm's order).
+fn delegate_unaffordable(
+    comptime fork: Fork,
+    evm: *Evm,
+    delegate: primitives.Address,
+    gas_available: u64,
+    target_cold: u64,
+) bool {
+    if (gas_available < target_cold + gas.warm_storage_read) return true;
+    const delegate_cold = target_cold + gas.cold_account_access;
+    return cold_account_unaffordable(fork, evm, delegate, gas_available, delegate_cold);
+}
+
 fn call_creates_account(
     comptime fork: Fork,
     account: *const state_module.Account,
@@ -984,8 +1061,8 @@ fn call_creates_account(
 }
 
 fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
-    if (f.is_static) return .static_violation;
     const target = primitives.u256_to_address(f.stack.pop());
+    if (f.is_static) return .static_violation;
     if (cold_account_unaffordable(fork, evm, target, f.gas, gas.cold_account_access)) {
         return .out_of_gas;
     }
@@ -1000,8 +1077,11 @@ fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     } else if (fork.at_least(.tangerine) and result.target_empty) {
         cost += gas.new_account;
     }
-    if (f.gas < cost) return .out_of_gas;
+    if (f.gas < cost) return fail_accessed(evm, result.target_access, .out_of_gas);
     f.gas -= cost;
+    // Tracer bookkeeping only: the instruction ran, so a diff leaves the account out of
+    // `post` even if a frame reverts (Nethermind's and geth's deleted accounts).
+    if (result.destroys) f.account.self_destruct_tx = evm.state.tx_id;
     if (!result.previously_destroyed) f.refund += gas.selfdestruct_refund(fork);
     if (evm.tracer) |tracer| trace_self_destruct(tracer, f, target, balance);
     return .self_destruct;

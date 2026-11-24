@@ -82,6 +82,7 @@ fn parse_options(raw: []const u8, options: *Options) error{ InvalidParams, TooMa
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
         if (std.mem.eql(u8, name.bytes, "validity") and !found) {
             options.count = try validity.parse_list(&scanner, &options.predicates);
             found = true;

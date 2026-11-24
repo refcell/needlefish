@@ -271,19 +271,30 @@ fn decode_bytes_array(
         failure.* = .{ .offset = length_word.* };
         return null;
     };
-    const area = data[@intCast(offset + 32)..];
-    if (length > area.len / 32) {
-        failure.* = .overrun;
+    // alloy reserves the element vector (16-byte slices) before decoding any element.
+    if (length > bytes_elements_max) {
+        failure.* = .capacity;
         return null;
     }
-    var item: u32 = 0;
+    // Then it decodes element by element, so an invalid element ahead of the area's end
+    // fails before a count past the end overruns.
+    const area = data[@intCast(offset + 32)..];
+    var item: u64 = 0;
     while (item < length) : (item += 1) {
-        const head_item = area[32 * @as(usize, item) ..][0..32];
+        const head_item = head_word(area, @intCast(item)) orelse {
+            failure.* = .overrun;
+            return null;
+        };
         _ = decode_dynamic(area, head_item, 1, failure) orelse return null;
     }
     count.* = @intCast(length);
     return area;
 }
+
+/// The largest element counts alloy's `Vec::try_reserve` accepts (`isize::MAX` bytes): above
+/// them decoding fails with a capacity overflow before reading any element.
+const words_elements_max: u64 = std.math.maxInt(i64) / 32;
+const bytes_elements_max: u64 = (std.math.maxInt(i64) - 7) / 16;
 
 fn bytes_element(area: []const u8, item: u32) ?[]const u8 {
     var failure: native.DecodeFailure = .overrun;
@@ -311,6 +322,11 @@ fn decode_dynamic(
         failure.* = .{ .offset = length_word.* };
         return null;
     };
+    // A one-word element array reserves its vector first (a byte payload reserves nothing).
+    if (element_size == 32 and length > words_elements_max) {
+        failure.* = .capacity;
+        return null;
+    }
     const elements = data[@intCast(offset + 32)..];
     if (length > elements.len / element_size) {
         failure.* = .overrun;
@@ -374,6 +390,14 @@ test "native abi: dynamic address arrays follow alloy's decoder" {
     data[127] = 3; // Length beyond the buffer.
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.overrun, failure);
+    // 2^58 words is past alloy's reservation limit (isize::MAX bytes), one fewer is not.
+    std.mem.writeInt(u64, data[120..128], 1 << 58, .big);
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
+    try testing.expectEqual(native.DecodeFailure.capacity, failure);
+    std.mem.writeInt(u64, data[120..128], (1 << 58) - 1, .big);
+    try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
+    try testing.expectEqual(native.DecodeFailure.overrun, failure);
+    std.mem.writeInt(u64, data[120..128], 2, .big);
     data[127] = 2;
     data[64] = 1; // Dirty offset.
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));

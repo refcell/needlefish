@@ -38,7 +38,7 @@ pub const methods = [_]rpc.Method(*Api){
 /// `base_transactionStatus(hash)`: `{"status":"Known"}` while the transaction is in the
 /// pool, else `"Unknown"` (base/base without a sequencer client to forward to).
 fn transaction_status(api: *Api, call: *Call) HandlerError!void {
-    const hash: primitives.B256 = .{ .bytes = try call.params.fixed(32) };
+    const hash: primitives.B256 = .{ .bytes = try call.params.hash() };
     try call.params.finish();
     const known = if (api.pool) |pool| pool.get(hash) != null else false;
     try call.writer.begin_object();
@@ -49,7 +49,7 @@ fn transaction_status(api: *Api, call: *Call) HandlerError!void {
 
 /// `admin_dropTransaction(hash)`: removes one pool transaction; true when it was there.
 fn drop_transaction(api: *Api, call: *Call) HandlerError!void {
-    const hash: primitives.B256 = .{ .bytes = try call.params.fixed(32) };
+    const hash: primitives.B256 = .{ .bytes = try call.params.hash() };
     try call.params.finish();
     const removed = if (api.pool) |pool| pool.remove(hash) else false;
     assert(api.pool == null or api.pool.?.get(hash) == null);

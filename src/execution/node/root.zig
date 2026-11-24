@@ -15,7 +15,6 @@ pub const Chain = chain.Chain;
 pub const witness = @import("witness.zig");
 pub const base_time = @import("base_time.zig");
 pub const history_database = @import("history_database.zig");
-pub const access_list = @import("access_list.zig");
 pub const HistoryDatabase = history_database.HistoryDatabase;
 pub const test_fixture = @import("test_fixture.zig");
 pub const genesis = @import("genesis.zig");

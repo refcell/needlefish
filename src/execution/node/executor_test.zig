@@ -221,7 +221,10 @@ test "executor: simulate runs a call without committing" {
     try testing.expect(transfer_result.executed.success);
     try testing.expectEqual(@as(u64, 21_000), transfer_result.executed.gas_used);
     const poor = try f.executor.simulate(&block_env(1), .{ .to = target, .value = 1 });
-    try testing.expect(poor == .invalid);
+    // revm's first frame halts with `OutOfFunds`, returning the frame's gas.
+    try testing.expect(!poor.executed.success);
+    try testing.expectEqual(evm.evm.Exit.out_of_funds, poor.executed.exit);
+    try testing.expectEqual(@as(u64, 21_000), poor.executed.gas_used);
     // A contract may be the sender of a call (EIP-3607 binds signed transactions only).
     const from_contract = try f.executor.simulate(&block_env(1), .{ .from = target, .to = target });
     try testing.expect(from_contract == .executed);

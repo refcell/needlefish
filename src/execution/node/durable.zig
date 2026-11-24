@@ -11,8 +11,8 @@
 //!
 //! Lifecycle (storage callbacks only run from the caller's storage tick):
 //! `start` opens the storage, formatting it first when it holds no database, and reports
-//! `ready`. A fresh database gets the genesis allocation as block 0 (`bootstrap`). On a
-//! restart `retained` lists the canonical blocks for `Chain.restore`.
+//! `ready`. A fresh database gets the genesis allocation as the genesis block, whatever its
+//! number (`bootstrap`). On a restart `retained` lists the canonical blocks for `Chain.restore`.
 //!
 //! The format id carries the genesis hash prefix in its high 64 bits, so a datadir written
 //! for another chain is refused instead of silently reused.
@@ -105,6 +105,8 @@ pub fn Durable(comptime Storage: type) type {
                     const chain_prefix: u64 = @truncate(working.format_id >> 64);
                     const expected: u64 = @truncate(self.format_id() >> 64);
                     if (chain_prefix != expected) return self.fail(error.WrongChain);
+                    self.resume_forkchoice();
+                    if (self.database.phase != .ready) return self.fail(error.OpenFailed);
                     self.phase = .ready;
                 },
                 .closed => {
@@ -117,6 +119,24 @@ pub fn Durable(comptime Storage: type) type {
                 },
                 .failed, .formatting => self.fail(error.OpenFailed),
             }
+        }
+
+        /// Moves the head back to the forkchoice head the journal recorded when the last
+        /// entries moved it elsewhere (a side block executed on its parent, then a crash
+        /// or restart): the node resumes where the last forkchoice update left it, as reth
+        /// resumes on its persisted canonical head. A forkchoice head the database no longer
+        /// stores, or one too deep to reach, leaves the journal's head (the CL resends).
+        fn resume_forkchoice(self: *Self) void {
+            const database = &self.database;
+            assert(database.phase == .ready);
+            const hash = database.forkchoice_head orelse return;
+            assert(database.head_info.present);
+            if (std.mem.eql(u8, &database.head_info.hash, &hash)) return;
+            // A planning error (evicted, too deep, no room) changes nothing: the node
+            // resumes on the journal's head. A state error failed the database: the open
+            // fails (`poll_opening`).
+            _ = database.set_forkchoice_head(hash) catch return;
+            assert(std.mem.eql(u8, &database.head_info.hash, &hash));
         }
 
         fn fail(self: *Self, err: StartError) void {
@@ -138,8 +158,8 @@ pub fn Durable(comptime Storage: type) type {
             return self.database.head_info.present;
         }
 
-        /// Commits the genesis allocation as block 0 of a fresh database. Allocates a
-        /// temporary overlay sized from the allocation (startup only).
+        /// Commits the genesis allocation as the genesis block (any number) of a fresh
+        /// database. Allocates a temporary overlay sized from the allocation (startup only).
         pub fn bootstrap(
             self: *Self,
             allocator: std.mem.Allocator,
@@ -214,11 +234,34 @@ pub fn Durable(comptime Storage: type) type {
             return out[0..count];
         }
 
+        /// Stored blocks off the head's branch (side blocks executed before the restart),
+        /// oldest first, into `out`. Restored before `retained`, they let a forkchoice update
+        /// return to one without the CL resending it: the database still moves its state
+        /// there through the stored changesets. Genesis (stored without a record) is skipped.
+        pub fn retained_side(self: *const Self, out: [][]const u8) [][]const u8 {
+            assert(self.phase == .ready and self.has_head());
+            const chain = &self.database.chain;
+            const capacity: u32 = @intCast(chain.slots.len);
+            var count: usize = 0;
+            var position: u32 = 0;
+            while (position < chain.block_count() and count < out.len) : (position += 1) {
+                const meta = chain.slots[(chain.slot_head + position) % capacity].meta;
+                if (chain.is_canonical(meta.hash)) continue;
+                const view = chain.block(meta.hash).?;
+                if (view.body.len == 0) continue; // Genesis.
+                out[count] = view.body;
+                count += 1;
+            }
+            assert(count <= chain.block_count());
+            return out[0..count];
+        }
+
         pub fn journal(self: *Self) chain_module.Journal {
             return .{
                 .context = self,
                 .commit_block = commit_block,
                 .move_head = move_head,
+                .move_forkchoice = move_forkchoice,
                 .hold_checkpoints = hold_checkpoints,
                 .witness = witness,
                 .proof = if (self.database.history != null) proof else null,
@@ -337,7 +380,12 @@ pub fn Durable(comptime Storage: type) type {
                 .transaction_hashes = &.{},
                 .changeset = block.changeset,
             };
-            _ = self.database.commit_applied(&input) catch |err| return map_error(err);
+            const database = &self.database;
+            const commit = if (block.forkchoice)
+                database.commit_applied_forkchoice(&input)
+            else
+                database.commit_applied(&input);
+            _ = commit catch |err| return map_error(err);
             assert(std.mem.eql(u8, &self.database.head_info.hash, &block.hash));
         }
 
@@ -348,6 +396,13 @@ pub fn Durable(comptime Storage: type) type {
         fn move_head(context: *anyopaque, hash: Hash) chain_module.JournalError!void {
             const self = from(context);
             _ = self.database.set_head(hash) catch |err| return map_error(err);
+            assert(std.mem.eql(u8, &self.database.head_info.hash, &hash));
+        }
+
+        fn move_forkchoice(context: *anyopaque, hash: Hash) chain_module.JournalError!void {
+            const self = from(context);
+            _ = self.database.set_forkchoice_head(hash) catch |err| return map_error(err);
+            assert(std.mem.eql(u8, &self.database.forkchoice_head.?, &hash));
             assert(std.mem.eql(u8, &self.database.head_info.hash, &hash));
         }
 

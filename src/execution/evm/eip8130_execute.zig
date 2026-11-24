@@ -169,6 +169,7 @@ pub fn execute(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) Error!transacti
         .exit = if (calls.reverted) .revert else .return_,
         .gas_used = gas_used,
         .gas_refunded = 0,
+        .gas_max_used = gas_used,
         .output = calls.output,
         .created = null,
         .logs = logs,

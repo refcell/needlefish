@@ -24,6 +24,8 @@ pub const Inclusion = struct {
     block_number: u64,
     index: u32,
     base_fee: ?u64,
+    /// A simulated block's base fee above u64 (`simulate_block.Sealed`), else null.
+    base_fee_override: ?u256 = null,
     /// Denim: the block's millisecond timestamp (`blockTimestampMs`), when known.
     timestamp_ms: ?u64 = null,
     /// The block's timestamp (`blockTimestamp` of transactions and logs), when known.
@@ -72,6 +74,19 @@ pub fn timestamp_ms_of(second: []const u8, number: u64, timestamp: u64) ?u64 {
 }
 
 pub fn header_fields(w: *Writer, header: *const Header, hash: Hash, size: usize) WriteError!void {
+    return header_fields_base_fee(w, header, hash, size, null);
+}
+
+/// `header_fields` with a simulated block's `baseFeePerGas` above the header's u64
+/// (`simulate_block.Sealed`) when `base_fee_override` is set.
+pub fn header_fields_base_fee(
+    w: *Writer,
+    header: *const Header,
+    hash: Hash,
+    size: usize,
+    base_fee_override: ?u256,
+) WriteError!void {
+    assert(base_fee_override == null or header.base_fee_per_gas == std.math.maxInt(u64));
     try field_data(w, "hash", &hash);
     try field_data(w, "parentHash", &header.parent_hash.bytes);
     try field_data(w, "sha3Uncles", &header.ommers_hash.bytes);
@@ -89,7 +104,9 @@ pub fn header_fields(w: *Writer, header: *const Header, hash: Hash, size: usize)
     try field_data(w, "mixHash", &header.mix_hash.bytes);
     try field_data(w, "nonce", &header.nonce.bytes);
     try field_quantity(w, "size", size);
-    if (header.base_fee_per_gas) |fee| try field_quantity(w, "baseFeePerGas", fee);
+    if (header.base_fee_per_gas) |fee| {
+        try field_quantity(w, "baseFeePerGas", base_fee_override orelse fee);
+    }
     if (header.withdrawals_root) |root| try field_data(w, "withdrawalsRoot", &root.bytes);
     if (header.blob_gas_used) |used| try field_quantity(w, "blobGasUsed", used);
     if (header.excess_blob_gas) |excess| try field_quantity(w, "excessBlobGas", excess);
@@ -174,6 +191,46 @@ pub fn transaction(
 ) WriteError!void {
     const envelope = Envelope.decode(raw) catch return w.null_value();
     const sender = envelope.recover_sender(recoverer) orelse primitives.Address.zero;
+    try transaction_object(w, envelope, raw, sender, inclusion, .signed);
+}
+
+/// An eth_simulateV1 transaction object: its signature is zero, so the request's `from` is
+/// its sender (reth `Recovered::new_unchecked`).
+pub fn simulated_transaction(
+    w: *Writer,
+    raw: []const u8,
+    sender: primitives.Address,
+    chain_id: u64,
+    inclusion: Inclusion,
+) WriteError!void {
+    if (raw[0] >= 0xc0) {
+        // An unsigned legacy transaction (`consensus.tx.encode_unsigned_legacy`): Nethermind
+        // writes v, r and s zero and the transaction's chain id.
+        var tx = consensus.tx.decode_unsigned_legacy(raw) catch unreachable; // Proof: built.
+        tx.chain_id = chain_id;
+        const unsigned: Envelope = .{ .legacy = .{
+            .tx = tx,
+            .signature = .{ .y_parity = false, .r = 0, .s = 0 },
+        } };
+        return transaction_object(w, unsigned, raw, sender, inclusion, .unsigned);
+    }
+    // Proof: the simulation encoded `raw` from a transaction it built.
+    const envelope = Envelope.decode(raw) catch unreachable;
+    assert(envelope != .deposit);
+    try transaction_object(w, envelope, raw, sender, inclusion, .signed);
+}
+
+/// Whether a legacy transaction's `v` follows its signature or is zero (unsigned).
+const Signing = enum { signed, unsigned };
+
+fn transaction_object(
+    w: *Writer,
+    envelope: Envelope,
+    raw: []const u8,
+    sender: primitives.Address,
+    inclusion: ?Inclusion,
+    signing: Signing,
+) WriteError!void {
     try w.begin_object();
     try field_data(w, "hash", &primitives.keccak256(raw).bytes);
     try field_quantity(w, "type", @as(u8, @backingInt(envelope.tx_type())));
@@ -197,7 +254,7 @@ pub fn transaction(
     try inclusion_fields(w, inclusion);
     if (inclusion) |at| if (at.timestamp) |time| try field_quantity(w, "blockTimestamp", time);
     if (inclusion) |at| if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
-    try signature_fields(w, envelope);
+    try signature_fields(w, envelope, signing);
     if (envelope == .deposit) {
         try deposit_fields(w, envelope.deposit);
         if (deposit_receipt_fields) |fields| if (fields.version) |version| {
@@ -219,14 +276,30 @@ fn deposit_fields(w: *Writer, deposit: consensus.Deposit) WriteError!void {
     inline for (.{ "v", "r", "s", "yParity" }) |name| try field_quantity(w, name, @as(u8, 0));
 }
 
+/// `Envelope.effective_gas_price` over a base fee of any size, the base fee itself when the
+/// fee cap is below it.
+fn effective_gas_price(envelope: Envelope, base_fee: u256) u256 {
+    assert(envelope != .deposit);
+    const fee_cap: u256 = envelope.max_fee_per_gas();
+    if (fee_cap < base_fee) return base_fee;
+    const tip = @min(envelope.max_priority_fee_per_gas(), fee_cap - base_fee);
+    assert(base_fee + tip <= fee_cap);
+    return base_fee + tip;
+}
+
 fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!void {
-    const base_fee = if (inclusion) |i| i.base_fee else null;
+    var base_fee: ?u256 = null;
+    if (inclusion) |i| {
+        if (i.base_fee) |fee| base_fee = i.base_fee_override orelse fee;
+    }
     switch (envelope) {
         .legacy, .eip2930 => try field_quantity(w, "gasPrice", envelope.max_fee_per_gas()),
         .deposit => try field_quantity(w, "gasPrice", @as(u8, 0)),
         else => {
+            // alloy: the effective tip (zero when the fee cap is below the base fee, as
+            // only a simulated block allows) plus the base fee.
             const price = if (base_fee) |fee|
-                envelope.effective_gas_price(fee) orelse envelope.max_fee_per_gas()
+                effective_gas_price(envelope, fee)
             else
                 envelope.max_fee_per_gas();
             try field_quantity(w, "gasPrice", price);
@@ -297,11 +370,13 @@ fn inclusion_fields(w: *Writer, inclusion: ?Inclusion) WriteError!void {
     try field_quantity(w, keys[2], at.index);
 }
 
-fn signature_fields(w: *Writer, envelope: Envelope) WriteError!void {
+fn signature_fields(w: *Writer, envelope: Envelope, signing: Signing) WriteError!void {
     const sig = envelope.signature() orelse return;
     const parity: u64 = @intFromBool(sig.y_parity);
     if (envelope == .legacy) {
-        const v = if (envelope.chain_id()) |id| 35 + 2 * id + parity else 27 + parity;
+        const v = if (signing == .unsigned)
+            0
+        else if (envelope.chain_id()) |id| 35 + 2 * id + parity else 27 + parity;
         try field_quantity(w, "v", v);
     } else {
         try field_quantity(w, "v", parity);
@@ -427,6 +502,9 @@ pub fn receipt_context(
         blob_price = params.base_fee(header.excess_blob_gas orelse 0);
     };
     assert(value.cumulative_gas_used >= position.previous_gas);
+    // A deposit has no nonce: it creates at the sender's nonce before execution, the receipt's
+    // deposit nonce (zero before Regolith), as base/base's receipt builder reports.
+    const creation_nonce = envelope.nonce() orelse value.deposit_nonce orelse 0;
     return .{
         .inclusion = .{
             .block_hash = hash,
@@ -438,7 +516,7 @@ pub fn receipt_context(
         .tx_hash = primitives.keccak256(raw).bytes,
         .from = sender,
         .to = to,
-        .contract_address = if (to == null) contract_address(sender, envelope.nonce().?) else null,
+        .contract_address = if (to == null) contract_address(sender, creation_nonce) else null,
         .gas_used = value.cumulative_gas_used - position.previous_gas,
         .effective_gas_price = envelope.effective_gas_price(base_fee) orelse 0,
         .first_log_index = position.log_index,
@@ -566,6 +644,39 @@ test "format: deposit transaction and receipt carry the OP fields" {
     try testing.expect(std.mem.indexOf(u8, receipt_text, "\"depositNonce\":\"0x3\"") != null);
     const version = "\"depositReceiptVersion\":\"0x1\"";
     try testing.expect(std.mem.indexOf(u8, receipt_text, version) != null);
+}
+
+test "format: a creating deposit's receipt names the address at its deposit nonce" {
+    const deposit: Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x5c) },
+        .from = .{ .bytes = @splat(0xde) },
+        .to = .create,
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var raw_buffer: [256]u8 = undefined;
+    const raw = deposit.encode_to(&raw_buffer);
+    const value: consensus.Receipt = .{
+        .tx_type = .deposit,
+        .status = false,
+        .cumulative_gas_used = 50_000,
+        .logs_bloom = .zero,
+        .logs = .{ .payload = &.{}, .count = 0 },
+        .deposit_nonce = 3,
+        .deposit_receipt_version = 1,
+    };
+    const spec = &chainspec.ChainSpec.presets.base_devnet;
+    const header: Header = .{};
+    // A deposit has no nonce of its own (this used to unwrap null and abort the node).
+    const context = receipt_context(spec, no_recovery, &header, @splat(1), raw, 0, value, .{
+        .previous_gas = 0,
+        .log_index = 0,
+    });
+    const from: primitives.Address = .{ .bytes = @splat(0xde) };
+    try testing.expectEqual(contract_address(from, 3), context.contract_address.?);
 }
 
 fn timestamp_scenario(seed: u64) !void {

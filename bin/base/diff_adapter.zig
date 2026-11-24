@@ -29,6 +29,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     defer gpa.destroy(adapter);
     try adapter.init(gpa);
     defer adapter.deinit();
+    adapter.io = init.io;
     var coverage = try coverage_from_environment(init);
     defer if (coverage) |*features| features.deinit(gpa);
     const features: ?*const diff.Coverage = if (coverage) |*collected| collected else null;
@@ -83,9 +84,11 @@ fn coverage_from_environment(init: std.process.Init) !?diff.Coverage {
     );
     defer init.gpa.free(executable);
     const coverage = try diff.Coverage.init(init.gpa, executable);
-    std.log.info("diff-adapter: coverage on, {d} of {d} edges in the EVM and crypto", .{
-        coverage.edges.len,
+    std.log.info("diff-adapter: coverage on, of {d} edges {d} in the EVM and crypto, " ++
+        "{d} in the trie, state database and storage engine (trie mode)", .{
         coverage.counters.len,
+        coverage.edges.len,
+        coverage.trie_edges.len,
     });
     return coverage;
 }

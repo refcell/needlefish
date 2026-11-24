@@ -394,6 +394,44 @@ test "transaction: access-list storage keys are warm without being read" {
     try std.testing.expectEqual(@as(u64, 21_000 + 2_400 + 1_900 + 3 + 100), warm.gas_used);
 }
 
+test "transaction: access-list addresses are warm without being read" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(caller, 1_000_000_000, 0, &.{});
+    try h.database.put_account(other, 0, 1, &.{op.STOP});
+    try h.database.put_account(third, 7, 0, &.{});
+    // `contract` reads BALANCE(third), then stops.
+    const balance = [_]u8{0x73} ++ third ++ [_]u8{ op.BALANCE, op.STOP };
+    try h.database.put_account(contract, 0, 1, &balance);
+    const unread = [_]transaction.AccessListItem{.{ .address = third, .storage_keys = &.{} }};
+    var tx = transaction.TxEnv{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = other,
+        .access_list = &unread,
+    };
+    const skipped = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, skipped.status);
+    // Never read: a stateless witness without the account still executes (mainnet 57716004).
+    try std.testing.expect(h.state.accounts.getPtr(third) == null);
+    // A listed address the code reads costs a warm BALANCE (100), not a cold one (2600).
+    tx = .{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .nonce = 1,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = contract,
+        .access_list = &unread,
+    };
+    const warm = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, warm.status);
+    try std.testing.expectEqual(@as(u64, 21_000 + 2_400 + 3 + 100), warm.gas_used);
+}
+
 test "transaction: invalid transactions change nothing" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);

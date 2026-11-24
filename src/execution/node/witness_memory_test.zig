@@ -166,7 +166,8 @@ fn handle_nothing(
 test "witness memory: the node's HTTP large send buffers are reserved, not resident" {
     const limits: service.Limits = .{};
     const options = limits.http;
-    var meter = try Meter.init(128 << 20);
+    // The connection table and buffers (~80 MiB) and the large buffers (~320 MiB).
+    var meter = try Meter.init(512 << 20);
     defer meter.deinit();
     const Server = http.Server(io.SimIo, *u8, handle_nothing);
     var server: Server = undefined;

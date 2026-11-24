@@ -4,10 +4,14 @@
 //! edges, `nf:edge:<index>`: the compiler's 8-bit counters (`-ffuzz`) whose code lies in an
 //! EVM or crypto function (`edge_filter`), hit counts modulo 256, reset per request. Edge
 //! indices are stable for one binary only.
+//!
+//! `trie` mode reports only edges (`write_trie`), from its own function list
+//! (`trie_function_prefixes`): the trie, the state database and the storage engine. Its
+//! databases run on the calling thread (no rehash workers, a blocking file backend), so
+//! the counters do not depend on threads or on completion timing.
 
 const std = @import("std");
 const assert = std.debug.assert;
-const elf = std.elf;
 
 const evm = @import("../../execution/evm/root.zig");
 
@@ -16,9 +20,22 @@ const evm = @import("../../execution/evm/root.zig");
 /// function by its file's path in the `base` module.
 pub const function_prefixes = [_][]const u8{ "execution.evm.", "common.crypto." };
 
+/// `trie` mode's functions: the tries (`execution.trie`: sparse trie, `StateTrie`, hash
+/// builder, proofs), the state database (`execution.db`: changesets, `State`, `DiskState`,
+/// flat trees, branch records, the database facade, `SparseState`) and its storage engine
+/// (`execution.db.storage`: journal, checkpoints, grid, LSM trees). Not the adapter, JSON,
+/// or the request's decoding.
+pub const trie_function_prefixes = [_][]const u8{
+    "execution.trie.",
+    "execution.db.",
+    "execution.db.storage.",
+};
+
 pub const Coverage = struct {
     /// Indices into the edge counters, ascending.
     edges: []const u32,
+    /// `trie` mode's indices (`trie_function_prefixes`), ascending.
+    trie_edges: []const u32,
     counters: []u8,
 
     /// `elf_bytes` is this executable (for its symbol table). Without the instrumentation,
@@ -28,12 +45,16 @@ pub const Coverage = struct {
         const counters = evm.coverage.edge_counters();
         const pcs = evm.coverage.edge_pcs();
         assert(counters.len == pcs.len);
-        const edges = try edge_filter(allocator, elf_bytes, pcs);
+        const filter = evm.coverage_edges.edge_filter;
+        const edges = try filter(allocator, elf_bytes, pcs, &function_prefixes);
+        errdefer allocator.free(edges);
+        const trie_edges = try filter(allocator, elf_bytes, pcs, &trie_function_prefixes);
         evm.coverage.active = true;
-        return .{ .edges = edges, .counters = counters };
+        return .{ .edges = edges, .trie_edges = trie_edges, .counters = counters };
     }
 
     pub fn deinit(coverage: *Coverage, allocator: std.mem.Allocator) void {
+        allocator.free(coverage.trie_edges);
         allocator.free(coverage.edges);
         evm.coverage.active = false;
         coverage.* = undefined;
@@ -58,123 +79,18 @@ pub const Coverage = struct {
         }
         try out.writeAll("}");
     }
-};
 
-const Range = struct { start: u64, end: u64 };
-
-/// Indices of the `pcs` (one per edge counter) inside a function named with one of
-/// `function_prefixes`, read from the ELF symbol table in `elf_bytes`.
-pub fn edge_filter(
-    allocator: std.mem.Allocator,
-    elf_bytes: []const u8,
-    pcs: []const usize,
-) ![]u32 {
-    var ranges: std.ArrayList(Range) = .empty;
-    defer ranges.deinit(allocator);
-    try function_ranges(allocator, elf_bytes, &ranges);
-    std.mem.sort(Range, ranges.items, {}, range_less);
-    var edges: std.ArrayList(u32) = .empty;
-    errdefer edges.deinit(allocator);
-    for (pcs, 0..) |pc, index| {
-        if (contains(ranges.items, pc)) try edges.append(allocator, @intCast(index));
-    }
-    assert(edges.items.len <= pcs.len);
-    return edges.toOwnedSlice(allocator);
-}
-
-fn range_less(_: void, a: Range, b: Range) bool {
-    return a.start < b.start;
-}
-
-/// Ranges may overlap (aliases); a PC in any of them counts.
-fn contains(ranges: []const Range, pc: u64) bool {
-    // The last range starting at or before `pc`, then a short scan back for aliases.
-    var low: usize = 0;
-    var high: usize = ranges.len;
-    while (low < high) {
-        const middle = low + (high - low) / 2;
-        if (ranges[middle].start <= pc) low = middle + 1 else high = middle;
-    }
-    var index = low;
-    var scanned: u32 = 0;
-    while (index > 0 and scanned < 16) : (scanned += 1) {
-        index -= 1;
-        if (pc < ranges[index].end) return true;
-    }
-    return false;
-}
-
-const Error = error{InvalidElf};
-
-fn function_ranges(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-    ranges: *std.ArrayList(Range),
-) !void {
-    if (bytes.len < @sizeOf(elf.Elf64_Ehdr)) return error.InvalidElf;
-    if (!std.mem.eql(u8, bytes[0..4], elf.MAGIC)) return error.InvalidElf;
-    if (bytes[elf.EI.CLASS] != elf.ELFCLASS64) return error.InvalidElf;
-    const header = std.mem.bytesToValue(elf.Elf64_Ehdr, bytes[0..@sizeOf(elf.Elf64_Ehdr)]);
-    const sections = try section_headers(bytes, &header);
-    for (sections) |section| {
-        if (section.sh_type != elf.SHT_SYMTAB) continue;
-        if (section.sh_link >= sections.len) return error.InvalidElf;
-        const strings = try section_bytes(bytes, &sections[section.sh_link]);
-        const symbols = try section_bytes(bytes, &section);
-        const count = symbols.len / @sizeOf(elf.Elf64_Sym);
-        for (0..count) |index| {
-            const offset = index * @sizeOf(elf.Elf64_Sym);
-            const symbol = std.mem.bytesToValue(
-                elf.Elf64_Sym,
-                symbols[offset..][0..@sizeOf(elf.Elf64_Sym)],
-            );
-            if (symbol.st_type() != elf.STT_FUNC or symbol.st_size == 0) continue;
-            if (symbol.st_name >= strings.len) return error.InvalidElf;
-            const name = std.mem.sliceTo(strings[symbol.st_name..], 0);
-            if (!selected(name)) continue;
-            const end = std.math.add(u64, symbol.st_value, symbol.st_size) catch
-                return error.InvalidElf;
-            try ranges.append(allocator, .{ .start = symbol.st_value, .end = end });
+    /// `,"coverage":{...}` of a `trie` request: its edges only, hit counts modulo 256.
+    pub fn write_trie(coverage: *const Coverage, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        try out.writeAll(",\"coverage\":{");
+        var first = true;
+        for (coverage.trie_edges) |index| {
+            const count = coverage.counters[index];
+            if (count == 0) continue;
+            try evm.coverage.separator(out, &first);
+            try out.print("\"nf:edge:{d}\":{d}", .{ index, count });
         }
+        try out.writeAll("}");
+        assert(coverage.trie_edges.len <= coverage.counters.len);
     }
-}
-
-fn selected(name: []const u8) bool {
-    for (function_prefixes) |prefix| {
-        if (std.mem.startsWith(u8, name, prefix)) return true;
-    }
-    return false;
-}
-
-const Sections = []align(1) const elf.Elf64_Shdr;
-
-fn section_headers(bytes: []const u8, header: *const elf.Elf64_Ehdr) Error!Sections {
-    if (header.e_shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidElf;
-    const size = @as(u64, header.e_shnum) * @sizeOf(elf.Elf64_Shdr);
-    if (header.e_shoff > bytes.len or size > bytes.len - header.e_shoff) return error.InvalidElf;
-    const start: usize = @intCast(header.e_shoff);
-    return std.mem.bytesAsSlice(elf.Elf64_Shdr, bytes[start..][0..@intCast(size)]);
-}
-
-fn section_bytes(bytes: []const u8, section: *align(1) const elf.Elf64_Shdr) Error![]const u8 {
-    if (section.sh_offset > bytes.len or section.sh_size > bytes.len - section.sh_offset) {
-        return error.InvalidElf;
-    }
-    const start: usize = @intCast(section.sh_offset);
-    return bytes[start..][0..@intCast(section.sh_size)];
-}
-
-test "diff coverage: edge filter keeps PCs inside selected functions" {
-    const ranges = [_]Range{
-        .{ .start = 0x100, .end = 0x180 },
-        .{ .start = 0x200, .end = 0x210 },
-    };
-    try std.testing.expect(contains(&ranges, 0x100));
-    try std.testing.expect(contains(&ranges, 0x17f));
-    try std.testing.expect(!contains(&ranges, 0x180));
-    try std.testing.expect(!contains(&ranges, 0xff));
-    try std.testing.expect(contains(&ranges, 0x20f));
-    try std.testing.expect(!contains(&ranges, 0x1000));
-    try std.testing.expect(selected("execution.evm.interpreter.run__anon_1"));
-    try std.testing.expect(!selected("execution.node.executor.Executor.apply"));
-}
+};

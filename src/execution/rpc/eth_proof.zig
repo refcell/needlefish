@@ -228,17 +228,37 @@ pub fn parse_keys(raw: []const u8, out: *[storage_keys_max]Hash) HandlerError!u3
     return count;
 }
 
-fn parse_key(text: []const u8) ?Hash {
-    var key: Hash = @splat(0);
-    var buffer: [32]u8 = undefined;
-    if (json.parse_data(text, &buffer)) |bytes| {
-        @memcpy(key[32 - bytes.len ..], bytes);
-        return key;
-    } else |_| {}
-    // Odd-length or minimal hex: read it as a number.
-    const value = json.parse_quantity(u256, text) catch return null;
+/// A storage key as alloy's `JsonStorageKey` reads it: `0x` and up to 64 hex digits, leading
+/// zeros allowed, right-aligned in the 32-byte slot; a bare `0x` is slot zero (ruint).
+pub fn parse_key(text: []const u8) ?Hash {
+    if (text.len < 2 or text.len > 2 + 64 or !std.mem.startsWith(u8, text, "0x")) return null;
+    for (text[2..]) |digit| if (!std.ascii.isHex(digit)) return null;
+    const digits = if (text.len == 2) "0" else text[2..];
+    const value = std.fmt.parseInt(u256, digits, 16) catch unreachable; // 64 digits fit.
+    var key: Hash = undefined;
     std.mem.writeInt(u256, &key, value, .big);
     return key;
+}
+
+/// A storage key of an access list or a state override as Nethermind's
+/// `UInt256Converter.ReadHex` reads it: `0x` and 1 to 64 hex digits (an odd count too),
+/// right-aligned in the 32-byte slot. Unlike `parse_key`, a bare `0x` is refused.
+pub fn parse_slot_key(text: []const u8) ?Hash {
+    if (text.len < 3) return null;
+    const key = parse_key(text) orelse return null;
+    assert(text.len <= 2 + 64);
+    return key;
+}
+
+test "eth_proof: parse_slot_key reads odd digit counts and refuses a bare 0x" {
+    const one = parse_slot_key("0x1").?;
+    try std.testing.expectEqual(@as(u256, 1), std.mem.readInt(u256, &one, .big));
+    const odd = parse_slot_key("0xabc").?;
+    try std.testing.expectEqual(@as(u256, 0xabc), std.mem.readInt(u256, &odd, .big));
+    try std.testing.expect(parse_slot_key("0x") == null);
+    try std.testing.expect(parse_slot_key("0X1") == null);
+    const digits_65 = "1" ++ "1111111111111111111111111111111111111111111111111111111111111111";
+    try std.testing.expect(parse_slot_key("0x" ++ digits_65) == null);
 }
 
 comptime {

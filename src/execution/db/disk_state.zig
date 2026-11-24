@@ -858,7 +858,7 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
 
         /// `changeset` with old and new swapped (same keys, so still sorted).
         fn reverse(self: *Self, changeset: *const Changeset) Error!*const Changeset {
-            self.swapped.clear();
+            self.swapped.clear_like(changeset) catch return error.Full;
             for (changeset.account_changes()) |change| {
                 self.swapped.add_account(.{
                     .address = change.address,
@@ -893,7 +893,8 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 const listed = storage_index < storage_changes.len and
                     std.mem.eql(u8, &storage_changes[storage_index].address, &change.address);
                 if (listed) continue;
-                const record = self.account(&node.keccak256(&change.address)) orelse continue;
+                const record = self.account(&changeset.account_key(&change.address)) orelse
+                    continue;
                 if (!std.mem.eql(u8, &record.storage_root, &node.empty_root)) {
                     return error.Unsupported;
                 }
@@ -1172,7 +1173,9 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             depth: u8,
             want: *const Hash,
         ) ?[]const u8 {
-            assert(depth < 64);
+            // Depth 64: the child of a branch at depth 63 (keys sharing 63 nibbles), a leaf
+            // with an empty path.
+            assert(depth <= 64);
             self.stats.leaves_resolved += 1;
             var value_buffer: [state_trie.account_rlp_bytes_max]u8 = undefined;
             var value: []const u8 = undefined;
@@ -1609,13 +1612,14 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                     end += 1;
                 }
                 start = end;
-                const address_hash = node.keccak256(address);
+                const address_hash = changeset.account_key(address);
                 const pre = self.account(&address_hash);
                 if (self.fault) return error.Corrupt;
                 const pre_root = if (pre) |record| record.storage_root else node.empty_root;
-                const post_root = self.sparse_state.account_storage_root(address.*) catch {
+                const post = self.sparse_state.account_hashed(&address_hash) catch {
                     return error.Corrupt;
                 };
+                const post_root = if (post) |leaf| leaf.storage_root else node.empty_root;
                 try self.diff(address_hash, &pre_root, &post_root);
             }
             assert(start == changes.len);
@@ -1678,15 +1682,15 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 }
                 while (storage_index < changes.len and
                     std.mem.eql(u8, &changes[storage_index].address, &address)) storage_index += 1;
-                try self.collect_account(&address);
+                try self.collect_account(&changeset.account_key(&address));
             }
             assert(self.account_writes_len <= accounts.len + changes.len);
         }
 
-        fn collect_account(self: *Self, address: *const Address) Error!void {
+        fn collect_account(self: *Self, address_hash: *const Hash) Error!void {
             if (self.account_writes_len == self.account_writes.len) return error.Full;
             const write = &self.account_writes[self.account_writes_len];
-            write.key = node.keccak256(address);
+            write.key = address_hash.*;
             write.value = null;
             write.old = null;
             if (self.capture != null) {
@@ -1695,11 +1699,16 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                     write.old = flat_trees_module.account_encode(&pre.info, &pre.storage_root);
                 }
             }
-            const info = self.sparse_state.basic(address.*) catch return error.Corrupt;
-            if (info) |account_info| {
-                const storage_root = self.sparse_state.account_storage_root(address.*) catch {
-                    return error.Corrupt;
+            const leaf = self.sparse_state.account_hashed(address_hash) catch {
+                return error.Corrupt;
+            };
+            if (leaf) |account_leaf| {
+                const account_info: AccountInfo = .{
+                    .nonce = account_leaf.nonce,
+                    .balance = account_leaf.balance,
+                    .code_hash = account_leaf.code_hash,
                 };
+                const storage_root = account_leaf.storage_root;
                 write.value = flat_trees_module.account_encode(&account_info, &storage_root);
             }
             self.account_writes_len += 1;
@@ -1723,10 +1732,11 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
                 else
                     false;
                 if (!same) {
-                    address_hash = node.keccak256(&change.address);
+                    address_hash = changeset.account_key(&change.address);
                     address_last = change.address;
                 }
-                const key = flat_trees_module.storage_key(&address_hash, change.slot);
+                const slot_hash = changeset.slot_key(change.slot);
+                const key = flat_trees_module.storage_key_hashed(&address_hash, &slot_hash);
                 var value: [flat_trees_module.storage_value_size]u8 = undefined;
                 std.mem.writeInt(u256, &value, change.new, .big);
                 const value_pointer = if (change.new == 0) null else &value;

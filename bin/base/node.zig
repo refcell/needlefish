@@ -25,6 +25,7 @@ const io = base.utilities.io;
 const log = base.utilities.log;
 const node = base.execution.node;
 const Service = node.Service(io.IO);
+const rpc_coverage = base.execution.rpc.eth.fuzz_coverage;
 
 const usage =
     \\usage: base node --chain GENESIS.json [--datadir DIR] [--http.addr IP] [--http.port P]
@@ -228,6 +229,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .sink = log.stderr_sink(),
         .time = .{ .context = &os_io, .now_ns = now_ns },
     };
+    if (rpc_coverage.enabled) try init_rpc_coverage(init, &logger);
+    defer if (rpc_coverage.enabled) rpc_coverage.deinit(init.gpa);
     const service = try init.gpa.create(Service);
     defer init.gpa.destroy(service);
     try service.init(init.gpa, &os_io, &logger, &parsed.value, .{
@@ -249,6 +252,23 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         .dev_l1 = flags.dev_l1,
     });
     while (true) try os_io.run_for_ns(std.time.ns_per_s);
+}
+
+/// `fuzz_coverage` (a `-Ddiff-coverage` build): picks the kept edge counters from this
+/// executable's symbol table, once.
+fn init_rpc_coverage(init: std.process.Init, logger: *log.Logger) !void {
+    comptime std.debug.assert(rpc_coverage.enabled);
+    const prefixes = init.environ_map.get(rpc_coverage.prefixes_variable) orelse
+        rpc_coverage.default_prefixes;
+    const executable = try Io.Dir.cwd().readFileAlloc(
+        init.io,
+        "/proc/self/exe",
+        init.gpa,
+        .limited(1 << 30),
+    );
+    defer init.gpa.free(executable);
+    const kept = try rpc_coverage.init(init.gpa, executable, prefixes);
+    logger.log(.info, "node", "fuzz_coverage on", .{ .counters = kept, .prefixes = prefixes });
 }
 
 test "node: flags" {

@@ -178,7 +178,7 @@ fn write_precompiles(spec: *const ChainSpec, w: *json.Writer, timestamp: u64) Ha
         const address = evm.primitives.address_from_int(entry.number);
         if (!precompile_active(spec, timestamp, address)) continue;
         try w.key(entry.name);
-        try w.string(&primitives.checksum(.{ .bytes = address }, null));
+        try w.data(&address); // Lower case, as base/base lists precompiles.
     }
     try w.end_object();
 }

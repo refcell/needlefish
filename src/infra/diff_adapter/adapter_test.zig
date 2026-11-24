@@ -105,14 +105,25 @@ fn hex_string(out: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 fn transfer(buffer: []u8, from: u8, nonce: u64, max_fee: u128) ![]const u8 {
+    return send(buffer, from, nonce, max_fee, recipient, 5);
+}
+
+fn send(
+    buffer: []u8,
+    from: u8,
+    nonce: u64,
+    max_fee: u128,
+    to: Address,
+    value: u256,
+) ![]const u8 {
     const tx: consensus.Eip1559 = .{
         .chain_id = spec.chain_id,
         .nonce = nonce,
         .max_priority_fee_per_gas = 1,
         .max_fee_per_gas = max_fee,
         .gas_limit = 21_000,
-        .to = .{ .call = .{ .bytes = recipient } },
-        .value = 5,
+        .to = .{ .call = .{ .bytes = to } },
+        .value = value,
         .input = &.{},
         .access_list = .empty,
     };
@@ -140,6 +151,8 @@ const Lines = struct {
     out: std.Io.Writer.Allocating,
     /// Leave out the transactions build mode rejects (the block it built).
     only_valid: bool = false,
+    /// Replaces the default transactions.
+    transactions: ?[]const []const u8 = null,
 
     fn request(lines: *Lines, genesis: *const Genesis, mode: []const u8, skip: ?u32) ![]const u8 {
         return lines.request_with(genesis, mode, skip, null);
@@ -193,7 +206,8 @@ const Lines = struct {
             try transfer(&buffers[3], 1, 1, 2_000),
         };
         const included = [_][]const u8{ all[0], all[3] };
-        const transactions: []const []const u8 = if (lines.only_valid) &included else &all;
+        const default: []const []const u8 = if (lines.only_valid) &included else &all;
+        const transactions = lines.transactions orelse default;
         for (transactions, 0..) |raw, index| {
             if (index > 0) try w.writeAll(",");
             try hex_string(w, raw);
@@ -352,4 +366,47 @@ test "diff adapter: build mode skips invalid transactions and reports the block"
     ));
     try testing.expect(invalid.ok and !invalid.valid);
     try testing.expectEqual(@as(usize, 0), invalid.rejected.len);
+}
+
+test "diff adapter: post marks an account destroyed and recreated in the block as wiped" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const empty: Address = @splat(0x66);
+    const accounts = [_]Account{
+        .{ .address = address_of(1), .info = .{ .balance = 10 * ether } },
+        .{ .address = coinbase, .info = .{ .balance = 7 } },
+        // Exists but is empty: touching it removes it (EIP-161), a destruction.
+        .{ .address = empty, .info = .{} },
+    };
+    var genesis: Genesis = undefined;
+    try genesis.init(&accounts);
+    defer genesis.deinit();
+    const adapter = try testing.allocator.create(diff.Adapter);
+    defer testing.allocator.destroy(adapter);
+    try adapter.init(testing.allocator);
+    defer adapter.deinit();
+    var buffers: [3][256]u8 = undefined;
+    const transactions = [_][]const u8{
+        try send(&buffers[0], 1, 0, 2_000, empty, 0), // Touches it: removed.
+        try send(&buffers[1], 1, 1, 2_000, empty, 9), // Recreates it.
+        try send(&buffers[2], 1, 2, 2_000, recipient, 5), // New: not wiped.
+    };
+    var lines: Lines = .{ .out = .init(testing.allocator), .transactions = &transactions };
+    defer lines.out.deinit();
+    const built = try answer(adapter, arena, try lines.request(&genesis, "build", null));
+    try testing.expect(built.ok and built.valid);
+    try testing.expectEqual(@as(usize, 3), built.receipts.len);
+    const post = built.post.?;
+    try expect_account(post, empty, 0, 9);
+    var name: [42]u8 = undefined;
+    hex.encode_prefixed(&name, &empty);
+    const recreated = post.object.get(&name).?.object;
+    try testing.expect(recreated.get("wiped").?.bool);
+    try testing.expectEqual(@as(usize, 0), recreated.get("storage").?.object.count());
+    // Neither a new account nor a changed one that was never destroyed is wiped.
+    hex.encode_prefixed(&name, &recipient);
+    try testing.expect(post.object.get(&name).?.object.get("wiped") == null);
+    hex.encode_prefixed(&name, &address_of(1));
+    try testing.expect(post.object.get(&name).?.object.get("wiped") == null);
 }

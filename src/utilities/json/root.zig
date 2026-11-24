@@ -5,12 +5,19 @@
 //! are slices into that input, so nothing is copied unless the caller unescapes a string
 //! into its own buffer. Nesting depth is bounded by `depth_max`; exceeding it is an error,
 //! not a crash. Structure is validated while scanning: a document that scans to `.end`
-//! without error is well formed.
+//! without error is well formed. The writer nests up to `writer_depth_max`, enough for any
+//! call tree.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const depth_max = 64;
+/// Scanner nesting: 127 levels, as serde_json's default recursion limit (128, an error once
+/// it is reached), which base/base parses JSON-RPC requests with.
+pub const depth_max = 127;
+
+/// Writer nesting: a callTracer tree takes two levels per call frame (an object and its
+/// `calls` array), and the EVM nests at most 1025 frames; geth-style traces have no limit.
+pub const writer_depth_max = 4096;
 
 pub const Error = error{
     UnexpectedEnd,
@@ -426,6 +433,23 @@ pub fn parse_fixed(comptime N: usize, text: []const u8) (HexError || error{Inval
     return out;
 }
 
+/// Parses a 32-byte hash as Nethermind's strict `Hash256Converter` does: the prefix must be a
+/// lowercase `0x` (a capital `0X` is refused, unlike `parse_data`).
+pub fn parse_hash(text: []const u8) (HexError || error{InvalidLength})![32]u8 {
+    if (text.len >= 2 and text[1] == 'X') return error.MissingPrefix;
+    const hash = try parse_fixed(32, text);
+    assert(text[1] == 'x');
+    return hash;
+}
+
+test "json: parse_hash refuses a capital 0X prefix" {
+    const digits = "00000000000000000000000000000000000000000000000000000000000000ab";
+    const hash = try parse_hash("0x" ++ digits);
+    try std.testing.expectEqual(@as(u8, 0xab), hash[31]);
+    try std.testing.expectError(error.MissingPrefix, parse_hash("0X" ++ digits));
+    try std.testing.expectError(error.InvalidLength, parse_hash("0xab"));
+}
+
 const hex_digits = "0123456789abcdef";
 
 /// Formats a QUANTITY into `buffer` (no quotes). Returns the slice.
@@ -456,7 +480,7 @@ pub const Writer = struct {
     out: *std.Io.Writer,
     depth: u32 = 0,
     /// Per depth: whether the container already has an element (needs a comma first).
-    has_element: [depth_max + 1]bool = @splat(false),
+    has_element: std.StaticBitSet(writer_depth_max + 1) = .empty,
     /// True right after `key()`: the next value must not be preceded by a comma.
     after_key: bool = false,
 
@@ -471,8 +495,8 @@ pub const Writer = struct {
             writer.after_key = false;
             return;
         }
-        if (writer.has_element[writer.depth]) try writer.out.writeByte(',');
-        writer.has_element[writer.depth] = true;
+        if (writer.has_element.isSet(writer.depth)) try writer.out.writeByte(',');
+        writer.has_element.set(writer.depth);
     }
 
     pub fn begin_object(writer: *Writer) WriteError!void {
@@ -492,11 +516,11 @@ pub const Writer = struct {
     }
 
     fn begin(writer: *Writer, byte: u8) WriteError!void {
-        assert(writer.depth < depth_max);
+        assert(writer.depth < writer_depth_max);
         try writer.separate();
         try writer.out.writeByte(byte);
         writer.depth += 1;
-        writer.has_element[writer.depth] = false;
+        writer.has_element.unset(writer.depth);
     }
 
     fn end(writer: *Writer, byte: u8) WriteError!void {
@@ -675,6 +699,39 @@ pub fn find_path(input: []const u8, keys: []const []const u8) Error!?[]const u8 
     try scanner.skip(try scanner.next());
     assert(scanner.index > start);
     return input[start..scanner.index];
+}
+
+/// Returns the raw text of the last member of the object `input` whose key equals `wanted`
+/// ASCII case-insensitively (.NET's `PropertyNameCaseInsensitive`: a later member wins), or
+/// null if there is none or `input` is not an object. Keys containing escapes never match.
+pub fn find_member_ignore_case(input: []const u8, wanted: []const u8) Error!?[]const u8 {
+    var scanner = Scanner.init(input);
+    const container = try scanner.next();
+    if (container.tag != .object_begin) return null;
+    var found: ?[]const u8 = null;
+    // Each member consumes at least one byte, so input length bounds the loop.
+    var members: u32 = 0;
+    while (true) : (members += 1) {
+        assert(members <= input.len);
+        const key = try scanner.next();
+        if (key.tag == .object_end) return found;
+        assert(key.tag == .string and key.key);
+        scanner.skip_whitespace();
+        const start = scanner.index;
+        try scanner.skip(try scanner.next());
+        assert(scanner.index > start);
+        if (!key.escaped and std.ascii.eqlIgnoreCase(key.bytes, wanted)) {
+            found = std.mem.trim(u8, input[start..scanner.index], " \t\r\n:");
+        }
+    }
+}
+
+test "json: find_member_ignore_case takes the last member of any case" {
+    const object = "{\"gasLimit\":\"0x1\",\"other\":[1,{\"gaslimit\":3}],\"GASLIMIT\" : \"0x2\"}";
+    const found = (try find_member_ignore_case(object, "gasLimit")).?;
+    try std.testing.expectEqualStrings("\"0x2\"", found);
+    try std.testing.expect(try find_member_ignore_case(object, "gas") == null);
+    try std.testing.expect(try find_member_ignore_case("[1]", "gasLimit") == null);
 }
 
 /// Scans a whole document, returning an error if it is not well formed.

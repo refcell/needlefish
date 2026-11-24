@@ -168,6 +168,41 @@ fn encode_legacy(encoder: *Encoder, tx: Legacy, signature: ?Signature) void {
     }
 }
 
+/// An unsigned legacy transaction as geth's eth_simulateV1 builds one (`ToTransaction`):
+/// `[..., v, r, s]` with all three zero, no EIP-155 chain id. RPC only: never a signed
+/// transaction, so the consensus decoder refuses it (`InvalidV`).
+pub fn unsigned_legacy_length(tx: Legacy) usize {
+    return rlp.list_length(rlp.codec.fields_length(tx.core()) + 3);
+}
+
+pub fn encode_unsigned_legacy(tx: Legacy, buffer: []u8) []u8 {
+    var encoder = Encoder.init(buffer);
+    encoder.list_header(rlp.codec.fields_length(tx.core()) + 3);
+    rlp.codec.encode_fields(&encoder, tx.core());
+    inline for (0..3) |_| encoder.int(@as(u8, 0));
+    assert(encoder.written().len == unsigned_legacy_length(tx));
+    return encoder.written();
+}
+
+/// Reads `encode_unsigned_legacy`'s bytes; the chain id is left null.
+pub fn decode_unsigned_legacy(input: []const u8) DecodeError!Legacy {
+    var decoder = Decoder.init(input);
+    var items = try decoder.list();
+    try decoder.finish();
+    const core = try rlp.codec.decode_fields(LegacyCore, &items);
+    inline for (0..3) |_| if (try items.int(u256) != 0) return error.InvalidV;
+    try items.finish();
+    return .{
+        .chain_id = null,
+        .nonce = core.nonce,
+        .gas_price = core.gas_price,
+        .gas_limit = core.gas_limit,
+        .to = core.to,
+        .value = core.value,
+        .input = core.input,
+    };
+}
+
 fn typed_payload_length(tx: anytype, signature: ?Signature) usize {
     const sig_length = if (signature) |sig| signature_length(sig) else 0;
     return rlp.codec.fields_length(tx) + sig_length;
@@ -254,6 +289,29 @@ fn decode_legacy(input: []const u8) DecodeError!Signed(Legacy) {
         },
         .signature = .{ .y_parity = v.y_parity, .r = r, .s = s },
     };
+}
+
+test "tx: an unsigned legacy transaction encodes v, r and s zero" {
+    const tx: Legacy = .{
+        .chain_id = 8453,
+        .nonce = 1,
+        .gas_price = 2,
+        .gas_limit = 21_000,
+        .to = .create,
+        .value = 3,
+        .input = &.{0xaa},
+    };
+    var buffer: [64]u8 = undefined;
+    const raw = encode_unsigned_legacy(tx, &buffer);
+    // [1, 2, 21000, "", 3, 0xaa, 0, 0, 0]
+    const expected = [_]u8{ 0xcc, 0x01, 0x02, 0x82, 0x52, 0x08, 0x80, 0x03, 0x81, 0xaa } ++
+        [_]u8{ 0x80, 0x80, 0x80 };
+    try std.testing.expectEqualSlices(u8, &expected, raw);
+    const decoded = try decode_unsigned_legacy(raw);
+    try std.testing.expectEqual(@as(?u64, null), decoded.chain_id);
+    try std.testing.expectEqual(@as(u64, 21_000), decoded.gas_limit);
+    // Never a signed transaction.
+    try std.testing.expectError(error.InvalidV, decode_legacy(raw));
 }
 
 pub const KeccakSink = @import("hashing.zig").KeccakSink;

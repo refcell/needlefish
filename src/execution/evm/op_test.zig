@@ -95,6 +95,8 @@ test "op: deposit whose value exceeds balance plus mint fails with its whole gas
     const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
     try testing.expectEqual(evm_module.Status.halt, executed.status);
     try testing.expectEqual(@as(u64, 100_000), executed.gas_used);
+    // The callee was loaded before the transfer failed (revm's frame), as a trace lists it.
+    try testing.expectEqual(h.state.tx_id, h.state.accounts.getPtr(target).?.seen_tx);
     try testing.expectEqual(@as(u256, 4), try balance(&h, depositor));
     try testing.expectEqual(@as(u64, 8), (try h.state.load(depositor)).info.nonce);
     try testing.expectEqual(@as(u256, 0), try balance(&h, target));
@@ -176,6 +178,36 @@ test "op: L1 fee, base fee, and operator fee go to their vaults" {
     try testing.expectEqual(@as(u256, 21_000 * 2), try balance(&h, coinbase));
     const spent = 1_000 + 21_000 * 9 + l1_fee + operator_fee;
     try testing.expectEqual(initial - spent, try balance(&h, sender_address));
+}
+
+test "op: a zero fee credit leaves its vault unseen by the transaction" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    try put_l1_block(&h);
+    try h.database.put_storage(op_stack.l1_block_address, op_stack.slot_operator_fee, 0);
+    h.evm.block.op = .{ .upgrade = .isthmus };
+    h.evm.block.base_fee = 0;
+    h.evm.block.coinbase = coinbase;
+    try h.database.put_account(sender_address, 1_000_000_000_000, 0, &.{});
+    const envelope = [_]u8{ 0x02, 0xf8, 0x00, 0x11, 0x22, 0x00, 0x33, 0x44, 0x55, 0x00, 0x66 };
+    const tx = transaction.TxEnv{
+        .tx_type = .eip1559,
+        .caller = sender_address,
+        .gas_limit = 60_000,
+        .gas_price = 0,
+        .to = target,
+        .envelope = &envelope,
+    };
+    _ = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    // Nethermind's prestateTracer lists a fee vault only when the transaction credits it:
+    // the L1 fee vault is, the base fee and operator fee vaults (zero credits) are not. The
+    // state change is the same either way.
+    const tx_id = h.state.tx_id;
+    try testing.expect(h.state.accounts.get(op_stack.l1_fee_vault).?.seen_tx == tx_id);
+    try testing.expect(h.state.accounts.get(op_stack.base_fee_vault).?.seen_tx != tx_id);
+    try testing.expect(h.state.accounts.get(op_stack.operator_fee_vault).?.seen_tx != tx_id);
+    try testing.expectEqual(@as(u256, 0), try balance(&h, op_stack.base_fee_vault));
 }
 
 test "op: L1 and operator fees count toward the balance check" {
@@ -596,6 +628,34 @@ test "op: B-20 factory calldata below the interface minimum fails the interface 
     try testing.expectEqualSlices(u8, &selector, cobalt.output);
 }
 
+test "op: B-20 factory bytes[] elements decode before the count is checked (Beryl)" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    // Chain-campaign finding: initCalls points one byte into the arguments, so its count is
+    // 0x0397 and its first element head is the salt shifted by one byte. alloy reserves the
+    // elements and fails that head's offset check; checking the count against the calldata
+    // first reported an overrun, a shorter revert.
+    const salt = "97667070c54ef182b0f5858b034beac1b6f3089aa2d3188bb1e8929f4fa9b929";
+    var input: [4 + 9 * 32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&input, "62975e6a" ++
+        "0000000000000000000000000000000000000000000000000000000000000003" ++ salt ++
+        "0000000000000000000000000000000000000000000000000000000000000080" ++
+        "0000000000000000000000000000000000000000000000000000000000000001" ++
+        "0000000000000000000000000000000000000000000000000000000000000044" ++
+        "40c10f19000000000000000000000000c99a712af88be98c5179b3fbdb12588b" ++
+        "5b6a303f00000000000000000000000000000000000000000000000000000000" ++
+        "000389b200000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000");
+    const executed = try create_call(&h, &input);
+    try testing.expect(executed.status == .revert);
+    const expected = "\x62\x97\x5e\x6a" ++
+        "type check failed for \"offset (usize)\" with data: " ++ salt[2..] ++ "00";
+    try testing.expectEqual(@as(usize, 118), expected.len);
+    try testing.expectEqualStrings(expected, executed.output);
+}
+
 test "op: PolicyRegistry argument-free views answer a bare selector (Denim)" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
@@ -910,6 +970,31 @@ test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
     try testing.expect(bad_v.status == .revert);
     try testing.expectEqual(@as(usize, 4 + 64), bad_v.output.len);
     try testing.expectEqual(owner, std.mem.readInt(u256, bad_v.output[36..68], .big));
+}
+
+test "op: B-20 updateExtraMetadata with an empty value deletes a long value before Cobalt" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    // "k0" holds a 40-byte value: length 40 * 2 + 1 in its slot, two chunks after it.
+    var preimage: [2 + 32]u8 = undefined;
+    preimage[0..2].* = "k0".*;
+    preimage[2..].* = native.u256_word(b20_asset.asset_root + 3);
+    const slot = std.mem.readInt(u256, &keccak_of(&preimage), .big);
+    const data = std.mem.readInt(u256, &keccak_of(&native.u256_word(slot)), .big);
+    try h.database.put_storage(token_address, slot, 81);
+    try h.database.put_storage(token_address, data, 0x61);
+    try h.database.put_storage(token_address, data + 1, 0x62);
+    h.state.reset(h.database.interface());
+    _ = try token_call(&h, .grant_role, &.{ b20.role_metadata, address_int(sender_address) });
+    const k0 = short_string("k0") & ~@as(u256, 0xff);
+    const cleared = try token_call(&h, .update_extra_metadata, &.{ 0x40, 0x80, 2, k0, 0 });
+    try testing.expect(cleared.status == .success);
+    try testing.expectEqual(@as(usize, 1), cleared.logs.len);
+    // base/base deletes the entry: the slot and both chunks are zero.
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, slot));
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, data));
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, data + 1));
 }
 
 fn keccak_of(bytes: []const u8) [32]u8 {
@@ -1358,4 +1443,25 @@ test "op: B-20 V3 rejects crediting the token and always checks the executor pol
     try testing.expect(minted.status == .revert);
     const sent = try token_call(&h, .transfer, &.{ address_int(holder), 1 });
     try testing.expect(sent.status == .success);
+}
+
+test "op: a deposit failing its transfer loads the callee's EIP-7702 delegate" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .jovian };
+    const delegate = primitives.address_from_int(0xd1ff0000);
+    const designator = [_]u8{ 0xef, 0x01, 0x00 } ++ delegate;
+    try h.database.put_account(target, 0, 55, &designator);
+    try h.database.put_account(delegate, 0, 1, &store_code);
+    var tx = deposit(target, 100_000);
+    tx.mint = 1;
+    const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.halt, executed.status);
+    const tx_id = h.state.tx_id;
+    try testing.expectEqual(tx_id, h.state.accounts.getPtr(target).?.seen_tx);
+    // Loaded but not stamped as read: prestateTracer lists the callee's delegate from the
+    // pre-transaction state instead.
+    try testing.expect(h.state.accounts.getPtr(delegate).?.seen_tx != tx_id);
+    try testing.expectEqual(@as(u256, 0), try h.storage(delegate, 0));
 }

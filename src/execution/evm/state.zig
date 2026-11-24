@@ -81,6 +81,15 @@ pub const Account = struct {
     warm_tx: u32 = 0,
     created_tx: u32 = 0,
     storage_epoch: u32 = 0,
+    /// The last transaction that loaded the account (not reverted, unlike `warm_tx`);
+    /// system reads such as the L1 fee parameters do not count. The accounts a
+    /// transaction loads are revm's post-transaction state (prestateTracer).
+    seen_tx: u32 = 0,
+    /// The transaction whose SELFDESTRUCT destroyed the account.
+    destroyed_tx: u32 = 0,
+    /// The last transaction that ran a SELFDESTRUCT destroying the account, kept when a
+    /// frame reverts (prestateTracer: Nethermind's and geth's deleted accounts).
+    self_destruct_tx: u32 = 0,
 
     /// Whether the account counts as "empty/non-existent" for the given fork:
     /// EIP-161 empty from Spurious Dragon, otherwise absent from the state.
@@ -352,6 +361,9 @@ pub const State = struct {
     /// EIP-2930 storage keys of the current transaction: warm without being read (as in
     /// revm), so a stateless witness need not hold a listed slot the EVM never reads.
     listed_slots: StorageKeyMap(void) = .empty,
+    /// EIP-2930 addresses of the current transaction: warm without being loaded (as in
+    /// revm), so a stateless witness need not hold a listed account the EVM never reads.
+    listed_accounts: AddressMap(void) = .empty,
     journal: []Entry,
     journal_len: u32 = 0,
     logs: []Log,
@@ -365,6 +377,50 @@ pub const State = struct {
     /// Addresses warm in the current transaction without being loaded (precompiles and
     /// native singletons, EIP-2929); consulted only when an account's stamp is stale.
     static_warm: StaticWarm = .{},
+    /// Precompile and native-contract addresses an RPC state override made ordinary
+    /// accounts: geth's override `Apply` drops any overridden address from the call's
+    /// precompiles, so the EVM runs the account's code (they stay warm: EIP-2929 warms the
+    /// fork's precompiles). Block execution never sets it; a session or reset clears it.
+    ordinary: [ordinary_max]Address = undefined,
+    ordinary_count: u32 = 0,
+    /// Addresses CREATE and CREATE2 of the current transaction paid for but never loaded,
+    /// failing first (depth, balance, nonce). geth's and Nethermind's prestateTracer look
+    /// the created address up once the instruction's gas is paid; execution never reads it.
+    unborn: [unborn_max]Address = undefined,
+    unborn_count: u32 = 0,
+    /// More than `unborn_max` were noted: the list is incomplete.
+    unborn_overflow: bool = false,
+
+    pub const ordinary_max = 64;
+    pub const unborn_max = 1024;
+
+    /// Records the address of a create that failed before loading it (prestateTracer).
+    pub fn note_unborn(state: *State, address: Address) void {
+        if (state.unborn_count == unborn_max) {
+            state.unborn_overflow = true;
+            return;
+        }
+        state.unborn[state.unborn_count] = address;
+        state.unborn_count += 1;
+        assert(state.unborn_count <= unborn_max);
+    }
+
+    /// Makes `address` an ordinary account for the EVM (an RPC state override names it).
+    pub fn make_ordinary(state: *State, address: Address) void {
+        if (state.is_ordinary(address)) return;
+        assert(state.ordinary_count < ordinary_max);
+        state.ordinary[state.ordinary_count] = address;
+        state.ordinary_count += 1;
+        assert(state.is_ordinary(address));
+    }
+
+    pub fn is_ordinary(state: *const State, address: Address) bool {
+        assert(state.ordinary_count <= ordinary_max);
+        for (state.ordinary[0..state.ordinary_count]) |other| {
+            if (std.mem.eql(u8, &other, &address)) return true;
+        }
+        return false;
+    }
 
     pub fn init(allocator: std.mem.Allocator, database: Database, limits: Limits) !State {
         var state = State{
@@ -382,6 +438,7 @@ pub const State = struct {
         try state.slots.ensureTotalCapacity(allocator, limits.slots_max);
         try state.transient.ensureTotalCapacity(allocator, limits.transient_slots_max);
         try state.listed_slots.ensureTotalCapacity(allocator, limits.slots_max);
+        try state.listed_accounts.ensureTotalCapacity(allocator, limits.accounts_max);
         return state;
     }
 
@@ -390,6 +447,7 @@ pub const State = struct {
         state.slots.deinit(allocator);
         state.transient.deinit(allocator);
         state.listed_slots.deinit(allocator);
+        state.listed_accounts.deinit(allocator);
         allocator.free(state.journal);
         allocator.free(state.logs);
         allocator.free(state.log_data);
@@ -407,12 +465,14 @@ pub const State = struct {
         state.slots.clearRetainingCapacity();
         state.clear_transient();
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
+        if (state.listed_accounts.count() > 0) state.listed_accounts.clearRetainingCapacity();
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
         state.code_store_len = 0;
         state.tx_id = 1;
         state.static_warm = .{};
+        state.ordinary_count = 0;
         assert(state.accounts.count() == 0);
     }
 
@@ -422,6 +482,8 @@ pub const State = struct {
         assert(state.tx_id < std.math.maxInt(u32));
         state.tx_id += 1;
         state.static_warm = .{};
+        state.unborn_count = 0;
+        state.unborn_overflow = false;
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
@@ -429,6 +491,8 @@ pub const State = struct {
         assert(state.transient.count() == 0);
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
         assert(state.listed_slots.count() == 0);
+        if (state.listed_accounts.count() > 0) state.listed_accounts.clearRetainingCapacity();
+        assert(state.listed_accounts.count() == 0);
     }
 
     /// Empties transient storage. Entries are removed only here (reverts restore values in
@@ -563,8 +627,17 @@ pub const State = struct {
         return state.slot_list[0..state.slots.count()];
     }
 
-    /// The cached account, loading it from the database on first use. Does not warm.
+    /// The cached account, loading it from the database on first use, and marked as seen
+    /// by the current transaction. Does not warm.
     pub fn load(state: *State, address: Address) Error!*Account {
+        const account = try state.load_unseen(address);
+        account.seen_tx = state.tx_id;
+        return account;
+    }
+
+    /// `load` for system reads, which leave the account unseen by the transaction (an
+    /// account the transaction already read stays seen).
+    pub fn load_unseen(state: *State, address: Address) Error!*Account {
         if (state.accounts.getPtr(address)) |account| return account;
         if (state.accounts.count() >= state.limits.accounts_max) return error.StateFull;
         const info = try state.database.basic(address);
@@ -581,12 +654,56 @@ pub const State = struct {
         return entry.value_ptr;
     }
 
-    pub const Access = struct { account: *Account, is_cold: bool };
+    pub const Access = struct {
+        account: *Account,
+        is_cold: bool,
+        /// The transaction had read the account before this access (prestateTracer).
+        seen: bool = true,
+    };
 
     /// Load and warm an account (EIP-2929), reporting whether it was cold.
     pub fn access(state: *State, address: Address) Error!Access {
-        const account = try state.load(address);
-        const is_cold = account.warm_tx != state.tx_id and !state.static_warm.contains(address);
+        const account = try state.load_unseen(address);
+        const seen = account.seen_tx == state.tx_id;
+        account.seen_tx = state.tx_id;
+        var result = try state.warm(account);
+        result.seen = seen;
+        return result;
+    }
+
+    /// Takes back the transaction's first read of an account whose instruction then failed
+    /// before it ran (out of gas for the access, its memory or the call): geth's and
+    /// Nethermind's prestateTracer do not look such an account up. Execution is unaffected.
+    pub fn unsee(state: *State, account_access: Access) void {
+        assert(account_access.account.seen_tx == state.tx_id);
+        if (account_access.seen) return;
+        // No transaction has id 0 (`tx_id` starts at 1).
+        account_access.account.seen_tx = 0;
+    }
+
+    /// `access` leaving the account unseen (`seen_tx`, prestateTracer only) unless the
+    /// transaction already read it.
+    pub fn access_unseen(state: *State, address: Address) Error!Access {
+        return state.warm(try state.load_unseen(address));
+    }
+
+    /// Warm an EIP-2930 access list address without reading it (revm warms listed
+    /// addresses; only a later use loads them).
+    pub fn warm_listed_account(state: *State, address: Address) Error!void {
+        if (state.listed_accounts.count() >= state.limits.accounts_max) return error.StateFull;
+        state.listed_accounts.putAssumeCapacity(address, {});
+        assert(state.listed_accounts.contains(address));
+    }
+
+    fn is_listed_account(state: *const State, address: Address) bool {
+        if (state.listed_accounts.count() == 0) return false;
+        return state.listed_accounts.contains(address);
+    }
+
+    fn warm(state: *State, account: *Account) Error!Access {
+        const address = account.address;
+        const is_cold = account.warm_tx != state.tx_id and
+            !state.static_warm.contains(address) and !state.is_listed_account(address);
         if (is_cold) {
             try state.record(.account_warmed, @intFromPtr(account), 0, 0);
             account.warm_tx = state.tx_id;
@@ -596,6 +713,7 @@ pub const State = struct {
 
     pub fn is_warm(state: *State, address: Address) bool {
         if (state.static_warm.contains(address)) return true;
+        if (state.is_listed_account(address)) return true;
         const account = state.accounts.getPtr(address) orelse return false;
         return account.warm_tx == state.tx_id;
     }
@@ -714,6 +832,10 @@ pub const State = struct {
         target_empty: bool,
         target_cold: bool,
         previously_destroyed: bool,
+        /// Whether the account is destroyed (before Cancun, or created in the transaction).
+        destroys: bool,
+        /// The target's access (`unsee` it when the instruction then fails).
+        target_access: Access,
     };
 
     /// SELFDESTRUCT `address` sending its balance to `target`. From Cancun (EIP-6780)
@@ -733,8 +855,10 @@ pub const State = struct {
             .target_empty = target_account.is_empty_for(fork),
             .target_cold = target_access.is_cold,
             .previously_destroyed = account.self_destructed,
+            .destroys = fork.before(.cancun) or account.created_tx == state.tx_id,
+            .target_access = target_access,
         };
-        const destroys = fork.before(.cancun) or account.created_tx == state.tx_id;
+        const destroys = result.destroys;
         if (account != target_account) {
             try state.touch(target_account);
             try state.set_balance(target_account, target_account.info.balance + balance);
@@ -750,10 +874,13 @@ pub const State = struct {
 
     // ---------------------------------------------------------------- storage
 
-    /// The cached slot for the current incarnation and transaction. Does not warm.
-    fn slot_for(state: *State, account: *Account, slot: u256) Error!*Slot {
+    /// The cached slot for the current incarnation and transaction. Does not warm. Sets
+    /// `stamped` to whether the transaction had already read the slot (`original_tx`).
+    fn slot_for(state: *State, account: *Account, slot: u256, stamped: *bool) Error!*Slot {
         const key = StorageKey{ .address = account.address, .slot = slot };
+        stamped.* = false;
         if (state.slots.getPtr(key)) |cached| {
+            stamped.* = cached.original_tx == state.tx_id;
             if (cached.epoch != account.storage_epoch) {
                 try state.reincarnate(account, cached, slot);
             } else if (cached.original_tx != state.tx_id) {
@@ -798,25 +925,52 @@ pub const State = struct {
     }
 
     /// Present value of a slot without warming it, for system reads (OP L1Block fees).
+    /// The account stays unseen and the slot unstamped (`original_tx`), so neither counts
+    /// as read by the transaction; the value is the transaction's start value either way.
     pub fn storage_value(state: *State, address: Address, slot: u256) Error!u256 {
-        const account = try state.load(address);
-        const cached = try state.slot_for(account, slot);
+        const account = try state.load_unseen(address);
+        const key = StorageKey{ .address = address, .slot = slot };
+        if (state.slots.getPtr(key)) |cached| {
+            if (cached.epoch == account.storage_epoch) return cached.present;
+        }
+        var stamped: bool = undefined;
+        const cached = try state.slot_for(account, slot, &stamped);
         assert(cached.epoch == account.storage_epoch);
+        assert(cached.original == cached.present);
+        // No transaction has id 0: the next read in the transaction stamps it.
+        cached.original_tx = 0;
         return cached.present;
     }
 
-    pub const SlotAccess = struct { slot: *Slot, is_cold: bool };
+    pub const SlotAccess = struct {
+        slot: *Slot,
+        is_cold: bool,
+        /// The transaction had read the slot before this access.
+        stamped: bool = true,
+    };
 
     /// Load and warm a storage slot of `account`.
     pub fn storage_access(state: *State, account: *Account, slot: u256) Error!SlotAccess {
-        const cached = try state.slot_for(account, slot);
+        var stamped: bool = undefined;
+        const cached = try state.slot_for(account, slot, &stamped);
         const is_cold = cached.warm_tx != state.tx_id and
             !state.is_listed(account.address, slot);
         if (is_cold) {
             try state.record(.slot_warmed, @intFromPtr(cached), 0, 0);
             cached.warm_tx = state.tx_id;
         }
-        return .{ .slot = cached, .is_cold = is_cold };
+        return .{ .slot = cached, .is_cold = is_cold, .stamped = stamped };
+    }
+
+    /// Takes back the transaction's first read of a slot whose instruction then failed
+    /// (an SSTORE out of gas): Nethermind's prestateTracer drops the slot. Execution is
+    /// unaffected: nothing was written, so the next read restamps the same original.
+    pub fn unstamp_slot(state: *State, slot_access: SlotAccess) void {
+        assert(slot_access.slot.original_tx == state.tx_id);
+        if (slot_access.stamped) return;
+        assert(slot_access.slot.original == slot_access.slot.present);
+        // No transaction has id 0, as in `storage_value`.
+        slot_access.slot.original_tx = 0;
     }
 
     pub fn storage_write(state: *State, account: *Account, slot: *Slot, value: u256) Error!void {
@@ -889,7 +1043,10 @@ pub const State = struct {
     pub fn finalize_transaction(state: *State, comptime fork: Fork) void {
         for (state.journal[0..state.journal_len]) |entry| {
             switch (entry.kind) {
-                .self_destructed => state.destroy(account_at(entry)),
+                .self_destructed => {
+                    account_at(entry).destroyed_tx = state.tx_id;
+                    state.destroy(account_at(entry));
+                },
                 .account_touched => {
                     const account = account_at(entry);
                     account.touched = false;

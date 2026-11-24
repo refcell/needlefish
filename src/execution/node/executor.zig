@@ -41,8 +41,6 @@ pub const consolidation_request_address: Address =
 pub const system_call_gas: u64 = 30_000_000;
 const gas_per_blob: u64 = 1 << 17;
 
-const access_list_module = @import("access_list.zig");
-
 fn hex20(comptime text: []const u8) Address {
     return comptime primitives.hex.decode_array(20, text) catch unreachable;
 }
@@ -97,10 +95,16 @@ pub const BlockEnv = struct {
     beneficiary: Address,
     gas_limit: u64,
     base_fee: u64,
+    /// An RPC block override of the base fee above `base_fee`'s range (geth and Nethermind
+    /// keep it whole): BASEFEE and the fee rules see it; `base_fee` holds it saturated.
+    base_fee_override: ?u256 = null,
     prev_randao: Hash,
     parent_hash: Hash,
     parent_beacon_block_root: ?Hash = null,
     excess_blob_gas: ?u64 = null,
+    /// An RPC block override of the blob base fee (BLOBBASEFEE), else derived from
+    /// `excess_blob_gas`.
+    blob_base_fee: ?u256 = null,
 };
 
 /// A stateless backend could not read or update state (details stay in the backend).
@@ -611,8 +615,11 @@ pub const Executor = struct {
         clock: Clock,
         transaction_ns: []u64,
         transaction_gas: []u64,
+        /// Sees the transactions' frames (not the block's system calls).
+        tracer: ?*const evm.evm.Tracer,
     ) Error!Metered {
         assert(executor.known_sender == null);
+        assert(executor.machine.tracer == null);
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
         const recovery_start = clock.read();
         try executor.recover_all(transactions);
@@ -631,6 +638,8 @@ pub const Executor = struct {
             }
             try executor.state.set_nonce(account, nonce);
         }
+        executor.machine.tracer = tracer;
+        defer executor.machine.tracer = null;
         try executor.apply_timed(&building, transactions, clock, transaction_ns, transaction_gas);
         return .{
             .signer_recovery_ns = recovery_end -| recovery_start,
@@ -682,24 +691,66 @@ pub const Executor = struct {
         value: u256 = 0,
         data: []const u8 = &.{},
         access_list: []const evm.transaction.AccessListItem = &.{},
-        /// Receives the warm accounts and slots of an executed call (eth_createAccessList).
-        collect: ?*access_list_module.Collector = null,
-        /// Sees the state right after the call executes, before it is discarded
-        /// (debug_traceCall prestateTracer).
+        /// The request's EIP-7702 authorizations: present (even empty) makes the call a
+        /// type-4 transaction, as alloy's `TransactionRequest::preferred_type`.
+        authorization_list: ?[]const evm.transaction.Authorization = null,
+        /// The request's `chainId`, checked against the chain's (null: the chain's).
+        chain_id: ?u64 = null,
+        /// The request's `blobVersionedHashes`: non-empty makes the call a type-3
+        /// transaction (alloy's `minimal_tx_type`), checked as revm checks one.
+        blob_hashes: []const [32]u8 = &.{},
+        /// `maxFeePerBlobGas`; null takes the block's blob base fee (`CallFees`).
+        max_fee_per_blob_gas: ?u256 = null,
+        /// Sees the state right before and after the call executes, before it is
+        /// discarded (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
-        /// Runs on the fresh state before the call (eth_call state overrides); it may fail
-        /// through its own context, which the caller checks.
-        prepare: ?Inspect = null,
+        /// Runs on the fresh state before the call (eth_call state overrides, the gas cap
+        /// of a priced call); it may adjust the call and fail through its own context,
+        /// which the caller checks.
+        prepare: ?Prepare = null,
+        /// Gas price (legacy price, or the EIP-1559 effective price when `priority_fee` is
+        /// set) seen by GASPRICE; no fee is charged either way.
+        gas_price: u256 = 0,
+        priority_fee: ?u256 = null,
+        /// Runs with the block's base fee instead of zero (a priced eth_call, and
+        /// eth_estimateGas, as reth: it zeroes the base fee only for an unpriced call).
+        keep_base_fee: bool = false,
+        /// `session_call` only: the request's nonce (null: the sender's), and whether
+        /// fees, balance and nonce are checked and fees charged (eth_simulateV1
+        /// `validation`).
+        nonce: ?u64 = null,
+        validate: bool = false,
+        /// `session_call` with `validate`: the call's EIP-2718 encoding, over which the OP
+        /// Stack L1 data and operator fees are charged (Nethermind charges a validated
+        /// simulated call its rollup fees).
+        envelope: []const u8 = &.{},
     };
 
     pub const Inspect = struct {
         context: *anyopaque,
+        /// Sees the state just before the call executes (overrides applied).
+        begin: *const fn (context: *anyopaque, state: *const evm.State) void,
         run: *const fn (context: *anyopaque, state: *evm.State) void,
+    };
+
+    pub const Prepare = struct {
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque, state: *evm.State, call: *Call) void,
     };
 
     pub const Simulated = union(enum) {
         invalid: evm.transaction.Invalid,
-        executed: struct { success: bool, gas_used: u64, output: []const u8 },
+        executed: struct {
+            success: bool,
+            gas_used: u64,
+            output: []const u8,
+            /// Why the call stopped (the halt reason of a failed, non-reverted call).
+            exit: evm.evm.Exit = .stop,
+            /// Gas refunded after the cap (reth's estimate adds it to its first guess).
+            gas_refunded: u64 = 0,
+            /// The gas limit the call ran with (after `prepare`).
+            gas_limit: u64 = 0,
+        },
     };
 
     /// `simulate` against another state (an older block's, see `HistoryDatabase`); the
@@ -728,7 +779,11 @@ pub const Executor = struct {
         invalid: evm.transaction.Invalid,
         executed: struct {
             status: evm.evm.Status,
+            /// Why the call stopped (the halt reason of a failed, non-reverted call).
+            exit: evm.evm.Exit,
             gas_used: u64,
+            /// Gas spent before the refund, at least the calldata floor (`maxUsedGas`).
+            gas_max_used: u64,
             /// Valid until the next session call.
             output: []const u8,
             logs: []const evm.state.Log,
@@ -762,84 +817,119 @@ pub const Executor = struct {
         return result;
     }
 
-    /// Runs `call` in `block` (fee-free: gas price zero) without discarding its changes.
+    fn call_type(call: *const Call) evm.transaction.TxType {
+        if (call.authorization_list != null) return .eip7702;
+        if (call.blob_hashes.len > 0) return .eip4844;
+        return if (call.priority_fee == null) .legacy else .eip1559;
+    }
+
+    /// Runs `call` in `block` without discarding its changes: fee-free unless `validate`.
     pub fn session_call(executor: *Executor, block: *const BlockEnv, call: Call) Error!SessionCall {
         executor.set_block_env(block);
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         const caller = try executor.state.load(call.from);
         const tx: TxEnv = .{
-            .tx_type = .legacy,
+            .tx_type = call_type(&call),
             .caller = call.from,
             .gas_limit = call.gas orelse executor.default_call_gas(block),
-            .gas_price = 0,
+            .gas_price = call.gas_price,
+            .gas_priority_fee = call.priority_fee,
             .to = call.to,
             .value = call.value,
             .data = call.data,
-            .nonce = caller.info.nonce,
-            .chain_id = executor.spec.chain_id,
+            .nonce = if (call.validate) call.nonce orelse caller.info.nonce else caller.info.nonce,
+            .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
+            .authorization_list = call.authorization_list orelse &.{},
+            .blob_hashes = call.blob_hashes,
+            .max_fee_per_blob_gas = call.max_fee_per_blob_gas orelse
+                executor.machine.block.blob_base_fee,
             .skip_sender_code_check = true,
+            .disable_fee_charge = !call.validate,
+            .disable_tx_gas_cap = true,
+            .envelope = if (call.validate) call.envelope else &.{},
         };
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         return switch (result) {
             .invalid => |reason| .{ .invalid = reason },
             .executed => |executed| .{ .executed = .{
                 .status = executed.status,
+                .exit = executed.exit,
                 .gas_used = executed.gas_used,
-                .output = executed.output,
+                .gas_max_used = executed.gas_max_used,
+                .output = try executor.call_output(&executed),
                 .logs = executed.logs,
             } },
         };
     }
 
-    /// Runs `call` on top of the committed state in `block`'s context, with no fee
-    /// (base fee zero, gas price zero), then discards every change. The output borrows
-    /// the scratch arena until the next call.
-    pub fn simulate(executor: *Executor, block: *const BlockEnv, call: Call) Error!Simulated {
-        try executor.fit_state(block.gas_limit);
+    /// A call's result as revm reports it: a successful creation returns the code it
+    /// deployed (the frame itself returns no data to a parent).
+    fn call_output(
+        executor: *Executor,
+        executed: *const evm.transaction.Executed,
+    ) Error![]const u8 {
+        const created = executed.created orelse return executed.output;
+        assert(executed.output.len == 0);
+        return executor.state.code(try executor.state.load(created));
+    }
+
+    /// Runs `call` on top of the committed state in `block`'s context, charging no fee (the
+    /// base fee is zero unless `keep_base_fee`), then discards every change. The output
+    /// borrows the scratch arena until the next call.
+    pub fn simulate(executor: *Executor, block: *const BlockEnv, call_in: Call) Error!Simulated {
+        try executor.fit_state(@max(block.gas_limit, call_in.gas orelse 0));
         executor.arena.reset();
         defer executor.abort_block();
         var free_block = block.*;
-        free_block.base_fee = 0;
+        if (!call_in.keep_base_fee) {
+            free_block.base_fee = 0;
+            free_block.base_fee_override = null;
+        }
         executor.set_block_env(&free_block);
-        if (call.prepare) |prepare| prepare.run(prepare.context, executor.state);
+        var call = call_in;
+        if (call.prepare) |prepare| prepare.run(prepare.context, executor.state, &call);
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         const caller = try executor.state.load(call.from);
         const tx: TxEnv = .{
-            .tx_type = .legacy,
+            .tx_type = call_type(&call),
             .caller = call.from,
-            .gas_limit = @min(call.gas orelse executor.default_call_gas(block), block.gas_limit),
-            .gas_price = 0,
+            .gas_limit = call.gas orelse executor.default_call_gas(block),
+            .gas_price = call.gas_price,
+            .gas_priority_fee = call.priority_fee,
             .to = call.to,
             .value = call.value,
             .data = call.data,
             .nonce = caller.info.nonce,
-            .chain_id = executor.spec.chain_id,
+            .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
+            .authorization_list = call.authorization_list orelse &.{},
+            .blob_hashes = call.blob_hashes,
+            .max_fee_per_blob_gas = call.max_fee_per_blob_gas orelse
+                executor.machine.block.blob_base_fee,
             .skip_sender_code_check = true,
+            .disable_fee_charge = true,
+            .wrap_max_nonce = true,
+            .disable_tx_gas_cap = true,
+            .disable_block_gas_limit = true,
         };
+        if (call.inspect) |inspect| inspect.begin(inspect.context, executor.state);
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         const executed = switch (result) {
             .invalid => |reason| return .{ .invalid = reason },
             .executed => |executed| executed,
         };
-        if (call.collect) |collector| {
-            const context: access_list_module.Context = .{
-                .spec = executor.spec,
-                .timestamp = block.timestamp,
-                .from = call.from,
-                .to = call.to,
-                .coinbase = block.beneficiary,
-            };
-            collector.collect(executor.state, &context);
-        }
         if (call.inspect) |inspect| inspect.run(inspect.context, executor.state);
-        const output = try executor.alloc(u8, executed.output.len);
-        @memcpy(output, executed.output);
+        const result_output = try executor.call_output(&executed);
+        const output = try executor.alloc(u8, result_output.len);
+        @memcpy(output, result_output);
         return .{ .executed = .{
             .success = executed.status == .success,
             .gas_used = executed.gas_used,
             .output = output,
+            .exit = executed.exit,
+            .gas_refunded = executed.gas_refunded,
+            .gas_limit = tx.gas_limit,
         } };
     }
 
@@ -904,6 +994,7 @@ pub const Executor = struct {
         executor.state.accounts.clearRetainingCapacity();
         executor.state.slots.clearRetainingCapacity();
         executor.state.code_store_len = 0;
+        executor.state.ordinary_count = 0;
         executor.state.begin_transaction();
     }
 
@@ -933,12 +1024,15 @@ pub const Executor = struct {
         if (executor.spec.blob_params_at(block.timestamp)) |params| {
             blob_base_fee = params.base_fee(block.excess_blob_gas orelse 0);
         }
+        if (block.blob_base_fee) |overridden| blob_base_fee = overridden;
+        assert(block.base_fee_override == null or
+            block.base_fee_override.? > std.math.maxInt(u64));
         executor.machine.block = .{
             .number = block.number,
             .coinbase = block.beneficiary,
             .timestamp = block.timestamp,
             .gas_limit = block.gas_limit,
-            .base_fee = block.base_fee,
+            .base_fee = block.base_fee_override orelse block.base_fee,
             .prevrandao = block.prev_randao,
             .blob_base_fee = blob_base_fee,
             .op = op_rules.context(executor.spec, block.timestamp),

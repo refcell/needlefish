@@ -102,13 +102,46 @@ test "rpc: protocol errors" {
             "{bad",
             \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}
         },
+        // jsonrpsee keeps an invalid request's id when it reads as a u64, string or null.
         .{
-            \\{"id":1,"method":"eth_chainId"}
+            \\{"method":"eth_chainId","jsonrpc":"","id":1}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"invalid request"}}
+        },
+        .{
+            \\{"id":"a","method":7,"jsonrpc":"2.0"}
+            ,
+            \\{"jsonrpc":"2.0","id":"a","error":{"code":-32600,"message":"invalid request"}}
+        },
+        .{
+            \\{"id":-1,"method":"eth_chainId"}
+            ,
+            invalid_request,
+        },
+        .{
+            \\{"id":{},"jsonrpc":"2.0","method":"eth_chainId"}
             ,
             invalid_request,
         },
         .{
             \\{"jsonrpc":"2.0","id":1,"method":"nope"}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}
+        },
+        // jsonrpsee parses the request and the method refuses scalar params.
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":true}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}
+        },
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":null}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"result":"0x2105"}
+        },
+        // A control character makes a valid but unknown method name.
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chain\rId","params":[]}
             ,
             \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}
         },

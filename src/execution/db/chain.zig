@@ -412,7 +412,8 @@ pub const ChainStore = struct {
     fn set_canonical_root(self: *ChainStore, root: BlockMeta) void {
         assert(self.head_meta == null);
         self.set_canonical(root);
-        if (root.number == 0) return;
+        // Genesis (any number) has the zero parent hash and no parent block.
+        if (root.number == 0 or is_genesis(root)) return;
         self.set_canonical(.{
             .hash = root.parent_hash,
             .parent_hash = @splat(0),
@@ -420,6 +421,10 @@ pub const ChainStore = struct {
             .timestamp = 0,
         });
         assert(self.canonical[(root.number - 1) % self.canonical.len].number == root.number - 1);
+    }
+
+    fn is_genesis(block_meta: BlockMeta) bool {
+        return std.mem.allEqual(u8, &block_meta.parent_hash, 0);
     }
 
     fn set_canonical(self: *ChainStore, block_meta: BlockMeta) void {

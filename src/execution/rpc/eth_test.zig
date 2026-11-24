@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
+const rlp = @import("../../common/rlp/root.zig");
 const txpool = @import("../txpool/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
@@ -38,9 +39,14 @@ const Harness = struct {
     }
 
     fn create_for(spec: *const chainspec.ChainSpec) !*Harness {
+        return create_numbered(spec, 0);
+    }
+
+    /// A harness whose genesis block has `genesis_number`.
+    fn create_numbered(spec: *const chainspec.ChainSpec, genesis_number: u64) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
-        harness.node = try fixture.Node.create_for(spec);
+        harness.node = try fixture.Node.create_numbered(spec, null, genesis_number);
         harness.api = .{
             .spec = spec,
             .chain = &harness.node.chain,
@@ -91,6 +97,18 @@ const Harness = struct {
         return hash;
     }
 };
+
+/// Expects the request to fail with `code` and a message starting with `message`.
+fn expect_failure(
+    h: *Harness,
+    comptime method: []const u8,
+    comptime params: []const u8,
+    comptime code: []const u8,
+    comptime message: []const u8,
+) !void {
+    const response = try h.request(method, params);
+    try expect_contains(response, "{\"code\":" ++ code ++ ",\"message\":\"" ++ message);
+}
 
 fn expect_contains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
@@ -306,6 +324,24 @@ test "eth: block transaction counts, by-index lookups, uncles, sha3, txpool_stat
     try expect_contains(tx, "\"blockNumber\":\"0x1\"");
     const past_end = try h.request("eth_getTransactionByBlockNumberAndIndex", "[\"0x1\",\"0x1\"]");
     try testing.expectEqualStrings("\"result\":null", past_end);
+    // An unknown block is refused (Nethermind's OP module), whatever the index; the raw
+    // form and the uncle answer null.
+    const unknown = "[\"0x93fbe6f24bf0038f8fafa5fef96df0ec11c066fdf976ecdc649a1aa820365100\",";
+    inline for (.{ "\"0x0\"]", "\"0xffffffffffffffffffffffffffffffd7\"]" }) |index| {
+        const params = unknown ++ index;
+        const method = "eth_getTransactionByBlockHashAndIndex";
+        try expect_failure(h, method, params, "-32000", "header not found");
+        inline for (.{
+            "eth_getRawTransactionByBlockHashAndIndex",
+            "eth_getUncleByBlockHashAndIndex",
+        }) |null_method| {
+            const answer = try h.request(null_method, params);
+            try testing.expectEqualStrings("\"result\":null", answer);
+        }
+    }
+    const beyond = "[\"0x9\",\"0x0\"]";
+    const method = "eth_getTransactionByBlockNumberAndIndex";
+    try expect_failure(h, method, beyond, "-32000", "header not found");
     var request_buffer: [256]u8 = undefined;
     const by_hash = try std.fmt.bufPrint(
         &request_buffer,
@@ -580,9 +616,14 @@ test "eth: eth_simulateV1 carries state across calls and blocks with overrides" 
         "0000000000000000000000000000000b\"");
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"returnData\":\"" ++ word ++ "1\""));
     try expect_contains(text, "\"logIndex\":\"0x1\"");
-    try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"}");
-    try expect_contains(text, "\"number\":\"0x2\",\"timestamp\":\"0x1000\"");
-    try expect_contains(text, "\"number\":\"0x3\",\"timestamp\":\"0x100c\"");
+    // A revert without data still reports it, as Nethermind: "0x".
+    try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"," ++
+        "\"data\":\"0x\"}");
+    try expect_contains(text, "\"number\":\"0x2\"");
+    try expect_contains(text, "\"timestamp\":\"0x1000\"");
+    // base/base's default: the chain's schedule, here two seconds after the override.
+    try expect_contains(text, "\"number\":\"0x3\"");
+    try expect_contains(text, "\"timestamp\":\"0x1002\"");
     // Nothing was committed.
     try testing.expectEqual(head_root, try h.node.db.root());
     try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_getCode", "[" ++
@@ -594,17 +635,270 @@ test "eth: eth_simulateV1 limits and rejections" {
     defer h.destroy();
     const gas = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"gasLimit\":\"0x7530\"}," ++
         "\"calls\":[{\"to\":" ++ address_target ++ ",\"gas\":\"0xc350\"}]}]}]";
-    try expect_contains(try h.request("eth_simulateV1", gas), "\"code\":-38015");
+    try expect_contains(try h.request("eth_simulateV1", gas), "{\"code\":-38015,\"message\":" ++
+        "\"Block gas limit exceeded by the block's transactions\"}");
+    // A call the EVM rejects fails the whole request.
+    const no_gas = "[{\"blockStateCalls\":[{\"calls\":[{\"gas\":\"0x0\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", no_gas), "{\"code\":-38013,\"message\":" ++
+        "\"intrinsic gas too low\"}");
     const backwards = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", backwards), "\"code\":-38020");
+    try expect_failure(h, "eth_simulateV1", backwards, "-38020", "block numbers must be in order");
+    // At most 256 blocks past the base block, gap fillers included.
+    const too_many = "{\"code\":-38026,\"message\":\"too many blocks\"}";
+    const far = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x1000\"}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", far), too_many);
+    const max = "\"0xffffffffffffffff\"";
+    const last = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":" ++ max ++ "}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", last), too_many);
+    const many = comptime blk: {
+        var text: []const u8 = "[{\"blockStateCalls\":[";
+        for (0..256) |_| text = text ++ "{},";
+        break :blk text ++ "{}]}]";
+    };
+    try expect_contains(try h.request("eth_simulateV1", many), too_many);
+    // Number gaps fill with empty blocks.
+    const gap = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x3\"}}]}]";
+    const filled = try h.request("eth_simulateV1", gap);
+    try testing.expectEqual(@as(usize, 3), count_of(filled, "\"miner\""));
+    // Before Denim a default timestamp after 2^64 - 1 overflows.
+    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}},{}]}]";
+    try expect_contains(try h.request("eth_simulateV1", late), "{\"code\":-38021,\"message\":" ++
+        "\"block timestamps must be in order: 18446744073709551615 <= 18446744073709551615\"}");
+    // Two blocks overriding the same time: Nethermind refuses the second.
+    const same = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
+        "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", same), "{\"code\":-38021,\"message\":" ++
+        "\"Block timestamp out of order 18446744073709551615 is <= than given base " ++
+        "timestamp of 18446744073709551615!\"}");
     const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
-    try expect_contains(try h.request("eth_simulateV1", validation), "not supported");
-    const fee = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x1\"}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", fee), "unsupported block override");
+    try expect_contains(try h.request("eth_simulateV1", validation), "{\"code\":-32602," ++
+        "\"message\":\"calls are empty.\"}");
+    // Base fee and blob base fee overrides apply (BASEFEE, BLOBBASEFEE).
+    const fees = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x7\"," ++
+        "\"blobBaseFee\":\"0x9\"},\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x484a015f5260205ff3\"}},\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    const fee_text = try h.request("eth_simulateV1", fees);
+    try expect_contains(fee_text, "\"baseFeePerGas\":\"0x7\"");
+    try expect_contains(fee_text, "\"returnData\":\"0x" ++ zeros_62 ++ "10\"");
+    // A base fee above 2^64 - 1 stays whole in the header and for BASEFEE, as Nethermind's
+    // UInt256 (`Sealed` hashes it whole).
+    const wide = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":" ++
+        "\"0x9ed5eb1431d6880000\"},\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x485f5260205ff3\"}},\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    const wide_text = try h.request("eth_simulateV1", wide);
+    try expect_contains(wide_text, "\"baseFeePerGas\":\"0x9ed5eb1431d6880000\"");
+    try expect_contains(wide_text, "\"returnData\":\"0x" ++ zeros_62[0..46] ++
+        "9ed5eb1431d6880000\"");
+    // The largest base fee plus a tip saturates; the effective price is the fee cap (it
+    // overflowed and panicked before).
+    const word_max = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const huge = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x" ++
+        word_max ++ "\"},\"calls\":[{\"to\":" ++ override_target ++
+        ",\"maxFeePerGas\":\"0x" ++ word_max ++ "\",\"maxPriorityFeePerGas\":\"0x" ++
+        word_max ++ "\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", huge), "\"status\":\"0x1\"");
     try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
-    const empty = try h.request("eth_simulateV1", "[{\"blockStateCalls\":[]}]");
-    try testing.expectEqualStrings("\"result\":[]", empty);
+    // A gas limit above the block's and the RPC gas cap is refused, not run (a looping call
+    // without gas would otherwise spin for 2^64 gas).
+    const unbounded = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"gasLimit\":" ++ max ++
+        "},\"stateOverrides\":{" ++ override_target ++ ":{\"code\":\"0x5b5f56\"}}," ++
+        "\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    try expect_failure(h, "eth_simulateV1", unbounded, "-38026", "Client adjustable limit reached");
+    // Nethermind checks every block's overrides before it runs any call: a later block's gas
+    // limit is refused before an earlier block's incomplete deposit.
+    const later = "[{\"blockStateCalls\":[{\"calls\":[{\"type\":\"0x7e\"}]}," ++
+        "{\"blockOverrides\":{\"gasLimit\":" ++ max ++ "}}]}]";
+    try expect_failure(h, "eth_simulateV1", later, "-38026", "Client adjustable limit reached");
+    const tip = "[{\"blockStateCalls\":[{\"calls\":[{\"type\":\"0x7e\"}]},{\"calls\":" ++
+        "[{\"maxPriorityFeePerGas\":\"0x2\",\"maxFeePerGas\":\"0x1\"}]}]}]";
+    try expect_failure(h, "eth_simulateV1", tip, "-32003", "max priority fee per gas higher");
+    // A call for another chain in block 2 is refused before block 3's gas limit and state
+    // conflict, and before block 1's out-of-order number (Nethermind).
+    const chain = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}," ++
+        "{\"calls\":[{\"chainId\":\"0x32ff\"}]},{\"blockOverrides\":{\"gasLimit\":" ++
+        max ++ "},\"stateOverrides\":{" ++ override_target ++
+        ":{\"state\":{},\"stateDiff\":{}}}}]}]";
+    try expect_failure(h, "eth_simulateV1", chain, "-32000", "invalid chain ID");
 }
+
+test "eth: eth_simulateV1 refuses an unknown override key" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Nethermind reads override keys strictly and case-insensitively: an alias such as
+    // `baseFee` names no field, in any block, before the block parameter is read.
+    const prefix = "[{\"blockStateCalls\":[{},{\"blockOverrides\":";
+    const tail = "}]},\"bad\"]";
+    const unknown = prefix ++ "{\"baseFee\":\"0x8\"}" ++ tail;
+    try expect_failure(h, "eth_simulateV1", unknown, "-32602", "invalid argument 0");
+    const twice = prefix ++ "{\"gasLimit\":\"0x8\",\"GasLimit\":\"0x8\"}" ++ tail;
+    try expect_failure(h, "eth_simulateV1", twice, "-32602", "invalid argument 0");
+    const account = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"storage\":{}}}}]}]";
+    try expect_failure(h, "eth_simulateV1", account, "-32602", "invalid argument 0");
+    // Any case names the field, and the same spelling twice is one key.
+    const cased = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"BASEFEEPERGAS\":\"0x7\"," ++
+        "\"Time\":\"0x7fffffff\",\"Time\":\"0x7fffffff\"},\"stateOverrides\":{" ++
+        override_target ++ ":{\"Code\":\"0x485f5260205ff3\"}},\"calls\":[{\"to\":" ++
+        override_target ++ "}]}]}]";
+    const text = try h.request("eth_simulateV1", cased);
+    try expect_contains(text, "\"baseFeePerGas\":\"0x7\"");
+    try expect_contains(text, "\"timestamp\":\"0x7fffffff\"");
+    try expect_contains(text, "\"returnData\":\"0x" ++ zeros_62 ++ "07\"");
+}
+
+test "eth: eth_simulateV1 Denim default timestamps repeat at 2^64 - 1" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    const max = "\"0xffffffffffffffff\"";
+    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}},{}]}]";
+    const saturated = try h.request("eth_simulateV1", late);
+    try testing.expectEqual(@as(usize, 2), count_of(saturated, "\"timestamp\":" ++ max));
+    const stalled = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
+        "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
+    // An overridden time must still pass the previous block's (Nethermind), Denim or not.
+    try expect_failure(h, "eth_simulateV1", stalled, "-38021", "Block timestamp out of order");
+}
+
+test "eth: eth_simulateV1 call errors and validation" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const blocks = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"" ++ revert_nope_code ++ "\"}},\"calls\":[";
+    const reverted = try h.request("eth_simulateV1", blocks ++ "{\"to\":" ++ override_target ++
+        "}]}]}]");
+    try expect_contains(reverted, "\"returnData\":\"0x\"");
+    const reverted_error = "\"error\":{\"code\":3,\"message\":\"execution reverted: nope\"," ++
+        "\"data\":\"" ++ revert_nope_data ++ "\"}";
+    try expect_contains(reverted, reverted_error);
+    const loop = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x5b5f56\"}},\"calls\":[{\"to\":" ++ override_target ++
+        ",\"gas\":\"0x5300\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", loop), "\"error\":{\"code\":-32015," ++
+        "\"message\":\"out of gas: gas required exceeds: 21248\"}");
+    const poor = "[{\"blockStateCalls\":[{\"calls\":[{\"from\":" ++ poor_sender ++
+        ",\"to\":" ++ address_target ++ ",\"value\":\"0x1\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", poor), "\"gasUsed\":\"0x5208\"," ++
+        "\"maxUsedGas\":\"0x5208\",\"status\":\"0x0\",\"error\":{\"code\":-32015," ++
+        "\"message\":\"EVM error: OutOfFunds\"}");
+    // With validation the fee, nonce and balance checks apply.
+    const validated = "[{\"validation\":true,\"blockStateCalls\":[{\"calls\":[{\"from\":" ++
+        poor_sender ++ ",\"to\":" ++ address_target;
+    const low_fee = "max fee per gas less than block base fee\"}";
+    try expect_failure(h, "eth_simulateV1", validated ++ "}]}]}]", "-38012", low_fee);
+    const priced = validated ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const nonce = priced ++ ",\"nonce\":\"0x5\"}]}]}]";
+    const funds = "Insufficient funds to pay for gas fees and value for a transaction\"}";
+    try expect_failure(h, "eth_simulateV1", priced ++ "}]}]}]", "-38014", funds);
+    // As Nethermind, the balance is checked before the nonce.
+    try expect_failure(h, "eth_simulateV1", nonce, "-38014", funds);
+    const funded = "[{\"validation\":true,\"blockStateCalls\":[{\"stateOverrides\":{" ++
+        poor_sender ++ ":{\"balance\":\"0xffffffffffffffffffff\"}},\"calls\":[{\"from\":" ++
+        poor_sender ++ ",\"to\":" ++ address_target ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const funded_nonce = funded ++ ",\"nonce\":\"0x5\"}]}]}]";
+    try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
+}
+
+test "eth: eth_simulateV1 with validation charges the OP rollup fees" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    // The sender holds exactly gas * price; the operator fee constant (L1Block slot 8) is
+    // charged over the call's encoding on top (Nethermind), so the funds fall short.
+    const blocks = "[{\"validation\":true,\"blockStateCalls\":[{\"stateOverrides\":{" ++
+        poor_sender ++ ":{\"balance\":\"0x52080000000000\"}";
+    const operator_fee = ",\"0x4200000000000000000000000000000000000015\":{\"stateDiff\":{" ++
+        "\"0x" ++ zeros_62 ++ "08\":\"0x" ++ zeros_62 ++ "ff\"}}";
+    const calls = "},\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target ++
+        ",\"gas\":\"0x5208\",\"maxFeePerGas\":\"0x10000000000\"}]}]}]";
+    const funds = "Insufficient funds to pay for gas fees and value for a transaction\"}";
+    try expect_failure(h, "eth_simulateV1", blocks ++ operator_fee ++ calls, "-38014", funds);
+    try expect_contains(try h.request("eth_simulateV1", blocks ++ calls), "\"status\":\"0x1\"");
+}
+
+test "eth: a sender at the maximum nonce" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const max_sender = "{" ++ poor_sender ++
+        ":{\"nonce\":\"0xffffffffffffffff\",\"balance\":\"0xffffffffffffffffffff\"}}";
+    // As Nethermind (and geth), an RPC call checks no nonce: the sender still runs.
+    // A creation too: the nonce wraps to zero.
+    const create = "[{\"from\":" ++ poor_sender ++ "},\"latest\"," ++ max_sender ++ "]";
+    try expect_contains(try h.request("eth_call", create), "\"result\":\"0x\"");
+    const sent = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target ++ "},\"latest\",";
+    const call = sent ++ max_sender ++ "]";
+    try expect_contains(try h.request("eth_call", call), "\"result\":\"0x\"");
+    try expect_contains(try h.request("eth_estimateGas", call), "\"result\":\"0x5208\"");
+    try expect_contains(try h.request("eth_createAccessList", call), "\"gasUsed\":\"0x5208\"");
+    const traced = sent ++ "{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ max_sender ++ "}]";
+    try expect_contains(try h.request("debug_traceCall", traced), "\"gasUsed\":\"0x5208\"");
+    // eth_simulateV1 with validation reports a lower nonce before the maximum one.
+    const blocks = "[{\"blockStateCalls\":[{\"stateOverrides\":" ++ max_sender ++
+        ",\"calls\":[{\"from\":" ++ poor_sender ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const low = blocks ++ ",\"nonce\":\"0x28a\"}]}],\"validation\":true}]";
+    try expect_failure(h, "eth_simulateV1", low, "-38010", "nonce too low");
+    // Without validation, eth_simulateV1 refuses to bump the nonce (Nethermind).
+    const plain = blocks ++ "}]}]}]";
+    try expect_failure(h, "eth_simulateV1", plain, "-32603", "nonce has max value");
+}
+
+test "eth: eth_simulateV1 traceTransfers adds ERC-7528 transfer logs outside the bloom" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The callee runs LOG0 (no data); the sender is funded by an override.
+    const request = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}," ++ override_target ++ ":{\"code\":\"0x60006000a000\"}}," ++
+        "\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target ++
+        ",\"value\":\"0x5\"}]}]";
+    const plain = try h.request("eth_simulateV1", request ++ "}]");
+    const bloom_at = std.mem.indexOf(u8, plain, "\"logsBloom\":").?;
+    var bloom: [600]u8 = undefined;
+    const plain_bloom = bloom[0..532];
+    @memcpy(plain_bloom, plain[bloom_at..][0..532]);
+    try testing.expectEqual(@as(usize, 1), count_of(plain, "\"logIndex\""));
+    const traced = try h.request("eth_simulateV1", request ++ ",\"traceTransfers\":true}]");
+    const transfer = "{\"address\":\"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"topics\":[" ++
+        "\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"," ++
+        "\"0x000000000000000000000000000000000000000000000000000000000000dead\"," ++
+        "\"0x0000000000000000000000000000000000000000000000000000000000007777\"]," ++
+        "\"data\":\"0x" ++ zeros_62 ++ "05\"";
+    try expect_contains(traced, "\"logs\":[" ++ transfer);
+    try expect_contains(traced, "\"logIndex\":\"0x0\"");
+    try expect_contains(traced, "\"address\":" ++ override_target ++ ",\"topics\":[]");
+    try expect_contains(traced, "\"logIndex\":\"0x1\"");
+    // The block's bloom (and receipts) leave the synthetic log out.
+    try expect_contains(traced, plain_bloom);
+    // A reverted call logs no transfer.
+    const reverting = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}," ++ override_target ++ ":{\"code\":\"0x5f5ffd\"}}," ++
+        "\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target ++
+        ",\"value\":\"0x5\"}]}],\"traceTransfers\":true}]";
+    try expect_contains(try h.request("eth_simulateV1", reverting), "\"logs\":[]");
+    // A call to a precompile with value logs one transfer.
+    const precompile = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}},\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++
+        "\"0x0000000000000000000000000000000000000004\",\"value\":\"0x7\"}]}]," ++
+        "\"traceTransfers\":true}]";
+    const identity = try h.request("eth_simulateV1", precompile);
+    try testing.expectEqual(@as(usize, 1), count_of(identity, "\"logIndex\""));
+    try expect_contains(identity, "\"data\":\"0x" ++ zeros_62 ++ "07\"");
+    // The flags read as Nethermind's BooleanConverter: a string must start with true/false.
+    const upper = request ++ ",\"traceTransfers\":\"TRUE\"}]";
+    const string_flag = try h.request("eth_simulateV1", upper);
+    try testing.expectEqual(@as(usize, 2), count_of(string_flag, "\"logIndex\""));
+    const refused = [_][]const u8{ "\"latest\"", "null", "1", "{}" };
+    const flags = [_][]const u8{ "traceTransfers", "validation", "returnFullTransactions" };
+    var body: [1024]u8 = undefined;
+    for (flags) |flag| for (refused) |value| {
+        const format = request_prefix_format ++ "eth_simulateV1\",\"params\":{s},\"{s}\":{s}}}]}}";
+        const text = try std.fmt.bufPrint(&body, format, .{ request, flag, value });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    };
+}
+
+/// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.
+const revert_nope_code = "0x6064600a5f39" ++ "60645ffd" ++ revert_nope_data[2..];
+const revert_nope_data = "0x08c379a0" ++ zeros_62 ++ "20" ++ zeros_62 ++ "04" ++
+    "6e6f7065" ++ "00000000000000000000000000000000000000000000000000000000";
+const poor_sender = "\"0x000000000000000000000000000000000000dead\"";
 
 fn simulate_scenario(seed: u64) !void {
     var prng = Prng.init(seed);
@@ -616,6 +910,8 @@ fn simulate_scenario(seed: u64) !void {
         "{\"calls\":[{\"to\":" ++ counter_at ++ "}]}",
         "{\"stateOverrides\":{" ++ counter_at ++ ":{\"code\":\"" ++ counter_hex ++ "\"}}}",
         "{\"blockOverrides\":{\"time\":\"0x5\"}}",
+        "{\"blockOverrides\":{\"time\":\"0xffffffffffffffff\"}}",
+        "{\"blockOverrides\":{\"number\":\"0xffffffffffffffff\"}}",
         "{\"blockOverrides\":{\"gasLimit\":\"0x0\"},\"calls\":[{}]}",
         "{\"stateOverrides\":{" ++ counter_at ++ ":{\"balance\":\"0x10\",\"state\":{}}}}",
         "{\"calls\":[{\"to\":" ++ counter_at ++ ",\"value\":\"0x1\"}]}",
@@ -648,6 +944,135 @@ fn fuzz_simulate(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: fuzz eth_simulateV1" {
     try testing.fuzz({}, fuzz_simulate, .{});
+}
+
+test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var head: [66]u8 = undefined;
+    const latest = try h.request("eth_getBlockByNumber", "[\"latest\",false]");
+    @memcpy(&head, value_after(latest, "hash", 0).?);
+    // A counter call (one log), then slot 0 cleared from 1 (a refund), then an empty block.
+    const clearer_at = "\"0x0000000000000000000000000000000000000057\"";
+    const params = "[{\"returnFullTransactions\":true,\"blockStateCalls\":[" ++
+        "{\"stateOverrides\":{" ++ counter_at ++
+        ":{\"code\":\"" ++ counter_hex ++ "\"}},\"calls\":[{\"from\":" ++ address_one ++
+        ",\"to\":" ++ counter_at ++ ",\"gasPrice\":\"0x0\"}]}," ++
+        "{\"stateOverrides\":{" ++ clearer_at ++ ":{\"code\":\"0x5f5f5500\",\"state\":{\"0x" ++
+        zeros_62 ++ "00\":\"0x" ++ zeros_62 ++ "01\"}}},\"calls\":[{\"to\":" ++ clearer_at ++
+        "}]},{}]},\"latest\"]";
+    const text = try h.request("eth_simulateV1", params);
+    const result = text["\"result\":".len..];
+    // Block hashes chain from the base block; the first block's log points at its block and
+    // transaction. With full transactions, block and transaction hashes alternate.
+    const first_hash = value_after(text, "hash", 0).?;
+    const second_hash = value_after(text, "hash", 2).?;
+    const tx_hash = value_after(text, "hash", 1).?;
+    try testing.expectEqualStrings(&head, value_after(text, "parentHash", 0).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "parentHash", 1).?);
+    try testing.expectEqualStrings(second_hash, value_after(text, "parentHash", 2).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "blockHash", 0).?);
+    try testing.expectEqualStrings(tx_hash, value_after(text, "transactionHash", 0).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "blockHash", 1).?);
+    // Each `hash` is the hash of the header the block object shows.
+    for (0..3) |index| {
+        const object = element_of(result, index).?;
+        const shown = try json.parse_fixed(32, value_after(object, "hash", 0).?);
+        try testing.expectEqualSlices(u8, &shown, &(try header_of_block(object)).hash().bytes);
+    }
+    // A zero state and withdrawals root (no state provider), the transaction with its
+    // `from` and a zero signature (a legacy one, gasPrice given, unsigned as geth builds it:
+    // v zero, no EIP-155 v).
+    const zero_hash = "\"0x" ++ zeros_62 ++ "00\"";
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"stateRoot\":" ++ zero_hash));
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"withdrawalsRoot\":" ++ zero_hash));
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"withdrawals\":[]"));
+    try expect_contains(text, "\"type\":\"0x0\",\"from\":" ++ address_one);
+    try expect_contains(text, "\"type\":\"0x2\",\"from\":\"0x" ++ zeros_62[0..40] ++ "\"");
+    try expect_contains(text, "\"r\":\"0x0\",\"s\":\"0x0\"");
+    try expect_contains(text, "\"v\":\"0x0\",\"r\":\"0x0\",\"s\":\"0x0\"");
+    try testing.expectEqual(@as(usize, 0), count_of(text, "\"v\":\"0x2"));
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"difficulty\":\"0x0\""));
+    // The empty block has the empty transactions and receipts roots.
+    const empty = "\"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421\"";
+    try expect_contains(text, "\"transactionsRoot\":" ++ empty ++ ",\"receiptsRoot\":" ++ empty);
+    // maxUsedGas is the gas before the refund: 21000 + 2 * 2 + 5000 = 26004, refunded 4800.
+    try expect_contains(text, "\"gasUsed\":\"0x52d4\",\"maxUsedGas\":\"0x6594\"");
+}
+
+/// The value of the `nth` (from 0) string member `key` in `text`, without its quotes.
+fn value_after(text: []const u8, key: []const u8, nth: usize) ?[]const u8 {
+    var buffer: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buffer, "\"{s}\":\"", .{key}) catch unreachable;
+    var position: usize = 0;
+    var found: usize = 0;
+    while (std.mem.indexOfPos(u8, text, position, needle)) |at| : (found += 1) {
+        const start = at + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return null;
+        if (found == nth) return text[start..end];
+        position = end;
+    }
+    return null;
+}
+
+/// The raw text of element `index` of the JSON array `array`.
+fn element_of(array: []const u8, index: usize) ?[]const u8 {
+    var scanner = json.Scanner.init(array);
+    const open = scanner.next() catch return null;
+    if (open.tag != .array_begin) return null;
+    var position: usize = 0;
+    while (position <= index) : (position += 1) {
+        const before = scanner.offset();
+        const token = scanner.next() catch return null;
+        if (token.tag == .array_end) return null;
+        scanner.skip(token) catch return null;
+        if (position == index) {
+            const raw = scanner.input[before..scanner.offset()];
+            return std.mem.trimStart(u8, raw, " \t\r\n,");
+        }
+    }
+    return null;
+}
+
+/// Rebuilds the consensus header of an RPC block object from its fields.
+fn header_of_block(object: []const u8) !consensus.Header {
+    var header: consensus.Header = .{};
+    header.parent_hash.bytes = try fixed_field(32, object, "parentHash");
+    header.ommers_hash.bytes = try fixed_field(32, object, "sha3Uncles");
+    header.beneficiary.bytes = try fixed_field(20, object, "miner");
+    header.state_root.bytes = try fixed_field(32, object, "stateRoot");
+    header.transactions_root.bytes = try fixed_field(32, object, "transactionsRoot");
+    header.receipts_root.bytes = try fixed_field(32, object, "receiptsRoot");
+    header.logs_bloom.bytes = try fixed_field(256, object, "logsBloom");
+    header.difficulty = try quantity_field(u256, object, "difficulty");
+    header.number = try quantity_field(u64, object, "number");
+    header.gas_limit = try quantity_field(u64, object, "gasLimit");
+    header.gas_used = try quantity_field(u64, object, "gasUsed");
+    header.timestamp = try quantity_field(u64, object, "timestamp");
+    header.mix_hash.bytes = try fixed_field(32, object, "mixHash");
+    header.nonce.bytes = try fixed_field(8, object, "nonce");
+    header.base_fee_per_gas = try quantity_field(u64, object, "baseFeePerGas");
+    header.withdrawals_root = .{ .bytes = try fixed_field(32, object, "withdrawalsRoot") };
+    header.blob_gas_used = try quantity_field(u64, object, "blobGasUsed");
+    header.excess_blob_gas = try quantity_field(u64, object, "excessBlobGas");
+    header.parent_beacon_block_root = .{
+        .bytes = try fixed_field(32, object, "parentBeaconBlockRoot"),
+    };
+    header.requests_hash = .{ .bytes = try fixed_field(32, object, "requestsHash") };
+    const extra = value_after(object, "extraData", 0) orelse return error.MissingField;
+    try testing.expect(extra.len <= 2 + 2 * 32);
+    header.extra_data = try json.parse_data(extra, &extra_data_buffer);
+    return header;
+}
+
+var extra_data_buffer: [32]u8 = undefined;
+
+fn fixed_field(comptime size: usize, object: []const u8, key: []const u8) ![size]u8 {
+    return json.parse_fixed(size, value_after(object, key, 0) orelse return error.MissingField);
+}
+
+fn quantity_field(comptime T: type, object: []const u8, key: []const u8) !T {
+    return json.parse_quantity(T, value_after(object, key, 0) orelse return error.MissingField);
 }
 
 test "eth: call and estimate gas" {
@@ -771,7 +1196,7 @@ test "eth: eth_config on the dev L1 lists Prague with no next fork" {
     const schedule = "\"blobSchedule\":{\"baseFeeUpdateFraction\":5007716,\"max\":9,\"target\":6}";
     try expect_contains(text, schedule);
     try expect_contains(text, "\"chainId\":\"0x539\"");
-    const pairing = "\"BLS12_PAIRING_CHECK\":\"0x000000000000000000000000000000000000000F\"";
+    const pairing = "\"BLS12_PAIRING_CHECK\":\"0x000000000000000000000000000000000000000f\"";
     try expect_contains(text, pairing);
     try testing.expect(std.mem.indexOf(u8, text, "P256VERIFY") == null);
     try expect_contains(text, "\"WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS\"");
@@ -842,6 +1267,428 @@ fn fuzz_txpool(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: txpool listings fuzz" {
     try testing.fuzz({}, fuzz_txpool, .{});
+}
+
+test "eth: fee history closes with the base fee after its newest block, not the head" {
+    const h = try Harness.create_for(&chainspec.ChainSpec.presets.base_devnet);
+    defer h.destroy();
+    const first = try h.mine(2);
+    const second = try h.mine(4);
+    _ = try h.mine(6);
+    const fee_first = h.node.chain.header(first.bytes).?.base_fee_per_gas.?;
+    const fee_second = h.node.chain.header(second.bytes).?.base_fee_per_gas.?;
+    // Empty blocks lower the base fee each block, so the head would imply a third value.
+    try testing.expect(fee_second < fee_first);
+    var expected: [128]u8 = undefined;
+    const fees = try std.fmt.bufPrint(&expected, "\"baseFeePerGas\":[\"0x{x}\",\"0x{x}\"]", .{
+        fee_first,
+        fee_second,
+    });
+    const history = try h.request("eth_feeHistory", "[\"0x1\",\"0x1\",[]]");
+    try expect_contains(history, fees);
+    try expect_contains(history, "\"oldestBlock\":\"0x1\"");
+    try expect_contains(history, "\"reward\":[]");
+    try testing.expectEqualStrings(
+        "\"result\":{\"gasUsedRatio\":[],\"oldestBlock\":\"0x0\"}",
+        try h.request("eth_feeHistory", "[\"0x0\",\"latest\"]"),
+    );
+    // Counts past block 0 or above 1024 truncate, as in reth.
+    const range = try h.request("eth_feeHistory", "[\"0x401\",\"0x1\"]");
+    try expect_contains(range, "\"oldestBlock\":\"0x0\"");
+    // The block size is the length of the block's RLP encoding.
+    const raw = try h.request("debug_getRawBlock", "[\"0x1\"]");
+    const raw_prefix = "\"result\":\"0x";
+    try testing.expect(std.mem.startsWith(u8, raw, raw_prefix));
+    const raw_length = (raw.len - raw_prefix.len - 1) / 2;
+    const size = try std.fmt.bufPrint(&expected, "\"size\":\"0x{x}\"", .{raw_length});
+    try expect_contains(try h.request("eth_getBlockByNumber", "[\"0x1\",false]"), size);
+}
+
+test "eth: fuzz_coverage exists only in a coverage build" {
+    if (eth.fuzz_coverage.enabled) return error.SkipZigTest;
+    const h = try Harness.create();
+    defer h.destroy();
+    try expect_contains(try h.request("fuzz_coverage", "[]"), "\"code\":-32601");
+}
+
+test "eth: block objects refuse unknown members instead of spinning" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const address = "\"0x833b738e23eb9ba1529e0d93ff98ba38dbb503bf\"";
+    // An unknown member whose value is a container once left the member loop reading the
+    // scanner's end token forever.
+    for ([_][]const u8{ "{\"a\":[]}", "{\"accessList\":[]}", "{\"a\":1}", "{}" }) |block| {
+        var body: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&body, request_prefix_format ++
+            "eth_getBalance\",\"params\":[{s},{s}]}}", .{ address, block });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    }
+    const by_number = try h.request("eth_getBalance", "[" ++ address ++
+        ",{\"blockNumber\":\"0x0\"}]");
+    try expect_contains(by_number, "\"result\":\"0x");
+    const config = try h.request("debug_traceCall", "[{}, \"latest\"," ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":[],\"x\":1}}]");
+    try expect_contains(config, "invalid tracer config");
+}
+
+test "eth: getStorageAt reads a full-width slot key and defaults to latest" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const account = "\"0x4200000000000000000000000000000000000015\"";
+    const wide = "\"0x0000000000000000000000000000000000000000000000000000000000000007\"";
+    const short = try h.request("eth_getStorageAt", "[" ++ account ++ ",\"0x7\",\"latest\"]");
+    try expect_contains(short, "\"result\":\"0x");
+    try testing.expectEqualStrings(short, try h.request("eth_getStorageAt", "[" ++ account ++
+        "," ++ wide ++ "]"));
+    try testing.expectEqualStrings(short, try h.request("eth_getStorageAt", "[" ++ account ++
+        ",\"0x007\"]"));
+    // A bare 0x is slot zero (ruint reads no digits as zero), as base answers eth_getProof.
+    const bare = try h.request("eth_getStorageAt", "[" ++ account ++ ",\"0x\"]");
+    try expect_contains(bare, "\"result\":\"0x");
+    for ([_][]const u8{ "\"7\"", "\"0x+7\"", "\"0x1_2\"" }) |slot| {
+        var body: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&body, request_prefix_format ++
+            "eth_getStorageAt\",\"params\":[{s},{s}]}}", .{ account, slot });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    }
+}
+
+test "eth: eth_call of a creation returns the deployed code" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Init code storing 0x60ff at memory[30..32] and returning it as the runtime code.
+    const created = try h.request("eth_call", "[{\"input\":\"0x6160ff6000526002601ef3\"}]");
+    try testing.expectEqualStrings("\"result\":\"0x60ff\"", created);
+}
+
+test "eth: feeHistory takes a numeric block count and no percentiles" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const history = try h.request("eth_feeHistory", "[1,\"latest\"]");
+    try expect_contains(history, "\"oldestBlock\":\"0x0\"");
+    try testing.expect(std.mem.indexOf(u8, history, "reward") == null);
+    try expect_contains(try h.request("eth_feeHistory", "[\"+1\",\"latest\"]"), "-32602");
+    try expect_contains(try h.request("eth_feeHistory", "[1.5,\"latest\"]"), "-32602");
+}
+
+test "eth: a call request's access list is charged and warms its entries" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const to = "\"to\":\"0x00000000000000000000000000000000000000aa\"";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x5208\"",
+        try h.request("eth_estimateGas", "[{" ++ to ++ "}]"),
+    );
+    // 21000 + 2400 for the address + 1900 for each of two keys = 27200, before or after
+    // `input`; reth's search (optimistic guess, then 1.5%) settles at 27545.
+    const item_address = "\"address\":\"0x1111111111111111111111111111111111111111\"";
+    const key_0 = "\"0x0000000000000000000000000000000000000000000000000000000000000000\"";
+    const key_1 = "\"0x0000000000000000000000000000000000000000000000000000000000000001\"";
+    const listed = "\"accessList\":[{" ++ item_address ++ ",\"storageKeys\":[" ++ key_0 ++
+        "," ++ key_1 ++ "]}]";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x6b99\"",
+        try h.request("eth_estimateGas", "[{" ++ to ++ "," ++ listed ++ ",\"input\":\"0x\"}]"),
+    );
+    try testing.expectEqualStrings(
+        "\"result\":\"0x6b99\"",
+        try h.request("eth_estimateGas", "[{\"input\":\"0x\"," ++ listed ++ "," ++ to ++ "}]"),
+    );
+    // Nethermind requires an item's address, not its keys.
+    const keyless = "[{\"accessList\":[{" ++ item_address ++ "}]}]";
+    try expect_contains(try h.request("eth_estimateGas", keyless), "\"result\":\"0x");
+    const addressless = "[{\"accessList\":[{\"storageKeys\":[]}]}]";
+    try expect_contains(try h.request("eth_estimateGas", addressless), "-32602");
+}
+
+/// A call to code returning TIMESTAMP and NUMBER, the override installing it, and the
+/// leading zeros of a 32-byte zero_word holding a one-byte value.
+const clock_call = "{\"to\":\"0x00000000000000000000000000000000000c0ffe\"}";
+const clock_code = "{\"0x00000000000000000000000000000000000c0ffe\":" ++
+    "{\"code\":\"0x426000524360205260406000f3\"}}";
+const zero_word = "00000000000000000000000000000000000000000000000000000000000000";
+
+test "eth: a call at a block runs in that block's environment, pending in the next" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(2);
+    _ = try h.mine(4);
+    const code = clock_code;
+    // The harness keeps only the head's state, so block 2 is named by number and by tag.
+    const head = "\"result\":\"0x" ++ zero_word ++ "04" ++ zero_word ++ "02\"";
+    try testing.expectEqualStrings(
+        head,
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"0x2\"," ++ code ++ "]"),
+    );
+    try testing.expectEqualStrings(
+        head,
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"latest\"," ++ code ++ "]"),
+    );
+    // base/base derives "pending" from the head: number + 1, timestamp + 12.
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "10" ++ zero_word ++ "03\"",
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"pending\"," ++ code ++ "]"),
+    );
+}
+
+test "eth: a pending eth_call runs at the Denim schedule's next block, traceCall at + 12" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    // Block 1 is due 200 ms after genesis (time 0): second 0, millisecond part 200.
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "00" ++ zero_word ++ "01\"",
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"pending\"," ++ clock_code ++ "]"),
+    );
+    // BaseTime's packed slot 0 holds the forecast part beneath the caller's own override
+    // (code returning slot 0); latest holds genesis's.
+    const base_time = "\"0x4200000000000000000000000000000000000030\"";
+    const millis = "[{\"to\":" ++ base_time ++ "}";
+    const slot_reader = "{" ++ base_time ++ ":{\"code\":\"0x5f545f5260205ff3\"}}]";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "c8\"",
+        try h.request("eth_call", millis ++ ",\"pending\"," ++ slot_reader),
+    );
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "00\"",
+        try h.request("eth_call", millis ++ ",\"latest\"," ++ slot_reader),
+    );
+    // debug_traceCall keeps reth's pending env: head + 12 seconds.
+    const traced = try h.request("debug_traceCall", "[" ++ clock_call ++ ",\"pending\"," ++
+        "{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ clock_code ++ "}]");
+    try expect_contains(traced, "\"output\":\"0x" ++ zero_word ++ "0c" ++ zero_word ++ "01\"");
+}
+
+test "eth: a call request's authorizations are charged as a type-4 transaction" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // An authorization for another chain is skipped but still costs 25000 intrinsic gas.
+    const authorization = "{\"address\":\"0x0000000000000000000000000000000000000004\"," ++
+        "\"chainId\":\"0x2105\",\"nonce\":\"0x5\",\"r\":\"0x1\",\"s\":\"0x1\"," ++
+        "\"yParity\":\"0x1\"}";
+    const to = "\"to\":\"0x2a379f4bf2e4752dd19c04b3d8ac9f1d4ad44b89\"";
+    const listed = try h.request("eth_createAccessList", "[{\"authorizationList\":[" ++
+        authorization ++ "]," ++ to ++ "}]");
+    try expect_contains(listed, "\"gasUsed\":\"0xb3b0\"");
+    // Every field but r and s (zero when absent, as Nethermind) is required.
+    const partial = "[{\"authorizationList\":[{\"address\":" ++
+        "\"0x0000000000000000000000000000000000000004\"}]," ++ to ++ "}]";
+    try expect_contains(try h.request("eth_createAccessList", partial), "-32602");
+}
+
+test "eth: request fields parse as base/base's serde types" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(2);
+    // alloy's `Filter`: a block hash excludes a range; null bounds read as absent.
+    const block = try h.request("eth_getBlockByNumber", "[\"latest\",false]");
+    const at = std.mem.indexOf(u8, block, "\"hash\":\"").? + 8;
+    var hash: [66]u8 = undefined;
+    @memcpy(&hash, block[at..][0..66]);
+    var body: [512]u8 = undefined;
+    const both_format = request_prefix_format ++ "eth_getLogs\",\"params\":[{{" ++
+        "\"blockHash\":\"{s}\",\"toBlock\":\"latest\"}}]}}";
+    const both = try std.fmt.bufPrint(&body, both_format, .{&hash});
+    try expect_contains(try h.request_runtime(both), "-32602");
+    const open_end = "[{\"fromBlock\":\"latest\",\"toBlock\":null}]";
+    try expect_contains(try h.request("eth_getLogs", open_end), "\"result\":[");
+    // A block number parameter reads a hash as that block (Nethermind's BlockParameter).
+    const by_hash_format = request_prefix_format ++
+        "eth_getBlockByNumber\",\"params\":[\"{s}\",false]}}";
+    const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash});
+    try expect_contains(try h.request_runtime(by_hash), "\"number\":\"0x1\"");
+    // EIP-1898 objects as Nethermind's converter reads them: a null blockNumber is latest,
+    // a null blockHash is absent, other members are ignored.
+    const latest = try h.request("eth_getBlockReceipts", "[\"latest\"]");
+    var latest_copy: [4096]u8 = undefined;
+    const latest_text = latest_copy[0..latest.len];
+    @memcpy(latest_text, latest);
+    const null_number = "[{\"blockNumber\":null}]";
+    try testing.expectEqualStrings(latest_text, try h.request("eth_getBlockReceipts", null_number));
+    const numbered = "[{\"blockHash\":null,\"blockNumber\":\"0x1\",\"other\":1}]";
+    try expect_contains(try h.request("eth_getBlockByNumber", numbered[0 .. numbered.len - 1] ++
+        ",false]"), "\"number\":\"0x1\"");
+    try expect_contains(try h.request("eth_getBlockReceipts", "[{\"blockHash\":null}]"), "-32602");
+    const balance = "[\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",{\"blockNumber\":null}]";
+    try expect_contains(try h.request("eth_getBalance", balance), "\"result\":\"0x");
+    // eth_getLogs bounds may be block hashes (Nethermind), mixed with tags or numbers.
+    const hashes_format = request_prefix_format ++ "eth_getLogs\",\"params\":[{{" ++
+        "\"fromBlock\":\"{s}\",\"toBlock\":\"{s}\"}}]}}";
+    const hashes = try std.fmt.bufPrint(&body, hashes_format, .{ &hash, &hash });
+    try expect_contains(try h.request_runtime(hashes), "\"result\":[");
+    const mixed = try std.fmt.bufPrint(&body, hashes_format, .{ "0x0", &hash });
+    try expect_contains(try h.request_runtime(mixed), "\"result\":[");
+    const unknown = "0x" ++ @as([64]u8, @splat('e'));
+    const missing = try std.fmt.bufPrint(&body, hashes_format, .{ unknown, unknown });
+    try expect_contains(try h.request_runtime(missing), "block not found");
+    // eth_call ignores movePrecompileToAddress (only eth_simulateV1 applies it).
+    const moved = "[{},\"latest\",{\"0x0000000000000000000000000000000000000001\":" ++
+        "{\"movePrecompileToAddress\":\"0x8fe1cc26a5cc6c3299bc42ffe394466911fc0dea\"}}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", moved));
+    // The chain id is checked; empty bytes read as empty; `type` must be a u8 quantity.
+    try expect_failure(h, "eth_call", "[{\"chainId\":\"0x1\"}]", "-32000", "invalid chain ID");
+    try testing.expectEqualStrings(
+        "\"result\":\"0x\"",
+        try h.request("eth_call", "[{\"input\":\"\"}]"),
+    );
+    try expect_contains(try h.request("eth_call", "[{\"type\":\"finalized\"}]"), "-32602");
+    try expect_contains(try h.request("eth_call", "[{\"type\":-1}]"), "-32602");
+    try expect_contains(try h.request("eth_call", "[{\"type\":\"0x2\"}]"), "\"result\"");
+    const blob_hash = "\"0x02" ++ zero_word ++ "\"";
+    const blob = "[{\"blobVersionedHashes\":[" ++ blob_hash ++ "]}]";
+    try expect_failure(h, "eth_call", blob, "-32003", "blob hash version mismatch");
+    // A call with blob hashes is a type-3 transaction: its blob fee cap is checked (revm
+    // `validate_eip4844_tx`), while no fee is charged.
+    const kzg_hash = "\"0x01" ++ zero_word ++ "\"";
+    const blob_call = "[{\"blobVersionedHashes\":[" ++ kzg_hash ++ "],\"to\":" ++
+        "\"0x4ac857f04be60f4f00ba2f2a6aa1f62b40459e53\",\"maxFeePerBlobGas\":";
+    const blob_fee = "max fee per blob gas less than block blob gas fee";
+    try expect_failure(h, "eth_call", blob_call ++ "\"0x0\"}]", "-32003", blob_fee);
+    try expect_failure(h, "eth_estimateGas", blob_call ++ "\"0x0\"}]", "-32003", blob_fee);
+    const traced = try h.request("debug_traceCall", blob_call ++ "\"0x0\"},\"latest\"," ++
+        "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "{\"code\":-32003,\"message\":\"" ++ blob_fee);
+    const paid = try h.request("eth_estimateGas", blob_call ++ "\"0x1\"}]");
+    try testing.expectEqualStrings("\"result\":\"0x5208\"", paid);
+    // `JsonStorageKey` reads a bare 0x as slot zero.
+    const proof = "[\"0x4200000000000000000000000000000000000007\",[\"0x\"],\"latest\"]";
+    try expect_contains(try h.request("eth_getProof", proof), "\"storageProof\":[{");
+}
+
+test "eth: block parameters and indexes read as Nethermind's converters" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var tx_buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 5, &tx_buffer);
+    const hash = try h.mine(12);
+    var body: [512]u8 = undefined;
+    // A hash names its block in a block-number parameter; "" and null read as latest.
+    const count_format = request_prefix_format ++
+        "eth_getBlockTransactionCountByNumber\",\"params\":[\"0x{x}\"]}}";
+    const count = try std.fmt.bufPrint(&body, count_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(count), "\"result\":\"0x1\"}");
+    const at_format = request_prefix_format ++
+        "eth_getTransactionByBlockNumberAndIndex\",\"params\":[\"0x{x}\",\"0x0\"]}}";
+    const at = try std.fmt.bufPrint(&body, at_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(at), "\"transactionIndex\":\"0x0\"");
+    for ([_][]const u8{ "[\"\",false]", "[null,false]" }) |params| {
+        const latest_format = request_prefix_format ++ "eth_getBlockByNumber\",\"params\":{s}}}";
+        const latest = try std.fmt.bufPrint(&body, latest_format, .{params});
+        try expect_contains(try h.request_runtime(latest), "\"number\":\"0x1\"");
+    }
+    // An index of 2^64 or more is past the end (Nethermind reads a `UInt256`).
+    const wide = "\"0x10000000000000000\"";
+    inline for (.{
+        "eth_getTransactionByBlockNumberAndIndex",
+        "eth_getRawTransactionByBlockNumberAndIndex",
+        "eth_getUncleByBlockNumberAndIndex",
+    }) |method| {
+        const past = try h.request(method, "[\"latest\"," ++ wide ++ "]");
+        try testing.expectEqualStrings("\"result\":null", past);
+    }
+    const by_hash_format = request_prefix_format ++
+        "eth_getTransactionByBlockHashAndIndex\",\"params\":[\"0x{x}\"," ++ wide ++ "]}}";
+    const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(by_hash), "\"result\":null}");
+    // A capital 0X hash is refused.
+    for ([_][]const u8{ "eth_getBlockByHash", "eth_getBlockByNumber" }) |method| {
+        const capital_format = request_prefix_format ++ "{s}\",\"params\":[\"0X{x}\",false]}}";
+        const capital = try std.fmt.bufPrint(&body, capital_format, .{ method, &hash.bytes });
+        try expect_contains(try h.request_runtime(capital), "-32602");
+    }
+    // debug_traceBlockByNumber has no pending block.
+    const pending = try h.request("debug_traceBlockByNumber", "[\"pending\"]");
+    try expect_contains(pending, "{\"code\":-32000,\"message\":\"pending block is not available\"");
+}
+
+test "eth: debug_traceBlock of genesis follows Nethermind" {
+    // Block 0 is not traceable.
+    const zero = try Harness.create();
+    defer zero.destroy();
+    const refused = "{\"code\":-32000,\"message\":\"genesis is not traceable\"";
+    try expect_contains(try zero.request("debug_traceBlockByNumber", "[\"earliest\"]"), refused);
+    // A later genesis has no transactions, so it has no traces, whatever the tracer.
+    const h = try Harness.create_numbered(fixture.spec, 30_008_523);
+    defer h.destroy();
+    _ = try h.mine(1);
+    const empty = "\"result\":[]";
+    const limited = "[\"earliest\",{\"limit\":512}]";
+    try expect_contains(try h.request("debug_traceBlockByNumber", limited), empty);
+    const call_tracer = "[\"earliest\",{\"tracer\":\"callTracer\"}]";
+    try expect_contains(try h.request("debug_traceBlockByNumber", call_tracer), empty);
+    const genesis = &h.node.chain.genesis_hash;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    try expect_contains(try trace_request(h, "debug_traceBlockByHash", genesis, plain), empty);
+    // Its RLP is refused.
+    var buffer: [4096]u8 = undefined;
+    const raw_genesis = try h.request("debug_getRawBlock", "[\"earliest\"]");
+    const raw = try result_data(raw_genesis, &buffer);
+    var body: [4096]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceBlock\",\"params\":[\"0x{x}\"]}}";
+    const traced_raw = try h.request_runtime(try std.fmt.bufPrint(&body, format, .{raw}));
+    try expect_contains(traced_raw, refused);
+}
+
+test "eth: call requests read as Nethermind's transaction converters" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Access list keys of any digit count, items without `storageKeys`.
+    const listed = "[{\"to\":" ++ address_target ++ ",\"accessList\":[{\"address\":" ++
+        address_target ++ ",\"storageKeys\":[\"0x1\",\"0xabc\"]},{\"address\":" ++
+        address_one ++ "},{\"address\":" ++ address_one ++ ",\"storageKeys\":null}]}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", listed));
+    const bare_key = "[{\"to\":" ++ address_target ++ ",\"accessList\":[{\"address\":" ++
+        address_target ++ ",\"storageKeys\":[\"0x\"]}]}]";
+    try expect_contains(try h.request("eth_call", bare_key), "-32602");
+    // An authorization without r and s has a zero signature (no authority).
+    const unsigned = "[{\"to\":" ++ address_target ++ ",\"authorizationList\":[{" ++
+        "\"chainId\":\"0x2105\",\"address\":" ++ address_one ++ ",\"nonce\":\"0x0\"," ++
+        "\"yParity\":\"0x0\"}]}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", unsigned));
+    // Override slot keys are numbers; override code of an odd digit count has a leading
+    // zero nibble (0x0 is STOP).
+    const slot_reader = "[{\"to\":" ++ override_target ++ "},\"latest\",{" ++ override_target ++
+        ":{\"code\":\"0x60015460005260206000f3\",\"stateDiff\":{\"0x1\":\"0x" ++ zero_word ++
+        "ff\"}}}]";
+    try expect_contains(try h.request("eth_call", slot_reader), "ff\"");
+    const odd_code = "[{\"to\":" ++ override_target ++ "},\"latest\",{" ++ override_target ++
+        ":{\"code\":\"0x0\"}}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", odd_code));
+    // Call data stays strict: an odd digit count is refused, as Nethermind's input.
+    const odd_input = "[{\"to\":" ++ address_target ++ ",\"input\":\"0x123\"}]";
+    try expect_contains(try h.request("eth_call", odd_input), "-32602");
+    // A deposit is no signable request; debug_traceCall takes a complete one only.
+    const deposit = "[{\"to\":" ++ address_target ++ ",\"type\":\"0x7e\"}]";
+    const refused = "{\"code\":-32602,\"message\":\"invalid argument 0\"";
+    try expect_contains(try h.request("eth_call", deposit), refused);
+    try expect_contains(try h.request("eth_estimateGas", deposit), refused);
+    try expect_contains(try h.request("eth_createAccessList", deposit), refused);
+    const tracer = "},\"latest\",{\"tracer\":\"callTracer\"}]";
+    const no_source = "{\"code\":-32602,\"message\":\"Value cannot be null. " ++
+        "(Parameter 'SourceHash')\"";
+    try expect_contains(try h.request("debug_traceCall", deposit[0 .. deposit.len - 2] ++
+        tracer), no_source);
+    const sourced = "[{\"to\":" ++ address_target ++ ",\"type\":\"0x7e\",\"sourceHash\":\"0x" ++
+        zeros_62 ++ "01\",\"from\":" ++ poor_sender;
+    const no_value = "\"message\":\"Value cannot be null. (Parameter 'Value')\"";
+    try expect_contains(try h.request("debug_traceCall", sourced ++ tracer), no_value);
+    const complete = sourced ++ ",\"value\":\"0x0\",\"input\":\"0x\"";
+    const traced = try h.request("debug_traceCall", complete ++ tracer);
+    try expect_contains(traced, "\"result\":{\"type\":\"CALL\"");
+    // eth_simulateV1 converts its calls the same way.
+    const blocks = "[{\"blockStateCalls\":[{\"calls\":";
+    const simulated = blocks ++ deposit ++ "}]}]";
+    try expect_contains(try h.request("eth_simulateV1", simulated), no_source);
+    const whole = blocks ++ complete ++ "}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", whole), "\"status\":\"0x1\"");
+    // A priced transfer from an unfunded sender exceeds its allowance (no 21000 shortcut).
+    const unfunded = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target;
+    const exceeds = "{\"code\":-32000,\"message\":\"gas required exceeds allowance (0)\"";
+    inline for (.{ "gasPrice", "maxFeePerGas" }) |field| {
+        const priced = unfunded ++ ",\"" ++ field ++ "\":\"0x10000000000\"}]";
+        try expect_contains(try h.request("eth_estimateGas", priced), exceeds);
+    }
+    const free = try h.request("eth_estimateGas", unfunded ++ "}]");
+    try testing.expectEqualStrings("\"result\":\"0x5208\"", free);
 }
 
 fn fuzz_body(h: *Harness, body: []const u8) !void {
@@ -996,6 +1843,253 @@ test "eth: Denim blocks, transactions and logs report millisecond timestamps" {
     try testing.expect(std.mem.indexOf(u8, genesis_block, "timestampMs") == null);
 }
 
+/// Mines a block holding `deposit` alone on the harness head (timestamp 4, coinbase 0xfe..),
+/// then six more; returns the deposit's block hash.
+fn mine_deposit(h: *Harness, deposit: consensus.Envelope, raw: *[256]u8) !primitives.B256 {
+    const forced = [1][]const u8{deposit.encode_to(raw)};
+    var attrs = fixture.attributes_l2(4, 0xfe);
+    attrs.transactions = &forced;
+    const node = h.node;
+    const head: primitives.B256 = .{ .bytes = node.chain.head_hash() };
+    const version = engine_types.forkchoice_version(node.spec, 4);
+    const updated = try node.engine.forkchoice_updated(version, fixture.forkchoice(head), &attrs);
+    const get_version = engine_types.get_payload_version(node.spec, 4);
+    const built = try node.engine.get_payload(get_version, updated.payload_id.?);
+    _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(built.block_hash), null);
+    _ = try h.mine(6);
+    return built.block_hash;
+}
+
+fn deposit_to(to: [20]u8, gas_limit: u64) consensus.Envelope {
+    return .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x22) },
+        .from = .{ .bytes = @splat(0xd0) },
+        .to = .{ .call = .{ .bytes = to } },
+        .mint = 0,
+        .value = 0,
+        .gas_limit = gas_limit,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+}
+
+/// A harness on Denim with history for tracing; 0x55.. (nonce 60) is delegated to 0x33..,
+/// which CALLs 0x44.. (nonce 1, no code) and then loops until out of gas.
+fn failing_deposit_harness(store: *history_module.Store) !*Harness {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    errdefer h.destroy();
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(store);
+    const callee_code = [_]u8{ 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x73 } ++
+        @as([20]u8, @splat(0x44)) ++ [_]u8{ 0x61, 0xff, 0xff, 0xf1, 0x50, 0x5b, 0x60, 0x24, 0x56 };
+    try h.node.db.put_account(@splat(0x33), 0, 1, &callee_code);
+    try h.node.db.put_account(@splat(0x44), 0, 1, &.{});
+    const delegation = [_]u8{ 0xef, 0x01, 0x00 } ++ @as([20]u8, @splat(0x33));
+    try h.node.db.put_account(@splat(0x55), 0, 60, &delegation);
+    _ = try h.mine(2);
+    return h;
+}
+
+/// Mines `deposit`, checks it failed with its whole gas limit and returns its prestate.
+fn failed_deposit_prestate(h: *Harness, deposit: consensus.Envelope) ![]const u8 {
+    return failed_deposit_trace(h, deposit, "{\"tracer\":\"prestateTracer\"}");
+}
+
+/// Mines `deposit`, checks it failed with its whole gas limit and traces it with `config`.
+fn failed_deposit_trace(
+    h: *Harness,
+    deposit: consensus.Envelope,
+    config: []const u8,
+) ![]const u8 {
+    var raw: [256]u8 = undefined;
+    _ = try mine_deposit(h, deposit, &raw);
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const receipt_format = request_prefix_format ++
+        "eth_getTransactionReceipt\",\"params\":[\"0x{x}\"]}}";
+    var body: [256]u8 = undefined;
+    const receipt = try h.request_runtime(try std.fmt.bufPrint(&body, receipt_format, .{&hash}));
+    try expect_contains(receipt, "\"status\":\"0x0\"");
+    var gas_used: [32]u8 = undefined;
+    const gas_limit = deposit.deposit.gas_limit;
+    const gas_used_text = "\"gasUsed\":\"0x{x}\"";
+    try expect_contains(receipt, try std.fmt.bufPrint(&gas_used, gas_used_text, .{gas_limit}));
+    return trace_request(h, "debug_traceTransaction", &hash, config);
+}
+
+test "eth: prestateTracer lists the beneficiary for a deposit" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // The beneficiary is not empty; a deposit pays it nothing, yet Nethermind looks it up.
+    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
+    _ = try h.mine(2);
+    var raw: [256]u8 = undefined;
+    const block_hash = try mine_deposit(h, deposit_to(@splat(0x33), 100_000), &raw);
+    const coinbase = "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\":\"0x1\"}";
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceBlockByHash", &block_hash.bytes, plain);
+    try testing.expectEqual(@as(usize, 1), count_of(traced, "\"txHash\""));
+    try expect_contains(traced, coinbase);
+    const hash = primitives.keccak256(deposit_to(@splat(0x33), 100_000).encode_to(&raw)).bytes;
+    try expect_contains(try trace_request(h, "debug_traceTransaction", &hash, plain), coinbase);
+    // Unchanged, it is not in a diff.
+    const diff = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}";
+    const changes = try trace_request(h, "debug_traceTransaction", &hash, diff);
+    try testing.expect(std.mem.indexOf(u8, changes, "0xfefefefe") == null);
+}
+
+const callee_pre = "\"0x5555555555555555555555555555555555555555\":{" ++
+    "\"balance\":\"0x0\",\"nonce\":60,";
+const delegate_pre = "\"0x3333333333333333333333333333333333333333\":{\"balance\"";
+const inner_pre = "\"0x4444444444444444444444444444444444444444\":{" ++
+    "\"balance\":\"0x0\",\"nonce\":1}";
+
+test "eth: prestateTracer keeps what a deposit loaded before running out of gas" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    const traced = try failed_deposit_prestate(h, deposit_to(@splat(0x55), 100_000));
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+    try expect_contains(traced, inner_pre);
+}
+
+test "eth: prestateTracer lists the callee of a deposit that cannot pay its value" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.mint = 1;
+    deposit.deposit.value = 2;
+    const traced = try failed_deposit_prestate(h, deposit);
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+}
+
+test "eth: callTracer gives a failed deposit revm-inspectors' top frame" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // The first frame starts and fails its transfer (geth's top frame, as base gives it):
+    // gas and gasUsed are the gas limit, the receipt's.
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.mint = 1;
+    deposit.deposit.value = 2;
+    deposit.deposit.input = &.{ 0x82, 0x4b, 0xb8, 0x45, 0x01, 0x02 };
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const unfunded = try failed_deposit_trace(h, deposit, call_tracer);
+    try expect_contains(unfunded, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x2\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0x186a0\",\"input\":\"0x824bb8450102\",\"error\":" ++
+        "\"insufficient balance for transfer\"}");
+    var raw: [256]u8 = undefined;
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const four_byte = "{\"tracer\":\"4byteTracer\"}";
+    const selectors = try trace_request(h, "debug_traceTransaction", &hash, four_byte);
+    try expect_contains(selectors, "\"result\":{\"0x824bb845-2\":1}");
+}
+
+test "eth: callTracer gives a call that cannot pay its value its top frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's EVM.Call enters the frame before its balance check, and revm's first frame
+    // fails the transfer: the tracers see the frame; gasUsed is the calldata floor here.
+    const call = "[{\"to\":\"0x00000000000000000000000000000000000000aa\",\"value\":\"0xef\"," ++
+        "\"gas\":\"0x186a0\",\"input\":\"0x12345678\"},\"latest\",";
+    const traced = try h.request("debug_traceCall", call ++ "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "0000000000000000000000000000000000000000\",\"to\":\"0x" ++
+        "00000000000000000000000000000000000000aa\"," ++
+        "\"value\":\"0xef\",\"gas\":\"0x186a0\",\"gasUsed\":\"0x52a8\",\"input\":" ++
+        "\"0x12345678\",\"error\":\"insufficient balance for transfer\"}");
+    const selectors = try h.request("debug_traceCall", call ++ "{\"tracer\":\"4byteTracer\"}]");
+    try expect_contains(selectors, "\"result\":{\"0x12345678-0\":1}");
+    const flat = try h.request("debug_traceCall", call ++ "{\"tracer\":\"flatCallTracer\"}]");
+    try expect_contains(flat, "\"error\":\"Insufficient balance for transfer\"");
+    try testing.expectEqual(@as(usize, 1), count_of(flat, "\"traceAddress\""));
+}
+
+test "eth: callTracer gives a creation that cannot pay its value a frame without to" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's `processOutput` (and revm-inspectors) clear a failed CREATE's `to`; gasUsed is
+    // the intrinsic gas: 53000 plus the initcode word cost.
+    const call = "[{\"value\":\"0xef\",\"gas\":\"0x186a0\",\"input\":\"0x6001600055\"}," ++
+        "\"latest\",";
+    const traced = try h.request("debug_traceCall", call ++ "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "\"result\":{\"type\":\"CREATE\",\"from\":\"0x" ++
+        "0000000000000000000000000000000000000000\",\"value\":\"0xef\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0xcf4e\",\"input\":\"0x6001600055\",\"error\":" ++
+        "\"insufficient balance for transfer\"}");
+    const selectors = try h.request("debug_traceCall", call ++ "{\"tracer\":\"4byteTracer\"}]");
+    try expect_contains(selectors, "\"result\":{}");
+    const flat = try h.request("debug_traceCall", call ++ "{\"tracer\":\"flatCallTracer\"}]");
+    try expect_contains(flat, "\"error\":\"Insufficient balance for transfer\"");
+    try expect_contains(flat, "\"creationMethod\":\"create\"");
+    try testing.expect(std.mem.indexOf(u8, flat, "\"address\"") == null);
+}
+
+test "eth: callTracer gives a deposit rejected before any frame a frame from the tx" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // A system deposit after Regolith enters no frame: geth's (and Nethermind's) frame is
+    // built from the transaction, and no selector is counted.
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.is_system_transaction = true;
+    deposit.deposit.input = &.{ 0x82, 0x4b, 0xb8, 0x45, 0x01, 0x02 };
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const system = try failed_deposit_trace(h, deposit, call_tracer);
+    try expect_contains(system, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x0\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0x186a0\",\"input\":\"0x824bb8450102\",\"error\":" ++
+        "\"failed deposit: system deposit after Regolith\"}");
+    var raw: [256]u8 = undefined;
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const four_byte = "{\"tracer\":\"4byteTracer\"}";
+    const selectors = try trace_request(h, "debug_traceTransaction", &hash, four_byte);
+    try expect_contains(selectors, "\"result\":{}");
+    const flat = "{\"tracer\":\"flatCallTracer\"}";
+    const flat_traces = try trace_request(h, "debug_traceTransaction", &hash, flat);
+    try expect_contains(flat_traces, "\"error\":\"failed deposit: system deposit after Regolith\"");
+    try testing.expectEqual(@as(usize, 1), count_of(flat_traces, "\"traceAddress\""));
+}
+
+test "eth: callTracer gives a deposit below its intrinsic gas a frame from the tx" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const low = try failed_deposit_trace(h, deposit_to(@splat(0x55), 20_000), call_tracer);
+    try expect_contains(low, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x0\",\"gas\":\"0x4e20\"," ++
+        "\"gasUsed\":\"0x4e20\",\"input\":\"0x\",\"error\":" ++
+        "\"failed deposit: intrinsic gas too low\"}");
+}
+
+test "eth: prestateTracer lists the callee of a deposit below its intrinsic gas" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // Nethermind looks up the callee and its delegate before any check; nothing runs.
+    const traced = try failed_deposit_prestate(h, deposit_to(@splat(0x55), 20_000));
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+    try testing.expect(std.mem.indexOf(u8, traced, "0x44444444") == null);
+}
+
 test "eth: pre-Denim blocks carry no millisecond timestamps" {
     const h = try Harness.create();
     defer h.destroy();
@@ -1082,9 +2176,9 @@ test "eth: calls without gas default under the Osaka per-transaction cap" {
     try expect_contains(call_result, "\"result\":\"0x\"");
     const estimate = try h.request("eth_estimateGas", "[{" ++ to ++ "}]");
     try expect_contains(estimate, "\"result\":\"0x5208\"");
-    // An explicit gas above the cap is still the caller's error.
+    // An explicit gas above the cap runs: reth lifts the cap for calls.
     const over = try h.request("eth_call", "[{" ++ to ++ ",\"gas\":\"0x1c9c380\"},\"latest\"]");
-    try expect_contains(over, "gas_cap_exceeded");
+    try expect_contains(over, "\"result\":\"0x\"");
     const head = h.node.chain.header(h.node.chain.head_hash()).?;
     const env = chain_module.env_of(&head);
     try testing.expect(head.gas_limit > 1 << 24);
@@ -1297,6 +2391,14 @@ test "eth: base_meterBundle meters a bundle ahead of the sender's nonce" {
     try expect_contains(try h.request("base_meterBundle", "[{}]"), "-32602");
     try expect_contains(try h.request("base_meterBundle", "[{\"txs\":[\"0x7e\"]}]"), "-32602");
     try expect_contains(try h.request("base_meterBundle", "[{\"txs\":1}]"), "-32602");
+    // base/base decodes every transaction before metering (`ParsedBundle::try_from`).
+    const undecodable = try h.request("base_meterBundle", "[{\"txs\":[\"0xc20180\"]}]");
+    try expect_contains(undecodable, "-32602");
+    try expect_contains(undecodable, "Failed to decode transaction");
+    // serde refuses null for the `full` flag; leaving it out reads as false.
+    const null_full = try h.request("eth_getBlockByNumber", "[\"latest\",null]");
+    try expect_contains(null_full, "-32602");
+    try expect_contains(try h.request("eth_getBlockByNumber", "[\"latest\"]"), "\"result\":{");
 }
 
 test "eth: seeded fuzz of base_meterBundle nonces" {
@@ -1375,6 +2477,8 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
     const nested_hash = primitives.keccak256(nested).bytes;
     const text = try trace_request(h, "debug_traceTransaction", &nested_hash, call_tracer);
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"type\":\"CALL\""));
+    // A CALL reports its value even when zero.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\":\"0x0\""));
     try expect_contains(text, "\"calls\":[{");
     try expect_contains(text, "\"gas\":\"0x30d40\""); // The transaction's gas limit.
     try expect_contains(text, "\"logs\":[{");
@@ -1392,9 +2496,69 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
         "[\"latest\",{\"tracer\":\"callTracer\"}]",
     );
     try testing.expectEqual(@as(usize, 2), count_of(by_number, "\"txHash\""));
-    // The default struct logger is not supported.
+    // No tracer: geth's struct logger, one frame per transaction.
     const default = try h.request("debug_traceBlockByNumber", "[\"latest\"]");
-    try expect_contains(default, "only callTracer");
+    try testing.expectEqual(@as(usize, 2), count_of(default, "\"structLogs\":[{"));
+    try testing.expectEqual(@as(usize, 2), count_of(default, "\"txHash\""));
+    // The most common call: a transaction with no options. The CALL forwards all but 1/64
+    // of the gas left after its 2600 (cold account); the counter runs at depth 2.
+    const logs = try trace_request(h, "debug_traceTransaction", &nested_hash, "{}");
+    try expect_contains(logs, "{\"failed\":false,\"gas\":46377,\"returnValue\":\"0x\",");
+    try expect_contains(logs, "{\"pc\":27,\"op\":\"CALL\",\"gas\":178985," ++
+        "\"gasCost\":176229,\"depth\":1,");
+    try expect_contains(logs, "{\"pc\":0,\"op\":\"PUSH0\",\"gas\":173629,\"gasCost\":2," ++
+        "\"depth\":2,\"stack\":[],\"refund\":0}");
+    try expect_contains(logs, "{\"pc\":28,\"op\":\"STOP\",\"gas\":153623,\"gasCost\":0," ++
+        "\"depth\":1,\"stack\":[\"0x1\"],\"refund\":0}]}");
+    // flatCallTracer locates each trace in the block.
+    const flat = "{\"tracer\":\"flatCallTracer\"}";
+    const flat_text = try trace_request(h, "debug_traceTransaction", &reverting_hash, flat);
+    var block_hash: [2 + 64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&block_hash, "0x{x}", .{&block.bytes});
+    try expect_contains(flat_text, "\"blockHash\":\"");
+    try expect_contains(flat_text, &block_hash);
+    try expect_contains(flat_text, "\"error\":\"Reverted\",\"result\":{\"gasUsed\":\"0x4\"," ++
+        "\"output\":\"0x\"},\"subtraces\":0,\"traceAddress\":[],\"transactionHash\":\"");
+    try expect_contains(flat_text, "\"transactionPosition\":1,\"type\":\"call\"}]");
+}
+
+test "eth: debug_trace replays BLOCKHASH of a block the head's ring has dropped" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // SSTORE(0, BLOCKHASH(NUMBER - 255)); STOP.
+    const target: [20]u8 = @splat(0x5b);
+    try h.node.db.put_account(target, 0, 0, &.{ 0x60, 0xff, 0x43, 0x03, 0x40, 0x5f, 0x55, 0x00 });
+    var timestamp: u64 = 0;
+    for (0..256) |_| {
+        timestamp += 12;
+        _ = try h.mine(timestamp);
+    }
+    var buffer: [256]u8 = undefined;
+    const raw = try contract_call_raw(&buffer, 0, target);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    timestamp += 12;
+    _ = try h.mine(timestamp);
+    // The next block takes the ring slot of BLOCKHASH(2): only the replay reads it there.
+    timestamp += 12;
+    _ = try h.mine(timestamp);
+    const tx_hash = primitives.keccak256(raw).bytes;
+    // 21000 + 30 for the opcodes + 22100 for a cold SSTORE of a non-zero hash.
+    const gas_used = "\"gasUsed\":\"0xa87a\"";
+    var body: [200]u8 = undefined;
+    const receipt_format = request_prefix_format ++
+        "eth_getTransactionReceipt\",\"params\":[\"0x{x}\"]}}";
+    const receipt = try std.fmt.bufPrint(&body, receipt_format, .{&tx_hash});
+    try expect_contains(try h.request_runtime(receipt), gas_used);
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    try expect_contains(
+        try trace_request(h, "debug_traceTransaction", &tx_hash, call_tracer),
+        gas_used,
+    );
+    try expect_contains(try trace_request(h, "debug_traceTransaction", &tx_hash, "{}"), "43130");
 }
 
 test "eth: debug_traceCall traces a call against the head state" {
@@ -1431,10 +2595,432 @@ test "eth: debug_traceCall traces a call against the head state" {
     try expect_contains(try h.request(
         "debug_traceCall",
         "[{\"to\":" ++ caller_at ++ "},\"latest\"]",
-    ), "only callTracer");
+    ), "\"structLogs\":[{");
     // The executor's tracer is detached afterwards: a plain call still runs.
     try expect_contains(try h.request("eth_call", "[{\"to\":" ++ caller_at ++ "}]"), "result");
     try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+/// One struct log as revm-inspectors writes it (no error, refund counter 0).
+fn struct_step(
+    comptime pc: u32,
+    comptime name: []const u8,
+    comptime gas: u64,
+    comptime cost: u64,
+    comptime stack: []const u8,
+    comptime storage: []const u8,
+) []const u8 {
+    const format = "{{\"pc\":{d},\"op\":\"{s}\",\"gas\":{d},\"gasCost\":{d},\"depth\":1," ++
+        "\"stack\":[{s}]{s},\"refund\":0}}";
+    return std.fmt.comptimePrint(format, .{ pc, name, gas, cost, stack, storage });
+}
+
+const invalid_at = "\"0x0000000000000000000000000000000000000058\"";
+
+/// The counter, the reverter, an INVALID contract and a caller of the counter.
+fn put_trace_contracts(h: *Harness) !void {
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const reverter = primitives.hex.decode_array(20, reverter_at[3..43]) catch unreachable;
+    try h.node.db.put_account(reverter, 0, 0, &.{ 0x5f, 0x5f, 0xfd });
+    const invalid = primitives.hex.decode_array(20, invalid_at[3..43]) catch unreachable;
+    try h.node.db.put_account(invalid, 0, 0, &.{0xfe});
+    const caller_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++
+        [_]u8{ 0x5a, 0xf1, 0x00 };
+    try h.node.db.put_account(@splat(0x57), 0, 0, &caller_code);
+}
+
+/// The counter called with 200000 gas, by hand: 179000 after the 21000 intrinsic. The cold
+/// SLOAD costs 2100, setting the (now warm) slot from 0 to 1 costs 20000, the MSTORE 3 plus
+/// one word of memory, the LOG0 375 plus 8 per byte of its 32; 22762 in all.
+const slot_zero = ",\"storage\":{" ++ word_zero ++ ":" ++ word_zero ++ "}";
+const slot_one = ",\"storage\":{" ++ word_zero ++ ":" ++ word_one ++ "}";
+const counter_struct_logs = "{\"failed\":false,\"gas\":43762,\"returnValue\":" ++ word_one ++
+    ",\"structLogs\":[" ++
+    struct_step(0, "PUSH0", 179000, 2, "", "") ++ "," ++
+    struct_step(1, "SLOAD", 178998, 2100, "\"0x0\"", slot_zero) ++ "," ++
+    struct_step(2, "PUSH1", 176898, 3, "\"0x0\"", "") ++ "," ++
+    struct_step(4, "ADD", 176895, 3, "\"0x0\",\"0x1\"", "") ++ "," ++
+    struct_step(5, "DUP1", 176892, 3, "\"0x1\"", "") ++ "," ++
+    struct_step(6, "PUSH0", 176889, 2, "\"0x1\",\"0x1\"", "") ++ "," ++
+    struct_step(7, "SSTORE", 176887, 20000, "\"0x1\",\"0x1\",\"0x0\"", slot_one) ++ "," ++
+    struct_step(8, "PUSH0", 156887, 2, "\"0x1\"", "") ++ "," ++
+    struct_step(9, "MSTORE", 156885, 6, "\"0x1\",\"0x0\"", "") ++ "," ++
+    struct_step(10, "PUSH1", 156879, 3, "", "") ++ "," ++
+    struct_step(12, "PUSH0", 156876, 2, "\"0x20\"", "") ++ "," ++
+    struct_step(13, "LOG0", 156874, 631, "\"0x20\",\"0x0\"", "") ++ "," ++
+    struct_step(14, "PUSH1", 156243, 3, "", "") ++ "," ++
+    struct_step(16, "PUSH0", 156240, 2, "\"0x20\"", "") ++ "," ++
+    struct_step(17, "RETURN", 156238, 0, "\"0x20\",\"0x0\"", "") ++ "]}";
+const reverter_struct_logs = "\"result\":{\"failed\":true,\"gas\":21004," ++
+    "\"returnValue\":\"0x\",\"structLogs\":[" ++
+    struct_step(0, "PUSH0", 179000, 2, "", "") ++ "," ++
+    struct_step(1, "PUSH0", 178998, 2, "\"0x0\"", "") ++ "," ++
+    struct_step(2, "REVERT", 178996, 0, "\"0x0\",\"0x0\"", "") ++ "]}";
+
+test "eth: debug_trace struct logger writes geth's default frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const gas = "\"gas\":\"0x30d40\"},\"latest\"";
+    try testing.expectEqualStrings("\"result\":" ++ counter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ "]",
+    ));
+    // An empty tracer name is the struct logger too.
+    try testing.expectEqualStrings("\"result\":" ++ counter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ ",{\"tracer\":\"\"}]",
+    ));
+    // REVERT is no step error; the frame failed and returned nothing.
+    try testing.expectEqualStrings(reverter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ reverter_at ++ "," ++ gas ++ "]",
+    ));
+    // INVALID halts with revm's error text, and the halt spends all the gas.
+    try testing.expectEqualStrings("\"result\":{\"failed\":true,\"gas\":200000," ++
+        "\"returnValue\":\"0x\",\"structLogs\":[{\"pc\":0,\"op\":\"INVALID\",\"gas\":179000," ++
+        "\"gasCost\":0,\"depth\":1,\"error\":\"Some(InvalidFEOpcode)\",\"stack\":[]," ++
+        "\"refund\":0}]}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ invalid_at ++ "," ++ gas ++ "]",
+    ));
+}
+
+test "eth: debug_trace struct logger honours its config" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const gas = "\"gas\":\"0x30d40\"},\"latest\"";
+    // Memory (after the MSTORE of 1 at 0) and return data on; stack and storage off; ten
+    // steps at most.
+    const config = "{\"disableStack\":true,\"disableStorage\":true,\"enableMemory\":true," ++
+        "\"enableReturnData\":true,\"limit\":10}";
+    const text = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ "," ++ config ++ "]",
+    );
+    try testing.expectEqual(@as(usize, 10), count_of(text, "\"pc\":"));
+    try testing.expect(std.mem.indexOf(u8, text, "\"stack\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"storage\"") == null);
+    try expect_contains(text, "{\"pc\":1,\"op\":\"SLOAD\",\"gas\":178998,\"gasCost\":2100," ++
+        "\"depth\":1,\"returnData\":\"0x\",\"memory\":[],\"refund\":0}");
+    try expect_contains(text, "{\"pc\":10,\"op\":\"PUSH1\",\"gas\":156879,\"gasCost\":3," ++
+        "\"depth\":1,\"returnData\":\"0x\",\"memory\":[" ++ word_one ++ "],\"refund\":0}]}");
+    // After the counter returns, the caller's STOP sees its output as return data.
+    const caller_at = "\"0x5757575757575757575757575757575757575757\"";
+    const nested = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "," ++ gas ++ ",{\"enableReturnData\":true}]",
+    );
+    try expect_contains(nested, "\"depth\":2,");
+    try expect_contains(nested, "{\"pc\":28,\"op\":\"STOP\",\"gas\":153623,\"gasCost\":0," ++
+        "\"depth\":1,\"stack\":[\"0x1\"],\"returnData\":" ++ word_one ++ ",\"refund\":0}]}");
+    // Tracers reth serves only as JavaScript, or that needlefish lacks, are internal errors.
+    const js = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"{result: 1}\"}]",
+    );
+    try expect_contains(js, "-32603");
+    try expect_contains(js, "JS Tracer is not enabled");
+    try expect_contains(try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"muxTracer\"}]",
+    ), "unsupported tracer");
+    // The block parameter fails first; the tracer is refused once the block is found.
+    const latests = "{\"tracer\":\"latests\"}]";
+    const by_tag = try h.request("debug_traceBlockByNumber", "[\"latests\"," ++ latests);
+    try expect_contains(by_tag, "-32602");
+    const by_number = try h.request("debug_traceBlockByNumber", "[\"0x7777\"," ++ latests);
+    try expect_contains(by_number, "block not found");
+    const found = try h.request("debug_traceBlockByNumber", "[\"latest\"," ++ latests);
+    try expect_contains(found, "JS Tracer is not enabled");
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+test "eth: debug_trace callTracer values follow revm-inspectors" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    // DELEGATECALL(gas, counter, 0, 0, 0, 0); POP; STATICCALL(gas, counter, 0, 0, 0, 0); STOP.
+    const call_counter = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++ [_]u8{0x5a};
+    const code = call_counter ++ [_]u8{ 0xf4, 0x50 } ++ call_counter ++ [_]u8{ 0xfa, 0x00 };
+    try h.node.db.put_account(@splat(0x59), 0, 0, &code);
+    const text = try h.request(
+        "debug_traceCall",
+        "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\"," ++
+            "\"to\":\"0x5959595959595959595959595959595959595959\",\"value\":\"0x7\"}," ++
+            "\"latest\",{\"tracer\":\"callTracer\"}]",
+    );
+    try expect_contains(text, "\"type\":\"DELEGATECALL\"");
+    try expect_contains(text, "\"type\":\"STATICCALL\"");
+    // The DELEGATECALL reports its parent's value; only the STATICCALL has none.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\":\"0x7\""));
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\""));
+}
+
+test "eth: debug_trace tracerConfig fields are typed as alloy's config structs" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const head = "[{\"to\":" ++ counter_at ++ "},\"latest\",";
+    const invalid = "-32602";
+    const config = "invalid tracer config";
+    const prestate = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":";
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":[]}}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"withLog\":1}}]", invalid, config);
+    const yes = prestate ++ "{\"diffMode\":\"yes\"}}]";
+    try expect_failure(h, "debug_traceCall", head ++ yes, invalid, config);
+    const object = prestate ++ "{\"diffMode\":{}}}]";
+    try expect_failure(h, "debug_traceCall", head ++ object, invalid, config);
+    const finalized = prestate ++ "{\"disableCode\":\"finalized\"}}]";
+    try expect_failure(h, "debug_traceCall", head ++ finalized, invalid, config);
+    const zero = prestate ++ "{\"disableStorage\":0}}]";
+    try expect_failure(h, "debug_traceCall", head ++ zero, invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++ "{\"tracer\":\"flatCallTracer\"," ++
+        "\"tracerConfig\":{\"convertParityErrors\":\"no\"}}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++ "{\"tracer\":\"flatCallTracer\"," ++
+        "\"tracerConfig\":{\"includePrecompiles\":[true]}}]", invalid, config);
+    // A config that is no object (or an array longer than the struct) does not deserialize.
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":5}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":[true,true,true]}]", invalid, config);
+    // Null reads as absent, unknown fields and other tracers' fields are ignored, an array
+    // fills the fields by position, and tracers without a config never read it.
+    const top = try h.request("debug_traceCall", head ++ "{\"tracer\":\"callTracer\"," ++
+        "\"tracerConfig\":{\"onlyTopCall\":null,\"diffMode\":\"yes\",\"other\":[]}}]");
+    try expect_contains(top, "\"type\":\"CALL\"");
+    const positional = try h.request("debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":[null,true]}]");
+    try expect_contains(positional, "\"logs\":[{");
+    try expect_contains(try h.request("debug_traceCall", head ++
+        "{\"tracer\":\"4byteTracer\",\"tracerConfig\":5}]"), "\"result\":{}");
+    // The struct logger's flags fail the params, as serde reads the whole options object.
+    try expect_failure(h, "debug_traceCall", head ++ "{\"debug\":\"x\"}]", invalid, "invalid");
+    try expect_failure(h, "debug_traceCall", head ++ "{\"timeout\":5}]", invalid, "invalid");
+    try expect_failure(h, "debug_traceCall", head ++ "{\"limit\":\"5\"}]", invalid, "invalid");
+    // A bad config is refused once the transaction is found, as reth builds its tracer.
+    const missing = "[\"0x" ++ zeros_62 ++ "01\",{\"tracer\":\"callTracer\",\"tracerConfig\":1}]";
+    try expect_failure(h, "debug_traceTransaction", missing, "-32000", "transaction not found");
+}
+
+test "eth: debug_traceCall without gas runs with the RPC gas cap" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    // reth's `prepare_call_env`: the 50M cap, not the block's gas limit.
+    const tracer = "{\"tracer\":\"callTracer\"}]";
+    const bare = try h.request("debug_traceCall", "[{},\"latest\"," ++ tracer);
+    try expect_contains(bare, "\"gas\":\"0x2faf080\"");
+    const call = try h.request("debug_traceCall", "[{\"to\":" ++ counter_at ++ "}," ++
+        "\"latest\"," ++ tracer);
+    try expect_contains(call, "\"gas\":\"0x2faf080\"");
+    // A priced call without gas runs with what the caller can afford: 100000 wei at 1 wei.
+    const priced = try h.request("debug_traceCall", "[{\"from\":" ++ poor_sender ++
+        ",\"to\":" ++ counter_at ++ ",\"gasPrice\":\"0x1\"},\"latest\",{\"tracer\":" ++
+        "\"callTracer\",\"stateOverrides\":{" ++ poor_sender ++ ":{\"balance\":\"0x186a0\"}}}]");
+    try expect_contains(priced, "\"gas\":\"0x186a0\"");
+    // A given gas is kept.
+    const given = try h.request("debug_traceCall", "[{\"to\":" ++ counter_at ++
+        ",\"gas\":\"0x30d40\"},\"latest\"," ++ tracer);
+    try expect_contains(given, "\"gas\":\"0x30d40\"");
+}
+
+/// Routes `body` into a response that grows on demand, as an HTTP response moves into a
+/// large send buffer; returns the response (caller frees).
+fn request_growing(h: *Harness, body: []const u8) ![]u8 {
+    var allocating: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer allocating.deinit();
+    _ = eth.Router.handle(&h.api, body, &allocating.writer);
+    return allocating.toOwnedSlice();
+}
+
+test "eth: debug_trace struct logs stream past the scratch into the response" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // JUMPDEST; PUSH0; JUMP: 11 gas a turn. 79000 gas after the intrinsic is 7181 turns
+    // and a JUMP that runs out with 6 left: 21546 steps, megabytes of logs where the
+    // scratch holds 256 KiB.
+    const looper: [20]u8 = @splat(0x5a);
+    try h.node.db.put_account(looper, 0, 0, &.{ 0x5b, 0x5f, 0x56 });
+    const body = request_prefix ++ "debug_traceCall\",\"params\":[{\"to\":" ++
+        "\"0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",\"gas\":\"0x186a0\"},\"latest\"]}";
+    const text = try request_growing(h, body);
+    defer testing.allocator.free(text);
+    try json.validate(text);
+    try testing.expect(text.len > h.scratch.len);
+    try testing.expect(std.mem.startsWith(u8, text, "{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"result\":{\"failed\":true,\"gas\":100000,\"returnValue\":\"0x\",\"structLogs\":[{"));
+    try testing.expectEqual(@as(usize, 21546), count_of(text, "\"pc\":"));
+    try expect_contains(text, "{\"pc\":2,\"op\":\"JUMP\",\"gas\":6,\"gasCost\":6,\"depth\":1," ++
+        "\"error\":\"Some(OutOfGas)\",\"stack\":[\"0x0\"],\"refund\":0}]}}");
+    // A response that cannot grow past its buffer fails cleanly, as jsonrpsee's.
+    const too_large = try h.request_runtime(body);
+    try expect_contains(too_large, oversized);
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+/// jsonrpsee's error for a response past reth's 160 MiB bound.
+const oversized = "\"error\":{\"code\":-32008,\"message\":\"Response is too big\"," ++
+    "\"data\":\"Exceeded max limit of 167772160\"}}";
+
+const http = @import("../../utilities/http/root.zig");
+
+/// A response as the node's HTTP server builds it: a 64 KiB send buffer whose body moves
+/// into `large` once a write needs more room (`http.ResponseBuilder`).
+const HttpResponse = struct {
+    small: [1 << 16]u8 = undefined,
+    large: []u8,
+    builder: http.ResponseBuilder = undefined,
+
+    fn acquire(context: *anyopaque, size_bytes: usize) ?[]u8 {
+        const response: *HttpResponse = @ptrCast(@alignCast(context));
+        return if (size_bytes <= response.large.len) response.large else null;
+    }
+
+    fn request(response: *HttpResponse, h: *Harness, body: []const u8) ![]const u8 {
+        response.builder = .init(&response.small);
+        response.builder.grow = .{ .context = response, .acquire = acquire };
+        _ = eth.Router.handle(&h.api, body, response.builder.writer());
+        const text = response.builder.writer().buffered();
+        try json.validate(text);
+        return text;
+    }
+};
+
+/// Reads `fan_out_count` storage slots (counter down to 1) and makes as many CALLs to 128
+/// fresh accounts (0x10000 + counter % 128): a transaction whose call tree and prestate
+/// run past a 64 KiB send buffer, within the fixture executor's state bounds.
+const fan_out_count = 900;
+const fan_out_code = [_]u8{
+    0x61, fan_out_count >> 8, fan_out_count & 0xff, // PUSH2 count
+    0x5b, 0x80, 0x15, 0x60, 0x24, 0x57, // loop (3): JUMPDEST DUP1 ISZERO PUSH1 end JUMPI
+    0x80, 0x54, 0x50, // SLOAD(counter) POP
+    0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x85, 0x60, 0x7f, 0x16, // the CALL's zeros, counter % 128
+    0x62, 0x01, 0x00, 0x00, 0x01, 0x5a, 0xf1, 0x50, // + 0x10000; GAS CALL POP
+    0x60, 0x01, 0x90, 0x03, 0x60, 0x03, 0x56, // counter - 1; PUSH1 loop JUMP
+    0x5b, 0x00, // end (0x24): JUMPDEST STOP
+};
+comptime {
+    std.debug.assert(fan_out_code[0x24] == 0x5b and fan_out_code[3] == 0x5b);
+}
+const fan_out_at = "\"0x5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b\"";
+
+fn fan_out_raw(buffer: []u8) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 3_000_000,
+        .to = .{ .call = .{ .bytes = @splat(0x5b) } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+test "eth: debug_trace tracers stream a heavy transaction into a growing response" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const scratch = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(scratch);
+    h.api.scratch = scratch;
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    try h.node.db.put_account(@splat(0x5b), 0, 0, &fan_out_code);
+    _ = try h.mine(12);
+    var buffer: [256]u8 = undefined;
+    const raw = try fan_out_raw(&buffer);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(24);
+    const large = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(large);
+    const response = try testing.allocator.create(HttpResponse);
+    defer testing.allocator.destroy(response);
+    response.* = .{ .large = large };
+    const block = request_prefix ++ "debug_traceBlockByNumber\",\"params\":[\"latest\",";
+    // Each slot read reports its zero value.
+    const zero_slot = "\":\"0x" ++ zeros_62 ++ "00\"";
+    const pre = try response.request(h, block ++ "{\"tracer\":\"prestateTracer\"}]}");
+    try testing.expect(pre.len > response.small.len);
+    try testing.expect(count_of(pre, zero_slot) >= fan_out_count);
+    const diff = try response.request(h, block ++ "{\"tracer\":\"prestateTracer\"," ++
+        "\"tracerConfig\":{\"diffMode\":true}}]}");
+    try expect_contains(diff, "\"post\":{");
+    const calls = try response.request(h, block ++ "{\"tracer\":\"callTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(calls, "\"type\":\"CALL\""));
+    const flat = try response.request(h, block ++ "{\"tracer\":\"flatCallTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(flat, "\"callType\""));
+    const four = try response.request(h, block ++ "{\"tracer\":\"4byteTracer\"}]}");
+    try expect_contains(four, "\"result\":{}");
+    // debug_traceCall's prestate and call paths hold the same call.
+    const call = request_prefix ++ "debug_traceCall\",\"params\":[{\"to\":" ++ fan_out_at ++
+        "},\"latest\",";
+    const call_pre = try response.request(h, call ++ "{\"tracer\":\"prestateTracer\"}]}");
+    try testing.expect(count_of(call_pre, zero_slot) >= fan_out_count);
+    const call_tree = try response.request(h, call ++ "{\"tracer\":\"callTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(call_tree, "\"to\""));
+    // Past the large buffer: jsonrpsee's oversized response, not a torn result.
+    response.large = large[0 .. 64 << 10];
+    const call_tracer = "{\"tracer\":\"callTracer\"}]}";
+    try expect_contains(try response.request(h, block ++ call_tracer), oversized);
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+test "eth: debug_trace 4byteTracer, noopTracer and flatCallTracer" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const four = "{\"tracer\":\"4byteTracer\"}";
+    try testing.expectEqualStrings("\"result\":{\"0x12345678-2\":1}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ ",\"input\":\"0x12345678aabb\"},\"latest\"," ++ four ++ "]",
+    ));
+    // The caller's CALL passes no input: nothing to count.
+    const caller_at = "\"0x5757575757575757575757575757575757575757\"";
+    try testing.expectEqualStrings("\"result\":{}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\"," ++ four ++ "]",
+    ));
+    try testing.expectEqualStrings("\"result\":{}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\",{\"tracer\":\"noopTracer\"}]",
+    ));
+    // By hand: the caller spends 15 on pushes and GAS, 2600 on the cold CALL and the 22762
+    // the counter uses (0x6321); the counter gets all but 1/64 of the 176385 left (0x2a63d).
+    const flat = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ ",\"gas\":\"0x30d40\"},\"latest\"," ++
+            "{\"tracer\":\"flatCallTracer\"}]",
+    );
+    try expect_contains(flat, "\"result\":[{\"action\":{\"from\":");
+    try expect_contains(flat, "\"callType\":\"call\",\"gas\":\"0x30d40\",\"input\":\"0x\"," ++
+        "\"to\":" ++ caller_at ++ ",\"value\":\"0x0\"},\"blockNumber\":");
+    try expect_contains(flat, "\"result\":{\"gasUsed\":\"0x6321\",\"output\":\"0x\"}," ++
+        "\"subtraces\":1,\"traceAddress\":[],\"transactionHash\":null," ++
+        "\"transactionPosition\":null,\"type\":\"call\"},{\"action\":{\"from\":" ++ caller_at ++
+        ",\"callType\":\"call\",\"gas\":\"0x2a63d\",\"input\":\"0x\",\"to\":" ++ counter_at ++
+        ",\"value\":\"0x0\"},\"blockNumber\":");
+    try expect_contains(flat, "\"result\":{\"gasUsed\":\"0x58ea\",\"output\":" ++ word_one ++
+        "},\"subtraces\":0,\"traceAddress\":[0],\"transactionHash\":null," ++
+        "\"transactionPosition\":null,\"type\":\"call\"}]");
+    try testing.expect(std.mem.indexOf(u8, flat, "blockHash") == null);
+    // A halt other than a revert has a parity error and no result.
+    try expect_contains(try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ invalid_at ++ "},\"latest\",{\"tracer\":\"flatCallTracer\"}]",
+    ), "\"error\":\"Bad instruction\",\"result\":null,\"subtraces\":0");
 }
 
 const zeros_62 = "00000000000000000000000000000000000000000000000000000000000000";
@@ -1470,7 +3056,9 @@ test "eth: debug_trace prestateTracer reports pre-transaction state and diffs" {
     const first_hash = primitives.keccak256(first).bytes;
     const changes = try trace_request(h, "debug_traceTransaction", &first_hash, diff);
     const post = changes[std.mem.indexOf(u8, changes, "\"post\"").?..];
-    try expect_contains(changes[0 .. changes.len - post.len], word_zero);
+    // The counter's slot was zero: a diff leaves zero values out (revm-inspectors).
+    const pre_side = changes[0 .. changes.len - post.len];
+    try testing.expect(std.mem.indexOf(u8, pre_side, "storage") == null);
     try expect_contains(post, word_one);
     try expect_contains(post, "\"nonce\":1");
     const by_hash = try trace_request(h, "debug_traceBlockByHash", &block.bytes, plain);
@@ -1565,6 +3153,378 @@ test "eth: prestateTracer keeps accounts and slots touched by reverted frames" {
     try expect_contains(text, "\"storage\":{\"0x" ++ zeros_62 ++ "00\":" ++ word_zero);
 }
 
+fn tip_free_call_raw(buffer: []u8, chain_id: u64, to: [20]u8) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 0,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = .{ .call = .{ .bytes = to } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const vaults = [_][]const u8{ "19", "1a", "1b" };
+    for (vaults) |last| {
+        var address: [20]u8 = @splat(0);
+        address[0] = 0x42;
+        address[19] = std.fmt.parseInt(u8, last, 16) catch unreachable;
+        try h.node.db.put_account(address, 1, 0, &.{0x00});
+    }
+    // The coinbase, and the L1Block contract the L1 fee parameters are read from.
+    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
+    var l1_block: [20]u8 = @splat(0);
+    l1_block[0] = 0x42;
+    l1_block[19] = 0x15;
+    try h.node.db.put_account(l1_block, 1, 0, &.{0x00});
+    _ = try h.mine(2);
+    var buffer: [256]u8 = undefined;
+    const raw = try tip_free_call_raw(&buffer, h.node.spec.chain_id, l1_block);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(4);
+    const hash = primitives.keccak256(raw).bytes;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceTransaction", &hash, plain);
+    // A transaction without a tip still pays the coinbase (nothing), which revm loads.
+    try expect_contains(traced, "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\"");
+    // The L1 fee parameters are read outside the EVM: no L1Block slot is listed.
+    // Nethermind lists an account's code hash next to its code.
+    try expect_contains(traced, "\"0x4200000000000000000000000000000000000015\":{" ++
+        "\"balance\":\"0x1\",\"code\":\"0x00\",\"codeHash\":" ++ code_hash_00 ++ "}");
+    // A call charges no fee and credits no fee vault; as Nethermind, the coinbase is
+    // listed (credited nothing) and empty accounts are left out.
+    const call = try h.request("debug_traceCall", "[{\"from\":" ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x00000000000000000000000000000000000000aa\"},\"latest\",{\"tracer\":" ++
+        "\"prestateTracer\",\"tracerConfig\":{\"disableCode\":true}}]");
+    try testing.expect(std.mem.startsWith(u8, call, "\"result\":{" ++
+        "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\":\"0x"));
+    try testing.expect(std.mem.endsWith(u8, call, "\"}}"));
+    try testing.expectEqual(@as(usize, 1), count_of(call, "balance"));
+    // An overridden account the call never loads is not reported; the sender, empty
+    // before, is left out of a diff's pre (Nethermind), and both it and the account it
+    // creates are in post.
+    const created = try h.request("debug_traceCall", "[{\"from\":" ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\"},\"latest\",{\"stateOverrides\":" ++
+        "{\"0x5b76c950a887b42e74fdde348bf928517f41cf70\":{\"code\":\"0x\"}},\"tracer\":" ++
+        "\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]");
+    try testing.expectEqualStrings("\"result\":{\"pre\":{},\"post\":{" ++
+        "\"0x5c7d5a7b707d05be9a3f8f28eb3099ed20e22f9f\":{\"nonce\":1}," ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
+}
+
+test "eth: a call object member of the wrong type is refused" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Nethermind types every `TransactionForRpc` member: a block tag is no nonce.
+    const tagged = "[{\"nonce\":\"finalized\",\"to\":" ++ address_target ++ "},\"latest\"]";
+    try expect_contains(try h.request("eth_estimateGas", tagged), "{\"code\":-32602");
+    try expect_contains(try h.request("eth_call", tagged), "{\"code\":-32602");
+    const bad_hash = "[{\"blockHash\":\"0x12\",\"to\":" ++ address_target ++ "},\"latest\"]";
+    try expect_contains(try h.request("eth_call", bad_hash), "{\"code\":-32602");
+    // A padded hex nonce or a decimal one reads as Nethermind's `ULongConverter` reads it.
+    const padded = "[{\"nonce\":\"0x01\",\"v\":\"27\",\"to\":" ++ address_target ++
+        "},\"latest\"]";
+    try expect_contains(try h.request("eth_call", padded), "\"result\":\"0x\"");
+}
+
+test "eth: prestateTracer diff leaves out an account destroyed in a reverted frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 0x..c0de creates a child whose init code self-destructs (CALLER SELFDESTRUCT), then
+    // reverts everything (INVALID). As Nethermind and geth, the destroyed account stays out
+    // of post although the revert undid the destruction; an account created without
+    // destroying itself is listed missing (a zero code hash).
+    const request = "[{\"from\":\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x000000000000000000000000000000000000c0de\"},\"latest\",{\"stateOverrides\":{" ++
+        "\"0x000000000000000000000000000000000000c0de\":{\"code\":\"0x61";
+    const config = "6000526002601e6000f0fe\"}},\"tracer\":\"prestateTracer\"," ++
+        "\"tracerConfig\":{\"diffMode\":true}}]";
+    // The child, at nonce 0 of 0x..c0de.
+    const child = "\"0x8bbc3514477d75ec797bbe4e19d7961660bb849c\":";
+    const destroyed = try h.request("debug_traceCall", request ++ "33ff" ++ config);
+    try testing.expect(std.mem.indexOf(u8, destroyed, child) == null);
+    const kept = try h.request("debug_traceCall", request ++ "0000" ++ config);
+    try expect_contains(kept, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+}
+
+test "eth: prestateTracer diff lists a create that fails before it runs" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 0x..c0de (no balance) creates with one wei: the create pays its gas, then cannot
+    // transfer the value, so the account never exists. As geth and Nethermind (the address
+    // is looked up once the instruction's gas is paid, and counted created), post lists it
+    // missing (a zero code hash) and pre leaves it out.
+    const request = "[{\"from\":\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x000000000000000000000000000000000000c0de\"},\"latest\",{\"stateOverrides\":{" ++
+        "\"0x000000000000000000000000000000000000c0de\":{\"code\":\"0x600060006001f000\"}}," ++
+        "\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]";
+    const child = "\"0x8bbc3514477d75ec797bbe4e19d7961660bb849c\":";
+    const diff = try h.request("debug_traceCall", request);
+    const post = diff[std.mem.indexOf(u8, diff, "\"post\"").?..];
+    try testing.expect(std.mem.indexOf(u8, diff[0 .. diff.len - post.len], child) == null);
+    try expect_contains(post, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+}
+
+test "eth: prestateTracer diff of a creation call that cannot pay its value" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // As Nethermind: the address the creation makes is looked up and counted created, so
+    // post lists it missing; the missing sender, which Nethermind creates for an unpriced
+    // call and whose nonce the failed creation leaves alone, is no diff.
+    const request = "[{\"from\":\"0x00000000000000000000000000000000000000aa\",\"input\":" ++
+        "\"0x6001600055\",\"value\":\"0xffffffffffffffffffffffffffff\"},\"latest\"," ++
+        "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]";
+    const diff = try h.request("debug_traceCall", request);
+    try testing.expect(std.mem.startsWith(u8, diff, "\"result\":{\"pre\":{},\"post\":{"));
+    try expect_contains(diff, "\"0x45eb6484d76cfe3f45708b91f5af8ce495134fac\":{\"codeHash\":" ++
+        "\"0x" ++ zeros_62 ++ "00\"}");
+    try testing.expect(std.mem.indexOf(u8, diff, "00000000000000000000aa") == null);
+}
+
+test "eth: prestateTracer diff lists a looked-up missing account with a zero code hash" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The identity precompile has no account. Nethermind (as geth) reads a zero code hash
+    // for an account missing after the transaction, which differs from the empty-code
+    // hash it assumes before: the diff's post lists it, its pre does not.
+    const call = "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"to\":" ++
+        "\"0x0000000000000000000000000000000000000004\"},\"latest\",{\"tracer\":" ++
+        "\"prestateTracer\"";
+    const diff_config = ",\"tracerConfig\":{\"diffMode\":true}}]";
+    const diff = try h.request("debug_traceCall", call ++ diff_config);
+    const post = diff[std.mem.indexOf(u8, diff, "\"post\"").?..];
+    const identity = "\"0x0000000000000000000000000000000000000004\":";
+    try expect_contains(post, identity ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+    try testing.expectEqual(@as(usize, 1), count_of(diff, identity));
+    const plain = try h.request("debug_traceCall", call ++ "}]");
+    try testing.expect(std.mem.indexOf(u8, plain, identity) == null);
+}
+
+/// keccak256(0x00), the code hash of the one-byte code `0x00`.
+const code_hash_00 = "\"0xbc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a\"";
+
+test "eth: prestateTracer lists an authority whose authorization is invalid" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Key 1's account (funded by the fixture) signs for chain 1: the authorization is
+    // skipped, yet Nethermind's tracer still looks the authority up.
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = 1,
+        .address = .{ .bytes = @splat(0xcc) },
+        .nonce = 0,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(1), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    var body: [1024]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceCall\",\"params\":[{{\"to\":" ++
+        "\"0x00000000000000000000000000000000000000aa\",\"authorizationList\":[{{" ++
+        "\"chainId\":\"0x1\",\"address\":\"0x{x}\",\"nonce\":\"0x0\",\"yParity\":\"0x{x}\"," ++
+        "\"r\":\"0x{x}\",\"s\":\"0x{x}\"}}]}},\"latest\",{{\"tracer\":\"prestateTracer\"}}]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{
+        &authorization.address.bytes,
+        authorization.y_parity,
+        authorization.r,
+        authorization.s,
+    });
+    const traced = try h.request_runtime(request);
+    try expect_contains(traced, "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\":{\"balance\"");
+}
+
+test "eth: prestateTracer lists the callee's delegate from before the authorizations" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Key 1's account is delegated to 0xd0.. and re-delegates to 0xd1.. in the call it
+    // receives. Nethermind's tracer looks up the delegate before the authorization applies;
+    // the call then runs 0xd1..'s (empty) code without listing it.
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = 0,
+        .address = .{ .bytes = @splat(0xd1) },
+        .nonce = 0,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(1), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    const authority = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    const old = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
+    const new = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+    var body: [1536]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceCall\",\"params\":[{{\"to\":\"" ++
+        authority ++ "\",\"authorizationList\":[{{\"chainId\":\"0x0\",\"address\":" ++
+        "\"0x{x}\",\"nonce\":\"0x0\",\"yParity\":\"0x{x}\",\"r\":\"0x{x}\",\"s\":\"0x{x}\"}}]}}," ++
+        "\"latest\",{{\"tracer\":\"prestateTracer\",\"stateOverrides\":{{\"" ++ authority ++
+        "\":{{\"code\":\"0xef0100" ++ old ++ "\"}},\"0x" ++ old ++ "\":{{\"balance\":\"0x1\"}}," ++
+        "\"0x" ++ new ++ "\":{{\"balance\":\"0x1\"}}}}}}]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{
+        &authorization.address.bytes,
+        authorization.y_parity,
+        authorization.r,
+        authorization.s,
+    });
+    const traced = try h.request_runtime(request);
+    try expect_contains(traced, "\"" ++ authority ++ "\":{\"balance\"");
+    try expect_contains(traced, "\"0x" ++ old ++ "\":{\"balance\":\"0x1\"}");
+    try testing.expect(std.mem.indexOf(u8, traced, new) == null);
+}
+
+test "eth: prestateTracer lists an authority whose authorization nonce mismatches" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // Key 2's account, delegated already at nonce 74, signs for nonce 93 on this chain.
+    const designator = [_]u8{ 0xef, 0x01, 0x00 } ++ @as([19]u8, @splat(0)) ++ [_]u8{0x06};
+    try h.node.db.put_account(fixture.address_of(2).bytes, 1, 74, &designator);
+    _ = try h.mine(2);
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = h.node.spec.chain_id,
+        .address = .{ .bytes = @as([19]u8, @splat(0)) ++ [_]u8{0x0c} },
+        .nonce = 93,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(2), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    var list_bytes: [256]u8 = undefined;
+    var encoder = rlp.Encoder.init(&list_bytes);
+    rlp.encode(&encoder, authorization);
+    const tx: consensus.Eip7702 = .{
+        .chain_id = h.node.spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 0,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = .{ .bytes = @as([19]u8, @splat(0)) ++ [_]u8{0xaa} },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+        .authorization_list = .{ .payload = encoder.written(), .count = 1 },
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    var buffer: [512]u8 = undefined;
+    const raw = envelope.encode_to(&buffer);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(4);
+    const hash = primitives.keccak256(raw).bytes;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceTransaction", &hash, plain);
+    var expected: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&expected, "\"0x{x}\":{{\"balance\"", .{
+        &fixture.address_of(2).bytes,
+    });
+    try expect_contains(traced, key);
+}
+
+test "eth: prestateTracer leaves out an account an instruction cannot pay to run" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 0x..be (one wei) and 0x..d1e (delegated to it) are named by the code below.
+    const other = "00000000000000000000000000000000000000be";
+    const delegated = "0000000000000000000000000000000000000d1e";
+    const listed = "\"0x" ++ other ++ "\":{\"balance\"";
+    const other_key = "\"0x" ++ other ++ "\":";
+    const delegated_key = "\"0x" ++ delegated ++ "\":{\"balance\"";
+    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"";
+    const tracer = "\"},\"latest\",{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++
+        "\"0x" ++ other ++ "\":{\"balance\":\"0x1\"},\"0x" ++ delegated ++
+        "\":{\"code\":\"0xef0100" ++ other ++ "\"}," ++ override_target ++ ":{\"code\":\"";
+    // As geth's tracer (the failed opcode reported with its error), nothing is looked up.
+    // BALANCE of a cold account without gas for the cold access: never read.
+    const balance_code = "0x73" ++ other ++ "3100";
+    const balance = try h.request("debug_traceCall", request ++ "0x5400" ++ tracer ++
+        balance_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, balance, other_key) == null);
+    // EXTCODECOPY of 64 KiB: the account is read, then the memory is unaffordable.
+    const copy_code = "0x61ffff60006000" ++ "73" ++ other ++ "3c00";
+    const copied = try h.request("debug_traceCall", request ++ "0x7918" ++ tracer ++
+        copy_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, copied, other_key) == null);
+    // A CALL the frame cannot pay for: neither the target nor its delegate.
+    const call_code = "0x60006000600060006000" ++ "73" ++ delegated ++ "61fffff100";
+    const called = try h.request("debug_traceCall", request ++ "0x5400" ++ tracer ++
+        call_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, called, delegated_key) == null);
+    try testing.expect(std.mem.indexOf(u8, called, other_key) == null);
+    // The same with gas to spare lists both, and so does a CALL that runs but cannot
+    // transfer its value (the caller has none).
+    const paid = try h.request("debug_traceCall", request ++ "0x30000" ++ tracer ++
+        call_code ++ "\"}}}]");
+    try expect_contains(paid, delegated_key);
+    try expect_contains(paid, listed);
+    const value_code = "0x60006000600060006001" ++ "73" ++ other ++ "61fffff100";
+    const valued = try h.request("debug_traceCall", request ++ "0x30000" ++ tracer ++
+        value_code ++ "\"}}}]");
+    try expect_contains(valued, listed);
+}
+
+test "eth: prestateTracer leaves out a slot whose SSTORE runs out of gas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // SLOAD 0xbc, then SSTORE 1 to the cold slot 0xbb: the frame can load 0xbb but not pay
+    // the 22100 for the write. The failed instruction's slot is not listed.
+    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"0x7530\"},\"latest\"," ++
+        "{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x60";
+    const store_code = "5450600160bb5500\"}}}]";
+    const slot_bc = "\"0x" ++ zeros_62 ++ "bc\":\"0x" ++ zeros_62 ++ "00\"";
+    const slot_bb = "\"0x" ++ zeros_62 ++ "bb\":\"0x" ++ zeros_62 ++ "00\"";
+    const failed = try h.request("debug_traceCall", request ++ "bc" ++ store_code);
+    try expect_contains(failed, "\"storage\":{" ++ slot_bc ++ "}");
+    try testing.expect(std.mem.indexOf(u8, failed, slot_bb) == null);
+    // A slot read before the failing SSTORE stays listed.
+    const read_first = try h.request("debug_traceCall", request ++ "bb" ++ store_code);
+    try expect_contains(read_first, "\"storage\":{" ++ slot_bb ++ "}");
+}
+
+test "eth: a call naming a tip but no fee cap fails as in geth and Nethermind" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The missing fee cap stays zero (geth `CallDefaults`), below the tip.
+    const inner = "max priority fee per gas higher than max fee per gas: address " ++
+        "0x0000000000000000000000000000000000000000, maxPriorityFeePerGas: 1, maxFeePerGas: 0";
+    const tip_call = "{\"to\":" ++ override_target ++ ",\"maxPriorityFeePerGas\":\"0x1\"}";
+    const called = try h.request("eth_call", "[" ++ tip_call ++ ",\"latest\"]");
+    try testing.expectEqualStrings("\"error\":{\"code\":-32000,\"message\":\"err: " ++ inner ++
+        " (supplied gas 50000000)\"}", called);
+    const traced = try h.request("debug_traceCall", "[" ++ tip_call ++ ",\"latest\",{}]");
+    try testing.expectEqualStrings("\"error\":{\"code\":-32000,\"message\":\"tracing failed: " ++
+        inner ++ "\"}", traced);
+    const gas_given = "{\"gas\":\"0x7530\",\"maxPriorityFeePerGas\":\"0x1\"}";
+    const estimated = try h.request("eth_estimateGas", "[" ++ gas_given ++ "]");
+    const failed_with = "\"error\":{\"code\":-32000,\"message\":\"failed with 30000 gas: ";
+    try testing.expectEqualStrings(failed_with ++ inner ++ "\"}", estimated);
+    // A zero tip is not above the zero cap.
+    const zero_tip = "[{\"to\":" ++ override_target ++ ",\"maxPriorityFeePerGas\":\"0x0\"}]";
+    const unrefused = try h.request("eth_call", zero_tip);
+    try testing.expect(std.mem.indexOf(u8, unrefused, "maxPriorityFeePerGas") == null);
+}
+
 const override_target = "\"0x0000000000000000000000000000000000007777\"";
 
 test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block overrides" {
@@ -1600,7 +3560,100 @@ test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block o
     // Malformed overrides are invalid params.
     const bad = "{" ++ override_target ++ ":{\"colour\":\"0x01\"}}]";
     try expect_contains(try h.request("eth_call", call ++ bad), "-32602");
-    try expect_contains(try h.request("eth_call", call ++ "null,{\"bogus\":1}]"), "-32602");
+    // Unknown block override members are ignored, as serde ignores them.
+    try expect_contains(try h.request("eth_call", call ++ "null,{\"bogus\":1}]"), "\"result\"");
+    const both = "{" ++ override_target ++ ":{\"state\":{},\"stateDiff\":{}}}]";
+    try expect_contains(try h.request("eth_call", call ++ both), "{\"code\":-32602,\"message\":" ++
+        "\"account 0x0000000000000000000000000000000000007777 has both 'state' and 'stateDiff'\"}");
+}
+
+test "eth: any state override of a precompile's address makes it an ordinary account" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's override `Apply` (and Nethermind's): the identity precompile echoes its input
+    // until an override names its address, then the account's code runs.
+    const identity = "\"0x0000000000000000000000000000000000000004\"";
+    const call = "[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"},\"latest\"";
+    const word_7 = "\"result\":\"0x" ++ zeros_62 ++ "07\"";
+    const word_42 = "\"result\":\"0x" ++ zeros_62 ++ "2a\"";
+    try expect_contains(try h.request("eth_call", call ++ "]"), word_7);
+    const code_42 = "{" ++ identity ++ ":{\"code\":\"0x602a5f5260205ff3\"}}";
+    try expect_contains(try h.request("eth_call", call ++ "," ++ code_42 ++ "]"), word_42);
+    // Without code too: the account has none, so the call returns nothing.
+    const balance = "{" ++ identity ++ ":{\"balance\":\"0x1\"}}";
+    const none = try h.request("eth_call", call ++ "," ++ balance ++ "]");
+    try expect_contains(none, "\"result\":\"0x\"");
+    // A delegation designator as override code is followed.
+    const delegated = "{" ++ identity ++ ":{\"code\":\"0xef0100" ++
+        "0000000000000000000000000000000000007777\"}," ++ override_target ++
+        ":{\"code\":\"0x602a5f5260205ff3\"}}";
+    try expect_contains(try h.request("eth_call", call ++ "," ++ delegated ++ "]"), word_42);
+    const traced = try h.request("debug_traceCall", call ++
+        ",{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ code_42 ++ "}]");
+    try expect_contains(traced, "\"output\":\"0x" ++ zeros_62 ++ "2a\"");
+    // Not carried into the next call.
+    try expect_contains(try h.request("eth_call", call ++ "]"), word_7);
+    // eth_simulateV1: only for the overriding block.
+    const simulated = "[{\"blockStateCalls\":[{\"stateOverrides\":" ++ code_42 ++
+        ",\"calls\":[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"}]}," ++
+        "{\"calls\":[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"}]}]}]";
+    const blocks = try h.request("eth_simulateV1", simulated);
+    const first = std.mem.indexOf(u8, blocks, "\"returnData\":\"0x" ++ zeros_62 ++ "2a\"").?;
+    const second = std.mem.indexOf(u8, blocks, "\"returnData\":\"0x" ++ zeros_62 ++ "07\"").?;
+    try testing.expect(first < second);
+}
+
+test "eth: eth_call, eth_estimateGas and eth_createAccessList report reth's call errors" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const call = "[{\"to\":" ++ override_target;
+    const nope = "\"latest\",{" ++ override_target ++ ":{\"code\":\"" ++ revert_nope_code ++
+        "\"}}]";
+    const reverted = "{\"code\":3,\"message\":\"execution reverted: nope\",\"data\":\"" ++
+        revert_nope_data ++ "\"}";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ nope), reverted);
+    try expect_contains(try h.request("eth_estimateGas", call ++ "}," ++ nope), reverted);
+    const limited = call ++ ",\"gas\":\"0x7530\"}," ++ nope;
+    try expect_contains(try h.request("eth_estimateGas", limited), reverted);
+    const listed = try h.request("eth_createAccessList", call ++ "}," ++ nope);
+    try expect_contains(listed, "\"error\":\"execution reverted: nope\"}");
+    // Halts are -32003 with reth's text.
+    const fe = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0xfe\"}}]";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ fe), "{\"code\":-32003," ++
+        "\"message\":\"EVM error: InvalidFEOpcode\"}");
+    const loop = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0x5b5f56\"}}]";
+    const out_of_gas = "out of gas: gas required exceeds: 21248\"}";
+    const looping = call ++ ",\"gas\":\"0x5300\"}," ++ loop;
+    try expect_failure(h, "eth_call", looping, "-32003", out_of_gas);
+    // Fee fields: the base fee check, conflicts, and the caller's allowance.
+    const low_fee = "max fee per gas less than block base fee\"}";
+    try expect_failure(h, "eth_call", call ++ ",\"maxFeePerGas\":\"0x1\"}]", "-32000", low_fee);
+    try expect_contains(try h.request("eth_call", call ++ ",\"gasPrice\":\"0x1\"," ++
+        "\"maxFeePerGas\":\"0x1\"}]"), "{\"code\":-32602,\"message\":\"both gasPrice and " ++
+        "(maxFeePerGas or maxPriorityFeePerGas) specified\"}");
+    const poor = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target;
+    const priced = poor ++ ",\"gasPrice\":\"0x1\"}]";
+    // As Nethermind (and geth), the 21000 transfer shortcut needs the sender to fund it.
+    const allowance = "gas required exceeds allowance (0)\"}";
+    try expect_failure(h, "eth_estimateGas", priced, "-32000", allowance);
+    const priced_create = "[{\"from\":" ++ poor_sender ++ ",\"gasPrice\":\"0x1\"}]";
+    try expect_failure(h, "eth_estimateGas", priced_create, "-32000", allowance);
+    try expect_contains(try h.request("eth_call", poor ++ ",\"gasPrice\":\"0x1\"," ++
+        "\"value\":\"0x1\"}]"), "{\"code\":-32003,\"message\":\"insufficient funds for gas * " ++
+        "price + value: have 0 want 1\"}");
+    try expect_failure(h, "eth_createAccessList", priced, "-32000", "intrinsic gas too low\"}");
+    const short = poor ++ ",\"value\":\"0x1\"}]";
+    try expect_failure(h, "eth_call", short, "-32003", "EVM error: OutOfFunds\"}");
+    // The RPC gas cap (50M) is the default gas and bounds a larger one (GAS returns the
+    // cap less 21000 and the GAS opcode's 2).
+    const gas_left = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0x5a5f5260205ff3\"}}]";
+    const capped = "\"result\":\"0x" ++ zeros_62[0..57] ++ "2fa9e76\"";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ gas_left), capped);
+    const above = call ++ ",\"gas\":\"0x5f5e100\"}," ++ gas_left;
+    try expect_contains(try h.request("eth_call", above), capped);
+    // reth's estimate stops within 1.5%: a bare create needs 53000 and reports 53793.
+    const create = try h.request("eth_estimateGas", "[{\"from\":" ++ poor_sender ++ "}]");
+    try expect_contains(create, "\"result\":\"0xd221\"");
 }
 
 test "eth: seeded fuzz of eth_call storage overrides" {
@@ -1754,6 +3807,10 @@ test "eth: debug_traceBlock traces an RLP block like debug_traceBlockByNumber" {
     const configs = [_][]const u8{
         "{\"tracer\":\"callTracer\"}",
         "{\"tracer\":\"prestateTracer\"}",
+        "{\"tracer\":\"4byteTracer\"}",
+        "{\"tracer\":\"noopTracer\"}",
+        "{\"tracer\":\"flatCallTracer\"}",
+        "{\"disableStack\":true}",
     };
     for (configs) |config| {
         var copy: [8192]u8 = undefined;
@@ -2284,4 +4341,130 @@ fn fuzz_sender_nonce(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: fuzz eth_getTransactionBySenderAndNonce nonces" {
     try testing.fuzz({}, fuzz_sender_nonce, .{});
+}
+
+// ---- eth_createAccessList (reth's AccessListInspector) and base_meterBundle opcodeGas ----
+
+inline fn address_hex(comptime byte: []const u8) []const u8 {
+    const zeros: [38]u8 = @splat('0');
+    return "\"0x" ++ zeros ++ byte ++ "\"";
+}
+
+inline fn slot_hex(comptime byte: []const u8) []const u8 {
+    const zeros: [62]u8 = @splat('0');
+    return "\"0x" ++ zeros ++ byte ++ "\"";
+}
+
+/// 0x41 reads its slot 7, the balance of 0x44 and calls 0x42, which reads its slot 1 and
+/// the code size of 0x55 and reverts; 0x41 then stops.
+fn put_access_list_contracts(h: *Harness) !void {
+    const caller = [_]u8{
+        0x60, 0x07, 0x54, 0x50, 0x60, 0x44, 0x31, 0x50, // PUSH1 7 SLOAD POP PUSH1 0x44 BALANCE POP
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x42, 0x5a, // PUSH0 x5 PUSH1 0x42 GAS
+        0xf1, 0x50, 0x00, // CALL POP STOP
+    };
+    // PUSH1 1 SLOAD POP PUSH1 0x55 EXTCODESIZE POP PUSH0 PUSH0 REVERT.
+    const reverter = [_]u8{ 0x60, 0x01, 0x54, 0x50, 0x60, 0x55, 0x3b, 0x50, 0x5f, 0x5f, 0xfd };
+    var address: [20]u8 = @splat(0);
+    address[19] = 0x41;
+    try h.node.db.put_account(address, 0, 1, &caller);
+    address[19] = 0x42;
+    try h.node.db.put_account(address, 0, 1, &reverter);
+    _ = try h.mine(12);
+}
+
+test "eth: eth_createAccessList follows reth's access list inspector" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_access_list_contracts(h);
+    // The request's untouched 0x66 stays; its seeded slot 9 of the excluded `to` stays too
+    // (geth, Nethermind: only a slotless excluded account goes), as does the slot `to`
+    // reads; the reverted frame's accesses stay.
+    const call = "[{\"to\":" ++ address_hex("41") ++ ",\"accessList\":[{\"address\":" ++
+        address_hex("66") ++ ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++
+        address_hex("41") ++ ",\"storageKeys\":[" ++ slot_hex("09") ++ "]}]}]";
+    // Second run: 21000 + 5 * 2400 + 4 * 1900 intrinsic; 0x41 runs 327 gas with every
+    // access warm, 0x42 214 (PUSH1 3, SLOAD 100, POP 2, PUSH1 3, EXTCODESIZE 100, POP 2,
+    // PUSH0 PUSH0 4): 41141.
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("41") ++
+        ",\"storageKeys\":[" ++ slot_hex("07") ++ "," ++ slot_hex("09") ++
+        "]},{\"address\":" ++ address_hex("42") ++
+        ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("44") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("55") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("66") ++ ",\"storageKeys\":[" ++
+        slot_hex("01") ++ "]}],\"gasUsed\":\"0xa0b5\"}";
+    try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
+}
+
+test "eth: eth_createAccessList converges past a failed run, with its gas and error" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_access_list_contracts(h);
+    const call = "[{\"to\":" ++ address_hex("42") ++ ",\"accessList\":[{\"address\":" ++
+        address_hex("77") ++ ",\"storageKeys\":[]}]}]";
+    // The failed run lists more, so it runs again with that list (geth, Nethermind); the
+    // gas is that run's: 21000 + 3 * 2400 + 1900 intrinsic; PUSH1 3, warm SLOAD 100, POP 2,
+    // PUSH1 3, warm EXTCODESIZE 100, POP 2, PUSH0 PUSH0 4: 30314.
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("42") ++
+        ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("55") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("77") ++
+        ",\"storageKeys\":[]}],\"gasUsed\":\"0x766a\",\"error\":\"execution reverted\"}";
+    try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
+}
+
+test "eth: eth_createAccessList keeps the callee's slot when the next run stops sooner" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // KECCAK256 of 6 KiB (1835 gas with its PUSHes and memory), POP, SLOAD(0), then loop
+    // until out of gas. The first run reads slot 0; with the list attached (4300 more
+    // intrinsic gas) the second runs out of gas before the SLOAD. As geth and Nethermind,
+    // the callee's listed slot stays, so the list converges on that run.
+    const code = [_]u8{ 0x61, 0x18, 0x00, 0x5f, 0x20, 0x50, 0x5f, 0x54, 0x5b, 0x60, 0x08, 0x56 };
+    var contract: [20]u8 = @splat(0);
+    contract[19] = 0x5a;
+    try h.node.db.put_account(contract, 0, 1, &code);
+    _ = try h.mine(1);
+    const call = "[{\"to\":" ++ address_hex("5a") ++ ",\"gas\":\"0x6590\"}]";
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("5a") ++
+        ",\"storageKeys\":[" ++ slot_hex("00") ++ "]}],\"gasUsed\":\"0x6590\",\"error\":";
+    try expect_contains(try h.request("eth_createAccessList", call), expected);
+}
+
+test "eth: base_meterBundle reports precompile opcodeGas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // BN254_ADD and RIPEMD160 twice without input, then BN254_ADD on (1, 0), not a curve
+    // point, with 0x1000 gas, which it spends.
+    const code = [_]u8{
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x06, 0x5a, 0xf1, 0x50, // CALL 0x06
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x03, 0x5a, 0xf1, 0x50, // CALL 0x03
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x03, 0x5a, 0xf1, 0x50, // CALL 0x03
+        0x60, 0x01, 0x5f, 0x52, // PUSH1 1 PUSH0 MSTORE
+        0x5f, 0x5f, 0x60, 0x40,
+        0x5f, 0x5f, 0x60, 0x06,
+        0x61, 0x10, 0x00, 0xf1,
+        0x50, 0x00,
+    };
+    var contract: [20]u8 = @splat(0);
+    contract[19] = 0x48;
+    try h.node.db.put_account(contract, 0, 1, &code);
+    _ = try h.mine(12);
+    var sha256: [20]u8 = @splat(0);
+    sha256[19] = 0x02;
+    var buffers: [3][256]u8 = undefined;
+    const raws = [_][]const u8{
+        try contract_call_raw(&buffers[0], 0, contract),
+        // The transaction's own call counts: SHA256 of nothing costs 60.
+        try contract_call_raw(&buffers[1], 1, sha256),
+        try transfer_raw(&buffers[2], 2),
+    };
+    const text = try meter_bundle_request(h, &raws);
+    const entry = "{\"contractAddress\":";
+    try expect_contains(text, "\"opcodeGas\":[" ++ entry ++ address_hex("03") ++
+        ",\"opcode\":\"RIPEMD160\",\"count\":2,\"gasUsed\":1200}," ++ entry ++
+        address_hex("06") ++ ",\"opcode\":\"BN254_ADD\",\"count\":2,\"gasUsed\":4246}]}");
+    try expect_contains(text, "\"opcodeGas\":[" ++ entry ++ address_hex("02") ++
+        ",\"opcode\":\"SHA256\",\"count\":1,\"gasUsed\":60}]}");
+    // Nothing metered: no `opcodeGas`.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "opcodeGas"));
 }

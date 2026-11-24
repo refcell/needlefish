@@ -64,7 +64,7 @@ pub fn write_outcome(
     try out.writeAll("}");
 }
 
-fn write_string_or_null(out: *Writer, text: ?[]const u8) Writer.Error!void {
+pub fn write_string_or_null(out: *Writer, text: ?[]const u8) Writer.Error!void {
     const value = text orelse return out.writeAll("null");
     try std.json.Stringify.encodeJsonString(value, .{}, out);
 }
@@ -129,6 +129,7 @@ fn write_account(out: *Writer, account: *const adapter.PostAccount) Writer.Error
     try out.writeAll(",\"balance\":");
     try quantity(out, info.balance);
     try field_data(out, ",\"codeHash\":", &info.code_hash);
+    if (account.wiped) try out.writeAll(",\"wiped\":true");
     try out.writeAll(",\"storage\":{");
     for (account.storage, 0..) |slot, index| {
         if (index > 0) try out.writeAll(",");
@@ -145,7 +146,7 @@ fn field_data(out: *Writer, name: []const u8, bytes: []const u8) Writer.Error!vo
 }
 
 /// `"0x..."`: lower-case hex of every byte.
-fn data(out: *Writer, bytes: []const u8) Writer.Error!void {
+pub fn data(out: *Writer, bytes: []const u8) Writer.Error!void {
     try out.writeAll("\"0x");
     var chunk: [128]u8 = undefined;
     var offset: usize = 0;
@@ -165,7 +166,7 @@ fn word(out: *Writer, value: u256) Writer.Error!void {
     try data(out, &bytes);
 }
 
-fn quantity(out: *Writer, value: u256) Writer.Error!void {
+pub fn quantity(out: *Writer, value: u256) Writer.Error!void {
     var buffer: [66]u8 = undefined;
     try out.writeAll("\"");
     try out.writeAll(hex.encode_quantity(&buffer, value));

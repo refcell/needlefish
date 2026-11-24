@@ -120,11 +120,9 @@ fn head_number(api: *Api) u64 {
 
 fn new_filter(api: *Api, call: *Call) HandlerError!void {
     const filters = try table(api, call);
-    const criteria = try eth.parse_filter(api, call, try call.params.raw());
+    const criteria = try eth.parse_filter(api, try call.params.raw());
     try call.params.finish();
-    if (criteria.block_hash != null) {
-        return call.fail(rpc.code.invalid_params, "blockHash is not supported in filters");
-    }
+    if (criteria.missing_block) return call.fail(rpc.code.server_error, "block not found");
     try call.writer.quantity(filters.install(.logs, head_number(api), criteria));
 }
 
@@ -186,6 +184,8 @@ fn pending_changes(filters: *Filters, call: *Call, slot: *Slot) HandlerError!voi
 
 fn log_changes(api: *Api, call: *Call, slot: *Slot) HandlerError!void {
     const criteria = &slot.criteria;
+    // reth answers a blockHash filter with that block's logs on every poll.
+    if (criteria.block_hash) |hash| return hash_logs(api, call, criteria, hash);
     var last = head_number(api);
     if (criteria.to_given) last = @min(last, criteria.to);
     last = @min(last, slot.last_number +| eth.logs_blocks_max);
@@ -198,6 +198,11 @@ fn get_filter_logs(api: *Api, call: *Call) HandlerError!void {
     const slot = try lookup(api, call);
     if (slot.kind != .logs) return call.fail(rpc.code.invalid_params, "not a log filter");
     const criteria = &slot.criteria;
+    if (criteria.block_hash) |hash| {
+        try call.writer.begin_array();
+        try hash_logs(api, call, criteria, hash);
+        return call.writer.end_array();
+    }
     const to = if (criteria.to_given) criteria.to else head_number(api);
     if (to >= criteria.from and to - criteria.from >= eth.logs_blocks_max) {
         return call.fail(rpc.code.server_error, "block range too large");
@@ -205,6 +210,18 @@ fn get_filter_logs(api: *Api, call: *Call) HandlerError!void {
     try call.writer.begin_array();
     try write_range(api, call, criteria, criteria.from, to);
     try call.writer.end_array();
+}
+
+/// Logs of block `hash` (none once the block is gone: the array is already open).
+fn hash_logs(
+    api: *Api,
+    call: *Call,
+    criteria: *const eth.Filter,
+    hash: [32]u8,
+) HandlerError!void {
+    if (api.chain.store.ref(hash) == null) return;
+    var written: u32 = 0;
+    try eth.block_logs(api, call, hash, criteria, &written);
 }
 
 fn write_range(
